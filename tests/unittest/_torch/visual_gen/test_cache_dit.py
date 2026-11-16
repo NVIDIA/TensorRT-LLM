@@ -439,7 +439,7 @@ class _IdentityBlock(torch.nn.Module):
 
 
 class TestFluxEnablerCompiledBlockCheckFlags:
-    """enable_cache_dit_for_flux must disable cache_dit's inspect-based
+    """The FLUX enablers must disable cache_dit's inspect-based
     forward-pattern checks exactly when blocks are torch.compile wrappers.
 
     Compiled blocks expose a ``(*args, **kwargs)`` forward, so cache_dit's
@@ -489,6 +489,30 @@ class TestFluxEnablerCompiledBlockCheckFlags:
         kwargs = self._block_adapter_kwargs(compiled=False, is_flux2=is_flux2)
         assert kwargs["check_forward_pattern"] is True
         assert kwargs["check_num_outputs"] is True
+
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+    def test_flux3_caches_only_the_joint_blocks(self, compiled):
+        """FLUX 3 caches only its single-stream joint blocks, with one context for packed CFG."""
+        from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
+        from tensorrt_llm.visual_gen.args import CacheDiTConfig
+
+        pipeline = self._make_flux_like_pipeline(compiled=compiled)
+        transformer = pipeline.transformer
+        with (
+            patch.object(cache_dit_enablers, "BlockAdapter") as adapter_cls,
+            patch.object(cache_dit_enablers, "cache_dit") as cache_dit_mock,
+        ):
+            cache_dit_enablers.enable_cache_dit_for_flux3(pipeline, CacheDiTConfig())
+        adapter_cls.assert_called_once()
+        kwargs = adapter_cls.call_args.kwargs
+        assert kwargs["transformer"] is transformer
+        assert len(kwargs["blocks"]) == 1
+        assert kwargs["blocks"][0] is transformer.single_transformer_blocks
+        assert kwargs["forward_pattern"] == [cache_dit_enablers.ForwardPattern.Pattern_3]
+        assert kwargs["check_forward_pattern"] is not compiled
+        assert kwargs["check_num_outputs"] is not compiled
+        cache_config = cache_dit_mock.enable_cache.call_args.kwargs["cache_config"]
+        assert cache_config.enable_separate_cfg is False
 
 
 # ---------------------------------------------------------------------------

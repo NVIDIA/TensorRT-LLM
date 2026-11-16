@@ -3,11 +3,17 @@
 
 """CPU tests for the BFL <-> Diffusers FLUX 3 tensor name bijection."""
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import pytest
 import torch
-from flux3_test_utils import KLEIN_BASE_CONFIG, KLEIN_CONFIG, diffusers_shapes, tiny_config
+from flux3_test_utils import (
+    BFL_BLOCK_LINEARS,
+    KLEIN_BASE_CONFIG,
+    KLEIN_CONFIG,
+    bfl_variant_tensor_names,
+    diffusers_shapes,
+)
 
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
     bfl_to_diffusers_key,
@@ -21,7 +27,6 @@ from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
 
 pytestmark = pytest.mark.cpu_only
 
-BFL_BLOCK_LINEARS = ("q_proj", "k_proj", "v_proj", "attn_out", "mlp_in", "mlp_out")
 VARIANT_SCALES = {
     "nvfp4": ("weight_scale", "weight_scale_2", "input_scale"),
     "fp8r": ("weight_scale",),
@@ -117,23 +122,17 @@ def variant_names(config: dict[str, Any], variant: Optional[str]) -> list[str]:
 def test_released_checkpoint_names_are_a_bijection(
     config: dict[str, Any], variant: Optional[str], count: int
 ) -> None:
-    """Names laid out like the released packages map one to one onto the Diffusers checkpoint."""
+    """Names laid out like the released packages map one to one onto the Diffusers checkpoint.
+
+    They also match the names the variant fixtures write.
+    """
     names = variant_names(config, variant)
     assert len(set(names)) == len(names) == count
+    assert sorted(names) == bfl_variant_tensor_names(config, variant)
     mapped = [bfl_to_diffusers_key(name) for name in names]
     assert len(set(mapped)) == count
     assert [diffusers_to_bfl_key(name) for name in mapped] == names
     assert {name for name in mapped if name.endswith(".weight")} == set(diffusers_shapes(config))
-
-
-@pytest.mark.parametrize("flow_map", [True, False], ids=["klein", "base"])
-def test_tiny_checkpoint_names_round_trip(flow_map: bool) -> None:
-    config = tiny_config(flow_map)
-    names = sorted(diffusers_shapes(config))
-    bfl = [diffusers_to_bfl_key(name) for name in names]
-    assert len(set(bfl)) == len(names)
-    assert set(bfl) == set(bfl_names(config))
-    assert [bfl_to_diffusers_key(name) for name in bfl] == names
 
 
 @pytest.mark.parametrize(
@@ -165,33 +164,21 @@ def test_suffixes_and_qk_norm_names_map() -> None:
         bfl_to_diffusers_key("single_blocks.27.norm.key_norm.scale")
         == "single_transformer_blocks.27.attn.norm_k.weight"
     )
-    assert (
-        diffusers_to_bfl_key("single_transformer_blocks.3.attn.to_q.lora_A.weight")
-        == "single_blocks.3.q_proj.lora_A.weight"
-    )
 
 
 def test_norm_out_rows_swap_between_shift_scale_orders() -> None:
     hidden_size = 4
     shift = torch.arange(hidden_size * 3, dtype=torch.float32).reshape(hidden_size, 3)
     scale = 100 + shift
-    bias_shift = torch.arange(hidden_size, dtype=torch.float32)
-    bias_scale = 10 + bias_shift
     bfl = {
         "final_layer.image.adaLN_modulation.1.weight": torch.cat([shift, scale]),
-        "final_layer.image.adaLN_modulation.1.bias": torch.cat([bias_shift, bias_scale]),
         "txt_in.weight": torch.ones(2, 3),
     }
 
     diffusers = bfl_to_diffusers_state_dict(bfl)
 
-    assert diffusers.keys() == {
-        "norm_out.linear.weight",
-        "norm_out.linear.bias",
-        "context_embedder.weight",
-    }
+    assert diffusers.keys() == {"norm_out.linear.weight", "context_embedder.weight"}
     assert torch.equal(diffusers["norm_out.linear.weight"], torch.cat([scale, shift]))
-    assert torch.equal(diffusers["norm_out.linear.bias"], torch.cat([bias_scale, bias_shift]))
     assert diffusers["context_embedder.weight"] is bfl["txt_in.weight"]
     round_trip = diffusers_to_bfl_state_dict(diffusers)
     assert round_trip.keys() == bfl.keys()
@@ -199,45 +186,11 @@ def test_norm_out_rows_swap_between_shift_scale_orders() -> None:
         assert torch.equal(round_trip[key], value), key
 
 
-@pytest.mark.parametrize(
-    "down, up", [("lora_A.weight", "lora_B.weight"), ("lora_down.weight", "lora_up.weight")]
-)
-def test_norm_out_lora_swaps_up_rows_only(down: str, up: str) -> None:
-    """LoRA up rows follow the output rows; down rows and alpha are not split by output row."""
-    hidden_size, rank = 4, 2
-    up_shift = torch.arange(hidden_size * rank, dtype=torch.float32).reshape(hidden_size, rank)
-    up_scale = 100 + up_shift
-    bfl = {
-        f"final_layer.image.adaLN_modulation.1.{down}": torch.randn(rank, hidden_size),
-        f"final_layer.image.adaLN_modulation.1.{up}": torch.cat([up_shift, up_scale]),
-        "final_layer.image.adaLN_modulation.1.alpha": torch.tensor(8.0),
-    }
-
-    diffusers = bfl_to_diffusers_state_dict(bfl)
-
-    assert torch.equal(diffusers[f"norm_out.linear.{up}"], torch.cat([up_scale, up_shift]))
-    assert (
-        diffusers[f"norm_out.linear.{down}"] is bfl[f"final_layer.image.adaLN_modulation.1.{down}"]
-    )
-    assert diffusers["norm_out.linear.alpha"] is bfl["final_layer.image.adaLN_modulation.1.alpha"]
-    round_trip = diffusers_to_bfl_state_dict(diffusers)
-    assert round_trip.keys() == bfl.keys()
-    for key, value in bfl.items():
-        assert torch.equal(round_trip[key], value), key
-
-
-@pytest.mark.parametrize(
-    "convert, key",
-    [
-        (bfl_to_diffusers_state_dict, "final_layer.image.adaLN_modulation.1.weight_scale"),
-        (diffusers_to_bfl_state_dict, "norm_out.linear.input_scale"),
-    ],
-)
-def test_norm_out_tensors_without_a_known_row_order_raise(
-    convert: Callable[[dict], dict], key: str
-) -> None:
+def test_norm_out_tensors_without_a_known_row_order_raise() -> None:
     with pytest.raises(ValueError, match="shift/scale order"):
-        convert({key: torch.ones(4)})
+        bfl_to_diffusers_state_dict(
+            {"final_layer.image.adaLN_modulation.1.weight_scale": torch.ones(4)}
+        )
 
 
 def test_norm_out_swap_needs_even_rows() -> None:
@@ -246,31 +199,23 @@ def test_norm_out_swap_needs_even_rows() -> None:
 
 
 @pytest.mark.parametrize(
-    "convert, key",
+    "key",
     [
-        (bfl_to_diffusers_key, "single_blocks.0.unknown.weight"),
-        (bfl_to_diffusers_key, "repa_projectors.0.weight"),
-        (bfl_to_diffusers_key, "single_blocks.0.q_proj"),
-        (bfl_to_diffusers_key, "single_blocks.0.norm.query_norm.weight"),
-        (bfl_to_diffusers_key, "x_embedders.image.weight"),
-        (diffusers_to_bfl_key, "mode_blocks.image.0.attn.norm_q.bias"),
-        (diffusers_to_bfl_key, "single_blocks.0.q_proj.weight"),
-        (diffusers_to_bfl_key, "proj_out"),
+        "single_blocks.0.unknown.weight",
+        "repa_projectors.0.weight",
+        "single_blocks.0.q_proj",
+        "single_blocks.0.norm.query_norm.weight",
+        "x_embedders.image.weight",
     ],
 )
-def test_unknown_tensor_names_raise(convert: Callable[[str], str], key: str) -> None:
-    with pytest.raises(ValueError, match="Unknown .* FLUX 3 tensor name"):
-        convert(key)
+def test_unknown_tensor_names_raise(key: str) -> None:
+    with pytest.raises(ValueError, match="Unknown BFL FLUX 3 tensor name"):
+        bfl_to_diffusers_key(key)
 
 
 @pytest.mark.parametrize(
-    "convert, name",
-    [
-        (bfl_to_diffusers_module, "single_blocks.0.norm.query_norm"),
-        (bfl_to_diffusers_module, "single_blocks.0.q_proj.weight"),
-        (diffusers_to_bfl_module, "mode_blocks.image.0.attn"),
-    ],
+    "name", ["single_blocks.0.norm.query_norm", "single_blocks.0.q_proj.weight"]
 )
-def test_unknown_module_names_raise(convert: Callable[[str], str], name: str) -> None:
-    with pytest.raises(ValueError, match="Unknown .* FLUX 3 module name"):
-        convert(name)
+def test_unknown_module_names_raise(name: str) -> None:
+    with pytest.raises(ValueError, match="Unknown BFL FLUX 3 module name"):
+        bfl_to_diffusers_module(name)

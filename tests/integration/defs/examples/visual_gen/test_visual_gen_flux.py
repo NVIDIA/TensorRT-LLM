@@ -391,9 +391,19 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
+def _flux3_klein_checkpoint() -> str:
+    """Klein from FLUX3_KLEIN_CHECKPOINT, else the CI model store; fails if missing."""
+    override = os.environ.get("FLUX3_KLEIN_CHECKPOINT")
+    if override:
+        if not os.path.isdir(override):
+            pytest.fail(f"FLUX3_KLEIN_CHECKPOINT is not a directory: {override}")
+        return override
+    return get_checkpoint("flux-3-image-klein")
+
+
 def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
     """Run the FLUX 3 Klein example with the supported single-GPU NVFP4 config."""
-    model_path = get_checkpoint("flux-3-image-klein")
+    model_path = _flux3_klein_checkpoint()
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux3_example")
     os.makedirs(out_dir, exist_ok=True)
@@ -428,7 +438,7 @@ def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
 
 def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
     """Run the FLUX 3 Klein example with a reference image that is padded and cropped back."""
-    model_path = get_checkpoint("flux-3-image-klein")
+    model_path = _flux3_klein_checkpoint()
     # A 600 x 400 reference pads to a 608 x 400 canvas, and the output is cropped back to it.
     pixels = np.random.default_rng(0).integers(0, 256, (400, 600, 3), dtype=np.uint8)
     reference_path = tmp_path / "flux3_reference.png"

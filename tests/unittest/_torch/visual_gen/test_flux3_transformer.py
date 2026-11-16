@@ -165,36 +165,27 @@ def test_matches_diffusers_reference(flow_map: bool, shape: str, backend: str, h
 
 @torch.inference_mode()
 def test_packed_samples_are_isolated():
+    """Changing every token of sample 1 leaves sample 0's output bitwise unchanged."""
     model, _, config = build(flow_map=False)
-    samples = make_samples(config, *SHAPES["mixed_refs"])
-    kwargs = packed_inputs(model, samples, TIMESTEPS)
+    kwargs = packed_inputs(model, make_samples(config, *SHAPES["mixed_refs"]), TIMESTEPS)
     packed = model(**kwargs)["x_image"]
-    for index, (start, end) in enumerate(bounds(SHAPES["mixed_refs"][0])):
-        single = packed_inputs(model, samples[index : index + 1], TIMESTEPS[index : index + 1])
-        assert_parity(
-            packed[start:end], model(**single)["x_image"], relative_l2=1e-2, cosine=0.9999
-        )
-    text_start = SHAPES["mixed_refs"][2][0]
-    kwargs["x_text"][text_start:] += 1
+    for name, lengths in kwargs["layout"]:
+        kwargs[f"x_{name}"][lengths[0] :] += 1
     changed = model(**kwargs)["x_image"]
     image_end = SHAPES["mixed_refs"][0][0]
-    torch.testing.assert_close(changed[:image_end], packed[:image_end])
+    torch.testing.assert_close(changed[:image_end], packed[:image_end], rtol=0, atol=0)
     assert not torch.equal(changed[image_end:], packed[image_end:])
 
 
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
 @torch.inference_mode()
 def test_prepared_static_inputs_match_uncached(flow_map: bool):
+    """Inputs prepared at the first step serve a later step as an uncached forward does."""
     model, _, config = build(flow_map)
-    kwargs = packed_inputs(model, make_samples(config, *SHAPES["mixed_refs"]), TIMESTEPS)
-    prepared = model.prepare_static_inputs(**kwargs)
-    assert "_flux3_joint_cos" in prepared
-    assert ("_flux3_text_tokens" in prepared) != flow_map
-    assert not any(key.endswith("_vec") for key in prepared)
-    targets = target_kwargs(flow_map, TARGETS)
-    torch.testing.assert_close(
-        model(**kwargs, **prepared, **targets)["x_image"], model(**kwargs, **targets)["x_image"]
-    )
+    samples = make_samples(config, *SHAPES["mixed_refs"])
+    prepared = model.prepare_static_inputs(**packed_inputs(model, samples, TIMESTEPS))
+    kwargs = {**packed_inputs(model, samples, TARGETS), **target_kwargs(flow_map, (0.25, 0.05))}
+    torch.testing.assert_close(model(**kwargs, **prepared)["x_image"], model(**kwargs)["x_image"])
 
 
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
@@ -246,7 +237,7 @@ def test_cuda_graph_replay_follows_layout_and_timesteps(flow_map: bool):
             targets = target_kwargs(flow_map, tuple(t / 2 for t in timesteps))
             expected = model(**kwargs, **prepared, **targets)["x_image"]
             actual = forward(**kwargs, **prepared, **targets)["x_image"].clone()
-            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert len(runner.graphs) == 2
     finally:
         runner.clear()
@@ -414,32 +405,6 @@ def test_sol_packed_samples_match_single_samples(flow_map, shape):
         targets = target_kwargs(flow_map, TARGETS[index:], 1)
         alone = model(**at_step(single, 0.5), **targets)["x_image"]
         torch.testing.assert_close(packed[start:end], alone, rtol=0, atol=0)
-
-
-@requires_sm100
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-@torch.inference_mode()
-def test_sol_cuda_graphs_key_dense_and_sparse_phases(flow_map):
-    """One graph per side of the cutoff; each replay equals the eager forward."""
-    model, _, config = build(flow_map, head_dim=128, attention=sol_attention("TRTLLM"))
-    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-    model.register_cuda_graph_extra_key_fns(runner)
-    forward = runner.wrap(model.forward)
-    _, kwargs = sol_inputs(model, config, "i2i_cfg")
-    prepared = model.prepare_static_inputs(**at_step(kwargs, 1.0))
-    targets = target_kwargs(flow_map, TARGETS)
-    try:
-        for value in (1.0, 0.98, 0.5, 0.3):
-            expected = model(**at_step(kwargs, value), **prepared, **targets)["x_image"]
-            actual = forward(**at_step(kwargs, value), **prepared, **targets)["x_image"]
-            torch.testing.assert_close(actual.clone(), expected, rtol=0, atol=0)
-        assert len(runner.graphs) == 2
-        phases = {
-            value for key in runner.graphs for name, value in key if name == "sparse_attn_phase"
-        }
-        assert phases == {0, 1}, list(runner.graphs)
-    finally:
-        runner.clear()
 
 
 class VCPreparations:

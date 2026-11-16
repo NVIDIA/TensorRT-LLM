@@ -220,8 +220,10 @@ are not supported. See the
 - FLUX 3 encodes the prompt as given, without prompt upsampling. Write full scene captions, or
   upsample offline with `black-forest-labs/flux-3-image-klein-pup`.
 - `pipeline_config.variant: nvfp4` or `fp8r` loads BFL's pre-quantized transformer weights.
-- SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`, and VC-Attention at
-  2048x2048.
+  Loading by Hugging Face ID downloads both variants. To download one, fetch
+  `modular_model_index.json`, `transformer/config.json`, `text_encoder/*`, `vae/*` and
+  `variants/<variant>/*`, then pass the local directory.
+- SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`.
 - The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
   `--visual_gen_args`.
 

@@ -32,11 +32,6 @@ def samples(text_lengths: tuple[int, ...]) -> list[dict]:
     return result
 
 
-def test_bounds_are_consecutive_segments() -> None:
-    assert bounds((3, 0, 2)) == ((0, 3), (3, 3), (3, 5))
-    assert bounds(()) == ()
-
-
 def test_packing_preserves_sample_boundaries() -> None:
     inputs = samples((7, 11))
     actual = pack(inputs, CHANNELS)

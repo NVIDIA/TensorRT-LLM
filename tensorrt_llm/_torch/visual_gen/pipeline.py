@@ -127,30 +127,6 @@ class BasePipeline(nn.Module):
         """
         return cls
 
-    @classmethod
-    def hf_download_patterns(
-        cls, patterns: List[str], pipeline_config: Dict[str, Any]
-    ) -> List[str]:
-        """Hub allow-patterns for this ``pipeline_config``; an empty list fetches the whole repo.
-
-        Runs on the registered class before ``resolve_variant``; subclass-only overrides never run.
-        """
-        return patterns
-
-    @classmethod
-    def resolve_component_configs(
-        cls,
-        checkpoint_dir: str,
-        component_configs: Dict[str, Dict[str, Any]],
-        pipeline_config: Dict[str, Any],
-        quant_config: Any,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Diffusers component configs to build from; a returned ``quantization_config`` applies.
-
-        Runs on the registered class before ``resolve_variant``; subclass-only overrides never run.
-        """
-        return component_configs
-
     def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
         self.pipeline_config = pipeline_config

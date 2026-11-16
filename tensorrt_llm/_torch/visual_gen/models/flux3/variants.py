@@ -30,8 +30,6 @@ VARIANT_SCALES = {
     "nvfp4": ("weight_scale", "weight_scale_2", "input_scale"),
     "fp8r": ("weight_scale",),
 }
-# NVFP4 activations use the calibrated input_scale; FP8 rowwise quantizes each token at runtime.
-_DYNAMIC_ACTIVATIONS = {"nvfp4": False, "fp8r": True}
 _SCALE_SUFFIXES = sorted({suffix for scales in VARIANT_SCALES.values() for suffix in scales})
 NVFP4_GROUP_SIZE = 16
 
@@ -113,12 +111,7 @@ def variant_quantization_config(
     excluded = [_module_name(name) for name in quantization.get("exclude_modules", [])]
     return {
         "quant_algo": quant_algo,
-        "config_groups": {
-            "default": {
-                "weights": weights,
-                "input_activations": {"dynamic": _DYNAMIC_ACTIVATIONS[variant]},
-            }
-        },
+        "config_groups": {"default": {"weights": weights}},
         "ignore": collapse_exclusions(excluded, modules),
     }
 
@@ -168,6 +161,33 @@ def resolve_variant_quantization_config(
         tensor_names = list(f.keys())
     hf_quant_config = _read_json(os.path.join(directory, "hf_quant_config.json"))
     return variant_quantization_config(variant, hf_quant_config, tensor_names)
+
+
+def apply_variant_quantization(
+    checkpoint_dir: str,
+    component_configs: Dict[str, Dict[str, Any]],
+    variant: Any,
+    quant_config: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Give the transformer config the selected variant's quantization_config."""
+    variant = check_variant(variant)
+    if variant is None:
+        return component_configs
+    user_algo = (
+        quant_config.get("quant_algo")
+        if isinstance(quant_config, dict)
+        else getattr(quant_config, "quant_algo", None)
+    )
+    if user_algo is not None:
+        raise ValueError(
+            f"FLUX 3 variant {variant!r} is pre-quantized; remove quant_config.quant_algo or "
+            "pipeline_config.variant."
+        )
+    transformer = dict(component_configs["transformer"])
+    transformer["quantization_config"] = resolve_variant_quantization_config(
+        checkpoint_dir, variant, transformer
+    )
+    return {**component_configs, "transformer": transformer}
 
 
 def check_variant_scales(

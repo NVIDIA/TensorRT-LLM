@@ -152,13 +152,10 @@ class PipelineLoader:
                     ),
                     revision=revision,
                 )
-            download_patterns = entry and entry.pipeline_cls.hf_download_patterns(
-                list(entry.download_patterns), {**entry.defaults, **self.args.pipeline_config}
-            )
-            if download_patterns:
+            if entry is not None and entry.download_patterns:
                 local_dir = download_hf_partial(
                     checkpoint_dir,
-                    allow_patterns=download_patterns,
+                    allow_patterns=entry.download_patterns,
                     revision=revision,
                 )
             else:

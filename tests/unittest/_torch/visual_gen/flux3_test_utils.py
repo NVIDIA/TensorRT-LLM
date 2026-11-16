@@ -20,8 +20,10 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3 import pipeline_flux3
-from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import Flux3Pipeline
-from tensorrt_llm._torch.visual_gen.models.flux3.text_encoder import HIDDEN_STATE_LAYERS
+from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
+    HIDDEN_STATE_LAYERS,
+    Flux3Pipeline,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
     bfl_to_diffusers_module,
     diffusers_to_bfl_key,
@@ -172,14 +174,12 @@ def diffusers_shapes(config: dict[str, Any]) -> dict[str, tuple[int, ...]]:
     return shapes
 
 
-def diffusers_weights(
-    config: dict[str, Any], seed: int = 0, unit_scale: bool = False
-) -> dict[str, torch.Tensor]:
+def diffusers_weights(config: dict[str, Any], unit_scale: bool = False) -> dict[str, torch.Tensor]:
     """Random BF16 weights; every QK-norm weight is distinct and away from one.
 
     ``unit_scale`` scales projections by 1 / sqrt(fan_in), so every path changes the output.
     """
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator().manual_seed(0)
     weights = {}
     for name, shape in diffusers_shapes(config).items():
         value = torch.randn(shape, generator=generator)
@@ -245,12 +245,12 @@ def write_checkpoint(
     root: Path,
     config: dict[str, Any],
     weights: dict[str, torch.Tensor],
-    num_shards: int = 2,
     class_name: Optional[str] = None,
 ) -> None:
     """Write a modular Diffusers checkpoint whose transformer is sharded like the released one."""
     from safetensors.torch import save_file
 
+    num_shards = 2
     root.mkdir(parents=True, exist_ok=True)
     index = pipeline_manifest(config.get("flow_map", False), class_name)
     (root / "modular_model_index.json").write_text(json.dumps(index))
@@ -287,14 +287,11 @@ def assert_parity(
 # =============================================================================
 
 
-def tiny_vae(mid_channels: int = 8) -> AutoencoderKLFlux2:
-    """A 4-level (8x) Diffusers FLUX.2/3 VAE whose packed latents have LATENT_CHANNELS.
-
-    Its mid-block attention is one head of ``mid_channels``; the released VAE uses 512.
-    """
+def tiny_vae() -> AutoencoderKLFlux2:
+    """A 4-level (8x) Diffusers FLUX.2/3 VAE whose packed latents have LATENT_CHANNELS."""
     torch.manual_seed(0)
     return AutoencoderKLFlux2(
-        block_out_channels=(8, 8, 8, mid_channels),
+        block_out_channels=(8, 8, 8, 8),
         layers_per_block=1,
         latent_channels=LATENT_CHANNELS // 4,
         norm_num_groups=4,
@@ -320,7 +317,7 @@ class _FakeProcessor:
 class _FakeQwen3VLModel(torch.nn.Module):
     """Qwen3-VL layer layout whose selected hidden states concatenate to a seeded embedding."""
 
-    def __init__(self, dim: int, encoded: list):
+    def __init__(self, encoded: list):
         super().__init__()
         self.language_model = torch.nn.Module()
         self.language_model.layers = torch.nn.ModuleList(
@@ -328,12 +325,12 @@ class _FakeQwen3VLModel(torch.nn.Module):
         )
         self.language_model.norm = torch.nn.Identity()
         self.visual = torch.nn.Identity()
-        self.dim, self.encoded = dim, encoded
+        self.encoded = encoded
 
     def forward(self, input_ids, **kwargs):
         self.encoded.append(int(input_ids[0, 0]))
         generator = torch.Generator().manual_seed(int(input_ids[0, 0]))
-        embedding = torch.randn(1, input_ids.shape[1], self.dim, generator=generator)
+        embedding = torch.randn(1, input_ids.shape[1], TEXT_DIM, generator=generator)
         chunks = embedding.to(input_ids.device).chunk(len(HIDDEN_STATE_LAYERS), dim=-1)
         # Embeddings, then one entry per layer, as Hugging Face returns them.
         hidden_states = [None] * (len(self.language_model.layers) + 1)
@@ -347,12 +344,12 @@ class FakeTextEncoder(torch.nn.Module):
     prompt has 3 template tokens plus one per word. Records prompts and encoded token ids.
     """
 
-    def __init__(self, dim: int = TEXT_DIM, device: str = "cpu"):
+    def __init__(self):
         super().__init__()
         self.tokenized, self.encoded = [], []
         self.processor = _FakeProcessor(self.tokenized)
-        self.model = _FakeQwen3VLModel(dim, self.encoded)
-        self.register_buffer("anchor", torch.zeros((), device=device))
+        self.model = _FakeQwen3VLModel(self.encoded)
+        self.register_buffer("anchor", torch.zeros(()))
 
     @property
     def device(self) -> torch.device:
@@ -363,9 +360,9 @@ class FakeTextEncoder(torch.nn.Module):
         return self.anchor.dtype
 
 
-def use_fake_text_encoder(pipeline: Flux3Pipeline, device: str = "cpu") -> FakeTextEncoder:
+def use_fake_text_encoder(pipeline: Flux3Pipeline) -> FakeTextEncoder:
     """Give ``pipeline`` a FakeTextEncoder and its processor."""
-    pipeline.text_encoder = FakeTextEncoder(device=device)
+    pipeline.text_encoder = FakeTextEncoder()
     pipeline.processor = pipeline.text_encoder.processor
     return pipeline.text_encoder
 
@@ -412,12 +409,11 @@ def gpu_transformer_config(flow_map: bool, num_layers: int = 1, **overrides: Any
 def write_gpu_checkpoint(
     path: Path, flow_map: bool, num_layers: int = 1, **overrides: Any
 ) -> dict[str, torch.Tensor]:
-    """Write a synthetic checkpoint with a tiny VAE unless it exists; returns its weights."""
+    """Write a synthetic checkpoint with a tiny VAE; returns its weights."""
     config = gpu_transformer_config(flow_map, num_layers, **overrides)
     weights = diffusers_weights(config, unit_scale=True)
-    if not (path / "transformer").exists():
-        write_checkpoint(path, config, weights)
-        tiny_vae().save_pretrained(str(path / "vae"))
+    write_checkpoint(path, config, weights)
+    tiny_vae().save_pretrained(str(path / "vae"))
     return weights
 
 
@@ -447,16 +443,16 @@ def load_gpu_pipeline(
 
 
 def lora_adapter(
-    weights: dict[str, torch.Tensor], rank: int = 4, seed: int = 1, std: float = 0.1
+    weights: dict[str, torch.Tensor], rank: int = 4
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """Random BF16 (A [rank, in], B [out, rank]) for every Linear module of Diffusers weights."""
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator().manual_seed(1)
     adapter = {}
     for name, value in sorted(weights.items()):
         if value.dim() == 2:
             out_features, in_features = value.shape
-            a = torch.randn(rank, in_features, generator=generator) * std
-            b = torch.randn(out_features, rank, generator=generator) * std
+            a = torch.randn(rank, in_features, generator=generator) * 0.1
+            b = torch.randn(out_features, rank, generator=generator) * 0.1
             adapter[name[: -len(".weight")]] = (a.to(torch.bfloat16), b.to(torch.bfloat16))
     return adapter
 
@@ -592,7 +588,6 @@ def write_variant(
     config: dict[str, Any],
     variant: str,
     tensors: dict[str, torch.Tensor],
-    hf_quant_config: Optional[dict[str, Any]] = None,
 ) -> None:
     """Write ``variants/<variant>/`` with BFL-named ``tensors``."""
     from safetensors.torch import save_file
@@ -603,8 +598,9 @@ def write_variant(
         {name: value.contiguous() for name, value in tensors.items()},
         str(directory / "model.safetensors"),
     )
-    hf_quant_config = hf_quant_config or bfl_hf_quant_config(config, variant)
-    (directory / "hf_quant_config.json").write_text(json.dumps(hf_quant_config))
+    (directory / "hf_quant_config.json").write_text(
+        json.dumps(bfl_hf_quant_config(config, variant))
+    )
     (directory / "config.json").write_text(json.dumps(bfl_variant_config(config, variant)))
 
 
@@ -617,7 +613,7 @@ def quantize_variant(
     config: dict[str, Any],
     weights: dict[str, torch.Tensor],
     variant: str,
-    input_amax: Optional[dict[str, float]] = None,
+    input_amax: dict[str, float],
 ) -> dict[str, torch.Tensor]:
     """BFL-named variant tensors of Diffusers BF16 ``weights``, quantized with TRT-LLM ops on CUDA.
 

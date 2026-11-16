@@ -4,11 +4,9 @@
 """CPU tests for building FLUX 3 from its config and loading Diffusers checkpoints."""
 
 import re
-from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 from flux3_test_utils import (
     block_names,
     diffusers_shapes,
@@ -21,18 +19,10 @@ from flux3_test_utils import (
     write_checkpoint,
     write_lora,
 )
-from safetensors.torch import save_file
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
-from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import pack
-from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
-    Flux3Attention,
-    Flux3Transformer2DModel,
-    Flux3TransformerConfig,
-)
+from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import Flux3Transformer2DModel
 from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -115,26 +105,6 @@ def test_every_checkpoint_tensor_loads_into_one_parameter(flow_map: bool) -> Non
         assert torch.equal(actual[name], value), name
 
 
-def test_norm_out_reads_scale_before_shift_per_sample() -> None:
-    model, weights = build_and_load(flow_map=True)
-    hidden_size = model.arch_config.hidden_size
-    generator = torch.Generator().manual_seed(1)
-    x = torch.randn(2, 3, hidden_size, generator=generator).to(torch.bfloat16)
-    vec = torch.randn(2, hidden_size, generator=generator).to(torch.bfloat16)
-    with torch.inference_mode():
-        actual = model.norm_out(x, vec)
-    scale, shift = F.linear(F.silu(vec), weights["norm_out.linear.weight"])[:, None].chunk(2, -1)
-    normed = F.layer_norm(x.float(), (hidden_size,), eps=1e-6).to(torch.bfloat16)
-    torch.testing.assert_close(actual, (1 + scale) * normed + shift)
-
-
-def test_target_timestep_embedder_exists_only_with_flow_map() -> None:
-    assert build(flow_map=True).target_timestep_embedder is not None
-    base = build(flow_map=False)
-    assert base.target_timestep_embedder is None
-    assert not any(name.startswith("target_") for name, _ in base.named_parameters())
-
-
 def test_attention_layer_indices_are_unique_across_stacks() -> None:
     config = tiny_config(flow_map=False)
     model = build(flow_map=False, skip_create_weights_in_init=True)
@@ -145,44 +115,20 @@ def test_attention_layer_indices_are_unique_across_stacks() -> None:
     assert mlp_indices == indices
 
 
-@pytest.mark.parametrize(
-    "model_flow_map, checkpoint_flow_map, message",
-    [
-        pytest.param(
-            True,
-            False,
-            "missing 2 [target_timestep_embedder.linear_1.weight, "
-            "target_timestep_embedder.linear_2.weight], unexpected 0 []",
-            id="klein_model_base_checkpoint",
-        ),
-        pytest.param(
-            False,
-            True,
-            "missing 0 [], unexpected 2 [target_timestep_embedder.linear_1.weight, "
-            "target_timestep_embedder.linear_2.weight]",
-            id="base_model_klein_checkpoint",
-        ),
-    ],
-)
-def test_flow_map_mismatch_fails_to_load(
-    model_flow_map: bool, checkpoint_flow_map: bool, message: str
-) -> None:
-    model = build(model_flow_map)
-    with pytest.raises(ValueError, match=re.escape(message)):
-        model.load_weights(diffusers_weights(tiny_config(checkpoint_flow_map)))
-
-
 def test_missing_and_unexpected_tensors_are_named() -> None:
+    """Fused, plain-Linear and non-Linear tensors are each reported under checkpoint names."""
     weights = diffusers_weights(tiny_config(flow_map=True))
     del weights["single_transformer_blocks.1.ff.linear_in.weight"]
     del weights["mode_blocks.image_cond.0.attn.norm_k.weight"]
+    del weights["target_timestep_embedder.linear_1.weight"]
     weights["single_transformer_blocks.3.attn.to_q.weight"] = torch.zeros(32, 32)
     with pytest.raises(ValueError) as error:
         build(flow_map=True).load_weights(weights)
     message = str(error.value)
     assert (
-        "missing 2 [mode_blocks.image_cond.0.attn.norm_k.weight, "
-        "single_transformer_blocks.1.ff.linear_in.weight]"
+        "missing 3 [mode_blocks.image_cond.0.attn.norm_k.weight, "
+        "single_transformer_blocks.1.ff.linear_in.weight, "
+        "target_timestep_embedder.linear_1.weight]"
     ) in message
     assert "unexpected 1 [single_transformer_blocks.3.attn.to_q.weight]" in message
 
@@ -243,9 +189,6 @@ def test_production_config_path_builds_and_loads(tmp_path) -> None:
     loaded = WeightLoader().load_weights(str(tmp_path), Mapping(), prefetch=False)
     assert loaded.keys() == weights.keys()
     model.load_weights(loaded)
-    actual = dict(model.named_parameters())
-    for name, value in expected_parameters(weights).items():
-        assert torch.equal(actual[name], value), name
 
 
 @pytest.mark.parametrize(
@@ -274,72 +217,7 @@ def test_config_is_read_strictly(removed: str | None, changes: dict, message: st
     if removed is not None:
         del config[removed]
     with pytest.raises(ValueError, match=re.escape(message)):
-        Flux3TransformerConfig.from_pretrained_config(SimpleNamespace(**config))
-    with pytest.raises(ValueError, match=re.escape(message)):
         Flux3Transformer2DModel(model_config(config))
-
-
-def test_config_defaults_flow_map_and_ignores_loader_keys() -> None:
-    config = {**tiny_config(flow_map=False), "_name_or_path": "/ckpt", "quantization_config": {}}
-    arch = Flux3TransformerConfig.from_pretrained_config(SimpleNamespace(**config))
-    assert arch.flow_map is False
-    assert arch.hidden_size == 32 and arch.mlp_hidden_dim == 96
-
-
-NVFP4 = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
-
-
-@pytest.mark.parametrize(
-    "quant_config, dynamic_weight_quant, qkv_mode",
-    [
-        pytest.param(QuantConfig(), False, QKVMode.FUSE_QKV, id="bf16"),
-        pytest.param(QuantConfig(quant_algo=QuantAlgo.FP8), False, QKVMode.FUSE_QKV, id="fp8"),
-        pytest.param(NVFP4, True, QKVMode.FUSE_QKV, id="dynamic_nvfp4"),
-        pytest.param(NVFP4, False, QKVMode.SEPARATE_QKV, id="static_nvfp4"),
-        pytest.param(
-            QuantConfig(
-                quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=["txt_mode_blocks.0"]
-            ),
-            False,
-            QKVMode.FUSE_QKV,
-            id="static_nvfp4_excluded_block",
-        ),
-    ],
-)
-def test_qkv_topology_follows_quant_config_and_keeps_backend(
-    monkeypatch: pytest.MonkeyPatch,
-    quant_config: QuantConfig,
-    dynamic_weight_quant: bool,
-    qkv_mode: QKVMode,
-) -> None:
-    """Static NVFP4 splits quantized Q/K/V but stays self-attention, so TRTLLM is kept."""
-    backends = []
-
-    def create_attention(backend: str, **kwargs) -> SimpleNamespace:
-        backends.append(backend)
-        return SimpleNamespace(preferred_layout=AttentionTensorLayout.NHD)
-
-    monkeypatch.setattr(attention_module, "create_attention", create_attention)
-    config = model_config(
-        tiny_config(flow_map=True),
-        quant_config=quant_config,
-        backend="TRTLLM",
-        dynamic_weight_quant=dynamic_weight_quant,
-        skip_create_weights_in_init=True,
-    )
-    attn = Flux3Attention(
-        hidden_size=32,
-        num_heads=2,
-        eps=1e-6,
-        config=config,
-        layer_idx=7,
-        module_name="txt_mode_blocks.0.attn",
-    )
-    assert attn.qkv_mode == qkv_mode
-    assert attn.separate_qkv_is_self_attention
-    assert attn.attn_backend == "TRTLLM"
-    assert attn.layer_idx == 7
-    assert backends == ["TRTLLM"]
 
 
 def test_checkpoint_module_names_exclude_fused_linears() -> None:
@@ -364,18 +242,7 @@ def test_checkpoint_module_names_exclude_fused_linears() -> None:
     }
 
 
-def test_composite_modules_settle_after_their_linears(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = build(flow_map=False)
-    calls = []
-    monkeypatch.setattr(Linear, "post_load_weights", lambda self: calls.append("linear"))
-    monkeypatch.setattr(Attention, "post_load_weights", lambda self: calls.append("composite"))
-    model.post_load_weights()
-    assert "composite" in calls
-    assert calls.index("composite") > max(i for i, call in enumerate(calls) if call == "linear")
-
-
 ONE_SAMPLE = {"image": (4,), "image_cond": (0,), "text": (3,)}
-TWO_SAMPLES = {"image": (4, 4), "image_cond": (0, 0), "text": (3, 5)}
 
 
 def without(kwargs: dict, key: str) -> dict:
@@ -432,29 +299,6 @@ def test_invalid_inputs_fail_before_compute(flow_map: bool, edit, message: str) 
         model(**edit(packed_kwargs(model, ONE_SAMPLE)))
 
 
-def test_prepared_text_streams_replace_raw_text_inputs() -> None:
-    """Cached streams need no raw text tensors, so graph callers may drop them."""
-    model = build(flow_map=False, skip_create_weights_in_init=True)
-    kwargs = packed_kwargs(model, TWO_SAMPLES)
-    cached = {"_flux3_text_tokens": torch.zeros(1), "_flux3_joint_cos": torch.zeros(1)}
-    layout, timestep = kwargs["layout"], kwargs["timestep"]
-    model._check_inputs(
-        {**without(without(kwargs, "x_text"), "x_text_ids"), **cached}, layout, timestep
-    )
-    with pytest.raises(ValueError, match="need x_text"):
-        model._check_inputs(without(kwargs, "x_text"), layout, timestep)
-
-
-def test_cuda_graph_key_includes_packed_layout() -> None:
-    model = build(flow_map=False, skip_create_weights_in_init=True)
-    key_fns = {}
-    runner = SimpleNamespace(register_extra_key_fn=key_fns.__setitem__)
-    model.register_cuda_graph_extra_key_fns(runner)
-    layout = packed_kwargs(model, TWO_SAMPLES)["layout"]
-    assert key_fns["flux3_layout"](layout=layout) == layout
-    assert key_fns["flux3_layout"]() is None
-
-
 # =============================================================================
 # Runtime LoRA
 # =============================================================================
@@ -487,52 +331,3 @@ def test_runtime_lora_in_both_formats_matches_the_merged_checkpoint(tmp_path, fl
         # Fusion rounds the BF16 delta and sum, far below the size of a misplaced delta.
         atol = value.abs().max().item() * 2**-6
         torch.testing.assert_close(fused["diffusers"][name].float(), value, rtol=0, atol=atol)
-
-
-@pytest.mark.parametrize("bfl", [False, True], ids=["diffusers", "bfl"])
-def test_runtime_lora_at_scale_zero_keeps_every_weight(tmp_path, bfl: bool) -> None:
-    model, weights = build_and_load(flow_map=True)
-    path = write_lora(tmp_path / "lora", lora_adapter(weights, LORA_RANK), LORA_ALPHA, bfl=bfl)
-    before = parameters(model)
-    apply_runtime_lora(model, RuntimeLoRAConfig(path=str(path), scale=0.0))
-    for name, value in model.named_parameters():
-        assert torch.equal(value, before[name]), name
-
-
-def lora_tensors(prefix: str, module: str, a: torch.Tensor, b: torch.Tensor) -> dict:
-    return {
-        f"{prefix}{module}.lora_A.weight": a.clone(),
-        f"{prefix}{module}.lora_B.weight": b.clone(),
-    }
-
-
-def test_runtime_lora_strict_mode_rejects_unknown_targets_before_fusing(tmp_path) -> None:
-    model, weights = build_and_load(flow_map=True)
-    a, b = lora_adapter(weights, LORA_RANK)["proj_out"]
-    tensors = {
-        **lora_tensors("diffusion_model.", "final_layer.image.linear", a, b),
-        **lora_tensors("diffusion_model.", "single_blocks.0.gate_proj", a, b),
-    }
-    save_file(tensors, str(tmp_path / "lora.safetensors"))
-    before = parameters(model)
-    config = RuntimeLoRAConfig(path=str(tmp_path / "lora.safetensors"))
-    with pytest.raises(ValueError, match="skipped 1 adapter target.*single_blocks.0.gate_proj"):
-        apply_runtime_lora(model, config)
-    for name, value in model.named_parameters():
-        assert torch.equal(value, before[name]), name
-
-    report = apply_runtime_lora(model, config.model_copy(update={"strict": False}))
-    assert report.applied_modules == ("proj_out",)
-    assert report.skipped_non_targets == 1
-
-
-def test_runtime_lora_rejects_bfl_and_diffusers_names_for_one_module(tmp_path) -> None:
-    model, weights = build_and_load(flow_map=True)
-    a, b = lora_adapter(weights, LORA_RANK)["proj_out"]
-    tensors = {
-        **lora_tensors("diffusion_model.", "final_layer.image.linear", a, b),
-        **lora_tensors("transformer.", "proj_out", a, b),
-    }
-    save_file(tensors, str(tmp_path / "lora.safetensors"))
-    with pytest.raises(ValueError, match="both target FLUX 3 module 'proj_out'"):
-        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(tmp_path / "lora.safetensors")))

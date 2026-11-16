@@ -82,6 +82,18 @@ class TinyFlux2Transformer(nn.Module):
         self.norm_out.linear = nn.Linear(2, 3, bias=False)
 
 
+class TinyFlux3Transformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_mode_blocks = nn.ModuleList()
+        self.image_cond_mode_blocks = nn.ModuleList()
+        self.txt_mode_blocks = nn.ModuleList()
+        self.single_transformer_blocks = nn.ModuleList([TinyAttention()])
+        self.norm_out = nn.Module()
+        self.norm_out.linear = nn.Linear(2, 3, bias=False)
+        self.proj_out = nn.Linear(2, 3, bias=False)
+
+
 def _add_rank_one_lora_pair(
     tensors: dict[str, torch.Tensor],
     name: str,
@@ -343,6 +355,37 @@ def test_runtime_lora_does_not_map_flux3_aliases_for_other_transformers(
     save_file(tensors, str(lora_path))
 
     with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+
+def test_runtime_lora_skips_unknown_flux3_bfl_names_as_non_targets(tmp_path: Path) -> None:
+    model = TinyFlux3Transformer()
+    lora_path = tmp_path / "adapter.safetensors"
+    tensors: dict[str, torch.Tensor] = {}
+    for name in (
+        "diffusion_model.final_layer.image.linear",
+        "diffusion_model.single_blocks.0.gate_proj",
+    ):
+        _add_rank_one_lora_pair(tensors, name)
+    save_file(tensors, str(lora_path))
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path), strict=False))
+
+    assert report.applied_modules == ("proj_out",)
+    assert report.skipped_non_targets == 1
+
+
+def test_runtime_lora_rejects_flux3_bfl_and_diffusers_names_for_one_module(
+    tmp_path: Path,
+) -> None:
+    model = TinyFlux3Transformer()
+    lora_path = tmp_path / "adapter.safetensors"
+    tensors: dict[str, torch.Tensor] = {}
+    for name in ("diffusion_model.final_layer.image.linear", "transformer.proj_out"):
+        _add_rank_one_lora_pair(tensors, name)
+    save_file(tensors, str(lora_path))
+
+    with pytest.raises(ValueError, match="both target FLUX 3 module 'proj_out'"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
 

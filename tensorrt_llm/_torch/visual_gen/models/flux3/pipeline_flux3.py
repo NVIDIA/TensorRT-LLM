@@ -7,12 +7,11 @@ Klein Base samples with classifier-free guidance; Klein is a step-distilled flow
 """
 
 import dataclasses
-import json
 import math
 import os
 import time
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -22,7 +21,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import ImageOps
-from torch import Tensor
+from torch import Tensor, nn
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
@@ -35,14 +34,6 @@ from tensorrt_llm._torch.visual_gen.utils import classify_worker_error, make_noi
 from tensorrt_llm.logger import logger
 
 from .packed import pack
-from .text_encoder import (
-    HIDDEN_STATE_LAYERS,
-    PADDING_POSITION_ID,
-    TEXT_MAX_TOKENS,
-    TEXT_PAD_MULTIPLE,
-    padded_text_length,
-    trim_for_text,
-)
 from .transformer_flux3 import (
     IMAGE,
     IMAGE_COND,
@@ -51,7 +42,7 @@ from .transformer_flux3 import (
     TEXT,
     Flux3Transformer2DModel,
 )
-from .variants import check_variant, load_variant_weights, resolve_variant_quantization_config
+from .variants import load_variant_weights
 
 # Constant timestep shift of the FLUX 3 sampling recipe.
 SCHEDULER_SHIFT = 6.93
@@ -63,16 +54,24 @@ MAX_REFERENCES = 10
 SINGLE_REFERENCE_MAX_PIXELS = 4 * 1024 * 1024
 MULTI_REFERENCE_MAX_PIXELS = 1024 * 1024
 MIN_REFERENCE_SIDE, MAX_REFERENCE_SIDE = 64, 4096
+# Hidden states stacked along channels; 8 x 2560 is the transformer's joint_attention_dim.
+HIDDEN_STATE_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)
+# Prompts are right-padded to a multiple of TEXT_PAD_MULTIPLE tokens, at most TEXT_MAX_TOKENS.
+# The DiT attends to the padding, so the padded length is part of the conditioning.
+TEXT_PAD_MULTIPLE = 80
+TEXT_MAX_TOKENS = 8192
+# Padding token position id; matches the transformers version FLUX 3 was trained with.
+PADDING_POSITION_ID = 1
 # Every padded text length is a multiple of this, so the sequence-parallel size must divide it.
 TEXT_TOKEN_MULTIPLE = math.gcd(TEXT_PAD_MULTIPLE, TEXT_MAX_TOKENS)
 # Text windows that warmup compiles and captures, for t2i and the edit at each resolution.
 WARMUP_TEXT_WINDOWS = (TEXT_PAD_MULTIPLE, 2 * TEXT_PAD_MULTIPLE)
-_PIPELINE_CLASS_NAMES = ("Flux3ModularPipeline", "Flux3DistilledModularPipeline")
 
-_TRANSFORMER_PATTERN = "transformer/*"
 _DOWNLOAD_PATTERNS = [
     "modular_model_index.json",
-    _TRANSFORMER_PATTERN,
+    "transformer/*",
+    # Pre-quantized transformers selected by pipeline_config.variant.
+    "variants/*",
     "vae/*",
     "text_encoder/*",
     "LICENSE.md",
@@ -228,6 +227,29 @@ def set_flux3_timesteps(
     return scheduler.timesteps
 
 
+def padded_text_length(
+    num_tokens: int, pad_multiple: int = TEXT_PAD_MULTIPLE, max_tokens: int = TEXT_MAX_TOKENS
+) -> int:
+    """Window of a prompt with ``num_tokens`` tokens: rounded up to ``pad_multiple``, capped."""
+    return min(math.ceil(num_tokens / pad_multiple) * pad_multiple, max_tokens)
+
+
+def trim_for_text(model: nn.Module, last_layer: int) -> None:
+    """Keep a Qwen3-VL model's first ``last_layer`` decoder layers and drop its vision tower.
+
+    A cut model's final norm becomes Identity, so hidden_states[last_layer] stays un-normed.
+    """
+    language_model = model.model.language_model
+    num_layers = len(language_model.layers)
+    if not 1 <= last_layer <= num_layers:
+        raise ValueError(f"FLUX 3 text encoder layer {last_layer} is not in 1..{num_layers}")
+    if last_layer < num_layers:
+        language_model.layers = language_model.layers[:last_layer]
+        language_model.norm = nn.Identity()
+    # FLUX 3 encodes text only; the vision tower is never called.
+    model.model.visual = None
+
+
 def _prepare_image_ids(height: int, width: int, device: torch.device, l_coord: int = 0) -> Tensor:
     """(t, h, w, l) ids [height * width, 4] of a token grid, h and w scaled for RoPE."""
     ids = torch.cartesian_prod(
@@ -274,16 +296,6 @@ def _transformer_inputs(inputs: Dict[str, Any], prepared: Dict[str, Tensor]) -> 
     return call
 
 
-def _read_manifest(checkpoint_dir: str) -> Dict[str, Any]:
-    """The checkpoint's model_index.json or modular_model_index.json, else an empty dict."""
-    for name in ("model_index.json", "modular_model_index.json"):
-        path = os.path.join(checkpoint_dir, name)
-        if os.path.isfile(path):
-            with open(path) as f:
-                return json.load(f)
-    return {}
-
-
 # =============================================================================
 # Pipelines
 # =============================================================================
@@ -310,55 +322,6 @@ class Flux3Pipeline(BasePipeline):
         super().__init__(pipeline_config)
         self.processor: Optional[Any] = None
         self._warmup_reference_keys: Set[tuple] = set()
-
-    @classmethod
-    def resolve_variant(cls, config: Any) -> Type["Flux3Pipeline"]:
-        """Keep the class of an exact registered manifest name; otherwise choose it by flow_map."""
-        pretrained = config.primary_pretrained_config
-        manifest = _read_manifest(getattr(pretrained, "_name_or_path", None) or "")
-        if manifest.get("_class_name") in _PIPELINE_CLASS_NAMES:
-            return cls
-        return Flux3DistilledPipeline if getattr(pretrained, "flow_map", False) else Flux3Pipeline
-
-    @classmethod
-    def hf_download_patterns(
-        cls, patterns: List[str], pipeline_config: Dict[str, Any]
-    ) -> List[str]:
-        """With a variant, fetch its weights in place of the BF16 transformer weights."""
-        variant = check_variant(pipeline_config.get("variant"))
-        if variant is None:
-            return patterns
-        kept = [pattern for pattern in patterns if pattern != _TRANSFORMER_PATTERN]
-        return [*kept, "transformer/config.json", f"variants/{variant}/*"]
-
-    @classmethod
-    def resolve_component_configs(
-        cls,
-        checkpoint_dir: str,
-        component_configs: Dict[str, Dict[str, Any]],
-        pipeline_config: Dict[str, Any],
-        quant_config: Any,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Give the transformer a selected variant's quantization_config."""
-        variant = check_variant(pipeline_config.get("variant"))
-        if variant is None:
-            return component_configs
-        user_algo = (
-            quant_config.get("quant_algo")
-            if isinstance(quant_config, dict)
-            else getattr(quant_config, "quant_algo", None)
-        )
-        if user_algo is not None:
-            raise ValueError(
-                f"FLUX 3 variant {variant!r} is pre-quantized; remove quant_config.quant_algo or "
-                "pipeline_config.variant."
-            )
-        name = PipelineComponent.TRANSFORMER.value
-        transformer = dict(component_configs[name])
-        transformer["quantization_config"] = resolve_variant_quantization_config(
-            checkpoint_dir, variant, transformer
-        )
-        return {**component_configs, name: transformer}
 
     @classmethod
     def _check_pipeline_config(cls, config: Any) -> None:

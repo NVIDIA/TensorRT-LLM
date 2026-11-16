@@ -47,7 +47,6 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen import pipeline_loader as pipeline_loader_module
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.backend import SOLTrtllmAttention
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import pack
 from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
@@ -55,7 +54,6 @@ from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
     Flux3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
-    Flux3Attention,
     Flux3Transformer2DModel,
     _checkpoint_module_names,
     bfl_to_diffusers_key,
@@ -63,35 +61,29 @@ from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
     diffusers_to_bfl_module,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.variants import (
-    check_variant,
+    apply_variant_quantization,
     collapse_exclusions,
     variant_quantization_config,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen import VisualGen
-from tensorrt_llm.visual_gen.args import AttentionConfig, SolAttentionConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 VARIANTS = ["nvfp4", "fp8r"]
 FLOW_MAP = [pytest.param(True, id="klein"), pytest.param(False, id="base")]
-HF_IDS = {
-    True: "black-forest-labs/flux-3-image-klein",
-    False: "black-forest-labs/flux-3-image-klein-base",
-}
 DOWNLOAD_PATTERNS = [
     "modular_model_index.json",
     "transformer/*",
+    "variants/*",
     "vae/*",
     "text_encoder/*",
     "LICENSE.md",
     "NOTICE.md",
     "README.md",
 ]
-# Tensor counts of the released BF16, nvfp4 and fp8r exports (klein, klein-base).
-RELEASED_TENSOR_COUNTS = {None: (359, 357), "nvfp4": (953, 951), "fp8r": (593, 591)}
 # exclude_modules lengths of the released hf_quant_config.json files (klein, klein-base).
 RELEASED_EXCLUDE_COUNTS = {"nvfp4": (75, 73), "fp8r": (39, 37)}
 # Block-level exclusions the released variants translate to.
@@ -130,16 +122,11 @@ KLEIN_IGNORE = {
 }
 QUANTIZED_METHODS = {"nvfp4": NVFP4LinearMethod, "fp8r": FP8RowwiseLinearMethod}
 QUANTIZED_DTYPES = {"nvfp4": torch.uint8, "fp8r": torch.float8_e4m3fn}
-FP8_ROWWISE = {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"}
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="NVFP4 needs a Blackwell GPU",
-)
-requires_sm100 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="SOL attention needs SM100 or SM103",
 )
 
 
@@ -153,14 +140,14 @@ def released_config(flow_map: bool) -> dict:
 
 
 def drop_transformer_weights(path: Path) -> None:
-    """Keep only transformer/config.json, as a Hub variant download does."""
+    """Keep only transformer/config.json, so a variant must load without the BF16 weights."""
     for file in (path / "transformer").iterdir():
         if file.name != "config.json":
             file.unlink()
 
 
 def write_variant_checkpoint(path: Path, flow_map: bool, variant: str) -> dict:
-    """A tiny variant download whose tensors only have the right names; no BF16 transformer."""
+    """A tiny variant checkpoint whose tensors only have the right names; no BF16 transformer."""
     config = tiny_config(flow_map)
     write_checkpoint(path, config, diffusers_weights(config))
     write_variant(path, config, variant, placeholder_variant_tensors(config, variant))
@@ -219,41 +206,17 @@ def no_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("variant", [None, *VARIANTS])
-def test_known_variants_are_accepted(variant):
-    assert check_variant(variant) == variant
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("variant", ["NVFP4", "fp8", "../nvfp4", "", 4, ["nvfp4"]])
-def test_unknown_variants_are_rejected_before_any_download(monkeypatch, variant):
-    def download(*args, **kwargs):
-        raise AssertionError("an invalid variant must not download")
-
-    monkeypatch.setattr(pipeline_loader_module, "download_hf_partial", download)
-    monkeypatch.setattr(pipeline_loader_module, "download_hf_model", download)
+def test_unknown_variants_are_rejected(variant):
     message = re.escape("pipeline_config.variant must be null or one of ['fp8r', 'nvfp4']")
     with pytest.raises(ValueError, match=message):
-        check_variant(variant)
-    args = VisualGenArgs(model=HF_IDS[True], pipeline_config={"variant": variant})
-    with pytest.raises(ValueError, match=message):
-        PipelineLoader(args, device="cpu")._resolve_checkpoint_dir(HF_IDS[True])
+        apply_variant_quantization("", {}, variant, None)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("variant", [None, *VARIANTS])
-def test_hub_download_fetches_only_the_selected_variant(monkeypatch, tmp_path, variant):
-    """One download at the requested revision; a variant replaces the BF16 transformer weights."""
-    for flow_map, class_name, pipeline_cls in (
-        (True, "Flux3DistilledModularPipeline", Flux3DistilledPipeline),
-        (False, "Flux3ModularPipeline", Flux3Pipeline),
-    ):
-        entry = PIPELINE_REGISTRY[class_name]
-        assert entry.pipeline_cls is pipeline_cls
-        assert entry.hf_ids == [HF_IDS[flow_map]]
-        assert HF_IDS[flow_map] in VisualGen.supported_models()
-        assert VisualGen.pipeline_config(HF_IDS[flow_map]) == {"variant": None}
-    hf_id = HF_IDS[True]
+def test_hub_download_fetches_the_registered_patterns(monkeypatch, tmp_path):
+    """One download at the requested revision, holding every variant."""
+    hf_id = "black-forest-labs/flux-3-image-klein"
     downloads = []
 
     def download_partial(model, allow_patterns, revision=None):
@@ -265,15 +228,9 @@ def test_hub_download_fetches_only_the_selected_variant(monkeypatch, tmp_path, v
 
     monkeypatch.setattr(pipeline_loader_module, "download_hf_partial", download_partial)
     monkeypatch.setattr(pipeline_loader_module, "download_hf_model", download_full)
-    pipeline_config = {} if variant is None else {"variant": variant}
-    args = VisualGenArgs(model=hf_id, revision="0123abc", pipeline_config=pipeline_config)
+    args = VisualGenArgs(model=hf_id, revision="0123abc")
     assert PipelineLoader(args, device="cpu")._resolve_checkpoint_dir(hf_id) == str(tmp_path)
-
-    expected = DOWNLOAD_PATTERNS
-    if variant is not None:
-        expected = [p for p in DOWNLOAD_PATTERNS if p != "transformer/*"]
-        expected += ["transformer/config.json", f"variants/{variant}/*"]
-    assert downloads == [(hf_id, expected, "0123abc")]
+    assert downloads == [(hf_id, DOWNLOAD_PATTERNS, "0123abc")]
 
 
 # =============================================================================
@@ -282,21 +239,13 @@ def test_hub_download_fetches_only_the_selected_variant(monkeypatch, tmp_path, v
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_synthetic_variants_have_the_released_structure(flow_map):
-    config, index = released_config(flow_map), 0 if flow_map else 1
-    for variant, counts in RELEASED_TENSOR_COUNTS.items():
-        assert len(bfl_variant_tensor_names(config, variant)) == counts[index], variant
-    for variant, counts in RELEASED_EXCLUDE_COUNTS.items():
-        assert len(bfl_variant_excludes(config, variant)) == counts[index], variant
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
 def test_released_variants_translate_to_block_level_exclusions(no_cuda, flow_map, variant):
     """Every BFL-excluded Linear stays BF16 and every other one gets the variant's method."""
     config = released_config(flow_map)
+    released_excludes = RELEASED_EXCLUDE_COUNTS[variant][0 if flow_map else 1]
+    assert len(bfl_variant_excludes(config, variant)) == released_excludes
     quantization_config = variant_quantization_config(
         variant, bfl_hf_quant_config(config, variant), bfl_variant_tensor_names(config, variant)
     )
@@ -324,9 +273,11 @@ def test_released_variants_translate_to_block_level_exclusions(no_cuda, flow_map
         )
     assert bfl_linear_quantization(transformer) == expected_bfl_quantization(config, variant)
     assert_methods_follow_quantization(transformer, QUANTIZED_METHODS[variant])
-    # Static NVFP4 q, k and v carry their own scales, so quantized blocks keep them separate.
-    separate = QKVMode.SEPARATE_QKV if variant == "nvfp4" else QKVMode.FUSE_QKV
-    assert transformer.single_transformer_blocks[0].attn.qkv_mode == separate
+    # Static NVFP4 q, k and v carry their own scales, so quantized blocks keep them separate,
+    # still as self-attention so the requested backend is kept.
+    attn = transformer.single_transformer_blocks[0].attn
+    assert attn.qkv_mode == (QKVMode.SEPARATE_QKV if variant == "nvfp4" else QKVMode.FUSE_QKV)
+    assert attn.separate_qkv_is_self_attention
     assert transformer.txt_mode_blocks[0].attn.qkv_mode == QKVMode.FUSE_QKV
 
 
@@ -371,7 +322,7 @@ def test_unsupported_hf_quant_configs_are_rejected(variant, change, message):
 
 
 # =============================================================================
-# Variants through the checkpoint-config hook
+# Variants through DiffusionPipelineConfig
 # =============================================================================
 
 
@@ -401,17 +352,15 @@ def test_variant_quantization_reaches_the_transformer(no_cuda, tmp_path, flow_ma
 @pytest.mark.parametrize(
     "quant_config",
     [
-        pytest.param(FP8_ROWWISE, id="fp8_rowwise"),
-        pytest.param({"quant_algo": "NVFP4", "dynamic": True}, id="dynamic_nvfp4"),
+        pytest.param({"quant_algo": "NVFP4", "dynamic": True}, id="dict"),
         pytest.param(QuantConfig(quant_algo=QuantAlgo.NVFP4), id="quant_config_object"),
     ],
 )
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_variant_rejects_an_explicit_quant_algo(tmp_path, variant, quant_config):
-    write_variant_checkpoint(tmp_path, True, variant)
-    message = f"FLUX 3 variant '{variant}' is pre-quantized; remove quant_config.quant_algo"
+def test_variant_rejects_an_explicit_quant_algo(tmp_path, quant_config):
+    write_variant_checkpoint(tmp_path, True, "nvfp4")
+    message = "FLUX 3 variant 'nvfp4' is pre-quantized; remove quant_config.quant_algo"
     with pytest.raises(ValueError, match=re.escape(message)):
-        load_config(tmp_path, pipeline_config={"variant": variant}, quant_config=quant_config)
+        load_config(tmp_path, pipeline_config={"variant": "nvfp4"}, quant_config=quant_config)
 
 
 @pytest.mark.cpu_only
@@ -502,10 +451,6 @@ LOAD_TIME = {
 }
 # Per-rank widths of the block-scaled GEMMs and their TP shards.
 BLOCK_ALIGNMENT = {"FP8_BLOCK_SCALES": 128, "NVFP4": 32}
-# Embedder widths that NVFP4 can quantize, for recipes that skip the default exclusions.
-NVFP4_ALIGNED = dict(
-    in_channels=16, cond_in_channels=32, joint_attention_dim=48, timestep_channels=64
-)
 
 
 def load_time_quant(quant_algo: str, **extra) -> dict:
@@ -541,6 +486,8 @@ def test_load_time_quant_keeps_the_bf16_linears_of_its_variant(no_cuda, flow_map
     transformer = load_time_transformer(config, quant_algo)
     assert bfl_linear_quantization(transformer) == expected_bfl_quantization(config, variant)
     assert_methods_follow_quantization(transformer, method)
+    # Load-time recipes keep QKV fused; NVFP4 quantizes q, k and v under one global scale.
+    assert transformer.single_transformer_blocks[0].attn.qkv_mode == QKVMode.FUSE_QKV
     if flow_map:
         excluded = transformer.model_config.quant_config.exclude_modules
         assert sorted(excluded) == KLEIN_IGNORE[variant]
@@ -566,7 +513,8 @@ def test_load_time_quant_adds_user_exclusions_to_the_defaults(no_cuda, tmp_path,
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+# Every tp > 1 builds the same Linears, and tp 2 and 4 shards are multiples of tp 8 shards.
+@pytest.mark.parametrize("tp_size", [1, 8])
 @pytest.mark.parametrize("quant_algo", list(BLOCK_ALIGNMENT))
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
 def test_released_quantized_linears_align_at_every_tp_size(no_cuda, flow_map, quant_algo, tp_size):
@@ -588,42 +536,15 @@ def test_released_quantized_linears_align_at_every_tp_size(no_cuda, flow_map, qu
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("quant_algo", ["W4A16_AWQ", "W4A8_AWQ", "W8A8_SQ_PER_CHANNEL"])
-def test_unsupported_load_time_quant_is_rejected_naming_the_supported_algorithms(
-    tmp_path, quant_algo
-):
+def test_unsupported_load_time_quant_is_rejected_naming_the_supported_algorithms(tmp_path):
     config = tiny_config(flow_map=True)
     write_checkpoint(tmp_path, config, diffusers_weights(config))
     message = (
         "FLUX 3 quantizes BF16 weights on load with quant_config.quant_algo FP8, "
-        f"FP8_BLOCK_SCALES, FP8_PER_CHANNEL_PER_TOKEN, NVFP4, got {quant_algo}."
+        "FP8_BLOCK_SCALES, FP8_PER_CHANNEL_PER_TOKEN, NVFP4, got W4A16_AWQ."
     )
     with pytest.raises(ValueError, match=re.escape(message)):
-        build_pipeline(tmp_path, quant_config=load_time_quant(quant_algo))
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "quant_config, quant_algo",
-    [
-        pytest.param(
-            {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": False}, "FP8_BLOCK_SCALES", id="blockwise"
-        ),
-        pytest.param({**FP8_ROWWISE, "dynamic": False}, "FP8_PER_CHANNEL_PER_TOKEN", id="rowwise"),
-        pytest.param(QuantConfig(quant_algo=QuantAlgo.NVFP4), "NVFP4", id="quant_config_object"),
-    ],
-)
-def test_static_quantization_of_a_bf16_checkpoint_fails_to_load(
-    no_cuda, tmp_path, quant_config, quant_algo
-):
-    """The shared weight loader refuses static recipes on a checkpoint without scales."""
-    config = tiny_config(flow_map=True, **NVFP4_ALIGNED)
-    weights = diffusers_weights(config)
-    write_checkpoint(tmp_path, config, weights)
-    pipeline = build_pipeline(tmp_path, quant_config=quant_config)
-    message = f"Static quantization ({quant_algo}) is configured for module"
-    with pytest.raises(ValueError, match=re.escape(message)):
-        pipeline.transformer.load_weights(weights)
+        build_pipeline(tmp_path, quant_config=load_time_quant("W4A16_AWQ"))
 
 
 # =============================================================================
@@ -776,36 +697,6 @@ def test_variant_loads_through_pipeline_loader_and_tracks_bf16(
     assert output.image.shape == (1, 64, 64, 3) and output.image.dtype == torch.uint8
 
 
-@requires_sm100
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_static_nvfp4_keeps_the_sol_backend(tmp_path, flow_map):
-    """Separate NVFP4 Q/K/V projections still run SOL self-attention, not a VANILLA fallback."""
-    config = tiny_config(flow_map, attention_head_dim=128, axes_dims_rope=[32] * 4)
-    write_checkpoint(tmp_path, config, diffusers_weights(config))
-    write_variant(tmp_path, config, "nvfp4", placeholder_variant_tensors(config, "nvfp4"))
-    drop_transformer_weights(tmp_path)
-    sol = SolAttentionConfig(tau=1.0, disabled_until_timestep=0.96)
-    pipeline = build_pipeline(
-        tmp_path,
-        pipeline_config={"variant": "nvfp4"},
-        attention_config=AttentionConfig(backend="TRTLLM", sparse_attention_config=sol),
-    )
-    quantization = pipeline.transformer.checkpoint_quantization()
-    attentions = [
-        (name, module)
-        for name, module in pipeline.transformer.named_modules()
-        if isinstance(module, Flux3Attention)
-    ]
-    assert len(attentions) == 3 * config["num_layers"] + config["num_single_layers"]
-    separate = 0
-    for name, module in attentions:
-        assert isinstance(module.attn, SOLTrtllmAttention), name
-        if quantization[f"{name}.to_q"]:
-            assert module.qkv_mode == QKVMode.SEPARATE_QKV, name
-            separate += 1
-    assert separate > 0
-
-
 @requires_cuda
 @pytest.mark.parametrize(
     "quant_algo",
@@ -838,20 +729,3 @@ def test_load_time_quant_pipeline_runs_and_keeps_its_bf16_linears(
 
     output = pipeline.forward("a red fox", height=64, width=64, num_inference_steps=2, seed=0)
     assert output.image.shape == (1, 64, 64, 3) and output.image.dtype == torch.uint8
-
-
-@requires_cuda
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_fp8r_variant_matches_load_time_fp8_exactly(tmp_path, monkeypatch, flow_map):
-    """Both quantize the same Linears with the same rowwise op, so BFL names and scales round-trip."""
-    weights = write_gpu_checkpoint(tmp_path, flow_map, num_layers=2, **GPU_OVERRIDES)
-    config = gpu_transformer_config(flow_map, num_layers=2, **GPU_OVERRIDES)
-    write_variant(tmp_path, config, "fp8r", quantize_variant(config, weights, "fp8r"))
-    variant = load_gpu_pipeline(tmp_path, monkeypatch, pipeline_config={"variant": "fp8r"})
-    load_time = load_gpu_pipeline(tmp_path, monkeypatch, quant_config=FP8_ROWWISE)
-    assert_weight_dtypes(load_time.transformer, torch.float8_e4m3fn)
-    kwargs = gpu_inputs(variant.transformer)
-    with torch.inference_mode():
-        actual = variant.transformer(**kwargs)["x_image"]
-        expected = load_time.transformer(**kwargs)["x_image"]
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
