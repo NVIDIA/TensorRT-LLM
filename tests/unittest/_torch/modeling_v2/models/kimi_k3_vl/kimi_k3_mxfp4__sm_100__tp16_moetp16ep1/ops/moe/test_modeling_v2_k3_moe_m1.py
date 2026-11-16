@@ -11,7 +11,7 @@ import _k3_moe_engines as engines
 import pytest
 import torch
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import validating
 
 k3_moe_m1 = importlib.import_module(

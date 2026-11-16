@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-__extra_import_path__ = ["../../../../..", "."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2", "."]
 from _m3_router import (  # noqa: E402, F401
     SF_SCALE,
     _build,

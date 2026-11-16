@@ -50,13 +50,10 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> str:
+def run(entry: str, directory: Path | None = None) -> str:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices; returns its stdout."""
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
-    if entry == "m3_mc_allreduce_norm":
-        launcher = (Path(__file__).resolve().parent / "../ops/comm" / launcher.name).resolve()
-    elif entry == "m3_moe_push":
-        launcher = (Path(__file__).resolve().parent / "../ops/moe" / launcher.name).resolve()
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
 
     # Match the package resolved by pytest: an unbuilt checkout must not

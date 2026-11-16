@@ -11,7 +11,7 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     noaux_tc_op as op,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"

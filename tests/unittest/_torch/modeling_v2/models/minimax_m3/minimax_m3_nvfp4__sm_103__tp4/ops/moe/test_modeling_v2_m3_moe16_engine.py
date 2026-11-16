@@ -20,7 +20,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103_
     m3_moe16_engine as op,
 )
 
-__extra_import_path__ = ["../../../../..", "."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2", "."]
 from _m3_moe_operands import H, check_routed_part, hidden_states, layer_for  # noqa: E402
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 

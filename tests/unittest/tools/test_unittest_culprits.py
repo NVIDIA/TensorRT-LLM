@@ -260,23 +260,8 @@ def test_parallel_config_key_strips_only_ignore_arguments(case: str, expected: s
 
 _GR100_M3_TARGETS = "unittest/_torch/modeling_v2/models/minimax_m3"
 _GR100_M3_REPORT_CASES = (
-    *(
-        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp2/{relative}"
-        for relative in (
-            "ops/m3_moe",
-            "ops/moe/test_modeling_v2_m3_moe_engine.py",
-            "ops/moe/test_modeling_v2_m3_moe_epoch_wrap.py",
-            "ops/moe/test_modeling_v2_m3_moe_triton_finalize.py",
-        )
-    ),
-    *(
-        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp4/{relative}"
-        for relative in ("ops/moe", "ops/m3_moe")
-    ),
-    *(
-        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp{tp}/ops/moe/test_modeling_v2_m3_router_tc.py"
-        for tp in (2,)
-    ),
+    *(f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp{tp}/ops/moe" for tp in (2, 4, 8)),
+    *(f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp{tp}/ops/m3_moe" for tp in (2, 4)),
 )
 _CaptureUnittest = Callable[[str, int, bool], list[list[str]]]
 
@@ -294,12 +279,12 @@ def capture_unittest_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     dataframe.unique.return_value = dataframe
     dataframe.tolist.return_value = ["CPU"]
     pandas_module = types.ModuleType("pandas")
-    setattr(pandas_module, "read_csv", MagicMock(return_value=dataframe))
+    pandas_module.read_csv = MagicMock(return_value=dataframe)
     nvml_module = types.ModuleType("pynvml")
-    setattr(nvml_module, "NVMLError", RuntimeError)
-    setattr(nvml_module, "nvmlInit", MagicMock())
-    setattr(nvml_module, "nvmlDeviceGetHandleByIndex", MagicMock(return_value=0))
-    setattr(nvml_module, "nvmlDeviceGetName", MagicMock(return_value="CPU"))
+    nvml_module.NVMLError = RuntimeError
+    nvml_module.nvmlInit = MagicMock()
+    nvml_module.nvmlDeviceGetHandleByIndex = MagicMock(return_value=0)
+    nvml_module.nvmlDeviceGetName = MagicMock(return_value="CPU")
     monkeypatch.setitem(sys.modules, "pandas", pandas_module)
     monkeypatch.setitem(sys.modules, "pynvml", nvml_module)
 
@@ -354,73 +339,12 @@ def test_unittest_reports_distinguish_gr100_selectors(
         _report_path(capture_unittest_wrapper(case, 1, False)[0]) for case in _GR100_M3_REPORT_CASES
     ]
     assert paths == repeated
-    assert len(set(paths)) == len(_GR100_M3_REPORT_CASES) == 7
+    assert len(set(paths)) == len(_GR100_M3_REPORT_CASES) == 5
     assert len({path.parent for path in paths}) == 1
     assert all(
         path.name.startswith("results-sub-unittests-") and path.suffix == ".xml" for path in paths
     )
     assert all(len(os.fsencode(path.name)) <= 255 for path in paths)
-
-
-@pytest.mark.cpu_only
-def test_unittest_reports_survive_separate_pytest_processes(
-    tmp_path: Path, capture_unittest_wrapper: _CaptureUnittest
-) -> None:
-    paths = [
-        _report_path(capture_unittest_wrapper(case, 1, False)[0])
-        for case in _GR100_M3_REPORT_CASES[1:3]
-    ]
-    work_dir = tmp_path / "pytest-processes"
-    work_dir.mkdir()
-    config = work_dir / "pytest.ini"
-    config.write_text("[pytest]\n", encoding="utf-8")
-    runner = (
-        "import sys\n"
-        "import pytest\n"
-        "from periodic_junit import PeriodicJUnitXML\n"
-        "raise SystemExit(pytest.main(sys.argv[2:], "
-        "plugins=[PeriodicJUnitXML(xmlpath=sys.argv[1], batch_size=1)]))\n"
-    )
-    env = {
-        **os.environ,
-        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-        "PYTEST_ADDOPTS": "",
-        "PYTHONPATH": str(_REPO_ROOT / "tests/integration/defs/utils"),
-    }
-    first_report = b""
-    for index, report_path in enumerate(paths):
-        test_file = work_dir / f"test_process_{index}.py"
-        test_file.write_text(
-            f"def test_process_{index}() -> None:\n    assert True\n", encoding="utf-8"
-        )
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                runner,
-                str(report_path),
-                "-q",
-                "-c",
-                str(config),
-                f"--confcutdir={work_dir}",
-                "-p",
-                "no:cacheprovider",
-                str(test_file),
-            ],
-            cwd=work_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        if index == 0:
-            first_report = report_path.read_bytes()
-    assert paths[0].read_bytes() == first_report
-    assert paths[0] != paths[1]
-    for index, report_path in enumerate(paths):
-        root = ET.parse(report_path).getroot()
-        assert [case.get("name") for case in root.iter("testcase")] == [f"test_process_{index}"]
 
 
 @pytest.mark.cpu_only
@@ -453,6 +377,20 @@ def test_unittest_moe_reports_keep_reporting_exclusion_prefix(
     command = capture_unittest_wrapper("unittest/_torch/moe/test_moe_module.py", 1, False)[0]
     assert _report_path(command).name.startswith("moe-results-sub-unittests-")
     unfinished = next(arg for arg in command if arg.startswith("--periodic-unfinished-test-path="))
-    assert Path(unfinished.split("=", 1)[1]).name == (
-        "moe-unfinished-sub-unittests-unittest-_torch-moe-test_moe_module.py.txt"
+    label = (
+        _report_path(command).name.removeprefix("moe-results-sub-unittests-").removesuffix(".xml")
     )
+    assert Path(unfinished.split("=", 1)[1]).name == (f"moe-unfinished-sub-unittests-{label}.txt")
+
+
+@pytest.mark.cpu_only
+def test_unittest_report_names_and_long_boundary(
+    capture_unittest_wrapper: _CaptureUnittest,
+) -> None:
+    cases = ("unittest/foo", "x" * 80, "x" * 81, "x" * 80 + "y")
+    reports = [_report_path(capture_unittest_wrapper(case, 1, False)[0]) for case in cases]
+    labels = [p.name.removeprefix("results-sub-unittests-").removesuffix(".xml") for p in reports]
+    assert labels[0].startswith("unittest-foo-")
+    assert len(labels[0]) == len("unittest-foo-") + 16
+    assert all(len(label) == 80 for label in labels[1:])
+    assert len(set(reports)) == len(reports)

@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__d
     fused_moe,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import ULP, validating  # noqa: E402 — needs the path declared above
 

@@ -14,7 +14,7 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_sigmoid_topk as entry,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 op = entry.cute_dsl_moe_sigmoid_topk

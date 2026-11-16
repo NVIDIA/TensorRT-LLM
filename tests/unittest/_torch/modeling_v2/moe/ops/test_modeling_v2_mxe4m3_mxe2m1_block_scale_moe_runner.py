@@ -16,7 +16,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_r
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
 
-__extra_import_path__ = ["../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402 — needs the path declared above

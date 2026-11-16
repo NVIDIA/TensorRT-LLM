@@ -22,7 +22,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     qwen4_exp_hc_up_gate_mean_fp4 as op,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_hc_up_gate_mean_fp4 requires a CUDA device"

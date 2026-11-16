@@ -344,10 +344,6 @@ _NO_CI_STAGE = {
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/comm": (
         "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
-    (
-        "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/moe/"
-        "test_modeling_v2_m3_moe_push_op_matrix.py"
-    ): ("2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),

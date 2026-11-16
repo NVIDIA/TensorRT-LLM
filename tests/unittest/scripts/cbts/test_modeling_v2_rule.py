@@ -204,7 +204,7 @@ def test_unrelated_target_keeps_fp4_helper_cpu_guard(rule: ModelingV2Rule, selec
         ("gpt_oss", _GPT_OSS_TARGET, "modeling.py", None),
     ],
 )
-def test_m3_target_keeps_its_router_configuration(
+def test_target_changes_select_target_tests_and_tree_guards(
     rule: ModelingV2Rule,
     tmp_path: Path,
     family: str,
@@ -323,7 +323,7 @@ def _test_stages(
         if (block.yaml_stem, block.block_index) in selected_blocks
         for stage in stages.values()
         if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
-    }
+    } & result.affected_stages
 
 
 @pytest.mark.parametrize(
@@ -385,7 +385,7 @@ def _m3_family_check_stages() -> dict[str, set[str]]:
         "m3_router_tc",
     ],
 )
-def test_m3_family_sources_keep_unmoved_checks(
+def test_m3_family_sources_keep_family_root_checks(
     repository_rule: tuple[ModelingV2Rule, YAMLIndex, dict[str, Stage]], name: str
 ) -> None:
     rule, index, stages = repository_rule
@@ -394,7 +394,7 @@ def test_m3_family_sources_keep_unmoved_checks(
         assert expected_stages <= _test_stages(result, index, stages, path), path
 
 
-def _m3_unmoved_allreduce_tests() -> set[str]:
+def _m3_allreduce_tests() -> set[str]:
     return {
         "unittest/_torch/modeling_v2/models/minimax_m3/"
         f"minimax_m3_nvfp4__sm_103__tp{tp}/comm/test_modeling_v2_m3_allreduce.py"
@@ -412,7 +412,7 @@ def test_m3_family_sources_keep_unmoved_allreduce(
     rule, index, stages = repository_rule
     result = _apply(rule, f"{_PY}/models/minimax_m3/ops/{relative}")
     expected_stages = {f"GB300-4_GPUs-PyTorch-Post-Merge-{split}" for split in (1, 2, 3)}
-    for path in _m3_unmoved_allreduce_tests():
+    for path in _m3_allreduce_tests():
         assert expected_stages <= _test_stages(result, index, stages, path), path
 
 
@@ -428,7 +428,7 @@ def test_other_sources_do_not_select_m3_companion_configurations(
 ) -> None:
     rule, index, stages = repository_rule
     result = _apply(rule, f"{_PY}/models/{relative}")
-    for paths in (*_m3_companion_tests(), _m3_family_check_stages(), _m3_unmoved_allreduce_tests()):
+    for paths in (*_m3_companion_tests(), _m3_family_check_stages(), _m3_allreduce_tests()):
         for path in paths:
             assert not _test_stages(result, index, stages, path), path
 
@@ -565,3 +565,14 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                     for stage in stages.values()
                 ), (block.yaml_stem, name)
     assert seen == expected
+
+
+def test_stage_coverage_requires_an_affected_stage(repository_rule) -> None:
+    rule, index, stages = repository_rule
+    source = f"{_PY}/models/minimax_m3/ops/comm/m3_allreduce.py"
+    result = _apply(rule, source)
+    paths, _, _ = _m3_companion_tests()
+    path = sorted(paths)[0]
+    assert _test_stages(result, index, stages, path)
+    result.affected_stages.clear()
+    assert not _test_stages(result, index, stages, path)

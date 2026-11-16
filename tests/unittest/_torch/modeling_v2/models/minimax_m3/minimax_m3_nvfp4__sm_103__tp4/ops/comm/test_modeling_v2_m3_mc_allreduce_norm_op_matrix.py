@@ -7,6 +7,8 @@ kernel, one exchange protocol). The matrix is ``_m3_mc_allreduce_norm_op_matrix.
 beside this file, its own 4-rank launcher; see ``_rank_job`` for why.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -19,4 +21,4 @@ assert torch.cuda.is_available(), "m3_mc_allreduce_norm requires CUDA devices"
 # Spawns 4 rank processes over the visible devices; under xdist workers would fight for them.
 @pytest.mark.no_xdist
 def test_m3_mc_allreduce_norm_op_matrix() -> None:
-    _rank_job.run("m3_mc_allreduce_norm")
+    _rank_job.run("m3_mc_allreduce_norm", directory=Path(__file__).resolve().parent)

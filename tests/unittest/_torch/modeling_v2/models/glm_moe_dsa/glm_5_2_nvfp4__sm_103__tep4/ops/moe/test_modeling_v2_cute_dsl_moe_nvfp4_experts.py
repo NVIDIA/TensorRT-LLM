@@ -38,7 +38,7 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     reference_slot_maps,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 HIDDEN, INTER, EXPERTS, GLOBAL_EXPERTS = 6144, 2048, 64, 256

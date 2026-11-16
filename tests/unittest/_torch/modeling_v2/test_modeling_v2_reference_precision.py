@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-__extra_import_path__ = ["."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 import _precision as precision  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only

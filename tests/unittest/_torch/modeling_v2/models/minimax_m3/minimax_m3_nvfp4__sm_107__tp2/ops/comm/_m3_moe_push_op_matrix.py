@@ -317,8 +317,8 @@ def _run_one_rank() -> int:
 
     ar, prequant, moe_state, ar_push_desc, engine_op = _ar, _pq, M3MoeState, _desc_fn, _op
     sf_written = _sf_written
-    # Spawned by file path, not collected by pytest: load the colocated operands.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    # Spawned by file path, not collected by pytest: load the MoE operands.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "moe"))
     if TYPE_CHECKING:
         from _torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe import (
             _m3_moe_operands as _operands,

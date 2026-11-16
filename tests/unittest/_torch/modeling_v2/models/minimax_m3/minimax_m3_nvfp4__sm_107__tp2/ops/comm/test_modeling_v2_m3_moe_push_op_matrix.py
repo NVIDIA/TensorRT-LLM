@@ -3,6 +3,8 @@
 """Collected entry point for the MoE engine's all-reduce push certification (``_m3_moe_push_op_matrix.py`` beside
 this file, its own 2-rank launcher; see ``_rank_job``)."""
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -24,4 +26,4 @@ pytestmark = [
 # Spawns 2 rank processes over the visible devices; under xdist workers would fight for them.
 @pytest.mark.no_xdist
 def test_m3_moe_push_op_matrix() -> None:
-    _rank_job.run("m3_moe_push")
+    _rank_job.run("m3_moe_push", directory=Path(__file__).resolve().parent)

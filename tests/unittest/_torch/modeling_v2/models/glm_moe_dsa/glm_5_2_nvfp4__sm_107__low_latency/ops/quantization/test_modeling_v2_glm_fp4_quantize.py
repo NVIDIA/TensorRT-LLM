@@ -22,7 +22,7 @@ except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import certifying  # noqa: E402,F401 — fixture by name
 
 pytestmark = pytest.mark.skipif(

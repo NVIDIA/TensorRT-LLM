@@ -36,14 +36,12 @@ or has a return whose directory it does not name, every path of the family is
 family code, and the whole family's tests stand in for those of its targets.
 A target's tests include its unit tests
 (`unittest/_torch/modeling_v2/models/<family>/<target>`) and its accuracy
-tests (`accuracy/modeling_v2/<family>/<target>`), plus any explicitly listed
-configuration tests of family-shared ops. A family's tests are the
+tests (`accuracy/modeling_v2/<family>/<target>`). A family's tests are the
 same two paths one level up. The CPU check
 `unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` requires every
 target to have accuracy tests, and every accuracy directory to name a target.
 
-- Any file in a target, native code included, selects that target's tests
-  and its explicitly listed family-op configurations.
+- Any file in a target, native code included, selects that target's tests.
 - A Python file of family code in a subdirectory selects its mirror unit
   directory (`unittest/_torch/modeling_v2/models/<family>/<its directory>`).
   When there is none, or the file sits directly in the family directory, it
@@ -134,6 +132,7 @@ from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 from .modeling_v2_source import PACKAGE, imported_names, package_names, routed_targets
+from .modeling_v2_test_groups import M3_UNIT_DIR
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -147,22 +146,22 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 _PKG_MODULE = PACKAGE
-_M3_UNIT_ROOT = f"{_UNIT_ROOT}/models/minimax_m3"
-_M3_SOURCE_ROOT = f"{_MV2_SRC_PREFIXES[0]}models/minimax_m3/ops"
+_M3_UNIT_ROOT = M3_UNIT_DIR
+_M3_OPS_SOURCE_ROOT = f"{_MV2_SRC_PREFIXES[0]}models/minimax_m3/ops"
 _M3_SM103_MOE_TESTS = {
     f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/ops/moe/test_modeling_v2_m3_{name}.py"
     for tp in (4, 8)
     for name in ("moe_engine", "router_gemv", "router_gemv_fp4", "router_tc")
 } | {f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp4/ops/moe/test_modeling_v2_m3_moe16_engine.py"}
 _EXTRA_SOURCE_UNIT_TESTS = {
-    f"{_M3_SOURCE_ROOT}/comm/m3_allreduce.py": {
+    # Target multicast tests share the family allreduce contract.
+    f"{_M3_OPS_SOURCE_ROOT}/comm/m3_allreduce.py": {
         f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/ops/comm/test_modeling_v2_m3_{name}.py"
         for tp in (4, 8)
         for name in ("mc_allreduce_norm_op_matrix", "mc_finalize_allreduce_norm")
     },
-    f"{_M3_SOURCE_ROOT}/moe/m3_router_gemv.py": _M3_SM103_MOE_TESTS,
-    f"{_M3_SOURCE_ROOT}/moe/m3_router_tc.py": _M3_SM103_MOE_TESTS,
-    f"{_M3_SOURCE_ROOT}/moe/m3_router_gemv_fp4.py": _M3_SM103_MOE_TESTS
+    # FP4 routing also protects the target engine checks that consume its operands.
+    f"{_M3_OPS_SOURCE_ROOT}/moe/m3_router_gemv_fp4.py": _M3_SM103_MOE_TESTS
     | {
         f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_107__tp4/{directory}/test_modeling_v2_m3_{name}.py"
         for directory, name in (
@@ -172,36 +171,10 @@ _EXTRA_SOURCE_UNIT_TESTS = {
         )
     },
 }
-_M3_FAMILY_CHECKS = {
-    f"{_M3_UNIT_ROOT}/{relative}"
-    for relative in (
-        "test_collective_launcher_cleanup.py",
-        "test_modeling_v2_eagle3_worker_api.py",
-        "test_shared_kernel_contracts.py",
-        "ops/spec/test_modeling_v2_spec_tail_contracts.py",
-    )
-}
+# Include SM103 allreduce checks outside the mirrored ops/comm prefix.
 _EXTRA_SOURCE_UNIT_TESTS.update(
     {
-        f"{_M3_SOURCE_ROOT}/moe/{name}.py": _EXTRA_SOURCE_UNIT_TESTS.get(
-            f"{_M3_SOURCE_ROOT}/moe/{name}.py", set()
-        )
-        | _M3_FAMILY_CHECKS
-        for name in (
-            "__init__",
-            "state",
-            "runtime",
-            "reference",
-            "phase_plan",
-            "m3_router_gemv",
-            "m3_router_gemv_fp4",
-            "m3_router_tc",
-        )
-    }
-)
-_EXTRA_SOURCE_UNIT_TESTS.update(
-    {
-        f"{_M3_SOURCE_ROOT}/{relative}": {
+        f"{_M3_OPS_SOURCE_ROOT}/{relative}": {
             f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/comm/test_modeling_v2_m3_allreduce.py"
             for tp in (4, 8)
         }
@@ -466,8 +439,7 @@ class ModelingV2Rule(Rule):
 
     @staticmethod
     def _target_tests(family: str, target: str) -> set[str]:
-        tests = {f"{_UNIT_ROOT}/models/{family}/{target}", f"{_ACCURACY_ROOT}/{family}/{target}"}
-        return tests
+        return {f"{_UNIT_ROOT}/models/{family}/{target}", f"{_ACCURACY_ROOT}/{family}/{target}"}
 
     @staticmethod
     def _family_tests(family: str) -> set[str]:

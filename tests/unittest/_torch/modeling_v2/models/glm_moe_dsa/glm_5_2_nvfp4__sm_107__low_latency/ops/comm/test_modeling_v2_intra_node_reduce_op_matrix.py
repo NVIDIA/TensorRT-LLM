@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real four-rank IPC comparison with shared kernels, dirty ranges and graph replay."""
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -22,4 +24,4 @@ pytestmark = pytest.mark.skipif(
 def test_intra_node_reduce_op_matrix(monkeypatch, cta1, fp32):
     monkeypatch.setenv("TRTLLM_MOE_FINALIZE_CTA1", cta1)
     monkeypatch.setenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32", fp32)
-    _rank_job.run("intra_node_reduce")
+    _rank_job.run("intra_node_reduce", directory=Path(__file__).resolve().parent)

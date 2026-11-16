@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterator, Mapping
 import pytest
 import torch
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402
 

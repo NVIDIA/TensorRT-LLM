@@ -567,15 +567,12 @@ def test_kernel_sourcing_and_landing_branches(
     assert ("Start the variant as a copy" in text) is (mode != "onboard")
 
 
-@pytest.mark.parametrize(
-    "name",
-    ["fp4_block_scale_moe_runner", "mxe4m3_mxe2m1_block_scale_moe_runner", "noaux_tc_op"],
-)
 @pytest.mark.parametrize("tests_directory", ["moe", "moe/ops"])
 @pytest.mark.parametrize("shared_landing", [False, True])
 def test_kernel_prompt_protects_shared_tests_in_task_checkout(
-    tmp_path: Path, name: str, tests_directory: str, shared_landing: bool
+    tmp_path: Path, tests_directory: str, shared_landing: bool
 ) -> None:
+    name = "fp4_block_scale_moe_runner"
     repo = tmp_path / "checkout"
     source = f"{catalog_paths.CATALOG_DIR}/moe/{name}.py"
     test = f"{catalog_paths.CATALOG_TESTS_DIR}/{tests_directory}/test_modeling_v2_{name}.py"

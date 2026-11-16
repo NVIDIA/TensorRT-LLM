@@ -7,7 +7,7 @@ import zlib
 
 import torch
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import assert_within_ulp  # noqa: E402 — needs the path declared above
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_router_gemv import (  # noqa: E501

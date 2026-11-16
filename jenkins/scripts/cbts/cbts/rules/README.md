@@ -626,3 +626,12 @@ and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 | `lookup_paths_into_block_filters` | testdef | Runs `find_match_for_path` over a set of anchors; returns block_filters and miss set. |
 | `resolve_affected_stages` | all narrowing rules | Maps `block_filters` keys to stage names via `stages_by_yaml_stem`. |
 | `stages_by_yaml_stem` | all rules | Builds `{yaml_stem: [Stage, ...]}` index from the parsed Groovy stages. |
+
+
+ModelingV2 test-side cross-directory associations are declared in
+`modeling_v2_test_groups.py`. They preserve the existing component selection
+scope while related tests occupy both category and ops/category directories.
+Whole-file associations add to the ordinary walk-up anchors; function/class
+changes retain precise selection. The shared FP4 MoE helper explicitly selects
+the ModelingV2 unit root, including its model-family consumers and CPU guard.
+The tables are checked against real repository paths and test-db registration.

@@ -32,6 +32,8 @@ from ..operators.coverage import (
     CATALOG_TESTS_DIR,
     MODEL_OPS_DIRNAME,
     MODELING_V2_PACKAGE,
+    OP_MATRIX_SUFFIX,
+    collected_test_names,
     entry_tests_dir,
 )
 
@@ -270,16 +272,14 @@ def check_model_ops(
 
 
 def _test_check(repo_root: Path, tests_dir: str, label: str, name: str) -> Check:
-    candidates = [
-        f"{tests_dir}/test_modeling_v2_{name}{suffix}.py" for suffix in ("", "_op_matrix")
-    ]
+    candidates = [f"{tests_dir}/{filename}" for filename in collected_test_names(name)]
     found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
     if found is None:
         return Check(name=label, passed=False, detail=f"missing: {candidates[0]}")
     test = repo_root / found
     # A multi-rank entry's collected file only launches its rank body, which
     # sits beside it as `_<name>_op_matrix.py`; the cells are driven there.
-    sources = [test, test.parent / f"_{name}_op_matrix.py"]
+    sources = [test, test.parent / f"_{name}{OP_MATRIX_SUFFIX}.py"]
 
     def drives_cells(path: Path) -> bool:
         if not path.is_file():

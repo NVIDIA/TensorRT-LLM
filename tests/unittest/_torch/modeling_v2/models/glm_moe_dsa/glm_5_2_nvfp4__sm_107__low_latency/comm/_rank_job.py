@@ -49,13 +49,10 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> None:
+def run(entry: str, directory: Path | None = None) -> None:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
-    if entry == "intra_node_reduce":
-        launcher = (Path(__file__).resolve().parent / "../ops/comm" / launcher.name).resolve()
-    elif entry == "mnnvl_moe_finalize_hop":
-        launcher = (Path(__file__).resolve().parent / "../ops/comm" / launcher.name).resolve()
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
     package = importlib.util.find_spec("tensorrt_llm")
     assert package is not None and package.origin is not None, "tensorrt_llm is not importable"

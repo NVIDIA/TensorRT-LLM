@@ -8,6 +8,8 @@ kernel, one exchange protocol; the finalize entry's reference has its own test i
 beside this file, its own 2-rank launcher; see ``_rank_job`` for why.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -21,4 +23,4 @@ if not torch.cuda.is_available():
 # Spawns 2 rank processes over the visible devices; under xdist workers would fight for them.
 @pytest.mark.no_xdist
 def test_m3_mc_allreduce_norm_op_matrix() -> None:
-    _rank_job.run("m3_mc_allreduce_norm")
+    _rank_job.run("m3_mc_allreduce_norm", directory=Path(__file__).resolve().parent)

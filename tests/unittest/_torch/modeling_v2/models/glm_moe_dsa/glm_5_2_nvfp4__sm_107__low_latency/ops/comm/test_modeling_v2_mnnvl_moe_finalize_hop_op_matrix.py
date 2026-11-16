@@ -7,6 +7,8 @@ on one node; see ``_rank_job`` for why it runs as a separate job. The 16-rank c1
 hand (``_mnnvl_ranks``).
 """
 
+from pathlib import Path
+
 import pytest
 
 from tensorrt_llm._utils import get_sm_version
@@ -23,4 +25,4 @@ pytestmark = pytest.mark.skipif(
 # the same GPUs.
 @pytest.mark.no_xdist
 def test_mnnvl_moe_finalize_hop_op_matrix() -> None:
-    _rank_job.run("mnnvl_moe_finalize_hop")
+    _rank_job.run("mnnvl_moe_finalize_hop", directory=Path(__file__).resolve().parent)

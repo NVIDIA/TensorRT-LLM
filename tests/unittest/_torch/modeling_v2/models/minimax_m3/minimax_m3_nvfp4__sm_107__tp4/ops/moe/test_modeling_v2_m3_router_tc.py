@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
 
-__extra_import_path__ = ["../../../../..", "."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2", "."]
 from _m3_router import _build, _compare_logits, _seed, tc  # noqa: E402
 from _validating import validating  # noqa: E402 — needs the path declared above
 

@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op as op  # noqa: E501
 
-__extra_import_path__ = ["../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 

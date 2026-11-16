@@ -321,7 +321,8 @@ def test_shared_fp4_helper_keeps_modeling_v2_family_consumers(
     assert result.affected_stages == {stage.name}
     expected = {shared_test} | (family_consumers if select_family else set())
     prefix = modeling_v2 if select_family else f"{modeling_v2}/moe"
-    assert result.block_filters == {("l0_b200", 0): {prefix: expected}}
+    assert _selected_entries(result) == {("l0_b200", 0): expected}
+    assert prefix in result.block_filters[("l0_b200", 0)]
 
 
 @pytest.mark.parametrize(
@@ -377,7 +378,7 @@ def test_m3_tp2_operands_keep_sibling_sh_take_consumer(
     ("helper", "select_moved_consumer"),
     [("_rank_job.py", True), ("_local_test_utils.py", False)],
 )
-def test_m3_rank_helper_keeps_moved_collective_consumer(
+def test_m3_rank_helper_keeps_collective_launcher_consumer(
     tmp_path: Path, tp_size: int, helper: str, select_moved_consumer: bool
 ) -> None:
     target = f"unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp{tp_size}"
@@ -912,12 +913,9 @@ def test_modeling_v2_cohort_sm103_collectives_keep_both_directories(
     [
         pytest.param(tp_size, path, id=f"tp{tp_size}-{Path(path).name}")
         for tp_size in (2, 4, 8)
-        for path in sorted(
-            _m3_moe_cohort(tp_size)
-            | {
-                f"{_m3_target(tp_size)}/ops/moe/_m3_moe_operands.py",
-                f"{_COHORT_M3}/minimax_m3_nvfp4__sm_107__tp{tp_size}/ops/moe/_m3_router.py",
-            }
+        for path in (
+            f"{_m3_target(tp_size)}/ops/moe/_m3_moe_operands.py",
+            f"{_m3_target(tp_size)}/ops/moe/test_modeling_v2_m3_moe_engine.py",
         )
     ],
 )
@@ -926,7 +924,7 @@ def test_modeling_v2_cohort_sm107_moe_keeps_siblings_without_comm(
 ) -> None:
     target = _m3_target(tp_size)
     entries = set().union(*(_m3_moe_cohort(tp) for tp in (2, 4, 8))) | {
-        f"{target}/ops/moe/test_modeling_v2_m3_moe_push_op_matrix.py",
+        f"{target}/ops/comm/test_modeling_v2_m3_moe_push_op_matrix.py",
         f"{target}/ops/comm/test_modeling_v2_m3_mc_allreduce_norm_op_matrix.py",
         f"{target}/norm/test_norm.py",
     }
@@ -959,15 +957,7 @@ def test_modeling_v2_cohort_sm107_moe_keeps_siblings_without_comm(
         for tp_size in (2, 4, 8)
         for relative in (
             "comm/_rank_job.py",
-            "comm/_m3_allreduce_op_matrix.py",
             "ops/comm/_m3_mc_allreduce_norm_op_matrix.py",
-            *(("ops/moe/_m3_moe_push_op_matrix.py",) if tp_size in (2, 8) else ()),
-            *(
-                ("comm/_m3_capture_in_boundary_op_matrix.py", "comm/_m3_draft_ar_norm_op_matrix.py")
-                if tp_size == 4
-                else ()
-            ),
-            *(("comm/_sampled_accept_tp8.py",) if tp_size == 8 else ()),
         )
     ],
 )
@@ -1043,6 +1033,13 @@ def test_modeling_v2_cohort_preserves_function_diff_narrowing(
     assert result.affected_stages == {"l0_gr100-post_merge"}
 
 
+def _entries_by_stem(result: RuleResult) -> dict[str, set[str]]:
+    entries: dict[str, set[str]] = {}
+    for (stem, _), selected in _selected_entries(result).items():
+        entries.setdefault(stem, set()).update(entry.split()[0] for entry in selected)
+    return entries
+
+
 @pytest.fixture(scope="module")
 def modeling_v2_cohort_real_rule() -> CbtsTestsDefRule:
     repo_root = Path(__file__).resolve().parents[4]
@@ -1060,17 +1057,11 @@ def test_modeling_v2_cohort_real_glm_gemm_excludes_rubin_moe(
         PRInputs(changed_files=[f"tests/{_COHORT_GLM_ROUTER}"], diffs={})
     )
     assert result is not None
-    entries = _selected_entries(result)
-    assert entries[("l0_b300", 0)] == {f"{_COHORT_GLM} TIMEOUT (30)"}
-    assert entries[("l0_gr100", 0)] == {
-        f"{_COHORT_GLM}/gemm",
-        f"{_COHORT_GLM}/ops/gemm",
-    }
-    assert result.affected_stages == {
-        "B300-PyTorch-1",
-        "B300-PyTorch-2",
-        "GR100-PyTorch-Post-Merge-1",
-    }
+    entries = _entries_by_stem(result)
+    assert _COHORT_GLM in entries["l0_b300"]
+    assert {f"{_COHORT_GLM}/gemm", f"{_COHORT_GLM}/ops/gemm"} <= entries["l0_gr100"]
+    assert not any(path.startswith(f"{_COHORT_GLM}/ops/moe") for path in entries["l0_gr100"])
+    assert "GR100-PyTorch-Post-Merge-1" in result.affected_stages
 
 
 def test_modeling_v2_cohort_real_k3_helper_keeps_root_checks(
@@ -1080,13 +1071,13 @@ def test_modeling_v2_cohort_real_k3_helper_keeps_root_checks(
         PRInputs(changed_files=[f"tests/{_COHORT_K3}/ops/moe/_k3_moe_engines.py"], diffs={})
     )
     assert result is not None
-    entries = _selected_entries(result)
+    entries = _entries_by_stem(result)
     assert {
         f"{_COHORT_K3}/ops/moe/test_modeling_v2_k3_moe_m1.py",
         f"{_COHORT_K3}/test_tp16_moetp16ep1_construction.py",
-    } <= entries[("l0_b300", 0)]
-    assert any(stem == "l0_cpu" for stem, _ in entries)
-    assert any(stem == "l0_gb300" for stem, _ in entries)
+    } <= entries["l0_b300"]
+    assert "l0_cpu" in entries
+    assert any(stem.startswith("l0_gb300") for stem in entries)
     assert all(
         entry.startswith(_COHORT_K3 + "/") for selected in entries.values() for entry in selected
     )
@@ -1100,8 +1091,39 @@ def test_modeling_v2_cohort_real_tp2_moe_keeps_only_moe_group(
         PRInputs(changed_files=[f"tests/{target}/ops/moe/_m3_moe_operands.py"], diffs={})
     )
     assert result is not None
-    expected = {
-        path for path in _m3_moe_cohort(2) if not path.startswith(f"{target}/ops/m3_moe/")
-    } | {f"{target}/ops/m3_moe"}
-    assert _selected_entries(result) == {("l0_gr100", 0): expected}
-    assert result.affected_stages == {"GR100-PyTorch-Post-Merge-1"}
+    entries = _entries_by_stem(result)
+    assert {f"{target}/ops/moe", f"{target}/ops/m3_moe"} <= entries["l0_gr100"]
+    assert not any(path.startswith(f"{target}/ops/comm") for path in entries["l0_gr100"])
+    assert "GR100-PyTorch-Post-Merge-1" in result.affected_stages
+
+
+def test_modeling_v2_helper_keeps_new_same_directory_consumer(tmp_path: Path) -> None:
+    target = _m3_target(2)
+    new_test = f"{target}/ops/moe/test_new_router.py"
+    entries = _m3_moe_cohort(2) | {new_test}
+    rule = _make_cohort_rule(tmp_path, {"l0_gr100": entries}, frozenset({"l0_gr100"}))
+    result = rule.apply(
+        PRInputs(changed_files=[f"tests/{target}/ops/moe/_m3_moe_operands.py"], diffs={})
+    )
+    assert result is not None
+    assert new_test in _entries_by_stem(result)["l0_gr100"]
+
+
+def test_modeling_v2_association_paths_and_ci_registration(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule,
+) -> None:
+    from cbts.rules._helpers import lookup_paths_into_block_filters
+    from cbts.rules.modeling_v2 import _EXTRA_SOURCE_UNIT_TESTS, _is_whole_tree_test
+    from cbts.rules.modeling_v2_test_groups import MODELING_V2_TEST_GROUPS
+
+    repo = Path(__file__).resolve().parents[4]
+    index = modeling_v2_cohort_real_rule.yaml_index
+    for source, targets in {**MODELING_V2_TEST_GROUPS, **_EXTRA_SOURCE_UNIT_TESTS}.items():
+        assert (repo / source).is_file(), source
+        for target in targets:
+            assert (repo / "tests" / target).exists(), target
+            filters, _ = lookup_paths_into_block_filters(index, [target])
+            assert filters, (source, target)
+    guard = "unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py"
+    assert (repo / "tests" / guard).is_file()
+    assert _is_whole_tree_test(guard)

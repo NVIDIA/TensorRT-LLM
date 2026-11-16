@@ -22,7 +22,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107_
     m3_moe_engine as run,
 )
 
-__extra_import_path__ = ["../../../../..", "../moe"]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2", "../moe"]
 from _m3_moe_operands import hidden_states, layer_for  # noqa: E402
 
 if not torch.cuda.is_available():

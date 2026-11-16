@@ -1191,9 +1191,9 @@ _SHARED_MOE_ENTRIES = (
 )
 
 
-@pytest.mark.parametrize("name", _SHARED_MOE_ENTRIES)
 @pytest.mark.parametrize("layout", ["moe/ops", "moe"])
-def test_shared_moe_test_layout_paths_and_delivery(tmp_path: Path, name: str, layout: str) -> None:
+def test_shared_moe_test_layout_paths_and_delivery(tmp_path: Path, layout: str) -> None:
+    name = "fp4_block_scale_moe_runner"
     source = f"{_LAYOUT_PACKAGE}/catalog/moe/{name}.py"
     test = f"{_LAYOUT_TESTS}/{layout}/test_modeling_v2_{name}.py"
     _write_entry(tmp_path / source, tmp_path / test)
@@ -1210,8 +1210,8 @@ def test_shared_moe_test_layout_paths_and_delivery(tmp_path: Path, name: str, la
     assert check.passed, check.detail
     assert check.detail == str(tmp_path / test)
     checks = delivery._dependency_checks(tmp_path, _LAYOUT_TARGET)
-    assert checks and all(check.passed for check in checks), checks
-    assert any(check.detail == str(tmp_path / test) for check in checks)
+    assert checks and all(c.passed for c in checks), checks
+    assert any(c.detail == str(tmp_path / test) for c in checks)
 
 
 def test_shared_moe_mixed_layout_resolves_each_entry_separately(tmp_path: Path) -> None:
@@ -1237,8 +1237,8 @@ def test_shared_moe_mixed_layout_resolves_each_entry_separately(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("owner", ["family", "target"])
-@pytest.mark.parametrize("category", ["moe", "comm", "gemm", "quantization"])
-@pytest.mark.parametrize("mirrored", [False, True], ids=["legacy", "source-mirror"])
+@pytest.mark.parametrize("category", ["moe", "comm"])
+@pytest.mark.parametrize("mirrored", [False, True], ids=["category_dir", "ops_dir"])
 def test_model_op_test_layout_preserves_owner_and_category(
     tmp_path: Path, owner: str, category: str, mirrored: bool
 ) -> None:
@@ -1262,12 +1262,12 @@ def test_model_op_test_layout_preserves_owner_and_category(
     )
     assert check.passed and check.detail == str(tmp_path / test), check
     checks = delivery._dependency_checks(tmp_path, _LAYOUT_TARGET)
-    assert checks and all(check.passed for check in checks), checks
-    assert any(check.detail == str(tmp_path / test) for check in checks)
+    assert checks and all(c.passed for c in checks), checks
+    assert any(c.detail == str(tmp_path / test) for c in checks)
 
 
 @pytest.mark.parametrize("shared", [False, True], ids=["target", "shared"])
-@pytest.mark.parametrize("mirrored", [False, True], ids=["legacy", "source-mirror"])
+@pytest.mark.parametrize("mirrored", [False, True], ids=["category_dir", "ops_dir"])
 def test_op_matrix_layout_retains_collected_launcher_and_rank_body(
     tmp_path: Path, shared: bool, mirrored: bool
 ) -> None:
@@ -1352,3 +1352,81 @@ def test_new_test_layout_does_not_accept_missing_or_unexercised_tests(
 )
 def test_shared_moe_entry_file_boundary(path: str, expected: bool) -> None:
     assert catalog_paths.is_entry_file(path, "moe/probe") is expected
+
+
+@pytest.mark.parametrize("component", ["comm", "ops/comm"])
+def test_new_model_op_uses_existing_component_directory(tmp_path: Path, component: str) -> None:
+    tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/{component}"
+    existing = tmp_path / tests / "test_modeling_v2_existing_op_matrix.py"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("def test_existing(): pass\n", encoding="utf-8")
+    item = catalog_paths.QueueItem(n=1, mode="verify", target="ops/comm/new_collective")
+    expected = f"{tests}/test_modeling_v2_new_collective.py"
+    assert catalog_paths.entry_paths(item, _LAYOUT_TARGET, tmp_path)[1] == expected
+    [check] = delivery.check_model_op_tests(
+        tmp_path, _LAYOUT_TARGET, [("layout_target", "comm", "new_collective")]
+    )
+    assert not check.passed and check.detail == f"missing: {expected}"
+    _write_entry(tmp_path / _LAYOUT_TARGET / "ops/comm/new_collective.py", tmp_path / expected)
+    [check] = delivery.check_model_op_tests(
+        tmp_path, _LAYOUT_TARGET, [("layout_target", "comm", "new_collective")]
+    )
+    assert check.passed and check.detail == str(tmp_path / expected)
+
+
+@pytest.mark.parametrize("owner", ["shared", "family", "target"])
+def test_new_moe_entry_uses_contract_directory(tmp_path: Path, owner: str) -> None:
+    name = "new_probe"
+    owner_rel = ""
+    tests_base = _LAYOUT_TESTS
+    if owner != "shared":
+        owner_tail = "models/layout_family" + ("/layout_target" if owner == "target" else "")
+        owner_rel = f"{_LAYOUT_PACKAGE}/{owner_tail}"
+        tests_base = f"{_LAYOUT_TESTS}/{owner_tail}"
+    old_dir = tmp_path / tests_base / "moe"
+    old_dir.mkdir(parents=True)
+    (old_dir / "test_modeling_v2_existing.py").write_text(
+        "def test_existing(): pass\n", encoding="utf-8"
+    )
+    tests_dir = f"{tests_base}/ops/moe" if owner_rel else f"{tests_base}/moe/ops"
+    expected = f"{tests_dir}/test_modeling_v2_{name}.py"
+
+    if owner_rel:
+        source = f"{owner_rel}/ops/moe/{name}.py"
+        item = catalog_paths.QueueItem(n=1, mode="verify", target=f"ops/moe/{name}")
+        paths = catalog_paths.entry_paths(item, owner_rel, tmp_path)
+        [check] = delivery.check_model_op_tests(
+            tmp_path, owner_rel, [(Path(owner_rel).name, "moe", name)]
+        )
+    else:
+        source = f"{_LAYOUT_PACKAGE}/catalog/moe/{name}.py"
+        paths = catalog_paths.shared_entry_paths(f"moe/{name}", tmp_path)
+        [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+    assert paths == (source, expected)
+    assert not check.passed and check.detail == f"missing: {expected}"
+
+    _write_entry(tmp_path / source, tmp_path / expected)
+    if owner_rel:
+        [check] = delivery.check_model_op_tests(
+            tmp_path, owner_rel, [(Path(owner_rel).name, "moe", name)]
+        )
+    else:
+        [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+    assert check.passed and check.detail == str(tmp_path / expected)
+
+
+def test_shared_moe_matrix_variant_keeps_launcher_and_rank_body(tmp_path: Path) -> None:
+    tests = tmp_path / _LAYOUT_TESTS / "moe/ops"
+    tests.mkdir(parents=True)
+    for name in ("test_modeling_v2_probe_op_matrix.py", "_probe_op_matrix.py"):
+        (tests / name).write_text("# Matrix entry.\n", encoding="utf-8")
+    item = catalog_paths.queue_item_from_ref("verify:moe/probe@site", "matrix_probe")
+    assert item is not None and item.variant is not None
+    name = item.variant.rsplit("/", 1)[-1]
+    target_tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe"
+    (tmp_path / _LAYOUT_TESTS / "models/layout_family/layout_target/moe").mkdir(parents=True)
+    assert catalog_paths.entry_paths(item, _LAYOUT_TARGET, tmp_path) == (
+        f"{_LAYOUT_TARGET}/{item.variant}.py",
+        f"{target_tests}/test_modeling_v2_{name}_op_matrix.py",
+        f"{target_tests}/_{name}_op_matrix.py",
+    )

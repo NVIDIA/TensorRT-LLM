@@ -34,7 +34,7 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_topk_routing_rep as op,
 )
 
-__extra_import_path__ = ["../../../../.."]
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 EXPERTS = 256
