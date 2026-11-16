@@ -41,7 +41,11 @@ trap is reported as such, not left waiting in the collective teardown. These
 cases fault every GPU of the node on purpose, so they run only when their own
 node id selects them (the post-merge ISOLATION entry in
 l0_gb200_multi_gpus.yml) or HALO_R_TEST_TRAPS=1; a directory-level test list
-entry skips them.
+entry skips them. Each case gets new ranks from the MPIPoolExecutor, but the
+ranks of ``trtllm-llmapi-launch`` serve every case of the pytest process, and a
+trap leaves them with a sticky CUDA error. Under the launcher only the first
+trap case runs and the others skip: run one trap kind per
+``trtllm-llmapi-launch`` step, or run without the launcher.
 
 The ranks run on one node through an MPIPoolExecutor, or on any number of
 nodes under ``trtllm-llmapi-launch`` through the MPI session it serves.
@@ -1884,6 +1888,15 @@ def _traps_selected(config: pytest.Config) -> bool:
     )
 
 
+# The trap kinds this pytest process has run on the trtllm-llmapi-launch ranks. Those ranks
+# outlive a case, and a trap leaves each of them with a sticky CUDA error.
+_LAUNCHER_TRAPS_RUN: list[str] = []
+_LAUNCHER_TRAP_SKIP = (
+    "a trap leaves the trtllm-llmapi-launch ranks with a sticky CUDA error; run one trap kind "
+    "per trtllm-llmapi-launch step, or run without the launcher"
+)
+
+
 @pytest.mark.parametrize("kind", _TRAPS)
 def test_halo_r_traps(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, kind: str
@@ -1894,6 +1907,12 @@ def test_halo_r_traps(
             "faults every GPU of the node; select test_halo_r_traps by node id "
             "or set HALO_R_TEST_TRAPS=1 to run"
         )
+    if os.environ.get("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"):
+        if _LAUNCHER_TRAPS_RUN:
+            _skip(
+                f"{_LAUNCHER_TRAP_SKIP} (trap {_LAUNCHER_TRAPS_RUN[0]} ran first in this process)"
+            )
+        _LAUNCHER_TRAPS_RUN.append(kind)
     results = _run_on_every_rank(monkeypatch, f"trap_{kind}")
     _skip_if_any(results)
     outcomes = {result["rank"]: result for _, result in results}
