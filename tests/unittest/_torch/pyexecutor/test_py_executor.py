@@ -2112,11 +2112,17 @@ def test_adp_running_counts_update_without_a_new_block_sample():
         ]
 
 
-def test_adp_ranks_stop_on_same_iteration():
+@pytest.mark.parametrize("account_for_in_transfer", [False, True])
+def test_adp_ranks_stop_on_same_iteration(account_for_in_transfer: bool):
     """An idle attention-DP rank keeps stepping at shutdown while a peer has or gets a request.
 
-    Stopping alone would leave the peer's next collective without this rank.
+    Stopping alone would leave the peer's next collective without this rank. A peer request
+    that is only sending KV needs no step, also when the router counts it as load.
     """
+    from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+        AsyncTransferManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import KVCacheAwareADPRouter
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
 
     executor = _make_executor_with_kv_cache_manager(None)
@@ -2138,20 +2144,34 @@ def test_adp_ranks_stop_on_same_iteration():
     executor.active_requests = []
     executor.is_shutdown = True
 
-    def stops(peer_requests: int, routed_to_peer: list[RequestQueueItem]) -> bool:
+    def stops(peer_state: RankState, routed_to_peer: list[RequestQueueItem]) -> bool:
         # The routing allgather returns rank 1's load, and every rank routes the same requests.
-        executor.adp_router.gather_all_rank_states.return_value = [
-            RankState(rank=0),
-            RankState(rank=1, num_active_requests=peer_requests),
-        ]
+        executor.adp_router.gather_all_rank_states.return_value = [RankState(rank=0), peer_state]
         executor.adp_router.route_requests.return_value = ({0: [], 1: routed_to_peer}, 1)
         assert executor._fetch_new_requests(executor.waiting_queue, executor.active_requests) == []
         return executor.should_stop_processing
 
-    assert not stops(peer_requests=1, routed_to_peer=[])
+    assert not stops(RankState(rank=1, num_active_requests=1), routed_to_peer=[])
     # A request accepted with the shutdown is routed after the allgather.
-    assert not stops(peer_requests=0, routed_to_peer=[RequestQueueItem(2)])
-    assert stops(peer_requests=0, routed_to_peer=[])
+    assert not stops(RankState(rank=1), routed_to_peer=[RequestQueueItem(2)])
+    assert stops(RankState(rank=1), routed_to_peer=[])
+
+    # Rank 1 builds its state with KV-cache-aware routing while one finished request sends KV.
+    transfers = AsyncTransferManager(
+        types.SimpleNamespace(resource_managers={}), should_store_blocks=False
+    )
+    transfers.start_transfer(
+        types.SimpleNamespace(py_request_id=7, py_orig_prompt_len=16, cached_tokens=0)
+    )
+    peer_router = KVCacheAwareADPRouter(
+        types.SimpleNamespace(tp_rank=1, has_cp_helix=False),
+        kv_cache_manager=None,
+        async_transfer_manager=transfers,
+        account_for_in_transfer=account_for_in_transfer,
+    )
+    running = types.SimpleNamespace(py_orig_prompt_len=16, cached_tokens=0)
+    assert not stops(peer_router.create_rank_state([running], []), routed_to_peer=[])
+    assert stops(peer_router.create_rank_state([], []), routed_to_peer=[])
 
 
 def _classify_termination(

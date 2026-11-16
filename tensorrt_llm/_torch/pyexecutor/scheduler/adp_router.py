@@ -931,6 +931,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         num_active_tokens = sum(_active_tokens(req) for req in active_requests)
         n_active_for_state = len(active_requests)
+        num_in_transfer_requests = 0
 
         # Fold in requests mid KV-transfer to GEN; they are removed from
         # active_requests but still counted as per-rank load. Gated behind
@@ -940,12 +941,14 @@ class KVCacheAwareADPRouter(ADPRouter):
         if self.account_for_in_transfer and self.async_transfer_manager is not None:
             in_transfer = self.async_transfer_manager.requests_in_transfer()
             num_active_tokens += sum(_active_tokens(r) for r in in_transfer.values())
-            n_active_for_state += len(in_transfer)
+            num_in_transfer_requests = len(in_transfer)
+            n_active_for_state += num_in_transfer_requests
 
         return RankState(
             rank=self.dist.tp_rank,
             num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
+            num_in_transfer_requests=num_in_transfer_requests,
         )
 
     def gather_prefix_matches(

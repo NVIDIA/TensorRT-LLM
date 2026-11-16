@@ -252,9 +252,12 @@ class TestRankState:
         assert state.num_active_tokens == 100
 
     def test_serialize(self) -> None:
-        state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
+        state = RankState(
+            rank=0, num_active_requests=5, num_active_tokens=100, num_in_transfer_requests=2
+        )
         # rank, active, tokens, retiring, pending_new, the iter-stats payload, then the
-        # forward work (context, generation) and the connector counters
+        # forward work (context, generation), the connector counters and the tagged
+        # in-transfer count
         assert state.serialize() == [
             0,
             5,
@@ -266,7 +269,10 @@ class TestRankState:
             0,
             0,
             0,
+            RankState._IN_TRANSFER_TAG,
+            2,
         ]
+        assert RankState.deserialize(state.serialize()) == state
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -455,6 +461,8 @@ class TestRankState:
             4,
             6,
             1,  # Scheduling and connector tail.
+            -4,
+            0,  # Tagged in-transfer count.
         ]
 
         assert state.serialize(include_kv_cache_load=True) == expected
@@ -937,12 +945,14 @@ class TestDefaultADPRouter:
             num_generation_requests=3,
             num_connector_transfers=5,
             connector_poll_failed=True,
+            num_in_transfer_requests=1,
         )
 
         disabled = state.serialize()
         # rank, active requests, active tokens, retiring requests, pending-request
-        # hint, the 9 iteration stats, the 2 forward-work counters and the 2 connector counters.
-        assert len(disabled) == 18
+        # hint, the 9 iteration stats, the 2 forward-work counters, the 2 connector counters
+        # and the tagged in-transfer count.
+        assert len(disabled) == 20
         restored = RankState.deserialize(disabled)
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
@@ -950,15 +960,20 @@ class TestDefaultADPRouter:
         assert restored.connector_poll_failed
         assert restored.iter_stats.kv_used_blocks == -1
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 21
+        assert len(enabled) == 23
         restored = RankState.deserialize(enabled)
         assert restored.iter_stats.kv_used_blocks == 4
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
         assert restored.num_connector_transfers == 5
         assert restored.connector_poll_failed
+        assert restored.num_in_transfer_requests == 1
         for wire in (disabled, enabled):
-            legacy = RankState.deserialize(wire[:-2])
+            without_in_transfer = RankState.deserialize(wire[:-2])
+            assert without_in_transfer.num_connector_transfers == 5
+            assert without_in_transfer.connector_poll_failed
+            assert without_in_transfer.num_in_transfer_requests == 0
+            legacy = RankState.deserialize(wire[:-4])
             assert legacy.num_context_requests == 2
             assert legacy.num_generation_requests == 3
             assert legacy.num_connector_transfers == 0

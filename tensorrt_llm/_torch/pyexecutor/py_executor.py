@@ -1265,9 +1265,9 @@ class PyExecutor:
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # Whether any attention-DP rank held or received a request at the last
-        # routing allgather. An idle rank keeps stepping while it is set, so
-        # every rank leaves the executor loop on the same iteration.
+        # Whether any attention-DP rank held a request to step or received one
+        # at the last routing allgather. An idle rank keeps stepping while it is
+        # set, so every rank leaves the executor loop on the same iteration.
         self._fleet_has_live_requests = False
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
@@ -9185,8 +9185,11 @@ class PyExecutor:
             ]
             # Fleet-wide snapshot for should_stop_processing. A rank-local
             # decision would let an idle rank stop while a peer still runs
-            # collectives.
-            self._fleet_has_live_requests = (total_num_live_requests > 0
+            # collectives. Requests still sending KV need no step, and the
+            # rank-local stop condition does not wait for them either.
+            num_requests_to_step = total_num_live_requests - sum(
+                s.num_in_transfer_requests for s in all_rank_states)
+            self._fleet_has_live_requests = (num_requests_to_step > 0
                                              or len(all_new_flat) > 0)
             if not self._enable_non_overlap_adp_forward_intent:
                 self._update_adp_dummy_role(all_new_flat)
