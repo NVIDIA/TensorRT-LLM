@@ -112,6 +112,9 @@ target_link_libraries(
   tllm_common_nccl_comm
   PUBLIC tllm::common_nccl
   PRIVATE tllm::runtime_distributed tllm::runtime_ipc_nvls)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(tllm_common_nccl_comm PRIVATE pg_utils)
+endif()
 target_compile_features(tllm_common_nccl_comm PUBLIC cxx_std_20)
 set_target_properties(tllm_common_nccl_comm PROPERTIES POSITION_INDEPENDENT_CODE
                                                        ON)
