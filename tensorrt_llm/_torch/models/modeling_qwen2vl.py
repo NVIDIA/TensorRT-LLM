@@ -1375,7 +1375,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         multimodal_data = multimodal_params.multimodal_data
         multimodal_data["multimodal_embedding"] = image_embeddings
         multimodal_data["mrope_config"] = mrope_config
-        return prompt_token_ids, {"multimodal_data": multimodal_data}
+        return prompt_token_ids, {
+            "multimodal_data": multimodal_data,
+            "multimodal_input": multimodal_params.multimodal_input,
+        }
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()

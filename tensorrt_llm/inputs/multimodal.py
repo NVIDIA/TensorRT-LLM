@@ -9,6 +9,7 @@ current forward. `MultimodalInput` carries the executor boundary representation.
 Processor registration and encoder execution live outside this module.
 """
 
+import secrets
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from itertools import accumulate
@@ -999,9 +1000,9 @@ class MultimodalParams:
 
         Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
         shared-tensor handle. Item output lengths describe those rows; prompt
-        lengths also count model-specific MM framing tokens. Hashes enable
-        the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        lengths also count model-specific MM framing tokens. Hashes key the
+        KV cache blocks of the items. Without hashes, each item gets a random
+        one, so no other request reuses the KV cache of these items.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths
@@ -1010,29 +1011,19 @@ class MultimodalParams:
             raise ValueError("Embeddings and item output lengths must align")
         if any(length <= 0 for length in embedding_lengths):
             raise ValueError("Attached embedding lengths must be positive")
-        multimodal_input = None
-        if multimodal_hashes is not None:
-            if len(multimodal_hashes) != len(embedding_lengths):
-                raise ValueError(
-                    "Multimodal hashes and item output lengths must align")
-            multimodal_input = MultimodalInput.from_components(
-                multimodal_hashes,
-                multimodal_positions,
-                multimodal_lengths,
-                mm_item_run_cu_offsets=multimodal_item_run_cu_offsets,
-                mm_run_positions=multimodal_run_positions,
-                mm_run_lengths=multimodal_run_lengths,
-            )
-        else:
-            _validate_multimodal_positions_and_lengths(
-                multimodal_positions, multimodal_lengths,
-                len(embedding_lengths), "output_embedding_lengths")
-            _validate_multimodal_runs(len(embedding_lengths),
-                                      multimodal_lengths,
-                                      multimodal_item_run_cu_offsets,
-                                      multimodal_run_positions,
-                                      multimodal_run_lengths,
-                                      "output_embedding_lengths")
+        if multimodal_hashes is None:
+            multimodal_hashes = random_mm_hashes(len(embedding_lengths))
+        if len(multimodal_hashes) != len(embedding_lengths):
+            raise ValueError(
+                "Multimodal hashes and item output lengths must align")
+        multimodal_input = MultimodalInput.from_components(
+            multimodal_hashes,
+            multimodal_positions,
+            multimodal_lengths,
+            mm_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+            mm_run_positions=multimodal_run_positions,
+            mm_run_lengths=multimodal_run_lengths,
+        )
         data = {
             "multimodal_embedding": embeddings,
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: item_metadata,
@@ -1514,6 +1505,15 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
             value = value - 0x100000000  # Convert to signed by subtracting 2^32
         result.append(value)
     return result
+
+
+def random_mm_hashes(num_items: int) -> List[List[int]]:
+    """A random hash (8 int32 values) for each of `num_items` multimodal items.
+
+    For items without a content hash. KV block reuse keys the blocks of an item
+    by its hash, so with a random one no other request matches these blocks.
+    """
+    return [hexdigest_to_int32(secrets.token_hex(32)) for _ in range(num_items)]
 
 
 def int32_to_hexdigest(int32_values: List[int]) -> str:

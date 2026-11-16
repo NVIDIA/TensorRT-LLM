@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tensorrt_llm._errors import UnsupportedError
+from tensorrt_llm.inputs import registry
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -21,6 +22,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
+    random_mm_hashes,
     select_multimodal_fields,
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
@@ -876,6 +878,47 @@ def test_hashing_error_with_hashing_on_serves_request() -> None:
     assert processor.multimodal_hashing_supported is True
 
 
+def test_random_mm_hashes_are_new_for_each_item() -> None:
+    hashes = random_mm_hashes(3) + random_mm_hashes(3)
+
+    assert len({tuple(h) for h in hashes}) == 6
+    for h in hashes:
+        assert len(h) == 8
+        assert all(-(2**31) <= value < 2**31 for value in h)
+
+
+@pytest.mark.parametrize("hashing_off", [True, False], ids=["hashing_off", "hashing_failed"])
+def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_off) -> None:
+    """Hashing off, or hashing failed for this request: the items get random hashes.
+
+    Two requests with other images and the same prompt get the same spans and other hashes,
+    so their KV cache blocks get other keys.
+    """
+    processor = _ProbeFakeProcessor()
+    if hashing_off:
+        processor.multimodal_hashing_supported = False
+    else:
+
+        def cannot_hash(*args, **kwargs):
+            raise ValueError("cannot hash this image")
+
+        monkeypatch.setattr(registry, "apply_mm_hashes", cannot_hash)
+    wrapped = create_input_processor_with_hash(processor)
+
+    inputs = [
+        {"prompt": "unused", "multi_modal_data": {"image": [np.full((2, 2, 3), i, np.uint8)]}}
+        for i in range(2)
+    ]
+    mm_inputs = [wrapped(request, None)[1]["multimodal_input"] for request in inputs]
+
+    assert processor.multimodal_hashing_supported is (False if hashing_off else None)
+    for mm_input in mm_inputs:
+        assert mm_input.multimodal_positions == [1]
+        assert mm_input.multimodal_lengths == [2]
+        assert mm_input.multimodal_hashes != [_CONTENT_HASH_SNAPSHOT["image"]]
+    assert mm_inputs[0].multimodal_hashes != mm_inputs[1].multimodal_hashes
+
+
 def test_missing_hf_token_count_is_unsupported() -> None:
     with pytest.raises(UnsupportedError, match="_get_num_multimodal_tokens"):
         _NoHfTokenCountProcessor().get_num_tokens_per_image(
@@ -1012,13 +1055,14 @@ def test_multimodal_input_contract_snapshot(
     assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
         item_refs, [4] * num_items, [2] * num_items
     )
-    if not hashing_enabled:
-        assert "multimodal_input" not in extra
-        return
-
     mm_input = extra["multimodal_input"]
-    hashes = _CONTENT_HASH_SNAPSHOT
-    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    if hashing_enabled:
+        hashes = _CONTENT_HASH_SNAPSHOT
+        assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    else:
+        # Without content hashes, each item gets a random hash and the same spans.
+        assert len(mm_input.multimodal_hashes) == num_items
+        assert not any(h in _CONTENT_HASH_SNAPSHOT.values() for h in mm_input.multimodal_hashes)
     assert mm_input.multimodal_uuids is None
     assert mm_input.multimodal_positions == [1 + 3 * index for index in range(num_items)]
     assert mm_input.multimodal_lengths == [2 + len(special_ids or [])] * num_items
@@ -1265,7 +1309,10 @@ def test_attached_embeddings_accept_tensors_without_cache_hashes(modality):
         multimodal_lengths=[3],
     )
 
-    assert params.multimodal_input is None
+    # Without content hashes, the item gets a random hash for its KV cache keys.
+    assert len(params.multimodal_input.multimodal_hashes) == 1
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.multimodal_input.multimodal_lengths == [3]
     assert params.item_metadata.item_refs == ((modality, 0),)
     assert params.multimodal_data["multimodal_embedding"][0] is embedding
     assert params.item_metadata.encoder_token_lengths is None
