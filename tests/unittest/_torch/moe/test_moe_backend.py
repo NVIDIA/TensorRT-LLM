@@ -59,6 +59,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
+    RenormalizeNaiveMoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
@@ -93,8 +94,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
@@ -109,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
+    MoEEligibility,
     MoEEnvironment,
     MoEInputRequirement,
     MoEProblem,
@@ -1261,6 +1263,81 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         rank=0,
         world_size=1,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,expected_skip",
+    [
+        ({}, False),
+        ({"dtypes": [torch.float16]}, True),
+        ({"activation_type": ActivationType.Swiglu}, True),
+        ({"activation_type": ActivationType.Silu}, True),
+        ({"model_configs": [MoeModelConfig(64, 4, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 8, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 4, 4096, 1408)]}, True),
+        ({"swiglu_combos": [(1.702, 1.0, 7.0)]}, True),
+        ({"routing_methods": [RenormalizeNaiveMoeRoutingMethod]}, True),
+    ],
+    ids=[
+        "restored",
+        "float16",
+        "swiglu",
+        "silu",
+        "more-experts",
+        "larger-top-k",
+        "larger-hidden-size",
+        "custom-swiglu",
+        "renormalize-naive-routing",
+    ],
+)
+def test_trtllm_nvfp4_seq8_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    expected_skip: bool,
+) -> None:
+    backend = Mock(spec_set=["can_implement"])
+    backend.can_implement.return_value = MoEEligibility.ok()
+    monkeypatch.setattr("_torch.moe.moe_test_utils.find_backend_classes", lambda *_: [backend])
+    params = dict(
+        swiglu_combos=[(1, 0, float("inf"))],
+        model_configs=[MoeModelConfig(60, 4, 2048, 1408)],
+        seq_lens=[8],
+        dtypes=[torch.bfloat16],
+        backend_types=[MoeBackendType.TRTLLM],
+        quant_algos=[QuantAlgo.NVFP4],
+        routing_methods=[RenormalizeMoeRoutingMethod],
+        activation_type=ActivationType.Relu2,
+    )
+    params.update(overrides)
+    configs = list(iter_base_test_configs(**params))
+    assert len(configs) == 1
+    (
+        _swiglu_alpha,
+        _swiglu_beta,
+        _swiglu_limit,
+        _model_config,
+        _seq_len,
+        _dtype,
+        _backend_type,
+        _quant_algo,
+        _routing_method_cls,
+        skip_reason,
+        base_test_id,
+    ) = configs[0]
+    if expected_skip:
+        assert skip_reason is not None and "seq_len=8" in skip_reason
+    else:
+        assert skip_reason is None
+        assert params["model_configs"][0] in MOE_MODEL_CONFIGS
+        assert params["seq_lens"][0] in SEQ_LENS_TO_TEST
+        assert params["dtypes"][0] in DTYPES_TO_TEST
+        monkeypatch.setattr(sys.modules[__name__], "MOE_MODEL_CONFIGS", params["model_configs"])
+        monkeypatch.setattr(sys.modules[__name__], "SEQ_LENS_TO_TEST", params["seq_lens"])
+        monkeypatch.setattr(sys.modules[__name__], "DTYPES_TO_TEST", params["dtypes"])
+        generated_ids = {param.id for param in generate_element_wise_test_params()}
+        assert f"act=Relu2-{base_test_id}" in generated_ids
+        assert f"act=Silu-{base_test_id}" not in generated_ids
 
 
 def should_skip_gptoss(
@@ -2542,6 +2619,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
+    moe._shared_expert = None
     moe.fc31_input_scale = torch.ones(1)
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
@@ -3477,7 +3555,7 @@ def test_apply_router_weight_on_input_support_is_not_inherited():
     wrapper."""
     assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
-    for b12x_leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE):
+    for b12x_leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl):
         assert not b12x_leaf.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
@@ -3928,11 +4006,13 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     activation, which leaves ``quantize_input`` as the one place to apply it.
 
     ``__new__`` without ``__init__``: the real constructor wants a GPU and a
-    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    symmetric-memory provider, and ``quantize_input`` reads two parameters and
+    the fused shared expert, which stays unset here.
     """
     hidden_size = 64
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
+    backend._shared_expert = None
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
@@ -5307,6 +5387,7 @@ def generate_element_wise_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
             [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             if skip_reason:
                 continue
@@ -5374,6 +5455,7 @@ def generate_int8_woq_non_aligned_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS],
             [QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             # get_quick_skip_reason() rejects every quantized config whose sizes are
             # not 128-aligned. That gate is exactly what this case exists to cover:
@@ -5758,6 +5840,88 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 90,
+    reason="The SM90 FP8 block-scale GEMM quantizes FC1 inputs in the row expansion",
+)
+@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
+def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
+    """Row expansion with many rows per block, routed to few experts.
+
+    Most tokens pick the same four experts and the rest route randomly, so
+    each expansion block walks a long run of rows across expert boundaries,
+    past experts that received no rows, and into experts that received one.
+    """
+    num_experts, top_k, hidden_size, intermediate_size = 64, 4, 512, 512
+    dtype = torch.bfloat16
+    quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(Mapping())
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype)
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
+        # 7 of every 8 tokens pick experts 0, 7, 8 and 40; the others pick four
+        # of experts 41-63, except tokens 7 and 15, which each send one row to
+        # expert 3 and 5. Experts 1, 2, 4, 6 and 9-39 receive no rows.
+        token = torch.arange(num_tokens)
+        hot = token % 8 != 7
+        router_logits[hot.nonzero().flatten()[:, None], torch.tensor([0, 7, 8, 40])] += 20.0
+        router_logits[(~hot).nonzero().flatten()[:, None], torch.arange(41, 64)] += 20.0
+        for single_token, expert in ((7, 3), (15, 5)):
+            if single_token < num_tokens:
+                router_logits[single_token, expert] += 40.0
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, MoeBackendType.CUTLASS
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=MoeBackendType.CUTLASS,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=Mapping(),
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            counts = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+            if num_tokens == 8192:
+                assert counts[[1, 2, 4, 6, *range(9, 40)]].sum() == 0
+                assert counts[3] == counts[5] == 1
+                assert counts.max() >= num_tokens * 7 // 8
+            ref_output = ref_fused_moe.forward(x, router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                MoeBackendType.CUTLASS,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+        ref_fused_moe.check_accuracy(output, ref_output)
 
 
 # =====================================================================
@@ -6686,6 +6850,7 @@ def test_cutedsl_fc12_run_moe_sort_tables(
     backend.mapping = SimpleNamespace(moe_ep_size=1)
     backend._concurrent_sm_reserve = 0
     backend.apply_router_weight_on_input = False
+    backend.routing_method = None
     weights = MagicMock(expert_size_per_partition=8, slot_start=0)
     backend._build_local_weight_view = lambda: weights
     sort_outputs = (None,) * 6
@@ -6937,12 +7102,12 @@ _B12X_PREFILL_THRESHOLD = 64
 @pytest.mark.parametrize(
     "leaf_cls, num_tokens, reaches_cutlass",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
         pytest.param(
-            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+            FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
         ),
         pytest.param(
-            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+            FlashinferCutedslW4a16Nvfp4Impl, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
         ),
     ],
 )
@@ -7007,6 +7172,7 @@ class _FreshOutputBackend:
 
     capabilities = MoEStaticCapability()
     input_requirement = MoEInputRequirement()
+    fused_route_quant_enabled = True
 
     def __init__(self, stream_stack: list) -> None:
         self._stream_stack = stream_stack
@@ -7065,7 +7231,8 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,
-        _using_load_balancer=lambda: False,
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
         _load_balancer_done_set_cpu_stage=no_op,
@@ -7090,7 +7257,9 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+    "leaf_cls",
+    [FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl],
+    ids=["nvfp4", "w4a16"],
 )
 def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
     """Every b12x call returns the same storage, so a two-chunk forward has to

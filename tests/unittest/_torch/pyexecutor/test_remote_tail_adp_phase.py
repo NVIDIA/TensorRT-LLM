@@ -4,7 +4,7 @@
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -19,7 +19,6 @@ from _torch.pyexecutor.kv_cache.test_kv_cache_v2_scheduler import (
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -35,14 +34,13 @@ def _make_executor() -> PyExecutor:
     executor.enable_attention_dp = True
     executor.inflight_req_ids = set()
     executor._remote_tail_phase = RemoteTailPhase.NONE
-    executor._last_remote_tail_phase = RemoteTailPhase.DECODE
     executor.model_engine = SimpleNamespace(
         _dspark_confidence_enabled=False,
         cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()}),
     )
     executor.scheduler = Mock()
-    executor.scheduler.is_request_in_schedulable_state.side_effect = (
-        lambda request: request.state
+    executor.scheduler.is_request_in_schedulable_state.side_effect = lambda request: (
+        request.state
         in (
             LlmRequestState.ENCODER_INIT,
             LlmRequestState.CONTEXT_INIT,
@@ -80,8 +78,10 @@ def test_deferred_generation_waits_for_next_phase_vote(phase: RemoteTailPhase) -
     scheduler._DEADLOCK_STALL_ITERS = 2
     generation = _make_generation_request(1)
     generation.py_batch_idx = 7
-    # CONTEXT/NONE defer existing decode work; DECODE defers a late arrival.
-    frozen_generation_ids = frozenset() if phase is RemoteTailPhase.DECODE else frozenset({1})
+    # CONTEXT/NONE defer decode work; DECODE/MIXED defer a late arrival.
+    frozen_generation_ids = (
+        frozenset() if phase in (RemoteTailPhase.DECODE, RemoteTailPhase.MIXED) else frozenset({1})
+    )
     scheduler.set_remote_tail_phase(phase, frozenset(), frozen_generation_ids)
 
     for _ in range(scheduler._DEADLOCK_STALL_ITERS + 2):
@@ -192,7 +192,7 @@ def test_frozen_phase_filters_before_kv_work_and_keeps_transfer_admission(
     phase: RemoteTailPhase,
 ) -> None:
     manager = make_kv_cache_manager()
-    scheduler = make_scheduler(manager, max_num_tokens=128)
+    scheduler = make_scheduler(manager, max_num_tokens=256)
     context = make_ctx_request(1, context_remaining_length=128)
     context.py_csa2_remote_tail_mode = "destination"
     generation = _make_generation_request(2)
@@ -209,8 +209,12 @@ def test_frozen_phase_filters_before_kv_work_and_keeps_transfer_admission(
         [late_context, late_generation, context, generation, transfer, terminal], set()
     )
 
-    expected_contexts = [context] if phase is RemoteTailPhase.CONTEXT else []
-    expected_generations = [generation] if phase is RemoteTailPhase.DECODE else []
+    expected_contexts = (
+        [context] if phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED) else []
+    )
+    expected_generations = (
+        [generation] if phase in (RemoteTailPhase.DECODE, RemoteTailPhase.MIXED) else []
+    )
     assert result.context_requests == expected_contexts
     assert result.generation_requests == expected_generations
     assert result.fitting_disagg_gen_init_requests == [transfer]
@@ -244,7 +248,7 @@ def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> N
         make_ctx_request(2, context_remaining_length=128),
         make_ctx_request(3, context_remaining_length=128),
     ]
-    for phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE):
+    for phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED):
         scheduler.set_remote_tail_phase(phase, context_ids, generation_ids)
         result = scheduler.schedule_request(active, set())
         assert not result.context_requests
@@ -277,7 +281,7 @@ def test_phase_snapshot_excludes_inflight_dummy_and_unready_requests() -> None:
     )
 
 
-def test_phase_consensus_alternates_busy_categories_including_idle_ranks() -> None:
+def test_phase_consensus_admits_busy_categories_including_idle_ranks() -> None:
     executors = [_make_executor() for _ in range(3)]
     states = [
         RankState(rank=0, num_context_requests=2),
@@ -289,27 +293,26 @@ def test_phase_consensus_alternates_busy_categories_including_idle_ranks() -> No
         (frozenset(), frozenset({3, 4, 5})),
         (frozenset(), frozenset()),
     ]
-    for expected in (
-        RemoteTailPhase.CONTEXT,
-        RemoteTailPhase.DECODE,
-        RemoteTailPhase.CONTEXT,
-        RemoteTailPhase.DECODE,
-    ):
+    for _ in range(2):
         for executor, (context_ids, generation_ids) in zip(executors, local_ids):
             executor._select_remote_tail_phase(states, context_ids, generation_ids)
-            assert executor._remote_tail_phase is expected
+            assert executor._remote_tail_phase is RemoteTailPhase.MIXED
             executor.scheduler.set_remote_tail_phase.assert_called_with(
-                expected, context_ids, generation_ids
+                RemoteTailPhase.MIXED, context_ids, generation_ids
             )
     for executor in executors:
         executor._select_remote_tail_phase([RankState(rank=0)], frozenset(), frozenset())
         assert executor._remote_tail_phase is RemoteTailPhase.NONE
-        assert executor._last_remote_tail_phase is RemoteTailPhase.DECODE
 
 
 @pytest.mark.parametrize(
     "contexts,generations,expected",
-    [(1, 0, RemoteTailPhase.CONTEXT), (0, 1, RemoteTailPhase.DECODE), (0, 0, RemoteTailPhase.NONE)],
+    [
+        (1, 0, RemoteTailPhase.CONTEXT),
+        (0, 1, RemoteTailPhase.DECODE),
+        (1, 1, RemoteTailPhase.MIXED),
+        (0, 0, RemoteTailPhase.NONE),
+    ],
 )
 def test_phase_consensus_uses_ready_categories_not_total_active_requests(
     contexts: int,
@@ -430,34 +433,41 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
     assert runner.padding_dummy_requests[0] is dummy
 
 
-@pytest.mark.parametrize("phase", [RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE])
+@pytest.mark.parametrize(
+    "phase", [RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED]
+)
+@pytest.mark.parametrize("draft_len", [0, 5])
 def test_idle_execution_reuses_retained_row_without_changing_semantic_batch(
     phase: RemoteTailPhase,
+    draft_len: int,
 ) -> None:
-    dummy = object()
-    runner = SimpleNamespace(padding_dummy_requests={0: dummy})
+    dummies = {0: object(), 5: object()}
+    dummy = dummies[draft_len]
+    runner = SimpleNamespace(padding_dummy_requests=dummies.copy())
     graphs = SimpleNamespace(cuda_graph_runner=runner)
     semantic_batch = ScheduledRequests()
     semantic_batch.attention_dp_phase = phase
     semantic_batch.is_attention_dp_phase_idle = True
 
     for _ in range(2):
-        execution_batch = DecoderCudaGraphs.attention_dp_execution_batch(graphs, semantic_batch)
+        execution_batch = DecoderCudaGraphs.attention_dp_execution_batch(
+            graphs, semantic_batch, draft_len
+        )
         assert execution_batch is not semantic_batch
         assert execution_batch.generation_requests == [dummy]
         assert execution_batch.attention_dp_phase is phase
         assert execution_batch.is_attention_dp_phase_idle
-        assert execution_batch.can_run_cuda_graph is (phase is RemoteTailPhase.DECODE)
+        assert execution_batch.can_run_cuda_graph is (phase is not RemoteTailPhase.CONTEXT)
         assert semantic_batch.batch_size == 0
         assert not semantic_batch.added_inflight_req_ids
-    assert runner.padding_dummy_requests == {0: dummy}
+    assert runner.padding_dummy_requests == dummies
 
 
 def test_idle_execution_refuses_missing_row_or_nonempty_semantic_batch() -> None:
     graphs = SimpleNamespace(cuda_graph_runner=SimpleNamespace(padding_dummy_requests={}))
     batch = ScheduledRequests()
     batch.is_attention_dp_phase_idle = True
-    with pytest.raises(RuntimeError, match="execution row is missing"):
+    with pytest.raises(RuntimeError, match="execution row for draft length 0 is missing"):
         DecoderCudaGraphs.attention_dp_execution_batch(graphs, batch)
     for bucket in (batch.generation_requests, batch.encoder_requests):
         bucket.append(object())
@@ -497,28 +507,10 @@ def test_context_phase_disables_graph_for_real_work_and_idle_rows() -> None:
     assert not batch.can_run_cuda_graph
     batch.attention_dp_phase = RemoteTailPhase.DECODE
     assert batch.can_run_cuda_graph
-
-
-@pytest.mark.parametrize("graph_flags", [[1, 1], [0, 1], [1, 0]])
-def test_decode_graph_requirement_uses_token_count_collective(
-    graph_flags: list[int],
-) -> None:
-    dist = Mock()
-    dist.tp_allgather_int64.return_value = torch.tensor(
-        [[16, graph_flags[0]], [16, graph_flags[1]]]
-    )
-    engine = SimpleNamespace(dist=dist)
-    metadata = SimpleNamespace(num_tokens=16)
-    if all(graph_flags):
-        assert DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
-            engine, metadata, bool(graph_flags[0])
-        ) == [16, 16]
-    else:
-        with pytest.raises(RuntimeError, match="at least one rank missed its graph"):
-            DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
-                engine, metadata, bool(graph_flags[0])
-            )
-    dist.tp_allgather_int64.assert_called_once_with([16, graph_flags[0]])
+    batch.attention_dp_phase = RemoteTailPhase.MIXED
+    assert batch.can_run_cuda_graph
+    batch.context_requests_last_chunk = [object()]
+    assert not batch.can_run_cuda_graph
 
 
 def _make_startup_executor() -> PyExecutor:
@@ -588,7 +580,11 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         resource_managers={ResourceManagerType.KV_CACHE_MANAGER: manager}
     )
     scheduler = make_scheduler(make_kv_cache_manager())
-    transceiver = SimpleNamespace(get_status_dump=Mock()) if has_transceiver else None
+    transceiver = (
+        SimpleNamespace(get_status_dump=Mock(), reads_unique_tokens=False)
+        if has_transceiver
+        else None
+    )
     dist = SimpleNamespace(
         rank=0,
         tp_rank=0,
@@ -643,6 +639,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
             batch_wait_timeout_ms=0,
             batch_wait_timeout_iters=0,
             batch_wait_max_tokens_ratio=0,
+            enable_client_io_during_gpu_wait=False,
         ),
         get_max_num_sequences=lambda: 8,
         warmup=warmup,
@@ -677,15 +674,23 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     assert runner._get_or_create_padding_dummy.call_count == int(should_enable)
 
 
-def test_final_startup_reserves_idle_row_without_admitting_a_request() -> None:
+@pytest.mark.parametrize("draft_len", [0, 5])
+def test_final_startup_reserves_idle_row_without_admitting_a_request(draft_len: int) -> None:
     executor = _make_startup_executor()
+    if draft_len:
+        executor.model_engine.spec_config = SimpleNamespace(
+            spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
+            draft_is_embedded_in_target=True,
+            is_linear_tree=True,
+            max_draft_len=draft_len,
+        )
     executor.active_requests = []
     executor._initialize_remote_tail_adp()
     assert executor._enable_remote_tail_adp
     assert executor.active_requests == []
-    executor.model_engine.cuda_graph_runner._get_or_create_padding_dummy.assert_called_once_with(
-        executor.resource_manager, 0
-    )
+    assert executor.model_engine.cuda_graph_runner._get_or_create_padding_dummy.call_args_list == [
+        call(executor.resource_manager, length) for length in range(draft_len + 1)
+    ]
 
 
 def test_estimation_does_not_reserve_idle_execution_resources() -> None:
@@ -707,7 +712,9 @@ def test_startup_rejects_unsupported_execution_contracts(unsupported: str) -> No
     elif unsupported == "beam":
         executor.max_beam_width = 2
     elif unsupported == "speculation":
-        executor.model_engine.spec_config = object()
+        executor.model_engine.spec_config = SimpleNamespace(
+            spec_dec_mode=SimpleNamespace(is_dspark=lambda: False)
+        )
     else:
         executor.scheduler = object()
     with pytest.raises(ValueError, match="padded decode CUDA graphs"):
@@ -719,7 +726,7 @@ def test_startup_rejects_unsupported_execution_contracts(unsupported: str) -> No
 def test_startup_reports_missing_idle_reservation() -> None:
     executor = _make_startup_executor()
     executor.model_engine.cuda_graph_runner._get_or_create_padding_dummy.return_value = None
-    with pytest.raises(RuntimeError, match="padding request at startup"):
+    with pytest.raises(RuntimeError, match="padding request for draft length 0 at startup"):
         executor._initialize_remote_tail_adp()
     assert not executor._enable_remote_tail_adp
 

@@ -2698,12 +2698,14 @@ class KvCacheCreator:
         if lookahead is None:
             return False
         if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
-                                         "_supports_reuse_match_backoff",
+                                         "_supports_draft_reuse_match_backoff",
                                          False):
             # The opt-out is about backing the match off by `lookahead` tokens,
             # which a specialized commit/history protocol (recurrent snapshots,
             # DSA) cannot express. A zero span asks for no backoff at all, so
             # every backoff-sized path stays a no-op and the pairing is safe.
+            # The pool that has to express the backoff is the draft pool, which
+            # holds only the speculation layers.
             return False
         return True
 
@@ -3391,9 +3393,31 @@ class KvCacheCreator:
             head_dim = encoder_hidden_size // encoder_num_heads
 
         max_seq_len = fallback_max_seq_len or self._max_seq_len
-        max_input_len = getattr(self._llm_args, "max_input_len", None)
-        if isinstance(max_input_len, int) and max_input_len > 0:
-            max_seq_len = max_input_len
+        input_processor = self._model_engine.input_processor
+        # max_input_len bounds the prompt, which is the encoder input only for
+        # token encoders (BART/T5). A feature encoder (e.g. Whisper) takes the
+        # prompt as the decoder prefix and emits a model-defined number of
+        # positions, so max_input_len must not cap its cross pool.
+        if getattr(input_processor, "requires_encoder_features", False):
+            # The input processor stamps this length on every request, and the
+            # cross pool allocates blocks from it.
+            encoder_output_len = getattr(input_processor, "encoder_output_len",
+                                         None)
+            if encoder_output_len is not None:
+                encoder_output_len = int(encoder_output_len)
+                if max_seq_len < encoder_output_len:
+                    raise ValueError(
+                        f"max_seq_len ({max_seq_len}) is smaller than the "
+                        f"{encoder_output_len} encoder positions every request "
+                        "of this model produces, so the encoder pass and the "
+                        "cross-attention KV cache cannot hold them. Leave "
+                        "max_seq_len unset or set it to at least "
+                        f"{encoder_output_len}.")
+                return num_layers, num_kv_heads, head_dim, encoder_output_len
+        else:
+            max_input_len = getattr(self._llm_args, "max_input_len", None)
+            if isinstance(max_input_len, int) and max_input_len > 0:
+                max_seq_len = max_input_len
         encoder_limit = self._get_config_int_attr(
             config,
             ("max_encoder_input_len", "encoder_max_input_length",
@@ -4173,6 +4197,8 @@ def _create_kv_cache_manager(
         if getattr(sparse_attention_config, "algorithm", None) == "csa2":
             manager_extra_kwargs["context_swa_layer_limit"] = (
                 _model_config.extra_attrs.get("csa2_context_swa_layer_limit"))
+            manager_extra_kwargs["encoder_replay"] = (
+                _model_config.extra_attrs.get("csa2_encoder_replay"))
             manager_extra_kwargs["bounded_replay_on_generation"] = (
                 _model_config.extra_attrs.get("bounded_replay_on_generation",
                                               False))
@@ -4582,11 +4608,12 @@ def should_enable_overlap_headroom(mapping: Mapping,
     seat until the next iteration's ``_process_previous_batch``, which runs
     after that iteration has already admitted new work. Admission excludes such
     retiring requests whenever this gate is on (``ADPRouter`` on the
-    attention-DP path, ``_fetch_new_requests`` otherwise), so the replacement
-    cohort needs seats of its own. Without the extra micro-batch, a workload
-    whose requests retire after one iteration -- a context server, where every
-    request finishes in its prefill step -- can only refill the seats the
-    previous iteration did not use, and runs at roughly half its batch.
+    attention-DP path, ``_fetch_new_requests`` otherwise, except aggregated
+    requests), so the replacement cohort needs seats of its own. Without the
+    extra micro-batch, a workload whose requests retire after one iteration --
+    a context server, where every request finishes in its prefill step -- can
+    only refill the seats the previous iteration did not use, and runs at
+    roughly half its batch.
 
     Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
     sized from ``compute_max_num_sequences``. Two model families size one from
@@ -4906,6 +4933,12 @@ def create_py_executor_resources(
             f"scheduler_config.context_scheduling_policy="
             f"{context_scheduling_policy.value} is ignored: it needs the KV "
             "cache manager V2 scheduler")
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and scheduler_config is not None
+            and scheduler_config.max_gen_init_admissions_per_pass is not None):
+        logger.warning(
+            "scheduler_config.max_gen_init_admissions_per_pass is ignored: it "
+            "needs the KV cache manager V2 scheduler")
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -4936,6 +4969,9 @@ def create_py_executor_resources(
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
             if scheduler_config is not None else None,
+            max_gen_init_admissions_per_pass=(
+                scheduler_config.max_gen_init_admissions_per_pass
+                if scheduler_config is not None else None),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

@@ -189,6 +189,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def ran_on_routing_tables(self, rows: int, tile: int | None) -> None:
+        """A run of ``rows`` tokens given routing tables used the table of ``tile`` (None: the
+        runner routed itself)."""
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -251,9 +255,28 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             use_dp=self.use_dp,
             prerouted=prerouted,
             decode_tuning=self.decode_tuning,
+            routing_tables=ctx.routing_tables,
         )
 
         if not k.do_finalize:
+            if k.token_final_scales is not None and prerouted is None:
+                # With routing weights passed in, the runner combines with those and leaves its
+                # own expert_weights output unwritten: hand the caller the ones it used.
+                outputs = [outputs[0], k.token_final_scales, outputs[2]]
+            if ctx.routing_tables is not None:
+                # The runner ran on the tables when its permutation is an empty [0, tile]
+                # placeholder naming the tile whose table holds it; else it routed itself.
+                used = outputs[2].shape[1] if outputs[2].numel() == 0 else None
+                self.ran_on_routing_tables(k.x.shape[0], used)
+                if used is not None:
+                    tables = ctx.routing_tables
+                    permutation = tables.tables[tables.tiles.index(used), 0]
+                    weights = outputs[1]
+                    outputs = [
+                        outputs[0],
+                        weights,
+                        permutation[: weights.numel()].view(weights.shape),
+                    ]
             return self._unfinalized(outputs)
 
         # When output is provided, use it directly as the result
@@ -295,10 +318,17 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         # SiTu fills the act_alpha/act_beta slots from create_weights, which
         # runs after this, so keying off the tensor would make the method
         # depend on *when* it is asked for.
-        needs_padded_method = self.act_alpha is not None or self.activation_type in (
-            ActivationType.SiTu,
-            ActivationType.Relu2,
-            ActivationType.Silu,
+        # The gate and up shards fill each 128-row scale-shuffle tile half and half, and the down
+        # projection's K takes whole 4-column scale atoms: 64 rows per shard serve both.
+        needs_padded_method = (
+            self.intermediate_size_per_partition % 64 != 0
+            or self.act_alpha is not None
+            or self.activation_type
+            in (
+                ActivationType.SiTu,
+                ActivationType.Relu2,
+                ActivationType.Silu,
+            )
         )
         return (
             NVFP4TRTLLMGenFusedMoEMethod()

@@ -66,19 +66,8 @@ struct HostCacheTierConfig
     //! exceed anyway.
     std::optional<size_t> maxQuota;
 
-    //! Whether a page may come from a NUMA node other than the one the GPU
-    //! attaches to, when the local node cannot satisfy it.
-    //!
-    //! False keeps every page local, at the cost of capping the tier at one
-    //! node's memory: a quota sized from total system memory cannot then be
-    //! filled. True accepts a remote page, which the GPU reaches more slowly,
-    //! rather than failing the allocation.
-    //!
-    //! False additionally requires that a memory policy be settable. Where the
-    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
-    //! one, and the tier refuses to start rather than fall back to first touch
-    //! -- which prefers the local node but takes a remote page instead of
-    //! failing, and so would not be the strictness that was asked for.
+    //! Deprecated: set KVCacheManagerConfig::hostMemBacking instead. False here still makes the
+    //! host memory's placement strict; the tier itself does not read it.
     bool allowRemoteNumaFallback = true;
 
     [[nodiscard]] CacheTier tier() const noexcept
@@ -99,6 +88,28 @@ struct DiskCacheTierConfig
 {
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
+
+    //! Upper bound of numIoThreads, matching KvCacheConfig.disk_io_threads.
+    static constexpr int kMaxIoThreads = 256;
+
+    //! Worker threads for asynchronous disk I/O, 0 to kMaxIoThreads. Process-wide: the first nonzero value starts the
+    //! pool for the life of the process, and later values, including 0, do not change it. Without a pool, disk I/O is
+    //! synchronous.
+    int numIoThreads = 0;
+
+    //! Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
+    bool keepCopyAfterRestore = false;
+
+    //! Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
+    //! and required writes. Requires numIoThreads > 0 and a host tier right above this disk tier.
+    bool writeThrough = false;
+
+    //! Share of this tier's slots, 0 to 1, that retained copies (from keepCopyAfterRestore or writeThrough) may hold
+    //! ahead of pages whose only copy is on disk. When the tier runs short, copies beyond the share are released
+    //! before any of those pages is evicted, and write-through creates no copy beyond it. Copies within the share are
+    //! released only for what evicting those pages cannot cover. 1 favors saving writes (write-bound deployments); a
+    //! lower value keeps more distinct pages on disk (capacity-bound deployments).
+    float protectedCopyFraction = 1.0F;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -573,6 +584,32 @@ struct PoolRebalanceConfig
     }
 };
 
+//! How the KV cache manager backs the host cache tier's memory. HostMemBacking applies it where the
+//! memory is mapped; the tier takes the backed memory and does not read it.
+struct HostMemBackingConfig
+{
+    //! The NUMA node for the pages instead of the one the GPU attaches to.
+    std::optional<int> numaNode;
+
+    //! Whether a page may come from another NUMA node when the chosen node cannot satisfy it.
+    //!
+    //! False keeps every page on that node, at the cost of capping the memory at one node's: a
+    //! quota sized from total system memory cannot then be filled. True accepts a remote page,
+    //! which the GPU reaches more slowly, rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the memory is
+    //! mmap-backed, a container without CAP_SYS_NICE cannot set one, and the manager refuses to
+    //! start rather than fall back to first touch -- which prefers the local node but takes a
+    //! remote page instead of failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
+    void validate() const
+    {
+        if (numaNode && *numaNode < 0)
+            throw std::invalid_argument("HostMemBackingConfig: numa_node must be >= 0");
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
@@ -659,6 +696,8 @@ struct KVCacheManagerConfig
 
     // Unreferenced GPU pages below this priority are dropped instead of offloaded.
     Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
+
+    HostMemBackingConfig hostMemBacking;
 
     bool enableSwaScratchReuse() const noexcept
     {

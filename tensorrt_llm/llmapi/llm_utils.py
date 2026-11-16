@@ -229,7 +229,8 @@ class ModelLoader:
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                    self.llm_args.moe_config.backend)
+                    self.llm_args.moe_config.backend,
+                    moe_tactic=self.llm_args.moe_config.tactic)
                 quant_config.group_size = 32
                 quant_config.exclude_modules = [
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
@@ -536,6 +537,24 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
+
+    # A user's ``moe_config.tactic`` already names the implementation, so a
+    # model's preferred ``moe_config.backend`` yields to it instead of being
+    # merged into a combination that MoeConfig rejects.
+    user_moe_config = user_overrides.get("moe_config")
+    default_moe_config = model_defaults_dict.get("moe_config")
+    if (isinstance(user_moe_config, dict)
+            and user_moe_config.get("tactic") is not None
+            and isinstance(default_moe_config, dict)
+            and "backend" in default_moe_config):
+        model_defaults_dict = {
+            **model_defaults_dict,
+            "moe_config": {
+                key: value
+                for key, value in default_moe_config.items() if key != "backend"
+            },
+        }
+
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
     # Model defaults cannot change this config; retain its private launcher state,
