@@ -1278,11 +1278,10 @@ class DisaggTransferCoordinator:
         enters a collective, so it is deferred to ``handle_timeouts_synced``.
         """
         for req in requests:
-            # cancel_request does not change the state. Left in progress,
+            # cancel_request leaves the state in progress. Left as is,
             # PyExecutor._handle_errors would park the failure for a transfer
-            # that no longer exists (_transfer_owns_request_blocks), and
-            # _sweep_transfer_held_failures would drop it without a response
-            # because the request has already left active_requests.
+            # that no longer exists, and _sweep_transfer_held_failures would
+            # drop it without a response.
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if self._enable_attention_dp and self._dist.world_size != 1:

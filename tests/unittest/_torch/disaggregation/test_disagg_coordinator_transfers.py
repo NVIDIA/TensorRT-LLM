@@ -519,10 +519,10 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
 
 
 def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
-    """cancel_request leaves a receive in progress. Failing the request must
-    end that state, or the executor's error path would park the failure for a
-    transfer that no longer exists and then drop it without a response. A
-    receive that completed after its deadline keeps its state."""
+    """Failing a cancelled receive ends its in-progress state.
+
+    A receive that completed after its deadline keeps its state.
+    """
     h = _Harness()
     cancelled = _Request(
         1,
@@ -546,9 +546,7 @@ def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
 
 
 def test_fail_timed_out_ends_the_receive_state_before_the_adp_buffer() -> None:
-    """Under multi-rank ADP the state ends when the request is buffered, not
-    at the synced drain, because the request has already left the active
-    list the error vote reads."""
+    """Under multi-rank ADP the state ends when the request is buffered, not at the synced drain."""
     h = _Harness(enable_attention_dp=True, world_size=2)
     req = _Request(
         1,
