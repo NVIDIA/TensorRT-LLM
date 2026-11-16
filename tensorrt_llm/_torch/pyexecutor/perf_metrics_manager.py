@@ -26,10 +26,19 @@ class PerfMetricsManager:
     Args:
         enabled: Whether performance metrics collection is turned on
             (mirrors ``LlmArgs.return_perf_metrics``).
+        timing_side_stream: Record the timing events on a side stream that waits
+            for the current stream (``RuntimeHooks.perf_metrics_timing_side_stream``).
     """
 
-    def __init__(self, enabled: bool):
+    _timing_stream: Optional[torch.cuda.Stream] = None
+    # Marks the current stream's position for the side stream to wait on; reused every record.
+    _fork_event: Optional[torch.cuda.Event] = None
+
+    def __init__(self, enabled: bool, timing_side_stream: bool = False):
         self.enabled = enabled
+        if enabled and timing_side_stream:
+            self._timing_stream = torch.cuda.Stream()
+            self._fork_event = torch.cuda.Event()
         self._perf_events = None
         self._perf_event_idx = 0
         self._forward_event_pool = []
@@ -99,7 +108,7 @@ class PerfMetricsManager:
 
         # --- Pre-execution: record start ---
         if start_event is not None:
-            start_event.record()
+            self._record(start_event)
         if self.enabled:
             timing.start_time = get_steady_clock_now_in_seconds()
 
@@ -107,9 +116,18 @@ class PerfMetricsManager:
 
         # --- Post-execution: record end ---
         if end_event is not None:
-            end_event.record()
+            self._record(end_event)
         if self.enabled:
             timing.end_time = get_steady_clock_now_in_seconds()
+
+    def _record(self, event: torch.cuda.Event) -> None:
+        """Record ``event`` after the current stream's work, on the side stream when there is one."""
+        if self._timing_stream is None or torch.cuda.is_current_stream_capturing():
+            event.record()
+            return
+        self._fork_event.record()
+        self._timing_stream.wait_event(self._fork_event)
+        event.record(self._timing_stream)
 
     # ------------------------------------------------------------------
     # Saving / computing timing data
@@ -119,16 +137,22 @@ class PerfMetricsManager:
         """Return a CPU timestamp if metrics are enabled, else ``None``."""
         return get_steady_clock_now_in_seconds() if self.enabled else None
 
-    @staticmethod
     def try_compute_gpu_elapsed_time_ms(
+        self,
         start_event: Optional[torch.cuda.Event],
         end_event: Optional[torch.cuda.Event],
     ) -> Optional[float]:
-        """Return CUDA-event elapsed time if ready, without synchronizing."""
+        """Return CUDA-event elapsed time if ready.
+
+        Events on the current stream are not waited for. An event on the timing side stream is
+        ordered after nothing the caller synchronized with, so it is waited for.
+        """
         if start_event is None or end_event is None:
             return None
         try:
-            if not end_event.query():
+            if self._timing_stream is not None:
+                end_event.synchronize()
+            elif not end_event.query():
                 return None
             return float(start_event.elapsed_time(end_event))
         except RuntimeError as e:

@@ -344,7 +344,7 @@ def compile_model(
             model, prefill_only = apply_torch_compile(
                 model, backend, llm_args=llm_args, fullgraph=torch_compile_fullgraph
             )
-            torch._dynamo.config.cache_size_limit = 16
+            torch._dynamo.config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
         else:
             set_torch_compiling(False)
             if window_scopes_enabled:
@@ -369,6 +369,9 @@ def compile_model(
 
 
 _DEEP_GEMM_PDL_CONFIGURED = False
+# Dynamo recompile limit of a compiled model; PyExecutor applies it again on its
+# worker thread, since torch keeps each Dynamo config value per thread.
+DYNAMO_RECOMPILE_LIMIT = 16
 
 
 def _configure_deep_gemm_pdl() -> None:
