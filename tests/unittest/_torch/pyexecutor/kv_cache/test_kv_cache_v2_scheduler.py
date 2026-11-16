@@ -2737,13 +2737,6 @@ class TestEncoder:
         assert ids(out.encoder_requests) == [0]
         assert ids(out.context_requests) == []
 
-    def test_encoder_budget_overflow(self):
-        mgr = make_kv_cache_manager()
-        sched = make_encoder_scheduler(mgr, max_num_tokens=100)
-        reqs = [make_encoder_request(0, encoder_output_len=200)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.encoder_requests) == 0
-
     def test_encoder_exceeds_budget(self):
         """encoder_output_len > max_num_tokens → break (not scheduled)."""
         mgr = make_kv_cache_manager()
@@ -3645,17 +3638,6 @@ class TestDraftTokenFitting:
         # V2 does not trim drafts — full draft_len included
         req.discard_draft_tokens.assert_not_called()
 
-    def test_max_context_length_limits_draft(self):
-        """max_context_length=110, chunk=100, draft=20. V2 scheduler adds
-        full draft_len to chunk_tokens without trimming."""
-        mgr = make_kv_cache_manager(tokens_per_block=64)
-        sched = make_scheduler(mgr, max_num_tokens=110, ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
-        out = sched.schedule_request([req], set())
-        assert ids(out.context_requests) == [0]
-        # V2 does not trim drafts — full draft_len included
-        req.discard_draft_tokens.assert_not_called()
-
     def test_draft_tokens_add_to_batch_budget(self):
         """Last chunk with draft: batch_num_tokens += chunk_size + num_draft_tokens."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -3932,14 +3914,6 @@ class TestMixedOrdering:
         assert len(out.generation_requests) == 2
         assert len(out.context_requests) == 2
 
-    def test_ctx_fail_gen_after_succeeds(self):
-        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_ctx_request(0, 500), make_gen_request(1)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
-        assert ids(out.generation_requests) == [1]
-
     def test_gen_fail_self_evicts_then_breaks(self):
         """Gen fails → self-evicts → break. Ctx after is NOT tried."""
         mgr = make_kv_cache_manager(
@@ -3976,18 +3950,6 @@ class TestMixedOrdering:
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 1
         assert len(out.context_requests) == 1
-
-    def test_encoder_then_gen(self):
-        mgr = make_kv_cache_manager()
-        sched = make_encoder_scheduler(mgr, max_num_tokens=100)
-        reqs = [
-            make_encoder_request(0, encoder_output_len=50),
-            make_gen_request(1),
-        ]
-        out = sched.schedule_request(reqs, set())
-        assert ids(out.encoder_requests) == [0]
-        assert ids(out.context_requests) == []
-        assert ids(out.generation_requests) == [1]
 
     def test_ctx_fail_budget_preserved(self):
         """Failed ctx doesn't consume budget — gen gets full budget."""
