@@ -1549,6 +1549,7 @@ class KvCacheCreator:
             # Cost the GDN replay region of the state the manager will select.
             extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
         if (not is_draft and self._speculative_config is not None
+                and isinstance(manager_cls, type)
                 and issubclass(manager_cls, MambaHybridCacheManagerV2)
                 and self._model_engine is not None
                 and _uses_kda_mtp_replay(self._model_engine.model)):
