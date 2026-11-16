@@ -394,11 +394,11 @@ def test_fused_vs_sequential_two_rounds(
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
     fused_slots = slot_indices
+    request_ids = list(range(101, 101 + B))
     replay_slots = slot_indices
     replay_manager = _make_kvcm_replay_manager(num_heads) if kvcm_replay else None
     if replay_manager is not None:
         request.addfinalizer(replay_manager.shutdown)
-        request_ids = list(range(101, 101 + B))
         replay_manager.add_dummy_requests(request_ids, token_nums=[32] * B, is_gen=False)
         fused_slots = torch.tensor(
             replay_manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda"

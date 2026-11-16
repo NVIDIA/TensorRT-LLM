@@ -799,6 +799,7 @@ def setup_disagg_cluster(
     share_gpu: bool = False,
     config_overrides: dict[str, Any] | None = None,
     log_output_dir: str | None = None,
+    prepare_fmha_metadata: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch the workers and the disagg server, wait for ready.
@@ -818,6 +819,8 @@ def setup_disagg_cluster(
             work_dir instead of the inherited stdout
         log_output_dir: With save_log, directory the logs are copied to if
             startup fails (CI's --output-dir, so they get uploaded)
+        prepare_fmha_metadata: Prepare shared FMHA artifacts before single-rank
+            Blackwell Python transceiver workers start.
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
@@ -915,6 +918,47 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
+        ctx_worker_config = build_worker_config(config, ctx_servers,
+                                                disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers,
+                                                disagg_cluster)
+        if prepare_fmha_metadata and get_sm_version() in (100, 103):
+            prepared_caches = set()
+            for worker_config, ranks, worker_env in (
+                (ctx_worker_config, gpus_per_ctx, ctx_env or env),
+                (gen_worker_config, gpus_per_gen, gen_env or env),
+            ):
+                worker_env = worker_env or os.environ
+                if (ranks != 1 or worker_config.get(
+                        "cache_transceiver_config",
+                    {}).get("transceiver_runtime") != "PYTHON"):
+                    continue
+                # Managed MPI workspaces select their cache after spawning.
+                if (not worker_env.get("FLASHINFER_CUBIN_DIR") and
+                    (worker_env.get("TRTLLM_CACHE_DIR")
+                     or worker_env.get("TRTLLM_FLASHINFER_WORKSPACE_MANAGED")
+                     == "1")):
+                    continue
+                cache_key = tuple(
+                    (key, value) for key, value in sorted(worker_env.items())
+                    if key.startswith("FLASHINFER_") or key in (
+                        "HOME", "PATH", "PYTHONPATH", "TRTLLM_CACHE_DIR"))
+                if cache_key in prepared_caches:
+                    continue
+                # Both single-rank workers must see verified metadata before
+                # either starts warming up against their shared cold cache.
+                check_call([
+                    "python3", "-c",
+                    "from flashinfer.jit.attention import gen_trtllm_gen_fmha_module; "
+                    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
+                    "print(f'Preparing FMHA metadata in {FLASHINFER_CUBIN_DIR}', flush=True); "
+                    "gen_trtllm_gen_fmha_module()"
+                ],
+                           env=worker_env,
+                           cwd=cwd,
+                           timeout=server_start_timeout)
+                prepared_caches.add(cache_key)
+
         server_config = {
             "hostname":
             server_host,
@@ -962,10 +1006,9 @@ def setup_disagg_cluster(
                 cluster_uri=f"http://{server_host}:{server_port}")
 
         # Build worker configs and launch workers
-        ctx_worker_config = build_worker_config(config, ctx_servers,
-                                                disagg_cluster)
-        gen_worker_config = build_worker_config(config, gen_servers,
-                                                disagg_cluster)
+        # The server may have selected a port after metadata preparation.
+        ctx_worker_config["disagg_cluster"] = disagg_cluster
+        gen_worker_config["disagg_cluster"] = disagg_cluster
         ctx_worker_config[
             "internal_request_auth_key"] = internal_request_auth_key
         gen_worker_config[
@@ -1149,9 +1192,10 @@ def run_disaggregated_test(example_dir,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
-    after the client tests, at least one worker of each specified role must log its substring
-    (used to prove an intended code path actually engaged instead of silently falling back).
+    If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
+    worker logs are captured and, after the client tests, at least one worker of each specified
+    role must log each substring (used to prove an intended code path actually engaged instead of
+    silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1181,7 +1225,10 @@ def run_disaggregated_test(example_dir,
                              perf_metrics_output_dir=perf_metrics_output_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
                              share_gpu=share_gpu,
-                             config_overrides=config_overrides)
+                             config_overrides=config_overrides,
+                             prepare_fmha_metadata=test_desc in (
+                                 "overlap_transceiver_runtime_python",
+                                 "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
 
@@ -1219,11 +1266,11 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        for role, workers, marker in (
+        for role, workers, markers in (
             ("context", ctx_workers, assert_ctx_log_contains),
             ("generation", gen_workers, assert_gen_log_contains),
         ):
-            if marker is None:
+            if markers is None:
                 continue
             # Fail loudly if the marker is absent: the code path the test means to
             # exercise never ran and something else silently took its place.
@@ -1232,10 +1279,12 @@ def run_disaggregated_test(example_dir,
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(marker in log for log in logs), (
-                f"expected marker {marker!r} in a {role}-worker log, "
-                f"but none of {len(logs)} log(s) contained it "
-                f"(the intended code path did not engage)")
+            for marker in ((markers, )
+                           if isinstance(markers, str) else markers):
+                assert any(marker in log for log in logs), (
+                    f"expected marker {marker!r} in a {role}-worker log, "
+                    f"but none of {len(logs)} log(s) contained it "
+                    f"(the intended code path did not engage)")
         success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -2187,16 +2236,49 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
+    """Attention DP with the overlap scheduler and the servers' scheduling fields.
+
+    A long prompt reaches the generation workers trimmed to its tail and must still be answered.
+    """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           num_iters=1,
-                           env=llm_venv._new_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=1200)
+    def trimmed_prompt_answer(server_url):
+        import requests
+
+        with open(
+                f"{disaggregated_example_root}/clients/long_prompts.json") as f:
+            prompt = json.load(f)[0]
+        # Longer than gen_prompt_tail_tokens: the generation workers get only its tail.
+        prompt += ("\n\nQuestion: What is the capital of Germany?\n"
+                   "Answer: The capital of Germany is")
+        response = requests.post(f"{server_url}/v1/completions",
+                                 json={
+                                     "model": "DeepSeek-V3-Lite/fp8",
+                                     "prompt": prompt,
+                                     "max_tokens": 8,
+                                     "temperature": 0
+                                 },
+                                 timeout=600)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["usage"]["prompt_tokens"] > 256, result["usage"]
+        text = result["choices"][0]["text"]
+        assert "berlin" in text.lower(), text
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp_8_attention_dp_overlap",
+        num_iters=1,
+        env=llm_venv._new_env,
+        gen_env={"TLLM_LOG_LEVEL": "INFO"},
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200,
+        post_client_test=trimmed_prompt_answer,
+        assert_gen_log_contains=(
+            "max_gen_init_admissions_per_pass=1",
+            "prompt tail trimming: first trimmed request sends 256"))
 
 
 @skip_no_hopper

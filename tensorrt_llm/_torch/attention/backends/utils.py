@@ -87,6 +87,8 @@ def create_attention(
     skip_correction_threshold: float = 0.0,
     gqa_decode: Optional["GqaDecodeSetup"] = None,
     cache_context_plan: bool = False,
+    context_fmha_head_dim_per_stage_kv: int = 0,
+    context_last_rows_only: bool = False,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -125,6 +127,8 @@ def create_attention(
         skip_correction_threshold=skip_correction_threshold,
         gqa_decode=gqa_decode,
         cache_context_plan=cache_context_plan,
+        context_fmha_head_dim_per_stage_kv=context_fmha_head_dim_per_stage_kv,
+        context_last_rows_only=context_last_rows_only,
     )
 
     return attn_cls(

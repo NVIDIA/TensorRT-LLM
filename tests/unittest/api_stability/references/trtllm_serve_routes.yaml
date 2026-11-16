@@ -619,6 +619,7 @@ configs:
     - POST /select APIRoute
     - POST /finish APIRoute
     - POST /renew APIRoute
+    - POST /output_length APIRoute
     - GET /cluster_info APIRoute
     - GET /health APIRoute
     - GET /version APIRoute
@@ -632,6 +633,7 @@ configs:
     - POST /select APIRoute
     - POST /finish APIRoute
     - POST /renew APIRoute
+    - POST /output_length APIRoute
     - GET /cluster_info APIRoute
     - GET /health APIRoute
     - GET /version APIRoute

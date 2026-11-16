@@ -277,6 +277,9 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
+                self.count_current_block_in_topk,
+                self.fixed_query_len,
             )
         else:
             self.metadata_run(
@@ -292,6 +295,9 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
+                self.count_current_block_in_topk,
+                self.fixed_query_len,
             )
 
 
@@ -1128,9 +1134,13 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
-    # run_*_query_major entry points, so every profile keeps page-byte masks.
-    query_major_memberships = False
+    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+    # Other profiles and the standalone metadata API retain page-byte masks.
+    query_major_memberships = (
+        sparse_block_size == 4
+        and spec.config.use_fp8_qkv
+        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
+    )
     if query_major_memberships:
         page_capacity = (page_capacity + 31) // 32 * 32
     membership_words = (
@@ -1501,6 +1511,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
+            count_current_block_in_topk,
+            0,
         )
     else:
         metadata_module.run_fixed(
@@ -1516,6 +1529,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
+            count_current_block_in_topk,
+            0,
         )
     return outputs
 
@@ -1914,9 +1930,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         ),
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
         direct_q1_fixed_query_len=fixed_query_len,
-        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
-        # locator_head_multiplier argument and head-stride-1 locators only.
-        allow_head_aware_locators=False,
+        allow_head_aware_locators=group_size > 1,
         softmax_scale=scale_qk,
         output_scale=scale_v,
     )
@@ -2287,11 +2301,6 @@ def _validate_inputs(
     fixed_query_len: int = 0,
 ) -> None:
     """Validate tensor structure without copying live metadata values to the host."""
-    if count_current_block_in_topk is not True or fixed_query_len != 0:
-        raise ValueError(
-            "The installed metadata extension requires count_current_block_in_topk=True "
-            "and explicit token_to_request/query_positions tensors"
-        )
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     for name, tensor in (
         ("block_indices", block_indices),
