@@ -515,9 +515,9 @@ class KvCacheConnectorScheduler(ABC):
     #:   `update_state_after_alloc` in between, which is how a deferred first
     #:   chunk gives its pages back.
     #: A request asked at admission can still be dropped before
-    #: `prepare_resources` -- by the disaggregated benchmark gate, batch waiting
+    #: `prepare_resources` (by the disaggregated benchmark gate, batch waiting
     #: for generation requests, the total-KV cap, the multimodal scheduler
-    #: wrapper, or a batch that cannot be queued -- and is then asked again on a
+    #: wrapper, or a batch that cannot be queued) and is then asked again on a
     #: later iteration. A connector that starts a transfer inside
     #: `get_num_new_matched_tokens` must not declare it. Read from the class,
     #: so every tensor-parallel rank agrees.

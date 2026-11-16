@@ -1241,7 +1241,7 @@ class TestAdmissionQuery:
 
 
 class TestAdmissionGrow:
-    """``cover_admission_offer``: an admission-time offer past the chunk gets its pages before later admissions."""
+    """`cover_admission_offer`: an admission-time offer past the chunk gets its pages before later admissions."""
 
     @staticmethod
     def _asked(num_matched=128, grow_ok=True, capacity=64, chunk=64, scratch_reuse=False):

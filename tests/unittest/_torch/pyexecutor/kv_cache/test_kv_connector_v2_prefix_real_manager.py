@@ -1363,6 +1363,8 @@ def test_skipped_generation_retains_pages_and_mooncake_save_ownership(
         assert not manager._retained_generation_allocations
     finally:
         manager.shutdown()
+
+
 # -- admission-time connector queries ----------------------------------------------
 
 

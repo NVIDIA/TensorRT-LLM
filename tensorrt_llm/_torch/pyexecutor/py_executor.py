@@ -6191,9 +6191,9 @@ class PyExecutor:
             self) -> Optional[KVCacheV2Scheduler]:
         """Find the scheduler that runs admission-time connector queries.
 
-        ``kv_connector_config.admission_query`` is ignored, with a warning,
+        `kv_connector_config.admission_query` is ignored, with a warning,
         where the connector cannot be asked at admission. Read through
-        ``getattr`` because executors built without ``__init__`` reach this.
+        `getattr` because executors built without `__init__` reach this.
 
         Returns:
             The KVCacheV2Scheduler, under any wrapper, when admission queries
@@ -6236,7 +6236,7 @@ class PyExecutor:
         return scheduler
 
     def _find_kv_cache_v2_scheduler(self) -> Optional[KVCacheV2Scheduler]:
-        """The KVCacheV2Scheduler itself or under wrappers that keep it as ``.scheduler``."""
+        """The KVCacheV2Scheduler itself or under wrappers that keep it as `.scheduler`."""
         scheduler = getattr(self, "scheduler", None)
         # Wrappers nest one or two deep; the bound only stops a cycle.
         for _ in range(8):

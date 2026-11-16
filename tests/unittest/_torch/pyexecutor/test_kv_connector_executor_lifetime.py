@@ -819,7 +819,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
 
 
 def _prepare_batch_executor(monkeypatch, parked_ids) -> PyExecutor:
-    """An executor whose connector parks ``parked_ids``, as take_scheduled_requests_pending_load does."""
+    """An executor whose connector parks `parked_ids`, as take_scheduled_requests_pending_load does."""
     executor = _executor()
     connector = executor.kv_connector_manager
 
@@ -850,7 +850,7 @@ def _admission_config(max_uncharged_parks: int = 2) -> SimpleNamespace:
 
 
 def _admission_executor(scheduler) -> PyExecutor:
-    """An executor whose connector can be asked at admission, with ``scheduler`` installed."""
+    """An executor whose connector can be asked at admission, with `scheduler` installed."""
     executor = _executor()
     executor._kv_connector_config = _admission_config()
     executor.kv_connector_manager.admission_query_capable = True

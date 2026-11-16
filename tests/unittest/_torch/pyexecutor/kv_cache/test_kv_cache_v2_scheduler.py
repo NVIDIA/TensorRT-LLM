@@ -6559,7 +6559,7 @@ class TestConnectorAdmission:
 
     @staticmethod
     def _parking_manager(parked_ids, calls=None):
-        """A manager whose connector parks exactly ``parked_ids`` when asked at admission."""
+        """A manager whose connector parks exactly `parked_ids` when asked at admission."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
 
         def query(req):
@@ -6783,7 +6783,7 @@ class TestConnectorAdmission:
         mgr.cover_admission_offer.assert_not_called()
 
     def test_zero_parks_still_books_pages(self):
-        """``admission_query: {}``: the connector is asked and the offer's pages are booked,
+        """`admission_query: {}`: the connector is asked and the offer's pages are booked,
         but every chunk keeps its charge."""
         mgr = self._parking_manager({0})
         sched = self._scheduler(mgr, parks=0)

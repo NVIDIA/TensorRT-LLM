@@ -3549,7 +3549,7 @@ class KvCacheConnectorAdmissionConfig(StrictBaseModel):
     """Admission-time connector queries for the KVCacheManagerV2 scheduler.
 
     The scheduler asks a connector that declares
-    ``KvCacheConnectorScheduler.supports_admission_query`` for its prefix while
+    `KvCacheConnectorScheduler.supports_admission_query` for its prefix while
     it admits a first context chunk, once the chunk is sized and its pages are
     allocated, and books the pages a shifting offer needs at that point.
     """
