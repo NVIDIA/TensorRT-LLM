@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor, is_torch_compiling
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
@@ -48,10 +48,18 @@ from .params import (
 # GB300, cold L2: the dense CuTe DSL GEMM beats every native config of O-B (5120 x 8192) from
 # 384 rows; below, a native config is faster.
 _DENSE_O_B_MIN_ROWS = 384
+# Fused decode steps of up to 64 rows prefetch the O-A / O-B weights into L2 on a side stream, from
+# one-warp CTAs on the SMs the decode leaves free (SM100/SM103).
+_PREFETCH_OUTPUT_MAX_ROWS = 64
+_PREFETCH_OUTPUT_CTAS = 8
+# 24 us: a CTA stops issuing then, so a prefetch that gets its SMs late never outlasts O-B.
+_PREFETCH_OUTPUT_BUDGET_NS = 24000
+# The fused decode splits a step's tokens over at most this many CTAs each (kMaxCombineSplits).
+_DECODE_MAX_SPLITS = 8
 
 # 8-column tiles per CTA of the small-M Q-A + KV and Q-B projections of full 16-row steps: half the
-# CTAs, each loading the step's rows once for both (the same bits). Smaller steps keep one tile per
-# CTA, whose extra CTAs keep more weight loads in flight.
+# CTAs, each loading the step's rows once for both (the same bits). Smaller steps take
+# ``lowm_tiles``; one tile per CTA above 8 rows keeps more weight loads in flight.
 _LOWM_QUERY_TILES = 2
 _LOWM_TWO_TILE_MIN_ROWS = 16
 
@@ -59,7 +67,9 @@ _LOWM_TWO_TILE_MIN_ROWS = 16
 def _lowm_tiles(n: int, rows: int) -> int:
     if rows >= _LOWM_TWO_TILE_MIN_ROWS and n % (8 * _LOWM_QUERY_TILES) == 0:
         return _LOWM_QUERY_TILES
-    return 1
+    from tensorrt_llm._torch.modules.low_m_gemm import lowm_tiles
+
+    return lowm_tiles(n, rows)
 
 
 # Per (device, stream): the fused context kernel's O-A input buffers, grown to the largest forward.
@@ -190,7 +200,10 @@ class DeepseekV41Attention(nn.Module):
         self._descriptors_done = torch.cuda.Event() if aux_stream is not None else None
         self._query_done = torch.cuda.Event() if aux_stream is not None else None
         self._touch_done = torch.cuda.Event() if aux_stream is not None else None
+        self._qkv_done = torch.cuda.Event() if aux_stream is not None else None
+        self._rows_done = torch.cuda.Event() if aux_stream is not None else None
         self._touch_sink = None
+        self._prefetch_events = None
         self._overlap_query_kv = True
         self._fuse_index_q = sparse_params.fuse_index_q
         if sparse_params.fuse_packed_output_rope and pos_embd_params.is_neox:
@@ -513,7 +526,11 @@ class DeepseekV41Attention(nn.Module):
         late_stream: torch.cuda.Stream | None = None,
         fp8_query: _FP8Query | None = None,
         prequantized: MxFp8QuantizedTensor | None = None,
+        swa_ready: torch.cuda.Event | None = None,
+        smem_carveout: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``(qr, q, swa)``; ``swa_ready`` is recorded right after a small decode step's Q-A + KV
+        projection (``_lowm_projects_qkv``); ``smem_carveout``: of the small-M GEMMs."""
         if not decode_only and self._can_fuse_prefill_projection(hidden_states):
             return self._project_prefill_query_and_swa(hidden_states)
         if (
@@ -532,9 +549,17 @@ class DeepseekV41Attention(nn.Module):
                 split_n=self.wq_a.weight.shape[0],
                 scale_swizzled=True,
                 n_tiles=_lowm_tiles(self._fused_qkv_weight.shape[0], hidden_states.shape[0]),
+                smem_carveout=smem_carveout,
             )
+            if swa_ready is not None:
+                swa_ready.record()
             return self._project_decode_query(
-                latent, swa, query_stream, late_stream=late_stream, fp8_query=fp8_query
+                latent,
+                swa,
+                query_stream,
+                late_stream=late_stream,
+                fp8_query=fp8_query,
+                smem_carveout=smem_carveout,
             )
         fused = decode_only and hidden_states.shape[0] > 0 and self.takes_mxfp8_input
         if not fused:
@@ -587,6 +612,7 @@ class DeepseekV41Attention(nn.Module):
             query_stream,
             late_stream=late_stream,
             fp8_query=fp8_query,
+            smem_carveout=smem_carveout,
         )
 
     def _project_decode_query(
@@ -597,6 +623,7 @@ class DeepseekV41Attention(nn.Module):
         *,
         late_stream: torch.cuda.Stream | None,
         fp8_query: _FP8Query | None,
+        smem_carveout: int = 0,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         """``(qr, q, swa)`` of a decode step from its Q-A latent, on ``query_stream`` if given."""
         from .query_projection import fp8_query_single_tile_row
@@ -621,6 +648,7 @@ class DeepseekV41Attention(nn.Module):
                 tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
                 late_stream=late_stream,
                 fp8_query=fp8_query,
+                smem_carveout=smem_carveout,
             )
         return qr, q, swa
 
@@ -753,6 +781,7 @@ class DeepseekV41Attention(nn.Module):
         tune: bool,
         late_stream: torch.cuda.Stream | None = None,
         fp8_query: _FP8Query | None = None,
+        smem_carveout: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return ``(qr, q)``; ``q`` is None once ``fp8_query`` received the projection."""
         rank = latent.shape[1]
@@ -828,6 +857,7 @@ class DeepseekV41Attention(nn.Module):
                         (self.q_norm.weight, self.q_norm.variance_epsilon) if norm_in_q_b else None
                     ),
                     n_tiles=_lowm_tiles(self.wq_b.weight.shape[0], latent.shape[0]),
+                    smem_carveout=smem_carveout,
                 )
             elif fused:
                 q = mxfp8_query_gemm(
@@ -943,6 +973,39 @@ class DeepseekV41Attention(nn.Module):
         l2_touch((self.o_a_proj, linear.weight, linear.weight_scale), self._touch_sink)
         self._touch_done.record()
         return True
+
+    def _output_prefetch_ctas(self, rows: int) -> int:
+        """CTAs of the O-A/O-B weight prefetch beside a fused decode of ``rows`` rows (0: none)."""
+        weights = (self.o_a_proj, self.o_b_proj.weight)
+        if not (
+            0 < rows <= _PREFETCH_OUTPUT_MAX_ROWS
+            and is_blackwell_datacenter()
+            # The prefetch moves 128x128-byte boxes.
+            and all(
+                w.dtype == torch.float8_e4m3fn
+                and w.is_contiguous()
+                and w.shape[-1] % 128 == 0
+                and w.numel() // w.shape[-1] % 128 == 0
+                for w in weights
+            )
+        ):
+            return 0
+        sms = torch.cuda.get_device_properties(weights[0].device).multi_processor_count
+        # The decode CTAs need whole SMs and take at most this many.
+        return max(0, min(_PREFETCH_OUTPUT_CTAS, sms - min(_DECODE_MAX_SPLITS, sms // rows) * rows))
+
+    def _prefetch_output_weights(self, ctas: int) -> None:
+        """Prefetch the O-A and O-B weights into L2 on a side stream from the fused decode's launch
+        (``_prefetch_events[0]``, recorded by the backend) on; O-B joins ``_prefetch_events[1]``."""
+        from .projection import prefetch_output_weights
+
+        decode_start, done = self._prefetch_events
+        with torch.cuda.stream(csa2_side_stream(self.o_a_proj.device, 2)):
+            decode_start.wait()
+            prefetch_output_weights(
+                self.o_a_proj, self.o_b_proj.weight, ctas, _PREFETCH_OUTPUT_BUDGET_NS
+            )
+            done.record()
 
     def _q_amax_word(self, device: torch.device) -> torch.Tensor | None:
         """The int32 word Q's producer raises to Q's amax bits; staging consumes and clears it."""
@@ -1079,6 +1142,34 @@ class DeepseekV41Attention(nn.Module):
             index_weights = self._project_index_weights(hidden_states)
         return index_weights, main_kv, index_k
 
+    def _publish_rows(self, attn_metadata, swa, positions, compressed_positions, auxiliary) -> None:
+        """Publish the entered layer's SWA (and a Full layer's global) rows on a side stream after
+        Q-A + KV (``_qkv_done``) and the compressor (``_prepare_done``); ``_rows_done`` follows."""
+        _, main_kv, index_k = auxiliary
+        stream = csa2_side_stream(swa.device, 4)
+        with torch.cuda.stream(stream):
+            self._qkv_done.wait()
+            if self.layer.mode == CSA2Mode.FULL:
+                self._prepare_done.wait()
+            for tensor in (swa, positions, compressed_positions, main_kv, index_k):
+                if tensor is not None:
+                    tensor.record_stream(stream)
+            main_transform, index_transform = self.global_transforms(compressed_positions)
+            self.backend.publish_layer_rows(
+                CSA2ForwardState(
+                    metadata=attn_metadata,
+                    swa_kv=swa,
+                    main_kv=main_kv,
+                    index_k=index_k,
+                    swa_transform=self._row_transform(
+                        positions, norm=(self.kv_norm.weight, self.kv_norm.variance_epsilon)
+                    ),
+                    main_transform=main_transform,
+                    index_transform=index_transform,
+                )
+            )
+            self._rows_done.record()
+
     def _project_index_weights(self, hidden_states):
         projected = bf16_projection(self.index_weights_proj, hidden_states)
         # One launch for ``(projected * scale).to(dtype)``, bit for bit.
@@ -1088,6 +1179,21 @@ class DeepseekV41Attention(nn.Module):
             out=torch.empty(
                 projected.shape, dtype=self._index_weight_dtype, device=projected.device
             ),
+        )
+
+    def _packs_index_q(self, rows: int, positions: torch.Tensor) -> bool:
+        """Whether the index-query projection of a decode-graph step of ``rows`` rows packs the
+        queries as the cache write would (``mxfp8_lowm_index_query``), off the index chain."""
+        return (
+            self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
+            and not self._fuse_index_q
+            and not self.mapping.enable_attention_dp
+            and is_blackwell_datacenter()
+            and not self.rotary_emb.is_neox
+            and self.index_head_dim == 128
+            and self.qk_rope_head_dim == 64
+            and positions.dtype == torch.int32
+            and self._lowm_projects(self.index_wq_b, rows)
         )
 
     def _project_index_q(self, qr, positions):
@@ -1117,6 +1223,16 @@ class DeepseekV41Attention(nn.Module):
                 self._fp8_alpha,
             )
             return packed.view(-1, self.index_heads, 64), scale.view(-1, self.index_heads)
+        if self._packs_index_q(qr.shape[0], positions):
+            from tensorrt_llm._torch.modules.low_m_gemm import mxfp8_lowm_index_query
+
+            return mxfp8_lowm_index_query(
+                qr.contiguous(),
+                self.index_wq_b.weight,
+                self.index_wq_b.weight_scale,
+                positions,
+                self.rotary_emb.rotary_cos_sin.view(-1, 2, self.qk_rope_head_dim // 2),
+            )
         if (
             self._lowm_projects(self.index_wq_b, qr.shape[0])
             and not self.rotary_emb.is_neox
@@ -1159,12 +1275,12 @@ class DeepseekV41Attention(nn.Module):
             and (depth // default_k_warps(depth)) % self.qk_head_dim == 0
         )
 
-    def _project_output_small_m(self, output, positions):
-        """O-A with inverse RoPE fused, then O-B, for a small step; None when not applicable."""
+    def _small_m_o_a_fits(self, output, positions) -> bool:
+        """Whether ``_project_output_small_m`` projects ``output``."""
         rows = output.shape[0]
         positions = positions.reshape(-1)
         groups, rank, depth = self.o_a_proj.shape
-        if not (
+        return (
             self._small_m(rows)
             and self.o_a_proj.dtype == torch.float8_e4m3fn
             and self.o_a_proj_scale is not None
@@ -1177,7 +1293,40 @@ class DeepseekV41Attention(nn.Module):
             and positions.dtype == torch.int32
             and positions.numel() == rows
             and positions.is_contiguous()
-        ):
+        )
+
+    def _rope_tables_match(self) -> bool:
+        """Whether the inverse RoPE's table is the forward one (one shared tensor), whose
+        coefficients the direct decode holds."""
+        table, inverse = self.rotary_emb.rotary_cos_sin, self.inverse_rotary_emb.rotary_cos_sin
+        return (table.data_ptr(), table.shape, table.stride()) == (
+            inverse.data_ptr(),
+            inverse.shape,
+            inverse.stride(),
+        )
+
+    def _o_a_takes_rotated_back(self, output, positions) -> bool:
+        """Whether the direct decode writes ``output`` rotated back for an O-A on the small-M
+        warp-MMA kernel, which then skips its inverse RoPE on load (SM100/SM103)."""
+        return (
+            is_blackwell_datacenter()
+            and self.projection_quantization != "bf16"
+            and self._o_a_fp8_block128
+            and output.dtype == torch.bfloat16
+            and self._small_m_o_a_fits(output, positions)
+            and self._lowm_o_a(output.shape[0])
+            and self._rope_tables_match()
+        )
+
+    def _project_output_small_m(self, output, positions, rotated_back: bool = False):
+        """O-A with inverse RoPE fused (unless the output is ``rotated_back`` already), then O-B,
+        for a small step; None when not applicable."""
+        rows = output.shape[0]
+        positions = positions.reshape(-1)
+        groups, rank, depth = self.o_a_proj.shape
+        if not self._small_m_o_a_fits(output, positions):
+            if rotated_back:
+                raise ValueError("CSA2 rotated-back attention output needs the small-M O-A")
             return None
         from .projection import (
             inverse_rope_block128_small_m,
@@ -1197,26 +1346,52 @@ class DeepseekV41Attention(nn.Module):
             and not (linear.reduce_output and linear.use_fused_gemm_allreduce)
         )
         if output.dtype == torch.bfloat16 and self._lowm_o_a(rows):
-            from tensorrt_llm._torch.modules.low_m_gemm import fp8_grouped_lowm, mxfp8_lowm_linear
+            from tensorrt_llm._torch.modules.low_m_gemm import (
+                fp8_grouped_lowm,
+                lowm_tiles,
+                mxfp8_lowm_linear,
+            )
 
-            # Both kernels load their weights before the PDL wait: O-B's stream in under O-A.
+            projects = quantize and self._lowm_projects(linear, rows)
+            # A boundary that takes O-B is released after the decode: its weights come from L2 (its
+            # entry boundary prefetched them), and its loads beside the decode would slow it.
+            defers = bool(
+                projects
+                and getattr(self, "defer_ob_to_boundary", False)
+                and not linear.reduce_output
+            )
+            # Otherwise both kernels load their weights before the PDL wait: O-B's stream in under O-A.
             latent = fp8_grouped_lowm(
                 output.reshape(rows, -1).contiguous(),
                 self.o_a_proj.view(groups * rank, depth),
                 self.o_a_proj_scale.view(groups * rank // 128, depth // 128),
                 rank,
-                inverse_rope=(
+                inverse_rope=None
+                if rotated_back
+                else (
                     positions,
                     self.inverse_rotary_emb.rotary_cos_sin.view(-1, 2, self.qk_rope_head_dim // 2),
                     self.qk_head_dim,
                 ),
+                n_tiles=lowm_tiles(groups * rank, rows, rank),
+                release_after_wait=defers,
             )
-            if not (quantize and self._lowm_projects(linear, rows)):
+            if not projects:
                 return linear(latent)
+            if defers:
+                from tensorrt_llm._torch.modules.low_m_gemm import mxfp8_linear_scale
+                from tensorrt_llm._torch.modules.mhc.mhc_lowm import defer_ob_projection
+
+                # The all-reduce boundary that follows runs this projection in its own launch.
+                deferred = defer_ob_projection(latent, linear.weight, mxfp8_linear_scale(linear))
+                if deferred is not None:
+                    return deferred
             projected = mxfp8_lowm_linear(
                 latent, linear.weight, linear.weight_scale, scale_swizzled=True
             )
             return linear.all_reduce(projected) if linear.reduce_output else projected
+        if rotated_back:
+            raise ValueError("CSA2 rotated-back attention output needs the small-M O-A")
         o_lora = inverse_rope_block128_small_m(
             output.reshape(rows, -1),
             positions,
@@ -1326,7 +1501,14 @@ class DeepseekV41Attention(nn.Module):
         return projected
 
     def _project_output(
-        self, output, positions, *, inverse_rope_applied: bool = False, prequantized=None, out=None
+        self,
+        output,
+        positions,
+        *,
+        inverse_rope_applied: bool = False,
+        prequantized=None,
+        out=None,
+        rotated_back: bool = False,
     ):
         if prequantized is not None:
             projected = self._project_prequantized_output(*prequantized, out=out)
@@ -1335,6 +1517,8 @@ class DeepseekV41Attention(nn.Module):
             return project_sparse_attn_output(
                 self, [output.flatten(1)], positions, prequantized=prequantized
             )
+        if rotated_back:
+            return self._project_output_small_m(output, positions, rotated_back=True)
         if self._o_a_fp8_block128 and inverse_rope_applied:
             raise ValueError("Grouped 128-block FP8 owns its fused inverse-RoPE/quantization")
         if self.projection_quantization == "bf16":
@@ -1644,7 +1828,25 @@ class DeepseekV41Attention(nn.Module):
                 hidden_states.shape[0], 0, pad_up(extra_width, 128), hidden_states.device
             )
         )
+        # The query projections overlap the decode they release; at its split they can share SMs.
+        projection_carveout = (
+            self.backend.direct_decode_carveout(pad_up(extra_width, 128), hidden_states.device)
+            if direct and query_overlap
+            else 0
+        )
         gen_fmha = self._gen_fmha_decode(hidden_states.shape[0], attn_metadata)
+        # A small direct-decode step whose index-query projection packs the queries publishes the
+        # layer's cache rows off the index chain (``_publish_rows``).
+        publish_rows = (
+            late_query
+            and direct
+            and hidden_states.dtype == torch.bfloat16
+            and self._lowm_projects_qkv(hidden_states.shape[0])
+            and self._packs_index_q(hidden_states.shape[0], positions)
+        )
+        if publish_rows:
+            # On this stream: a slot resolution it may launch precedes the side stream's fork.
+            attn_metadata.enter_layer(self.layer)
         quant_q = q_amax = None
         unit_q = touched = False
         if fused_query:
@@ -1692,7 +1894,11 @@ class DeepseekV41Attention(nn.Module):
                 late_stream=self.aux_stream if late_query else None,
                 fp8_query=fp8_query,
                 prequantized=hidden_states_mxfp8,
+                swa_ready=self._qkv_done if publish_rows else None,
+                smem_carveout=projection_carveout,
             )
+            if publish_rows:
+                self._publish_rows(attn_metadata, swa, positions, compressed_positions, auxiliary)
             if fp8_query is not None and fp8_query.applied:
                 # Staging reads only the E4M3 Q; this BF16 Q keeps the shapes and is never read.
                 quant_q = fp8_query.quant_q
@@ -1714,6 +1920,8 @@ class DeepseekV41Attention(nn.Module):
                 self._prepare_done.record()
                 touched = self._touch_output_weights(q.shape[0])
             elif late_query:
+                if publish_rows:
+                    self._rows_done.wait()
                 self._query_done.record()
         if query_overlap or late_query:
             q.record_stream(torch.cuda.current_stream(hidden_states.device))
@@ -1732,6 +1940,9 @@ class DeepseekV41Attention(nn.Module):
             # The cache write needs the compressor's rows (and the index weights unless they
             # were split onto the second side stream, which the indexer joins: ``index_ready``).
             self._prepare_done.wait()
+            if publish_rows and self.layer.mode == CSA2Mode.FULL:
+                # The indexer scores this step's index rows.
+                self._rows_done.wait()
             current = torch.cuda.current_stream(hidden_states.device)
             for tensor in auxiliary:
                 if tensor is not None:
@@ -1801,6 +2012,14 @@ class DeepseekV41Attention(nn.Module):
                 positions.reshape(-1),
                 self.inverse_rotary_emb.rotary_cos_sin,
             )
+        prefetch_ctas = (
+            self._output_prefetch_ctas(q.shape[0])
+            if output_mxfp8 is not None and not gen_fmha and self.backend.fused_decode
+            else 0
+        )
+        if prefetch_ctas and self._prefetch_events is None:
+            self._prefetch_events = (torch.cuda.Event(), torch.cuda.Event())
+        rotated_back = direct and self._o_a_takes_rotated_back(q, positions)
         state = CSA2ForwardState(
             metadata=attn_metadata,
             swa_kv=swa,
@@ -1820,6 +2039,9 @@ class DeepseekV41Attention(nn.Module):
             output_fp8=output_fp8,
             output_mxfp8=output_mxfp8,
             query_rope=(positions.reshape(-1), self.rotary_emb.rotary_cos_sin) if direct else None,
+            output_rope=rotated_back,
+            decode_start=self._prefetch_events[0] if prefetch_ctas else None,
+            rows_published=publish_rows,
         )
         if unit_q and output_fp8 is not None:
             # The fused context kernel writes the O-A input instead of the BF16 output.
@@ -1893,6 +2115,8 @@ class DeepseekV41Attention(nn.Module):
                 compute(tile.flatten(1), metadata, args)
             else:
                 self.backend.forward(tile.flatten(1), None, None, metadata, forward_args=args)
+        if prefetch_ctas:
+            self._prefetch_output_weights(prefetch_ctas)
         if state.output_fp8_written:
             projected = self._project_output(
                 output, positions, prequantized=output_fp8[:2], out=out
@@ -1907,10 +2131,15 @@ class DeepseekV41Attention(nn.Module):
             if output.stride(0) == 0:
                 raise RuntimeError("CSA2 fused context kernel did not write the O-A input")
             projected = self._project_output(
-                output, positions, inverse_rope_applied=inverse_rope_applied
+                output,
+                positions,
+                inverse_rope_applied=inverse_rope_applied,
+                rotated_back=rotated_back,
             )
             if touched:
                 torch.cuda.current_stream(hidden_states.device).wait_event(self._touch_done)
+        if prefetch_ctas:
+            torch.cuda.current_stream(hidden_states.device).wait_event(self._prefetch_events[1])
         if out is None or projected is out:
             return projected
         return out.copy_(projected)

@@ -43,7 +43,16 @@ def _test_pools(swa, main, index):
         store_rows(main[owner], slots, values, "main", main_transform)
         store_index_rows(index[owner], slots, keys, index_transform)
 
-    def write_layer_rows(layer, slots, values, transform=None, *, global_rows=None, index_q=None):
+    def write_layer_rows(
+        layer,
+        slots,
+        values,
+        transform=None,
+        *,
+        global_rows=None,
+        index_q=None,
+        release_after_wait=False,
+    ):
         store_rows(swa[layer], slots, values, "swa", transform)
         if global_rows is not None:
             write_global(*global_rows)

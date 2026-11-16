@@ -3945,11 +3945,12 @@ def _cache_kernels():
         quantization groups reduce with butterfly shuffles.
         """
 
-        def __init__(self, jobs, pdl: bool = False):
+        def __init__(self, jobs, pdl: bool = False, release_after_wait: bool = False):
             if not 1 <= len(jobs) <= _MAX_QUANTIZE_JOBS:
                 raise ValueError("A CSA2 quantize launch takes one to four jobs")
             self.jobs = tuple(jobs)
             self.pdl = pdl
+            self.release_after_wait = release_after_wait
             self.threads = max(job.threads for job in self.jobs)
             # A norm row wider than a warp reduces through ``partial`` and a CTA barrier, so it
             # cannot share its CTA with other rows.
@@ -4147,7 +4148,7 @@ def _cache_kernels():
         ):
             cta, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
-            pdl_prologue(self.pdl, False)
+            pdl_prologue(self.pdl, self.release_after_wait)
             smem = SmemAllocator()
             partial = smem.allocate_tensor(
                 Float32, cute.make_layout(max(self.threads // 32, 1)), 16
@@ -4529,8 +4530,8 @@ def _cache_kernels():
 
         THREADS = 256
 
-        def __init__(self, jobs, pdl: bool = False):
-            super().__init__(jobs, pdl)
+        def __init__(self, jobs, pdl: bool = False, release_after_wait: bool = False):
+            super().__init__(jobs, pdl, release_after_wait)
             if any(job.head_dim not in (128, 512) for job in self.jobs):
                 raise ValueError("QuantizeScatterVecKernel takes 128- or 512-channel rows")
             self.threads = self.THREADS
@@ -7486,8 +7487,9 @@ def split_job(values: torch.Tensor, data: torch.Tensor, scales: torch.Tensor) ->
     )
 
 
-def quantize_scatter_jobs(jobs) -> None:
-    """Run up to four quantize jobs (``None`` entries skipped) as one launch."""
+def quantize_scatter_jobs(jobs, *, release_after_wait: bool = False) -> None:
+    """Run up to four quantize jobs (``None`` entries skipped) as one launch; with
+    ``release_after_wait`` (under PDL) the next kernel may launch right after its wait."""
     jobs = [job for job in jobs if job is not None]
     if not jobs:
         return
@@ -7510,14 +7512,15 @@ def quantize_scatter_jobs(jobs) -> None:
             job.eps,
         ]
     pdl = _pdl()
+    release = pdl and release_after_wait
     vec = (
         all(job.vec_ok for job in jobs)
         and sum(job.rows * job.spec.head_dim for job in jobs) >= _QUANTIZE_VEC_MIN_ELEMENTS
     )
     kernel = ns.QuantizeScatterVecKernel if vec else ns.QuantizeScatterKernel
     _launch(
-        ("quantize", vec, tuple(job.spec for job in jobs), pdl, device.index),
-        lambda: kernel([job.spec for job in jobs], pdl),
+        ("quantize", vec, tuple(job.spec for job in jobs), pdl, release, device.index),
+        lambda: kernel([job.spec for job in jobs], pdl, release),
         *args,
         _stream(device),
     )

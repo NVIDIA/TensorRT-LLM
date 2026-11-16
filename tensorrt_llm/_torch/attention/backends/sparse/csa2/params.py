@@ -285,12 +285,18 @@ class CSA2ForwardState:
     output_mxfp8: tuple[torch.Tensor, ...] | None = None
     # (positions, cos/sin) when the query still awaits its RoPE, which the direct decode applies.
     query_rope: tuple[torch.Tensor, torch.Tensor] | None = None
+    # With ``query_rope``: the direct decode writes its output rotated back for the O-A.
+    output_rope: bool = False
     swa_transform: RowTransform | None = None
     main_transform: RowTransform | None = None
     index_transform: RowTransform | None = None
     # Recorded on a side stream after the index weights and the paged indexer descriptors;
     # the indexer waits for it before scoring.
     index_ready: torch.cuda.Event | None = None
+    # Recorded on the model stream right before the fused decode kernel launches.
+    decode_start: torch.cuda.Event | None = None
+    # The module entered the layer and published its cache rows (``publish_layer_rows``) itself.
+    rows_published: bool = False
 
 
 @dataclass(frozen=True)
