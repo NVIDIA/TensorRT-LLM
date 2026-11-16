@@ -379,14 +379,14 @@ async def _drain_attached_frontends(
     """Stop the group and wait, in the event loop, until every frontend exits.
 
     SIGTERM starts each frontend's graceful shutdown. Frontends still running
-    drain_timeout_s plus a 10 s grace later, or once force_exit() is true, are
-    killed. None sets no deadline.
+    drain_timeout_s (None counts as 0) plus a 10 s grace later, or once
+    force_exit() is true, are killed.
     """
     for child in children:
         child.terminate()
-    deadline = None if drain_timeout_s is None else time.monotonic() + drain_timeout_s + 10
+    deadline = time.monotonic() + (drain_timeout_s or 0) + 10
     while any(child.poll() is None for child in children):
-        if force_exit() or (deadline is not None and time.monotonic() >= deadline):
+        if force_exit() or time.monotonic() >= deadline:
             for child in children:
                 child.kill()
             break

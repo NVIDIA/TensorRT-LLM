@@ -249,9 +249,11 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
         forwarder = LauncherForwarder(launcher_path)
         get_status = forwarder.get_status
         launcher_answered = asyncio.Event()
+        probe_statuses = []
 
         async def watchdog_get_status(path: str) -> int | None:
             status = await get_status(path)
+            probe_statuses.append(status)
             if status == 200:
                 launcher_answered.set()
             return status
@@ -275,6 +277,8 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
             await asyncio.wait_for(launcher_answered.wait(), timeout=5)
             engine.healthy = False
             await asyncio.wait_for(task, timeout=5)
+            # The launcher answered both failed probes: its socket was still open.
+            assert probe_statuses[-2:] == [503, 503]
         finally:
             await forwarder.close()
         events.append("attached frontends exited")
@@ -344,7 +348,7 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
         assert signals == [signal.SIGINT]
     else:
         # Off the main thread uvicorn installs no signal handlers.
-        serving = threading.Thread(target=asyncio.run, args=(serve,))
+        serving = threading.Thread(target=asyncio.run, args=(serve,), daemon=True)
         serving.start()
         try:
             deadline = time.monotonic() + 30
@@ -356,9 +360,11 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
             client.start()
             assert request_in_flight.wait(30), "the request did not reach the server"
             assert not events
-            servers[0].should_exit = True
-            serving.join(30)
         finally:
+            # Stop the server on every path, so that a failed check cannot leave it running.
+            if servers:
+                servers[0].should_exit = True
+            serving.join(30)
             for listener in listeners:
                 listener.close()
         assert not serving.is_alive()
@@ -411,15 +417,61 @@ def test_launcher_socket_server_keeps_the_graceful_shutdown_timeout(tmp_path, mo
     assert [config.timeout_graceful_shutdown for config in configs] == [7, 7]
 
 
-def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(monkeypatch) -> None:
+def test_engine_shuts_down_when_stopping_the_attached_frontends_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """Check that a failed drain is reported and the lifespan still shuts the engine down."""
+    events = []
+
+    async def stop_attached_frontends(force_exit) -> None:
+        raise RuntimeError("drain failed")
+
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+    generator = SimpleNamespace(
+        _check_health=lambda: True,
+        shutdown=lambda: events.append("engine shut down"),
+    )
+    # A VisualGen server needs no model to load.
+    with mock.patch.object(openai_server, "_is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=generator,
+            model="dummy",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+            stop_attached_frontends=stop_attached_frontends,
+        )
+
+    async def run_lifespan() -> None:
+        async with server.app.router.lifespan_context(server.app):
+            server._attached_frontends_stopped = asyncio.create_task(
+                server._stop_attached_frontends(lambda: False)
+            )
+
+    # The drain's error is reported: it leaves the lifespan, for uvicorn to log.
+    with pytest.raises(RuntimeError, match="drain failed"):
+        asyncio.run(run_lifespan())
+    assert events == ["engine shut down"]
+
+
+@pytest.mark.parametrize(
+    "graceful_shutdown_timeout_s, killed_at",
+    [(30, 140.0), (None, 110.0)],
+    ids=["timeout", "no_timeout"],
+)
+def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
+    monkeypatch, graceful_shutdown_timeout_s, killed_at
+) -> None:
     """Check that frontends still running the timeout plus 10 s after SIGTERM are killed.
 
-    Every frontend is reaped, including one that exited on SIGTERM.
+    Without a timeout, the deadline is 10 s. Every frontend is reaped, including one that
+    exited on SIGTERM.
     """
     clock = SimpleNamespace(now=100.0)
 
     async def sleep(seconds: float) -> None:
         clock.now += seconds
+        assert clock.now <= killed_at + 1.0, "the drain waits past its deadline"
 
     class _FakeFrontend:
         def __init__(self, exits_after_s: float | None) -> None:
@@ -454,18 +506,20 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(monkey
     exits, ignores_sigterm = _FakeFrontend(exits_after_s=2.0), _FakeFrontend(exits_after_s=None)
 
     asyncio.run(
-        _frontend_processes._drain_attached_frontends([exits, ignores_sigterm], 30, lambda: False)
+        _frontend_processes._drain_attached_frontends(
+            [exits, ignores_sigterm], graceful_shutdown_timeout_s, lambda: False
+        )
     )
 
     assert exits.terminated_at == ignores_sigterm.terminated_at == 100.0
     assert (exits.killed_at, exits.returncode) == (None, 0)
-    assert 140.0 <= ignores_sigterm.killed_at < 140.2
+    assert killed_at <= ignores_sigterm.killed_at < killed_at + 0.2
     assert ignores_sigterm.returncode == -signal.SIGKILL
     assert exits.waits == ignores_sigterm.waits == 1
 
 
 def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
-    """Check that a second Ctrl-C ends the wait for attached frontends without a deadline."""
+    """Check that a second Ctrl-C kills attached frontends before the drain deadline."""
     ignores_sigterm = (
         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
         "print(flush=True); time.sleep(60)"
