@@ -2910,6 +2910,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         "audio": frozenset(),  # Parakeet uses fixed relative-position SDPA.
     }
 
+    supports_multimodal_breakable_cuda_graph = True
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
@@ -2946,6 +2947,8 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
+        # The LM's attention and Mamba layers register where the engine looks them up.
+        llm_model_config.extra_attrs = model_config.extra_attrs
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
@@ -3035,6 +3038,10 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # `infer_max_seq_len` and `set_guided_decoder` through this property,
         # and its base implementation raises.
         return self.llm
+
+    @property
+    def text_embedding_layer(self) -> torch.nn.Module:
+        return self.llm.model.embed_tokens
 
     @property
     def draft_config(self) -> Optional[ModelConfig]:

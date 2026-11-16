@@ -191,6 +191,54 @@ def make_keyed_multimodal_param(
 
 
 @pytest.mark.cpu_only
+def test_registered_multimodal_breakable_cuda_graph_support() -> None:
+    from _torch.helpers import check_breakable_prefill_startup, make_stand_in_multimodal_model
+
+    from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
+    from tensorrt_llm._torch.models.modeling_utils import (
+        DecoderModelForCausalLM,
+        get_registered_model_class,
+    )
+
+    expected_decoders = {
+        "Cosmos3EdgeForConditionalGeneration": "Cosmos3EdgeForCausalLM",
+        "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+        "Exaone4_5_ForConditionalGeneration": "Exaone4ForCausalLM",
+        "Gemma4ForConditionalGeneration": "Gemma4ForCausalLM",
+        "Gemma4UnifiedForConditionalGeneration": "Gemma4ForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHForCausalLM",
+        "NemotronH_Nano_VL_V2": "NemotronHForCausalLM",
+        "NemotronH_Omni_Reasoning_V3": "NemotronHForCausalLM",
+        "Qwen2VLForConditionalGeneration": "Qwen2ForCausalLM",
+        "Qwen2_5_VLForConditionalGeneration": "Qwen2ForCausalLM",
+        "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
+        "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+    }
+    supported_architectures = set()
+    for arch in MODEL_ARCH_TO_MODULE:
+        model = get_registered_model_class(arch)
+        assert model is not None, arch
+        if not issubclass(model, MultimodalModelMixin):
+            continue
+        if arch not in expected_decoders:
+            wrapper = make_stand_in_multimodal_model(
+                model, DecoderModelForCausalLM, torch.nn.Identity()
+            )
+            with pytest.raises(ValueError, match=f"does not support {model.__name__}"):
+                check_breakable_prefill_startup(wrapper)
+            continue
+        decoder = get_registered_model_class(expected_decoders[arch])
+        assert decoder is not None, arch
+        wrapper = make_stand_in_multimodal_model(model, decoder, torch.nn.Identity())
+        check_breakable_prefill_startup(wrapper)
+        supported_architectures.add(arch)
+
+    assert supported_architectures == expected_decoders.keys()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("use_prepared_embeds", [False, True])
 def test_breakable_inputs_embed_through_text_embedding_hook(use_prepared_embeds):
     # The model exposes its embedding only through the mixin hook: no `llm.model.embed_tokens`.

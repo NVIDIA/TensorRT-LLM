@@ -270,6 +270,33 @@ def create_mock_cuda_graph_runner(
     return CUDAGraphRunner(config)
 
 
+def make_stand_in_multimodal_model(owner_cls: type, decoder_cls: type,
+                                   body: torch.nn.Module) -> torch.nn.Module:
+    """A multimodal wrapper and language model of real classes around a stand-in body."""
+    decoder = object.__new__(decoder_cls)
+    torch.nn.Module.__init__(decoder)
+    decoder.model = body
+    model = object.__new__(owner_cls)
+    torch.nn.Module.__init__(model)
+    model.llm = decoder
+    model.model_config = SimpleNamespace(disable_mm_encoder=False)
+    return model
+
+
+def check_breakable_prefill_startup(model: torch.nn.Module) -> None:
+    """Check whether the engine accepts this model for breakable prefill."""
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    engine = object.__new__(ModelEngine)
+    engine.model = model
+    engine.mapping = SimpleNamespace(pp_size=1)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        disable_mm_encoder=False)
+    engine._validate_breakable_cuda_graph_compatibility()
+
+
 def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
                                    forward: Callable[[dict], torch.Tensor],
                                    steps: List[dict], num_tokens: int) -> None:
@@ -282,17 +309,11 @@ def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
     """
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
         DecoderRunner
-    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
     from tensorrt_llm._torch.utils import model_extra_attrs
     from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
     backend = PrefillCudaGraphBackend.BREAKABLE
-    engine = object.__new__(ModelEngine)
-    engine.model = model
-    engine.mapping = SimpleNamespace(pp_size=1)
-    engine.llm_args = SimpleNamespace(prefill_cuda_graph_backend=backend,
-                                      disable_mm_encoder=False)
-    engine._validate_breakable_cuda_graph_compatibility()
+    check_breakable_prefill_startup(model)
     decoder_runner = object.__new__(DecoderRunner)
     decoder_runner._model = model
     decoder_runner._config = SimpleNamespace(
