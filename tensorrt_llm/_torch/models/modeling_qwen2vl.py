@@ -33,7 +33,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
-    MultimodalItemPartition, MultimodalParams)
+    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1279,29 +1279,19 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             'cpu').to(torch.int32).clone()
         return mrope_config
 
-    @staticmethod
-    def _infer_image_grid_thw(num_tokens: int,
-                              spatial_merge_size: int) -> List[int]:
-        if num_tokens <= 0:
-            raise ValueError(
-                f"Image embedding must contain at least one token, got {num_tokens}"
-            )
-        llm_grid_h = int(num_tokens**0.5)
-        while llm_grid_h > 1 and num_tokens % llm_grid_h != 0:
-            llm_grid_h -= 1
-        llm_grid_w = num_tokens // llm_grid_h
-        return [
-            1,
-            llm_grid_h * spatial_merge_size,
-            llm_grid_w * spatial_merge_size,
-        ]
-
     def _attach_multimodal_embeddings_impl(
         self,
         inputs: TextPrompt,
-        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        multimodal_embedding: Dict[str, List[Any]],
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Attach external image embeddings.
+
+        mRoPE positions depend on each image's grid, which the row count alone
+        does not give. So each image must be passed as
+        ``{"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}``, with the
+        grid from the model's image processor.
+        """
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
         if set(multimodal_embedding) != {"image"}:
@@ -1309,16 +1299,36 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "Only image modality is supported for external multimodal embedding"
             )
 
-        image_embeddings = multimodal_embedding["image"]
-        if isinstance(image_embeddings, torch.Tensor):
-            image_embeddings = [image_embeddings]
+        image_embeddings, item_metadata = split_multimodal_embedding_items(
+            multimodal_embedding["image"])
         if not image_embeddings:
             raise ValueError("At least one image embedding is required")
+        merge_size = self.config.vision_config.spatial_merge_size
+        image_grid_thw = []
         for index, image_embedding in enumerate(image_embeddings):
             if image_embedding.dim() != 2:
                 raise ValueError(
                     f"Image embedding {index} must be rank 2, got shape {tuple(image_embedding.shape)}"
                 )
+            grid = item_metadata[index].get("image_grid_thw")
+            if grid is None:
+                raise ValueError(
+                    f"Image embedding {index} has no image_grid_thw, which "
+                    f"{type(self).__name__} needs for mRoPE positions. Pass "
+                    "each image as {'mm_embeddings': tensor, "
+                    "'image_grid_thw': [t, h, w]}, with the grid from the "
+                    "model's image processor.")
+            grid = torch.as_tensor(grid, dtype=torch.long).flatten().tolist()
+            rows = image_embedding.shape[0]
+            if (len(grid) != 3 or min(grid) <= 0 or grid[1] % merge_size
+                    or grid[2] % merge_size
+                    or math.prod(grid) != rows * merge_size**2):
+                raise ValueError(
+                    f"image_grid_thw {grid} does not match image embedding "
+                    f"{index}: t * h * w / {merge_size}**2 must equal its "
+                    f"{rows} rows, and h and w must be multiples of "
+                    f"{merge_size}.")
+            image_grid_thw.append(grid)
 
         build_disagg_prefill_multimodal_inputs = getattr(
             self, "build_disagg_prefill_multimodal_inputs", None)
@@ -1338,18 +1348,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # ``mrope_input_ids`` is fed to ``get_mrope_config`` as-is.
         mrope_input_ids = torch.tensor(prompt_token_ids,
                                        dtype=torch.long).unsqueeze(0)
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_grid_thw = torch.tensor(
-            [
-                self._infer_image_grid_thw(image_embedding.shape[0],
-                                           spatial_merge_size)
-                for image_embedding in image_embeddings
-            ],
-            dtype=torch.long,
-        )
         attention_mask = torch.ones_like(mrope_input_ids)
-        mrope_config = self.get_mrope_config(mrope_input_ids, image_grid_thw,
-                                             None, attention_mask, None)
+        mrope_config = self.get_mrope_config(
+            mrope_input_ids, torch.tensor(image_grid_thw, dtype=torch.long),
+            None, attention_mask, None)
 
         multimodal_data = multimodal_params.multimodal_data
         multimodal_data["multimodal_embedding"] = image_embeddings
@@ -1603,6 +1605,10 @@ class Qwen2VisionModelBase(nn.Module):
     @nvtx_range("Qwen2VisionModelBase forward()")
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
+        # The aggregated model also calls this forward. Only the standalone
+        # encoder returns embedding handles.
+        if self.model_config.mm_encoder_only:
+            _set_item_grid_metadata(multimodal_params)
 
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(
             multimodal_params)
@@ -2321,6 +2327,26 @@ def _qwen_vision_input_partitions(
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
     }
+
+
+def _set_item_grid_metadata(multimodal_params: List[MultimodalParams]) -> None:
+    """Put each item's grid on its embedding handle, in prompt order.
+
+    A prefill worker that gets these embeddings without this encoder's mRoPE
+    positions (for example from an embedding cache) needs the grid to build
+    them.
+    """
+    for param in multimodal_params:
+        item_refs, _ = param.get_item_layout()
+        data = param.multimodal_data
+        grids = {}
+        metadata = []
+        for modality, index in item_refs:
+            key = f"{modality}_grid_thw"
+            if modality not in grids:
+                grids[modality] = data[modality][key].tolist()
+            metadata.append({key: grids[modality][index]})
+        data["multimodal_embedding_metadata"] = metadata
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):

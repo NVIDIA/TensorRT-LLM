@@ -23,6 +23,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
@@ -40,10 +41,15 @@ from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.sampling_params import SamplingParams
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -939,6 +945,208 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     )
 
     assert processor.get_mm_max_tokens_per_item() == expected_max_tokens_per_item
+
+
+def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
+    """Return a small Qwen2.5-VL or Qwen3-VL input processor and its embedding width."""
+    hidden_size = 8
+    vision_config = SimpleNamespace(
+        spatial_merge_size=2, temporal_patch_size=2, tokens_per_second=2
+    )
+    if model == "qwen3":
+        vision_config.deepstack_visual_indexes = [0]
+        processor_cls = Qwen3VLInputProcessorBase
+    else:
+        processor_cls = modeling_qwen2vl.Qwen2_5VLInputProcessorBase
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        vision_config=vision_config,
+        image_token_id=12,
+        video_token_id=14,
+        vision_start_token_id=11,
+        vision_end_token_id=13,
+    )
+    tokenizer = MagicMock()
+    tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
+    with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.return_value = MagicMock()
+        processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
+    # A Qwen3-VL embedding row also holds one deepstack level.
+    width = hidden_size * (2 if model == "qwen3" else 1)
+    return processor, width
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [(1920, 1080)],
+        [(1080, 1920)],
+        [(1280, 720)],
+        [(1000, 1000)],
+        # Two images with the same row count but swapped h and w. A grid used
+        # for the wrong image passes the row check; only the positions show it.
+        [(1920, 1080), (1080, 1920)],
+        [(1080, 1920), (1920, 1080)],
+    ],
+    ids=[
+        "1920x1080",
+        "1080x1920",
+        "1280x720",
+        "1000x1000",
+        "1920x1080+1080x1920",
+        "1080x1920+1920x1080",
+    ],
+)
+def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
+    """Embeddings + image_grid_thw give the same ids and mRoPE as raw images."""
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    # One <vision_start> <image> <vision_end> per image.
+    processor, width = _make_qwen_vl_embedding_processor(
+        model, [7] + [11, 12, 13] * len(sizes) + [8]
+    )
+    # The image processor settings of the Qwen2.5-VL and Qwen3-VL checkpoints.
+    image_processor = Qwen2VLImageProcessor(
+        patch_size=14 if model == "qwen2.5" else 16,
+        temporal_patch_size=2,
+        merge_size=2,
+        size={"shortest_edge": 3136, "longest_edge": 12845056}
+        if model == "qwen2.5"
+        else {"shortest_edge": 65536, "longest_edge": 16777216},
+    )
+    images = [Image.new("RGB", size) for size in sizes]
+    image_inputs = image_processor(images=images, return_tensors="pt")
+    grids = image_inputs["image_grid_thw"]
+    rows = [int(grid.prod()) // 4 for grid in grids]
+
+    def hf_processor_outputs(text, mm_data, mm_processor_kwargs):
+        # Like the HF processor: one image token per merged patch.
+        ids = [7]
+        for image_rows in rows:
+            ids += [11] + [12] * image_rows + [13]
+        ids.append(8)
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+            "pixel_values": image_inputs["pixel_values"],
+            "image_grid_thw": grids,
+        }
+
+    processor._preprocess = hf_processor_outputs
+    ref_ids, ref = processor.call_with_text_prompt(
+        {"prompt": "Describe this image.", "multi_modal_data": {"image": images}},
+        SamplingParams(),
+    )
+
+    def attach(image_grids):
+        items = [
+            {"mm_embeddings": torch.zeros(image_rows, width), "image_grid_thw": grid}
+            for image_rows, grid in zip(rows, image_grids)
+        ]
+        return processor.attach_multimodal_embeddings(
+            {"prompt": "Describe this image."}, {"image": items}, SamplingParams()
+        )
+
+    ids, extra = attach(grids)
+
+    assert ids == ref_ids
+    ref_mrope = ref["multimodal_data"]["mrope_config"]
+    mrope = extra["multimodal_data"]["mrope_config"]
+    torch.testing.assert_close(mrope["mrope_position_ids"], ref_mrope["mrope_position_ids"])
+    torch.testing.assert_close(mrope["mrope_position_deltas"], ref_mrope["mrope_position_deltas"])
+    if len(sizes) > 1:
+        # Negative control: swapped grids also pass the row check, but give
+        # other positions. So this test fails if an image gets the wrong grid.
+        _, swapped = attach(grids.flip(0))
+        assert not torch.equal(
+            swapped["multimodal_data"]["mrope_config"]["mrope_position_ids"],
+            ref_mrope["mrope_position_ids"],
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize("as_dict", [False, True], ids=["tensor", "dict"])
+def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 8])
+    image = torch.zeros(6, width)
+    if as_dict:
+        image = {"mm_embeddings": image}
+    with pytest.raises(ValueError, match="has no image_grid_thw"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"}, {"image": [image]}, SamplingParams()
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("grid", [[1, 6, 6], [1, 3, 8], [4, 6]])
+def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid):
+    processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 12, 8])
+    with pytest.raises(ValueError, match="does not match image embedding 0"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"},
+            {"image": [{"mm_embeddings": torch.zeros(6, width), "image_grid_thw": grid}]},
+            SamplingParams(),
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mm_encoder_only", [True, False], ids=["encoder", "aggregated"])
+@pytest.mark.parametrize(
+    "encoder_cls",
+    [modeling_qwen2vl.Qwen2VisionModelBase, Qwen3VisionModelBase, Cosmos3EdgeVisionEncoder],
+    ids=["qwen2.5", "qwen3", "cosmos3_edge"],
+)
+def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_encoder_only):
+    """The standalone encoder gives each item its grid, in prompt order.
+
+    A caller that caches encoder outputs passes this grid back with the
+    embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
+    """
+    # A landscape and a portrait image, so a swapped h and w shows.
+    data = {
+        "image": {
+            "pixel_values": torch.zeros(48, 4),
+            "image_grid_thw": torch.tensor([[1, 4, 6], [1, 6, 4]]),
+        }
+    }
+    item_refs = [("image", 0), ("image", 1)]
+    lengths = [6, 6]
+    expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
+    if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
+        # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
+        data["video"] = {
+            "pixel_values_videos": torch.zeros(32, 4),
+            "video_grid_thw": torch.tensor([[2, 4, 4]]),
+        }
+        item_refs.insert(0, ("video", 0))
+        lengths.insert(0, 8)
+        expected.insert(0, {"video_grid_thw": [2, 4, 4]})
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        item_refs, output_embedding_lengths=lengths
+    )
+
+    def vit(pixel_values, grid_thw):
+        # One row per 2x2 merged patch, like the real encoder.
+        return torch.zeros(int(grid_thw.prod(dim=-1).sum()) // 4, 8)
+
+    # Skip the real vision tower; forward only needs the config and the ViT call.
+    encoder = encoder_cls.__new__(encoder_cls)
+    torch.nn.Module.__init__(encoder)
+    encoder.model_config = SimpleNamespace(mm_encoder_only=mm_encoder_only)
+    encoder.visual = vit
+    encoder.encode_batched = vit
+    param = MultimodalParams(multimodal_data=data)
+    embeddings = encoder.forward([param])
+
+    assert sum(embedding.shape[0] for embedding in embeddings) == sum(lengths)
+    if mm_encoder_only:
+        assert param.multimodal_data["multimodal_embedding_metadata"] == expected
+    else:
+        assert "multimodal_embedding_metadata" not in param.multimodal_data
 
 
 # ---------------------------------------------------------------------------
