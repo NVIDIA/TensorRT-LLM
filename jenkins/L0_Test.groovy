@@ -580,6 +580,15 @@ def timeoutEvidenceFile(String stageName) {
     return "${workspaceTmp}/pytest-timeout-evidence-${safeStageName}.txt"
 }
 
+// Shell filter for a pytest pipeline: passes every line through to the console and copies
+// only the timeout markers to $TIMEOUT_LOG_FILE, so the full output never lands on disk.
+// The pipeline waits for awk, so the markers are complete before the final snapshot.
+// LC_ALL=C makes awk treat the output as bytes, so non-UTF-8 output never trips it up.
+def timeoutMarkerSplitter() {
+    return "LC_ALL=C awk -v marker_file=\"\$TIMEOUT_LOG_FILE\" " +
+        "'{ print; fflush() } /TRTLLM_PYTEST_(TIMEOUT|ATTEMPT) / { print > marker_file; fflush(marker_file) }'"
+}
+
 def clearTimeoutEvidence(String stageName) {
     try {
         sh "rm -f '${timeoutEvidenceFile(stageName)}' || true"
@@ -598,14 +607,29 @@ def retainUnfinishedTimeoutEvidence(String stageName, String llmSrc) {
 
     String unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     String helper = "${llmSrc}/jenkins/scripts/pytest_timeout_evidence.py"
-    int status = sh(
-        script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
-            "--unfinished-test-file '${unfinishedTestFile}'",
-        returnStatus: true,
-    )
-    if (status != 0) {
-        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}"
+    String retainedEvidence
+    try {
+        retainedEvidence = sh(
+            script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
+                "--unfinished-test-file '${unfinishedTestFile}'",
+            returnStdout: true,
+        )
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (hudson.AbortException scopeError) {
+        boolean ignorable =
+            (scopeError.message ==~ /script returned exit code -?\d+/) &&
+            FailureClassifier.flattenThrowable(scopeError).size() == 1 &&
+            (FailureClassifier.classify(scopeError, InfraFailure.K8S) instanceof UserFailure)
+        if (!ignorable) {
+            throw scopeError
+        }
+        // Leave the evidence file as it is rather than overwriting it with partial output.
+        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}: ${scopeError.message}"
+        return
     }
+    // The test container reads the evidence; the Jenkins agent keeps ownership of the file.
+    writeFile(file: evidenceFile, text: retainedEvidence)
 }
 
 def recordTimeoutEvidenceLines(String stageName, Map evidence) {
@@ -3501,6 +3525,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
+                def timeoutLogCmd = Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(
+                    "grep -aF -m ${PYTEST_TIMEOUT_EVIDENCE_LIMIT} -e 'TRTLLM_PYTEST_TIMEOUT ' " +
+                    "-e 'TRTLLM_PYTEST_ATTEMPT ' -- '${slurmJobLogPath}' || true"))
                 def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
                 try {
                     withEnv(watcher.env + [
@@ -3522,6 +3549,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         sh """#!/bin/bash
                             set +e
                             rm -f "\$PROGRESS_DONE_FILE" "\$PROGRESS_STOP_FILE" "\$PROGRESS_STOP_FILE.busy"
+                            TIMEOUT_LOG_FILE=\$(mktemp /tmp/pytest-timeout-log.XXXXXX) || exit 1
+                            export TIMEOUT_LOG_FILE
                             bash '${llmSrcLocal}/jenkins/scripts/progress_upload_watcher.sh' &
                             WATCHER_PID=\$!
                             ${checkpointNetrcWait(watcher.netrcDir)}
@@ -3568,8 +3597,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 done
                                 [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
                             done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
+                            ${timeoutLogCmd} > "\$TIMEOUT_LOG_FILE"
                             touch "\$PROGRESS_DONE_FILE"
                             wait \$WATCHER_PID
+                            rm -f "\$TIMEOUT_LOG_FILE"
                             exit \$rc
                         """
                     }
@@ -5604,22 +5635,26 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
             def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
             try {
                 withEnv(watcher.env + [
+                    "TIMEOUT_XML_SCRIPT=${llmSrc}/jenkins/scripts/generate_timeout_xml.py",
                     "PROGRESS_DONE_FILE=${WORKSPACE}/.rerun${times}-done-${stageName}",
                     "LABEL_PREFIX=rerun${times} checkpoint",
                     "FINAL_LABEL=rerun${times} final snapshot",
                     "XML_PATH=${xmlFile}",
                 ]) {
-                    sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
+                    sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """#!/bin/bash
                         set +e
                         rm -f "\$PROGRESS_DONE_FILE"
+                        TIMEOUT_LOG_FILE=\$(mktemp /tmp/pytest-timeout-log.XXXXXX) || exit 1
+                        export TIMEOUT_LOG_FILE
                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                         WATCHER_PID=\$!
                         ${checkpointNetrcWait(watcher.netrcDir)}
                         cd ${llmSrc}/tests/integration/defs && \\
-                        ${newTestCmdLine.join(" ")}
-                        rc=\$?
+                        ${newTestCmdLine.join(" ")} 2>&1 | ${timeoutMarkerSplitter()}
+                        rc=\${PIPESTATUS[0]}
                         touch "\$PROGRESS_DONE_FILE"
                         wait \$WATCHER_PID
+                        rm -f "\$TIMEOUT_LOG_FILE"
                         exit \$rc
                     """)
                 }
@@ -5970,6 +6005,7 @@ def prepareCheckpointWatcher(pipeline, String stageName, String postTag)
         "POST_TAG=${postTag}",
         "PROGRESS_TAR=${progressTar}",
         "PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC}",
+        "TIMEOUT_EVIDENCE_FILE=${timeoutEvidenceFile(stageName)}",
     ]
     for (location in locations) {
         String path = testResultsDirTarget(location, "test-results") + progressTar
@@ -6504,18 +6540,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     "XML_PATH=${WORKSPACE}/${stageName}/results.xml",
                                     "FINAL_REQUIRES=${WORKSPACE}/${stageName}/results.xml",
                                 ]) {
-                                    sh(label: "Run pytest (regular)", script: """
+                                    sh(label: "Run pytest (regular)", script: """#!/bin/bash
                                         set +e
                                         rm -f "\$PROGRESS_DONE_FILE"
+                                        TIMEOUT_LOG_FILE=\$(mktemp /tmp/pytest-timeout-log.XXXXXX) || exit 1
+                                        export TIMEOUT_LOG_FILE
                                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                                         WATCHER_PID=\$!
                                         ${checkpointNetrcWait(watcher.netrcDir)}
                                         rm -rf '${stageName}/'
                                         cd '${llmSrc}/tests/integration/defs'
-                                        ${pytestCommand.join(" ")}
-                                        rc=\$?
+                                        ${pytestCommand.join(" ")} 2>&1 | ${timeoutMarkerSplitter()}
+                                        rc=\${PIPESTATUS[0]}
                                         touch "\$PROGRESS_DONE_FILE"
                                         wait \$WATCHER_PID
+                                        rm -f "\$TIMEOUT_LOG_FILE"
                                         exit \$rc
                                     """)
                                 }

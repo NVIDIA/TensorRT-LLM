@@ -16,7 +16,6 @@
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from collections.abc import Iterable
@@ -120,17 +119,15 @@ def load_timeout_evidence(path: str | None, unfinished_nodeids: Iterable[str]) -
         return {}
 
 
-def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[str]) -> None:
-    """Discard records from completed attempts before a rerun starts."""
+def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[str]) -> str:
+    """Return retained records without replacing the agent-owned evidence file.
+
+    Raises OSError (including FileNotFoundError) when the evidence cannot be read,
+    so the caller leaves the file untouched instead of writing an empty one.
+    """
     candidates = _nodeid_set(unfinished_nodeids)
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        print(f"WARNING: cannot read timeout evidence file {path}: {exc}", file=sys.stderr)
-        return
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
 
     retained_lines = []
     for line in lines:
@@ -138,42 +135,29 @@ def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[s
         if event is not None and event[1] in candidates:
             retained_lines.append(line if line.endswith("\n") else line + "\n")
 
-    temporary_path = f"{path}.tmp"
-    try:
-        with open(temporary_path, "w", encoding="utf-8") as f:
-            f.writelines(retained_lines)
-        os.replace(temporary_path, path)
-    except OSError as exc:
-        print(f"WARNING: cannot prune timeout evidence file {path}: {exc}", file=sys.stderr)
-        try:
-            os.remove(temporary_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+    return "".join(retained_lines)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Keep timeout evidence only for tests still unfinished before a rerun"
+        description="Print timeout evidence only for tests still unfinished before a rerun"
     )
     parser.add_argument("--evidence-file", required=True)
     parser.add_argument("--unfinished-test-file", required=True)
     args = parser.parse_args()
 
     try:
-        with open(args.unfinished_test_file, encoding="utf-8", errors="replace") as f:
-            unfinished_nodeids = f.readlines()
-    except FileNotFoundError:
-        unfinished_nodeids = []
+        try:
+            with open(args.unfinished_test_file, encoding="utf-8", errors="replace") as f:
+                unfinished_nodeids = f.readlines()
+        except FileNotFoundError:
+            unfinished_nodeids = []
+        retained = retain_unfinished_timeout_evidence(args.evidence_file, unfinished_nodeids)
     except OSError as exc:
-        print(
-            f"WARNING: cannot read unfinished test file {args.unfinished_test_file}: {exc}",
-            file=sys.stderr,
-        )
-        return
-
-    retain_unfinished_timeout_evidence(args.evidence_file, unfinished_nodeids)
+        # A non-zero exit tells the caller to keep the evidence file as it is.
+        print(f"WARNING: cannot scope timeout evidence: {exc}", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(retained)
 
 
 if __name__ == "__main__":
