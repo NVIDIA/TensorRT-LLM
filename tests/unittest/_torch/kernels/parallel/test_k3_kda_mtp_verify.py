@@ -105,8 +105,9 @@ def _load_ops():
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
     import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 
+    # pytestmark has already skipped unsupported GPUs and missing dependencies, so a missing op is a build error.
     if not hasattr(torch.ops.trtllm, "kimi_k3_kda_mtp_verify"):
-        pytest.skip("trtllm::kimi_k3_kda_mtp_verify is not built")
+        pytest.fail("trtllm::kimi_k3_kda_mtp_verify is not built")
 
 
 def _in_place(values, stride=None):
@@ -570,9 +571,11 @@ def test_deterministic_graph_replay_and_pdl():
 
 def test_rejects_unsupported_inputs():
     base = _case(96, 3, 8, seed=17)
-    with pytest.raises(RuntimeError):
-        # T is no longer B * (num_spec + 1), and num_spec 2 is unsupported
+    with pytest.raises(RuntimeError, match="num_spec must be 3 or 5"):
         _run_cuda(dict(base, num_spec=2))
+    with pytest.raises(RuntimeError, match="packed layout"):
+        # 32 rows where 7 requests with 3 drafts need 28
+        _run_cuda(dict(base, ssm_state_indices=base["ssm_state_indices"][:7]))
     with pytest.raises(RuntimeError):
         _run_cuda(dict(base, g_cache=base["g_cache"].to(BF16)))  # g_cache must be FP32
     with pytest.raises(RuntimeError):
@@ -612,8 +615,6 @@ def test_rejects_unsupported_inputs():
 def _dispatch_module():
     from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 
-    if not hasattr(_kda_kernels, "_cuda_verify_ineligibility"):
-        pytest.skip("dispatch module without the CUDA verify path")
     return _kda_kernels
 
 
