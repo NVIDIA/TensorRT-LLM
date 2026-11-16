@@ -197,6 +197,9 @@ l0_cpu:
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
+  # Every test in it is cpu_only, so l0_b200's unittest/_torch/kv_cache_compression entry
+  # (-m "not cpu_only") runs none of them.
+  - unittest/_torch/kv_cache_compression/test_quantization_for_cold_page.py
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
@@ -208,6 +211,7 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/models/test_qwen3next_moe_input_dual_quant.py
   - unittest/_torch/models/test_modeling_utils.py
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
