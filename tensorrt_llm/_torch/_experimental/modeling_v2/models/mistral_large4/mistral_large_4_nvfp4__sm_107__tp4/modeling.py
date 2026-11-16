@@ -1554,6 +1554,11 @@ class DecodeTarget:
         self._shared_stream = None if _SERIAL_SHARED_EXPERT else torch.cuda.Stream()
         self._shared_fork = torch.cuda.Event()
         self._shared_join = torch.cuda.Event()
+        # The same for the attention block's query and latent half (`_attention`), beside the
+        # indexer.
+        self._latent_stream = torch.cuda.Stream()
+        self._latent_fork = torch.cuda.Event()
+        self._latent_join = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1763,41 +1768,54 @@ class DecodeTarget:
         )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
-        """One layer's attention block into `s.attn_out` (returned): the query with SSMax, the
-        indexer's selection, the absorbed query, the owner's rope and fp8_ds_mla append,
-        sparse decode over the pool, and the V up-projection of the latent output (FlashMLA's
-        live heads read in place under `gen_attn_flash_mla` with the fused glue)."""
+        """One layer's attention block into `s.attn_out` (returned): the indexer's selection and
+        its pool slots; the query with SSMax, the absorbed query, the owner's rope and
+        fp8_ds_mla append; sparse decode over the pool, and the V up-projection of the latent
+        output (FlashMLA's live heads read in place under `gen_attn_flash_mla` with the fused
+        glue). Under CUDA-graph capture the query half runs on the side stream beside the
+        selection: the selection writes the indexer's key pool and `topk_buf`, the query half
+        `s` and the latent pool, neither reads what the other writes, and the decode reads
+        both."""
         core = self.core
         rows = x.shape[0]
-        q = self._linear_fp8(x, L.wq, L.wq_s)
-        q3 = torch.reshape(q, [rows, core.heads, core.qk_dim])
         fq = s.fused_q[:, : core.heads]
-        if core.unfused_glue:
-            q3 = ssmax_scaling(q3, pos, L.ssmax_s, L.ssmax_b)
-            if L.rope:
-                fq[..., core.kv_lora :].copy_(q3[..., L.nope :])
-            else:
-                fq[..., core.kv_lora :].zero_()
-        else:
-            # SSMax in place; its rope half (a NoPE layer's zero) into the absorbed query's tail.
-            ssmax_scaling_fused_q(
-                q3, pos, L.ssmax_s, L.ssmax_b, q3, fq[..., core.kv_lora :], L.rope
-            )
-        if L.indexer is not None:
-            self._indexer(step, x, pos, L, topk_buf, skip_gen)
-        slots = convert_req_index_to_global(
-            req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
-            core._stride_factor, core._pool_row[L.kv_source],
-        )  # fmt: skip
-        bmm_out(
-            torch.transpose(q3[..., : L.nope], 0, 1), L.k_b,
-            torch.transpose(fq[..., : core.kv_lora], 0, 1),
-        )  # fmt: skip
-        if L.owner:
-            ds_mla_rope_append(
-                self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
-                step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
+
+        def select():
+            if L.indexer is not None:
+                self._indexer(step, x, pos, L, topk_buf, skip_gen)
+            return convert_req_index_to_global(
+                req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
+                core._stride_factor, core._pool_row[L.kv_source],
             )  # fmt: skip
+
+        def query():
+            q = self._linear_fp8(x, L.wq, L.wq_s)
+            q3 = torch.reshape(q, [rows, core.heads, core.qk_dim])
+            if core.unfused_glue:
+                q3 = ssmax_scaling(q3, pos, L.ssmax_s, L.ssmax_b)
+                if L.rope:
+                    fq[..., core.kv_lora :].copy_(q3[..., L.nope :])
+                else:
+                    fq[..., core.kv_lora :].zero_()
+            else:
+                # SSMax in place; its rope half (a NoPE layer's zero) into the absorbed query's
+                # tail.
+                ssmax_scaling_fused_q(
+                    q3, pos, L.ssmax_s, L.ssmax_b, q3, fq[..., core.kv_lora :], L.rope
+                )
+            bmm_out(
+                torch.transpose(q3[..., : L.nope], 0, 1), L.k_b,
+                torch.transpose(fq[..., : core.kv_lora], 0, 1),
+            )  # fmt: skip
+            if L.owner:
+                ds_mla_rope_append(
+                    self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
+                    step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
+                )  # fmt: skip
+
+        slots, _ = maybe_execute_in_parallel(
+            select, query, self._latent_fork, self._latent_join, self._latent_stream
+        )
         if core.gen_attn_flash_mla and core.unfused_glue:
             lat = flash_mla_sparse_decode(
                 s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out
