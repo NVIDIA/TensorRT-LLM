@@ -387,6 +387,35 @@ def test_catalog_rejects_index_header_disagreement_and_truncation(checkpoint) ->
         loader.SafetensorsCatalog(checkpoint)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preferred", [False, True])
+@pytest.mark.parametrize("pin", [None, False, True])
+def test_tile_reader_pinning_policy(
+    monkeypatch: pytest.MonkeyPatch, preferred: bool, pin: bool | None
+) -> None:
+    policy_calls = []
+    allocations = []
+    empty = torch.empty
+
+    def policy() -> bool:
+        policy_calls.append(True)
+        return preferred
+
+    def allocate(size: int, *, dtype: torch.dtype, pin_memory: bool) -> torch.Tensor:
+        allocations.append(pin_memory)
+        return empty(size, dtype=dtype)
+
+    monkeypatch.setattr(loader, "prefer_pinned", policy)
+    monkeypatch.setattr(loader.torch, "empty", allocate)
+    reader = loader.TileReader(tile_bytes=16) if pin is None else loader.TileReader(16, pin=pin)
+    try:
+        assert allocations == [preferred if pin is None else pin] * 2
+        assert len(policy_calls) == (1 if pin is None else 0)
+        assert all(buffer.numel() == 16 for buffer in reader.buffers)
+    finally:
+        reader.close()
+
+
 # ------------------------------------------------------------------ streaming reads on CUDA
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

@@ -31,6 +31,8 @@ from typing import Generator, Mapping, Optional, Sequence
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
+
 from .layout_bf16 import BF16, F32, FP8, TensorSpec
 
 INDEX_FILE = "model.safetensors.index.json"
@@ -179,16 +181,19 @@ class SafetensorsCatalog:
 
 
 class TileReader:
-    """Bounded byte-range reads: at most two pinned staging buffers of ``tile_bytes``.
+    """Bounded byte-range reads: at most two staging buffers of ``tile_bytes``.
 
     ``tiles(entry, rows)`` yields ``(row_start, row_stop, host_view)`` for consecutive row
     ranges; the next tile is read on a background thread while the caller consumes the
     current one, and a buffer is refilled only after the caller's device copy of it
     completed. Counts the bytes read and the peak staging footprint.
+    Pinning follows ``prefer_pinned()`` unless explicitly overridden.
     """
 
-    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool = True) -> None:
+    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool | None = None) -> None:
         self.tile_bytes = tile_bytes
+        if pin is None:
+            pin = prefer_pinned()
         self.buffers = [
             torch.empty(tile_bytes, dtype=torch.uint8, pin_memory=pin) for _ in range(2)
         ]
