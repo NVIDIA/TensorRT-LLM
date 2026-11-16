@@ -248,18 +248,38 @@ class TestLlmInputValidation:
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "embedding_bias_in",
+        "embedding_bias_in, error_regex",
         [
-            # NB: Tensors with fewer elements than vocab_size are currently implicitly zero-padded
-            torch.tensor([1] * 32001, dtype=torch.float32),  # invalid length
-            [1] * 32001,  # invalid length
-            ((42, -0.5), (-1, -2.5)),  # out of vocabulary
-            ((42, -0.5), (999999, -2.5)),  # out of vocabulary
+            (
+                torch.tensor([1] * 32001, dtype=torch.float32),
+                ".*Length of embedding bias tensor must match vocabulary size \\(151936\\).*",
+            ),
+            (
+                torch.tensor([[1] * 32001, [2] * 32001], dtype=torch.float32),
+                ".*bias\\.value\\(\\)\\.getShape\\(\\)\\.size\\(\\) == 1.*",
+            ),
+            (
+                [[1] * 32001, [2] * 32001],
+                ".*bias\\.value\\(\\)\\.getShape\\(\\)\\.size\\(\\) == 1.*",
+            ),
+            (
+                [1] * 32001,
+                ".*Length of embedding bias tensor must match vocabulary size \\(151936\\).*",
+            ),
+            (
+                ((42, -0.5), (-1, -2.5)),
+                ".*Embedding bias index must be in \\[0, 151935\\].*",
+            ),
+            (
+                ((42, -0.5), (999999, -2.5)),
+                ".*Embedding bias index must be in \\[0, 151935\\].*",
+            ),
         ],
     )
     def test_llm_invalid_embedding_bias(
         self,
         embedding_bias_in: torch.Tensor | list[float] | EmbeddingBias,
+        error_regex: str,
         llm: LLM,
     ):
         prompts = [
@@ -267,14 +287,16 @@ class TestLlmInputValidation:
         ]
         with pytest.raises(
                 RuntimeError,
-                match=
-                ".*Embedding bias index must be in \\[0, vocab_size - 1\\].*",
+                match=error_regex,
         ):
             llm.generate(
                 prompts,
                 sampling_params=SamplingParams(
                     max_tokens=5, embedding_bias=embedding_bias_in),
             )
+
+        # ensure engine remains responsive
+        llm.generate(prompts)
 
 
 @skip_ray
@@ -370,13 +392,19 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
+@pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.part0
-def test_embedding_bias_with_torch_sampler_strategies():
+def test_embedding_bias_with_torch_sampler_strategies(sparse: bool):
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
-    embedding_bias = ((biased_word_id, torch.finfo(torch.float32).max), )
+    if sparse:
+        embedding_bias = ((biased_word_id, torch.finfo(torch.float32).max), )
+    else:
+        vocab_size_padded = AutoConfig.from_pretrained(
+            llama_model_path).vocab_size
+        embedding_bias = torch.zeros(vocab_size_padded)
+        embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
     max_tokens = 6
     sampling_kwargs = {

@@ -43,7 +43,7 @@ class PythonRequestInputs:
     kv_hints: KvHintsSnapshot | None = None
     watermarking: bool | None = None
     prompt_trimmed_prefix: int = 0
-    embedding_bias: EmbeddingBias | None = None
+    sparse_embedding_bias: EmbeddingBias | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":

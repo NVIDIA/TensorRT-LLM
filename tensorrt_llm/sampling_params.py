@@ -299,7 +299,6 @@ class SamplingParams:
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
     embedding_bias: Optional[Union[torch.Tensor, list[float], EmbeddingBias]] = None
-    _embedding_bias_sparse: Optional[EmbeddingBias] = field(default=None, init=False, repr=False)
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
@@ -378,20 +377,6 @@ class SamplingParams:
             self.pad_id = self.end_id
 
         self.best_of = self.best_of or self.n
-
-        if self.embedding_bias is not None:
-            if isinstance(self.embedding_bias, (torch.Tensor, list)):
-                if isinstance(self.embedding_bias, torch.Tensor):
-                    embedding_bias_list = self.embedding_bias.tolist()
-                else:
-                    embedding_bias_list = self.embedding_bias
-                self._embedding_bias_sparse = tuple(
-                    [(idx, val) for idx, val in enumerate(embedding_bias_list) if val != 0]
-                )
-            else:
-                self._embedding_bias_sparse = self.embedding_bias
-        else:
-            self._embedding_bias_sparse = None
 
         self._validate()
 

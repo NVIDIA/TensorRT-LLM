@@ -48,7 +48,7 @@ from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..sampling_params import EmbeddingBias, SamplingParams
+from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
@@ -537,6 +537,21 @@ class BaseWorker(GenerationExecutor):
                 return max_tokens
 
         try:
+            # Dense embedding bias uses C++ path, sparse bias uses Python path
+            embedding_bias = request.sampling_params.embedding_bias
+            sparse_embedding_bias = None
+            if embedding_bias is not None:
+                if isinstance(embedding_bias, torch.Tensor):
+                    embedding_bias = embedding_bias.detach().clone()
+                elif isinstance(embedding_bias, list):
+                    embedding_bias = torch.tensor(embedding_bias,
+                                                  dtype=torch.float32)
+                elif isinstance(embedding_bias, tuple):  # EmbeddingBias
+                    sparse_embedding_bias = embedding_bias
+                    embedding_bias = None
+                else:
+                    raise ValueError("Unsupported embedding bias type")
+
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
@@ -553,7 +568,7 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=None,  # not used when backend=="pytorch"
+                embedding_bias=embedding_bias,
                 lora_config=lora_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
@@ -583,7 +598,7 @@ class BaseWorker(GenerationExecutor):
                     logprobs_mode=request.sampling_params.logprobs_mode,
                     logprobs_simple_format=request.sampling_params.
                     logprobs_simple_format,
-                    embedding_bias=request.sampling_params._embedding_bias_sparse,
+                    sparse_embedding_bias=sparse_embedding_bias,
                     return_routed_experts=request.sampling_params.
                     return_routed_experts,
                     disaggregated_params=request.disaggregated_params,
