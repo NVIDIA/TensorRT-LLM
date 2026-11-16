@@ -35,9 +35,10 @@ pytestmark = pytest.mark.cpu_only
 
 # Nothing listens here; connections are refused immediately.
 DEAD_URL = "http://127.0.0.1:9/health"
+UNITTEST_ROOT = Path(__file__).resolve().parents[1]
 MULTINODE_TEST_PATHS = (
-    Path("tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes.py"),
-    Path("tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes_service_discovery.py"),
+    UNITTEST_ROOT / "llmapi/apps/_test_disagg_serving_multi_nodes.py",
+    UNITTEST_ROOT / "llmapi/apps/_test_disagg_serving_multi_nodes_service_discovery.py",
 )
 
 
