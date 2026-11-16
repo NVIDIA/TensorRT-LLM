@@ -49,12 +49,12 @@ top-level directories when the configured include patterns name literal top-leve
 ## When it runs
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it through
-`testFilter[cbts_coverage]`: `ENABLE_CBTS_COVERAGE` and post-merge test mode.
+`testFilter[cbts_coverage]`: `ENABLE_CBTS_COVERAGE` and the official post-merge pipeline gate.
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on that flag plus:
 
 - not a perf stage, a Ray stage (`-Ray-` in the name), or a TensorRT / CPP stage
-- post-merge mode: single-GPU and single-node multi-GPU stages; pre-merge collection is disabled
+- single-GPU and single-node multi-GPU stages, including pre-merge-labeled stages run there
 - multi-node stages remain excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
 
