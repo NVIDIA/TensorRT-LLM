@@ -884,17 +884,13 @@ class TestCollectedRequestRecords:
 
         from tensorrt_llm.executor.result import GenerationResultBase
         from tensorrt_llm.metrics.perf import PerfMetricsCollector, PerfMetricsRecord
+        from tensorrt_llm.sampling_params import SamplingParams
 
-        result = SimpleNamespace(
-            finished=True,
-            candidate_metric_records=[],
-            candidate_metrics=[],
-            metrics_dict={},
-            cached_tokens=0,
-            prompt_token_ids=[1, 2],
-            per_pos_drafted=[4, 2],
-            per_pos_accepted=[3, 1],
-        )
+        result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result.finished = True
+        result.prompt_token_ids = [1, 2]
+        result.per_pos_drafted = [4, 2]
+        result.per_pos_accepted = [3, 1]
         output = SimpleNamespace(
             finish_reason="end_id",
             token_ids=[3, 4],
@@ -917,7 +913,7 @@ class TestCollectedRequestRecords:
                 PerfMetricsRecord, "request_metrics", side_effect=AssertionError("unexpected thaw")
             ),
         ):
-            GenerationResultBase.record_stats(result, output, stats)
+            result.record_stats(output, stats)
             result.per_pos_accepted[0] = 99
             result.per_pos_drafted[0] = 99
             assert result.candidate_metrics[0][MetricNames.SPEC_DEC_ACCEPTED_PER_POS] == [3, 1]
@@ -944,6 +940,7 @@ class TestCollectedRequestRecords:
                 metrics._record_error.assert_not_called()
             assert collect.call_count == 1
         assert _get_counter_value(collector, "counter_generation_tokens") == 2
+        assert _get_counter_value(collector, "counter_prompt_tokens") == 2
         assert _get_histogram_count(collector, "histogram_e2e_time_request") == 1
         assert _get_histogram_sum(collector, "histogram_e2e_time_request") == 2.0
         assert result.candidate_metric_records[0].per_req[
