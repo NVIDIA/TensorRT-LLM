@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import functools
 import inspect
+import os
 from typing import Optional
 
 import torch
@@ -64,6 +65,48 @@ class KimiK3DFlashWorker(DFlashWorker):
     # The generation-step preparation below reads _ctx_block_tables, not the
     # rebased view, so every drafter slot numbers from 0.
     _ctx_reads_rebased_view = False
+
+    def __init__(self, spec_config, mapping, use_separate_draft_kv_cache: bool = False):
+        flag = os.environ.get("TRTLLM_K3_INFERACT_BOUNDARY", "0")
+        if flag not in ("0", "1"):
+            raise ValueError("TRTLLM_K3_INFERACT_BOUNDARY must be 0 or 1")
+        self._inferact_boundary_enabled = flag == "1"
+        self._inferact_boundary = None
+        cache_flag = os.environ.get("TRTLLM_K3_INFERACT_CACHE_WRITE", "0")
+        if cache_flag not in ("0", "1"):
+            raise ValueError("TRTLLM_K3_INFERACT_CACHE_WRITE must be 0 or 1")
+        self._inferact_cache_write_enabled = cache_flag == "1"
+        context_flag = os.environ.get("TRTLLM_K3_INFERACT_CONTEXT", "0")
+        if context_flag not in ("0", "1"):
+            raise ValueError("TRTLLM_K3_INFERACT_CONTEXT must be 0 or 1")
+        self._inferact_context_enabled = context_flag == "1"
+        super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
+
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        if self._inferact_context_enabled:
+            from .inferact_boundary import _model_supported
+            from .inferact_context import try_prepare_context
+
+            if _model_supported(draft_model, self.mapping):
+                draft_model._inferact_context_prepare = try_prepare_context
+                logger.info("K3 Inferact five-layer context fusion enabled")
+        if self._inferact_cache_write_enabled:
+            from .inferact_cache_write import InferactPagedCacheWrite
+
+            draft_model._inferact_cache_writer = InferactPagedCacheWrite(draft_model, self.mapping)
+            logger.info(
+                "K3 Inferact direct paged cache write enabled; "
+                f"stock MLA admission={draft_model._inferact_cache_writer.model_supported}"
+            )
+        if self._inferact_boundary_enabled:
+            from .inferact_boundary import InferactBoundaryPreparation
+
+            self._inferact_boundary = InferactBoundaryPreparation(draft_model, self.mapping)
+            logger.info(
+                "K3 Inferact integer boundary preparation enabled; "
+                f"stock MLA admission={self._inferact_boundary.model_supported}"
+            )
 
     def _mask_token_id(self, draft_model) -> int:
         """The drafter's mask token id, resolved once."""
@@ -915,7 +958,25 @@ class KimiK3DFlashWorker(DFlashWorker):
             slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
             K_plus_1 = K + 1
 
-            if prep is not None:
+            boundary = None
+            if self._inferact_boundary is not None:
+                boundary = self._inferact_boundary.try_prepare(
+                    self, draft_model, attn_metadata, spec_metadata,
+                    gen_accepted_tokens, gen_num_accepted, slots, captured_hs,
+                    has_target_features, prep, mask_token_id,
+                )
+
+            if boundary is not None:
+                gen_rows_out = boundary.gen_rows
+                offsets_kp1 = boundary.offsets
+                bonus = boundary.bonus
+                query_position_ids = boundary.qpos
+                ctx_position_ids = boundary.cpos
+                noise_embed_2d = self._inferact_boundary.noise_embedding(
+                    embed_tokens, boundary.lookup_ids,
+                    self._trained_mask_embedding(draft_model, mask_token_id),
+                )
+            elif prep is not None:
                 gen_rows_out = self._k3_static_arange(num_contexts, num_contexts + num_gens)
                 offsets_kp1 = self._k3_static_arange(0, K_plus_1)
                 bonus = prep["bonus"]
@@ -976,18 +1037,22 @@ class KimiK3DFlashWorker(DFlashWorker):
                     # it, as _advance_ctx_len does after the add on the torch path.
                     self._ctx_len[self._dummy_slot].zero_()
             if has_target_features and not fused_ctx_kv:
-                gen_num_accepted_long = gen_num_accepted.long()
-                col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
-                write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
-                if self._ctx_block_tables is not None:
-                    # Bound by what the manager handed THIS request: the masked
-                    # entries below are still written (fixed-size, for graph
-                    # safety) and a placeholder page resolves to another's.
-                    gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
-                    col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
+                if boundary is not None:
+                    gen_num_accepted_long = boundary.n64
+                    col_idx = boundary.columns
+                    write_mask = boundary.write_mask
                 else:
-                    col_idx = col_idx.clamp(max=self._max_ctx - 1)
-
+                    gen_num_accepted_long = gen_num_accepted.long()
+                    col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+                    write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
+                    if self._ctx_block_tables is not None:
+                        # Bound by what the manager handed THIS request: the masked
+                        # entries below are still written (fixed-size, for graph
+                        # safety) and a placeholder page resolves to another's.
+                        gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
+                        col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
+                    else:
+                        col_idx = col_idx.clamp(max=self._max_ctx - 1)
                 # Fixed-size writes for CUDA graph compatibility:
                 # Write ALL entries but zero out invalid ones. Invalid
                 # writes land at clamped column indices beyond valid
