@@ -539,11 +539,79 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
     if (inputTokens.size() != 0)
     {
+        _unlinkPagesOfFailedRemoteLevels();
         reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
         std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+}
+
+void KvCacheManager::_unlinkPagesIfARemoteLevelFailed()
+{
+    if (mStorage->numFailedRemoteClients() <= mNumFailedRemoteClientsUnlinked.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    auto const apiLock = lockExclusive();
+    _unlinkPagesOfFailedRemoteLevels();
+}
+
+void KvCacheManager::_unlinkPagesOfFailedRemoteLevels()
+{
+    // Counted before the levels are taken: a client failing in between is unlinked by the next call.
+    auto const numFailed = mStorage->numFailedRemoteClients();
+    auto const levels = mStorage->takeNewlyFailedRemoteLevels();
+    mNumFailedRemoteClientsUnlinked.store(numFailed, std::memory_order_release);
+    if (levels.empty())
+    {
+        return;
+    }
+    // The evictable pages there are dropped already; the rest are held by requests. Collect first: unlinking can
+    // detach subtrees.
+    std::vector<std::pair<SharedPtr<Block>, LifeCycleId>> onFailedLevel;
+    std::vector<SharedPtr<Block>> pending;
+    for (auto const& [key, root] : mRadixTree->roots())
+    {
+        for (auto const& [childKey, child] : root->next)
+        {
+            pending.push_back(child);
+        }
+    }
+    auto const onFailed = [&levels](CommittedPage const* page)
+    { return page != nullptr && std::find(levels.begin(), levels.end(), page->cacheLevel) != levels.end(); };
+    while (!pending.empty())
+    {
+        auto block = std::move(pending.back());
+        pending.pop_back();
+        for (auto const& [childKey, child] : block->next)
+        {
+            pending.push_back(child);
+        }
+        for (LifeCycleId lc{0}; lc < block->numLifeCycles(); ++lc)
+        {
+            if (onFailed(block->getPage(lc)))
+            {
+                onFailedLevel.emplace_back(block, lc);
+            }
+        }
+    }
+    // Detached blocks stay alive until every unlink is done.
+    std::vector<SharedPtr<Block>> detached;
+    for (auto const& [block, lc] : onFailedLevel)
+    {
+        auto* const page = block->getPage(lc);
+        if (!onFailed(page))
+        {
+            continue;
+        }
+        block->unlinkPage(lc, page);
+        auto cleared = Block::clearStaleBlocksAfterPageUnlink(*block, lc, mStorage->lifeCycles().getLifeCycle(lc));
+        detached.insert(
+            detached.end(), std::make_move_iterator(cleared.begin()), std::make_move_iterator(cleared.end()));
+    }
+    TLLM_LOG_WARNING(
+        "KVCM2 remote level(s) failed: %zu page(s) requests hold there left the reuse tree", onFailedLevel.size());
 }
 
 void KvCacheManager::refreshRetention()
@@ -559,6 +627,7 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
     auto const apiLock = lockExclusive();
     if (target < kHotLevel || target >= mStorage->numCacheLevels())
         throw std::out_of_range("Prefetch target is outside the configured cache tiers");
+    _unlinkPagesOfFailedRemoteLevels();
     auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
     auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
         KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
@@ -573,17 +642,20 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
     KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
 std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
-    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
+    KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // The matched Block* remain protected until the key has been copied out.
     // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
     auto const apiLock = lockShared();

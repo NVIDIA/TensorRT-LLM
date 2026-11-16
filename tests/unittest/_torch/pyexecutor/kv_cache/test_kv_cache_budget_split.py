@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor._util import (
     _STANDALONE_DRAFT_TOKENS_PER_BLOCK,
@@ -35,6 +36,7 @@ from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
+    RemoteCacheConfig,
 )
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -1111,6 +1113,322 @@ class TestBuildManagersBudgetGates:
         assert getattr(target_config, budget_attr) is None
         assert getattr(draft_config, budget_attr) is None
 
+    @pytest.mark.parametrize("estimating_kv_cache", [False, True])
+    def test_only_final_managers_get_the_remote_config(
+        self, estimating_kv_cache, tmp_path, monkeypatch
+    ):
+        """A probe neither claims remote memory nor donates. The final draft manager gets the config for its host
+        tier sizing only (TestRemoteLevelOwnership)."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        monkeypatch.setattr(remote_donor, "start_donation", Mock())
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=20 * GB,
+            remote_cache_config={
+                "directory": str(tmp_path),
+                "level": {"size": 4 * GB},
+                "donor": {"size": 4 * GB},
+            },
+        )
+
+        c.build_managers({}, estimating_kv_cache=estimating_kv_cache)
+
+        for config in self._configs_passed_to_managers(c):
+            assert (config.remote_cache_config is None) == estimating_kv_cache
+
+    def _gen_style_donation(self, tmp_path, monkeypatch):
+        """A donation-only (GEN-style) creator whose donation start and manager constructions are recorded in order."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        events = []
+        donor = Mock()
+        monkeypatch.setattr(
+            remote_donor,
+            "start_donation",
+            lambda config, device: events.append("donation") or donor,
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 4 * GB}},
+        )
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
+            events.append(("target", kwargs["remote_donor"])) or Mock()
+        )
+        return c, donor, events
+
+    def test_donation_starts_before_the_estimation_and_moves_to_the_final_manager(
+        self, tmp_path, monkeypatch
+    ):
+        """Clients wait for donors, so the donation must not wait for the estimation's warmup.
+
+        It starts before the estimation probe exists, survives the probe's teardown and goes to the final target
+        manager, which owns it from then on: one donation per rank, never closed in between."""
+        c, donor, events = self._gen_style_donation(tmp_path, monkeypatch)
+        resources = {}
+
+        c.build_managers(resources, estimating_kv_cache=True)
+        assert events == ["donation", ("target", None)]
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+
+        assert events == ["donation", ("target", None), ("target", donor)]
+        # The draft only waits for the target's donation (TestRemoteLevelOwnership); the target owns it.
+        assert c._create_one_model_draft_kv_cache_manager.call_args.kwargs["remote_donor"] is donor
+        assert c._remote_donor is None
+        c.close_remote_donor()
+        donor.close.assert_not_called()
+
+    def test_a_failed_draft_build_shuts_the_target_down(self, tmp_path, monkeypatch):
+        """Nothing holds the target manager until build_managers returns, so its donation would leak."""
+        c, donor, _ = self._gen_style_donation(tmp_path, monkeypatch)
+        targets = []
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
+            targets.append(Mock()) or targets[-1]
+        )
+        c._create_one_model_draft_kv_cache_manager.side_effect = RuntimeError("draft OOM")
+        resources = {}
+
+        with pytest.raises(RuntimeError, match="draft OOM"):
+            c.build_managers(resources, estimating_kv_cache=False)
+
+        targets[-1].shutdown.assert_called_once_with()
+        assert resources == {}
+
+    @staticmethod
+    def _published_donor(directory: str):
+        """A real donation published in `directory` by a transport that allocates nothing."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        class PublishingTransport(remote_donor.DonorTransport):
+            kind = "test"
+
+            def start(self, donor):
+                donor._publish([], ["segment 0 1"], "test")
+
+        donor = remote_donor.RemoteMemDonor(
+            directory, 1 << 30, PublishingTransport(), chunk_bytes=1 << 30
+        )
+        donor.start()
+        return donor
+
+    @staticmethod
+    def _target_owning(donor):
+        """A final target manager that owns `donor`, with the real shutdown()."""
+        target = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        target._remote_donor = donor
+        target._shutdown_caches = Mock()
+        target.event_manager = None
+        return target
+
+    @pytest.mark.parametrize("estimation", [True, False], ids=["estimation", "no_estimation"])
+    def test_a_failed_draft_build_marks_the_targets_donation(
+        self, estimation, tmp_path, monkeypatch
+    ):
+        """Peers waiting for expected_num_donors stop at the failure marker; an unmarked withdrawal makes them wait the
+        full donor_wait_timeout_s. Without the estimation the target starts the donation itself."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        directory = str(tmp_path / "rendezvous")
+        remote_donor.ensure_rendezvous_directory(directory)
+        early = self._published_donor(directory) if estimation else None
+        monkeypatch.setattr(remote_donor, "start_donation", lambda config, device: early)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._skip_est = not estimation
+        c.configure_kv_cache_capacity = Mock()
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": directory, "donor": {"size": 1 << 30}},
+        )
+        c._create_kv_cache_manager.side_effect = lambda estimating, **kwargs: (
+            Mock()
+            if estimating
+            else self._target_owning(kwargs["remote_donor"] or self._published_donor(directory))
+        )
+        resources = {}
+        if estimation:
+            c.build_managers(resources, estimating_kv_cache=True)
+            resources.clear()  # the probe's teardown
+        c._create_one_model_draft_kv_cache_manager.side_effect = RuntimeError("draft OOM")
+
+        with pytest.raises(RuntimeError, match="draft OOM"):
+            c.build_managers(resources, estimating_kv_cache=False)
+
+        published, failed = remote_donor.scan_donors(directory)
+        assert published == []
+        assert len(failed) == 1 and "draft OOM" in failed[0]["error"]
+        c.close_remote_donor(
+            RuntimeError("creator cleanup")
+        )  # the creator's failure path marks nothing twice
+        assert len(remote_donor.scan_donors(directory)[1]) == 1
+        assert "draft OOM" in remote_donor.scan_donors(directory)[1][0]["error"]
+
+    def test_without_estimation_the_draft_waits_for_the_targets_own_donation(
+        self, tmp_path, monkeypatch
+    ):
+        """Skipping the estimation (TRTLLM_SKIP_KV_CACHE_ESTIMATION, sparse-offload decode workers), the target starts
+        the donation itself; a separate draft that does not get it charges the donation a second time."""
+        c, _, _ = self._gen_style_donation(tmp_path, monkeypatch)
+        c._skip_est = True
+        c.configure_kv_cache_capacity = Mock()
+        own = Mock()
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: SimpleNamespace(
+            remote_donor=own
+        )
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        assert c._create_one_model_draft_kv_cache_manager.call_args.kwargs["remote_donor"] is own
+        error = RuntimeError("rebind failed")
+        c.close_remote_donor(error)  # a later startup failure still marks it
+        own.close.assert_called_once_with(error)
+
+    def test_the_cross_manager_waits_for_the_targets_donation(self, tmp_path):
+        """Without the estimation (always for encoder-decoder) the target starts its donation in the background. The
+        cross manager sizes its automatic host tier from free host memory, so it waits for the donation first."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        events = []
+        donor = Mock()
+        donor.wait_started.side_effect = lambda: events.append("donation placed")
+        c._create_cross_kv_cache_manager = Mock(
+            side_effect=lambda *args, **kwargs: events.append("cross manager") or Mock()
+        )
+        config = KvCacheConfig(max_gpu_total_bytes=10 * GB)
+
+        c._build_secondary_managers(False, 1024, False, config, None, config, None, donor)
+
+        assert events == ["donation placed", "cross manager"]
+        donor.close.assert_not_called()  # the target owns it
+
+    def test_cross_manager_neither_claims_nor_donates(self, tmp_path):
+        """The self-attention manager owns the rank's remote level and donation; a cross manager with the config would
+        donate and claim a second time."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            cross_kv_cache_fraction=0.5,
+            remote_cache_config={
+                "directory": str(tmp_path),
+                "level": {"size": 4 * GB},
+                "donor": {"size": 4 * GB},
+            },
+        )
+        self_config, cross_config = c._split_kv_cache_budget_for_cross()
+        assert self_config.remote_cache_config is not None
+        assert cross_config.remote_cache_config is None
+
+    def test_donation_is_placed_before_the_estimation_takes_host_memory(
+        self, tmp_path, monkeypatch
+    ):
+        """A GEN node of two 176 GiB fabric donates (xb2): the second one fits at the default 24 GiB reserve only
+        before the estimation takes 44 GiB of the node's host memory; started after it, it is 44 GiB short."""
+        import contextlib
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory, remote_donor
+
+        node_gib = 176.0 + 176.0 + 24.0
+        room = {0: node_gib - 176.0}  # the co-located rank's donation is placed already
+
+        def place(n_chunks):
+            def create(node):
+                room[node] -= 1.0
+                return object()
+
+            handles, _ = host_memory.place_chunks(
+                n_chunks,
+                [0],
+                create,
+                chunk_gib=1.0,
+                reserve_gib=24.0,
+                node_lock=lambda node: contextlib.nullcontext(True),
+                meminfo=lambda node: {"MemFree": room[node]},
+                compact=Mock(),
+                contiguous=lambda node: 0.0,
+                sleep=lambda seconds: None,
+                clock=lambda: 0.0,
+            )
+            return len(handles)
+
+        placed = []
+        monkeypatch.setattr(
+            remote_donor,
+            "start_donation",
+            lambda config, device: placed.append(place(176)) or Mock(),
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 176 * GB}},
+        )
+
+        def manager(*args, **kwargs):
+            if args[0]:  # the estimation probe and its warmup
+                room[0] -= 44.0
+            return Mock()
+
+        c._create_kv_cache_manager.side_effect = manager
+        resources = {}
+        c.build_managers(resources, estimating_kv_cache=True)
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+
+        assert placed == [176]
+        # The same donation placed after the estimation comes up 44 GiB short.
+        room[0] = node_gib - 176.0 - 44.0
+        assert place(176) == 132
+
+    def test_donation_no_manager_took_over_is_closed(self, tmp_path, monkeypatch):
+        c, donor, _ = self._gen_style_donation(tmp_path, monkeypatch)
+        c.build_managers({}, estimating_kv_cache=True)
+
+        error = RuntimeError("warmup failed")
+        c.close_remote_donor(error)
+
+        donor.close.assert_called_once_with(error)
+        assert c._remote_donor is None
+
+    def test_the_estimation_probe_waits_for_the_donation_to_be_placed(self, tmp_path, monkeypatch):
+        """The donation starts on a thread; the probe and its warmup take host memory only once it is placed."""
+        c, donor, events = self._gen_style_donation(tmp_path, monkeypatch)
+        donor.wait_started.side_effect = lambda: events.append("placed")
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        assert events == ["donation", "placed", ("target", None)]
+
+    def test_a_failure_after_the_hand_over_still_marks_the_donation(self, tmp_path, monkeypatch):
+        """Once the final target manager owns the donation, a later startup failure (rebind_resources) still leaves its
+        failure marker: the manager's shutdown alone would withdraw it unmarked."""
+        c, donor, _ = self._gen_style_donation(tmp_path, monkeypatch)
+        resources = {}
+        c.build_managers(resources, estimating_kv_cache=True)
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+        assert c._remote_donor is None
+
+        error = RuntimeError("rebind failed")
+        c.close_remote_donor(error)
+
+        donor.close.assert_called_once_with(error)
+        c.close_remote_donor(error)  # once only
+        donor.close.assert_called_once_with(error)
+
+    def test_without_estimation_the_manager_starts_the_donation(self, tmp_path, monkeypatch):
+        c, _, events = self._gen_style_donation(tmp_path, monkeypatch)
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        assert events == [("target", None)]
+
     def test_gpu_budget_split_stays_skipped_during_estimation(self, tmp_path):
         """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
@@ -1120,6 +1438,77 @@ class TestBuildManagersBudgetGates:
         target_config, _ = self._configs_passed_to_managers(c)
         assert target_config.max_gpu_total_bytes == 10 * GB
         c._needs_gpu_kv_cache_budget_split.assert_not_called()
+
+
+class TestRemoteLevelOwnership:
+    """One claim and one donation per rank: the target manager makes both, a separate draft manager neither.
+
+    A draft that claimed too would take a second ``cache_size`` from donors sized for one per rank.
+    """
+
+    @staticmethod
+    def _add_remote_level(is_draft, tmp_path, monkeypatch, transport="nixl"):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor
+
+        transport_cls = Mock(options_from=remote_donor.DONOR_TRANSPORTS[transport].options_from)
+        monkeypatch.setitem(remote_donor.DONOR_TRANSPORTS, transport, transport_cls)
+        donor_cls = Mock()
+        donor_cls.transport_cls = transport_cls
+        monkeypatch.setattr(remote_donor, "RemoteMemDonor", donor_cls)
+        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
+        monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
+        manager = SimpleNamespace(is_draft=is_draft, _remote_donor=None)
+        config = RemoteCacheConfig(
+            directory=str(tmp_path),
+            level={"size": 4 * GB},
+            donor={"size": 4 * GB},
+            transport={"kind": transport},
+        )
+        tiers = []
+        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        return manager, tiers, donor_cls
+
+    def test_target_claims_and_donates(self, tmp_path, monkeypatch):
+        manager, tiers, donor_cls = self._add_remote_level(False, tmp_path, monkeypatch)
+        assert len(tiers) == 1
+        donor_cls.assert_called_once()
+        manager._remote_donor.start_in_background.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "transport, options",
+        [
+            ("nixl", {"ucx_devices": None}),
+            ("fabric", {"reserve_bytes": 24 * GB, "compact_host_memory": False}),
+        ],
+    )
+    def test_each_donor_gets_its_transport_options(self, transport, options, tmp_path, monkeypatch):
+        _, _, donor_cls = self._add_remote_level(False, tmp_path, monkeypatch, transport)
+        # The transport is made from its own options, apart from the donation it reaches.
+        donor_cls.transport_cls.assert_called_once_with(**options)
+        assert donor_cls.call_args.args[2] is donor_cls.transport_cls.return_value
+
+    def test_target_takes_over_a_donation_started_before_it(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor
+
+        start_donation = Mock()
+        monkeypatch.setattr(remote_donor, "start_donation", start_donation)
+        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
+        early = Mock()
+        manager = SimpleNamespace(is_draft=False, _remote_donor=early)
+        config = RemoteCacheConfig(
+            directory=str(tmp_path), level={"size": 4 * GB}, donor={"size": 4 * GB}
+        )
+        tiers = []
+        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        start_donation.assert_not_called()
+        assert manager._remote_donor is early
+        assert len(tiers) == 1
+
+    def test_draft_neither_claims_nor_donates(self, tmp_path, monkeypatch):
+        manager, tiers, donor_cls = self._add_remote_level(True, tmp_path, monkeypatch)
+        assert tiers == []
+        donor_cls.assert_not_called()
+        assert manager._remote_donor is None
 
 
 class TestExternalDrafterKvDtype:
