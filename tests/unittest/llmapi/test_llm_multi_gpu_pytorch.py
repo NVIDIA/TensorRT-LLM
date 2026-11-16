@@ -162,7 +162,18 @@ def test_llm_get_stats_async_pp2():
 
 
 @pytest.mark.gpu2
-def test_llm_beam_search_pp2() -> None:
+@pytest.mark.parametrize(
+    "compare_pp1, async_relay, speculative_d2h",
+    [
+        pytest.param(True, False, False, id="pp1_reference"),
+        pytest.param(False, False, False, id="default"),
+        pytest.param(False, False, True, id="inline_speculative"),
+        pytest.param(False, True, True, id="async_speculative"),
+    ],
+)
+def test_llm_beam_search_pp2(compare_pp1: bool, async_relay: bool,
+                             speculative_d2h: bool,
+                             monkeypatch: pytest.MonkeyPatch) -> None:
     """Beam search under pipeline parallelism returns every finalized beam.
 
     Only the last pipeline-parallel rank samples; the first rank, which returns
@@ -171,35 +182,44 @@ def test_llm_beam_search_pp2() -> None:
     beam_width = 4
     max_tokens = 24
     prompts = ["A B C", "The future of the AI is"]
+    monkeypatch.setenv("TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE",
+                       "1" if async_relay else "0")
     sampling_params = SamplingParams(max_tokens=max_tokens,
                                      n=beam_width,
                                      best_of=beam_width,
                                      use_beam_search=True,
                                      logprobs=True)
-    with LLM(model=llama_model_path,
-             kv_cache_config=global_kv_cache_config,
-             pipeline_parallel_size=1,
-             max_beam_width=beam_width,
-             max_batch_size=1,
-             disable_overlap_scheduler=True,
-             cuda_graph_config=None) as llm:
-        reference_outputs = llm.generate(prompts,
-                                         sampling_params=sampling_params)
+    llm_kwargs = dict(max_batch_size=len(prompts))
+    reference_outputs = None
+    if compare_pp1:
+        llm_kwargs.update(max_batch_size=1,
+                          disable_overlap_scheduler=True,
+                          cuda_graph_config=None)
+        with LLM(model=llama_model_path,
+                 kv_cache_config=global_kv_cache_config,
+                 pipeline_parallel_size=1,
+                 max_beam_width=beam_width,
+                 **llm_kwargs) as llm:
+            reference_outputs = llm.generate(prompts,
+                                             sampling_params=sampling_params)
     with LLM(model=llama_model_path,
              kv_cache_config=global_kv_cache_config,
              pipeline_parallel_size=2,
              max_beam_width=beam_width,
-             max_batch_size=1,
-             disable_overlap_scheduler=True,
-             cuda_graph_config=None) as llm:
+             enable_speculative_beam_history_d2h=speculative_d2h,
+             **llm_kwargs) as llm:
         outputs = llm.generate(prompts, sampling_params=sampling_params)
 
-    assert len(outputs) == len(reference_outputs) == len(prompts)
-    for prompt, output, reference in zip(prompts, outputs, reference_outputs):
+    assert len(outputs) == len(prompts)
+    if reference_outputs is not None:
+        assert len(reference_outputs) == len(prompts)
+        for prompt, output, reference in zip(prompts, outputs,
+                                             reference_outputs):
+            assert [list(beam.token_ids) for beam in output.outputs
+                    ] == [list(beam.token_ids)
+                          for beam in reference.outputs], prompt
+    for prompt, output in zip(prompts, outputs):
         beams = output.outputs
-        assert [list(beam.token_ids) for beam in beams
-                ] == [list(beam.token_ids)
-                      for beam in reference.outputs], prompt
         assert len(beams) == beam_width, prompt
         # Finalized beams are distinct paths, best first.
         assert len({tuple(beam.token_ids) for beam in beams}) == beam_width

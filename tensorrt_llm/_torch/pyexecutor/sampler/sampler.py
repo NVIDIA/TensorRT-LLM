@@ -24,6 +24,7 @@ seeds) lives in its own module and is held here as a handler, driven through
 """
 
 import sys
+import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
@@ -51,8 +52,8 @@ from .beam_search import (
     BeamSearchParams,
     BeamSearchStep,
     BeamSearchStore,
-    CBAGroupHost,
     PendingBeamHistories,
+    _reorder_cache_indirection,
     finalize_beam,
     prepare_beam_search,
 )
@@ -291,6 +292,10 @@ class Sampler(ABC, Generic[GenericSampleState]):
         samples, after ``state.sampler_event`` has completed and before the
         state reaches any ``update_requests``. Those ranks only receive
         ``state.host``.
+
+        This hook may run on the PP relay thread. Implementations must carry
+        preparation failures in the host state for ``update_requests`` to
+        report, so an exception does not terminate the relay thread.
 
         Args:
             state: A state this sampler's ``sample_async`` returned.
@@ -592,6 +597,8 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    beam_histories_deferred: bool = False
+    """The step skipped its snapshot; the PP relay can copy its finishing rows together."""
     sample_type: SampleType = SampleType.FULL
     """Tier this batch was sampled at.
 
@@ -1658,41 +1665,34 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         requests: list[LlmRequest],
         seq_slots_cuda: torch.Tensor,
+        seq_lens_host: torch.Tensor,
         num_context_requests: int,
-        cba_group: CBAGroupHost | None,
     ) -> BeamSearchHandoff:
         """Start the host copies of the step's beam-search state for the other ranks.
 
-        Their attention reads the cache indirection in the next forward, up to
-        the position of the token this step sampled, and a context-only request
-        returns the cumulative log-probs with its first tokens. The copies
-        complete with the sampler event, including its side-stream event when
-        reusing a speculative CBA snapshot. The zero prompt prefix is omitted.
+        Parent beam indices let each rank update its cache indirection without
+        transferring the full token history. Context-only requests also need
+        the cumulative log-probs of their first tokens. The copies complete
+        with the sampler event.
 
         Args:
             requests: The step's requests, after the beam-search step.
             seq_slots_cuda: The step's existing device sequence-slot indices.
+            seq_lens_host: The token positions used by this sampling step.
             num_context_requests: Number of leading context requests.
-            cba_group: The existing host snapshot, if the step made one.
         """
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
-        if cba_group is None:
-            token_base, width = self._beam_search.cache_indirection_span(requests)
-            cache_indirection_host = self._copy_to_host(
-                beam_search_store.cache_indirection[seq_slots_cuda, :, token_base:width]
-            )
-            cum_log_probs_host = self._copy_to_host(beam_search_store.cum_log_probs[seq_slots_cuda])
-        else:
-            token_base = cba_group.token_base
-            cache_indirection_host = cba_group.cache_indirection
-            cum_log_probs_host = cba_group.cum
+        beam_widths = [_get_beam_width_out(request) for request in requests]
         return BeamSearchHandoff(
             request_ids=[request.py_request_id for request in requests],
-            token_base=token_base,
             num_context_requests=num_context_requests,
-            cache_indirection=cache_indirection_host,
-            cum_log_probs=cum_log_probs_host,
+            predecessor_beams=self._copy_to_host(
+                beam_search_store.predecessor_beams[seq_slots_cuda, : max(beam_widths)]
+            ),
+            seq_lens=seq_lens_host.tolist(),
+            beam_widths=beam_widths,
+            cum_log_probs=self._copy_to_host(beam_search_store.cum_log_probs[seq_slots_cuda]),
         )
 
     @override
@@ -1716,32 +1716,50 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_histories: dict[int, BeamHistory] = {}
         try:
             first_finish_reasons_host = host.first_finish_reasons
-            assert first_finish_reasons_host is not None
+            assert first_finish_reasons_host is not None, (
+                "Beam-search handoff requires first finish reasons"
+            )
             finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(
                 first_finish_reasons_host
             )
-            for req_idx, req in enumerate(state.requests):
-                if not self._beam_request_finishing(req, finished_beam_prefix_lengths):
-                    continue
-                beam_history_builder = beam_history_builders[req_idx]
-                beam_history = beam_history_builder() if beam_history_builder is not None else None
+            finishing = [
+                (req_idx, req)
+                for req_idx, req in enumerate(state.requests)
+                if self._beam_request_finishing(req, finished_beam_prefix_lengths)
+            ]
+            batched_histories = None
+            if state.beam_histories_deferred and len(finishing) > 1:
+                batched_histories = self._beam_search.build_deferred_beam_histories(
+                    [req for _, req in finishing]
+                )
+            for row, (req_idx, req) in enumerate(finishing):
+                if batched_histories is not None:
+                    beam_history = batched_histories[row]
+                else:
+                    beam_history_builder = beam_history_builders[req_idx]
+                    beam_history = (
+                        beam_history_builder() if beam_history_builder is not None else None
+                    )
                 if beam_history is None:
+                    # Cancellation can finish the request while a deferred builder waits for copies.
+                    if req.state == LlmRequestState.GENERATION_COMPLETE:
+                        continue
                     raise RuntimeError(
                         f"Missing finalized beam history for request {req.py_request_id}"
                     )
                 beam_histories[req.py_request_id] = beam_history
         except Exception as exception:
+            logger.error(traceback.format_exc())
             host.beam_handoff.error = f"{type(exception).__name__}: {exception}"
         host.beam_handoff.beam_histories = beam_histories
 
     def _apply_beam_search_handoff(
         self, requests: list[LlmRequest], beam_handoff: BeamSearchHandoff
     ) -> None:
-        """Write the sampling rank's beam-search state of the step into this rank's store.
+        """Apply the sampling rank's beam-parent update to this rank's cache indirection.
 
-        This rank does not sample, so the hand-off is what keeps current the
-        cache indirection its attention reads in the next forward and the
-        cumulative log-probs a context-only request returns.
+        Token positions and output widths are captured before later request
+        updates can advance them.
 
         Args:
             requests: This rank's requests of the step.
@@ -1752,23 +1770,56 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert beam_handoff.request_ids == [request.py_request_id for request in requests], (
             "PP beam-search relay request order differs from the scheduled batch"
         )
+        # Completed requests may have released their slots to a new request.
+        live_rows = [
+            row
+            for row, request in enumerate(requests)
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        if not live_rows:
+            return
         seq_slots = [request.py_seq_slot for request in requests]
-        cache_indirection_host = beam_handoff.cache_indirection
-        cum_log_probs_host = beam_handoff.cum_log_probs
-        token_base = beam_handoff.token_base
-        width = token_base + cache_indirection_host.size(-1)
-        for request in requests[: beam_handoff.num_context_requests]:
-            assert request.py_seq_slot is not None
-            beam_search_store.cache_indirection[request.py_seq_slot, :, : request.py_prompt_len] = 0
-        seq_slots_cuda = torch.tensor(seq_slots, dtype=torch.int64, pin_memory=prefer_pinned()).to(
-            device="cuda", non_blocking=True
-        )
-        beam_search_store.cache_indirection[seq_slots_cuda, :, token_base:width] = (
-            cache_indirection_host.to(device="cuda", non_blocking=True)
-        )
-        beam_search_store.cum_log_probs[seq_slots_cuda] = cum_log_probs_host.to(
-            device="cuda", non_blocking=True
-        )
+        seq_slots_cuda, seq_lens_cuda = torch.tensor(
+            [seq_slots, beam_handoff.seq_lens], dtype=torch.int64, pin_memory=prefer_pinned()
+        ).to(device="cuda", non_blocking=True)
+        context_rows = [row for row in live_rows if row < beam_handoff.num_context_requests]
+        if context_rows:
+            max_prompt_len = max(requests[row].py_prompt_len for row in context_rows)
+            if len(context_rows) == beam_handoff.num_context_requests:
+                context_slots = seq_slots_cuda[: beam_handoff.num_context_requests]
+            else:
+                context_slots = torch.tensor(
+                    [seq_slots[row] for row in context_rows],
+                    dtype=torch.int64,
+                    pin_memory=prefer_pinned(),
+                ).to(device="cuda", non_blocking=True)
+            beam_search_store.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(
+                0, context_slots, 0
+            )
+        predecessor_beams_cuda = beam_handoff.predecessor_beams.to(device="cuda", non_blocking=True)
+        rows_by_width: dict[int, list[int]] = {}
+        for row in live_rows:
+            beam_width = beam_handoff.beam_widths[row]
+            rows_by_width.setdefault(beam_width, []).append(row)
+        num_positions = max(beam_handoff.seq_lens) + 1
+        for beam_width, rows in rows_by_width.items():
+            if len(rows) == len(requests):
+                slots, lengths = seq_slots_cuda, seq_lens_cuda
+                predecessors = predecessor_beams_cuda[:, :beam_width]
+            else:
+                rows_cuda = torch.tensor(rows, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+                    device="cuda", non_blocking=True
+                )
+                slots, lengths = seq_slots_cuda[rows_cuda], seq_lens_cuda[rows_cuda]
+                predecessors = predecessor_beams_cuda[rows_cuda, :beam_width]
+            beam_search_store.cache_indirection[slots, :beam_width, :num_positions] = (
+                _reorder_cache_indirection(
+                    beam_search_store.cache_indirection[slots, :, :num_positions],
+                    predecessors,
+                    lengths,
+                    beam_search_store.beam_idx_arange,
+                )
+            )
 
     @override
     @nvtx_range("update_requests")
@@ -2129,6 +2180,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+        beam_histories_deferred = False
         beam_handoff: BeamSearchHandoff | None = None
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
@@ -2157,13 +2209,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             if self._use_beam_search:
                 assert beam_search_store is not None
+                assert seq_lens_host is not None
                 assert seq_lens_cuda is not None
                 first_finish_reasons = beam_search_store.first_finish_reasons
                 first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
                 self._update_original_tokens(
                     beam_search_store.original_tokens, seq_slots_cuda, seq_lens_cuda, new_tokens
                 )
-                beam_history_builders, side_stream_event, cba_group = (
+                beam_history_builders, side_stream_event, beam_histories_deferred = (
                     self._beam_search.prepare_beam_histories(
                         requests, finish_reasons=first_finish_reasons
                     )
@@ -2172,8 +2225,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     beam_handoff = self._start_beam_search_handoff(
                         requests,
                         seq_slots_cuda,
+                        seq_lens_host,
                         len(scheduled_requests.context_requests_last_chunk),
-                        cba_group,
                     )
 
         # copy logprobs to host
@@ -2211,6 +2264,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            beam_histories_deferred=beam_histories_deferred,
             sample_type=self._current_sample_type,
         )
 
