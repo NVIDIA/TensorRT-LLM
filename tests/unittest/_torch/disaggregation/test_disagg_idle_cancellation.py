@@ -2325,6 +2325,16 @@ def test_legacy_tp_cp_cancel_vote_covers_cp_ranks_with_missing_replica(
     for engine in engines:
         assert "tp_cp_allgather" in [name for name, _ in engine.dist.calls]
 
+    # Vote two, still not ready: the propagated owner attempts cancellation but stays
+    # unretired, so retirement cannot slip past an unready CP owner.
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    if missing_replica != 1:
+        assert engines[1].disagg.request_cancellation.call_count >= 1
+    assert all(
+        not request.is_finished for rank, request in enumerate(requests) if rank != missing_replica
+    )
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+
     # Every rank's drain settles: the batch retires together and the ID clears.
     ready[1] = True
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))

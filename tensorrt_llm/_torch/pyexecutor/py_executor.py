@@ -8737,14 +8737,16 @@ class PyExecutor:
         # consumed: no further item will arrive to wake a blocking get(), so
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
-        # on `shutdown_event`. A rank with a pending cancellation is not idle
-        # either: the loop-head vote calls a TP+CP collective on every rank,
-        # and a blocking fetch here would hold that vote. The pending cancel
-        # can also be ready only on a peer, so waiting for a locally live
-        # request would not necessarily end.
+        # on `shutdown_event`. A rank with a pending cancellation that the
+        # loop-head vote clears is not idle either: the vote calls a TP+CP
+        # collective on every rank, and a blocking fetch here would hold it.
+        # Without a transceiver there is no vote to run: a stale ID then waits
+        # for the next batch's post-sampler cleanup instead of busy-polling.
         pending_retirement = self.disagg.has_retiring_gen_receives
+        pending_cancel_holds_vote = (self.canceled_req_ids
+                                     and self.kv_cache_transceiver is not None)
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.canceled_req_ids and not self.is_shutdown
+                and not pending_cancel_holds_vote and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
                 and not pending_retirement)
         # Only trust the hint on the busy path; `idle`, `control_pending` and
@@ -12014,6 +12016,11 @@ class PyExecutor:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
+            if self._kv_connector_moves_kv:
+                # A KV-moving connector may hold a save against the blocks this
+                # request has filled; give it the same finish handshake the
+                # post-batch cancellation path runs before pages are freed.
+                self._start_connector_async_save(request)
             response = request.create_response()
             if response is not None:
                 response.result.cached_tokens = request.cached_tokens
