@@ -496,7 +496,7 @@ The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `B
 
 `buildStageConfigs()` accepts a name template such as `Stage-{split}_of_4`. With three actual pytest splits, it generates only `-1_of_4`, `-2_of_4`, and `-3_of_4`; the fourth slot launches no stage of that list. Shard IDs larger than N wrap modulo N, so `-3_of_2` runs with `-1_of_2`. A stage with a single split is a literal stage entry that names its slot `k`, chosen so that every build carries a similar GPU load; each DeepSeek-V4-Pro `e2e` stage takes the slot of the `gen_only_no_context` stage of the same config. A test list holds cases of one frequency: where key-model and other cases share a topology, the key-model cases are in a `_key_models` list with a `-KeyModels-` stage.
 
-A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
+Post-merge perf-sanity stages (stages whose names contain both `PerfSanity` and `Post-Merge`) run automatically only in the official post-merge pipeline. In any other pipeline, including a PR's `/bot run --post-merge`, such a stage runs only when `--stage-list` or `--extra-stage` names it. A PR's `/bot run --post-merge` still runs the pre-merge perf-sanity stages, as a plain `/bot run` does.
 
 ### Pre-merge vs Post-merge Perf-Regression Gating
 

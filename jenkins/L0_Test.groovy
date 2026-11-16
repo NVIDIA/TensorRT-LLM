@@ -4034,7 +4034,8 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
-// Set by L0_MergeRequest.groovy for a pre-merge pipeline run with `/bot run --post-merge`.
+// Set by L0_MergeRequest.groovy outside the official post-merge pipeline, where post-merge perf-sanity
+// stages run only when --stage-list or --extra-stage names them.
 @Field
 def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
@@ -7668,7 +7669,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
-        // VisualGen PerfSanity post-merge test
+        // VisualGen PerfSanity post-merge test.
+        // See the "-k_of_N" scheduling rules above the GB300 PerfSanity stage definitions.
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-4_of_4": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // Single-GPU Gemma4 PerfSanity post-merge baseline
         "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
@@ -7735,8 +7737,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     ]
     // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
     // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash,
-    // Mistral Large 4) every 2 builds, the other cases every 4. buildStageConfigs gives split k slot k; a
-    // stage with a single split names its slot, chosen to spread the GPU load evenly over the builds.
+    // Mistral Large 4) every 2 builds, the other cases every 4. buildStageConfigs gives split k slot k, so
+    // a list whose split count is not a multiple of N runs more splits on some builds. A stage with a
+    // single split names its slot, chosen to offset this and keep each GPU pool's load per build about even.
     SBSASlurmTestConfigs += buildStageConfigs(
         "GB300-4_GPUs-PyTorch-PerfSanity-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-x4",
@@ -7815,7 +7818,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // 14 Nodes: ctx12 (1 node, 4 GPUs each) + gen1 (2 nodes, 8 GPUs) = 56 GPUs
         "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge-1_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8", 1, 1, 56, 14],
     ]
-    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs; the key-model cases in their own list
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs; the key-model cases in their own list.
+    // Splits 1 and 3 run on odd builds and split 2 on even ones; see the "-k_of_N" scheduling rules above the
+    // GB300 single-node PerfSanity stages.
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-flex",
@@ -8332,7 +8337,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     parallelJobsFiltered = filterCbtsStageJobs(
         parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
-    // Explicit selectors override both PR perf filtering and the -k_of_N build cadence.
+    // Explicit selectors override both the post-merge perf-sanity skip and the -k_of_N build cadence.
     def postMergeBuildNumber = globalVars[POST_MERGE_BUILD_NUMBER]
     if (postMergeBuildNumber != null && !(postMergeBuildNumber.toString() ==~ /\d+/)) {
         echo "WARNING: Invalid post-merge build number '${postMergeBuildNumber}'; ignoring stage cadence."

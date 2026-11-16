@@ -306,8 +306,8 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
-// True for a pre-merge pipeline run with `/bot run --post-merge`: it adds the post-merge stages
-// except the post-merge perf-sanity ones, which only the official post-merge pipeline runs.
+// True outside the official post-merge pipeline, where post-merge perf-sanity stages run only when
+// --stage-list or --extra-stage names them.
 @Field
 def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
@@ -402,7 +402,7 @@ def testFilter = [
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
     (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
-    (SKIP_POST_MERGE_PERF_SANITY): !(env.JOB_NAME ==~ /.*PostMerge.*/) && gitlabParamsFromBot.get((IS_POST_MERGE), false),
+    (SKIP_POST_MERGE_PERF_SANITY): !(env.JOB_NAME ==~ /.*PostMerge.*/),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
