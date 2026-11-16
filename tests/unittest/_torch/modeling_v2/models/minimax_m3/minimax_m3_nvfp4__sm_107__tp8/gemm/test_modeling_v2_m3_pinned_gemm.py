@@ -8,6 +8,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.mxfp8_quantize
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.modeling import (  # noqa: E501
+    MXFP8_DECODE_GEMM_TACTIC,
     _pinned_mxfp8_gemm,
     _pinned_mxfp8_quantize,
 )
@@ -15,7 +16,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_linear 
     mxfp8_reference,
 )
 
-__extra_import_path__ = ["../../../..", ".", "../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp  # noqa: E402
 
 if not torch.cuda.is_available():
@@ -34,9 +35,13 @@ CASES = [
 ]
 
 
+def test_the_pinned_tactic_is_cute_dsl() -> None:
+    assert MXFP8_DECODE_GEMM_TACTIC == FlashInferMXFP8GemmRunner.CUTE_DSL
+
+
 @pytest.mark.parametrize("nk,m", CASES, ids=[f"{n}x{k}-m{m}" for (n, k), m in CASES])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
-def test_pinned_decision_matches_every_stock_candidate(nk, m, scale) -> None:
+def test_pinned_gemm_is_cute_dsl_and_candidates_within_band(nk, m, scale) -> None:
     n, k = nk
     g = torch.Generator(device="cuda").manual_seed(n + k + m)
     w = (torch.randn(n, k, generator=g, device="cuda") / k**0.5).to(torch.bfloat16)
@@ -53,7 +58,9 @@ def test_pinned_decision_matches_every_stock_candidate(nk, m, scale) -> None:
     runner = FlashInferMXFP8GemmRunner(torch.bfloat16)
     # The pinned path must use the same tactic and produce identical bits on every call.
     cute = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTE_DSL)
-    assert torch.equal(out.view(torch.int16), cute.view(torch.int16))
+    assert torch.equal(out.view(torch.int16), cute.view(torch.int16)), (
+        FlashInferMXFP8GemmRunner.CUTE_DSL
+    )
     cutlass = runner.forward([xq, xsf, wq, wsf], tactic=FlashInferMXFP8GemmRunner.CUTLASS)
     ref = mxfp8_reference(xq, xsf, wq, wsf).to(torch.bfloat16)
     # Different GEMM implementations may accumulate in a different order. Check both against
