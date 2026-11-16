@@ -2905,6 +2905,11 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
+
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
         super().__init__(config)

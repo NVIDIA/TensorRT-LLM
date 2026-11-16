@@ -35,8 +35,8 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     validate_gdn_layout,
 )
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
 from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
-from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -190,7 +190,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
     _supports_mixed_precision_kv = False
-    mamba_metadata_cls = ReplayMamba2Metadata
+    mamba_metadata_cls = GDNMambaMetadata
     _replay_region: GDNReplayRegion | None = None
     _context_only = False
     # Whether the model's GDN layers verify drafts with the fused kernels, which

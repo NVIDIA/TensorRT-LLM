@@ -274,17 +274,22 @@ def get_kv_cache_manager_cls(
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
         if (is_hybrid_linear(config)
                 and model_config.get_num_mamba_layers() > 0):
-            # The hybrid V2 manager composes the FP4 MLA cache layout with
-            # its recurrent-state lifecycle; the Kimi K3 manager adds the KDA
-            # replay caches used by fused speculative verification. Its
-            # disaggregation declarations cover both the MLA and the
-            # recurrent-state roles.
+            # Kimi K3 is the hybrid linear-attention family with an FP4 MLA
+            # cache layout: its manager composes the layout with the
+            # recurrent-state lifecycle and the KDA replay caches used by
+            # fused speculative verification, and its disaggregation
+            # declarations cover both the MLA and the recurrent-state roles.
+            # The other families are not MLA models, or (glm5_next) NoPE ones,
+            # which is_mla() excludes.
+            if not is_kimi_linear(config):
+                raise ValueError(
+                    "An NVFP4 MLA KV cache is supported for hybrid "
+                    "linear-attention models only on Kimi K3 (kimi_linear); "
+                    f"got model_type={getattr(config, 'model_type', None)!r}.")
             _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
-            if is_kimi_linear(config):
-                from ..modules.kimi_kda.cache_manager import \
-                    KimiK3HybridCacheManager
-                return KimiK3HybridCacheManager
-            return MambaHybridCacheManagerV2
+            from ..modules.kimi_kda.cache_manager import \
+                KimiK3HybridCacheManager
+            return KimiK3HybridCacheManager
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 

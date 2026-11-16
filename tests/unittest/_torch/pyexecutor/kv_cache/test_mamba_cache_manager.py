@@ -52,6 +52,7 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     flashinfer_cached_replay_update,
     is_flashinfer_cached_replay_available,
 )
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 from tensorrt_llm._torch.modules.fla.replay_promotion import promote_conv_and_advance_replay_triton
 from tensorrt_llm._torch.modules.fla.replay_region import GDNReplayRegion
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
@@ -94,7 +95,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
-    InforwardSnapshotEntry,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -2210,6 +2210,7 @@ def _fp4_mla_snapshot_manager(**state_config) -> MambaHybridCacheManagerV2:
     mgr.enable_block_reuse = True
     mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
+    mgr._fp4_mla_snapshot_realignment_logged = False
     mgr._branch_snapshot_points = {}
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -2876,7 +2877,7 @@ def test_v2_hybrid_fp4_disagg_global_layer_ids_reject_unknown_virtual_layer(
     mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
     mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[5]]))
 
-    with pytest.raises(ValueError, match="Unknown hybrid FP4 MLA internal layer 5"):
+    with pytest.raises(ValueError, match="Unknown hybrid attention layout layer 5"):
         mgr.get_disagg_global_layer_ids(0)
 
 
@@ -2905,12 +2906,12 @@ def _build_v2_hybrid_fp4_mla(
     additional_snapshot_offsets_from_end: tuple[int, ...] = (),
     layer_specs=None,
     pool_ratio=None,
-) -> MambaHybridCacheManagerV2:
-    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1, then any
+) -> KimiK3HybridCacheManager:
+    """A real Kimi K3 manager: KDA layer 0 and FP4 MLA layer 1, then any
     appended draft layers."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
-    return MambaHybridCacheManagerV2(
+    return KimiK3HybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,
@@ -3058,16 +3059,17 @@ def test_v2_hybrid_fp4_target_pool_ratio_gains_the_draft_share(
 def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
+    from tensorrt_llm._torch.attention.backends.fp4_mla import (
+        cache_manager as fp4_mla_cache_manager,
+    )
 
     messages = []
-    monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", messages.append)
+    monkeypatch.setattr(fp4_mla_cache_manager.logger, "info", messages.append)
     mgr = SimpleNamespace(
-        _attention_cache_layout_policy=object(),
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         _fp4_mla_snapshot_realignment_logged=False,
     )
-    align = MambaHybridCacheManagerV2._align_fp4_mla_snapshot_points
+    align = Fp4MlaV2CacheLayoutPolicy.align_snapshot_points
 
     aligned = SimpleNamespace(py_request_id=1, expect_snapshot_points=[128, 256])
     align(mgr, aligned)
@@ -3945,7 +3947,6 @@ def _build_v2_hybrid_with_mamba_layer(
     is_disagg=False,
     enable_stats=False,
     model_manager_cls=None,
-    supports_inforward_snapshot=None,
     max_util_for_resume: float | None = None,
     kv_cache_config: KvCacheConfig | None = None,
     mamba_d_state: int = 8,
@@ -4017,8 +4018,6 @@ def _build_v2_hybrid_with_mamba_layer(
                 validate_gdn_layout(self, speculative_state)
             return speculative_state
 
-    if supports_inforward_snapshot is not None:
-        ModelStateManager._supports_inforward_snapshot = supports_inforward_snapshot
     manager_cls = ModelStateManager
     return manager_cls(
         mamba_d_state=mamba_d_state,
@@ -4122,7 +4121,6 @@ def _build_v2_inforward_snapshot_manager():
         block_reuse_policy="per_request",
         additional_snapshot_offsets_from_end=[2],
         conv_state_layout="q_k_v",
-        supports_inforward_snapshot=True,
     )
 
 
@@ -4201,7 +4199,7 @@ def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
         request.context_chunk_size = 66
         request.py_mamba_inforward_snapshot_point = 64
         batch = SimpleNamespace(context_requests=[request], generation_requests=[object()])
-        mgr._plan_inforward_snapshots(batch)
+        mgr._inforward_snapshots.plan_batch(batch)
         assert mgr.inforward_snapshot_plan == {}
         assert request.py_mamba_inforward_snapshot_point is None
     finally:

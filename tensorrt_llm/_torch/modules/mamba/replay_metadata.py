@@ -1,10 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Mamba metadata of the Mamba2 and GDN replay states: replay slots and replay work items.
+"""Replay metadata of the Mamba2 family, and the replay primitives the GDN metadata shares.
 
-A hybrid cache manager whose replay state the kernels address by replay slots of
-its own names this class as its ``mamba_metadata_cls``. The generic
-``Mamba2Metadata`` carries none of it.
+The replay kernels address each request's replay history by its replay slot
+and visit the generation rows write-first through replay work items. This
+module holds the work-item layout, its builders and the static replay-slot
+buffer (``ReplaySlotIndices``), and ``ReplayMamba2Metadata``, the Mamba metadata
+of the Mamba2 models, which their cache managers and models name as
+``mamba_metadata_cls``. The generic ``Mamba2Metadata`` carries none of it; the
+GDN layers' metadata (``modules/fla/gdn_metadata.py``) holds a replay state of
+its own built from the same primitives.
 """
 
 import torch
@@ -172,13 +177,85 @@ def _build_replay_work_items_torch(
     n_writes.copy_(batch_n_writes)
 
 
+def build_replay_work_items(
+    replay_metadata,
+    state_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    work_items: torch.Tensor,
+    n_writes: torch.Tensor,
+) -> None:
+    """Order the decode rows of a verify step write-first for the replay kernels.
+
+    Up to ``_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE`` rows take the
+    single-launch Triton builder, larger batches the ATen one.
+
+    Args:
+        replay_metadata: The cache manager's replay bookkeeping
+            (``ReplayStateUpdateMetadata``): the accepted-token counts and
+            active buffers by replay slot, the step width and history size.
+        state_indices: ``[num_decodes]`` int32 state slots of the decode rows.
+        replay_indices: ``[num_decodes]`` int32 replay slots of the same rows.
+        work_items: ``[>= num_decodes, REPLAY_WORK_ITEM_WIDTH]`` int32 output.
+        n_writes: ``[1]`` int32 output: the rows that write a checkpoint.
+    """
+    # The kernel reads the accepted counts and active buffers through their
+    # strides: a manager that keeps them in its KV cache pool hands out
+    # strided views of the per-slot replay metadata rows.
+    if len(state_indices) <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE:
+        build_work_items = _build_replay_work_items_triton
+    else:
+        build_work_items = _build_replay_work_items_torch
+    build_work_items(
+        state_indices,
+        replay_metadata.prev_num_accepted_tokens,
+        replay_metadata.cache_buf_idx,
+        work_items,
+        n_writes,
+        replay_metadata.replay_step_width,
+        replay_metadata.replay_history_size,
+        replay_indices,
+    )
+
+
+class ReplaySlotIndices:
+    """A static device buffer of the batch's replay slots.
+
+    A cache manager whose replay buffers have slots of their own
+    (``replay_layer_group_id``) hands them out through
+    ``get_replay_state_indices``; they are copied into one buffer, so CUDA
+    graphs keep reading the same address. Otherwise the replay buffers share
+    the recurrent-state slots.
+    """
+
+    def __init__(self, max_batch_size: int) -> None:
+        self.indices = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+        self._host = torch.zeros(max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned())
+        self._upload = DeviceCopyBuffer(self.indices, pin_memory=prefer_pinned())
+
+    def resolve(
+        self, kv_cache_manager, batch_request_ids, state_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The batch's replay slots: the static buffer, filled, or ``state_indices``."""
+        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None:
+            return state_indices
+        batch_size = len(batch_request_ids)
+        indices = kv_cache_manager.get_replay_state_indices(batch_request_ids)
+        assert len(indices) == batch_size, (
+            f"get_replay_state_indices() returned {len(indices)} entries for "
+            f"a batch of {batch_size} requests."
+        )
+        self._host[:batch_size].copy_(torch.as_tensor(indices, dtype=self._host.dtype))
+        self._upload.update(self._host[:batch_size])
+        return self.indices
+
+
 class ReplayMamba2Metadata(Mamba2Metadata):
-    """Mamba metadata plus each request's replay slot and the replay work items.
+    """Mamba2 metadata plus each request's replay slot and the replay work items.
 
     ``replay_state_indices`` is a static buffer the manager's replay slots are
-    copied into, or ``state_indices`` itself when the replay buffers share the
+    copied into, or ``state_indices`` itself when the replay history shares the
     recurrent-state slots. The replay work items order the generation rows
-    write-first for the partitioned cached replay.
+    write-first for ``replay_selective_state_update``.
     """
 
     def __init__(
@@ -189,18 +266,11 @@ class ReplayMamba2Metadata(Mamba2Metadata):
     ) -> None:
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
         self.replay_state_indices = self.state_indices
-        self._replay_state_indices = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
-        self._replay_state_indices_cpu = torch.zeros(
-            max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        self._replay_state_indices_buffer = DeviceCopyBuffer(
-            self._replay_state_indices, pin_memory=prefer_pinned()
-        )
+        self._replay_slots = ReplaySlotIndices(max_batch_size)
         self.replay_work_items = torch.zeros(
             max_batch_size, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda"
         )
         self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.replay_num_decodes = 0
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         super().prepare(attn_metadata)
@@ -212,7 +282,9 @@ class ReplayMamba2Metadata(Mamba2Metadata):
             and hasattr(kv_cache_manager, "get_state_indices")
             and request_ids is not None
         ):
-            self._prepare_replay_state_indices(kv_cache_manager, request_ids[:batch_size])
+            self.replay_state_indices = self._replay_slots.resolve(
+                kv_cache_manager, request_ids[:batch_size], self.state_indices
+            )
         else:
             self.replay_state_indices = self.state_indices
         self._prepare_replay_work_items(kv_cache_manager, batch_size, attn_metadata.num_contexts)
@@ -224,66 +296,20 @@ class ReplayMamba2Metadata(Mamba2Metadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         self._prepare_replay_work_items(attn_metadata.kv_cache_manager, batch_size, 0)
 
-    def _prepare_replay_state_indices(self, kv_cache_manager, batch_request_ids) -> None:
-        """Fill the static replay-slot buffer, or alias the state slots."""
-        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None:
-            self.replay_state_indices = self.state_indices
-            return
-        batch_size = len(batch_request_ids)
-        indices = kv_cache_manager.get_replay_state_indices(batch_request_ids)
-        assert len(indices) == batch_size, (
-            f"get_replay_state_indices() returned {len(indices)} entries for "
-            f"a batch of {batch_size} requests."
-        )
-        self._replay_state_indices_cpu[:batch_size].copy_(
-            torch.as_tensor(indices, dtype=self._replay_state_indices_cpu.dtype)
-        )
-        self._replay_state_indices_buffer.update(self._replay_state_indices_cpu[:batch_size])
-        self.replay_state_indices = self._replay_state_indices
-
-    def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int, num_contexts: int):
-        self.replay_num_decodes = 0
+    def _prepare_replay_work_items(
+        self, kv_cache_manager, batch_size: int, num_contexts: int
+    ) -> None:
         get_replay_metadata = getattr(kv_cache_manager, "get_replay_state_update_metadata", None)
         replay_metadata = get_replay_metadata() if get_replay_metadata is not None else None
-        if replay_metadata is None:
-            return
         num_decodes = batch_size - num_contexts
-        self.replay_num_decodes = num_decodes
-        if num_decodes == 0:
+        if replay_metadata is None or num_decodes == 0:
             return
-        # FlashInfer ring replay folds in-kernel and never reads work items.
-        if getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False):
-            return
-        use_gdn_all_layer_commit = getattr(
-            kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False
-        )
-        # The fused small-batch GDN kernel commits its checkpoint in-layer
-        # and indexes cache metadata directly. Work items are only consumed
-        # by the partitioned replay + all-layer commit path.
-        if use_gdn_all_layer_commit and not kv_cache_manager.gdn_replay_partitioned(num_decodes):
-            return
-
-        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
-        cache_buf_idx = replay_metadata.cache_buf_idx
-        replay_step_width = replay_metadata.replay_step_width
-        replay_history_size = replay_metadata.replay_history_size
-
-        # The kernel reads the accepted counts and active buffers through their
-        # strides: a manager that keeps them in its KV cache pool hands out
-        # strided views of the per-slot replay metadata rows.
-        if num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE:
-            build_work_items = _build_replay_work_items_triton
-        else:
-            build_work_items = _build_replay_work_items_torch
-        build_work_items(
+        build_replay_work_items(
+            replay_metadata,
             self.state_indices[num_contexts:batch_size],
-            prev_num_accepted_tokens,
-            cache_buf_idx,
+            self.replay_state_indices[num_contexts:batch_size],
             self.replay_work_items,
             self.replay_n_writes,
-            replay_step_width,
-            replay_history_size,
-            self.replay_state_indices[num_contexts:batch_size],
         )
 
 
@@ -295,4 +321,6 @@ __all__ = [
     "REPLAY_WORK_POSITION_IN_DECODE_BATCH",
     "REPLAY_WORK_REPLAY_SLOT",
     "ReplayMamba2Metadata",
+    "ReplaySlotIndices",
+    "build_replay_work_items",
 ]

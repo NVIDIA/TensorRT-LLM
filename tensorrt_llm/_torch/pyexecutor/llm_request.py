@@ -993,7 +993,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_hints: Optional[KvHintsSnapshot] = None
 
         # In-forward Mamba snapshot point P the scheduler let this context
-        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        # chunk run past (the GDN cache manager consumes it).
         self.py_mamba_inforward_snapshot_point: Optional[int] = None
         # Whether the first GEN step of a generation-only request was streamed.
         self.py_gen_first_emitted = False

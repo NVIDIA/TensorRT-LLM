@@ -14,9 +14,8 @@
 # limitations under the License.
 
 import contextlib
-import itertools
 import math
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -24,14 +23,9 @@ import triton.language as tl
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.modules.fla.flashinfer_chunk import \
-    invalidate_int32_cu_seqlens_cache
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
-
-if TYPE_CHECKING:
-    from .gdn_mixer import GdnIterationContext
 
 
 # num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
@@ -216,33 +210,14 @@ def cu_seqlens_to_chunk_indices_offsets(
     return chunk_indices, chunk_offsets
 
 
-class InforwardSnapshotSplit(NamedTuple):
-    """Index tensors of one step's in-forward Mamba snapshot split.
-
-    See ``Mamba2Metadata._prepare_inforward_split``. ``k`` requests are split;
-    ``num_tail_tokens`` tokens lie in their tails.
-    """
-    k: int
-    num_tail_tokens: int
-    cu: torch.Tensor
-    gather: torch.Tensor
-    live: torch.Tensor
-    main_rows: torch.Tensor
-    split_rows: torch.Tensor
-    stage_rows: torch.Tensor
-    tail_tok: torch.Tensor
-    cu_tail: torch.Tensor
-    tail_slots: torch.Tensor
-    conv_win: torch.Tensor
-
-
-# Fields of InforwardSnapshotSplit, in upload order.
-_INFORWARD_SPLIT_FIELDS = ("cu", "gather", "live", "main_rows", "split_rows",
-                           "stage_rows", "tail_tok", "cu_tail", "tail_slots",
-                           "conv_win")
-
-
 class Mamba2Metadata:
+    """Per-iteration metadata of the recurrent layers: the requests' state
+    slots and the chunked-scan layout of the context requests.
+
+    Model families extend it with metadata of their own state (replay slots,
+    per-layer caches); a model or its cache manager names the class to build
+    (``mamba_metadata_cls``).
+    """
 
     # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
     # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
@@ -250,11 +225,6 @@ class Mamba2Metadata:
     # during warmup. Class-scoped (not env-var) so it cannot leak into real
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
-
-    # Warmup-only knob, set via ``inforward_split_for_warmup``: ``prepare()``
-    # plans an in-forward snapshot split for the context requests, so warmup
-    # captures the CUDA graphs of the split GDN prefill core.
-    _warmup_inforward_split: bool = False
 
     # Set by a subclass whose prefill kernel compiles a separate variant
     # depending on whether every context length is a multiple of this value.
@@ -270,16 +240,6 @@ class Mamba2Metadata:
             yield
         finally:
             cls._warmup_force_initial_states = prev
-
-    @classmethod
-    @contextlib.contextmanager
-    def inforward_split_for_warmup(cls):
-        prev = cls._warmup_inforward_split
-        cls._warmup_inforward_split = True
-        try:
-            yield
-        finally:
-            cls._warmup_inforward_split = prev
 
     def __init__(
         self,
@@ -307,12 +267,6 @@ class Mamba2Metadata:
                                               dtype=torch.bool,
                                               device="cuda")
         self.use_initial_states = False
-        # Host gate for the GDN state reset (see gdn_mixer._reset_prefill_states):
-        # True when a context request of this iteration starts without a
-        # recurrent state; state_reset_done flips once the first GDN layer has
-        # cleared those slots for every layer.
-        self.prefill_needs_state_reset = True
-        self.state_reset_done = False
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
@@ -324,35 +278,17 @@ class Mamba2Metadata:
                                          device="cuda")
         self._state_indices_buffer = DeviceCopyBuffer(
             self.state_indices, pin_memory=prefer_pinned())
-        # The decode requests' slots of a mixed iteration in their own buffer:
-        # the FlashInfer decode kernel wants an aligned base pointer, which the
-        # tail slice ``state_indices[num_contexts:]`` only has when the number
-        # of context requests is a multiple of 4 (see _mixed_decode_recurrent).
-        self.state_indices_decode = torch.zeros(max_batch_size,
-                                                dtype=torch.int32,
-                                                device="cuda")
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
-        # Per-iteration GdnIterationContext (Qwen3NextGatedDeltaNet.forward_core):
-        # the first GDN layer of an iteration builds it once and the other
-        # layers reuse it. Cleared by prepare() and prepare_steady_gen_step().
-        self.gdn_iteration_context: Optional["GdnIterationContext"] = None
 
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
                                            dtype=torch.int,
                                            device="cuda")
         self._arange_buffer_long = self._arange_buffer.to(torch.long)
-
-        # In-forward Mamba snapshot split of this step (None: no split), and
-        # the buffer its index tensors live in at fixed field offsets, so they
-        # keep their addresses across steps (sized on the first split from the
-        # cache manager's staging capacity).
-        self.inforward_split: Optional[InforwardSnapshotSplit] = None
-        self._inforward_split_buf: Optional[torch.Tensor] = None
-        self._inforward_split_offsets: list[int] = []
+        # int64 copy of the cu_seqlens prefix (query_start_loc_long).
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
@@ -367,9 +303,6 @@ class Mamba2Metadata:
         ``prepare()``: the state indices and the dummy-request mask are still
         in place, so their host walk and H2D copies are skipped; only the
         per-step bookkeeping is refreshed."""
-        self.prefill_needs_state_reset = False
-        self.state_reset_done = False
-        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         kv_cache_manager = attn_metadata.kv_cache_manager
 
@@ -380,122 +313,7 @@ class Mamba2Metadata:
         if flush is not None:
             flush()
 
-    def _prepare_inforward_split(self, attn_metadata: AttentionMetadata,
-                                 kv_cache_manager, plan, num_contexts: int,
-                                 batch_size: int) -> None:
-        """Index tensors of the in-forward Mamba snapshot split.
-
-        A planned request's chunk [start, start + len) becomes two chunked
-        prefill sequences, [start, start + before) and the tail [start + before,
-        start + len); both gather the request's live state. The GDN layer
-        writes the first one's final state (the state at P) to the live slot,
-        recomputes the tail from it with the outputs written back at
-        ``tail_tok``, and stages the tail's final state (the state at the
-        prompt end) in the request's row. ``conv_win`` holds the token
-        positions of the convolution window that ends at P.
-        """
-        request_ids = attn_metadata.request_ids[:num_contexts]
-        entries = [plan.get(rid) for rid in request_ids]
-        k = sum(entry is not None for entry in entries)
-        if k == 0:
-            return
-        if batch_size != num_contexts:
-            raise RuntimeError("In-forward Mamba snapshot planned for a batch "
-                               "with generation requests")
-        width = kv_cache_manager.conv_state_shape[-1]
-        rows_cap = kv_cache_manager.inforward_snapshot_rows
-        tail_cap = rows_cap * kv_cache_manager.inforward_snapshot_max_tail
-        lens = attn_metadata.seq_lens[:num_contexts].tolist()
-        vals = {name: [] for name in _INFORWARD_SPLIT_FIELDS}
-        vals["cu"].append(0)
-        vals["cu_tail"].append(0)
-        start = 0
-        for rid, length, entry in zip(request_ids, lens, entries):
-            slot = kv_cache_manager.state_index(rid)
-            vals["live"].append(slot)
-            vals["main_rows"].append(len(vals["gather"]))
-            vals["gather"].append(slot)
-            if entry is None:
-                vals["cu"].append(start + length)
-            else:
-                before, after = entry.num_before, entry.num_after
-                if before + after != length or before < width:
-                    raise RuntimeError(
-                        f"In-forward Mamba snapshot: request {rid} chunk of "
-                        f"{length} tokens does not match the plan ({before} + "
-                        f"{after}, window {width})")
-                vals["split_rows"].append(len(vals["gather"]) - 1)
-                vals["stage_rows"].append(entry.row)
-                vals["cu"].append(start + before)
-                # The tail as a sequence of its own: its outputs are recomputed
-                # from the state at P, its final state is dropped.
-                vals["gather"].append(slot)
-                vals["cu"].append(start + length)
-                vals["tail_tok"].extend(range(start + before, start + length))
-                vals["cu_tail"].append(vals["cu_tail"][-1] + after)
-                vals["tail_slots"].append(slot)
-                vals["conv_win"].extend(
-                    range(start + before - width, start + before))
-            start += length
-        num_tail_tokens = len(vals["tail_tok"])
-        if k > rows_cap or num_tail_tokens > tail_cap:
-            raise RuntimeError(
-                f"In-forward Mamba snapshot: {k} requests / {num_tail_tokens} "
-                "tail tokens exceed the staging capacity")
-        if self._inforward_split_buf is None:
-            batch_cap = self.max_batch_size
-            capacity = (batch_cap + rows_cap + 1, batch_cap + rows_cap,
-                        batch_cap, batch_cap, rows_cap, rows_cap, tail_cap,
-                        rows_cap + 1, rows_cap, width * rows_cap)
-            self._inforward_split_offsets = [0, *itertools.accumulate(capacity)]
-            self._inforward_split_buf = torch.zeros(
-                self._inforward_split_offsets[-1],
-                dtype=torch.long,
-                device="cuda")
-        offsets = self._inforward_split_offsets
-        flat = [0] * offsets[-1]
-        for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets):
-            flat[start:start + len(vals[name])] = vals[name]
-        # One upload through a fresh pinned tensor: no later host write can
-        # race the copy.
-        self._inforward_split_buf.copy_(torch.tensor(
-            flat, dtype=torch.long, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        views = {
-            name: self._inforward_split_buf[start:start + len(vals[name])]
-            for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets)
-        }
-        self.inforward_split = InforwardSnapshotSplit(
-            k=k, num_tail_tokens=num_tail_tokens, **views)
-
-    @staticmethod
-    def _warmup_inforward_split_plan(attn_metadata: AttentionMetadata,
-                                     kv_cache_manager,
-                                     num_contexts: int) -> dict:
-        """Split each context request with room for the longest tail, up to the
-        staging rows (``inforward_split_for_warmup``)."""
-        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
-            InforwardSnapshotEntry
-        tail = kv_cache_manager.inforward_snapshot_max_tail
-        plan = {}
-        for rid, length in zip(attn_metadata.request_ids[:num_contexts],
-                               attn_metadata.seq_lens[:num_contexts].tolist()):
-            if (len(plan) < kv_cache_manager.inforward_snapshot_rows
-                    and length - tail
-                    >= kv_cache_manager.inforward_snapshot_min_main):
-                plan[rid] = InforwardSnapshotEntry(len(plan), length - tail,
-                                                   length - tail, tail)
-        return plan
-
     def prepare(self, attn_metadata: AttentionMetadata):
-        # The cu_seqlens buffers below are rewritten in place: drop the GDN
-        # launch path's per-iteration int32 casts of them first.
-        invalidate_int32_cu_seqlens_cache()
-        # Every iteration starts with the reset undone; the context branch below
-        # decides whether any request needs it at all.
-        self.prefill_needs_state_reset = False
-        self.state_reset_done = False
-        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
@@ -557,11 +375,6 @@ class Mamba2Metadata:
                 self._state_indices_buffer.update(
                     self.state_indices_cpu[:batch_size])
 
-        num_decodes = batch_size - num_contexts
-        if num_contexts > 0 and num_decodes > 0:
-            self.state_indices_decode[:num_decodes].copy_(
-                self.state_indices[num_contexts:batch_size], non_blocking=True)
-
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
@@ -613,13 +426,6 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
-            # Only context requests without a state need their slots zeroed;
-            # continuation chunks (the common case under prefix reuse) skip the
-            # reset launches in every GDN layer. Warmup forces the flag on so the
-            # reset kernel is compiled before the first real iteration.
-            self.prefill_needs_state_reset = bool(
-                Mamba2Metadata._warmup_force_initial_states
-                or not self.has_initial_states_cpu[:num_contexts].all())
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
@@ -637,18 +443,6 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
-
-        self.inforward_split = None
-        plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)
-        if (Mamba2Metadata._warmup_inforward_split and num_contexts > 0
-                and request_ids is not None):
-            plan = self._warmup_inforward_split_plan(attn_metadata,
-                                                     kv_cache_manager,
-                                                     num_contexts)
-        if (isinstance(plan, dict) and plan and num_contexts > 0
-                and request_ids is not None):
-            self._prepare_inforward_split(attn_metadata, kv_cache_manager, plan,
-                                          num_contexts, batch_size)
 
         # Complete any deferred recurrent-state block onboards scheduled by
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources

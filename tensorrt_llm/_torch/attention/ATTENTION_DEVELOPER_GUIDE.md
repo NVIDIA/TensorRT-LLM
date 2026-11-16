@@ -584,7 +584,7 @@ The FMHA package is split by role:
   chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
   rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
   holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
+  snapshot that the FP4 MLA layout aligns to a cache block) but not for dense
   FP4 MLA, whose reuse match can back off into a tile by the one-model
   draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
@@ -595,12 +595,17 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
-  linear-attention models (Kimi K3)
-  keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
-  `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
-  owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
-  manager keeps the SSM, convolution, and KDA replay state. For disaggregated
+  generation warmup shapes. The hybrid
+  linear-attention model Kimi K3
+  keeps its MLA latent cache in `KimiK3HybridCacheManager`, which selects
+  `Fp4MlaV2CacheLayoutPolicy` through the hybrid manager's
+  `_configure_attention_cache_layout` hook; `MambaHybridCacheManagerV2`
+  composes the policy with the recurrent-state lifecycle and forwards the
+  attention-layout operations to it: the policy owns the MLA layers' roles,
+  HP-ring virtual layers and snapshot-point alignment, and the hybrid
+  manager keeps the SSM, convolution, and KDA replay state. No other hybrid
+  linear-attention family has an FP4 MLA layout, so `get_kv_cache_manager_cls`
+  rejects one with an NVFP4 MLA cache. For disaggregated
   serving the hybrid manager owns the transfer declarations and merges the
   policy's MLA roles into them: K and K scales map to `NHD` and the HP ring to
   `REPLICATED` per role, so SSM state keeps the `INDEXED` `Role.ALL` fallback

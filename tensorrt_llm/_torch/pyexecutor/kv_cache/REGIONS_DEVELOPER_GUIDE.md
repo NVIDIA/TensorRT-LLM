@@ -51,7 +51,7 @@ The pool group belongs to the region alone, so this arithmetic is exact.
 | `region_layout` | After declaration | The regions and, once laid out, the owner of each buffer |
 | `get_region_group_ids(name)` | After construction | The region's layer group, through `KVCacheManager.get_region_group_id`; empty for an undeclared region |
 | `get_disagg_ignored_roles()` | Disaggregated transfer | Model and backend managers identify locally rebuilt buffers to exclude |
-| `mamba_metadata_cls` | Attention metadata creation | The Mamba metadata class the manager's state needs (the model's own class wins); `ReplayMamba2Metadata` carries replay slots and replay work items |
+| `mamba_metadata_cls` | Attention metadata creation | The Mamba metadata class the manager's state needs (the model's own class wins); the family classes below carry replay slots and replay work items |
 
 ## Replay regions of the model families
 
@@ -64,8 +64,8 @@ managers compose the provider through the generic hooks above and the recurrent-
 
 | Family | Provider | Managers | Metadata |
 |---|---|---|---|
-| Mamba2 | `Mamba2ReplayRegion` (`modules/mamba/replay_region.py`) | `NemotronHybridCacheManager` | `ReplayMamba2Metadata` |
-| GDN | `GDNReplayRegion` (`modules/fla/replay_region.py`) | `Qwen35HybridCacheManager`, `Qwen4ExpHybridCacheManager` | `ReplayMamba2Metadata` |
+| Mamba2 | `Mamba2ReplayRegion` (`modules/mamba/replay_region.py`) | `NemotronHybridCacheManager` | `ReplayMamba2Metadata` (`modules/mamba/replay_metadata.py`) |
+| GDN | `GDNReplayRegion` (`modules/fla/replay_region.py`) | `Qwen35HybridCacheManager`, `Qwen4ExpHybridCacheManager` | `GDNMambaMetadata` (`modules/fla/gdn_metadata.py`) |
 | KDA | `KDAReplayRegion` (`modules/kimi_kda/replay_region.py`) | `KimiK3HybridCacheManager`, `Glm5NextCacheManager` | `KimiK3MambaMetadata` |
 
 Every provider follows the same contract:
@@ -86,6 +86,28 @@ kernels read (`replay_state_indices`), or aliases `state_indices` when the repla
 recurrent-state slots. Before the manager exists, the manager's `_estimate_fixed_region_bytes()`
 reserves the provider's fixed pool. Replay buffers are never transferred between disaggregated
 workers: the manager lists them in `get_disagg_ignored_roles()`.
+
+The Mamba2 and GDN metadata classes extend `Mamba2Metadata` side by side; they share the replay
+primitives of `modules/mamba/replay_metadata.py` (the work-item layout and builders,
+`ReplaySlotIndices`), and only the GDN class applies the GDN gates (FlashInfer ring replay, the
+fused small-batch commit). The models name their family's class as well (`Qwen3NextForCausalLM`,
+`Qwen4ExpForCausalLM`, `NemotronHForCausalLM` and their multimodal wrappers), because the V1
+managers serve both families and name none.
+
+## The families' other state
+
+The shared hybrid manager and Mamba metadata leave the rest of the families' state to them too,
+through hooks that name no family:
+
+| State | Owner | Hooks of `MambaHybridCacheManagerV2` |
+|---|---|---|
+| FP4 MLA latent-cache layout | `KimiK3HybridCacheManager` selects `Fp4MlaV2CacheLayoutPolicy` for an NVFP4 MLA cache | `_configure_attention_cache_layout()` installs `_attention_cache_layout_policy`, to which the manager forwards attention-layout operations; `_estimate_attention_cache_cost()` gives the cost estimate its pages and rings |
+| A standalone drafter's KV layers | `KimiK3HybridCacheManager` (`accepts_appended_draft_layers`) | `_append_layers()` extends the layer masks, `_bind_appended_layers()` maps them to local layers |
+| GDN in-forward snapshots | `Qwen35HybridCacheManager` owns `InforwardSnapshots` (`modules/fla/inforward_snapshot.py`); `GDNMambaMetadata` plans the split | `_setup_model_state()`, `prepare_resources()`, `shutdown()`; the executor and scheduler read `inforward_snapshot_rows` (0 on `KVCacheManagerV2`) |
+| GDN mixer state (iteration context, state-reset gate, aligned decode slots) | `GDNMambaMetadata` | `prepare()`, `prepare_steady_gen_step()` |
+
+`tests/unittest/_torch/pyexecutor/kv_cache/test_replay_decoupling.py` checks that the shared
+modules name none of this state and import none of the families' modules.
 
 ## The KDA replay region
 

@@ -52,6 +52,7 @@ from ..distributed.ops import MNNVLAllReduce
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fla.gdn_metadata import GDNMambaMetadata
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
                               Linear, TensorParallelMode,
@@ -1385,7 +1386,10 @@ class Qwen3NextModel(DecoderModel):
 
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            attn_metadata.mamba_metadata = type(mamba_metadata)(
+            # The GDN layers read the GDN metadata's state.
+            metadata_cls = (type(mamba_metadata) if isinstance(
+                mamba_metadata, GDNMambaMetadata) else GDNMambaMetadata)
+            attn_metadata.mamba_metadata = metadata_cls(
                 attn_metadata.max_num_requests, chunk_size=128)
 
         if inputs_embeds is None:
@@ -1413,6 +1417,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     load_weights_strips_compile_wrapper = True
     model_specific_llm_args = frozenset(
         {"replicate_embedding", "mnnvl_allreduce_fp8_payload"})
+    # The GDN layers' Mamba metadata, whichever cache manager serves the model.
+    mamba_metadata_cls = GDNMambaMetadata
 
     @classmethod
     def supports_spec_decode_fast_paths(

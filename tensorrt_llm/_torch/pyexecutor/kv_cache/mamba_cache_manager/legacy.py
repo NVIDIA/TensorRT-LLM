@@ -984,13 +984,6 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     Delegates to PythonMambaCacheManager.
     """
 
-    @property
-    def mamba_metadata_cls(self):
-        """Mamba metadata with the replay slots and work items the replay path reads."""
-        from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
-
-        return ReplayMamba2Metadata
-
     def __init__(
         self,
         d_state: int,
@@ -1155,13 +1148,6 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = False
-
-    @property
-    def mamba_metadata_cls(self):
-        """Mamba metadata with the replay slots and work items the replay path reads."""
-        from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
-
-        return ReplayMamba2Metadata
 
     def _setup_mtp_intermediate_states(self, spec_config, max_batch_size: int) -> None:
         self.spec_config = spec_config

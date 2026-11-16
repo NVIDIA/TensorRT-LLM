@@ -23,6 +23,7 @@ from _torch.helpers import triton_num_compiled
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata, replay_metadata
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -79,9 +80,10 @@ class _GdnReplayCacheManager:
         )
 
 
+@pytest.mark.parametrize("metadata_cls", [ReplayMamba2Metadata, GDNMambaMetadata])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("num_decodes", [0, 2])
-def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
+def test_replay_mode_uses_one_metadata_query(monkeypatch, metadata_cls, enabled, num_decodes):
     replay = SimpleNamespace(
         prev_num_accepted_tokens=torch.zeros(10, dtype=torch.int32),
         cache_buf_idx=torch.zeros(10, dtype=torch.int32),
@@ -97,7 +99,7 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
             raise AssertionError("Replay mode must come from metadata, not the legacy flag")
 
     manager = Manager()
-    metadata = object.__new__(ReplayMamba2Metadata)
+    metadata = object.__new__(metadata_cls)
     metadata.state_indices = [7, 2, 9]
     metadata.replay_state_indices = [8, 3, 10]
     metadata.replay_work_items = object()
@@ -107,9 +109,10 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
     # the ATen one; either way the replay mode must come from the one metadata query.
     for builder in ("_build_replay_work_items_torch", "_build_replay_work_items_triton"):
         monkeypatch.setattr(replay_metadata, builder, build)
-    ReplayMamba2Metadata._prepare_replay_work_items(metadata, manager, 1 + num_decodes, 1)
+    metadata_cls._prepare_replay_work_items(metadata, manager, 1 + num_decodes, 1)
     manager.get_replay_state_update_metadata.assert_called_once_with()
-    assert metadata.replay_num_decodes == (num_decodes if enabled else 0)
+    if metadata_cls is GDNMambaMetadata:
+        assert metadata.replay_num_decodes == (num_decodes if enabled else 0)
     if enabled and num_decodes:
         build.assert_called_once_with(
             [2, 9],
@@ -126,10 +129,32 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
 
 
 def test_replay_metadata_optional_for_non_mamba_manager():
-    metadata = object.__new__(ReplayMamba2Metadata)
+    metadata = object.__new__(GDNMambaMetadata)
     metadata.replay_num_decodes = 10
     metadata._prepare_replay_work_items(SimpleNamespace(), 3, 1)
     assert metadata.replay_num_decodes == 0
+    # The Mamba2 metadata keeps no decode count; it builds nothing without replay.
+    ReplayMamba2Metadata._prepare_replay_work_items(
+        object.__new__(ReplayMamba2Metadata), SimpleNamespace(), 3, 1
+    )
+
+
+def test_mamba2_replay_builds_work_items_without_the_gdn_gates(monkeypatch):
+    """Mamba2 replay always reads the work items: the GDN gates (FlashInfer ring replay, the
+    fused small-batch commit) leave the Mamba2 metadata alone."""
+    build = Mock()
+    monkeypatch.setattr(replay_metadata, "_build_replay_work_items_triton", build)
+    manager = _GdnReplayCacheManager(
+        torch.zeros(4, dtype=torch.int32), torch.zeros(4, dtype=torch.int32)
+    )
+    manager.use_gdn_flashinfer_ring_replay = True
+    for metadata_cls, builds in ((ReplayMamba2Metadata, True), (GDNMambaMetadata, False)):
+        build.reset_mock()
+        metadata = object.__new__(metadata_cls)
+        metadata.state_indices = metadata.replay_state_indices = [0, 1, 2]
+        metadata.replay_work_items = metadata.replay_n_writes = object()
+        metadata._prepare_replay_work_items(manager, 3, 1)
+        assert build.called is builds, metadata_cls
 
 
 class _StateIndexCacheManager:
@@ -157,7 +182,8 @@ def _decode_attn_metadata(kv_cache_manager):
 
 
 @skip_no_cuda
-def test_prepare_fills_static_replay_slots_for_private_replay():
+@pytest.mark.parametrize("metadata_cls", [ReplayMamba2Metadata, GDNMambaMetadata])
+def test_prepare_fills_static_replay_slots_for_private_replay(metadata_cls):
     """A manager with PRIVATE replay buffers gets its replay slots copied into one static buffer, so CUDA graphs keep
     reading the same address; otherwise the replay slots alias the state slots."""
 
@@ -172,7 +198,7 @@ def test_prepare_fills_static_replay_slots_for_private_replay():
             return self.replay_indices[: len(request_ids)]
 
     manager = PrivateReplayCacheManager([4, 1], [6, 0])
-    metadata = ReplayMamba2Metadata(max_batch_size=2, chunk_size=8)
+    metadata = metadata_cls(max_batch_size=2, chunk_size=8)
     metadata.prepare(_decode_attn_metadata(manager))
     address = metadata.replay_state_indices.data_ptr()
     assert address != metadata.state_indices.data_ptr()
@@ -185,7 +211,7 @@ def test_prepare_fills_static_replay_slots_for_private_replay():
     assert metadata.replay_state_indices.data_ptr() == address
     assert metadata.replay_state_indices.tolist() == [3, 5]
 
-    coupled = ReplayMamba2Metadata(max_batch_size=2, chunk_size=8)
+    coupled = metadata_cls(max_batch_size=2, chunk_size=8)
     coupled.prepare(_decode_attn_metadata(_StateIndexCacheManager([4, 1])))
     assert coupled.replay_state_indices is coupled.state_indices
 
@@ -193,7 +219,7 @@ def test_prepare_fills_static_replay_slots_for_private_replay():
 @skip_no_cuda
 def test_generic_metadata_keeps_no_replay_slots_or_work_items():
     """The generic Mamba metadata prepares the state slots only, even for a manager with replay slots of its own;
-    the replay slots and work items are ReplayMamba2Metadata's."""
+    the replay slots and work items are the family metadata classes', as is the GDN state."""
 
     class PrivateReplayCacheManager(_StateIndexCacheManager):
         replay_layer_group_id = 1
@@ -213,11 +239,19 @@ def test_generic_metadata_keeps_no_replay_slots_or_work_items():
         "replay_work_items",
         "replay_n_writes",
         "replay_num_decodes",
-        "_prepare_replay_state_indices",
+        "_replay_slots",
         "_prepare_replay_work_items",
+        "gdn_iteration_context",
+        "prefill_needs_state_reset",
+        "state_reset_done",
+        "state_indices_decode",
+        "inforward_split",
+        "inforward_split_for_warmup",
+        "_prepare_inforward_split",
     ):
-        assert not hasattr(metadata, name)
+        assert not hasattr(metadata, name), name
     assert issubclass(ReplayMamba2Metadata, Mamba2Metadata)
+    assert issubclass(GDNMambaMetadata, Mamba2Metadata)
 
 
 def _torch_reference_work_items(
@@ -418,7 +452,8 @@ class TestMamba2Metadata:
         assert metadata.state_indices.data_ptr() == address
         assert writes == [[1, 2], [9, 2], [1, 2]]
 
-    def test_prepare_replay_work_items_write_first(self):
+    @pytest.mark.parametrize("metadata_cls", [ReplayMamba2Metadata, GDNMambaMetadata])
+    def test_prepare_replay_work_items_write_first(self, metadata_cls):
         class ReplayCacheManager:
             def __init__(self):
                 self.state_indices = [0, 3, 1, 4, 2]
@@ -438,7 +473,7 @@ class TestMamba2Metadata:
                     replay_history_size=MIN_REPLAY_HISTORY_SIZE,
                 )
 
-        metadata = ReplayMamba2Metadata(max_batch_size=5, chunk_size=8)
+        metadata = metadata_cls(max_batch_size=5, chunk_size=8)
         seq_lens = torch.tensor([2, 7, 7, 7, 7], dtype=torch.int)
         attn_metadata = SimpleNamespace(
             seq_lens=seq_lens,
@@ -574,7 +609,7 @@ class TestMamba2Metadata:
             torch.int32
         )
         manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
-        metadata = ReplayMamba2Metadata(max_batch_size=num_contexts + num_decodes, chunk_size=8)
+        metadata = GDNMambaMetadata(max_batch_size=num_contexts + num_decodes, chunk_size=8)
         metadata.state_indices[: num_contexts + num_decodes].copy_(state_indices)
 
         metadata._prepare_replay_work_items(manager, num_contexts + num_decodes, num_contexts)
@@ -606,7 +641,7 @@ class TestMamba2Metadata:
         prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
         cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
         manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
-        metadata = ReplayMamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata = GDNMambaMetadata(max_batch_size=num_decodes, chunk_size=8)
         metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
 
         launches = []
@@ -654,7 +689,7 @@ class TestMamba2Metadata:
         )
         manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
         manager.use_gdn_cached_replay_all_layer_commit = False
-        metadata = ReplayMamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata = GDNMambaMetadata(max_batch_size=num_decodes, chunk_size=8)
         state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
         metadata.state_indices.copy_(state_indices)
 
@@ -709,11 +744,11 @@ class TestMamba2Metadata:
         def build(prev_num_accepted_tokens, cache_buf_idx, private_slots):
             manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
             manager.use_gdn_cached_replay_all_layer_commit = all_layer_commit
-            metadata = ReplayMamba2Metadata(max_batch_size=batch_size, chunk_size=8)
+            metadata = GDNMambaMetadata(max_batch_size=batch_size, chunk_size=8)
             metadata.state_indices[:batch_size].copy_(state_indices)
             if private_slots is not None:
-                metadata._replay_state_indices[:batch_size].copy_(private_slots)
-                metadata.replay_state_indices = metadata._replay_state_indices
+                metadata._replay_slots.indices[:batch_size].copy_(private_slots)
+                metadata.replay_state_indices = metadata._replay_slots.indices
             metadata._prepare_replay_work_items(manager, batch_size, num_contexts)
             return metadata.replay_work_items[
                 :num_decodes
@@ -762,7 +797,7 @@ class TestMamba2Metadata:
         prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
         cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
         manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
-        metadata = ReplayMamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata = GDNMambaMetadata(max_batch_size=num_decodes, chunk_size=8)
         metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
 
         metadata._prepare_replay_work_items(manager, num_decodes, 0)
@@ -801,7 +836,7 @@ class TestMamba2Metadata:
         )
         manager.use_gdn_cached_replay_all_layer_commit = False
         manager.use_gdn_flashinfer_ring_replay = True
-        metadata = ReplayMamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata = GDNMambaMetadata(max_batch_size=num_decodes, chunk_size=8)
         metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
         metadata.replay_work_items.fill_(-7)
         metadata.replay_n_writes.fill_(-7)

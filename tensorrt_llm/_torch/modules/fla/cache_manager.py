@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated-DeltaNet replay integration for Mamba cache managers."""
+"""Gated-DeltaNet replay and in-forward snapshot integration for Mamba cache managers."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import math
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -18,7 +18,6 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
@@ -48,7 +47,12 @@ from .cached_replay import (
     build_gdn_history_descriptors,
     commit_gdn_cached_replay_history_layers,
 )
+from .gdn_metadata import GDNMambaMetadata
+from .inforward_snapshot import InforwardSnapshotEntry, InforwardSnapshots
 from .replay_region import REPLAY_STATE_REGION, GDNReplayRegion, ReplayLayout
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 MIN_REPLAY_HISTORY_SIZE = 16
 # Per-layer replay roles, by GDNReplayState attribute. The Triton kernel keeps
@@ -990,16 +994,16 @@ def estimate_gdn_replay_bytes_per_slot(
 
 
 class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
-    """Qwen3.5/Qwen3Next recurrent state with GDN replay.
+    """Qwen3.5/Qwen3Next recurrent state with GDN replay and in-forward snapshots.
 
     ``GDNReplayRegion`` declares and indexes the replay history; the FlashInfer
-    ring buffers are buffers of the recurrent layers instead.
+    ring buffers are buffers of the recurrent layers instead. The GDN mixer
+    implements the in-forward snapshot split, whose staging rows and per-step
+    plan ``InforwardSnapshots`` keeps.
     """
 
-    # The GDN mixer implements the in-forward snapshot split.
-    _supports_inforward_snapshot = True
     _skips_steady_state_index_upload = True
-    mamba_metadata_cls = ReplayMamba2Metadata
+    mamba_metadata_cls = GDNMambaMetadata
     _replay_region: GDNReplayRegion | None = None
     _context_only = False
     # Whether the model's GDN layers verify drafts with the fused kernels, which
@@ -1020,6 +1024,7 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         # A disaggregated context server never decodes and keeps no replay history.
         self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._replay_region = None
+        self._inforward_snapshots = InforwardSnapshots()
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -1029,6 +1034,49 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         batches commit inside each layer, as the fused target verify of the
         model's GDN layers (gdn_fused_verify) does at every batch size."""
         return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
+    @property
+    @override
+    def inforward_snapshot_rows(self) -> int:
+        """Staging rows per batch of the in-forward snapshots; 0 when the path does not apply."""
+        return self._inforward_snapshots.rows
+
+    @property
+    def inforward_snapshot_max_tail(self) -> int:
+        """The longest prompt tail an in-forward snapshot covers."""
+        return self._inforward_snapshots.max_tail
+
+    @property
+    def inforward_snapshot_min_main(self) -> int:
+        """The fewest chunk tokens before an in-forward snapshot point."""
+        return self._inforward_snapshots.min_main
+
+    @property
+    def inforward_snapshot_plan(self) -> dict[int, InforwardSnapshotEntry]:
+        """This step's in-forward snapshots by request id."""
+        return self._inforward_snapshots.plan
+
+    def inforward_snapshot_stage_views(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """A layer's staging rows: SSM ``[rows, H, V, K]`` and conv ``[rows, conv_dim, d_conv - 1]``."""
+        return self._inforward_snapshots.stage_views(self.mamba_layer_offsets[layer_idx])
+
+    def finish_inforward_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
+        """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
+
+        Called on the execution stream right after the forward, so the copies
+        precede the batch's sampler event.
+        """
+        self._inforward_snapshots.finish(self, scheduled_batch)
+
+    def state_index(self, request_id: int) -> int:
+        """The live state slot of a request scheduled in this step."""
+        return self._request_id_to_state_index[request_id]
+
+    @override
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        super().prepare_resources(scheduled_batch)
+        if self.inforward_snapshot_rows > 0:
+            self._inforward_snapshots.plan_batch(scheduled_batch)
 
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
@@ -1082,6 +1130,8 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
                 self.cuda_state_indices.device,
             )
         super()._setup_model_state()
+        if self.local_num_mamba_layers > 0:
+            self._inforward_snapshots.setup(self)
 
     @property
     def replay_layer_group_id(self) -> int | None:
@@ -1148,6 +1198,7 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     def shutdown(self) -> None:
         if self._replay_region is not None:
             self._replay_region.shutdown()
+        self._inforward_snapshots.shutdown()
         super().shutdown()
 
     @classmethod

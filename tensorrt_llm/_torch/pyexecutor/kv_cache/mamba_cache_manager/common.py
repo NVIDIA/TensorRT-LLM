@@ -595,7 +595,8 @@ def _estimate_mamba_hybrid_cache_cost(
     else:
         partial_attention_slots = max_resident_sequences * unaligned_fixed_rules
     # attention_page_bytes_override adds the per-sequence attention state
-    # that a retained partial page also pins (the FP4 MLA HP ring).
+    # that a retained partial page also pins (an attention layout's ring of
+    # recent tokens).
     intercept = fixed_state_slots * state_bytes_per_rank + partial_attention_slots * (
         attention_block_bytes + attention_page_bytes_override
     )

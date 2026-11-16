@@ -826,8 +826,10 @@ class Runner:
             )
 
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
+            # Resolved as the engine does: the model's class, then the cache manager's.
             mamba_metadata_cls = (
-                getattr(attn_metadata.kv_cache_manager, "mamba_metadata_cls", None)
+                getattr(self.model, "mamba_metadata_cls", None)
+                or getattr(attn_metadata.kv_cache_manager, "mamba_metadata_cls", None)
                 or Mamba2Metadata
             )
             mamba_metadata = mamba_metadata_cls(

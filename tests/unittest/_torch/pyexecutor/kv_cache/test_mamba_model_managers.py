@@ -21,6 +21,8 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
 )
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshots
 from tensorrt_llm._torch.modules.fla.replay_region import GDNReplayRegion
 from tensorrt_llm._torch.modules.fla.replay_region import replay_slot_count as gdn_replay_slot_count
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
@@ -221,6 +223,9 @@ def _shutdown_manager(manager, monkeypatch):
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
+        if isinstance(manager, Qwen35HybridCacheManager):
+            assert manager.inforward_snapshot_rows == 0
+            assert manager.inforward_snapshot_plan == {}
 
     pool_shutdown = Mock(side_effect=check_before_pool_shutdown)
     monkeypatch.setattr(KVCacheManagerV2, "shutdown", pool_shutdown)
@@ -495,6 +500,8 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     if manager_cls is Qwen4ExpHybridCacheManager:
         manager._ple_conv_states = {}
         manager._ple_ngram_contexts = {}
+    if manager_cls is Qwen35HybridCacheManager:
+        manager._inforward_snapshots = InforwardSnapshots()
     manager.mamba_layer_offsets = {42: 0}
     conv, ssm, payload = object(), object(), object()
     manager.all_conv_states, manager.all_ssm_states = [conv], [ssm]
@@ -652,26 +659,76 @@ def test_disaggregated_context_server_builds_no_replay_provider(manager_cls, sta
     assert manager.get_disagg_ignored_roles() == frozenset()
 
 
-def test_replay_managers_name_the_replay_mamba_metadata():
-    """The managers whose replay kernels address replay slots and work items name ReplayMamba2Metadata; the shared
-    manager and the KDA managers, whose models name their metadata, name none."""
+def test_family_managers_name_their_family_mamba_metadata():
+    """The Mamba2 manager names the Mamba2 replay metadata and the GDN managers the GDN metadata;
+    the shared manager, the KDA managers (whose models name their metadata) and the V1 managers,
+    which serve both families, name none."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         CppMambaHybridCacheManager,
         MambaCacheManager,
         MixedMambaHybridCacheManager,
     )
 
+    assert NemotronHybridCacheManager.mamba_metadata_cls is ReplayMamba2Metadata
+    assert Qwen35HybridCacheManager.mamba_metadata_cls is GDNMambaMetadata
+    assert Qwen4ExpHybridCacheManager.mamba_metadata_cls is GDNMambaMetadata
     for manager_cls in (
-        NemotronHybridCacheManager,
-        Qwen35HybridCacheManager,
-        Qwen4ExpHybridCacheManager,
+        MambaHybridCacheManagerV2,
+        KimiK3HybridCacheManager,
+        Glm5NextCacheManager,
         MambaCacheManager,
         MixedMambaHybridCacheManager,
         CppMambaHybridCacheManager,
     ):
-        assert object.__new__(manager_cls).mamba_metadata_cls is ReplayMamba2Metadata
-    for manager_cls in (MambaHybridCacheManagerV2, KimiK3HybridCacheManager, Glm5NextCacheManager):
         assert getattr(object.__new__(manager_cls), "mamba_metadata_cls", None) is None
+
+
+def test_family_metadata_classes_are_independent():
+    """The Mamba2 and GDN metadata classes extend the generic Mamba2Metadata side by side."""
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
+    assert issubclass(ReplayMamba2Metadata, Mamba2Metadata)
+    assert issubclass(GDNMambaMetadata, Mamba2Metadata)
+    assert not issubclass(ReplayMamba2Metadata, GDNMambaMetadata)
+    assert not issubclass(GDNMambaMetadata, ReplayMamba2Metadata)
+
+
+def test_models_name_their_family_mamba_metadata():
+    """The models name their family's metadata class, so the V1 managers, which serve both
+    families, build it too; the multimodal wrappers name their language model's."""
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6Model
+    from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import NemotronHMultimodalModel
+    from tensorrt_llm._torch.models.modeling_pplx_decider import PplxDeciderForDecision
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeVLModel,
+        Qwen3_5VLModel,
+    )
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import (
+        Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    for model_cls in (
+        Qwen3NextForCausalLM,
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5VLModel,
+        Qwen3_5MoeVLModel,
+        Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration,
+        PplxDeciderForDecision,
+    ):
+        assert model_cls.mamba_metadata_cls is GDNMambaMetadata, model_cls
+    assert NemotronHForCausalLM.mamba_metadata_cls is ReplayMamba2Metadata
+    for wrapper_cls in (NemotronHMultimodalModel, MiniCPMV4_6Model):
+        metadata_cls = wrapper_cls.mamba_metadata_cls.fget
+        assert metadata_cls(SimpleNamespace(llm=object())) is None
+        llm = SimpleNamespace(mamba_metadata_cls=ReplayMamba2Metadata)
+        assert metadata_cls(SimpleNamespace(llm=llm)) is ReplayMamba2Metadata
 
 
 def test_mamba_metadata_class_prefers_the_model_then_the_manager():
@@ -695,6 +752,10 @@ def test_mamba_metadata_class_prefers_the_model_then_the_manager():
     assert (
         resolve_mamba_metadata_cls(SimpleNamespace(mamba_metadata_cls=None), replay_manager)
         is ReplayMamba2Metadata
+    )
+    assert (
+        resolve_mamba_metadata_cls(plain_model, object.__new__(Qwen35HybridCacheManager))
+        is GDNMambaMetadata
     )
     assert resolve_mamba_metadata_cls(plain_model, plain_manager) is Mamba2Metadata
     assert resolve_mamba_metadata_cls(plain_model, None) is Mamba2Metadata
@@ -2344,3 +2405,193 @@ def test_legacy_kda_replay_retains_cpp_manager_gate(monkeypatch):
             False,
             False,
         ) == ("qwen3_next", False, expected)
+
+
+_FP4_MLA_PRETRAINED_CONFIG = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+
+
+def _configure_attention_layout(manager, config, *, dtype, kv_cache_type, pretrained_config):
+    return manager._configure_attention_cache_layout(
+        config,
+        kv_cache_type,
+        dtype=dtype,
+        tokens_per_block=128,
+        head_dim=576,
+        spec_config=None,
+        mapping=Mapping(),
+        pretrained_config=pretrained_config,
+        is_disagg=False,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_cls", [MambaHybridCacheManagerV2, Glm5NextCacheManager])
+def test_shared_hybrid_manager_keeps_the_v2_attention_layout(manager_cls):
+    """Only Kimi K3 selects the FP4 MLA layout; the shared manager keeps the V2 layout."""
+    from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+
+    manager = object.__new__(manager_cls)
+    config = KvCacheConfig(dtype="nvfp4")
+
+    assert (
+        manager._configure_attention_cache_layout(
+            config,
+            CacheTypeCpp.SELFKONLY,
+            dtype=DataType.NVFP4,
+            tokens_per_block=128,
+            head_dim=576,
+            spec_config=None,
+            mapping=Mapping(),
+            pretrained_config=_FP4_MLA_PRETRAINED_CONFIG,
+        )
+        is config
+    )
+    assert manager._attention_cache_layout_policy is None
+    assert manager_cls._estimate_attention_cache_cost(
+        SimpleNamespace(), Mapping(), max_batch_size=4, tokens_per_block=128
+    ) == (None, 0, 0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "dtype_name, kv_cache_type_name, pretrained_config, selects",
+    [
+        ("NVFP4", "SELFKONLY", _FP4_MLA_PRETRAINED_CONFIG, True),
+        ("FP8", "SELFKONLY", _FP4_MLA_PRETRAINED_CONFIG, False),
+        ("NVFP4", "SELF", _FP4_MLA_PRETRAINED_CONFIG, False),
+        ("NVFP4", "SELFKONLY", SimpleNamespace(kv_lora_rank=512), False),
+        ("NVFP4", "SELFKONLY", None, False),
+    ],
+)
+def test_kimi_k3_selects_the_fp4_mla_layout_for_an_nvfp4_latent_cache(
+    monkeypatch, dtype_name, kv_cache_type_name, pretrained_config, selects
+):
+    """Kimi K3 composes the FP4 MLA layout for an NVFP4 K-only MLA latent cache, else keeps V2's."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+        Fp4MlaV2CacheLayoutPolicy,
+    )
+    from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+
+    configured = []
+    returned = KvCacheConfig(dtype="nvfp4", enable_partial_reuse=False)
+
+    def configure_manager(manager, kv_cache_config, kv_cache_type, **kwargs):
+        configured.append((manager, kv_cache_type, kwargs))
+        manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
+        return returned
+
+    monkeypatch.setattr(
+        Fp4MlaV2CacheLayoutPolicy, "configure_manager", staticmethod(configure_manager)
+    )
+    manager = object.__new__(KimiK3HybridCacheManager)
+    config = KvCacheConfig(dtype="nvfp4")
+    result = _configure_attention_layout(
+        manager,
+        config,
+        dtype=getattr(DataType, dtype_name),
+        kv_cache_type=getattr(CacheTypeCpp, kv_cache_type_name),
+        pretrained_config=pretrained_config,
+    )
+
+    if selects:
+        assert result is returned
+        assert manager._attention_cache_layout_policy is Fp4MlaV2CacheLayoutPolicy
+        ((target, kv_cache_type, kwargs),) = configured
+        assert target is manager and kv_cache_type == CacheTypeCpp.SELFKONLY
+        assert kwargs["pretrained_config"] is pretrained_config
+        assert (kwargs["tokens_per_block"], kwargs["head_dim"]) == (128, 576)
+    else:
+        assert result is config
+        assert configured == []
+        assert manager._attention_cache_layout_policy is None
+
+
+@pytest.mark.cpu_only
+def test_kimi_k3_estimates_the_fp4_mla_attention_cost(monkeypatch):
+    """Kimi K3 costs FP4 MLA pages and HP rings for an FP4 MLA model, the generic estimate otherwise."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import cache_manager as fp4_mla
+    from tensorrt_llm._torch.modules.kimi_kda import cache_manager as kda_cache_manager
+
+    calls = []
+
+    def fp4_cost(model_config, mapping, num_layers=None, **kwargs):
+        calls.append((num_layers, kwargs))
+        return 40, 4 * 1000
+
+    monkeypatch.setattr(
+        fp4_mla.Fp4MlaKVCacheManagerV2, "get_cache_size_per_token", staticmethod(fp4_cost)
+    )
+    monkeypatch.setattr(
+        kda_cache_manager, "_get_local_mamba_cache_layout", lambda *args, **kwargs: (None, 2, 3)
+    )
+
+    def model_config(fp4_kv_cache):
+        return SimpleNamespace(
+            pretrained_config=_FP4_MLA_PRETRAINED_CONFIG,
+            quant_config=SimpleNamespace(
+                quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: fp4_kv_cache)
+            ),
+        )
+
+    mapping = Mapping()
+    assert KimiK3HybridCacheManager._estimate_attention_cache_cost(
+        model_config(True), mapping, max_batch_size=4, tokens_per_block=128, is_disagg=True
+    ) == (40, 4000, 1000)
+    ((num_layers, kwargs),) = calls
+    assert num_layers == 3
+    assert kwargs["tokens_per_block"] == 128 and kwargs["is_disagg"] is True
+    assert KimiK3HybridCacheManager._estimate_attention_cache_cost(
+        model_config(False), mapping, max_batch_size=4, tokens_per_block=128
+    ) == (None, 0, 0)
+
+
+def _hybrid_fp4_mla_model_config(pretrained_config):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantAlgo
+
+    return SimpleNamespace(
+        pretrained_config=pretrained_config,
+        sparse_attention_config=None,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        attn_backend="TRTLLM",
+        get_num_mamba_layers=lambda: 2,
+    )
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_route_rejects_a_hybrid_family_other_than_kimi_k3():
+    """No hybrid family but Kimi K3 has an FP4 MLA layout, so the route fails rather than build
+    the shared manager without one."""
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+
+    # A Nemotron-H hybrid pattern with MLA attention geometry.
+    config = SimpleNamespace(
+        model_type="nemotron_h",
+        hybrid_override_pattern="M*",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    with pytest.raises(ValueError, match="only on Kimi K3"):
+        get_kv_cache_manager_cls(
+            _hybrid_fp4_mla_model_config(config),
+            KvCacheConfig(use_kv_cache_manager_v2=True, enable_kv_pool_rebalance=False),
+        )
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_route_builds_the_kimi_k3_manager():
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        linear_attn_config={"full_attn_layers": [2]},
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert (
+        get_kv_cache_manager_cls(
+            _hybrid_fp4_mla_model_config(config),
+            KvCacheConfig(use_kv_cache_manager_v2=True, enable_kv_pool_rebalance=False),
+        )
+        is KimiK3HybridCacheManager
+    )
