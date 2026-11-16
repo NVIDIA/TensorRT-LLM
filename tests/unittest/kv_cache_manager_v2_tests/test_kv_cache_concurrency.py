@@ -37,12 +37,12 @@ import torch
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     BufferConfig,
     CudaStream,
     GpuCacheTierConfig,
     KVCacheManager,
     KVCacheManagerConfig,
+    ReusePolicy,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -188,7 +188,7 @@ def test_optional_selection_and_resume_with_concurrent_priority_callbacks() -> N
             layer_id=1,
             buffers=[BufferConfig(role="key", size=4096)],
             sliding_window_size=4,
-            reuse_policy=AttentionReusePolicy.OPTIONAL,
+            reuse_policy=ReusePolicy.OPTIONAL,
         ),
     ]
     manager = KVCacheManager(config)

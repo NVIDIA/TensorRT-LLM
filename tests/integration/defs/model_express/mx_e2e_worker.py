@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 
 # Eight prompts of distinct lengths (4-12 tokens). Every ID stays below 30000
 # so the same probe is valid for TinyLlama (32000-token vocabulary), Mistral,
@@ -48,6 +48,19 @@ _MAX_NEW_TOKENS = 32
 # whole batch within `_MAX_NUM_TOKENS`.
 _MAX_SEQ_LEN = 128
 _MAX_NUM_TOKENS = 256
+# The image probe asks each question about each `--image`, so vision-language
+# rows also run the vision encoder and multimodal positions on every role.
+_IMAGE_PROBE_QUESTIONS = (
+    "Describe the image in one sentence.",
+    "What colors dominate this image?",
+    "List the main objects in this image.",
+    "Where could this picture have been taken?",
+)
+# Image prompts are a few hundred tokens each; one context iteration still
+# schedules the whole batch, and every role uses the same limits.
+_IMAGE_MAX_SEQ_LEN = 1024
+_IMAGE_MAX_NUM_TOKENS = 4096
+_PROBES = ("text", "image")
 # Exit status of a receiver whose own transfer self-check failed before any
 # accuracy evaluation was attempted.
 SELF_CHECK_FAILED_EXIT_CODE = 3
@@ -64,6 +77,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--max-serve-seconds", type=float, default=1800.0)
+    parser.add_argument(
+        "--probe",
+        choices=_PROBES,
+        default="text",
+        help="Behavioral probe: token-ID text prompts, or image prompts built from --image",
+    )
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        type=Path,
+        help="Image file for the image probe; repeat for more images",
+    )
+    moe_group = parser.add_argument_group(
+        "moe", "MoE settings that every role of one row must share"
+    )
+    moe_group.add_argument("--moe-ep-size", type=int, default=1)
+    moe_group.add_argument("--moe-disable-finalize-fusion", action="store_true")
     eval_group = parser.add_argument_group(
         "eval", "Run an accuracy evaluator on the loaded model instead of the token probe"
     )
@@ -78,6 +109,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     eval_group.add_argument("--eval-apply-chat-template", action="store_true")
     eval_group.add_argument("--eval-system-prompt")
     args = parser.parse_args(argv)
+    if args.probe == "image":
+        if not args.image:
+            parser.error("--probe image requires at least one --image")
+        if args.eval_task is not None:
+            parser.error("--probe image is not supported with --eval-task")
+    elif args.image:
+        parser.error("--image requires --probe image")
     if args.eval_task is not None:
         if args.role == "donor":
             parser.error("--eval-task is not supported for the donor role")
@@ -110,10 +148,22 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "max_seq_len": _MAX_SEQ_LEN,
         "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.15),
     }
+    if args.probe == "image":
+        # Image prompts are built from text and need the tokenizer and the
+        # model's multimodal input processor.
+        kwargs.update(
+            {
+                "skip_tokenizer_init": False,
+                "max_batch_size": len(args.image) * len(_IMAGE_PROBE_QUESTIONS),
+                "max_num_tokens": _IMAGE_MAX_NUM_TOKENS,
+                "max_seq_len": _IMAGE_MAX_SEQ_LEN,
+            }
+        )
     if args.eval_task is not None:
         # Size the engine for the evaluator instead of the short probe. The
-        # donor keeps the probe sizing; SourceIdentity does not hash engine
-        # limits, so donor and receiver identities still match.
+        # donor keeps the probe sizing. SourceIdentity hashes realized tensor
+        # shapes, so this only works for families whose parameters and
+        # buffers do not depend on engine limits.
         max_seq_len = args.eval_max_input_len + args.eval_max_output_len
         kwargs.update(
             {
@@ -123,6 +173,17 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
                 "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=args.eval_kv_fraction),
             }
         )
+    if args.moe_ep_size != 1:
+        kwargs["moe_expert_parallel_size"] = args.moe_ep_size
+    # Collect every `MoeConfig` field first and build the config once, so one
+    # MoE flag never replaces the config that another flag set.
+    moe_config_fields: dict[str, object] = {}
+    if args.moe_disable_finalize_fusion:
+        # The CUTLASS FC2+finalize fusion is not deterministic for top-k > 2;
+        # the roles of one row must generate identical greedy tokens.
+        moe_config_fields["disable_finalize_fusion"] = True
+    if moe_config_fields:
+        kwargs["moe_config"] = MoeConfig(**moe_config_fields)
     env_overrides = _rank_process_env_overrides(args)
     if env_overrides:
         kwargs["env_overrides"] = env_overrides
@@ -199,6 +260,25 @@ def _self_check_receiver_transfer(tp_size: int) -> None:
         sys.exit(SELF_CHECK_FAILED_EXIT_CODE)
 
 
+def _probe_prompts(llm: LLM, args: argparse.Namespace) -> list[object]:
+    """Return the probe prompts: token-ID lists, or image prompts for `--probe image`."""
+    if args.probe == "text":
+        return [list(prompt) for prompt in _PROMPT_TOKEN_IDS]
+    from tensorrt_llm.inputs import default_multimodal_input_loader
+
+    config = json.loads((Path(args.model) / "config.json").read_text(encoding="utf-8"))
+    questions = [question for _image in args.image for question in _IMAGE_PROBE_QUESTIONS]
+    images = [str(image) for image in args.image for _question in _IMAGE_PROBE_QUESTIONS]
+    return default_multimodal_input_loader(
+        tokenizer=llm.tokenizer,
+        model_dir=args.model,
+        model_type=config["model_type"],
+        modality="image",
+        prompts=questions,
+        media=images,
+    )
+
+
 def _run_eval(llm: LLM, args: argparse.Namespace) -> dict[str, object]:
     """Run the requested `tensorrt_llm.evaluate` task with the reference sampling params."""
     import tensorrt_llm.evaluate as evaluate
@@ -273,22 +353,19 @@ def main() -> None:
             end_id=-1,
             pad_id=0,
         )
+        prompts = _probe_prompts(llm, args)
         generate_started = time.perf_counter()
-        results = list(
-            llm.generate(
-                [list(prompt) for prompt in _PROMPT_TOKEN_IDS],
-                sampling_params=sampling_params,
-            )
-        )
+        results = list(llm.generate(prompts, sampling_params=sampling_params))
         generate_seconds = time.perf_counter() - generate_started
         payload: dict[str, object] = {
             "role": args.role,
             "tp_size": args.tp_size,
+            "probe": args.probe,
             "load_seconds": load_seconds,
             "generate_seconds": generate_seconds,
             "max_new_tokens": _MAX_NEW_TOKENS,
-            "prompt_count": len(_PROMPT_TOKEN_IDS),
-            "prompt_lengths": [len(prompt) for prompt in _PROMPT_TOKEN_IDS],
+            "prompt_count": len(prompts),
+            "prompt_lengths": [len(result.prompt_token_ids) for result in results],
             "token_ids": [list(result.outputs[0].token_ids) for result in results],
         }
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

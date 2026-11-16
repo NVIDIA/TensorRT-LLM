@@ -61,7 +61,10 @@ void poisonOnExcept(char const* context, F&& func) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Exception hierarchy (mirrors _exceptions.py)
+// Exception hierarchy. The bindings make a Python class of each one
+// (nb::exception in nanobind/batch_manager/kvCacheManagerV2.cpp) and
+// runtime/kv_cache_manager_v2/__init__.py re-exports them, so the class a
+// Python caller catches is this one.
 // ---------------------------------------------------------------------------
 
 class OutOfMemoryError : public std::runtime_error
@@ -215,6 +218,18 @@ class OutOfPagesError : public std::runtime_error
 {
 public:
     explicit OutOfPagesError(std::string const& msg = "Out of pages")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// A remote cache level could not reach its donors, or a transfer to or from one failed or timed out
+// (storage/remoteMem.h). Not an out-of-pages error: the level's contents can no longer be trusted, which no retry
+// fixes.
+class RemoteMemError : public std::runtime_error
+{
+public:
+    explicit RemoteMemError(std::string const& msg)
         : std::runtime_error(msg)
     {
     }

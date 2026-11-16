@@ -1,0 +1,141 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build a "fat" enroot sqsh (base image + trtllm pre-installed).
+# Called by the CPU fat-builder sbatch job after the base sqsh has already been
+# imported/cached. Prepare Container waits for that job, and the GPU test job then
+# uses the fat sqsh directly (SKIP_INSTALL=1).
+#
+# Usage:
+#   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tar_artifact_path> <tar_name>
+#
+# The tarball is read on the host with fetch_build_artifact.sh (FAT_FETCH_HELPER_PATH), which
+# takes LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID from the
+# environment. ARTIFACTORY_NETRC is deleted as soon as the download ends.
+#
+# Exits 0 on success (fat sqsh written atomically to <fat_sqsh_path>).
+# The caller uses || true so failures are non-fatal; the GPU test job will then
+# fall back to the base sqsh + full slurm_install.sh.
+
+set -euo pipefail
+
+FAT_SQSH_PATH="$1"
+BASE_SQSH_PATH="$2"
+LLM_TAR_ARTIFACT_PATH="$3"
+TAR_NAME="$4"
+: "${FAT_FETCH_HELPER_PATH:?FAT_FETCH_HELPER_PATH is required}"
+# The read helper's exit status for a transfer that still failed after its own retries; its
+# other failures, such as an absent package or a rejected credential, are final.
+FETCH_TRANSFER_FAILED=4
+FETCH_MAX_ATTEMPTS=3
+
+FAT_HASH=$(printf '%s' "$LLM_TAR_ARTIFACT_PATH" | sha256sum | cut -d' ' -f1 | head -c 16)
+FAT_CONTAINER="fat_build_${FAT_HASH}_${SLURM_JOB_ID:-$$}"
+WORK_DIR=$(mktemp -d /tmp/fat_build_XXXXXX)
+FAT_TMP="${FAT_SQSH_PATH}.${SLURM_JOB_ID:-$$}.tmp"
+
+cleanup() {
+    enroot remove -f "$FAT_CONTAINER" 2>/dev/null || true
+    rm -rf "$WORK_DIR" "$FAT_TMP" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "[fat_build] Starting: $FAT_SQSH_PATH"
+echo "[fat_build] Base sqsh: $BASE_SQSH_PATH"
+echo "[fat_build] LLM tarball: $LLM_TAR_ARTIFACT_PATH"
+
+removeNetrc() {
+    if [ -n "${ARTIFACTORY_NETRC:-}" ]; then
+        rm -f "$ARTIFACTORY_NETRC"
+    fi
+}
+
+# Download on the host into WORK_DIR, so the netrc never enters the container.
+echo "[fat_build] Downloading $TAR_NAME..."
+attempt=1
+while true; do
+    status=0
+    bash "$FAT_FETCH_HELPER_PATH" "$LLM_TAR_ARTIFACT_PATH" "$WORK_DIR/$TAR_NAME" || status=$?
+    if [ "$status" -eq 0 ]; then
+        break
+    fi
+    if [ "$status" -ne "$FETCH_TRANSFER_FAILED" ] || [ "$attempt" -ge "$FETCH_MAX_ATTEMPTS" ]; then
+        echo "[fat_build] Download failed (exit $status) after $attempt attempt(s)"
+        removeNetrc
+        exit 1
+    fi
+    echo "[fat_build] Download failed (exit $status), attempt $attempt of $FETCH_MAX_ATTEMPTS; retrying in 60s..."
+    attempt=$((attempt + 1))
+    sleep 60
+done
+removeNetrc
+
+# Write the install script into WORK_DIR (mounted as /work inside the container).
+# Quoted heredoc (<<'INSTALL_EOF') prevents outer-shell expansion of LLM_TAR_ARTIFACT_PATH
+# and TAR_NAME; values are passed as positional arguments when the script is invoked.
+# All work is done inside /tmp/ in the container filesystem (not in the /work mount),
+# so the source tree (/tmp/TensorRT-LLM/) and installed packages are baked into the exported sqsh image.
+cat > "$WORK_DIR/install.sh" <<'INSTALL_EOF'
+#!/bin/bash
+set -euo pipefail
+LLM_TAR_ARTIFACT_PATH="$1"
+TAR_NAME="$2"
+cd /tmp
+tar -zxf "/work/$TAR_NAME"
+echo "[fat_build] Python/pip versions:"
+python3 --version
+pip3 --version
+echo "[fat_build] Installing apt deps..."
+apt-get install -y libffi-dev
+echo "[fat_build] pip site-packages location:"
+python3 -c "import site; print(site.getsitepackages())"
+echo "[fat_build] Installing requirements-dev.txt..."
+pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
+# Keep this list in sync with the non-fat-sqsh install paths (slurm_install.sh and
+# the !isFatSqsh branch in L0_Test.groovy); anything they install must be baked in
+# here too, or fat-sqsh jobs run against a smaller environment than everyone else.
+# The one exception is install_mamba.sh, which the Ray jobs run themselves.
+echo "[fat_build] Installing requirements-grpc-smg.txt..."
+pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-grpc-smg.txt
+echo "[fat_build] Installing trtllm wheel..."
+pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+# Baked in even though the non-fat paths let the test fixtures install it on
+# demand: the media-deps fixture returns early when cv2 already imports, so
+# pre-installing here costs the GPU job nothing and saves it a pip round trip.
+echo "[fat_build] Installing opencv-python-headless..."
+pip3 install --no-user --retries 10 opencv-python-headless
+echo "[fat_build] Installing ray (required for --run-ray test jobs)..."
+pip3 install --no-user --retries 10 "ray[default]==2.55.1"
+echo "[fat_build] Installed TensorRT-LLM version:"
+pip3 show tensorrt-llm || true
+echo "$LLM_TAR_ARTIFACT_PATH" > /tmp/trtllm_installed.txt
+echo "[fat_build] Install complete."
+INSTALL_EOF
+
+echo "[fat_build] Creating writable container from base sqsh..."
+enroot create --name "$FAT_CONTAINER" "$BASE_SQSH_PATH"
+
+echo "[fat_build] Running install inside container..."
+enroot start \
+    --rw \
+    --mount "$WORK_DIR:/work" \
+    "$FAT_CONTAINER" -- bash /work/install.sh "$LLM_TAR_ARTIFACT_PATH" "$TAR_NAME"
+
+echo "[fat_build] Exporting fat sqsh..."
+enroot export --output "$FAT_TMP" "$FAT_CONTAINER"
+mv -f "$FAT_TMP" "$FAT_SQSH_PATH"
+
+echo "[fat_build] Done: $(ls -lh "$FAT_SQSH_PATH" | awk '{print $5, $9}')"

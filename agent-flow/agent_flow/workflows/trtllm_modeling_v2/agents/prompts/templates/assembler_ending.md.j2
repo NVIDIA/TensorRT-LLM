@@ -1,0 +1,6 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+A correct call outside its entry's `CELLS` is not a reason to stop: list it
+under `uncertified` in your decision file, one line each naming the entry,
+the values and the call site, and carry on. The planner reads that list when
+your task ends and adds the certification.

@@ -46,13 +46,22 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/VideoSparseAttentionConfig"
+                  "$ref": "#/$defs/VideoSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SolAttentionConfig"
+                  "$ref": "#/$defs/SolAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -397,6 +406,14 @@
           "title": "Ring Size",
           "type": "integer"
         },
+        "text_encoder_tp_size": {
+          "default": 1,
+          "description": "Text encoder tensor-parallel group size. Currently MiniMax-H3 only: text-only prompts shard the Qwen3-VL text encoder across ranks [0, text_encoder_tp_size), while Ref2VA or FL2VA requests with Qwen vision inputs must use text_encoder_tp_size=1. The rank 0 worker broadcasts prompt embeddings to the remaining ranks.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Text Encoder Tp Size",
+          "type": "integer"
+        },
         "tp_layout": {
           "anyOf": [
             {
@@ -464,6 +481,7 @@
         "W4A16_NVFP4",
         "NVFP4_AWQ",
         "NVFP4_ARC",
+        "NVFP4_PLUS",
         "NO_QUANT"
       ],
       "title": "QuantAlgo",
@@ -536,6 +554,22 @@
           "status": "prototype",
           "title": "V Dtype",
           "type": "string"
+        },
+        "vc_attention": {
+          "default": false,
+          "description": "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts.",
+          "status": "prototype",
+          "title": "Vc Attention",
+          "type": "boolean"
+        },
+        "vc_repair_budget": {
+          "default": 0.0,
+          "description": "Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the fastest setting measured at unchanged quality. vc_attention only.",
+          "exclusiveMaximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Vc Repair Budget",
+          "type": "number"
         }
       },
       "title": "QuantAttentionConfig",
@@ -732,6 +766,45 @@
       "title": "RuntimeLoRAConfig",
       "type": "object"
     },
+    "SeaCacheConfig": {
+      "additionalProperties": false,
+      "description": "SeaCache step-caching acceleration config (https://arxiv.org/abs/2602.18993).\n\nSkips the generator transformer stack on steps whose spectrally filtered\ninput latents changed little since the last computed step, and predicts the\nstack's residual by linear extrapolation from the last two computed steps.\nThe first ``max(max_warmup_steps, 1)`` and the last denoising steps are always\ncomputed.",
+      "properties": {
+        "cache_backend": {
+          "const": "seacache",
+          "default": "seacache",
+          "description": "Selects the SeaCache backend in `cache_config`.",
+          "title": "Cache Backend",
+          "type": "string"
+        },
+        "max_continuous_cached_steps": {
+          "default": 2,
+          "description": "Maximum number of consecutive cached steps before a full step is forced; -1 removes the limit and 0 disables caching.",
+          "minimum": -1,
+          "status": "prototype",
+          "title": "Max Continuous Cached Steps",
+          "type": "integer"
+        },
+        "max_warmup_steps": {
+          "default": 12,
+          "description": "Leading denoising steps that always run the full stack; the first step always does.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Max Warmup Steps",
+          "type": "integer"
+        },
+        "threshold": {
+          "default": 0.25,
+          "description": "Accumulated relative-L1 change of the filtered latents below which a step reuses the cache; larger values skip more steps.",
+          "exclusiveMinimum": 0.0,
+          "status": "prototype",
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "title": "SeaCacheConfig",
+      "type": "object"
+    },
     "SkipSoftmaxAttentionConfig": {
       "additionalProperties": false,
       "description": "SkipSoftmax sparse attention configuration for visual generation.\n\nThis class is only the Python/YAML user surface. Checkpoint calibration\ndata is passed to ``to_sparse_params()`` when SparseParams are created.",
@@ -844,6 +917,17 @@
             "exact"
           ],
           "title": "Thresh Type",
+          "type": "string"
+        },
+        "token_order": {
+          "default": "native",
+          "description": "Order of the video tokens seen by the routing blocks. 'morton' applies a Z-order permutation over the (frames, height, width) latent grid around the transformer block stack so that each 64-token block covers a compact 3D neighborhood instead of a run along width; 'hilbert' uses the Hilbert curve, a continuous path with no octant jumps. Dense attention is permutation-equivariant in exact arithmetic; in bf16 the reordered sums round differently, so the output is not bit-identical to native order. Supported by the Wan pipelines; other pipelines reject a non-native order.",
+          "enum": [
+            "native",
+            "morton",
+            "hilbert"
+          ],
+          "title": "Token Order",
           "type": "string"
         }
       },
@@ -987,7 +1071,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -1002,16 +1086,29 @@
           "discriminator": {
             "mapping": {
               "cache_dit": "#/$defs/CacheDiTConfig",
+              "seacache": "#/$defs/SeaCacheConfig",
               "teacache": "#/$defs/TeaCacheConfig"
             },
             "propertyName": "cache_backend"
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/TeaCacheConfig"
+              "$ref": "#/$defs/TeaCacheConfig",
+              "required": [
+                "cache_backend"
+              ]
             },
             {
-              "$ref": "#/$defs/CacheDiTConfig"
+              "$ref": "#/$defs/CacheDiTConfig",
+              "required": [
+                "cache_backend"
+              ]
+            },
+            {
+              "$ref": "#/$defs/SeaCacheConfig",
+              "required": [
+                "cache_backend"
+              ]
             }
           ]
         },
@@ -1111,6 +1208,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --visual_gen_args",
   "type": "object"
 }

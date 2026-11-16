@@ -18,6 +18,7 @@ from tensorrt_llm.visual_gen.args import (
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
+    SeaCacheConfig,
     SkipSoftmaxAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
@@ -177,6 +178,135 @@ class TestAttentionConfigQuantValidation:
             )
 
         assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("vc_repair_budget", [0.0, 0.005])
+    def test_supported_quant_config_vc_attention(self, sm_ver, qk_dtype, vc_repair_budget):
+        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell, with tile means or repair rows."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype, vc_attention=True, vc_repair_budget=vc_repair_budget
+                ),
+            )
+
+        assert attention.quant_attention_config.vc_attention
+        assert attention.quant_attention_config.vc_repair_budget == vc_repair_budget
+        q_config = attention.quant_attention_config
+        assert (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size) == (
+            (0, 0, 1) if qk_dtype == "bf16" else (128, 128, 1)
+        )
+
+    @pytest.mark.parametrize(
+        ("backend", "sm_ver", "quant", "sparse", "match"),
+        [
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1),
+                None,
+                "fixes the block sizes",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_repair_budget is a VC-Attention",
+            ),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=-0.1), None, "vc_repair_budget"),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=1.0), None, "vc_repair_budget"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_k=True),
+                None,
+                "are SageAttention options",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_v=True),
+                None,
+                "are SageAttention options",
+            ),
+            ("TRTLLM", 90, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            ("TRTLLM", 120, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "CUTEDSL",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            ("CUDNN", 100, dict(qk_dtype="bf16"), None, "vc_attention is a TRTLLM backend option"),
+            (
+                "FLASHINFER",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+        ],
+        ids=[
+            "block_sizes",
+            "repair_without_vc",
+            "budget_below_zero",
+            "budget_at_one",
+            "smooth_k",
+            "smooth_v",
+            "sm90",
+            "sm120",
+            "vsa",
+            "skip_softmax",
+            "cutedsl",
+            "cudnn",
+            "flashinfer",
+            "vanilla",
+            "vanilla_repair",
+        ],
+    )
+    def test_vc_attention_rejections(self, backend, sm_ver, quant, sparse, match):
+        """VC-Attention fixes its block sizes, owns the repair budget, is TRTLLM and Blackwell only,
+        and never composes with SageAttention smoothing or a sparse algorithm."""
+        quant = {"vc_attention": True, **quant}
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            with pytest.raises(ValidationError, match=match):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(**quant),
+                    sparse_attention_config=sparse,
+                )
 
     @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
@@ -382,6 +512,56 @@ class TestVisualGenArgsCacheBackend:
         assert args.cache_backend == "teacache"
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_union_discriminated_seacache(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={"cache_backend": "seacache", "threshold": 0.15},
+        )
+        assert args.cache_backend == "seacache"
+        assert isinstance(args.cache_config, SeaCacheConfig)
+        assert args.seacache.threshold == 0.15
+        assert args.seacache.max_continuous_cached_steps == 2
+        assert args.teacache is None and args.cache_dit is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"threshold": 0.0},
+            {"threshold": -0.1},
+            {"max_continuous_cached_steps": -2},
+            {"max_warmup_steps": -1},
+            {"thresh": 0.2},
+            # The cap is named like Cache-DiT's; the earlier name is not an alias.
+            {"max_consecutive_cached_steps": 2},
+        ],
+    )
+    def test_seacache_rejects_invalid_values(self, kwargs):
+        with pytest.raises(ValidationError):
+            SeaCacheConfig(**kwargs)
+
+    @pytest.mark.parametrize("cap", [-1, 0, 5])
+    def test_seacache_accepts_unlimited_disabled_and_positive_caps(self, cap):
+        assert SeaCacheConfig(max_continuous_cached_steps=cap).max_continuous_cached_steps == cap
+
+    def test_seacache_config_round_trips(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={
+                "cache_backend": "seacache",
+                "max_warmup_steps": 3,
+                "max_continuous_cached_steps": -1,
+            },
+        )
+        dumped = args.model_dump()["cache_config"]
+        assert dumped == {
+            "cache_backend": "seacache",
+            "threshold": 0.25,
+            "max_warmup_steps": 3,
+            "max_continuous_cached_steps": -1,
+        }
+        restored = VisualGenArgs(model="/tmp/model", cache_config=dumped)
+        assert restored.cache_config == args.cache_config
 
     def test_cache_default_is_none(self):
         args = VisualGenArgs(model="/tmp/model")
@@ -594,6 +774,16 @@ class TestParallelConfigValidation:
     def test_parallel_vae_size_must_be_positive(self):
         with pytest.raises(ValidationError):
             ParallelConfig(parallel_vae_size=0)
+
+    def test_text_encoder_tp_size_does_not_change_worker_count(self):
+        pc = ParallelConfig(ulysses_size=2, text_encoder_tp_size=2)
+        assert pc.n_workers == 2
+        pc.validate_world_size(2)
+
+    def test_text_encoder_tp_size_validate_world_size_fails(self):
+        pc = ParallelConfig(text_encoder_tp_size=2)
+        with pytest.raises(ValueError, match="text_encoder_tp_size"):
+            pc.validate_world_size(1)
 
     def test_attn2d_and_ulysses_seq_parallel_size(self):
         pc = ParallelConfig(

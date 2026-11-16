@@ -15,7 +15,9 @@
 
 import concurrent
 import contextlib
+import copy
 import functools
+import hashlib
 import itertools
 import json
 import os
@@ -28,6 +30,7 @@ import time
 from collections import namedtuple
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import openai
@@ -37,12 +40,14 @@ import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
 
+from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
+                                          DSparkDecodingConfig,
                                           Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
-from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
+from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer, load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
@@ -50,9 +55,12 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
-                            LlmapiAccuracyTestHarness,
+                            LlmapiAccuracyTestHarness, LongBenchV2,
                             acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
+from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_host_fetches,
+                                      assert_token_parity, read_fetch_events,
+                                      wait_for_fetch_events)
 
 
 class Result(GenerationResultBase):
@@ -74,9 +82,11 @@ class Result(GenerationResultBase):
 # ``serve_url`` is the disaggregated server's base URL. It defaults to None so
 # that callers building a DuckLLM by hand keep working; tests that need to
 # reach the workers (e.g. for iteration stats) read it off the harness.
-DuckLLM = namedtuple('DuckLLM',
-                     ['args', 'tokenizer', 'generate_async', 'serve_url'],
-                     defaults=(None, ))
+# ``restart_generation`` reloads decode workers without reloading prefill.
+DuckLLM = namedtuple(
+    'DuckLLM',
+    ['args', 'tokenizer', 'generate_async', 'serve_url', 'restart_generation'],
+    defaults=(None, None))
 
 
 def pick_distinct_free_ports(count: int) -> List[int]:
@@ -97,8 +107,8 @@ def pick_distinct_free_ports(count: int) -> List[int]:
             sock.close()
 
 
-def compute_disagg_acceptance_length(serve_url: str) -> float:
-    """Acceptance length from the generation workers' iteration stats.
+def _get_disagg_generation_stats(serve_url: str) -> list[dict[str, Any]]:
+    """Read the generation workers' iteration stats.
 
     The disaggregated server does not proxy ``/metrics``, so the workers are
     resolved through ``/cluster_info`` -- the only authoritative source for
@@ -119,13 +129,19 @@ def compute_disagg_acceptance_length(serve_url: str) -> float:
 
     stats = []
     for worker in gen_workers:
-        # /metrics drains the buffer, so call it exactly once per worker,
-        # after the workload has finished.
+        # /metrics drains the buffer. Read it before a workload to discard
+        # startup statistics, then after the workload to collect its iterations.
         response = requests.get(
             f"http://{worker['host']}:{worker['port']}/metrics", timeout=60)
         response.raise_for_status()
         stats.extend(response.json())
-    return acceptance_length_from_iteration_stats(stats)
+    return stats
+
+
+def compute_disagg_acceptance_length(serve_url: str) -> float:
+    """Acceptance length from the generation workers' iteration stats."""
+    return acceptance_length_from_iteration_stats(
+        _get_disagg_generation_stats(serve_url))
 
 
 # Timeout for the entire test
@@ -222,23 +238,42 @@ def run_accuracy_test(llm: "DuckLLM",
         )
 
 
+def _terminate_server_processes(processes: list[subprocess.Popen]) -> None:
+    """Give serving processes a bounded opportunity to shut down MPI and transfers."""
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    deadline = time.monotonic() + 5
+    for process in processes:
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        except OSError:
+            pass
+
+
 @contextlib.contextmanager
 def launch_disaggregated_llm(
-    disaggregated_server_config: Dict[str, Any],
-    ctx_server_config: Dict[str, Any],
-    gen_server_config: Dict[str, Any],
-    model_name: str,
-    tensor_parallel_size: int = 1,
-    ctx_model: str = None,
-    gen_model: str = None,
-    server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
-    max_workers: int = 16,
-    enable_perf=False,
-    extra_env: Optional[Dict[str, str]] = None,
-    gen_extra_env: Optional[Dict[str, str]] = None,
-    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
-    request_max_retries: Optional[int] = None,
-    assert_worker_log_contains: str | None = None,
+        disaggregated_server_config: Dict[str, Any],
+        ctx_server_config: Dict[str, Any],
+        gen_server_config: Dict[str, Any],
+        model_name: str,
+        tensor_parallel_size: int = 1,
+        ctx_model: str = None,
+        gen_model: str = None,
+        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
+        max_workers: int = 16,
+        enable_perf=False,
+        extra_env: Optional[Dict[str, str]] = None,
+        gen_extra_env: Optional[Dict[str, str]] = None,
+        request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+        request_max_retries: Optional[int] = None,
+        assert_worker_log_contains: str | None = None,
+        assert_worker_log_excludes: tuple[str, ...] = (),
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -435,6 +470,8 @@ def launch_disaggregated_llm(
         gen_servers.append((env, gen_server_args))
 
     worker_log_paths = []
+    capture_worker_logs = bool(assert_worker_log_contains
+                               or assert_worker_log_excludes)
 
     @contextlib.contextmanager
     def report_worker_logs_on_failure() -> Iterator[None]:
@@ -511,40 +548,74 @@ def launch_disaggregated_llm(
         ctx_processes = server_stack.enter_context(
             multi_popen(ctx_servers,
                         "ctx",
-                        enable_redirect_log=assert_worker_log_contains
-                        is not None))
-        gen_processes = server_stack.enter_context(
+                        enable_redirect_log=capture_worker_logs))
+        generation_stack = server_stack.enter_context(contextlib.ExitStack())
+        gen_processes = generation_stack.enter_context(
             multi_popen(gen_servers,
                         "gen",
-                        enable_redirect_log=assert_worker_log_contains
-                        is not None))
+                        enable_redirect_log=capture_worker_logs))
 
-        start_time = time.time()
-        server_is_ready = False
-        while time.time() - start_time < server_waiting_timeout:
-            time.sleep(5)
-            for process in itertools.chain(ctx_processes, gen_processes,
-                                           server_processes):
-                if process.poll() is not None:
-                    raise Exception(
-                        f"process {process.pid} exited with code {process.returncode}"
-                    )
-            try:
-                print("Checking cluster_info endpoint for worker registration")
-                response = requests.get(
-                    f"http://localhost:{serve_port}/cluster_info")
-                if response.status_code == 200:
+        def wait_ready() -> None:
+            deadline = time.monotonic() + server_waiting_timeout
+            while time.monotonic() < deadline:
+                for process in itertools.chain(ctx_processes, gen_processes,
+                                               server_processes):
+                    if process.poll() is not None:
+                        raise RuntimeError(
+                            f"process {process.pid} exited with code {process.returncode}"
+                        )
+                try:
+                    response = requests.get(
+                        f"http://localhost:{serve_port}/cluster_info",
+                        timeout=10)
+                    response.raise_for_status()
                     cluster_info = response.json()
                     if cluster_info.get("is_ready"):
                         print(f"Cluster ready: {cluster_info}")
-                        server_is_ready = True
-                        break
-            except requests.exceptions.ConnectionError:
-                continue
-        if not server_is_ready:
+                        return
+                except requests.exceptions.ConnectionError:
+                    pass
+                time.sleep(5)
             pytest.fail(
-                f"Server is not ready after {server_waiting_timeout} seconds. Please check the logs for more details."
-            )
+                f"Server is not ready after {server_waiting_timeout} seconds")
+
+        wait_ready()
+
+        generation_round = 0
+
+        def restart_generation(config: dict[str, Any]) -> None:
+            """Reload only decode workers; keep prefill weights and discovery alive."""
+            nonlocal gen_server_config, gen_processes, generation_round
+            # Device assignments and CLI overrides are fixed for this launch.
+            for key in ("tensor_parallel_size", "pipeline_parallel_size",
+                        "context_parallel_size", "max_num_tokens"):
+                assert config.get(key) == gen_server_config.get(key), key
+            _terminate_server_processes(gen_processes)
+            generation_stack.close()
+            # Do not route a new request to a stale worker during its lease.
+            deadline = time.monotonic() + 60
+            while True:
+                response = requests.get(
+                    f"http://localhost:{serve_port}/cluster_info", timeout=10)
+                response.raise_for_status()
+                workers = response.json().get("current_workers", {})
+                if not workers.get("generation_servers"):
+                    break
+                assert time.monotonic(
+                ) < deadline, "Old generation workers did not unregister"
+                time.sleep(1)
+            gen_server_config = {
+                **copy.deepcopy(config),
+                "internal_request_auth_key":
+                internal_request_auth_key,
+            }
+            write_worker_configs(f"http://localhost:{serve_port}")
+            generation_round += 1
+            gen_processes = generation_stack.enter_context(
+                multi_popen(gen_servers,
+                            f"gen_{generation_round}",
+                            enable_redirect_log=capture_worker_logs))
+            wait_ready()
 
         client_kwargs: Dict[str, Any] = {
             "api_key": "1234567890",
@@ -629,7 +700,7 @@ def launch_disaggregated_llm(
         body_succeeded = False
         try:
             yield DuckLLM(args, tokenizer, generate_async,
-                          f"http://localhost:{serve_port}")
+                          f"http://localhost:{serve_port}", restart_generation)
             body_succeeded = True
         finally:
             if enable_perf:
@@ -639,41 +710,334 @@ def launch_disaggregated_llm(
             all_processes = list(
                 itertools.chain(ctx_processes, gen_processes, server_processes))
 
-            # SIGTERM triggers llm.shutdown() inside each trtllm-serve, cleaning up the executor and MPI workers.
-            for process in all_processes:
-                if process.poll() is None:
-                    process.terminate()
-
-            # Wait up to 5s total, then SIGKILL any process that doesn't exit.
-            # This is a safety net for when llm.shutdown() hangs.
-            deadline = time.monotonic() + 5
-            for process in all_processes:
-                remaining = max(0, deadline - time.monotonic())
-                try:
-                    process.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass  # already exited between timeout and kill
-                except OSError:
-                    pass  # process already gone
+            _terminate_server_processes(all_processes)
 
             # Finish process-tree cleanup before reading logs, while the
             # temporary directory still exists. Preserve any workload failure.
-            if assert_worker_log_contains is not None:
+            if capture_worker_logs:
                 server_stack.close()
                 if body_succeeded:
-                    marker_found = False
+                    marker_found = assert_worker_log_contains is None
                     for log_path in worker_log_paths:
                         with open(log_path, encoding="utf-8",
                                   errors="replace") as log_file:
-                            marker_found |= any(
-                                assert_worker_log_contains in line
-                                for line in log_file)
+                            for line in log_file:
+                                if assert_worker_log_contains is not None:
+                                    marker_found |= assert_worker_log_contains in line
+                                for forbidden in assert_worker_log_excludes:
+                                    assert forbidden not in line, (
+                                        f"Worker {log_path} used a forbidden fallback: {line}"
+                                    )
                     assert marker_found, (
                         f"No worker logged {assert_worker_log_contains!r}; "
                         "the required transfer path was not exercised")
+
+
+def _test_sparse_offload_long_context(
+    disaggregated_server_config: dict[str, Any],
+    ctx_server_config: dict[str, Any],
+    gen_server_config: dict[str, Any],
+    model_path: str,
+    *,
+    model_name: str,
+    index_topk: int,
+    unit_tokens: int,
+    block_reuse: bool = False,
+    server_waiting_timeout: int = 1200,
+) -> None:
+    """Require exact resident/offload tokens and real host fetches on LongBench v2.
+
+    Six complete documents cover the benchmark's domains. A repeated request
+    checks determinism (all six repeat when testing block reuse), and two
+    concurrent 256-token continuations cover sustained decode under eviction.
+    The same prefill worker serves both generation configurations.
+
+    Exact comparisons use eager, deterministic TP attention. CUDA graph replay
+    and request remapping remain covered by the native offload component tests.
+    """
+    output_len = 256
+    tokens_per_block = 128
+    max_batch_size = 2
+    tokenizer = (DeepseekV4Tokenizer.from_pretrained(model_path)
+                 if unit_tokens == 4 else load_hf_tokenizer(model_path))
+    assert Path(LongBenchV2.DATASET_DIR).is_dir(), (
+        f"Stage LongBench v2 under {LongBenchV2.DATASET_DIR} before running offload CI"
+    )
+    evaluator = LongBenchV2Evaluator(dataset_path=LongBenchV2.DATASET_DIR,
+                                     length="short",
+                                     max_input_length=32768,
+                                     max_output_length=output_len)
+    by_id = {sample["_id"]: sample for sample in evaluator.dataset}
+    samples, prompts = [], []
+    for sample_id, (digest, answer) in LONGBENCH_CASES.items():
+        assert sample_id in by_id, f"Missing pinned LongBench v2 sample {sample_id}"
+        sample = by_id[sample_id]
+        assert sample[
+            "answer"] == answer, f"LongBench v2 answer changed for {sample_id}"
+        text = evaluator._format_prompt(sample, evaluator.templates["0shot"])
+        assert hashlib.sha256(text.encode()).hexdigest() == digest, (
+            f"LongBench v2 prompt changed for {sample_id}")
+        prompt = tokenizer.apply_chat_template([{
+            "role": "user",
+            "content": text
+        }],
+                                               tokenize=True,
+                                               return_dict=False,
+                                               add_generation_prompt=True,
+                                               enable_thinking=False)
+        assert len(prompt) // unit_tokens > index_topk and len(
+            prompt
+        ) <= 32768, (
+            f"{sample_id}: {len(prompt)} tokens do not exercise sparse offload")
+        samples.append(sample)
+        prompts.append(prompt)
+    assert len({sample["domain"] for sample in samples}) == 6
+    # The single-row GVR path needs an aligned score width. Round the allocation,
+    # never the input document, to a KV page so CR4 widths also stay aligned.
+    max_seq_len = (
+        (max(map(len, prompts)) + output_len + tokens_per_block - 1) //
+        tokens_per_block * tokens_per_block)
+    sparse_config = {
+        **gen_server_config["sparse_attention_config"],
+        "index_topk": index_topk,
+        "enable_heuristic_topk": True,
+        "use_self_sampling_topk": True,
+        "gvr_deterministic_topk": True,
+        "enable_kv_cache_offload": False,
+    }
+    # Attention DP is off by design: the exact comparison uses TP attention.
+    for config in (ctx_server_config, gen_server_config):
+        config.update(max_batch_size=max_batch_size,
+                      max_seq_len=max_seq_len,
+                      enable_autotuner=False,
+                      enable_attention_dp=False,
+                      cuda_graph_config=None)
+        config["kv_cache_config"] = {
+            **config["kv_cache_config"],
+            "enable_block_reuse": block_reuse,
+            "use_kv_cache_manager_v2": True,
+            "tokens_per_block": tokens_per_block,
+        }
+        config["sparse_attention_config"] = copy.deepcopy(sparse_config)
+        if unit_tokens == 1:
+            config["moe_config"] = {
+                **config["moe_config"],
+                "disable_finalize_fusion": True,
+            }
+            if config["kv_cache_config"]["dtype"] == "fp8":
+                config["kv_cache_config"][
+                    "fp8_context_mla_kv_len_cap"] = max_seq_len
+    # Keep prefill identical across paired runs. This profile tests reuse of
+    # received decode KV; cached prefill would change the reference computation.
+    ctx_server_config["kv_cache_config"]["enable_block_reuse"] = False
+    ctx_server_config.update(enable_chunked_prefill=True, max_num_tokens=8192)
+    gen_server_config.update(enable_iter_perf_stats=True,
+                             max_num_tokens=2048,
+                             iter_stats_max_iterations=-1,
+                             max_stats_len=-1)
+    units_per_page = tokens_per_block // unit_tokens
+    cache_units = (index_topk // units_per_page + 1) * units_per_page
+    assert all(len(prompt) // unit_tokens > cache_units for prompt in prompts)
+    assert (output_len - 1) // unit_tokens > cache_units - index_topk, (
+        "Forced decode must append more history than the sparse cache's free slots"
+    )
+    offload_config = copy.deepcopy(gen_server_config)
+    offload_config["sparse_attention_config"].update(
+        enable_kv_cache_offload=True,
+        kv_cache_offload_config={"gpu_cache_factor": 1.0})
+    deterministic_env = {
+        "TLLM_LOG_LEVEL": "info",
+        "TLLM_LOG_LEVEL_BY_MODULE": "info:_torch",
+        # The umbrella switch forcibly disables block reuse in the executor.
+        # Reuse profiles keep the individual deterministic kernel switches.
+        "FORCE_DETERMINISTIC": "0" if block_reuse else "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+        "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+        "FORCE_MHC_KERNEL_DETERMINISTIC": "1",
+        "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+        "TRTLLM_DISAGG_NO_RETRY": "1",
+    }
+    world_size = gen_server_config["tensor_parallel_size"]
+    print(
+        f"Sparse offload profile: {model_name}, "
+        f"KV={gen_server_config['kv_cache_config']['dtype']}, TP={world_size}, "
+        f"reuse={block_reuse}, prompt_tokens={list(map(len, prompts))}, "
+        f"max_seq_len={max_seq_len}")
+    results = {}
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="sparse-offload-") as directory:
+        observer_dir = Path(directory) / "events"
+        observer_dir.mkdir()
+        # Python imports sitecustomize in both the serving process and spawned
+        # MPI interpreters. The observer itself imports no CUDA/MPI modules early.
+        (Path(directory) / "sitecustomize.py").write_text(
+            "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n"
+            "# SPDX-License-Identifier: Apache-2.0\n"
+            "from sparse_offload_observer import install\ninstall()\n")
+        observer_env = {
+            "TLLM_TEST_SPARSE_OFFLOAD_EVENTS":
+            str(observer_dir),
+            "PYTHONPATH":
+            os.pathsep.join([
+                directory,
+                str(Path(__file__).parent),
+                os.environ.get("PYTHONPATH", "")
+            ]),
+        }
+        with launch_disaggregated_llm(
+                copy.deepcopy(disaggregated_server_config),
+                copy.deepcopy(ctx_server_config),
+                copy.deepcopy(gen_server_config),
+                model_path,
+                server_waiting_timeout=server_waiting_timeout,
+                max_workers=max_batch_size,
+                extra_env=deterministic_env,
+                gen_extra_env=observer_env,
+                assert_worker_log_contains="self-sampling GVR top-K engaged",
+                assert_worker_log_excludes=(
+                    "falling back to the CUDA",
+                    "using the CUDA radix")) as llm, openai.OpenAI(
+                        api_key="1234567890",
+                        base_url=f"{llm.serve_url}/v1",
+                        timeout=300,
+                        max_retries=0) as client:
+
+            def request(index: int, stress: bool) -> dict:
+                response = client.completions.create(model=model_path,
+                                                     prompt=prompts[index],
+                                                     max_tokens=output_len,
+                                                     temperature=0,
+                                                     seed=0,
+                                                     extra_body={
+                                                         "detokenize": False,
+                                                         "top_k": 1,
+                                                         "ignore_eos": stress
+                                                     })
+                choice = response.choices[0]
+                token_ids = choice.model_dump()["token_ids"]
+                assert response.usage.prompt_tokens == len(prompts[index])
+                assert response.usage.completion_tokens == len(token_ids)
+                assert 0 < len(token_ids) <= output_len
+                assert choice.finish_reason in ("length", "stop")
+                if stress:
+                    assert len(
+                        token_ids
+                    ) == output_len and choice.finish_reason == "length"
+                prediction = tokenizer.decode(token_ids,
+                                              skip_special_tokens=True)
+                answer = evaluator._extract_answer(
+                    evaluator._post_process(prediction))
+                if not stress:
+                    assert answer is not None, f"No answer for {samples[index]['_id']}: {prediction}"
+                return {
+                    "id":
+                    samples[index]["_id"],
+                    "prompt_sha256":
+                    hashlib.sha256(json.dumps(
+                        prompts[index]).encode()).hexdigest(),
+                    "token_ids":
+                    token_ids,
+                    "finish_reason":
+                    choice.finish_reason,
+                    "answer":
+                    answer,
+                    "correct":
+                    answer == samples[index]["answer"],
+                }
+
+            def wave(indices: list[int],
+                     *,
+                     mode: str,
+                     stress: bool = False) -> tuple[list[dict], list[dict]]:
+                _get_disagg_generation_stats(llm.serve_url)
+                rows = []
+                groups = [indices] if stress else [[index] for index in indices]
+                for group in groups:
+                    previous = len(read_fetch_events(observer_dir))
+                    start_ns = time.monotonic_ns()
+                    if stress:
+                        with ThreadPoolExecutor(
+                                max_workers=max_batch_size) as pool:
+                            futures = [
+                                pool.submit(request, index, True)
+                                for index in group
+                            ]
+                            rows.extend(future.result() for future in futures)
+                    else:
+                        rows.append(request(group[0], False))
+                    if mode == "offload":
+                        # Drain cleanup before the next serial request so its
+                        # native counter delta cannot include another request.
+                        events = wait_for_fetch_events(observer_dir,
+                                                       previous=previous,
+                                                       expected=world_size *
+                                                       len(group))
+                        current = [
+                            event for event in events
+                            if event["first_fetch_ns"] >= start_ns
+                        ]
+                        assert_host_fetches(
+                            current,
+                            prompt_lengths=[len(prompts[i]) for i in group],
+                            world_size=world_size,
+                            index_topk=index_topk,
+                            unit_tokens=unit_tokens)
+                        print(
+                            f"Native offload evidence: {len(group)} requests, {world_size} ranks, "
+                            f"minimum batch-counter miss delta={min(e['misses'] for e in current)}"
+                        )
+                stats = _get_disagg_generation_stats(llm.serve_url)
+                if stress:
+                    batched_steps = sum(
+                        stat.get("inflightBatchingStats", {}).get(
+                            "numGenRequests", 0) > 1 for stat in stats)
+                    assert batched_steps >= tokens_per_block, (
+                        f"Only {batched_steps} batched decode iterations")
+                return rows, stats
+
+            for mode in ("resident", "offload"):
+                phase_start = time.monotonic()
+                if mode == "offload":
+                    llm.restart_generation(offload_config)
+                normal, _ = wave(list(range(len(samples))), mode=mode)
+                repeat_indices = list(range(
+                    len(samples))) if block_reuse else [0]
+                repeated, repeat_stats = wave(repeat_indices, mode=mode)
+                for index, row in zip(repeat_indices, repeated, strict=True):
+                    assert_token_parity(normal[index],
+                                        row,
+                                        label=f"{mode} repeat {row['id']}")
+                if block_reuse:
+                    cached = sum(
+                        sum(stat.get("iterCachedTokensByLevel", ()))
+                        for stat in repeat_stats)
+                    minimum = (min(map(len, prompts)) -
+                               1) // tokens_per_block * tokens_per_block
+                    assert cached >= minimum, f"Repeated round reused only {cached}/{minimum} tokens"
+                stress, _ = wave([0, 1], mode=mode, stress=True)
+                results[mode] = normal + repeated + stress
+                correct = sum(row["correct"] for row in normal)
+                print(
+                    f"LongBench v2 {model_name} {mode}: {correct}/{len(normal)} correct, "
+                    f"{len(results[mode])} requests, {time.monotonic() - phase_start:.1f}s"
+                )
+                if mode == "resident":
+                    assert not read_fetch_events(
+                        observer_dir), "Resident baseline used offload"
+            differences = []
+            for resident, offloaded in zip(results["resident"],
+                                           results["offload"],
+                                           strict=True):
+                try:
+                    assert_token_parity(resident,
+                                        offloaded,
+                                        label=f"offload {resident['id']}")
+                except AssertionError as error:
+                    differences.append(str(error))
+            assert not differences, "\n".join(differences)
+    print(f"Sparse offload exact parity: {len(results['resident'])} requests, "
+          f"total {time.monotonic() - started:.1f}s including model loading")
 
 
 def run_parallel_test(model_name: str,
@@ -1650,6 +2014,96 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 @skip_pre_blackwell
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+    DRAFT_PATH = f"{llm_models_root()}/Qwen3-8B-DFlash-b16"
+    MAX_DRAFT_LEN = 15
+
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_1p1d_unified_draft_kv(self):
+        """DFlash draft KV travels with the target KV from ctx to gen.
+
+        The drafter's layers share the target's KV cache manager, so the
+        generation worker drafts from the prompt context computed on the
+        context worker. Verified speculative decoding is lossless, so the
+        GSM8K score cannot see a drafter that starts from an empty context;
+        acceptance length can, so it is gated too.
+        """
+        speculative_config = {
+            "decoding_type": "DFlash",
+            "max_draft_len": self.MAX_DRAFT_LEN,
+            "speculative_model": self.DRAFT_PATH,
+            # The unified draft KV layout requires the TRTLLM drafter backend.
+            "attention_backend": "TRTLLM",
+        }
+        # Both workers run the drafter: the context worker writes the
+        # drafter's prompt KV into the shared manager, which is then
+        # transferred with the target KV.
+        common_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            # KVCacheManagerV2 requires the Python transceiver.
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": speculative_config,
+        }
+        ctx_server_config = {**common_server_config, "cuda_graph_config": None}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+            # Acceptance length is read back off this worker's /metrics.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"},
+                assert_worker_log_contains=
+                "target and draft KV layers share one KV cache manager") as llm:
+            llm.args.speculative_config = DFlashDecodingConfig(
+                max_draft_len=self.MAX_DRAFT_LEN,
+                speculative_model=self.DRAFT_PATH,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+            # Drafting from an empty prompt context costs ~17% acceptance
+            # length on this model, well below the 95% floor.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_unified_draft_kv "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv",
+                acceptance_length)
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
     FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
@@ -2275,6 +2729,73 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @pytest.mark.timeout(1800)
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload(self, kv_dtype: str) -> None:
+        """LongBench v2 tokens match with MLA latent history offloaded.
+
+        Each decode step fetches the indexer-selected tokens into a GPU cache.
+        Only a decode-only worker can offload, so the context server keeps its
+        history resident. Offload takes no speculative decoding.
+        """
+        # Both servers use the same KV dtype for transfer and decode.
+        kv_cache_config = {
+            "dtype": kv_dtype,
+            "free_gpu_memory_fraction": 0.7,
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        moe_config = {"backend": "CUTEDSL"}
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": True,
+            "trust_remote_code": True,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "sparse_attention_config": {
+                "algorithm": "dsa",
+                "enable_kv_cache_offload": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        _test_sparse_offload_long_context(disaggregated_server_config,
+                                          ctx_server_config,
+                                          gen_server_config,
+                                          self.MODEL_PATH,
+                                          model_name=self.MODEL_NAME,
+                                          index_topk=2048,
+                                          unit_tokens=1)
+
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
@@ -2389,6 +2910,74 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.timeout(1800)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload(self) -> None:
+        """LongBench v2 tokens match with FP8 ratio-4 history offloaded.
+
+        Each decode step fetches the indexer-selected units into a GPU cache.
+        Only a decode-only worker can offload, so the context server keeps its
+        history resident.
+        """
+        self._run_kv_cache_offload(kv_dtype="fp8", block_reuse=False)
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload_block_reuse(self) -> None:
+        """Repeated LongBench v2 prompts match and reuse the offloaded NVFP4 cache."""
+        self._run_kv_cache_offload(kv_dtype="nvfp4", block_reuse=True)
+
+    def _run_kv_cache_offload(self, *, kv_dtype: str,
+                              block_reuse: bool) -> None:
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        # Both servers use the same KV layout for transfer and decode.
+        kv_cache_config = {
+            "dtype": kv_dtype,
+            "free_gpu_memory_fraction": 0.5,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "sparse_attention_config": {
+                "algorithm": "deepseek_v4",
+                "enable_kv_cache_offload": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        _test_sparse_offload_long_context(disaggregated_server_config,
+                                          ctx_server_config,
+                                          gen_server_config,
+                                          self.MODEL_PATH,
+                                          model_name=self.MODEL_NAME,
+                                          index_topk=512,
+                                          unit_tokens=4,
+                                          block_reuse=block_reuse)
+
 
 @pytest.mark.timeout(14400)
 @skip_pre_blackwell
@@ -2426,7 +3015,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
-        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
+        # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -2481,16 +3070,17 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             },
         }
         # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
-        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
-        # _pick_rendezvous), and only falls back to picking a free port when
-        # they are not. Under a launcher that exports them -- Slurm in CI --
-        # the context and generation workers are two independent 4-rank jobs
-        # on one node that both inherit the *same* endpoint, so neither group
-        # ever forms: CI showed 68 failed bootstraps against a single
-        # host:port and the generation worker never registered. Hand each
-        # worker its own port so the two rendezvous cannot collide. The
-        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
-        # too before trusting the launcher's endpoint.
+        # / MASTER_PORT when both are set (ensure_cutedsl_torch_distributed in
+        # tensorrt_llm/_torch/distributed/initialization.py), and only falls
+        # back to picking a free port when they are not. Under a launcher that
+        # exports them -- Slurm in CI -- the context and generation workers are
+        # two independent 4-rank jobs on one node that both inherit the *same*
+        # endpoint, so neither group ever forms: CI showed 68 failed bootstraps
+        # against a single host:port and the generation worker never
+        # registered. Hand each worker its own port so the two rendezvous
+        # cannot collide. The DeepGEMM sibling avoids this by requiring
+        # RANK/WORLD_SIZE to be set too before trusting the launcher's
+        # endpoint.
         ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
 
         # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
@@ -2698,7 +3288,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "agent_bounce_buffer_enable": True,
                 "kv_cache_bounce_size_mb": 512,
                 # Relax the admission gates for this short CI workload.
                 # The production defaults remain 1024 descriptors / 16 KiB.

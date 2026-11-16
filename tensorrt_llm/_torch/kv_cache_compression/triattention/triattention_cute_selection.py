@@ -130,12 +130,14 @@ class _TriAttentionNormalizeUnionKernel:
         token_subtiles: int,
         row_cluster_ctas: int,
         output_row_stride: int,
+        compact_scores: bool = False,
     ) -> None:
         # Real head row q_head lives in score plane kv*8 + qg; partial-stats rows stay compact.
         self.score_group_size = num_q_heads // num_kv_heads
         self.score_head_pad = PADDED_HEAD_COLUMNS - self.score_group_size
         self.num_layers = num_layers
         self.score_token_capacity = score_token_capacity
+        self.compact_scores = compact_scores
         self.output_row_stride = output_row_stride
         self.num_q_heads = num_q_heads
         self.num_rows = num_layers * num_q_heads
@@ -155,7 +157,7 @@ class _TriAttentionNormalizeUnionKernel:
     def __call__(
         self,
         partial_stats: cute.Tensor,
-        scores: cute.Tensor,
+        scores,
         source_lengths: cute.Tensor,
         seg_out_offset: cute.Tensor,
         prompt_lengths: cute.Tensor,
@@ -163,6 +165,8 @@ class _TriAttentionNormalizeUnionKernel:
         request_count: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.compact_scores):
+            scores = cute.make_tensor(scores, cute.make_layout((1,)))
         kernel = self.kernel(
             partial_stats,
             scores,
@@ -290,6 +294,8 @@ class _TriAttentionNormalizeUnionKernel:
         # The normalization domain and the union output row both cover [0, valid - start).
         score_start = cutlass.Int32(prompt_lengths[request_idx])
         decode_length = source_lengths[request_idx] - score_start
+        if cutlass.const_expr(self.compact_scores):
+            score_start = score_start % 128
         warp_max_ptr = cute.arch.alloc_smem(
             cutlass.Float32,
             self.reduce_threads * self.tokens_per_lane * self.token_subtiles,

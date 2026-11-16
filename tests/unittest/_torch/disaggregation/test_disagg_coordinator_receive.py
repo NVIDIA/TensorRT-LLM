@@ -430,6 +430,27 @@ def test_deferred_receives_publish_independently_and_in_admission_order() -> Non
     assert [req.state for req in (first, second, unfenced)] == [_RECEIVING] * 3
 
 
+def test_deferred_receives_are_reported_from_admission_until_published() -> None:
+    """The transceiver learns the waiting count at admission, before any
+    receive starts, and again after each publication pass: its idle-poll skip
+    counts a waiting receive as a session on every rank."""
+    late = _ScriptedEvent(False, False, True)
+    h = _deferring_harness({1: _ScriptedEvent(True), 2: late})
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    # admission (both waiting), then the publication pass that started 1
+    assert h.transceiver.deferred_receive_reports == [2, 1]
+    assert h.transceiver.call_log[0] == "request_and_receive_async:1"
+
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1]
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1, 0]
+    assert h.transceiver.call_log.count("request_and_receive_async:2") == 1
+
+
 def test_forgotten_deferred_receive_is_never_published() -> None:
     """A request freed while its receive waits is dropped from the queue, so
     a later ready fence does not start a receive into freed blocks."""
@@ -550,15 +571,31 @@ def _batch(*generation_requests) -> ScheduledRequests:
     return batch
 
 
+def _received(h: CoordinatorHarness, *requests: "_GenRequest") -> None:
+    """Start the requests' receives through the coordinator and complete them."""
+    for req in requests:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    h.coordinator.receive_gen_init(list(requests))
+    for req in requests:
+        h.transceiver.finish_recv(req)
+    h.coordinator.reap_gen_receives()
+
+
 def test_completed_gen_receives_reports_only_completed_requests_in_batch_order() -> None:
-    """The query picks the transmission-complete generation requests, keeps
-    the batch order and changes nothing."""
+    """The query picks the requests whose receive the coordinator started and
+    that completed, keeps the batch order and changes nothing; a decoding
+    request in the batch is not visited, and a finished receive is not
+    reported again."""
     h = CoordinatorHarness()
     done_a, done_b = _GenRequest(1), _GenRequest(3)
-    receiving = _GenRequest(2, state=_RECEIVING)
+    receiving = _GenRequest(2, state=LlmRequestState.DISAGG_GENERATION_INIT)
     running = _GenRequest(4, state=LlmRequestState.GENERATION_IN_PROGRESS)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, done_b, done_a)
+    h.transceiver.call_log.clear()
 
-    completed = h.coordinator.completed_gen_receives(_batch(done_a, receiving, done_b, running))
+    batch = _batch(done_a, receiving, done_b, running)
+    completed = h.coordinator.completed_gen_receives(batch)
 
     assert [req.py_request_id for req in completed] == [1, 3]
     assert [req.state for req in (done_a, receiving, done_b, running)] == [
@@ -568,6 +605,8 @@ def test_completed_gen_receives_reports_only_completed_requests_in_batch_order()
         LlmRequestState.GENERATION_IN_PROGRESS,
     ]
     assert h.transceiver.call_log == []
+    assert h.coordinator.try_finish_gen_receive(done_a)
+    assert [req.py_request_id for req in h.coordinator.completed_gen_receives(batch)] == [3]
 
 
 def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> None:
@@ -666,7 +705,10 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
-    receiving = _GenRequest(3, events=events, state=_RECEIVING)
+    receiving = _GenRequest(3, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
 
     executor._prepare_disagg_gen_transmission_complete(_batch(first, receiving, second))
 
@@ -676,7 +718,6 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
         ("finish", 1, True),
         ("token", 1),
         ("logprobs", 1),
-        ("finish", 3, False),
         ("finish", 2, True),
         ("token", 2),
         ("logprobs", 2),
@@ -695,18 +736,23 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
 @pytest.mark.parametrize("coordinator_kind", ["real", "noop"])
 def test_receive_tail_does_nothing_without_a_completed_receive(coordinator_kind) -> None:
     """With nothing to finish the batch-level preparation is skipped and no
-    request is asked; the no-op coordinator reports nothing to finish even
-    for a request that claims to be complete."""
+    request is asked: a receive still in flight is not finished, a request
+    that reports itself complete but whose receive this coordinator never
+    started is not visited, and the no-op coordinator reports nothing."""
     events = []
     if coordinator_kind == "real":
-        coordinator = CoordinatorHarness().coordinator
-        request = _GenRequest(1, events=events, state=_RECEIVING)
+        h = CoordinatorHarness()
+        coordinator = h.coordinator
+        receiving = _GenRequest(2, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+        coordinator.receive_gen_init([receiving])
+        request = _GenRequest(1, events=events)
     else:
         coordinator = NoopDisaggCoordinator()
         request = _GenRequest(1, events=events)
     executor = _executor_over(coordinator, events)
+    batch = _batch(request, receiving) if coordinator_kind == "real" else _batch(request)
 
-    executor._prepare_disagg_gen_transmission_complete(_batch(request))
+    executor._prepare_disagg_gen_transmission_complete(batch)
 
     assert events == []
     assert request.new_tokens == []
@@ -723,6 +769,8 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
     executor.active_requests = [first, second]
 
     def raise_in_sampler(_requests):
@@ -746,6 +794,7 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
         ("finish", 1, False),
         ("finish", 2, False),
     ]
+    assert h.coordinator.completed_gen_receives(_batch(first, second)) == []
     assert [req.state for req in (first, second)] == [LlmRequestState.GENERATION_COMPLETE] * 2
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]

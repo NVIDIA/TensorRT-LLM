@@ -22,7 +22,7 @@ from collections.abc import Iterable, Mapping, Set
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 STORAGE_SCHEMA = "compact-v1"
 
 _CANON_RE = re.compile(r"(?:^|/)(tensorrt_llm/.*)$")
@@ -33,13 +33,11 @@ _REQUIRED_COLUMNS = {
     "file": {"id", "path"},
     "symbol": {"id", "file_id", "qualname"},
     "process": {"id", "uid", "stage_id"},
-    "process_case": {"process_id", "case_stage_id"},
     "touch": {"case_stage_id", "symbol_id"},
     "test_result": {
         "process_id",
         "case_stage_id",
         "outcome",
-        "expected_workers",
     },
     "taint": {"process_id", "case_stage_id", "kind", "reason"},
     "process_diagnostic": {"process_id", "key", "value"},
@@ -51,8 +49,6 @@ _REQUIRED_COLUMNS = {
         "test",
         "stage",
         "outcome",
-        "expected_workers",
-        "saved_procs",
         "tainted",
     },
 }
@@ -120,11 +116,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             stage_id INTEGER NOT NULL REFERENCES stage(id),
             UNIQUE(uid, stage_id)
         );
-        CREATE TABLE process_case (
-            process_id INTEGER NOT NULL REFERENCES process(id),
-            case_stage_id INTEGER NOT NULL REFERENCES case_stage(id),
-            PRIMARY KEY(process_id, case_stage_id)
-        ) WITHOUT ROWID;
         CREATE TABLE touch (
             case_stage_id INTEGER NOT NULL REFERENCES case_stage(id),
             symbol_id INTEGER NOT NULL REFERENCES symbol(id),
@@ -134,8 +125,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             process_id INTEGER NOT NULL REFERENCES process(id),
             case_stage_id INTEGER NOT NULL REFERENCES case_stage(id),
             outcome TEXT NOT NULL,
-            expected_workers INTEGER NOT NULL,
-            PRIMARY KEY(process_id, case_stage_id, outcome, expected_workers)
+            PRIMARY KEY(process_id, case_stage_id, outcome)
         ) WITHOUT ROWID;
         -- kind says which half of the data is in doubt: 'attribution' means the rows
         -- present here may belong to another test, 'incomplete' means the rows present
@@ -210,7 +200,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         WITH per_process AS (
             SELECT process_id,
                    case_stage_id,
-                   MAX(expected_workers) AS expected_workers,
                    SUM(CASE WHEN outcome != '' THEN 1 ELSE 0 END) AS outcome_count,
                    MAX(CASE WHEN outcome NOT IN ('', 'passed') THEN 1 ELSE 0 END)
                        AS has_non_passed
@@ -219,7 +208,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         ),
         result_summary AS (
             SELECT case_stage_id,
-                   SUM(expected_workers) AS expected_workers,
                    SUM(outcome_count) AS outcome_count,
                    MAX(has_non_passed) AS has_non_passed
             FROM per_process
@@ -237,11 +225,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FROM taint
             JOIN case_stage ON case_stage.id = taint.case_stage_id
             WHERE case_stage.test = ''
-        ),
-        save_summary AS (
-            SELECT case_stage_id, COUNT(*) AS saved_procs
-            FROM process_case
-            GROUP BY case_stage_id
         )
         SELECT CASE
                    WHEN case_stage.test = '' THEN ''
@@ -254,8 +237,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                    WHEN result_summary.has_non_passed != 0 THEN 'incomplete'
                    ELSE 'passed'
                END AS outcome,
-               COALESCE(result_summary.expected_workers, 0) AS expected_workers,
-               COALESCE(save_summary.saved_procs, 0) AS saved_procs,
                CASE
                    WHEN COALESCE(taint_summary.taint_rows, 0) > 0 THEN 1
                    WHEN session_taint.stage_id IS NOT NULL THEN 1
@@ -264,7 +245,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         FROM case_stage
         JOIN stage ON stage.id = case_stage.stage_id
         LEFT JOIN result_summary ON result_summary.case_stage_id = case_stage.id
-        LEFT JOIN save_summary ON save_summary.case_stage_id = case_stage.id
         LEFT JOIN taint_summary ON taint_summary.case_stage_id = case_stage.id
         LEFT JOIN session_taint ON session_taint.stage_id = case_stage.stage_id;
         """
@@ -282,8 +262,6 @@ def create_query_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS ix_case_test ON case_stage(test);
         CREATE INDEX IF NOT EXISTS ix_case_stage ON case_stage(stage_id, id);
         CREATE INDEX IF NOT EXISTS ix_touch_symbol ON touch(symbol_id, case_stage_id);
-        CREATE INDEX IF NOT EXISTS ix_process_case_case
-            ON process_case(case_stage_id, process_id);
         CREATE INDEX IF NOT EXISTS ix_test_result_case
             ON test_result(case_stage_id, process_id);
         ANALYZE main;
@@ -342,18 +320,15 @@ def write_leaf_database(
     process_uid: str,
     touches: Mapping[str, Set[tuple[str, str]]],
     outcomes: Mapping[str, str],
-    expected_workers: Mapping[str, int],
     taints: Iterable[tuple[str, str, str, str]] = (),
     diagnostics: Optional[Mapping[str, Mapping[str, str]]] = None,
     repository_root: Optional[str] = None,
 ) -> None:
     """Write one process snapshot in the same compact schema used by aggregates.
 
-    ``taints`` is ``(process_uid, test, kind, reason)`` for coverage nobody can vouch for.
-    The named process is usually this one, but a process that watches others records
-    theirs too, so those uids are added without a ``process_case`` row -- that count
-    is reserved for processes which actually saved. ``diagnostics`` is
-    ``process_uid -> {key: value}``, arbitrary and diagnostic only -- see
+    ``taints`` is ``(process_uid, test, kind, reason)`` for coverage nobody can vouch for. The
+    named process is usually this one, but a process that watches others records theirs too.
+    ``diagnostics`` is ``process_uid -> {key: value}``, arbitrary and diagnostic only -- see
     ``ContextServer.diagnostics``.
     """
     diagnostics = diagnostics or {}
@@ -367,7 +342,7 @@ def write_leaf_database(
         taint_records = sorted(
             {(str(uid), str(test), str(kind), str(reason)) for uid, test, kind, reason in taints}
         )
-        source_tests = set(touches) | set(outcomes) | set(expected_workers)
+        source_tests = set(touches) | set(outcomes)
         source_tests |= {test for _uid, test, _kind, _reason in taint_records}
         bare_tests = {test: _bare_test_id(test, stage) for test in source_tests}
         tests = sorted(set(bare_tests.values()))
@@ -432,24 +407,15 @@ def write_leaf_database(
             ),
         )
         connection.executemany(
-            "INSERT OR IGNORE INTO process_case(process_id, case_stage_id) VALUES (?, ?)",
-            (
-                (process_id, case_ids[_bare_test_id(test, stage)])
-                for test, symbols in canonical_touches.items()
-                if test and symbols
-            ),
-        )
-        connection.executemany(
             "INSERT OR IGNORE INTO test_result "
-            "(process_id, case_stage_id, outcome, expected_workers) VALUES (?, ?, ?, ?)",
+            "(process_id, case_stage_id, outcome) VALUES (?, ?, ?)",
             (
                 (
                     process_id,
                     case_ids[_bare_test_id(test, stage)],
                     outcomes.get(test) or "",
-                    int(expected_workers.get(test, 0)),
                 )
-                for test in sorted(set(outcomes) | set(expected_workers))
+                for test in sorted(outcomes)
             ),
         )
         connection.commit()
@@ -501,31 +467,12 @@ def _merge_attached(connection: sqlite3.Connection) -> None:
           ON target_symbol.file_id = target_file.id
          AND target_symbol.qualname = source_symbol.qualname;
 
-        INSERT OR IGNORE INTO main.process_case(process_id, case_stage_id)
-        SELECT target_process.id, target_case.id
-        FROM source.process_case AS source_process_case
-        JOIN source.process AS source_process
-          ON source_process.id = source_process_case.process_id
-        JOIN source.stage AS process_stage ON process_stage.id = source_process.stage_id
-        JOIN main.stage AS target_process_stage ON target_process_stage.name = process_stage.name
-        JOIN main.process AS target_process
-          ON target_process.uid = source_process.uid
-         AND target_process.stage_id = target_process_stage.id
-        JOIN source.case_stage AS source_case
-          ON source_case.id = source_process_case.case_stage_id
-        JOIN source.stage AS case_stage ON case_stage.id = source_case.stage_id
-        JOIN main.stage AS target_case_stage ON target_case_stage.name = case_stage.name
-        JOIN main.case_stage AS target_case
-          ON target_case.test = source_case.test
-         AND target_case.stage_id = target_case_stage.id;
-
         INSERT OR IGNORE INTO main.test_result(
-            process_id, case_stage_id, outcome, expected_workers
+            process_id, case_stage_id, outcome
         )
         SELECT target_process.id,
                target_case.id,
-               source_result.outcome,
-               source_result.expected_workers
+               source_result.outcome
         FROM source.test_result AS source_result
         JOIN source.process AS source_process ON source_process.id = source_result.process_id
         JOIN source.stage AS process_stage ON process_stage.id = source_process.stage_id

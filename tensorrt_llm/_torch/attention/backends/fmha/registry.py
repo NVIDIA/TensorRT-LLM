@@ -35,6 +35,13 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     without an import cycle.
     """
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
+    from .gqa_decode import (
+        GqaDecodeFmha,
+        GqaKvReplicaFmha,
+        GqaKvReplicaFusedFmha,
+        GqaSegmentedFmha,
+        GqaSplitKvFmha,
+    )
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
@@ -57,6 +64,13 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
+        # trtllm-gen with the module's KV append / deferred prologue.
+        "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
+        "gqa_kv_replica": GqaKvReplicaFmha,
+        "gqa_split_kv": GqaSplitKvFmha,
+        "gqa_segmented": GqaSegmentedFmha,
+        "gqa_decode": GqaDecodeFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

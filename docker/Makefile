@@ -39,7 +39,7 @@ DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
-CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90;100;103;107;120;121',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 BUILD_WHEEL_SCRIPT ?=
@@ -56,8 +56,19 @@ GITHUB_MIRROR      ?=
 # environment, never passed as a build arg -- build-arg values stay readable in
 # `docker history`. Empty means anonymous, rate-limited access.
 GITHUB_CLONE_TOKEN ?=
+# Optional netrc file with an Artifactory access token for artifactory.nvidia.com,
+# needed when the wheel stage takes the wheel from a packaged build
+# (BUILD_WHEEL_SCRIPT=scripts/get_wheel_from_package.py, which reads it through
+# jenkins/scripts/fetch_build_artifact.sh). Passed as a BuildKit secret, never as a
+# build arg, for the same reason as GITHUB_CLONE_TOKEN.
+ARTIFACTORY_NETRC  ?=
+# The location the packaged build is read from first (aws or urm; empty means aws),
+# and the name of the CI credential behind ARTIFACTORY_NETRC, used only in messages.
+LLM_ARTIFACTS_PRIMARY ?=
+ARTIFACTORY_CREDENTIAL_ID ?=
 COMMA              := ,
 GITHUB_SECRET_ARG  := $(if $(GITHUB_CLONE_TOKEN),--secret id=github_clone_token$(COMMA)env=GITHUB_CLONE_TOKEN)
+ARTIFACTORY_SECRET_ARG := $(if $(ARTIFACTORY_NETRC),--secret id=artifactory_netrc$(COMMA)src=$(ARTIFACTORY_NETRC))
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
@@ -96,6 +107,7 @@ base_pull:
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(GITHUB_SECRET_ARG) \
+		$(ARTIFACTORY_SECRET_ARG) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
@@ -103,6 +115,8 @@ base_pull:
 		$(if $(CUDA_COMPAT_TAG), --build-arg CUDA_COMPAT_TAG=$(CUDA_COMPAT_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
+		$(if $(LLM_ARTIFACTS_PRIMARY), --build-arg LLM_ARTIFACTS_PRIMARY="$(LLM_ARTIFACTS_PRIMARY)") \
+		$(if $(ARTIFACTORY_CREDENTIAL_ID), --build-arg ARTIFACTORY_CREDENTIAL_ID="$(ARTIFACTORY_CREDENTIAL_ID)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
 		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \

@@ -20,6 +20,7 @@
 # into kernels_src, exactly as it did before the move.
 add_subdirectory(cuteDsl) # cute_dsl_src
 add_subdirectory(trtllmGen) # trtllm_gen_fp8_block_scale_moe{,_routing}
+add_subdirectory(loadBalance/dynamicEplb) # moe_dynamic_eplb_src
 # cutlass/: moe_gemm_src and its per-arch OBJECT libraries are defined in
 # ../cutlass_kernels/CMakeLists.txt, next to the CUTLASS instantiation generator
 # they depend on.
@@ -28,7 +29,9 @@ add_subdirectory(trtllmGen) # trtllm_gen_fp8_block_scale_moe{,_routing}
 # kernels_src, so the backend directories are named here, next to the
 # add_subdirectory() calls they correspond to, and nowhere else.
 file(GLOB_RECURSE MOE_SRC *.cpp *.cu)
-list(FILTER MOE_SRC EXCLUDE REGEX "/kernels/moe/(cutlass|trtllmGen|cuteDsl)/.*")
+list(FILTER MOE_SRC EXCLUDE REGEX
+     "/kernels/moe/(cutlass|trtllmGen|cuteDsl|loadBalance/dynamicEplb)/.*")
+list(APPEND MOE_SRC $<TARGET_OBJECTS:moe_dynamic_eplb_src>)
 set(MOE_KERNELS_SRC
     ${MOE_SRC}
     PARENT_SCOPE)

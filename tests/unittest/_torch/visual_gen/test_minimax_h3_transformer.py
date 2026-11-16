@@ -789,6 +789,7 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             rotary_emb: tuple[torch.Tensor, torch.Tensor],
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
+            valid_seq_len: int | None = None,
         ) -> torch.Tensor:
             del temb, rotary_emb, key_padding_mask
             self.adaln_indices = adaln_indices.clone()
@@ -935,7 +936,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
+    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
@@ -947,7 +948,7 @@ def test_key_padding_mask_support_tracks_attention_backend(backend: str, support
 
 @requires_cuda
 def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
-    """TRTLLM/CUTEDSL swallow key_padding_mask via **kwargs, so fail loudly instead."""
+    """Reject padding when the selected backend cannot express it."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
@@ -958,7 +959,7 @@ def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
     model(**inputs)
 
     model._supports_key_padding_mask = False
-    model._attn_backend = "TRTLLM"
+    model._attn_backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         model(**inputs)
 
@@ -1414,9 +1415,13 @@ def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("sequence_length", [1, 7, 8, 9, 16])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_refiner_masks_padding_and_restores_sequence(
     world_size: int,
     sequence_length: int,
+    backend: str,
+    inference_mode: bool,
 ) -> None:
     hidden = torch.arange(2 * sequence_length * 4, dtype=torch.float32).reshape(
         2, sequence_length, 4
@@ -1442,28 +1447,39 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
                 return (expected_padded + 1)[:, :unpad_to]
 
         class MaskedBlock(nn.Module):
-            def forward(self, tensor, key_padding_mask):
-                if padded_length == sequence_length:
+            def forward(self, tensor, key_padding_mask, valid_seq_len):
+                assert valid_seq_len == (
+                    sequence_length if padded_length != sequence_length else None
+                )
+                if backend == "TRTLLM" or padded_length == sequence_length:
                     assert key_padding_mask is None
                 else:
                     torch.testing.assert_close(key_padding_mask, expected_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 return tensor + 1
 
         refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
         nn.Module.__init__(refiner)
+        refiner._attn_backend = backend
         refiner._supports_key_padding_mask = True
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
-        torch.testing.assert_close(refiner(hidden), hidden + 1)
+        with torch.inference_mode(inference_mode):
+            torch.testing.assert_close(refiner(hidden), hidden + 1)
 
 
 @requires_cuda
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("existing_padding", [False, True])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
     world_size: int,
     existing_padding: bool,
+    backend: str,
+    inference_mode: bool,
 ) -> None:
     """Exercise each rank's H3 forward; emulate only the collective transport."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
@@ -1517,13 +1533,27 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
 
         class CaptureBlock(nn.Module):
             def forward(
-                self, hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+                self,
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len=None,
             ):
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):
                     torch.testing.assert_close(actual, expected_rope.chunk(world_size)[rank])
-                if pad or existing_padding:
+                if backend == "TRTLLM":
+                    assert valid_seq_len == (
+                        int(full_mask.sum().item()) if pad or existing_padding else None
+                    )
+                    assert key_padding_mask is None
+                elif pad or existing_padding:
                     torch.testing.assert_close(key_padding_mask, full_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 else:
                     assert key_padding_mask is None
                 return hidden_states
@@ -1531,10 +1561,12 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         def check_norm_indices(module, args):
             torch.testing.assert_close(args[2], full_timesteps.chunk(world_size)[rank])
 
+        model._attn_backend = backend
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
-        actual = model(**inputs)
+        with torch.inference_mode(inference_mode):
+            actual = model(**inputs)
         handle.remove()
         torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
@@ -1550,12 +1582,16 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
 
 
 @requires_cuda
-def test_fa4_rejects_interior_padding() -> None:
+@pytest.mark.parametrize("backend", ["FA4", "TRTLLM"])
+def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
     if not _sm_at_least(10):
         pytest.skip("FA4 requires SM100 or newer")
-    assert FA4_AVAILABLE
+    if backend == "FA4":
+        assert FA4_AVAILABLE
     config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
-    config.attention = AttentionConfig(backend="FA4")
+    config.attention = AttentionConfig(backend=backend)
+    if backend == "TRTLLM":
+        config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
@@ -1639,14 +1675,16 @@ def test_async_ulysses_projections_match_the_sync_path(monkeypatch: pytest.Monke
     )
     mask = torch.tensor([[True, True, False]])
 
-    async_out = asynchronous(hidden_states, rotary_emb, key_padding_mask=mask)
-    sync_out = synchronous(hidden_states, rotary_emb, key_padding_mask=mask)
+    async_out = asynchronous(hidden_states, rotary_emb, key_padding_mask=mask, valid_seq_len=2)
+    sync_out = synchronous(hidden_states, rotary_emb, key_padding_mask=mask, valid_seq_len=2)
 
     for name in ("q", "k", "v"):
         torch.testing.assert_close(
             recorder.captured[name].flatten(2), sync_inputs[name], rtol=0, atol=0
         )
     assert recorder.captured["kwargs"]["key_padding_mask"] is mask
+    assert recorder.captured["kwargs"]["valid_seq_len"] == 2
+    assert sync_inputs["kwargs"]["valid_seq_len"] == 2
     torch.testing.assert_close(async_out, sync_out, rtol=0, atol=0)
 
 

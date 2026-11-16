@@ -17,21 +17,27 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
-from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionPipelineConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -40,8 +46,12 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import MpiTopology
+from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -70,7 +80,9 @@ from .packing import (
 )
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
+from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
@@ -135,12 +147,41 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
         )
 
 
+class _MiniMaxH3TextEncoderMapping(MpiTopology):
+    """Mapping for the MiniMax-H3 text-encoder-only TP subgroup."""
+
+    def __new__(cls, *args, **kwargs):
+        del args, kwargs
+        return object.__new__(cls)
+
+    def __init__(self, *args, tp_group_pg=None, **kwargs) -> None:
+        self._tp_group_pg = tp_group_pg
+        self._use_torch_distributed_allreduce = True
+        super().__init__(*args, **kwargs)
+
+    @property
+    def tp_group_pg(self):
+        if self._tp_group_pg is None:
+            raise RuntimeError("MiniMax-H3 text encoder TP process group is not initialized.")
+        return self._tp_group_pg
+
+    @property
+    def tp_group_name(self) -> str:
+        return self.tp_group_pg.group_name
+
+
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
-    hf_ids=["MiniMaxAI/MiniMax-H3"],
+    hf_ids=[
+        "MiniMaxAI/MiniMax-H3",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
+    ],
     defaults={"workflow": "fl2va"},
     download_patterns=[
         "modular_model_index.json",
+        "fastvideo_inference.json",
+        "checkpoint_content.json",
+        "checkpoint_metadata.json",
         "LICENSE",
         "README.md",
         "transformer/*",
@@ -176,23 +217,67 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
-        vgm = pipeline_config.visual_gen_mapping
+        self._configure_fasth3_attention(pipeline_config)
+        self.text_encoder_tp_size = int(
+            getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
+        )
+        vgm = getattr(pipeline_config, "visual_gen_mapping", None)
         world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) exceeds "
+                f"world_size ({world_size})."
+            )
         if world_size != 1:
-            is_pure_ulysses = vgm is not None and vgm.ulysses_size == world_size
-            if not is_pure_ulysses:
+            supports_topology = (
+                vgm is not None
+                and vgm.cfg_size == 1
+                and vgm.cp_size == 1
+                and vgm.ring_size == 1
+                and vgm.attn2d_row_size == 1
+                and vgm.attn2d_col_size == 1
+                and vgm.ulysses_size * pipeline_config.mapping.tp_size == world_size
+            )
+            if not supports_topology:
                 raise NotImplementedError(
-                    "MiniMax-H3 multi-GPU support is currently limited to pure "
-                    "Ulysses sequence parallelism: cfg_size=1, tp_size=1, "
-                    "ring_size=1, attn2d_size=(1, 1), and "
-                    "ulysses_size=world_size."
+                    "MiniMax-H3 supports tensor parallelism and Ulysses: "
+                    "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
+                    "tp_size * ulysses_size=world_size."
                 )
-            if pipeline_config.attention.backend not in ("VANILLA", "FA4"):
+            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in (
+                "VANILLA",
+                "FA4",
+                "TRTLLM",
+                "FLASHINFER",
+            ):
                 raise NotImplementedError(
-                    "MiniMax-H3 Ulysses requires VANILLA or FA4 attention. "
+                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention. "
                     "Other attention backends do not support the required "
                     "packed-row padding mask."
                 )
+        self._text_encoder_tp_group = None
+        if (
+            self._uses_tensor_parallel_text_encoder
+            and self.text_encoder_tp_size < world_size
+            and not mpi_disabled()
+        ):
+            raise RuntimeError(
+                "MiniMax-H3 subset text_encoder_tp_size requires TLLM_DISABLE_MPI=1 "
+                "so Qwen text encoder TP uses a torch process group instead of MPI collectives."
+            )
+        if self._uses_tensor_parallel_text_encoder and dist.is_initialized():
+            text_encoder_tp_ranks = list(range(self.text_encoder_tp_size))
+            rank = int(getattr(pipeline_config.mapping, "rank", 0))
+            if self.text_encoder_tp_size == world_size:
+                group = dist.group.WORLD
+            else:
+                group = dist.new_group(
+                    ranks=text_encoder_tp_ranks,
+                    use_local_synchronization=False,
+                )
+            if rank in text_encoder_tp_ranks:
+                self._text_encoder_tp_group = group
+
         if (
             pipeline_config.attention.backend == "TRTLLM"
             and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -205,12 +290,6 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise NotImplementedError(
                 "TeaCache and Cache-DiT are not quality-validated for MiniMax-H3."
             )
-        if getattr(pipeline_config.cpu_offload_config, "enable", False):
-            raise NotImplementedError(
-                "MiniMax-H3 does not implement CPU offloading; the pipeline never "
-                "enters the offload context, so staged components would be used "
-                "directly on the wrong device."
-            )
         if pipeline_config.cuda_graph.enable:
             raise NotImplementedError(
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
@@ -218,14 +297,26 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         vae_size = pipeline_config.parallel.parallel_vae_size
         if not 1 <= vae_size <= world_size:
-            raise ValueError(
-                "MiniMax-H3 parallel_vae_size must be between 1 and ulysses_size=world_size."
-            )
+            raise ValueError("MiniMax-H3 parallel_vae_size must be between 1 and world_size.")
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
         self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        return (("text_encoder",), ("transformer",), ("vae",), ("audio_vae",))
+
+    def extra_offload_component_names(self) -> set[str]:
+        # Non-participating ranks receive embeddings instead of loading Qwen.
+        return {PipelineComponent.TEXT_ENCODER.value}
+
+    def offload_pipeline_components(self) -> dict[str, torch.nn.Module]:
+        return {
+            name: component
+            for name in ("text_encoder", "transformer", "vae", "audio_vae")
+            if (component := getattr(self, name, None)) is not None
+        }
 
     def _check_sleep_world_size(self) -> None:
         config = self.pipeline_config
@@ -239,7 +330,11 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @contextmanager
     def _sleep_loading_context(
-        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+        self,
+        restore_mode: "SleepRestoreMode",
+        *,
+        device: torch.device,
+        release_host_backup: bool = False,
     ) -> Iterator[None]:
         """Back persistent H3 allocations while keeping warmup outside the pool."""
         config = self.pipeline_config
@@ -257,7 +352,9 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         from ...sleep import PipelineSleepManager
 
-        manager = PipelineSleepManager(restore_mode, device)
+        manager = PipelineSleepManager(
+            restore_mode, device, release_host_backup=release_host_backup
+        )
         with manager.loading():
             yield
         self._sleep_manager = manager
@@ -300,6 +397,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def default_generation_params(self) -> dict:
+        fastvideo_inference = getattr(self, "_fastvideo_inference", {})
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -307,7 +405,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": 28,
+            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
         }
 
     @property
@@ -351,6 +449,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         return super().load_transformer_weights(checkpoint_dir)
 
     @property
+    def default_warmup_steps(self) -> int:
+        steps = getattr(self, "_fastvideo_inference", {}).get("dmd_denoising_steps")
+        if steps is not None:
+            return len(steps) + 1
+        return super().default_warmup_steps
+
+    @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(768, 1344)]
 
@@ -383,6 +488,46 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_inference_steps=steps,
         )
 
+    @staticmethod
+    def _load_fasth3_manifest(checkpoint_dir: str) -> dict:
+        manifest_path = Path(checkpoint_dir) / "fastvideo_inference.json"
+        if manifest_path.exists():
+            with manifest_path.open() as f:
+                manifest = json.load(f)
+            if str(manifest.get("schema_version", "")).startswith("fasth3-"):
+                return manifest
+        return {}
+
+    @classmethod
+    def _configure_fasth3_attention(cls, config: DiffusionPipelineConfig) -> None:
+        pretrained = getattr(config, "primary_pretrained_config", None)
+        checkpoint_dir = getattr(pretrained, "_name_or_path", None)
+        manifest = cls._load_fasth3_manifest(checkpoint_dir) if checkpoint_dir else {}
+        if not manifest:
+            return
+
+        attention = config.attention
+        backend = attention.backend
+        if backend == "VANILLA" and "backend" not in attention.model_fields_set:
+            backend = "TRTLLM"
+        if backend not in ("TRTLLM", "CUTEDSL"):
+            raise ValueError("FastH3 requires VSA with the TRTLLM or CUTEDSL attention backend.")
+        sparse = attention.sparse_attention_config
+        if sparse is None:
+            sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.8))
+        elif sparse.algorithm != "vsa":
+            raise ValueError("FastH3 requires the vsa sparse attention algorithm.")
+        config.attention = AttentionConfig.model_validate(
+            {**attention.model_dump(), "backend": backend, "sparse_attention_config": sparse}
+        )
+        # Resolve defaults before constructing the transformer and loading its trained gate.
+        if backend == "TRTLLM" and config.attention_metadata_state is None:
+            config.attention_metadata_state = create_attention_metadata_state()
+        for model_config in config.model_configs.values():
+            model_config.attention = config.attention.model_copy(deep=True)
+            if backend == "TRTLLM" and model_config.attention_metadata_state is None:
+                model_config.attention_metadata_state = create_attention_metadata_state()
+
     def _init_transformer(self) -> None:
         self.transformer = MiniMaxH3Transformer3DModel(
             self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
@@ -393,6 +538,36 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.transformer.load_weights(transformer_weights)
         self.transformer.eval()
 
+    def _load_tensor_parallel_text_encoder(
+        self,
+        checkpoint_dir: str,
+        device: torch.device,
+    ) -> MiniMaxH3TensorParallelTextEncoder:
+        if not self._loads_text_encoder_on_this_rank:
+            raise RuntimeError(
+                "MiniMax-H3 tensor-parallel text encoder is loaded only on "
+                f"ranks < {self.text_encoder_tp_size}; rank {self.rank} "
+                "must receive broadcast prompt embeddings."
+            )
+        text_encoder_mapping = _MiniMaxH3TextEncoderMapping(
+            world_size=self.text_encoder_tp_size,
+            rank=self.rank,
+            tp_size=self.text_encoder_tp_size,
+            gpus_per_node=self.text_encoder_tp_size,
+            tp_group_pg=self._text_encoder_tp_group,
+        )
+        text_encoder = MiniMaxH3TensorParallelTextEncoder.from_pretrained_config(
+            checkpoint_dir, text_encoder_mapping, device
+        )
+        # Safetensors prefetch synchronizes on the default process group. Disable
+        # it when only a subset of ranks loads the text encoder.
+        prefetch = self.text_encoder_tp_size == self.world_size
+        weights = WeightLoader(components=PipelineComponent.TEXT_ENCODER).load_weights(
+            checkpoint_dir, text_encoder_mapping, prefetch=prefetch
+        )
+        text_encoder.load_weights(weights)
+        return text_encoder.eval()
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -402,6 +577,9 @@ class MiniMaxH3Pipeline(BasePipeline):
     ) -> None:
         del kwargs
         skip_components = skip_components or []
+        offloaded = self.offloader.requested_components()
+
+        self._fastvideo_inference = self._load_fasth3_manifest(checkpoint_dir)
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -414,12 +592,26 @@ class MiniMaxH3Pipeline(BasePipeline):
                 subfolder=PipelineComponent.PROCESSOR,
             )
         if not _component_skipped(skip_components, PipelineComponent.TEXT_ENCODER):
-            self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=torch.bfloat16,
-            ).to(device)
-            self.text_encoder.eval()
+            if self._loads_text_encoder_on_this_rank:
+                if self._uses_tensor_parallel_text_encoder:
+                    self.text_encoder = self._load_tensor_parallel_text_encoder(
+                        checkpoint_dir, device
+                    )
+                else:
+                    self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                        checkpoint_dir,
+                        subfolder=PipelineComponent.TEXT_ENCODER,
+                        torch_dtype=torch.bfloat16,
+                    ).to("cpu" if "text_encoder" in offloaded else device)
+                    self.text_encoder.eval()
+            else:
+                self.text_encoder = None
+                logger.info(
+                    "MiniMax-H3 text encoder is loaded only on ranks < %d; "
+                    "rank %d will receive broadcast prompt embeddings.",
+                    self.text_encoder_tp_size,
+                    self.rank,
+                )
         if not _component_skipped(skip_components, PipelineComponent.VAE):
             self.vae = TiledAutoencoderKLMiniMaxH3.from_pretrained(
                 checkpoint_dir,
@@ -432,7 +624,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.AUDIO_VAE,
                 torch_dtype=torch.float32,
-            ).to(device)
+            ).to("cpu" if "audio_vae" in offloaded else device)
             self.audio_vae.eval()
         if not _component_skipped(skip_components, PipelineComponent.SCHEDULER):
             self.scheduler = MiniMaxH3Scheduler.from_pretrained(
@@ -447,12 +639,42 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
-        if self.scheduler is not None:
+        # Distilled checkpoints carry their trained shifts in the scheduler configs.
+        if self.scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
-        if self.audio_scheduler is not None:
+        if self.audio_scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
         if self.vae is not None and self.device.type == "cuda":
             _prepare_vae_decoder(self.vae)
+
+    def _set_timesteps(self, num_inference_steps: int) -> None:
+        manifest = getattr(self, "_fastvideo_inference", {})
+        steps = manifest.get("dmd_denoising_steps")
+        if steps is None:
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+            return
+        if (
+            not steps
+            or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
+            or any(left <= right for left, right in zip(steps, steps[1:]))
+        ):
+            raise ValueError("FastH3 DMD steps must be strictly decreasing integers in (0, 1000].")
+        if num_inference_steps != len(steps) + 1:
+            raise ValueError(
+                f"FastH3 requires {len(steps) + 1} sigma-grid points for {len(steps)} forwards."
+            )
+        base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
+        for scheduler, shift_key in (
+            (self.scheduler, "video_scheduler_shift"),
+            (self.audio_scheduler, "audio_scheduler_shift"),
+        ):
+            shift = float(scheduler.shift)
+            if shift_key in manifest and shift != float(manifest[shift_key]):
+                raise ValueError(f"FastH3 {shift_key} disagrees with the checkpoint scheduler.")
+            # Shift each modality's trained noise clock once; explicit sigmas are not shifted.
+            sigmas = shift * base / (1 + (shift - 1) * base)
+            scheduler.set_timesteps(sigmas=sigmas, device=self.device)
 
     def torch_compile(self) -> None:
         super().torch_compile()
@@ -633,6 +855,100 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt: str,
         keyframes: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._uses_tensor_parallel_text_encoder and keyframes:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for keyframe requests."
+            )
+        if self.world_size == 1:
+            return self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds: torch.Tensor | None = None
+        text_token_tags: torch.Tensor | None = None
+        with self._coordinate_text_encoder_errors():
+            if self._loads_text_encoder_on_this_rank:
+                prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds = self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
+        text_token_tags = self._broadcast_tensor_from_rank0(text_token_tags, dtype=torch.long)
+        return prompt_embeds, text_token_tags.cpu()
+
+    @property
+    def _uses_tensor_parallel_text_encoder(self) -> bool:
+        return self.text_encoder_tp_size > 1
+
+    @property
+    def _loads_text_encoder_on_this_rank(self) -> bool:
+        return self.rank < self.text_encoder_tp_size
+
+    @contextmanager
+    def _coordinate_text_encoder_errors(self) -> Iterator[None]:
+        """Propagate caught encoding failures before peers enter payload broadcasts."""
+        if self.world_size == 1 or not dist.is_initialized():
+            yield
+            return
+
+        # Allocate before encoding so an encoder OOM does not prevent reporting it.
+        failed_rank = torch.zeros(1, dtype=torch.int32, device=self.device)
+        local_error: Exception | None = None
+        try:
+            yield
+        except Exception as error:
+            local_error = error
+            failed_rank.fill_(self.rank + 1)
+
+        # This coordinates Python failures only; failed TP collectives still
+        # require distributed worker teardown.
+        dist.all_reduce(failed_rank, op=dist.ReduceOp.MAX)
+        failed_rank_id = int(failed_rank.item()) - 1
+        if failed_rank_id >= 0:
+            message = f"MiniMax-H3 text encoding failed on rank {failed_rank_id}"
+            if local_error is not None:
+                message += f": {local_error}"
+            raise RuntimeError(message) from local_error
+
+    def _broadcast_tensor_from_rank0(
+        self,
+        tensor: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not dist.is_initialized():
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required when distributed is not initialized.")
+            return tensor.to(device=self.device, dtype=dtype)
+
+        shape = torch.zeros(8, dtype=torch.long, device=self.device)
+        if self.rank == 0:
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required for MiniMax-H3 broadcast.")
+            tensor = tensor.to(device=self.device, dtype=dtype).contiguous()
+            shape[0] = tensor.ndim
+            shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=self.device)
+        dist.broadcast(shape, src=0)
+        ndim = int(shape[0].item())
+        tensor_shape = tuple(int(value) for value in shape[1 : ndim + 1].tolist())
+        if self.rank != 0:
+            tensor = torch.empty(tensor_shape, dtype=dtype, device=self.device)
+        dist.broadcast(tensor, src=0)
+        return tensor
+
+    def _encode_prompt_local(
+        self,
+        prompt: str,
+        keyframes: list[Image.Image],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.text_encoder is None:
+            raise RuntimeError("MiniMax-H3 text encoder is not loaded on this rank.")
+        if not self._uses_tensor_parallel_text_encoder:
+            num_layers = self.text_encoder.config.text_config.num_hidden_layers
+            if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
+                raise ValueError(
+                    "MiniMax-H3 requires the unnormalized hidden state after Qwen3-VL "
+                    f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
+                    f"{num_layers} layers."
+                )
+
         pixel_values = None
         image_grid_thw = None
         token_ids = []
@@ -672,10 +988,42 @@ class MiniMaxH3Pipeline(BasePipeline):
             token_tags, dtype=torch.long
         )
 
+    def _encode_reference_text_tokens(
+        self,
+        token_ids: list[int],
+        vision_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode Ref2VA presentation tokens on owner ranks and broadcast."""
+        if self._uses_tensor_parallel_text_encoder and vision_inputs:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for Ref2VA "
+                "requests with image or video references."
+            )
+        if self.world_size == 1:
+            return self._encode_text_tokens(token_ids, vision_inputs)
+
+        prompt_embeds: torch.Tensor | None = None
+        with self._coordinate_text_encoder_errors():
+            if self._loads_text_encoder_on_this_rank:
+                prompt_embeds = self._encode_text_tokens(token_ids, vision_inputs)
+        return self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
+
     def _encode_text_tokens(
         self, token_ids: list[int], vision_inputs: dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Encode one H3 presentation, shared by keyframes and mixed references."""
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        if self._uses_tensor_parallel_text_encoder:
+            if vision_inputs:
+                raise NotImplementedError(
+                    "MiniMax-H3 tensor-parallel text encoder currently supports "
+                    "text-only prompts; set text_encoder_tp_size=1 for requests "
+                    "with Qwen3-VL vision inputs."
+                )
+            with self.offloader.context_if_requested("text_encoder"):
+                return self.text_encoder.encode(input_ids).to(device=self.device, dtype=self.dtype)
+
         num_layers = self.text_encoder.config.text_config.num_hidden_layers
         if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
             raise ValueError(
@@ -684,7 +1032,6 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"{num_layers} layers."
             )
 
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         mm_token_type_ids = torch.tensor(
             self.processor.create_mm_token_type_ids([token_ids]),
             dtype=torch.long,
@@ -696,14 +1043,15 @@ class MiniMaxH3Pipeline(BasePipeline):
             else value.to(self.device)
             for name, value in vision_inputs.items()
         }
-        outputs = self.text_encoder.model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            mm_token_type_ids=mm_token_type_ids,
-            use_cache=False,
-            output_hidden_states=True,
-            **vision_kwargs,
-        )
+        with self.offloader.context_if_requested("text_encoder"):
+            outputs = self.text_encoder.model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                **vision_kwargs,
+            )
         return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
             device=self.device, dtype=self.dtype
         )
@@ -733,7 +1081,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
         pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
-        posterior = self.vae.encode(pixels).latent_dist
+        with self.offloader.context_if_requested("vae"):
+            posterior = self.vae.encode(pixels).latent_dist
         encode_generator = torch.Generator().manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
         latents = posterior.sample(generator=encode_generator).to(torch.float16).float().cpu()
         return (latents - latents_mean) / latents_std
@@ -820,10 +1169,13 @@ class MiniMaxH3Pipeline(BasePipeline):
             device=self.device,
         ).view(1, -1, 1, 1, 1)
         latents = latents * latents_std + latents_mean
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.device.type == "cuda",
+        with (
+            self.offloader.context_if_requested("vae"),
+            torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.device.type == "cuda",
+            ),
         ):
             video = self.vae.decode(latents, return_dict=False)[0]
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
@@ -845,10 +1197,11 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.audio_vae.config.latents_std,
             device=self.device,
         ).view(1, -1, 1)
-        audio = self.audio_vae.decode(
-            latents * latents_std + latents_mean,
-            return_dict=False,
-        )[0]
+        with self.offloader.context_if_requested("audio_vae"):
+            audio = self.audio_vae.decode(
+                latents * latents_std + latents_mean,
+                return_dict=False,
+            )[0]
         return audio.float().permute(1, 0, 2)
 
     @torch.inference_mode()
@@ -964,8 +1317,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             condition_latents=condition_latents,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self._set_timesteps(num_inference_steps)
         # The denoise loop indexes both schedules with one counter, and
         # set_timesteps collapses float32 duplicates, so unequal lengths would
         # silently truncate a stream instead of failing.
@@ -991,10 +1343,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 self.audio_scheduler.timesteps,
             )
         ]
-        static_context = self.transformer.prepare_static_context(
-            prompt_embeds,
-            position_ids,
-        )
+        with self.offloader.context_if_requested("transformer"):
+            static_context = self.transformer.prepare_static_context(
+                prompt_embeds,
+                position_ids,
+            )
         condition_rows = layout.num_condition_video_rows
         condition_prefix = latents[:condition_rows][None]
         audio_condition_rows = layout.num_condition_audio_rows
@@ -1009,6 +1362,31 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.timesteps, self.audio_scheduler.timesteps
         )
 
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+        vsa_metadata = None
+        if _vsa_active:
+            if self.workflow == "ref2va" or keyframes:
+                raise ValueError("MiniMax-H3 VSA currently supports text-to-video only.")
+            patch = self.transformer.config.patch_size
+            grid = tuple(
+                size // p
+                for size, p in zip(
+                    (num_latent_frames, latent_height, latent_width), patch, strict=True
+                )
+            )
+            vsa_metadata = build_h3_vsa_metadata(
+                (text_indices.numel(), audio_indices.numel(), grid),
+                _vsa_sparsity,
+                self.device,
+            )
+
         def forward_fn(
             video_latents: torch.Tensor,
             extra_stream_latents: dict[str, torch.Tensor],
@@ -1019,7 +1397,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
             del timestep, encoder_hidden_states, extra_tensors
             unique_timesteps, timestep_indices = row_timestep_plan[index]
-            video_velocity, audio_velocity = self.transformer(
+            transformer_kwargs = dict(
                 hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
                 audio_hidden_states=torch.cat(
                     (audio_condition_prefix, extra_stream_latents["audio"]), dim=1
@@ -1036,6 +1414,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 return_dict=False,
                 static_context=static_context,
             )
+            if _vsa_active:
+                with set_h3_vsa_context(vsa_metadata):
+                    video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
+            else:
+                video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
             # A silent all-zero / non-finite velocity has been observed once in
             # practice: the run completed, reported success, and wrote a black
             # video with silent audio.  The cause was never reproduced, so fail
@@ -1047,15 +1430,16 @@ class MiniMaxH3Pipeline(BasePipeline):
             return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 
         timer.mark_denoise_start()
-        generated_latents, extra_latents = self.denoise(
-            latents=latents[condition_rows:][None],
-            scheduler=self.scheduler,
-            prompt_embeds=prompt_embeds,
-            guidance_scale=1.0,
-            forward_fn=forward_fn,
-            extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
-            extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
-        )
+        with self.offloader.context_if_requested("transformer"):
+            generated_latents, extra_latents = self.denoise(
+                latents=latents[condition_rows:][None],
+                scheduler=self.scheduler,
+                prompt_embeds=prompt_embeds,
+                guidance_scale=1.0,
+                forward_fn=forward_fn,
+                extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
+                extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
+            )
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
