@@ -553,7 +553,17 @@ class CodeRabbitRegressionTests(unittest.TestCase):
                     return response
 
                 with (
-                    patch.dict(os.environ, {"DASHBOARD_TEST_TOKEN": "test-token"}),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "DASHBOARD_TEST_TOKEN": "test-token",
+                            # An inherited no_proxy/NO_PROXY naming a loopback
+                            # host would bypass the proxy for us and hide a
+                            # regression in the explicit loopback bypass.
+                            "no_proxy": "",
+                            "NO_PROXY": "",
+                        },
+                    ),
                     patch(
                         "urllib.request.getproxies",
                         return_value={"http": "http://proxy.invalid:3128"},

@@ -3855,6 +3855,24 @@ class PyExecutor:
                 self.stats.pop(0)
             self.stats.append(entry)
 
+    def _stats_scheduler_mode(self) -> str:
+        """Per-record indicator so consumers can interpret iterLatencyMS without
+        inspecting server config: it spans ~2 loops under "overlap" (PP
+        included: _executor_loop_pp consumes a batch in a later loop) and one
+        clean loop under "non_overlap"; hostStepTimeMS is always one loop."""
+        is_overlap_like = (not self.disable_overlap_scheduler
+                           or self.dist.pp_size > 1)
+        return "overlap" if is_overlap_like else "non_overlap"
+
+    def _append_stats_rows(self, rows: List[str]) -> None:
+        """Append pre-serialized /metrics rows to the export buffer."""
+        with self.stats_lock:
+            for row in rows:
+                if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                        and len(self.stats) > self.max_stats_len):
+                    self.stats.pop(0)
+                self.stats.append(row)
+
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
