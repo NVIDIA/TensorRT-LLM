@@ -395,6 +395,7 @@ def _accuracy_llm(
 
 
 @pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(250000)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSparkMultinode(LlmapiAccuracyTestHarness):
