@@ -169,6 +169,10 @@ _HIGH, _LOW = {"reasoning_effort": "high"}, {"reasoning_effort": "low"}
         ({**_HIGH, "chat_template_kwargs": _HIGH}, _HIGH),
         ({**_HIGH, "chat_template_kwargs": _LOW}, ValueError("conflicts")),
         ({"chat_template": "{{ messages }}"}, ValueError("chat_template is not supported")),
+        (
+            {"chat_template_kwargs": {"chat_template": "{{ messages }}"}},
+            ValueError("chat_template is not supported"),
+        ),
     ],
 )
 def test_reasoning_effort_and_chat_template(fields, expected):
