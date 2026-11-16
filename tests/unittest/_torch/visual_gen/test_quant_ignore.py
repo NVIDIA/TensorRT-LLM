@@ -155,30 +155,25 @@ def test_linear_steps_require_load_time_quantization(config: dict[str, object]) 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize(
-    "algo,valid",
+    "algo",
     [
-        ("FP8", True),
-        ("FP8_BLOCK_SCALES", True),
-        ("FP8_PER_CHANNEL_PER_TOKEN", True),
-        ("NVFP4", True),
-        ("W4A16_AWQ", False),
-        ("W4A8_AWQ", False),
-        ("W8A8_SQ_PER_CHANNEL", False),
+        "FP8",
+        "FP8_BLOCK_SCALES",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "NVFP4",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+        "W8A8_SQ_PER_CHANNEL",
     ],
 )
-def test_linear_ignored_steps_supported_quant_algorithms(
-    algo: str, valid: bool, typed: bool
-) -> None:
+def test_linear_step_quant_algo_support_is_validated_by_loader(algo: str, typed: bool) -> None:
     config = {"quant_algo": algo, "ignored_steps": [0]}
-    if valid:
-        quant = DiffusionQuantConfig(**config) if typed else config
-        VisualGenArgs(quant_config=quant)
-    else:
-        with pytest.raises(ValidationError, match="requires load-time quantization"):
-            quant = DiffusionQuantConfig(**config) if typed else config
-            VisualGenArgs(quant_config=quant)
-        with pytest.raises(ValidationError, match="requires load-time quantization"):
-            DiffusionPipelineConfig.load_diffusion_quant_config(config)
+    quant = DiffusionQuantConfig(**config) if typed else config
+    VisualGenArgs(quant_config=quant)
+    parsed, _, dynamic, _ = DiffusionPipelineConfig.load_diffusion_quant_config(config)
+    assert parsed.quant_algo == algo
+    assert parsed.ignored_steps == [0]
+    assert dynamic
 
 
 @pytest.mark.cpu_only

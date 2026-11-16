@@ -254,7 +254,7 @@ class DynamicLinearWeightLoader:
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
-        """Decide if weight should be dynamically quantized at load time."""
+        """Decide whether to quantize a weight, validating configured step exclusions."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
 
@@ -278,6 +278,13 @@ class DynamicLinearWeightLoader:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
+        if getattr(self.quant_config, "ignored_steps", []):
+            raise ValueError(
+                "`ignored_steps` requires load-time weight quantization (`dynamic: true`). "
+                f"Load-time weight quantization ({quant_algo.name}) is not supported for "
+                f"module '{name}'. The checkpoint provides a {weight.dtype} weight, "
+                "but the VisualGen loader has no load-time quantizer for this algorithm."
+            )
         return False
 
     def _maybe_dynamic_quantize(
@@ -401,6 +408,9 @@ class DynamicLinearWeightLoader:
             self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
 
         if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
+            # Reject unsupported quantization before retaining any BF16 weights.
+            for weight_dict in weight_dicts:
+                self._should_dynamic_quantize(weight_dict, quant_algo, name)
             self._retain_unquantized_weight(module, name, weight_dicts)
 
         # Special handling for fused NVFP4 dynamic quantization

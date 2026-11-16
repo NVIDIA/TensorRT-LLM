@@ -202,6 +202,67 @@ class TestStaticQuantGuard:
         loader._check_static_quant_scales(_bf16_weights(), QuantAlgo.FP8, "blocks.0.attn1.to_q")
 
 
+class TestDynamicQuantGuard:
+    @pytest.mark.parametrize(
+        ("quant_algo", "weight_dtype"),
+        [
+            (QuantAlgo.W4A16_AWQ, torch.bfloat16),
+            (QuantAlgo.W4A8_AWQ, torch.bfloat16),
+            (QuantAlgo.W8A8_SQ_PER_CHANNEL, torch.bfloat16),
+            (QuantAlgo.W4A16_AWQ, torch.uint8),
+        ],
+    )
+    def test_unsupported_algorithm_raises_before_retaining_or_loading_weights(
+        self, quant_algo: QuantAlgo, weight_dtype: torch.dtype
+    ) -> None:
+        loader = DynamicLinearWeightLoader(
+            DiffusionModelConfig(
+                quant_config=DiffusionQuantConfig(quant_algo=quant_algo, ignored_steps=[0]),
+                dynamic_weight_quant=True,
+            )
+        )
+        module = _StubLinear()
+        with patch.object(loader, "_retain_unquantized_weight") as retain:
+            with pytest.raises(
+                ValueError,
+                match=(
+                    r"ignored_steps.*dynamic: true.*"
+                    f"Load-time weight quantization \\({quant_algo.name}\\).*blocks.0.attn1.to_q"
+                ),
+            ):
+                loader.load_linear_weights(
+                    module,
+                    "blocks.0.attn1.to_q",
+                    [{"weight": torch.zeros(8, 16, dtype=weight_dtype)}],
+                )
+        retain.assert_not_called()
+        assert module.loaded is None
+
+    @pytest.mark.parametrize(
+        ("ignored_steps", "weight_dtype"),
+        [(None, torch.bfloat16), ([], torch.bfloat16), ([], torch.uint8)],
+        ids=["not-configured", "empty", "prequantized"],
+    )
+    def test_without_step_exclusions_preserves_existing_loading(
+        self, ignored_steps: list[int] | None, weight_dtype: torch.dtype
+    ) -> None:
+        quant_algo = QuantAlgo.W4A16_AWQ
+        quant_config = (
+            QuantConfig(quant_algo=quant_algo)
+            if ignored_steps is None
+            else DiffusionQuantConfig(quant_algo=quant_algo, ignored_steps=ignored_steps)
+        )
+        loader = DynamicLinearWeightLoader(
+            DiffusionModelConfig(quant_config=quant_config, dynamic_weight_quant=True)
+        )
+        module = _StubLinear()
+        weights = {"weight": torch.zeros(8, 16, dtype=weight_dtype)}
+        with patch.object(loader, "_retain_unquantized_weight") as retain:
+            loader.load_linear_weights(module, "blocks.0.attn1.to_q", [weights])
+        retain.assert_not_called()
+        assert module.loaded == [weights]
+
+
 class TestStaticNVFP4ActivationScale:
     @pytest.fixture
     def quantizer(self, monkeypatch):
