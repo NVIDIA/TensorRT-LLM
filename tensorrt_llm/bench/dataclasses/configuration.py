@@ -1,16 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, Literal, Optional, Set, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
@@ -24,7 +26,6 @@ SPECULATIVE_MAP = {
 class RuntimeConfig(BaseModel):
     model: str
     model_path: Optional[Path] = None
-    engine_dir: Optional[Path] = None
     revision: Optional[str] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
@@ -33,50 +34,32 @@ class RuntimeConfig(BaseModel):
     mapping: Dict[str, Any]
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", "_autodeploy", None] = None
+    backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
     explicit_cli_keys: Optional[Set[str]] = None
 
     def get_llm_args(self) -> Dict:
-        model = self.engine_dir or self.model_path or self.model
+        model = self.model_path or self.model
 
         llm_args = {
-            "scheduler_config":
-            self.settings_config.get_scheduler_config(),
-            "model":
-            model,
-            "skip_tokenizer_init":
-            True,
-            "pipeline_parallel_size":
-            self.mapping["pp_size"],
-            "tensor_parallel_size":
-            self.mapping["tp_size"],
-            "gpus_per_node":
-            self.mapping["gpus_per_node"],
-            "moe_expert_parallel_size":
-            self.mapping["moe_ep_size"],
-            "moe_cluster_parallel_size":
-            self.mapping["moe_cluster_size"],
-            "trust_remote_code":
-            True,
-            "enable_chunked_prefill":
-            self.settings_config.chunking,
-            "extended_runtime_perf_knob_config":
-            self.performance_options.get_perf_config(),
-            "decoding_config":
-            self.decoding_config.get_decoding_config(),
-            "batching_type":
-            BatchingType.INFLIGHT,
-            "max_batch_size":
-            self.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.settings_config.max_num_tokens,
+            "scheduler_config": self.settings_config.get_scheduler_config(),
+            "model": model,
+            "skip_tokenizer_init": True,
+            "pipeline_parallel_size": self.mapping["pp_size"],
+            "tensor_parallel_size": self.mapping["tp_size"],
+            "gpus_per_node": self.mapping["gpus_per_node"],
+            "moe_expert_parallel_size": self.mapping["moe_ep_size"],
+            "moe_cluster_parallel_size": self.mapping["moe_cluster_size"],
+            "trust_remote_code": True,
+            "enable_chunked_prefill": self.settings_config.chunking,
+            "decoding_config": self.decoding_config.get_decoding_config(),
+            "max_batch_size": self.settings_config.max_batch_size,
+            "max_num_tokens": self.settings_config.max_num_tokens,
         }
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
-            "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
         if self.backend in backend_config_map:
@@ -93,18 +76,17 @@ class RuntimeConfig(BaseModel):
             explicit_cli_keys=self.explicit_cli_keys)
 
         if self.backend == "pytorch":
-            cuda_graph_config = updated_llm_args.pop(
-                "cuda_graph_config", llm_args["cuda_graph_config"])
-            if cuda_graph_config:
-                # Use runtime max_batch_size as cuda_graph_config.max_batch_size
-                # if both max_batch_size and batch_sizes are not set.
-                batch_sizes_set = cuda_graph_config.get("batch_sizes",
-                                                        None) is not None
+            cuda_graph_config = updated_llm_args.get("cuda_graph_config", {})
+            if cuda_graph_config is not None:
+                cuda_graph_config = dict(cuda_graph_config)
+                # Derive defaults from the final YAML/CLI capacity without
+                # mutating the reusable performance options.
+                batch_sizes_set = bool(cuda_graph_config.get("batch_sizes"))
                 max_batch_size_set = cuda_graph_config.get(
                     "max_batch_size", None) is not None
                 if not batch_sizes_set and not max_batch_size_set:
-                    cuda_graph_config[
-                        "max_batch_size"] = self.settings_config.max_batch_size
+                    cuda_graph_config["max_batch_size"] = updated_llm_args[
+                        "max_batch_size"]
             updated_llm_args["cuda_graph_config"] = cuda_graph_config
 
         return updated_llm_args
@@ -117,30 +99,13 @@ class RuntimeConfig(BaseModel):
 
 @dataclass
 class PerformanceOptions:
-    cuda_graphs: bool = False
-    multi_block_mode: bool = True
-    cuda_graph_cache_size: int = 1000
     pytorch_config: Dict[str, Any] = Field(default_factory=dict)
-
-    def get_perf_config(self) -> ExtendedRuntimePerfKnobConfig:
-        config = ExtendedRuntimePerfKnobConfig()
-        config.cuda_graph_mode = self.cuda_graphs
-        config.multi_block_mode = self.multi_block_mode
-        config.cuda_graph_cache_size = self.cuda_graph_cache_size
-
-        return config
 
     def get_pytorch_perf_config(self):
         return self.pytorch_config
 
-    def get_autodeploy_perf_config(self) -> Dict:
-        AutoDeployPerfConfig = dict
-        ad_config = AutoDeployPerfConfig()
-        return ad_config
-
 
 class DecodingConfig(BaseModel):
-    medusa_choices: Optional[List[List[int]]] = None
     decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
 
     @field_validator("decoding_mode")
@@ -150,23 +115,10 @@ class DecodingConfig(BaseModel):
                           SpeculativeDecodingMode]) -> SpeculativeDecodingMode:
         return SpeculativeDecodingMode(value)
 
-    @model_validator(mode="after")
-    def validate_speculative_decoding(self) -> DecodingConfig:
-        if self.medusa_choices and self.decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            raise RuntimeError(
-                "Attempting to use set Medusa choices with a non-Medusa engine."
-                " Verify that you are using a Medusa engine.")
-
-        return self
-
     def get_decoding_config(self) -> trtllm.DecodingConfig:
         """Create a populated TRT-LLM DecodingConfig."""
-        kwargs = {"decoding_mode": SPECULATIVE_MAP[self.decoding_mode]()}
-
-        if self.medusa_choices is not None:
-            kwargs["medusa_choices"] = self.medusa_choices
-
-        return trtllm.DecodingConfig(**kwargs)
+        return trtllm.DecodingConfig(
+            decoding_mode=SPECULATIVE_MAP[self.decoding_mode]())
 
 
 class ExecutorSettingsConfig(BaseModel):

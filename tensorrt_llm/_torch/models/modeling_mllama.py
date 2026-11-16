@@ -25,7 +25,7 @@ from torch import nn
 from tqdm import tqdm
 
 from ...logger import logger
-from ..attention_backend.interface import AttentionMetadata
+from ..attention.backends.interface import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead

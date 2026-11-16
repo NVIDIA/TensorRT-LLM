@@ -43,6 +43,13 @@ During each iteration of its background loop, the `PyExecutor` performs the foll
 - Output Handling: Updates the partial outputs for ongoing requests and finalizes the results for any requests that have reached completion, returning them to the user.
 
 
+## Multimodal Requests
+
+Multimodal input preparation and execution share `MultimodalParams`. The executor
+owns request cache references; encoder and LLM forwards use separate execution views.
+See the [multimodal developer guide](multimodal.md) for the data contracts,
+process boundaries, and encoder/prefill handoff.
+
 ## Runtime Optimizations
 
 TensorRT LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.
@@ -82,7 +89,7 @@ For diffusion-based visual generation (image/video), TensorRT-LLM provides a sep
 
 TensorRT-LLM log messages include a fixed-width module tag that identifies which subsystem produced the message:
 
-```txt
+```text
 [TRT-LLM] [I] [runtime ] Loading model weights...
 [TRT-LLM] [W] [_torch  ] FlashAttention not available, falling back to default
 [TRT-LLM] [I] [serve   ] Server listening on port 8000
@@ -122,3 +129,81 @@ export TLLM_LOG_LEVEL_BY_MODULE="debug:_torch,runtime;info:serve"
 ```
 
 This example sets the global level to `warning` but enables `debug` output for `_torch` and `runtime` modules, and `info` for `serve`. Valid levels: `trace`, `debug`, `verbose`, `info`, `warning`, `error`, `internal_error`.
+
+## Multi-Rank Crash Handling
+
+When one rank's executor loop dies in a multi-rank job, the peer ranks have
+nothing to fail on: they sit in a collective waiting for a rank that will never
+arrive. Left alone they hold every GPU in the job until an external wall-clock
+kill.
+
+To avoid that, a rank whose executor loop crashes tears the whole job down
+(`MPI_Abort`, falling back to self-`SIGKILL`) after a short grace period. The
+grace exists so cleaner paths can win the race: if the crash is reported to a
+client first — the caller gets the real traceback — the kill stands down, so a
+symmetric crash still ends in N tracebacks rather than a bare exit 137.
+
+**This is on by default for multi-rank runs.** Single-rank runs are unaffected;
+there are no peers to strand.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TLLM_RANK_CRASH_HARD_KILL_GRACE` | `10` | Seconds to wait before killing the job. `0` kills immediately. Any negative value (e.g. `-1`) **disables** the kill entirely — peers then fall back to the hang detector. Unparsable and non-finite values (`nan`, `inf`) fall back to the default. |
+
+```bash
+# Opt out: let the hang detector handle it instead (slower, but no world kill).
+export TLLM_RANK_CRASH_HARD_KILL_GRACE=-1
+```
+
+Use the escape hatch when you would rather have peer ranks reach their own
+timeouts — for example when attaching a debugger to a surviving rank, or when a
+harness collects per-rank state that a job-wide abort would destroy.
+
+Set `TLLM_HANG_DIAGNOSTICS=1` to enable additional PyExecutor diagnostics. It
+is disabled by default and remains silent unless initialization or execution
+hangs, then dumps worker stacks and the latest available executor state.
+
+## DeepGEMM Barrier Timeout
+
+The DeepGEMM MegaMoE kernels synchronize expert-parallel ranks with in-kernel
+barriers that self-abort after a fixed wall-clock budget, defaulting to 60
+seconds. When the budget is exceeded the kernel prints a diagnostic and trips a
+device-side assert, which poisons the CUDA context — so the first Python-level
+traceback usually points at whatever unrelated kernel ran next, not at the
+barrier:
+
+```text
+DeepGEMM grid sync timeout (60s): sm=114, thread=0, grid_sync_idx=0, ...
+DeepGEMM NVLink barrier timeout (60s): rank=5, counter=1381, signal=8, target=16, ...
+```
+
+Read `signal` against `target`: `signal=8, target=16` means only 8 of the 16
+ranks ever arrived at the barrier.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DG_JIT_BARRIER_TIMEOUT_SECONDS` | `60` | Wall-clock budget, in seconds, for DeepGEMM's in-kernel grid-sync and NVLink barriers. Values `<= 0` are ignored and the built-in default applies. |
+
+```bash
+# Give a large expert-parallel group more headroom before the barrier self-aborts.
+export DG_JIT_BARRIER_TIMEOUT_SECONDS=300
+```
+
+The value is baked into the kernels at JIT compile time and participates in the
+JIT cache key, so changing it recompiles the affected kernels rather than
+silently reusing a cached binary.
+
+TensorRT-LLM overrides this default at runtime, without recompiling. While the
+engine warms up, the barriers use `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default
+1800 seconds), because one-time per-rank work such as kernel JIT compilation can
+delay a healthy rank by minutes. While serving, they use
+`TRTLLM_MOE_COMM_TIMEOUT_SEC` when it is set, so `DG_JIT_BARRIER_TIMEOUT_SECONDS`
+only sets the serving budget when `TRTLLM_MOE_COMM_TIMEOUT_SEC` is unset. Both
+variables apply to every MoE communication kernel; see "Communication timeouts"
+in `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`.
+
+This is primarily a diagnostic knob: raising it distinguishes a slow-but-healthy
+rendezvous (all ranks eventually arrive and the run proceeds) from a genuine
+hang or a rank-count mismatch (the same `signal`/`target` split reappears at the
+larger budget). Prefer fixing the underlying imbalance over permanently raising
+the budget, since a longer timeout also delays detection of real hangs.

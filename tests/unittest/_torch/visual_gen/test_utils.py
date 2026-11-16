@@ -23,13 +23,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
-    from tensorrt_llm._utils import get_free_port
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import get_free_port
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -43,6 +38,7 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderInactive:
     def test_shard_gather_identity_when_size_one(self):
         s = SequenceSharder(size=1, rank=0, group=None)
@@ -62,17 +58,8 @@ class TestSequenceSharderInactive:
         rope = (cos, cos)
         assert s.shard_rope(rope, seq_len=4, seq_dim=1) is rope
 
-    def test_disable_enable_no_collectives(self):
-        s = SequenceSharder(size=4, rank=0, group=None)
-        assert s.is_active
-        s.disable()
-        assert not s.is_active
-        x = torch.randn(1, 8, 2)
-        assert s.shard(x, dim=1) is x
-        s.enable()
-        assert s.is_active
 
-
+@pytest.mark.cpu_only
 class TestSequenceSharderShardSlices:
     """Active sharder: block slice math without ``gather``."""
 
@@ -96,6 +83,7 @@ class TestSequenceSharderShardSlices:
             s.shard(x, dim=1)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderShardRope:
     def test_shard_rope_bsd_layout(self):
         s = SequenceSharder(size=2, rank=1, group=None)
@@ -122,6 +110,7 @@ class TestSequenceSharderShardRope:
         assert oc.shape == (2, 4, S)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderFromVgm:
     def test_from_vgm_none(self):
         s = SequenceSharder.from_vgm(None)
@@ -181,12 +170,11 @@ def _spawn_entry_combined(rank: int, world_size: int, port: int):
 
 
 def _run_dist(world_size: int, entry: Callable[[int, int, int], None]):
-    if not MODULES_AVAILABLE:
-        pytest.skip("SequenceSharder import failed")
     port = get_free_port()
     mp.spawn(entry, args=(world_size, port), nprocs=world_size, join=True)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderDistributed:
     def test_shard_gather_pad_unpad_four_ranks(self):
         _run_dist(4, _spawn_entry_combined)

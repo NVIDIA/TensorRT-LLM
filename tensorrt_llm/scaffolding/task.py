@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -116,8 +130,8 @@ class GenerationTask(Task):
 
     # Server-side request id captured from the OpenAI client's streaming
     # chunks (every chunk's ``chunk.id`` field).  Trace-replay clients use
-    # this to look up the matching record in trtllm-serve's
-    # ``/perf_metrics`` drain and attach per-request KV-cache statistics
+    # this to correlate response-carried per-request metrics and attach
+    # KV-cache statistics
     # (``num_reused_blocks`` / ``num_missed_blocks`` / ``free_num_blocks``)
     # to the per-LLM-call row in the step JSON.  ``None`` until the worker
     # observes the first chunk (or when not running against an
@@ -431,10 +445,13 @@ class DropKVCacheTask(Task):
         self.messages_to_retain = []
         self.chat_task = chat_task
 
-        self.messages_to_retain = [
-            message for message in chat_task.messages
-            if message.role in ("system", "user")
-        ]
+        # Only the leading system prompt is reusable across agent tasks.
+        # The engine uses its token count as a prefix boundary, so do not
+        # collect system messages occurring after task-specific context.
+        for message in chat_task.messages:
+            if message.role != "system":
+                break
+            self.messages_to_retain.append(message)
 
 
 @dataclass

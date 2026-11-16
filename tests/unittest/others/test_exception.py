@@ -1,6 +1,10 @@
 import sys
 
+import pytest
+
 from tensorrt_llm.bindings.exceptions import RequestSpecificException
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_basic_exception_creation():

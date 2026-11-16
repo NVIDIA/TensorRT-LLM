@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -13,6 +28,8 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 import yaml
+
+DEFAULT_SERVER_HEALTH_TIMEOUT = 1800
 
 
 def parse_args():
@@ -42,11 +59,130 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def get_server_health_timeout(env_config: Dict[str, Any]) -> int:
+    """Return the configured server health timeout in seconds."""
+    timeout = env_config.get('server_health_timeout',
+                             DEFAULT_SERVER_HEALTH_TIMEOUT)
+    if isinstance(timeout,
+                  bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError(
+            "environment.server_health_timeout must be a positive integer")
+    return timeout
+
+
 def save_worker_config(worker_config, output_path):
     """Save worker config to a separate YAML file."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         yaml.dump(worker_config, f, default_flow_style=False)
+
+
+#: Manifest the single mooncake_master in disaggr_torch.slurm publishes.
+MOONCAKE_POOL_FILE_NAME = 'pool.json'
+
+
+def mooncake_pool_config(worker_config):
+    """The mooncake_store block of worker_config, or None if unused."""
+    connector_config = worker_config.get('kv_connector_config') or {}
+    if connector_config.get('connector') != 'mooncake-store':
+        return None
+    return connector_config.setdefault('mooncake_store', {})
+
+
+def resolve_mooncake_pool(worker_config, pool_file):
+    """Point a mooncake-store worker config at the pool this job will start.
+
+    The path depends on the log directory, which config.yaml cannot know, so
+    it is filled in here rather than asked of the user. An explicit value is
+    left alone, for a pool run outside this script.
+
+    Returns:
+        Whether worker_config uses the connector at all.
+    """
+    pool_config = mooncake_pool_config(worker_config)
+    if pool_config is None:
+        return False
+    pool_config.setdefault('pool', f"file://{pool_file}")
+    return True
+
+
+def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
+    """Per-server copy of worker_config naming its own run directory.
+
+    The Mooncake client config a server renders into run_dir names that
+    server's role and its node's RDMA devices, so servers cannot share one.
+
+    Returns:
+        The path written, or None if worker_config does not use the connector.
+    """
+    if mooncake_pool_config(worker_config) is None:
+        return None
+    per_server = copy.deepcopy(worker_config)
+    mooncake_pool_config(per_server).setdefault(
+        'run_dir',
+        os.path.join(log_dir, f"mooncake_{role.lower()}_{instance_id}"))
+    config_path = os.path.join(log_dir,
+                               f"{role.lower()}_config_{instance_id}.yaml")
+    save_worker_config(per_server, config_path)
+    return config_path
+
+
+#: Rendezvous directory of the KV cache manager v2 remote level, under log_dir.
+REMOTE_CACHE_DIR_NAME = 'kvcm2_remote'
+
+
+def resolve_remote_cache(worker_config: Dict[str, Any],
+                         num_ranks: Dict[str, int], directory: str) -> None:
+    """Fill the job-wide fields of the KV cache remote level from the layout.
+
+    Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
+    directory; a role with a `level` also gets `level.expected`: the number of
+    donating ranks and the bytes all ranks with a level claim, which only the
+    launcher can count. The claim is the sum of level.size: ranks round each
+    layer group up to whole chunks, which the launcher cannot see, so a claim
+    that runs out stops once every expected donor has reported. An explicit
+    `level.expected` is left alone.
+
+    Args:
+        worker_config: {'ctx': ..., 'gen': ...} worker configs, edited in place.
+        num_ranks: {'ctx': ..., 'gen': ...} ranks of each role in the job.
+        directory: Rendezvous directory to use when none is set.
+
+    Raises:
+        ValueError: Roles sharing a directory set different transports.
+    """
+    remote = {}
+    for role in ('ctx', 'gen'):
+        kv_cache_config = worker_config[role].get('kv_cache_config') or {}
+        if kv_cache_config.get('remote_cache_config'):
+            remote[role] = kv_cache_config['remote_cache_config']
+            remote[role].setdefault('directory', directory)
+    # Donors and claims are counted per rendezvous directory, whose ranks must
+    # share one transport: a client passes over donors of another transport.
+    by_directory = {}
+    for role, config in remote.items():
+        by_directory.setdefault(config['directory'], []).append(role)
+    for shared, roles in by_directory.items():
+        transports = {
+            role: (remote[role].get('transport') or {}).get('kind', 'nixl')
+            for role in roles
+        }
+        if len(set(transports.values())) > 1:
+            raise ValueError(
+                f"remote_cache_config of roles {', '.join(roles)} share "
+                f"directory {shared!r} with different transports {transports}; "
+                "use one transport, or a directory per role")
+        num_donors = sum(num_ranks[role] for role in roles
+                         if remote[role].get('donor'))
+        claim_size = sum(num_ranks[role] * remote[role]['level']['size']
+                         for role in roles if remote[role].get('level'))
+        for role in roles:
+            level = remote[role].get('level')
+            if level and num_donors and 'expected' not in level:
+                level['expected'] = {
+                    'num_donors': num_donors,
+                    'claim_size': claim_size
+                }
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
@@ -150,9 +286,21 @@ def allocate_gpus(
     return allocations
 
 
-def convert_allocations_to_server_config(allocations,
-                                         server_port=8333,
-                                         router_config=None):
+# Router options of pooled generation dispatch; a context router rejects them.
+GEN_ONLY_ROUTER_KEYS = ("max_requests_per_server", "max_queue_wait_s")
+
+
+def convert_allocations_to_server_config(
+        allocations: dict,
+        server_port: int = 8333,
+        router_config: dict | None = None,
+        ctx_cache_transceiver_config: dict | None = None) -> dict:
+    """Build the disaggregated server config.
+
+    ``router_config`` applies to both roles, without its generation-only keys for the context
+    servers. The context workers' ``kv_transfer_timeout_ms`` (from
+    ``ctx_cache_transceiver_config``, null included) bounds the pooled generation wait.
+    """
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -168,6 +316,15 @@ def convert_allocations_to_server_config(allocations,
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
         if router_config:
             server_config_entry['router'] = router_config.copy()
+            if server_type == "CTX":
+                for key in GEN_ONLY_ROUTER_KEYS:
+                    server_config_entry['router'].pop(key, None)
+        if (server_type == "CTX" and ctx_cache_transceiver_config
+                and 'kv_transfer_timeout_ms' in ctx_cache_transceiver_config):
+            server_config_entry['cache_transceiver_config'] = {
+                'kv_transfer_timeout_ms':
+                ctx_cache_transceiver_config['kv_transfer_timeout_ms']
+            }
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -207,8 +364,9 @@ def replace_env_in_file(log_dir, file_path, env_var):
     with open(file_path, 'r', encoding='utf-8') as f:
         config_content = f.read()
 
+    file_content = config_content
     for env_name, env_value in env_var.items():
-        file_content = config_content.replace(env_name, env_value)
+        file_content = file_content.replace(env_name, env_value)
 
     tmp_dir = os.path.join(log_dir, "lm_eval_configs")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -227,6 +385,26 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
     # Return temp directory
     return tmp_dir
+
+
+def _parse_positive_concurrency(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+
+    try:
+        concurrency = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}") from error
+
+    if concurrency <= 0:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+    return concurrency
 
 
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
@@ -257,30 +435,17 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'worker_env_var',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1')
-    if benchmark_mode == "gen_only":
-        upsert_env_config(env_config, 'worker_env_var',
+    if benchmark_mode == "gen_only" and role == "GEN":
+        # GEN worker only: skipping transfer-state polling helps the generation
+        # worker, but the same flag on the CTX worker has been seen to hang
+        # gen_only runs with KV blocks never released.
+        upsert_env_config(env_config, 'gen_worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
-        if role == "GEN":
-            gen_config = worker_config.get('gen', {})
-            concurrency_int = int(concurrency)
-            max_batch_size = int(
-                gen_config.get('max_batch_size', concurrency_int))
-            enable_attention_dp = gen_config.get('enable_attention_dp', False)
-            tp_size = int(gen_config.get('tensor_parallel_size', 1))
-            max_capacity = ((max_batch_size * tp_size)
-                            if enable_attention_dp else max_batch_size)
-            queue_size = min(max_capacity, concurrency_int)
-            if queue_size < concurrency_int:
-                print(f"[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
-                      f"{queue_size} (max_batch_size={max_batch_size} x "
-                      f"tp_size={tp_size} with "
-                      f"attention_dp={enable_attention_dp}) "
-                      f"which is less than concurrency={concurrency}. "
-                      f"Fill loop would hang if set to {concurrency}.")
-            upsert_env_config(env_config, 'gen_worker_env_var',
-                              'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size}')
+        concurrency = _parse_positive_concurrency(concurrency)
+        upsert_env_config(env_config, 'gen_worker_env_var',
+                          'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
+                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -548,6 +713,15 @@ def submit_job(config, log_dir, dry_run):
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
+    mooncake_pool_file = os.path.join(log_dir, MOONCAKE_POOL_FILE_NAME)
+    ctx_uses_mooncake = resolve_mooncake_pool(worker_config['ctx'],
+                                              mooncake_pool_file)
+    gen_uses_mooncake = resolve_mooncake_pool(worker_config['gen'],
+                                              mooncake_pool_file)
+    resolve_remote_cache(worker_config, {
+        'ctx': ctx_num * ctx_world_size,
+        'gen': gen_num * gen_world_size
+    }, os.path.join(log_dir, REMOTE_CACHE_DIR_NAME))
     save_worker_config(worker_config['ctx'], ctx_config_path)
     save_worker_config(worker_config['gen'], gen_config_path)
 
@@ -567,7 +741,10 @@ def submit_job(config, log_dir, dry_run):
     # Generate disagg server config
     router_config = config.get('router_config', None)
     server_config = convert_allocations_to_server_config(
-        allocations, router_config=router_config)
+        allocations,
+        router_config=router_config,
+        ctx_cache_transceiver_config=worker_config['ctx'].get(
+            'cache_transceiver_config'))
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
@@ -586,12 +763,14 @@ def submit_job(config, log_dir, dry_run):
         "GEN": {
             "world_size": gen_world_size,
             "profile_range": profiling_config['gen_profile_range'],
-            "config_path": gen_config_path
+            "config_path": gen_config_path,
+            "worker_key": "gen"
         },
         "CTX": {
             "world_size": ctx_world_size,
             "profile_range": profiling_config['ctx_profile_range'],
-            "config_path": ctx_config_path
+            "config_path": ctx_config_path,
+            "worker_key": "ctx"
         }
     }
 
@@ -622,13 +801,32 @@ def submit_job(config, log_dir, dry_run):
                             hf.write(f"{host}\n")
                             gm.write(f"{rank} {host} {gpu}\n")
                             rank += 1
+                # Compact packing derives CUDA_VISIBLE_DEVICES from gpu_map.
+                cuda_devices = "none"
             else:
                 # Default packing: each node is dedicated to one worker, so
-                # SLURM_LOCALID directly maps to the physical GPU id in
-                # start_worker.sh (no hostfile/gpu_map needed).
+                # every rank on that node is given the node's full GPU list and
+                # binds to its own device via mapping.local_rank
+                # (= rank % gpus_per_node). Exposing the whole node is required
+                # for intra-node TP custom all-reduce (attention_dp=false /
+                # TEP), whose cudaDeviceCanAccessPeer() topology check must see
+                # the peer GPUs; pinning one GPU per rank only works for DEP.
                 node_list = list(allocation["nodes"].keys())
                 num_nodes = len(node_list)
+                # Whole-node ownership means every node carries the same GPU
+                # layout, so the first node's list applies to all ranks.
+                gpu_ids = sorted(list(allocation["nodes"].values())[0])
+                cuda_devices = ','.join(map(str, gpu_ids))
 
+            config_path = save_mooncake_worker_config(
+                worker_config[server_cfg['worker_key']], log_dir, server_type,
+                server_id)
+            if config_path is None:
+                config_path = server_cfg['config_path']
+
+            concurrency_list = benchmark_config['concurrency_list']
+            concurrency = (concurrency_list.split(',')[0] if isinstance(
+                concurrency_list, str) else concurrency_list)
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -636,7 +834,7 @@ def submit_job(config, log_dir, dry_run):
                 benchmark_mode=benchmark_config['mode'],
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
-                concurrency=benchmark_config['concurrency_list'].split(',')[0],
+                concurrency=concurrency,
             )
             export_str = format_export_string(worker_env)
 
@@ -669,7 +867,8 @@ def submit_job(config, log_dir, dry_run):
                 str(slurm_config['numa_bind']).lower(),
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
-                server_cfg['config_path'],
+                config_path,
+                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -701,12 +900,17 @@ def submit_job(config, log_dir, dry_run):
     )
 
     # Generate wait server command (use script_dir for wait_server.sh)
+    server_health_timeout = get_server_health_timeout(env_config)
+    wait_server_script = os.path.join(script_dir, 'wait_server.sh')
+    wait_server_command = (
+        f"bash {wait_server_script} {disagg_server_hostname} "
+        f"{disagg_server_port} {server_health_timeout}")
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
         f"--container-mounts={container_mount_str}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
+        wait_server_command,
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))
@@ -839,6 +1043,11 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+
+        # Empty unless a worker uses the mooncake-store connector, in which
+        # case the job starts one mooncake_master to publish this manifest.
+        '--mooncake-pool-file',
+        mooncake_pool_file if ctx_uses_mooncake or gen_uses_mooncake else '',
     ]
     # yapf: enable
 

@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
+import contextlib
+import multiprocessing
+import subprocess
+import sys
+
 import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakePool:
@@ -13,6 +20,7 @@ class _FakePool:
         self.wait_shutdown = wait_shutdown
         self.env_overrides = dict(env_overrides or {})
         self.shut = False
+        self.exit_joins_released = False
         import os
 
         # What the workers freeze at spawn: TRTLLM* forwarded from the parent
@@ -23,6 +31,9 @@ class _FakePool:
 
     def shutdown(self):
         self.shut = True
+
+    def release_exit_joins(self) -> None:
+        self.exit_joins_released = True
 
     def shutdown_abort(self, *args, **kwargs):
         self.shut = True
@@ -71,6 +82,7 @@ def _wait(pred, timeout=5.0):
 def test_reuse_hands_back_same_pool(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     real = s1._real
+    assert len(reuse_cache.prefetch.restocks) == 1  # armed only on the cache miss
     # Cache-managed pools block their (real) shutdown on worker exit, so a
     # replacement spawned right after a retire cannot race the GPU release.
     assert real.wait_shutdown
@@ -79,6 +91,7 @@ def test_reuse_hands_back_same_pool(reuse_cache):
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # the SAME pool, reused
     assert reuse_cache.resets  # workers were reset between handouts
+    assert len(reuse_cache.prefetch.restocks) == 1  # reuse does not create a shadow
 
 
 def test_cached_handover_reaps_in_flight_retires(reuse_cache):
@@ -113,32 +126,89 @@ def test_cache_miss_takes_prefetched_shadow(reuse_cache):
 
 
 def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
-    s = reuse_cache.acquire(_FakePool, 2)  # nothing armed: sync spawn
+    events = []
+
+    class _OrderedPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            events.append("sync pool ready")
+            super().__init__(*args, **kwargs)
+
+    original_schedule = reuse_cache.prefetch.schedule_shadow
+
+    def _record_schedule(*args, **kwargs):
+        events.append("shadow scheduled")
+        original_schedule(*args, **kwargs)
+
+    reuse_cache.prefetch.schedule_shadow = _record_schedule
+    s = reuse_cache.acquire(_OrderedPool, 2)  # nothing armed: sync spawn
     assert isinstance(s._real, _FakePool) and s._real.wait_shutdown
     assert s._real.env_overrides.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
     assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
+    assert events == ["sync pool ready", "shadow scheduled"]
 
 
-def test_spawn_failure_retries_once(reuse_cache):
-    # wait_shutdown spawns fail closed (identity collection must complete);
-    # one loud retry absorbs a transient slow node, a second failure means
-    # the node is genuinely broken and must propagate.
+def test_shadow_timeout_does_not_start_sync_pool(reuse_cache):
     calls = []
 
-    class _FlakyPool(_FakePool):
+    def _timeout(_n_workers):
+        raise TimeoutError("shadow bootstrap still running")
+
+    reuse_cache.prefetch.take = _timeout
+
+    class _RecordingPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(TimeoutError, match="still running"):
+        reuse_cache.acquire(_RecordingPool, 2)
+    assert calls == []
+    assert reuse_cache.prefetch.restocks == []
+
+
+def test_prefetcher_programming_error_propagates(reuse_cache):
+    calls = []
+
+    def _fail(_n_workers):
+        raise ValueError("prefetch lifecycle bug")
+
+    reuse_cache.prefetch.take = _fail
+
+    class _RecordingPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="prefetch lifecycle bug"):
+        reuse_cache.acquire(_RecordingPool, 2)
+    assert calls == []
+    assert reuse_cache.prefetch.restocks == []
+
+
+def test_spawn_failure_propagates_without_retry(reuse_cache):
+    # The attempt already waited for the full bootstrap deadline. Retrying
+    # could overlap workers that the failed identity barrier could not reap.
+    calls = []
+
+    class _FailingPool(_FakePool):
         def __init__(self, n_workers, wait_shutdown=False, env_overrides=None):
             calls.append(1)
-            if len(calls) == 1:
-                raise RuntimeError("identity collection incomplete")
-            super().__init__(n_workers, wait_shutdown, env_overrides)
+            raise RuntimeError("identity collection incomplete")
 
-    s = reuse_cache.acquire(_FlakyPool, 2)
-    assert isinstance(s._real, _FlakyPool) and len(calls) == 2
+    with pytest.raises(RuntimeError, match="identity collection incomplete"):
+        reuse_cache.acquire(_FailingPool, 2)
+    assert calls == [1]
+    assert reuse_cache.prefetch.restocks == []
 
 
 def test_reuse_size_mismatch_builds_new(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     s1.shutdown()
+
+    def _take_after_shutdown(_n_workers: int) -> None:
+        assert s1._real.shut
+
+    reuse_cache.prefetch.take = _take_after_shutdown
     s2 = reuse_cache.acquire(_FakePool, 4)
     assert s2._real.n_workers == 4 and s2._real is not s1._real
 
@@ -258,22 +328,179 @@ def test_drain_shuts_cached_pools(reuse_cache):
     assert real.shut
 
 
-def test_autodeploy_nodeids_are_private():
+def test_drain_kills_recorded_worker_when_shutdown_wedges(
+    reuse_cache: SessionReuseCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+    import subprocess
+    import sys
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+
+    class _WedgedPool(_FakePool):
+        def __init__(
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+            self._worker_identities = ((self.worker.pid, b"owned"),)
+
+        def shutdown(self) -> None:
+            self.worker.wait()
+            self.shut = True
+
+    session = reuse_cache.acquire(_WedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    try:
+        reuse_cache.drain(timeout=0.2)
+        assert pool.worker.returncode == -signal.SIGKILL
+        assert pool.shut
+    finally:
+        if pool.worker.poll() is None:
+            pool.worker.kill()
+        pool.worker.wait()
+
+
+def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
+    reuse_cache: SessionReuseCache,
+) -> None:
+    import threading
+    import time
+
+    class _ManagerWedgedPool(_FakePool):
+        def __init__(
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.shutdown_released = threading.Event()
+
+        def shutdown(self) -> None:
+            self.shutdown_released.wait()
+            # Dropping the exit joins only unparks the thread; the real
+            # shutdown still has to unwind (close the transport, reap its
+            # connection threads) before it returns.
+            time.sleep(0.05)
+            self.shut = True
+
+        def release_exit_joins(self) -> None:
+            super().release_exit_joins()
+            self.shutdown_released.set()
+
+    session = reuse_cache.acquire(_ManagerWedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    reuse_cache.drain(timeout=0.01)
+    assert pool.exit_joins_released
+    assert pool.shutdown_released.is_set()
+    # drain must not return while the released shutdown is still unwinding:
+    # it runs inside a test, so a thread that finishes a moment later drags
+    # its transport threads across the test boundary and pytest-threadleak
+    # blames whichever test runs next.
+    assert pool.shut
+    assert not [t for t in threading.enumerate() if t.name == "session-reuse-drain"]
+
+
+def test_kill_recorded_workers_skips_recycled_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"recycled")
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert session_reuse._kill_recorded_workers(pool) == 0
+    assert kills == []
+
+
+def test_kill_recorded_workers_signals_through_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pidfd handle is pinned BEFORE the identity recheck, and closed after.
+
+    The ordering is the whole invariant: opening the pidfd first pins the process
+    so the start-time recheck cannot be invalidated by the PID being recycled
+    before the signal lands. One ordered event log is what proves that. Separate
+    per-call lists record only that each call happened, so a regression that
+    rechecks first and opens the handle afterwards still satisfies them.
+    """
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    events: list[tuple] = []
+
+    def _start_time(pid):
+        events.append(("start_time", pid))
+        return b"owned"
+
+    def _pidfd_open(pid):
+        events.append(("open", pid))
+        return 77
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", _start_time)
+    monkeypatch.setattr(session_reuse.os, "pidfd_open", _pidfd_open, raising=False)
+    monkeypatch.setattr(session_reuse.os, "close", lambda fd: events.append(("close", fd)))
+    monkeypatch.setattr(
+        session_reuse.os,
+        "kill",
+        lambda pid, sig: pytest.fail("os.kill used while pidfd was available"),
+    )
+    import signal as _signal
+
+    monkeypatch.setattr(
+        _signal,
+        "pidfd_send_signal",
+        lambda fd, sig: events.append(("signal", fd, sig)),
+        raising=False,
+    )
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert events == [
+        ("open", 123),
+        ("start_time", 123),
+        ("signal", 77, _signal.SIGKILL),
+        ("close", 77),
+    ]
+
+
+def test_kill_recorded_workers_falls_back_without_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pidfd support must still reap: the wedged worker is the whole point."""
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+    monkeypatch.delattr(session_reuse.os, "pidfd_open", raising=False)
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    import signal as _signal
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert kills == [(123, _signal.SIGKILL)]
+
+
+def test_torch_compile_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
     assert _is_private_nodeid(
-        "accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::"
-        "test_autodeploy_from_registry[m-True]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]"
     )
     assert _is_private_nodeid(
-        "examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json"
-    )
-    assert _is_private_nodeid("unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y")
-    assert not _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[a]"
+        "accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::"
+        "test_nvfp4_multi_gpus_piecewise_cuda_graph[baseline]"
     )
     assert not _is_private_nodeid(
-        "unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[x]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]"
+    )
+    assert not _is_private_nodeid(
+        "unittest/llmapi/test_llm_args.py::test_torch_compile_config_round_trip"
     )
 
 
@@ -299,11 +526,11 @@ def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     assert s2._real is not real  # fresh pool, no reuse across the failure
 
 
-class _FakeBarrierSession:
+class _FakeProbeSession:
     """Fakes MpiPoolSession.submit for master-side submit_sync_per_worker tests.
 
-    Worker-side behaviour (the barrier itself) needs real MPI and is covered
-    by the multi-GPU validation runs; here each entry stands for one worker's
+    Worker-side behaviour needs real MPI and is covered by the multi-GPU
+    validation runs; here each entry stands for one worker's
     future: a (rank, result) tuple, an Exception, or None (never completes,
     i.e. a wedged worker).
     """
@@ -328,14 +555,14 @@ class _FakeBarrierSession:
 def test_probe_returns_results_ordered_by_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(2, "c"), (0, "a"), (1, "b")])
+    session = _FakeProbeSession([(2, "c"), (0, "a"), (1, "b")])
     assert submit_sync_per_worker(session, lambda: None) == ["a", "b", "c"]
 
 
 def test_probe_times_out_on_wedged_worker():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), None])  # rank 1 never returns
+    session = _FakeProbeSession([(0, "a"), None])  # rank 1 never returns
     with pytest.raises(RuntimeError, match="timed out"):
         submit_sync_per_worker(session, lambda: None, timeout=0.2)
 
@@ -343,7 +570,7 @@ def test_probe_times_out_on_wedged_worker():
 def test_probe_propagates_worker_exception():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), ValueError("worker died")])
+    session = _FakeProbeSession([(0, "a"), ValueError("worker died")])
     with pytest.raises(ValueError, match="worker died"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -351,7 +578,7 @@ def test_probe_propagates_worker_exception():
 def test_probe_flags_missing_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), (0, "a")])  # rank 1 never covered
+    session = _FakeProbeSession([(0, "a"), (0, "a")])  # rank 1 never covered
     with pytest.raises(RuntimeError, match=r"ranks \[1\]"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -375,6 +602,66 @@ def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
 
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # pool survived and was reused
+
+
+class _PlainItem:
+    nodeid = "test_e2e.py::test_ptp_quickstart_advanced"
+
+    @staticmethod
+    def get_closest_marker(name):
+        return None
+
+
+@pytest.fixture
+def cached_pool_hooks(reuse_cache, monkeypatch):
+    """The hooks bound to ``reuse_cache``, which holds one idle 4-worker pool."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+    monkeypatch.setattr(reuse_cache, "install_pool_factory_if_loaded", lambda: None)
+    s = reuse_cache.acquire(_FakePool, 4)
+    s.shutdown()
+    yield hooks, s._real
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_child_process_drains_cached_pools(cached_pool_hooks, capfd):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert pool.shut
+    assert "draining before child process" in capfd.readouterr().out
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_multiprocessing_child_drains_cached_pools(cached_pool_hooks):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    process = multiprocessing.get_context("spawn").Process(target=int)
+    process.start()
+    process.join()
+    assert pool.shut
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_device_query_keeps_cached_pools(cached_pool_hooks):
+    # The skip-marker fixtures run nvidia-smi before most multi-GPU tests.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run("nvidia-smi -L", shell=True, capture_output=True)
+    with contextlib.suppress(FileNotFoundError):  # no driver on this host
+        subprocess.run(["nvidia-smi", "-L"], capture_output=True)
+    hooks.pytest_runtest_teardown(_PlainItem())
+    assert not pool.shut
+
+
+def test_spawn_after_teardown_keeps_cached_pools(cached_pool_hooks):
+    # Finalizer cleanup commands must not cost the next test its pool.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    hooks.pytest_runtest_teardown(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert not pool.shut
 
 
 def test_seam_shim_is_isinstance_transparent():

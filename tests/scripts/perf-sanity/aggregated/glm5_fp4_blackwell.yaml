@@ -13,7 +13,7 @@ server_configs:
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 256
+    max_num_tokens: 8192
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:

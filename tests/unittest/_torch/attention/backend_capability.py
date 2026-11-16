@@ -20,7 +20,7 @@ from utils.util import getSMVersion
 #   fp4_kv         - NVFP4 KV cache (Blackwell only)
 #   sliding_window - sliding-window attention via attention_window_size
 #   no_cache       - ragged/prefill forward with kv_cache_manager=None
-#   sparse         - sparse-attention forward plumbing (degenerate regime here)
+#   sparse         - sparse-attention forward plumbing
 #   mla            - multi-head latent attention
 #   cross_attn     - cross-attention (encoder-decoder)
 #   kv_layouts     - supported paged-cache block layouts ("NHD" / "HND")
@@ -55,12 +55,12 @@ BACKEND_CAPS = {
         kv_layouts=("NHD", "HND"),  # selectable via metadata.kv_layout
     ),
     "VANILLA": dict(
-        paged=False,
+        paged=True,
         fp8_kv=True,
         fp4_kv=False,
         sliding_window=True,
         no_cache=True,
-        sparse=False,
+        sparse=True,
         mla=True,
         cross_attn=True,
         kv_layouts=("NHD",),  # reads the NHD get_buffers view
@@ -86,7 +86,7 @@ def required_features(case) -> set:
         feats.add("sliding_window")
     if getattr(case, "cache", "paged") == "none":
         feats.add("no_cache")
-    if getattr(case, "sparse", "off") != "off":
+    if getattr(case, "sparse_attention_config", None) is not None:
         feats.add("sparse")
     if getattr(case, "is_mla", False):
         feats.add("mla")
@@ -156,8 +156,8 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         return f"TRTLLM Blackwell paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
-    # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
-    # this sweep still pass on Blackwell.
+    # retained head_dim 80 vision workload; other no-cache head dims in this
+    # sweep still pass on Blackwell.
     if (
         backend == "TRTLLM"
         and sm >= 100

@@ -16,18 +16,19 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend import \
+from tensorrt_llm._torch.attention import attention as trtllm_attention
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import \
     interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
-    _ENCODER_FALLBACK_MAX_NUM_REQUESTS, MultimodalEncoderMixin)
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -165,7 +166,6 @@ class ViTPatchGenerator(nn.Module):
                 bias=patch_bias,
                 temporal_patch_size=temporal_patch_size,
             )
-        self._video_embedder_loaded = False
 
         self.pos_embed = None
         if abs_pos:
@@ -220,11 +220,6 @@ class ViTPatchGenerator(nn.Module):
             Embedded patches with temporal compression applied,
             shape [num_tubelets, seq_per_tubelet, embed_dim].
         """
-        if not self._video_embedder_loaded:
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) requires "
-                "video_embedder weights, but they were never loaded. "
-                "Ensure the checkpoint was trained with temporal compression.")
         T = self.temporal_patch_size
         input_size = x.shape[2:]
 
@@ -564,6 +559,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
     """
 
+    encoder_cuda_graph_modality = "vision"
+
     def __init__(
         self,
         img_size: int = 224,
@@ -759,8 +756,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
         # / metadata provider can read `self.attn_metadata` before the engine
         # re-sizes it via `setup_attn_metadata`.
-        self.setup_attn_metadata(max_num_requests=8192,
-                                 max_num_tokens=model_config.max_num_tokens)
+        self.setup_attn_metadata(max_num_tokens=model_config.max_num_tokens)
 
         # CUDA-graph runner for the block stack. None means graphs are off and
         # the eager path is always taken; the caller opts in via
@@ -769,47 +765,30 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
-    def setup_attn_metadata(self, max_num_requests: int,
-                            max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
         # FlashInfer's original default is "NHD"; TRT-LLM switched the default
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
         # (kv_cache_manager=None) computes k/v directly from input, which is
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
-        # default: one attention segment per image, which can exceed the
-        # LLM-side `max_batch_size` that `encoder_max_batch_size` falls back to.
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        # default while allowing one attention segment per encoder token.
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         metadata_kwargs = dict(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
         if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
-
-    def enable_blocks_cuda_graph(
-        self,
-        config: "MultimodalEncoderCudaGraphConfig",
-        *,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """Build the block-stack runner from `config` and capture startup graphs.
-
-        The caller must ensure the model parameters already live on `device`
-        (or on a CUDA device discoverable from `self.parameters()`); captures
-        are recorded immediately.
-        """
-        if self._blocks_graph_runner is not None:
-            return
-
-        graph_runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(self.parameters()).device
-        graph_runner.capture_all(device)
-        self._blocks_graph_runner = graph_runner
 
     def prepare_attn_metadata(
             self, batch_size: int, seq_lengths: List[int],
@@ -919,15 +898,19 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
 
     def _run_blocks(self, x: torch.Tensor,
                     attn_metadata: AttentionMetadata) -> torch.Tensor:
-        if self._blocks_graph_runner is not None:
-            seq_lengths = attn_metadata.seq_lens.tolist()
-            output = self._blocks_graph_runner.maybe_run(
-                seq_lengths=seq_lengths,
-                inputs={"x": x},
-            )
-            if output is not None:
-                return output["x"]
-        return self._run_blocks_eager(x, attn_metadata)
+        # RADIO runs outside the compiled LM region and receives its vision
+        # metadata explicitly. Keep both graph replay and eager fallback off
+        # the custom-op path, which resolves the LM metadata from extra_attrs.
+        with torch_compiling(False):
+            if self._blocks_graph_runner is not None:
+                seq_lengths = attn_metadata.seq_lens.tolist()
+                output = self._blocks_graph_runner.maybe_run(
+                    seq_lengths=seq_lengths,
+                    inputs={"x": x},
+                )
+                if output is not None:
+                    return output["x"]
+            return self._run_blocks_eager(x, attn_metadata)
 
     def _run_blocks_eager(self, x: torch.Tensor,
                           attn_metadata: AttentionMetadata) -> torch.Tensor:
@@ -936,12 +919,13 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         return x
 
 
-class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]
+                                     ):
     """Bridges the multimodal encoder graph runner to the model's eager metadata path.
 
     `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
     `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
-    `attention_backend/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
+    `attention/backends/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
     to run against captured CUDA graphs.
 
     The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
@@ -1157,6 +1141,21 @@ class RADIOVisionModelBase(nn.Module):
         return fmt_feat
 
 
+def split_fused_qkv(name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Split a fused ``attn.qkv`` weight or bias into its q/k/v projections.
+
+    The row order here is the only place the fusion order is written down, so
+    anything that builds an ``attn.qkv`` tensor for this loader has to match it.
+    """
+    dim_shape = tensor.shape[0] // 3
+    return {
+        name.replace('attn.qkv.', 'attn.q_proj.'): tensor[:dim_shape],
+        name.replace('attn.qkv.', 'attn.k_proj.'):
+        tensor[dim_shape:2 * dim_shape],
+        name.replace('attn.qkv.', 'attn.v_proj.'): tensor[2 * dim_shape:],
+    }
+
+
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
@@ -1212,11 +1211,12 @@ class RADIOVisionModel(PreTrainedModel):
         img_size = VIT_TIMM_CONFIG_BY_NAME[model_name].img_size
         mlp_ratio = intermediate_size / embed_dim
 
-        # Build the model.
+        # Build the model. C-RADIOv4-H omits `in_chans`, `input_size` and `drop`
+        # from the RADIO argument bag, so these reads tolerate their absence.
         in_chans = 3
-        if args.in_chans is not None:
+        if getattr(args, 'in_chans', None) is not None:
             in_chans = args.in_chans
-        elif args.input_size is not None:
+        elif getattr(args, 'input_size', None) is not None:
             in_chans = args.input_size[0]
         vit_model = VisionTransformer(
             img_size=img_size,
@@ -1226,7 +1226,7 @@ class RADIOVisionModel(PreTrainedModel):
             depth=depth,
             num_heads=num_attention_heads,
             mlp_ratio=mlp_ratio,
-            drop_rate=args.drop,
+            drop_rate=getattr(args, 'drop', 0.0),
             special_args=args,
             model_config=self.model_config,
         )
@@ -1240,35 +1240,47 @@ class RADIOVisionModel(PreTrainedModel):
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 
-        adaptor_names = config.adaptor_names or []
+        # C-RADIOv4 configs omit these three fields; absent means "not configured",
+        # which is the only case these guards accept anyway.
+        adaptor_names = getattr(config, 'adaptor_names', None) or []
         if len(adaptor_names) > 0:
             raise ValueError(
                 "Adaptor names are not supported for RADIO models.")
         adaptors = dict()
 
         feature_normalizer = None
-        if config.feature_normalizer_config is not None:
+        if getattr(config, 'feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Feature normalizer is not supported for RADIO models.")
 
         inter_feature_normalizer = None
-        if config.inter_feature_normalizer_config is not None:
+        if getattr(config, 'inter_feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Intermediate feature normalizer is not supported for RADIO models."
             )
+
+        # C-RADIOv4 renames both: `max_img_size` is `max_resolution`, and
+        # `image_size` the preferred (square) resolution. `vitdet_window_size`
+        # has no v4 counterpart; None is the constructor's own default.
+        max_resolution = (config.max_resolution if hasattr(
+            config, 'max_resolution') else config.max_img_size)
+        preferred_resolution = (config.preferred_resolution if hasattr(
+            config, 'preferred_resolution') else Resolution(
+                config.image_size, config.image_size))
 
         self.radio_model = RADIOVisionModelBase(
             vit_model,
             input_conditioner,
             patch_size=config.patch_size,
-            max_resolution=config.max_resolution,
-            window_size=config.vitdet_window_size,
-            preferred_resolution=config.preferred_resolution,
+            max_resolution=max_resolution,
+            window_size=getattr(config, 'vitdet_window_size', None),
+            preferred_resolution=preferred_resolution,
             adaptors=adaptors,
             feature_normalizer=feature_normalizer,
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=self.model_config,
         )
+        self.radio_model.model.encoder_cuda_graph_config = encoder_cuda_graph_config
 
     def load_weights(self, weights):
         # Load radio_model weights for pytorch modules.
@@ -1286,6 +1298,12 @@ class RADIOVisionModel(PreTrainedModel):
             unexpected_keys.remove("input_conditioner.norm_std")
         # Partial model.blocks weights will loaded in the following step.
         for m in missing_keys:
+            if m.startswith('model.patch_generator.video_embedder.'):
+                raise ValueError(
+                    f"Missing key: {m}. Temporal compression "
+                    "(video_temporal_patch_size > 1) requires video_embedder "
+                    "weights. Ensure the checkpoint was trained with temporal "
+                    "compression.")
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
@@ -1299,14 +1317,6 @@ class RADIOVisionModel(PreTrainedModel):
             )):
                 raise ValueError(f"Unexpected key: {u}")
 
-        # Mark video_embedder as loaded only when the submodule exists and its weights were actually
-        # present in the checkpoint (i.e. not reported as unexpected).
-        patch_gen = self.radio_model.model.patch_generator
-        if (getattr(patch_gen, 'video_embedder', None) is not None
-                and 'model.patch_generator.video_embedder.weight'
-                not in unexpected_keys):
-            patch_gen._video_embedder_loaded = True
-
         # Load weights for vision transformer module.
         model_weights = {
             k.replace('radio_model.model.', ''): v
@@ -1316,14 +1326,8 @@ class RADIOVisionModel(PreTrainedModel):
         for name in model_weights:
             # Handle with weights and bias for vision transformer's qkv projection.
             if "attn.qkv." in name:
-                q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                dim_shape = model_weights[name].shape[0] // 3
-                converted_weights[q_name] = model_weights[name][:dim_shape]
-                converted_weights[k_name] = model_weights[name][dim_shape:2 *
-                                                                dim_shape]
-                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+                converted_weights.update(
+                    split_fused_qkv(name, model_weights[name]))
             else:
                 converted_weights[name] = model_weights[name]
         pattern_mapping = {

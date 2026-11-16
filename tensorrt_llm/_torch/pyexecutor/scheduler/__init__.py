@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,8 @@ from .scheduler import (
     BindMicroBatchScheduler,
     CapacityScheduler,
     MicroBatchScheduler,
+    MultimodalEagerEncoderScheduler,
+    MultimodalScheduler,
     PyCapacityScheduler,
     PyMicroBatchScheduler,
     RequestList,
@@ -41,6 +43,7 @@ from .scheduler_v2 import KVCacheV2Scheduler
 
 # Re-export from waiting_queue.py
 from .waiting_queue import (
+    AgingPriorityWaitingQueue,
     FCFSWaitingQueue,
     PriorityWaitingQueue,
     WaitingQueue,
@@ -54,6 +57,8 @@ __all__ = [
     "CapacityScheduler",
     "KVCacheV2Scheduler",
     "MicroBatchScheduler",
+    "MultimodalEagerEncoderScheduler",
+    "MultimodalScheduler",
     "PyCapacityScheduler",
     "PyMicroBatchScheduler",
     "RequestList",
@@ -69,6 +74,7 @@ __all__ = [
     "KVCacheAwareADPRouter",
     "RankState",
     # Waiting queues
+    "AgingPriorityWaitingQueue",
     "FCFSWaitingQueue",
     "PriorityWaitingQueue",
     "WaitingQueue",

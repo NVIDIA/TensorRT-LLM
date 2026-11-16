@@ -72,7 +72,7 @@ The user must provide (or you must ask for) these values:
 |-----------|-------------|---------|
 | `container_image` | Path to `.sqsh` container image (see enroot import above) | `/path/to/pytorch.sqsh` |
 | `repo_dir` | Path to the TensorRT-LLM repository | `/path/to/TensorRT-LLM` |
-| `mount_dir` | Top-level directory to bind-mount into the container | `/shared/users` |
+| `user_root_dir` | Top-level directory to bind-mount into the container | `/shared/users` |
 | `partition` | SLURM partition | `batch` |
 | `account` | SLURM account | `my_account` |
 
@@ -83,7 +83,7 @@ Optional parameters:
 | `jobname` | SLURM job name | `trtllm-compile.<username>` |
 | `gpu_count` | Number of GPUs to request | `4` |
 | `time_limit` | Job time limit | `02:00:00` |
-| `arch` | GPU architecture(s) for `-a` flag | `100-real` |
+| `arch` | GPU architecture(s) for `-a` flag | `100` |
 | `extra_build_args` | Extra flags for `build_wheel.py` | (none) |
 
 ## Companion Scripts
@@ -123,18 +123,18 @@ If the user already has a `.sqsh` file, skip this step.
 Ask the user for any missing prerequisite values listed above. At minimum you need:
 - `container_image` (or the Docker image URL — then run Step 0 first)
 - `repo_dir`
-- `mount_dir`
+- `user_root_dir`
 - `partition` and `account`
 
 If the user has used this workflow before, check if previous values are stored in memory files.
 
 ### Step 2: Prepare the Scripts Directory
 
-The compile scripts must be accessible from inside the container (i.e., under `mount_dir`). Either:
+The compile scripts must be accessible from inside the container (i.e., under `user_root_dir`). Either:
 
-**Option A** — Copy companion scripts to a location under `mount_dir`:
+**Option A** — Copy companion scripts to a location under `user_root_dir`:
 ```bash
-scripts_dir=<mount_dir>/<username>/workspace/tensorrt_llm_scripts
+scripts_dir=<user_root_dir>/<username>/workspace/tensorrt_llm_scripts
 mkdir -p ${scripts_dir}/log
 cp skills/exec-slurm-compile/scripts/compile.sh ${scripts_dir}/
 cp skills/exec-slurm-compile/scripts/compile.slurm ${scripts_dir}/
@@ -156,7 +156,7 @@ sbatch \
     --job-name=<jobname> \
     --time=<time_limit> \
     <scripts_dir>/compile.slurm \
-    <container_image> <mount_dir> <scripts_dir> <repo_dir>
+    <container_image> <user_root_dir> <scripts_dir> <repo_dir>
 ```
 
 Capture and report the job ID from the `sbatch` output.
@@ -204,7 +204,7 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 
 | Flag | Description |
 |------|-------------|
-| `-a "100-real"` | Target architecture — `100` for Blackwell, `90` for Hopper, etc. |
+| `-a "100"` | Target architecture — `100` for B200/GB200, `103` for B300/GB300, `90` for Hopper, etc. |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--no-venv` | Skip virtual environment creation |
 | `--use_ccache` | Use ccache to speed up recompilation |
@@ -213,11 +213,12 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 | `-c` | Clean build — wipe build directory before building |
 
 Common architecture values:
-- `"100-real"` — Blackwell (B200, GB200)
-- `"90-real"` — Hopper (H100, H200)
-- `"89-real"` — Ada Lovelace (L40S)
-- `"80-real"` — Ampere (A100)
-- `"90;100-real"` — Multiple architectures
+- `"103"` — Blackwell Ultra (B300, GB300)
+- `"100"` — Blackwell (B200, GB200)
+- `"90"` — Hopper (H100, H200)
+- `"89"` — Ada Lovelace (L40S)
+- `"80"` — Ampere (A100)
+- `"90;100"` — Multiple architectures
 
 ## Troubleshooting
 
@@ -241,7 +242,7 @@ Common architecture values:
 **Agent actions**:
 1. Ask for container image path, repo path, mount dir (if not known)
 2. Confirm partition/account for OCI cluster
-3. Copy scripts to accessible location under mount_dir
+3. Copy scripts to accessible location under user_root_dir
 4. Submit with `sbatch`
 5. Report job ID
 6. Monitor with `squeue` until complete

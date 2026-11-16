@@ -17,11 +17,12 @@
 # whatever checkpoint is passed via --model_path). Shared by offline
 # examples (--visual_gen_args) and trtllm-serve.
 attention_config:
-  backend: VANILLA
+  backend: FA4
 parallel_config:
   cfg_size: 2
   ulysses_size: 2
   async_ulysses: true
+  parallel_vae_size: 4
 torch_compile_config:
   enable: true
 cuda_graph_config:

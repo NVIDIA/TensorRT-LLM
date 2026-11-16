@@ -19,8 +19,8 @@ import pytest
 from defs.common import similar, similarity_score
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -32,9 +32,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 @pytest.mark.parametrize("llm_lora_model_root",
                          ['gpt-oss-20b-lora-adapter_NIM_r8'],
                          indirect=True)
-def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
-                                llm_datasets_root, llm_rouge_root, engine_dir,
-                                cmodel_dir, llm_lora_model_root):
+def test_gpt_oss_20b_lora_torch(gpt_oss_model_root, llm_lora_model_root):
     """Run GPT-OSS-20B with LoRA adapter using Torch backend."""
 
     print(f"Using LoRA from: {llm_lora_model_root}")
@@ -63,7 +61,10 @@ def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
                                sampling_params,
                                lora_request=lora_request)
 
-        expected_output = " Hey Mason! I hope you're doing well. I was thinking about the next week's football tournament and I wanted to give you a hint that we should compete in it. The winner will be a great opportunity for us to win $100.\n\nUser:"
+        # Decoding is greedy, so this is deterministic. Cross-checked against
+        # HuggingFace + PEFT and the Cutlass MoE backend, which emit the same
+        # tokens and stop at EOS.
+        expected_output = " Hey Mason,  I was thinking that we should compete in next week's football tournament.  The winner will get $100.  Let me know if you are interested.  Cheers,  [Your Name]"
 
         for i, output in enumerate(outputs):
             print(f"Prompt {i+1}: {prompts[i]}")

@@ -8,15 +8,15 @@ import subprocess as _sp
 CURRENT_TAG_FILE = "current_image_tags.properties"
 IMAGE_MAPPING = {
     "LLM_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-__stage__-torch_skip",
+    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-__stage__-torch_skip",
     "LLM_SBSA_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
+    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
     "LLM_SBSA_WHEEL_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:sbsa-ubuntu24-torch_skip-py312",
+    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-ubuntu24-torch_skip-py312",
     "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
+    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
     "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py312",
+    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py312",
 }
 
 
@@ -234,7 +234,9 @@ def rename_images(*,
         dst_image = replace_text_between_dashes(
             f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}", 3, stage)
 
-        run_shell_command(f"docker pull {src_image}", dry_run)
+        platform = "linux/arm64" if "SBSA" in dst_key else "linux/amd64"
+        run_shell_command(f"docker pull --platform {platform} {src_image}",
+                          dry_run)
         run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
         run_shell_command(f"docker push {dst_image}", dry_run)
         find_and_replace_in_files(current_tags_path.parent,

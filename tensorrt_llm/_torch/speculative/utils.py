@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import os
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -10,32 +12,288 @@ import torch
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
+                                       match_nemotron_h_layer_types)
 from ..pyexecutor.sampler import TorchSampler
-from ..pyexecutor.seq_slot_manager import SeqSlotManager
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
-from .draft_target import (DraftTargetOneModelSampler,
-                           DraftTargetOneModelSpecMetadata,
+from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .dspark import DSparkSpecMetadata, DSparkWorker
+from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
-                     Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
-                     Eagle3OneModelWorker, Eagle3ResourceManager,
-                     Eagle3SpecMetadata, MTPEagleWorker)
+                     Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
+                     Eagle3ResourceManager, MTPEagleWorker)
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
-from .model_drafter import ModelDrafter
-from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
+from .mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
                                MTPEagleDynamicTreeWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
-from .sa_worker import SASampler, SASpecMetadata, SAWorker
+from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
+from .spec_sampler_base import SpecSampler
 from .suffix_automaton import SuffixAutomatonManager
+
+_GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+)
+
+# MTP structure fields copied from a separate MTP-head checkpoint onto the
+# target pretrained config when ``speculative_model`` is set.
+# Prefer writable HF fields: NemotronHConfig exposes mtp_hybrid_override_pattern
+# as a read-only property derived from mtp_layers_block_type.
+_MTP_STRUCTURE_FIELDS_FROM_DRAFT = (
+    "num_nextn_predict_layers",
+    "mtp_layers_block_type",
+    "mtp_block_configs",
+)
+
+_MTP_PATTERN_TO_LAYER = {
+    "M": "mamba",
+    "E": "moe",
+    "*": "attention",
+    "-": "mlp",
+}
+
+
+def _set_pretrained_config_attr(model_config,
+                                name: str,
+                                value,
+                                *,
+                                required: bool = True) -> bool:
+    """Set a config field, tolerating read-only properties / strict dataclasses.
+
+    Each write is verified by reading the value back: a class-level property
+    shadows ``__dict__``, so writing through ``vars()`` can appear to succeed
+    while the config keeps reporting its old value. When ``required`` is False,
+    failures are logged and ignored (used for optional fields like
+    ``mtp_block_configs``).
+    """
+    writes = (
+        lambda: setattr(model_config, name, value),
+        lambda: vars(model_config).__setitem__(name, value),
+    )
+    for write in writes:
+        try:
+            write()
+        except (TypeError, AttributeError):
+            continue
+        if getattr(model_config, name, None) == value:
+            return True
+
+    message = (f"Unable to set MTP config field '{name}' on "
+               f"{type(model_config).__name__}")
+    if required:
+        raise AttributeError(message)
+    logger.warning("%s; keeping the target checkpoint's value.", message)
+    return False
+
+
+def _pattern_to_mtp_layers_block_type(pattern: str) -> list:
+    try:
+        return [_MTP_PATTERN_TO_LAYER[char] for char in pattern]
+    except KeyError as exc:
+        raise ValueError(
+            f"Invalid mtp_hybrid_override_pattern {pattern!r}: "
+            f"expected characters in {sorted(_MTP_PATTERN_TO_LAYER)}") from exc
+
+
+def _is_mtp_checkpoint_weight_key(key: str) -> bool:
+    """Return True for checkpoint keys that belong to MTP heads."""
+    return key.startswith("mtp.") or key.startswith("mtp/")
+
+
+def filter_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Drop ``mtp.*`` keys so embedded MTP heads do not override a separate MTP checkpoint."""
+    return {
+        k: v
+        for k, v in weights.items() if not _is_mtp_checkpoint_weight_key(k)
+    }
+
+
+def select_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Keep only ``mtp.*`` keys from a (possibly full) checkpoint dict.
+
+    Separate MTP-head checkpoints may still ship unrelated tensors (or a full
+    target copy). Loading those into the one-engine model would overwrite the
+    already-loaded target backbone and corrupt generation.
+    """
+    return {
+        k: v
+        for k, v in weights.items() if _is_mtp_checkpoint_weight_key(k)
+    }
+
+
+def remap_preprocessed_mtp_weights_for_draft_model(
+    weights: dict,
+    num_hidden_layers: int,
+    num_mtp_layers: int,
+) -> dict:
+    """Map ``model.layers.{{N[+h]}}.*`` keys onto ``mtp_layers.{{h}}.*``.
+
+    Nemotron preprocess rewrites ``mtp.layers.*`` onto the target module path
+    ``model.layers.{{num_hidden_layers}}.*``. For a strict draft-only load we
+    re-home those keys under ``draft_model.mtp_layers``.
+    """
+    remapped: dict = {}
+    unused: list[str] = []
+    for key, value in weights.items():
+        matched = False
+        for head_idx in range(num_mtp_layers):
+            prefix = f"model.layers.{num_hidden_layers + head_idx}."
+            if key.startswith(prefix):
+                remapped[f"mtp_layers.{head_idx}.{key[len(prefix):]}"] = value
+                matched = True
+                break
+        if not matched:
+            unused.append(key)
+    if unused:
+        sample = ", ".join(unused[:8])
+        more = "" if len(unused) <= 8 else f" (+{len(unused) - 8} more)"
+        raise ValueError(
+            "After MTP preprocess, expected keys under "
+            f"'model.layers.{{{num_hidden_layers}+h}}.*' for "
+            f"h in [0, {num_mtp_layers}), but found unmatched keys: "
+            f"{sample}{more}")
+    return remapped
+
+
+def skip_modules_for_separate_mtp_checkpoint(weights: dict) -> list[str]:
+    """Modules to skip when loading a separate MTP checkpoint into draft_model.
+
+    ``shared_head`` is optional across MTP architectures:
+    - Nemotron ``mtp.*`` checkpoints omit it (final_layernorm on the last
+      sublayer is the trained norm; ``shared_head`` only wraps ``lm_head``).
+    - DeepSeek / Qwen / Exaone / Step3 ship ``shared_head.norm`` (and Step3
+      also ships a dedicated ``shared_head.output``).
+
+    Skip only when the remapped weight dict has no ``shared_head`` keys so
+    strict loading stays architecture-agnostic.
+    """
+    skip: list[str] = []
+    if not any("shared_head" in key for key in weights):
+        skip.append("shared_head")
+    return skip
+
+
+def uses_mtp_head_checkpoint(spec_config) -> bool:
+    """True when `speculative_model` contains replacement MTP heads."""
+    if spec_config is None:
+        return False
+    return spec_config.uses_replacement_heads
+
+
+def _refers_to_same_checkpoint(lhs, rhs) -> bool:
+    """True when two model references point at the same checkpoint."""
+    if lhs is None or rhs is None:
+        return False
+    if str(lhs) == str(rhs):
+        return True
+    try:
+        return os.path.samefile(str(lhs), str(rhs))
+    except OSError:
+        # At least one side is not an existing local directory (e.g. a Hub
+        # model id), so string equality above was the only comparison.
+        return False
+
+
+def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
+    """Keep one-model MTP on the target checkpoint when both paths match.
+
+    Before separate MTP checkpoints were supported, ``speculative_model`` was
+    ignored for one-model MTP and the heads always came from the target
+    weights. Configs that point ``speculative_model`` at the target checkpoint
+    keep that behavior instead of switching to the separate-heads load path,
+    which the target checkpoint's key layout may not even satisfy.
+    """
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return
+    if spec_config.speculative_model is None:
+        return
+    if not _refers_to_same_checkpoint(spec_config.speculative_model,
+                                      checkpoint_dir):
+        return
+    if (spec_config._mtp_draft_checkpoint_type
+            != _MTPDraftCheckpointType.TARGET):
+        logger.info(
+            "speculative_model points at the target checkpoint "
+            f"({checkpoint_dir}); loading MTP heads from the target weights.")
+        spec_config._mtp_draft_checkpoint_type = _MTPDraftCheckpointType.TARGET
+
+
+def _load_speculative_model_config_dict(spec_config) -> Optional[dict]:
+    """Read ``config.json`` from ``spec_config.speculative_model``, if present."""
+    draft_dir = getattr(spec_config, "speculative_model", None)
+    if not draft_dir:
+        return None
+    try:
+        cfg_path = os.path.join(str(draft_dir), "config.json")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning(
+            f"Unable to read speculative_model config from {draft_dir}: {exc}")
+        return None
+
+
+def _merge_mtp_fields_from_speculative_model(spec_config,
+                                             model_config) -> Optional[int]:
+    """Overlay MTP structure fields from ``speculative_model`` onto ``model_config``.
+
+    Returns the MTP layer count from the draft checkpoint when available.
+    """
+    draft_cfg = _load_speculative_model_config_dict(spec_config)
+    if not draft_cfg:
+        return None
+
+    draft_nextn = draft_cfg.get("num_nextn_predict_layers")
+    if draft_nextn is None:
+        draft_nextn = draft_cfg.get("mtp_num_hidden_layers")
+
+    for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
+        if field in draft_cfg and draft_cfg[field] is not None:
+            value = draft_cfg[field]
+            if field == "mtp_layers_block_type":
+                # draft_cfg is the draft checkpoint's config.json, read raw, so
+                # it may use the transformers 5.13 spelling.
+                value = match_nemotron_h_layer_types(model_config, value)
+            _set_pretrained_config_attr(
+                model_config,
+                field,
+                value,
+                required=(field != "mtp_block_configs"),
+            )
+
+    # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
+    # derived from mtp_layers_block_type. Expand the pattern when the draft
+    # checkpoint provides only the packed string form.
+    if (draft_cfg.get("mtp_layers_block_type") is None
+            and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
+        _set_pretrained_config_attr(
+            model_config,
+            "mtp_layers_block_type",
+            match_nemotron_h_layer_types(
+                model_config,
+                _pattern_to_mtp_layers_block_type(
+                    draft_cfg["mtp_hybrid_override_pattern"])),
+        )
+
+    if draft_nextn is not None:
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers",
+                                    draft_nextn)
+        return int(draft_nextn)
+    return None
 
 
 def _is_effective_dynamic_tree(spec_config) -> bool:
@@ -81,15 +339,45 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      temperature_only_graphs=False,
+                      watermark_config=None):
+    metadata = _build_spec_metadata(spec_config,
+                                    model_config,
+                                    max_num_requests,
+                                    max_num_tokens,
+                                    spec_resource_manager=spec_resource_manager,
+                                    max_seq_len=max_seq_len)
+    # Set here rather than in each branch below: every one-model mode needs it and
+    # the per-mode constructors are easy to miss one of.
+    if metadata is not None:
+        metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+        # advanced_sampling_mode has exactly that property, and getting it wrong fails
+        # silently rather than loudly: SpecSampler.validate_request reads the mode off the
+        # *config* to decide whether a min_p request is admitted, while the buffer fill
+        # (fill_min_p) and the sampling dispatcher read it off the *metadata*. If the two
+        # disagree the request is accepted, its buffers are never filled, and the
+        # dispatcher routes to a backend that takes no min_p argument -- so the filter is
+        # dropped with nothing raised. One assignment here keeps them in step.
+        metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        if num_seq_slots is not None:
+            metadata.num_seq_slots = num_seq_slots
+        metadata.temperature_only_graphs = temperature_only_graphs
+        if watermark_config is not None:
+            metadata.watermark = WatermarkSpecState(watermark_config,
+                                                    max_seq_len=max_seq_len)
+    return metadata
+
+
+def _build_spec_metadata(spec_config,
+                         model_config,
+                         max_num_requests,
+                         max_num_tokens,
+                         spec_resource_manager=None,
+                         max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
-    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
-    # DeepSeek-V4 overlap can exceed max_num_requests.
-    num_seq_slots = (num_seq_slots
-                     if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)
     # Draft-model vocab size, used to gate the d2t-expanded full_draft_probs
     # buffer allocation (see SpecMetadata.prepare_rejection_sampling_buffers).
@@ -112,7 +400,6 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
-            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
@@ -129,41 +416,6 @@ def get_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_mtp_eagle():
-        return Eagle3SpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
-            layers_to_capture=None,
-            is_mtp_eagle=True,
-        )
-    if spec_config.spec_dec_mode.is_eagle3():
-        effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)
-        return Eagle3SpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
-            layers_to_capture=spec_config.eagle3_layers_to_capture,
-            is_mtp_eagle=False,
-            eagle_choices=spec_config.eagle_choices,
-            is_spec_dec_tree=spec_config.eagle_choices is not None
-            or effective_dynamic_tree,
-            is_spec_dec_dynamic_tree=effective_dynamic_tree,
-        )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -179,7 +431,6 @@ def get_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
-            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -192,7 +443,13 @@ def get_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_dflash():
+    # A standalone DSpark drafter is drafted by DFlashWorker, so it needs the
+    # DFlash metadata (paged draft KV, DFlash capture buffer). Only the
+    # embedded DeepSeek-V4-Pro draft uses DSparkSpecMetadata and its rolling
+    # window. See DSparkDecodingConfig.draft_is_embedded_in_target.
+    if spec_config.spec_dec_mode.is_dflash() or (
+            spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
         return DFlashSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -209,6 +466,11 @@ def get_spec_metadata(spec_config,
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
+        if not target_layer_ids:
+            raise ValueError(
+                "Embedded DSpark requires nonempty target_layer_ids before "
+                "creating capture metadata. Resolve dspark_target_layer_ids "
+                "from the checkpoint's text_config for multimodal models.")
         return DSparkSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -255,9 +517,8 @@ def get_spec_metadata(spec_config,
             sa_manager=spec_resource_manager,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
         )
-    if  spec_config.spec_dec_mode.is_draft_target() or \
-        spec_config.spec_dec_mode.is_ngram() or \
-        spec_config.spec_dec_mode.is_user_provided():
+    if spec_config.spec_dec_mode.is_ngram(
+    ) or spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -269,15 +530,25 @@ def get_spec_metadata(spec_config,
 
 def get_mtp_hidden_size(model_config) -> int:
     pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    if getattr(pretrained_config, "model_type", None) == "qwen4_exp":
+        pretrained_config = pretrained_config.text_config
     hidden_size = getattr(pretrained_config, "hidden_size", None)
     if hidden_size is None:
         hidden_size = getattr(model_config, "hidden_size")
-    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
+    model_type = getattr(pretrained_config, "model_type", None)
+    if model_type == "deepseek_v4":
         return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    if model_type == "qwen4_exp_text":
+        return hidden_size * getattr(pretrained_config, "hc_count", 1)
     return hidden_size
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
+def seat_pool_or_none(model_engine) -> Optional[int]:
+    """The engine's sequence-slot pool size, or None if it publishes none."""
+    return getattr(model_engine, "max_num_seq_slots", None)
+
+
+def get_spec_resource_manager(model_engine):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -285,21 +556,25 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_requests = model_engine.batch_size
     max_seq_len = model_engine.max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+    num_seq_slots = seat_pool_or_none(model_engine)
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
         if getattr(spec_config, 'use_dynamic_tree', False):
             return MTPEagleDynamicTreeResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
                 sa_manager=sa_manager,
+                num_seq_slots=num_seq_slots,
             )
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             # Unified resource manager: the unified worker reads
@@ -313,6 +588,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
                 max_seq_len,
                 max_num_tokens,
                 sa_manager=sa_manager,
+                num_seq_slots=num_seq_slots,
             )
         else:
             return None
@@ -320,25 +596,30 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
             get_mtp_hidden_size(model_config),
             max_num_requests,
             sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
             spec_config):
-        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
-                                                        max_num_requests)
+        return Eagle3OneModelDynamicTreeResourceManager(
+            spec_config, max_num_requests, num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return Eagle3ResourceManager(
             spec_config,
             model_config.torch_dtype,
@@ -347,16 +628,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_seq_len,
             max_num_tokens,
             sa_manager=sa_manager,
-        )
-    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
-        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
-        return Eagle3ResourceManager(
-            spec_config,
-            draft_model_engine.model.config.torch_dtype,
-            model_config.hidden_size,
-            max_num_requests,
-            max_seq_len,
-            max_num_tokens,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(
@@ -369,15 +641,60 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_parallel_draft():
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
+            return SuffixAutomatonManager(sa_cfg,
+                                          max_num_requests,
+                                          max_seq_len,
+                                          num_seq_slots=num_seq_slots)
         return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_sa():
-        return SuffixAutomatonManager(spec_config, max_num_requests,
-                                      max_seq_len)
+        return SuffixAutomatonManager(spec_config,
+                                      max_num_requests,
+                                      max_seq_len,
+                                      num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
+    return None
+
+
+def _watermark_unsupported_reason(spec_config,
+                                  watermark_config=None) -> Optional[str]:
+    """Why text watermarking cannot be served by this one-model configuration, or None.
+
+    With exact-match verification the watermark relies on the target's own sample at every
+    verified position, committed in order. Tree rows follow root paths and relaxed
+    acceptance commits non-matching tokens, so neither is supported. Rejection sampling
+    accepts drafts that the target did not sample: it needs either dual-key watermarking
+    (the drafts are drawn under one key, the token after the accepted prefix under a second
+    one) or the explicit opt-in to leave accepted drafts unmarked.
+    """
+    if _is_effective_dynamic_tree(spec_config):
+        return (
+            "Text watermarking is not supported with tree (dynamic tree) speculative "
+            "decoding. Use a linear speculation mode or disable speculative decoding."
+        )
+    if (getattr(spec_config, "use_rejection_sampling", False)
+            and watermark_config is not None):
+        dual_key = watermark_config.algorithm == "gumbel_dual_key"
+        if not dual_key and not watermark_config.allow_target_only_watermarking:
+            return (
+                "Text watermarking with use_rejection_sampling needs "
+                "watermark_config.algorithm='gumbel_dual_key', or "
+                "allow_target_only_watermarking=True to leave accepted draft tokens "
+                "unmarked (the signal weakens with the acceptance rate). Alternatively "
+                "disable use_rejection_sampling to keep exact-match verification."
+            )
+        if dual_key and spec_config.spec_dec_mode.is_parallel_draft():
+            return (
+                "watermark_config.algorithm='gumbel_dual_key' is not supported "
+                "with parallel-draft speculation. Use an autoregressive drafter "
+                "(Eagle3, MTP, DraftTarget) or allow_target_only_watermarking=True."
+            )
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return (
+            "Text watermarking is not supported with relaxed acceptance for thinking. "
+            "Disable use_relaxed_acceptance_for_thinking.")
     return None
 
 
@@ -385,55 +702,38 @@ def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
 ):
-    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
-        # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
-        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_mtp_vanilla():
-        nextn = spec_config.max_draft_len
-        if getattr(spec_config, "use_dynamic_tree", False):
-            nextn = spec_config.max_total_draft_tokens
-        return MTPSampler(sampler_args, nextn=nextn)
-    if spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
-        # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
-        return TorchSampler(sampler_args)
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_parallel_draft():
-        return MTPSampler(sampler_args,
-                          nextn=spec_config.tokens_per_gen_step - 1)
-    if spec_config.spec_dec_mode.is_sa():
-        return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
-    if spec_config.spec_dec_mode.is_draft_target_one_model():
-        return DraftTargetOneModelSampler(sampler_args)
+    spec_dec_mode = spec_config.spec_dec_mode
+    if spec_dec_mode.use_one_engine():
+        # One sampler for every one-model mode (use_one_engine covers MTP,
+        # MTP Eagle, Eagle3, PARD/DFlash/DSpark, DraftTarget and SA): it only
+        # moves the worker's pre-sampled output around, and its buffer shapes
+        # derive from sampler_args alone.
+        #
+        # Occurrence penalties assume the linear row layout: one logits row per
+        # speculative position, so a position's prefix is the positions before it.
+        # A tree's rows are nodes whose prefix is their root path instead, and
+        # sibling branches must not penalize each other -- so tree modes are not
+        # supported yet and are rejected at admission rather than mispenalized.
+        penalty_supported = not _is_effective_dynamic_tree(spec_config)
+        fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
+        return SpecSampler(
+            sampler_args,
+            enable_penalty=spec_config.enable_penalty,
+            penalty_supported=penalty_supported,
+            fused_sampling=fused_sampling,
+            watermark_unsupported_reason=_watermark_unsupported_reason(
+                spec_config, sampler_args.watermark_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine,
-                     draft_model_engine,
-                     sampler,
-                     spec_resource_manager,
-                     guided_decoder: Optional[GuidedDecoder] = None):
+def get_spec_drafter(model_engine, spec_resource_manager):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
 
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
-
-    max_num_requests = model_engine.batch_size
-    if spec_config.spec_dec_mode.is_draft_target(
-    ) or spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
-        return ModelDrafter(spec_config,
-                            draft_model_engine,
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1,
-                            SeqSlotManager(max_num_requests),
-                            sampler,
-                            spec_resource_manager=spec_resource_manager,
-                            guided_decoder=guided_decoder)
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
@@ -442,6 +742,8 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
+    if getattr(spec_config, "_use_shared_kv_cache", False):
+        return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -472,7 +774,14 @@ def update_spec_config_from_draft_model_config(spec_config,
 def get_spec_worker(spec_config,
                     model_config,
                     mapping,
-                    use_separate_draft_kv_cache: bool = False):
+                    use_separate_draft_kv_cache: bool = False,
+                    key_exchange=None,
+                    spec_decode_fast_paths: bool = False):
+    """The one-engine worker of spec_config. key_exchange: the TP key
+    exchange (ll_exchange.TPKeyExchange) the linear Eagle3 / MTP-Eagle
+    worker samples vocabulary-sharded logits with, or None.
+    spec_decode_fast_paths: the model takes the one-engine speculative fast
+    paths (SpecDecOneEngineForCausalLM.spec_decode_fast_paths)."""
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config,
@@ -488,7 +797,9 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config,
                               model_config,
                               use_separate_draft_kv_cache,
-                              mapping=mapping)
+                              mapping=mapping,
+                              key_exchange=key_exchange,
+                              spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
@@ -496,12 +807,23 @@ def get_spec_worker(spec_config,
         return Eagle3OneModelWorker(
             spec_config,
             mapping=mapping,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            key_exchange=key_exchange,
+            spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    # DSpark splits by deployment form, mirroring the draft-model side. The
+    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
+    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
+    # forward_batched). A standalone drafter is DFlash lineage and is served by
+    # DSparkWorker, which adds only the Markov bias and the shift_label
+    # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
+        if spec_config.draft_is_embedded_in_target:
+            return DSv4DSparkWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
@@ -518,15 +840,34 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
+    if getattr(spec_config, "_use_shared_kv_cache", False):
+        return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
 
 
+def get_draft_block_width(spec_config, *, shift_label: bool = True) -> int:
+    """Block width the worker drafting for ``spec_config`` appends per request.
+
+    0 when that worker does not append a block to a paged draft KV cache.
+    ``shift_label`` selects the checkpoint's slot convention for standalone DSpark.
+    """
+    if spec_config is None:
+        return 0
+    if spec_config.spec_dec_mode.is_dflash():
+        return DFlashWorker.block_width_for(spec_config)
+    if (spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
+        return DSparkWorker.block_width_for(spec_config,
+                                            shift_label=shift_label)
+    return 0
+
+
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+    Return the one-model draft cache manager, including a shared draft KV view
+    when the target manager owns the draft cache storage.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -534,14 +875,68 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
+    draft = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft is not None:
+        return draft
+    target = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    get_view = getattr(target, "get_draft_kv_cache_view", None)
+    view = get_view() if get_view is not None else None
+    # A unified manager's request resources are already handled through target.
+    return None if view is target else view
 
 
-def update_spec_config_from_model_config(spec_config, model_config):
-    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+def update_spec_config_from_model_config(spec_config,
+                                         model_config,
+                                         target_model_cls=None):
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
     if not isinstance(spec_config, MTPDecodingConfig):
         return
+
+    architectures = getattr(model_config, "architectures", None) or ()
+    if (architectures
+            and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
+        spec_config._use_shared_kv_cache = (
+            spec_config.spec_dec_mode.is_mtp_eagle_one_model())
+    if is_glm5_next(model_config):
+        # The glm_kpool slot tables live in the recurrent metadata and are not
+        # switched by draft_kv_cache_context. Keep the MTP layers in the
+        # target KV cache manager so that one table is valid for both target
+        # and draft layers.
+        spec_config._allow_separate_draft_kv_cache = False
+
+    # The target implementation owns the contract for its MTP drafter. Some one-model MTP
+    # implementations construct `MTPForCausalLM` from the target config, and optionally load a
+    # head replacement checkpoint (e.g. NemotronH).
+    # Other implementations advertise an external assistant architecture, which must be
+    # constructed from the assistant's own config.
+    checkpoint_type = spec_config._mtp_draft_checkpoint_type
+    if spec_config.speculative_model is None:
+        checkpoint_type = _MTPDraftCheckpointType.TARGET
+    elif checkpoint_type != _MTPDraftCheckpointType.TARGET:
+        if target_model_cls is not None:
+            checkpoint_type = (
+                _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL if getattr(
+                    target_model_cls, "build_mtp_draft_model_from_config",
+                    False) else _MTPDraftCheckpointType.HEAD_REPLACEMENT)
+        elif checkpoint_type == _MTPDraftCheckpointType.UNRESOLVED:
+            checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
+    spec_config._mtp_draft_checkpoint_type = checkpoint_type
+
+    language_config = getattr(model_config, "llm_config", None)
+    if language_config is not None and is_nemotron_hybrid(language_config):
+        model_config = language_config
+
+    # When MTP heads live in a separate checkpoint, prefer that checkpoint's
+    # layer count / pattern over the target model's (which may have no MTP or
+    # an older embedded MTP head that will be overridden at weight load).
+    draft_nextn = None
+    if uses_mtp_head_checkpoint(spec_config):
+        draft_nextn = _merge_mtp_fields_from_speculative_model(
+            spec_config, model_config)
+
     # Read the MTP layer count from the model's pretrained config. This
     # determines the actual MTP layer count in the checkpoint and drives the
     # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
@@ -549,13 +944,25 @@ def update_spec_config_from_model_config(spec_config, model_config):
     # `num_nextn_predict_layers`, while Qwen3Next-style configs (including
     # Qwen3.5) use `mtp_num_hidden_layers`. Fall back to a single shared MTP /
     # EAGLE layer when neither field is present.
-    num_nextn_predict_layers = getattr(model_config, "num_nextn_predict_layers",
-                                       None)
-    if num_nextn_predict_layers is None:
+    if draft_nextn is not None:
+        num_nextn_predict_layers = draft_nextn
+    else:
         num_nextn_predict_layers = getattr(model_config,
-                                           "mtp_num_hidden_layers", None)
-    if num_nextn_predict_layers is None:
+                                           "num_nextn_predict_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = getattr(model_config,
+                                               "mtp_num_hidden_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = 1
+    if (draft_nextn is None and num_nextn_predict_layers == 0
+            and spec_config.uses_replacement_heads):
+        # A target without embedded MTP does not declare the replacement's count.
+        # Resolve the shared head before selecting the mode and draft length.
         num_nextn_predict_layers = 1
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers", 1)
+    if spec_config.uses_replacement_heads and num_nextn_predict_layers <= 0:
+        raise ValueError(
+            "A replacement MTP checkpoint must contain at least one head")
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
@@ -607,7 +1014,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     """
     Get the appropriate draft length for the given batch size using binary search.
 
-    This is a standalone function that can be used by both the drafter (two-model path)
+    This is a standalone function that can be used by both drafters (e.g. NGram)
     and the model engine / spec workers (one-model path).
 
     New semantics: Keys represent specific batch sizes (transition points).
@@ -642,3 +1049,95 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
 
     # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
     return 0
+
+
+def get_static_draft_len(spec_config: Optional["DecodingBaseConfig"]) -> int:
+    """Return logical K for linear modes or total tree tokens for tree modes.
+
+    This selects the static maximum without applying a batch-size schedule.
+    PARD's physical buffer width is derived separately.
+    """
+    if spec_config is None:
+        return 0
+    if spec_config.is_linear_tree:
+        return spec_config.max_draft_len
+    return spec_config.tokens_per_gen_step - 1
+
+
+def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
+                      scheduled_batch: "ScheduledRequests",
+                      *,
+                      max_draft_len: int,
+                      static_draft_len: int,
+                      draft_len: Optional[int] = None,
+                      speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
+
+    Dynamic and explicit lengths pad or truncate generation-request buffers to
+    a uniform width, as required by CUDA graph replay and the attention kernel.
+    Static decoding preserves the drafter's proposals instead.
+    """
+    if speculation_permanently_disabled:
+        for request in scheduled_batch.generation_requests:
+            request.py_draft_tokens = []
+        return 0
+
+    if draft_len is None:
+        if (spec_config is not None
+                and spec_config.draft_len_schedule is not None
+                and spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            draft_len = get_draft_len_for_batch_size(
+                spec_config.draft_len_schedule, scheduled_batch.batch_size,
+                max_draft_len)
+        else:
+            # Static decoding preserves the proposals produced by the drafter,
+            # including requests intentionally entering with no draft tokens.
+            return static_draft_len
+
+    draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
+    rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+    for request in scheduled_batch.generation_requests:
+        current_num_draft_tokens = len(request.py_draft_tokens)
+        # A generation request without a prior proposal has no draft-probability
+        # scatter. Preserve that fact before padding so input preparation can
+        # populate the one-hot placeholder instead of reading a stale row.
+        request.py_needs_onehot_draft_probs |= (rejection_on and
+                                                current_num_draft_tokens == 0)
+        if spec_config is not None and spec_config.spec_dec_mode.is_pard():
+            # PARD carries K proposals followed by K-1 placeholders.
+            buffer_width = spec_config.get_runtime_tokens_per_gen_step(
+                draft_len) - 1
+            current_draft_len = ((current_num_draft_tokens + 1) //
+                                 2 if current_num_draft_tokens > 0 else 0)
+            draft_tokens = request.py_draft_tokens[:min(current_draft_len,
+                                                        draft_len)]
+            draft_tokens.extend([draft_buffer_pad] *
+                                (draft_len - len(draft_tokens)))
+            request.py_draft_tokens = draft_tokens + [draft_buffer_pad] * (
+                buffer_width - len(draft_tokens))
+        elif current_num_draft_tokens < draft_len:
+            request.py_draft_tokens.extend(
+                [draft_buffer_pad] * (draft_len - current_num_draft_tokens))
+        elif current_num_draft_tokens > draft_len:
+            request.py_draft_tokens = request.py_draft_tokens[:draft_len]
+
+    return draft_len
+
+
+def update_draft_len(model_engine: "ModelEngine",
+                     scheduled_batch: "ScheduledRequests",
+                     *,
+                     draft_len: Optional[int] = None,
+                     speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
+
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length.
+    """
+    return resolve_draft_len(
+        model_engine.spec_config,
+        scheduled_batch,
+        max_draft_len=model_engine.max_draft_len,
+        static_draft_len=get_static_draft_len(model_engine.spec_config),
+        draft_len=draft_len,
+        speculation_permanently_disabled=speculation_permanently_disabled)

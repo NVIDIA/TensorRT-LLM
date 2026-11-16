@@ -585,6 +585,7 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
     pre-quantized FP8 checkpoints are properly excluded from quantization.
     """
 
+    @pytest.mark.cpu_only
     def test_remap_qkv_fusion(self):
         """to_q/to_k/to_v should produce a qkv_proj entry."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
@@ -597,6 +598,7 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         remapped = LTXModel._remap_exclude_modules(exclude)
         self.assertIn("transformer_blocks.0.attn1.qkv_proj", remapped)
 
+    @pytest.mark.cpu_only
     def test_remap_ff(self):
         """ff.net.0.proj / ff.net.2 should produce up_proj / down_proj."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
@@ -609,6 +611,7 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         self.assertIn("transformer_blocks.0.ff.up_proj", remapped)
         self.assertIn("transformer_blocks.0.ff.down_proj", remapped)
 
+    @pytest.mark.cpu_only
     def test_remap_audio_ff(self):
         """audio_ff.net.* should produce audio_ff.up_proj / down_proj."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
@@ -621,6 +624,7 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         self.assertIn("transformer_blocks.0.audio_ff.up_proj", remapped)
         self.assertIn("transformer_blocks.0.audio_ff.down_proj", remapped)
 
+    @pytest.mark.cpu_only
     def test_remap_preserves_originals(self):
         """Original entries (to_out.0, to_q for cross-attn) must survive."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel

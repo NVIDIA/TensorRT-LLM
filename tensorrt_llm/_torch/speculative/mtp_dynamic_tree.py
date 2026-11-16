@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed.ops import allgather
@@ -80,6 +80,14 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # spec_tree_manager is lazily bound from the resource manager.
         self.spec_tree_manager = None
         self._d2t = None
+
+        # (all_rank_num_tokens, force_prepare_spec_dec_tree_mask) snapshot taken by
+        # _forward_impl before mutating attn_metadata; None means "not saved / already
+        # restored" (all_rank_num_tokens is legitimately None outside ADP, so we can't
+        # use it directly as a sentinel). Restored by _ensure_spec_dec_state_restored
+        # on the failure path so a tolerated forward exception does not leak state
+        # into subsequent iterations.
+        self._saved_extra_state = None
 
         # Pre-allocated draft-loop buffers (CUDA-graph safe).
         self.draft_tokens_buffer = torch.zeros(
@@ -165,9 +173,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._mask_repack_buf = torch.zeros(
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
@@ -187,10 +195,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
-            self._saved_position_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
+            self._saved_spec_decoding_query_len = attn_metadata.spec_decoding_query_len
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
                 :batch_size
@@ -217,9 +225,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_position_offsets_cpp
+            attn_metadata.spec_decoding_query_len = self._saved_spec_decoding_query_len
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
@@ -227,13 +235,27 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             )
             self._saved_generation_lengths = None
 
+    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        # Base cleanup handles the has_spec_dec_saved_state path. Undo the
+        # dynamic-tree-only mutations (all_rank_num_tokens,
+        # force_prepare_spec_dec_tree_mask) so a tolerated forward failure
+        # does not leak the pre-draft-loop state into later iterations.
+        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+        if attn_metadata is None or self._saved_extra_state is None:
+            return
+        (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        ) = self._saved_extra_state
+        self._saved_extra_state = None
+
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
-        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
+        """Set the current speculative query lengths and position-offset layout."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.spec_decoding_query_len = query_len
 
     def _refresh_blackwell_tree_mask_metadata(self, attn_metadata):
         if not getattr(attn_metadata, "use_spec_decoding", False):
@@ -624,7 +646,11 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_num_heads,
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
+            # Dynamic-tree MTP currently supports full-attention KV layers.
+            # Hybrid managers may store a recurrent-state sentinel first,
+            # while V2 represents full attention as None, so neither form is
+            # suitable for the integer maxKVCacheLen operator argument.
+            cache_mgr.max_seq_len,
             pool_pointers,
             block_offsets,
             cache_mgr.max_blocks_per_seq,
@@ -681,9 +707,13 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 accepted_leaf_positions=accepted_leaf_positions,
             )
 
-        # Save attn/spec metadata before the draft loop mutates it.
-        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        original_force_prepare_spec_dec_tree_mask = attn_metadata.force_prepare_spec_dec_tree_mask
+        # Save attn/spec metadata before the draft loop mutates it. Stashed on
+        # self so _ensure_spec_dec_state_restored can undo the mutation if the
+        # draft loop raises (see SpecWorkerBase.forward try/finally).
+        self._saved_extra_state = (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        )
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         attn_metadata.force_prepare_spec_dec_tree_mask = True
 
@@ -706,8 +736,11 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Restore attn metadata to support cuda graph.
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-        attn_metadata.force_prepare_spec_dec_tree_mask = original_force_prepare_spec_dec_tree_mask
+        (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        ) = self._saved_extra_state
+        self._saved_extra_state = None
         attn_metadata.use_spec_decoding = True
 
         # (d) Prepare next_new_tokens for overlap scheduler.
@@ -740,6 +773,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         hidden_states,
         accepted_tokens,
         attn_metadata,
+        spec_metadata,
     ):
         """Repack step-0 drafter inputs to accepted-path layout."""
         num_contexts = attn_metadata.num_contexts
@@ -749,7 +783,12 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Match MTPEagleWorker context input repack.
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, num_ctx_tokens, last_tokens_idx, accepted_tokens, num_contexts
+            input_ids,
+            num_ctx_tokens,
+            last_tokens_idx,
+            accepted_tokens,
+            num_contexts,
+            prompt_lookahead_tokens=spec_metadata.context_prompt_lookahead_tokens,
         )
 
         if num_gens > 0:
@@ -854,6 +893,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             hidden_states=hidden_states,
             accepted_tokens=accepted_tokens,
             attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
         )
 
         # Reset verify-time tree metadata to accepted-path width.
@@ -1062,21 +1102,26 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
         hidden_size: int,
         max_num_requests: int,
         sa_manager=None,
+        num_seq_slots: Optional[int] = None,
     ):
         from .spec_tree_manager import SpecTreeManager
 
         self.max_num_requests = max_num_requests
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=True,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=None,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            num_seq_slots=num_seq_slots,
         )
         # MTP hidden-state slot pools (needed by MTPEagleWorker drafter inputs).
         self._mtp_hidden_states_manager = MTPHiddenStatesManager(
-            config, dtype, hidden_size, max_num_requests, sa_manager=sa_manager
+            config,
+            dtype,
+            hidden_size,
+            max_num_requests,
+            sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
 
     # Expose the MTPHiddenStatesManager surface MTPSpecMetadata expects.

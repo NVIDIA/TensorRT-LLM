@@ -1,0 +1,50 @@
+schema_version: 1
+vendors:
+  flashinfer-kda-bt16:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    branch: main
+    commit: b8e81a7dae6c2aa5c9aa19c06e81e9a729271493
+    source: flashinfer/kda_kernels
+    destination: tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda
+    include:
+    - kda_chunked_bt16.py
+    - kda_chunked_bt16_small_bh.py
+    patch: 3rdparty/vendor_patches/flashinfer-kda-bt16.patch
+    patch_digest: sha256:77729d1f7c3d29682d232e6128be8b1bfcb548cdcf54dd16995685d620a6eeea
+    digest: sha256-tree-v1:b5e8540bfd32251213a13d0aec255124a75606eb78cd1a9de5256a0062c9a9a9
+  flashinfer-prims-ts:
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts-dev-20261107
+    commit: 911d6a9d62308b6c8a5249e8dc4aabc7518020f1
+    source: flashinfer/attention/prims_ts
+    destination: tensorrt_llm/_torch/attention/backends/prims_ts
+    include:
+    - '**/*.py'
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
+    patch_digest: sha256:5e19fc304c3152e940fa1a6b29b4e6a2ca10c0a73770f2648fbdda7576a8a73c
+    digest: sha256-tree-v1:493689d123c87688d53549d97ce18a70e58ebc46c0b0d4b6a3ac05305bd6762a
+  openengine-proto:
+    url: https://github.com/ai-dynamo/openengine.git
+    tag: v0.1.0
+    commit: b5f2bd93721f7b888d3e2440679e0ae7012939d1
+    source: proto/openengine/v1
+    destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
+    include:
+    - '*.proto'
+    digest: sha256-tree-v1:54c95724673b50dee9f27ba72f98ed13b3009209f858f80e044ccd13974770f4
+  sana-sol-attn:
+    url: https://github.com/NVlabs/Sana.git
+    branch: sol-engine
+    commit: 5fe5febdf0f59fee1c0b44a5ce6665df0dabd247
+    source: techniques/sparse_backends
+    destination: tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell
+    include:
+    - sol_attn/THIRD_PARTY_NOTICES.md
+    - sol_attn/__init__.py
+    - sol_attn/common/*
+    - sol_attn/interface.py
+    - sol_attn/preprocess.py
+    - sol_attn/sm100/*
+    patch: 3rdparty/vendor_patches/sana-sol-attn.patch
+    patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
+    digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b

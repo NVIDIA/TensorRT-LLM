@@ -1,29 +1,25 @@
-import sys
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
+from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import DraftRowPick, SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
-from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-
-if sys.version_info[:2] >= (3, 12):
-    from typing import override
-else:
-    from typing_extensions import override
-
-SampleStateMTP = SampleStateSpec
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -48,7 +44,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  dtype: torch.dtype,
                  hidden_size: int,
                  max_num_requests: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
@@ -56,7 +53,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
         # Reserve one extra slot for the CUDA graph padding dummy request,
         # which is kept alive permanently and must not consume a real slot.
-        slot_pool_size = max_num_requests + 1
+        slot_pool_size = (num_seq_slots or max_num_requests) + 1
         self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
@@ -85,7 +82,13 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A padding dummy (e.g. the attention-DP idle-rank dummy) may
+                # already hold a slot from add_dummy_requests -- reuse it
+                # instead of re-adding, which SlotManager.add_slot only
+                # tolerates for the CUDA-graph dummy id.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id].copy_(
                         0, non_blocking=True)
@@ -104,7 +107,13 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+            # The target and draft engines share this resource manager and
+            # each registers its padding dummy under the same
+            # draft-length-derived request ID. Reserve the slot once and share
+            # it between them; dummy outputs are discarded, so the slot
+            # contents never matter (mirrors SuffixAutomatonManager).
+            if self.slot_manager.get_slot(rid) is None:
+                self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 
@@ -125,6 +134,7 @@ class MTPSpecMetadata(SpecMetadata):
     """
     Metadata for MTP.
     """
+    supports_steady_prepare: ClassVar[bool] = True
     # The number of MTP modules in the model
     mtp_num_modules: int = 1
     # The hidden states manager for MTP
@@ -180,6 +190,14 @@ class MTPSpecMetadata(SpecMetadata):
         if self.spec_dec_mode.is_mtp_eagle_one_model():
             self.subseq_all_rank_num_tokens = value
 
+    def dp_num_tokens(self) -> int:
+        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
+        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
+        # forward and only one input token in the following draft forward.
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            return self.num_tokens
+        return self.num_tokens - self.num_generations
+
     def prepare(self):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
@@ -190,12 +208,8 @@ class MTPSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
-        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
-        # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
-        if not self.spec_dec_mode.is_mtp_eagle_one_model():
-            self.num_tokens -= self.num_generations
+        self.num_tokens = self.dp_num_tokens()
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
             mtp_slot_ids = []
@@ -239,38 +253,6 @@ class MTPSpecMetadata(SpecMetadata):
                 sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
 
 
-class MTPSampler(SpecSamplerBase):
-    """
-    MTP sampler.
-
-    Inherits from SpecSamplerBase with overrides for tree-based speculation
-    using max_total_draft_tokens instead of draft_len.
-    """
-
-    SampleState = SampleStateMTP
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
-
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
-        pass
-
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        super().__init__(args, draft_len=nextn)
-
-    @override
-    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens + 1 for tree-based speculation."""
-        return args.max_total_draft_tokens + 1
-
-    @override
-    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args,
-                                       draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens for draft token storage."""
-        return args.max_total_draft_tokens
-
-
 class MTPWorker(SpecWorkerBase):
 
     def __init__(self,
@@ -290,6 +272,8 @@ class MTPWorker(SpecWorkerBase):
         self.mapping = mapping if mapping is not None else getattr(
             model_config, "mapping", None)
         self.is_thop = False
+        self._is_mamba_hybrid_cache = None
+        self._row_pick = DraftRowPick("MTP layers")
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
@@ -297,6 +281,40 @@ class MTPWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _mtp_layers_pick_rows(self, draft_model: nn.Module) -> bool:
+        """Whether the MTP layers take ``pick_rows`` (see
+        draft_layer_picks_rows). Declined under attention DP, where this
+        worker passes the MTP layers no per-rank token counts."""
+        adp = self.mapping is not None and self.mapping.enable_attention_dp
+        return self._row_pick.resolve(list(
+            getattr(draft_model, "mtp_layers", None) or ()),
+                                      self.mapping,
+                                      decline="attention DP" if adp else None)
+
+    def _commit_target_mamba_states(
+        self,
+        attn_metadata: AttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Promote the target state at each generation request's accepted depth.
+
+        Target verification writes intermediate GDN/Mamba states for every
+        candidate position. The next draft pass must start from the accepted
+        candidate, rather than the last (possibly rejected) position.
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
     def _forward_impl(
         self,
@@ -426,6 +444,17 @@ class MTPWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
+        # Keep the state written for accepted draft tokens, undo the rest.
+        # Must run before the draft pass below, which reads that state back.
+        self._commit_target_mamba_states(attn_metadata, num_accepted_tokens,
+                                         batch_size)
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                attn_metadata.num_contexts,
+            )
+
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
                                       hidden_states=hidden_states,
@@ -457,6 +486,16 @@ class MTPWorker(SpecWorkerBase):
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
+        # Each MTP module reads its output on the last row of every request
+        # only (the LM-head input and the next module's carried hidden state),
+        # so a supporting layer runs its post-attention part on those rows.
+        picks_rows = self._mtp_layers_pick_rows(draft_model)
+        if picks_rows:
+            logger.info_once(
+                f"MTP layers pick {batch_size} of "
+                f"{draft_inputs['input_ids'].shape[0]} rows after attention",
+                key="spec_mtp_pick_rows")
+
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
@@ -466,12 +505,23 @@ class MTPWorker(SpecWorkerBase):
                                                         num_accepted_tokens,
                                                         draft_step=i)
 
+                if picks_rows:
+                    draft_inputs["pick_rows"] = last_tokens_idx
                 hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                           **draft_inputs)
+                # The rows of the requests' last tokens, in request order.
+                last_rows = (slice(None) if picks_rows else last_tokens_idx)
 
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
+                if picks_rows:
+                    # The output holds only the last rows: the head takes
+                    # every row it is given (return_context_logits).
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata, True).float()
+                else:
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
                 if self.guided_decoder is not None:
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
@@ -488,7 +538,7 @@ class MTPWorker(SpecWorkerBase):
                 draft_hidden_states = draft_inputs["hidden_states"]
                 draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
                 draft_hidden_states[last_tokens_idx] = hidden_states[
-                    last_tokens_idx, :]
+                    last_rows, :]
                 draft_inputs = {
                     "input_ids": input_ids,
                     "position_ids": draft_inputs["position_ids"],
@@ -936,6 +986,8 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
                 min=runtime_draft_len)
             attn_metadata.on_update_kv_lens()
+            if getattr(attn_metadata, "fp4_mla_state", None) is not None:
+                attn_metadata.update_for_spec_dec()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):

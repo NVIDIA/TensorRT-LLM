@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import unittest
@@ -13,8 +16,8 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrai
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
@@ -23,10 +26,10 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs import (
     create_input_processor,
     create_input_processor_with_hash,
@@ -34,7 +37,7 @@ from tensorrt_llm.inputs import (
     prompt_inputs,
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig as PyKvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -207,18 +210,13 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 ):
                     module.post_load_weights()
 
-        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
-        # load via `_set_up_multimodal_encoder_attn_metadata`. These standalone
+        # ModelEngine builds the vision encoders' AttentionMetadata after
+        # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.
         for module in model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    # Encoder batch axis (image/sequence count) is a distinct
-                    # budget from the token axis; mirror the engine's
-                    # max_batch_size default. Qwen-family subclasses floor this
-                    # up to max_num_tokens internally for windowed fan-out.
-                    max_num_requests=2048,
                     max_num_tokens=model_config.max_num_tokens,
                 )
 
@@ -302,15 +300,16 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
 
-        # VL configs (e.g. Qwen2_5_VLConfig) in transformers 5.x no longer
+        # VL configs (e.g. Qwen3VLConfig) in transformers 5.x no longer
         # proxy text_config attributes to the outer config level.
         text_config = getattr(config, "text_config", config)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=text_config.num_hidden_layers,
             num_kv_heads=text_config.num_key_value_heads,
-            head_dim=text_config.hidden_size // text_config.num_attention_heads,
+            head_dim=getattr(text_config, "head_dim", None)
+            or text_config.hidden_size // text_config.num_attention_heads,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=batch_size,
@@ -493,10 +492,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             raise ValueError(f"Invalid modality: {modality}")
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against a TypedDict, and some
-        # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
+        # Qwen3-VL checkpoints leak processor *output* keys (e.g.
         # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
         # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
-        # validation. The Qwen VL input processor's ``__init__`` installs a
+        # validation. The Qwen3-VL input processor's ``__init__`` installs a
         # process-wide filter that drops those keys before the validator sees
         # them.
         processor_inputs = hf_processor(
@@ -527,7 +526,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             # Prepare metadata before capture
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = KeyType(batch_size=1, draft_len=0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
@@ -594,9 +593,9 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
     def _dummy_request_kwargs(self, scenario: MultimodalScenario) -> Dict:
         """Optional override hook for extra kwargs to `add_dummy_requests`.
 
-        Subclasses for mRoPE-using models (Qwen2.5-VL, Qwen3-VL, Qwen3.5-VL,
-        …) should return `{"use_mrope": True}` here so the cache manager
-        allocates the mRoPE position-id buffer at dummy-request time.
+        Subclasses for mRoPE-using models (Qwen3-VL, Qwen3.5-VL, …) should
+        return `{"use_mrope": True}` here so the cache manager allocates the
+        mRoPE position-id buffer at dummy-request time.
         Defaults to an empty dict, preserving existing behavior for tests
         that don't care.
         """
@@ -628,6 +627,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         }
 
         mamba_params = extract_mamba_kv_cache_params(text_config)
+        mamba_layer_mask, full_attention_layer_mask = mamba_params.get_layer_masks()
         if mamba_params.dtype not in dtype_map:
             raise ValueError(
                 f"Unsupported dtype for hybrid cache manager: "
@@ -639,11 +639,8 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         if not isinstance(head_dim, int):
             head_dim = text_config.hidden_size // text_config.num_attention_heads
 
-        # CppMambaHybridCacheManager reads Pydantic-only fields
-        # (mamba_state_cache_interval, enable_block_reuse) so we have to
-        # construct the llmapi.llm_args.KvCacheConfig here, not the C++
-        # bindings KvCacheConfig that the standard KVCacheManager path uses.
-        kv_cache_config = PyKvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+        # Hybrid managers read Pydantic-only Mamba fields from KvCacheConfig.
+        kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
         return CppMambaHybridCacheManager(
@@ -654,15 +651,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             mamba_params.n_groups,
             mamba_params.head_dim,
             mamba_params.num_mamba_layers,
-            mamba_params.mamba_layer_mask,
+            mamba_layer_mask,
             mamba_params.dtype,
             mamba_params.mamba_ssm_cache_dtype,
             # kv cache parameters (positional)
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             # kw-only
-            num_layers=mamba_params.num_full_attention_layers,
-            layer_mask=mamba_params.full_attention_layer_mask,
+            num_layers=sum(full_attention_layer_mask),
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=text_config.num_key_value_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -706,6 +703,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Context Phase
         print("  Running context phase...")
         with torch.inference_mode():
+            logits = None
             if scenario.chunked_prefill:
                 chunk_size = 128
                 total_prompt_len = len(trtllm_input_ids)
@@ -864,6 +862,8 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
         self.attn_metadata = None
         self.runtime_features = None
+        self.hf_model = None
+        self.trtllm_model = None
 
         gc.collect()
         if torch.cuda.is_available():

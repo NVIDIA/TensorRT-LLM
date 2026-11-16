@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from random import choices, shuffle
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Union
 
 import yaml
 
+from tensorrt_llm._errors import ConfigInputError
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
@@ -17,53 +17,14 @@ from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
                                                 get_model_config)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.version import __version__
 
 _KV_CACHE_MAP = {
     QuantAlgo.FP8.value: "fp8",
     QuantAlgo.NVFP4.value: "fp8",
 }
 
-ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy"]
-
-
-def get_settings_from_engine(
-    engine_path: Path
-) -> Tuple[Dict[str, Union[str, int]], Dict[str, Union[str, int]]]:
-    """Retrieve basic engine information.
-
-    Args:
-        engine_path (Path): Path to a TRT-LLM engine directory.
-
-    Returns:
-        Tuple[Dict[str, Union[str, int]], Dict[str, Union[str, int]]]: Engine
-        properties parsed from the engine at engine_path.
-    """
-    config_path = engine_path / "config.json"
-    runtime_config = {}
-
-    with open(config_path, "r") as config_json:
-        config = json.load(config_json)
-
-    mapping = config["pretrained_config"]["mapping"]
-    engine_build_cfg = config["build_config"]
-
-    executor_settings = {
-        "max_batch_size": engine_build_cfg["max_batch_size"],
-        "max_num_tokens": engine_build_cfg["max_num_tokens"],
-    }
-
-    runtime_config.update({
-        "sw_version": config["version"],
-        "engine_dir": str(engine_path.absolute()),
-        "settings_config": executor_settings,
-        "mapping": mapping,
-    })
-
-    runtime_config["performance_options"] = {}
-    runtime_config["decoding_config"] = {
-        "decoding_mode": engine_build_cfg["speculative_decoding_mode"]
-    }
-    return runtime_config, engine_build_cfg
+ALL_SUPPORTED_BACKENDS = ["pytorch"]
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
@@ -88,7 +49,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
         if not isinstance(llm_args_dict, dict):
-            raise TypeError(
+            raise ConfigInputError(
                 f"extra_llm_api_options must contain a YAML mapping, "
                 f"got {type(llm_args_dict)}")
         kv_cache_config = llm_args_dict.get("kv_cache_config", {
@@ -192,7 +153,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     backend = params.get("backend", "pytorch")
     return {
-        "sw_version": "1.2",
+        "sw_version": __version__,
         "model_path": model_path,
         "settings_config": {
             "max_batch_size": int(max_batch_size),
@@ -203,7 +164,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {
-            "cuda_graphs": True,
             "pytorch_config": pyt_options,
         }
     }

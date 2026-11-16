@@ -19,7 +19,6 @@ from functools import partial
 from pathlib import Path
 
 import click
-import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
@@ -32,13 +31,14 @@ from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
+from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings,
-    update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS)
+    get_settings, update_sampler_args_with_extra_options,
+    ALL_SUPPORTED_BACKENDS)
 # isort: on
 from tensorrt_llm.bench.utils.data import (DatasetFormatError,
                                            create_dataset_from_stream,
@@ -48,18 +48,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-@click.command(name="latency")
+@click.command(name="latency", cls=TelemetryCommand, telemetry_llm_startup=True)
 @optgroup.group("Engine run configuration",
-                help="Runtime settings for executing a TensorRT LLM engine.")
-@optgroup.option(
-    "--engine_dir",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    help="Path to a serialized TRT-LLM engine.",
-)
+                help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(
     "--config",
     "--extra_llm_api_options",
@@ -129,6 +120,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requests dropped at the deadline are excluded from the report, so the statistics cover the requests that "
+    "completed rather than the whole dataset.",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -175,18 +175,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
-@optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT LLM engine.")
-@optgroup.option(
-    "--medusa_choices",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    required=False,
-    help="Path to a YAML file that defines the Medusa tree.",
-)
 @optgroup.group("Reporting Options",
                 help="Options for reporting benchmark results.",
                 cls=OptionGroup)
@@ -215,15 +203,21 @@ def latency_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
-    """Run a latency test on a TRT-LLM engine."""
+    """Run a latency benchmark with TRT-LLM."""
     logger.info("Preparing to run latency benchmark...")
 
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
 
-    # Speculative Decode Options
-    medusa_choices = params.get("medusa_choices")
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
@@ -250,34 +244,15 @@ def latency_command(
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(metadata.get_summary_for_print())
 
-    # Engine configuration parsing for PyTorch backend
     kwargs = {}
-    if options.backend and options.backend.lower(
-    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
-        if bench_env.checkpoint_path is None:
-            snapshot_download(options.model, revision=bench_env.revision)
+    if bench_env.checkpoint_path is None:
+        snapshot_download(options.model, revision=bench_env.revision)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
-    elif options.backend.lower() == "tensorrt":
-        assert options.max_seq_len is None, (
-            "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
-        engine_max_seq_len = build_cfg["max_seq_len"]
-
-        if metadata.max_sequence_length > engine_max_seq_len:
-            raise RuntimeError(
-                f"Engine supports a max sequence of {engine_max_seq_len}. Provided "
-                "dataset contains a maximum sequence of "
-                f"{metadata.max_sequence_length}. Please rebuild a new engine to"
-                "support this dataset.")
-    else:
-        raise click.BadParameter(
-            f"{options.backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+    exec_settings = get_settings(params, metadata, bench_env.model,
+                                 bench_env.checkpoint_path)
+    kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
+    logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
+    kwargs["max_seq_len"] = kwargs_max_sql
 
     exec_settings["model"] = options.model
     exec_settings["revision"] = bench_env.revision
@@ -293,18 +268,9 @@ def latency_command(
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
-    # Performance options
-    exec_settings["performance_options"]["cuda_graphs"] = True
-    exec_settings["performance_options"]["multi_block_mode"] = True
-
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["iteration_log"] = options.iteration_log
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
-
-    # Decoding Options
-    if medusa_choices is not None:
-        with open(medusa_choices, "r") as medusa_yml:
-            exec_settings["decoding_config"]["medusa_choices"] = \
-                yaml.load(medusa_yml, Loader=yaml.SafeLoader)
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
@@ -335,6 +301,7 @@ def latency_command(
         logger.info("Setting up latency benchmark.")
 
         llm = get_llm(runtime_config, kwargs)
+        startup_metrics = llm.startup_metrics
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
@@ -382,7 +349,8 @@ def latency_command(
                                 True,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
 
@@ -390,8 +358,13 @@ def latency_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, True)
+        report_utility = ReportUtility(statistics,
+                                       metadata,
+                                       runtime_config,
+                                       logger,
+                                       kwargs,
+                                       True,
+                                       startup_metrics=startup_metrics)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

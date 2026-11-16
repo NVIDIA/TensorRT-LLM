@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_mistral_large3_vision_config_preserves_max_position_embeddings():

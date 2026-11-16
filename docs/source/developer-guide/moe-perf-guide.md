@@ -1,0 +1,626 @@
+(moe-perf-guide)=
+
+# MoE Performance Guide
+
+## MoE Architecture
+
+An MoE module contains `num_experts` experts and a router that selects `top_k` of them for each token. To accelerate LLM execution, a multi-GPU deployment usually partitions these experts across ranks, which makes each rank hold only part of them. The module therefore additionally pays for a **dispatch** (send each token to the rank that owns its target expert) and a **combine** (bring the results back).
+
+The consequence is that MoE execution time is usually *not* decided by the expert GEMM alone, but by the combination of **how the experts are partitioned**, **how the tokens are exchanged**, and **which kernel implementation runs the GEMM**:
+
+```
+                    hidden states
+                          |
+                +-------------------+
+                |   Router (top_k)  |
+                +-------------------+
+                          |
+                +-------------------+
+                |     Dispatch      | <--- Communication
+                +-------------------+
+                          |
+                +-------------------+
+                |    Expert GEMM    | <--- Backend
+                +-------------------+
+                          |
+                +-------------------+
+                |      Combine      | <--- Communication
+                +-------------------+
+                          |
+                        output
+
+     Parallelism decides which experts each rank owns,
+     and therefore how much there is to dispatch and to compute.
+```
+
+| Option | What it controls |
+|---|---|
+| **Parallelism** | How experts are sharded across GPUs: EP (expert parallelism, split by expert) vs TP (tensor parallelism, split inside every expert). |
+| **Communication** | Which path implements dispatch / combine. |
+| **Backend** | Which kernel implementation runs the expert GEMM. Each one supports a different set of quantization formats and GPU architectures. |
+
+The three can be combined in many ways, and no single combination is always the best one. The right choice changes with the world size and with the number of tokens in flight, which is why prefill and decode of the same deployment often need different answers. It also changes with the quantization format, with the GPU architecture, and with whether expert parallelism stays inside one NVLink domain. The large number of options, together with the many factors they depend on, makes it difficult to find the best MoE configuration for a given deployment.
+
+This guide aims to help you reach a high level of MoE performance in practice. It first gives a recommended configuration for a given platform, model, quantization, world size and workload. If you want to push the performance of a specific workload further, it then shows how to benchmark it yourself. Finally, it introduces the advanced techniques that are available when the recommended configuration is not enough.
+
+### Configuration Options
+
+#### Parallelism
+
+The parallelism scheme determines the communication volume and the computation each GPU performs, and therefore the execution efficiency of the MoE module. It also depends on how the attention module is parallelized, and that in turn is decided by whether the deployment targets low latency or high throughput.
+
+The parallelism scheme of MoE is expressed as a combination of `moe_ep_size` (experts partitioned across ranks) and `moe_tp_size` (every rank holds a shard of every expert), with `moe_ep_size * moe_tp_size = world_size`.
+
+The equations and recommendations in this guide assume `pp_size = 1` and `cp_size = 1`. Pipeline-parallel deployments are not covered; they must use the stage-local MoE group size instead of deployment-wide `world_size`.
+
+![Expert parallel vs tensor parallel vs hybrid, 4 experts on 4 ranks](../media/moe-parallelism.png)
+
+| Scheme | Token-expert assignments per rank (balanced routing) | Per-rank GEMM `N` | Communication |
+|---|---|---|---|
+| **Expert Parallelism (EP)** | `num_tokens * top_k / ep_size` | full `intermediate_size` | dispatch + combine of activations |
+| **Tensor Parallelism (TP)** | `num_tokens * top_k` | `intermediate_size / tp_size` | AllReduce of outputs, no cross-rank dispatch |
+| **hybrid (EP+TP)** | `num_tokens * top_k / ep_size` | `intermediate_size / tp_size` | both, at reduced scale each |
+
+Here, `num_tokens` counts unique input tokens globally across the MoE parallel group, without counting TP replicas. Each token contributes `top_k` token-expert assignments. The table sums these assignments over all experts on a rank, and an individual expert's average GEMM `M` is `num_tokens * top_k / num_experts` under balanced routing.
+
+EP keeps each rank's GEMM full-width and does redundant work on no token, but pays the routing exchange and becomes load-sensitive when the router is skewed. TP still performs router/top-k selection, but needs no cross-rank token dispatch. It stays efficient when there are too few tokens to fill an EP dispatch, although every rank redundantly reads every token and each expert's GEMM gets narrower as `tp_size` grows.
+
+The scheme is notated together with the attention parallelism:
+
+| Notation | Attention | MoE |
+|---|---|---|
+| `DEP` | DP | expert parallelism |
+| `TEP` | TP | expert parallelism |
+| `DTP` | DP | tensor parallelism |
+| `TTP<k>EP<m>` | TP | `moe_tp_size=k`, `moe_ep_size=m` |
+
+#### Communication
+
+Under expert parallel every rank holds only part of the experts, so a token whose target expert lives elsewhere has to be dispatched there. Each MoE forward therefore sends every token to the ranks owning its `top_k` experts and brings the partial results back. These are the *Dispatch* and *Combine* in the diagram above.
+
+TensorRT-LLM provides several implementations of this exchange. They differ in the physical link (NVLink inside a domain, or the network across it), how the data is moved (one-sided writes into the peer's memory, or a two-sided handshake), and whether tokens are routed at all. The best communication choice varies with specific workload and deployment environment.
+
+| Strategy | Mechanism |
+|---|---|
+| `NVLINK_ONE_SIDED` | One-sided writes into a symmetric MNNVL workspace |
+| `NVLINK_TWO_SIDED` | Two-sided alltoall over MNNVL |
+| `DEEPEP` | DeepEP normal-mode kernels over the network |
+| `DEEPEPLOWLATENCY` | DeepEP low-latency kernels over the network |
+| `NCCL_EP` | NCCL-EP 0.2 low-latency rank-major exchange, BF16, FP8 QDQ, or NVFP4 dispatch |
+| `ALLGATHER` | AllGather the tokens, ReduceScatter the outputs |
+
+> The `MEGAMOE` backends fuse dispatch and combine into the expert GEMM kernel over a symmetric memory heap, writing straight into a peer's buffer with no host-side exchange, which forces the communication to `NONE`.
+
+##### How to assign a communication strategy?
+
+By default TensorRT-LLM picks the strategy itself (`AUTO`). The choice is made from the maximum shapes rather than the live token count.
+
+```
+Default selection (`AUTO`)
+│
+├─ backend == MEGAMOE_*, or DWDP enabled     → NONE
+│     (the fused path owns the exchange)
+├─ attention TP, or dp_size == 1             → NONE
+│     (nothing to dispatch)
+├─ moe_tp_size != 1                          → ALLGATHER
+│     (an alltoall cannot serve MoE TP)
+├─ TRTLLM_FORCE_COMM_METHOD set              → that method
+│     (forced: no fallback if it fails to initialize)
+│
+└─ else, try in order — keep the first that initializes on this platform
+       │
+       ├─ NVLINK_ONE_SIDED     needs MNNVL, and moe_ep_size == world_size
+       │
+       ├─ num_experts % moe_ep_size != 0     → ALLGATHER
+       │     (candidates below are skipped when not divisible)
+       │
+       ├─ NVLINK_TWO_SIDED     needs MNNVL
+       ├─ NCCL_EP              needs NCCL-EP 0.2+, BF16 activations
+       ├─ DEEPEP               needs BF16 activations
+       ├─ DEEPEPLOWLATENCY     needs BF16 activations, top_k <= 16
+       │
+       └─ ALLGATHER            final fallback
+```
+
+To override the default, set `TRTLLM_FORCE_COMM_METHOD` on every rank:
+
+```bash
+TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY \
+  trtllm-serve <model> --tp_size 16 --ep_size 16 --enable_attention_dp \
+    --extra_llm_api_options config.yaml
+```
+
+The value must be one of the strategy names in the table above.
+
+##### `NVLINK_ONE_SIDED`: how arrival is detected
+
+`NVLINK_ONE_SIDED` has two ways for a rank to learn that a step's rows have arrived, selected per step:
+
+| Protocol | Mechanism | Used for |
+|---|---|---|
+| `fence` | Completion flags behind a system-scope fence | Every step it is selected for; always available |
+| `sentinel` | Landing rows are pre-filled with a sentinel word; receivers poll the data itself, so neither dispatch nor combine waits on a flag or fence | Small steps on SM100, SM103 and SM107 |
+
+`TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL` chooses the policy on every rank:
+
+- `auto` (default): sentinel for each step it can carry, fence for the others.
+- `fence`: fence only.
+- `sentinel`: same as `auto`, but logs a warning naming the reason when sentinel cannot be used.
+
+A step is carried by sentinel when its busiest rank sends at most `sentinel_max_tokens` tokens, it gathers no EPLB statistics, and its payload matches the layer's format (BF16, MXFP8 or NVFP4 rows). Sentinel is off for FP8 low-precision combine (`use_low_precision_moe_combine`), for communicators with the AlltoAll watchdog or EP-group health, for more than 64 EP ranks, and for the FP8 per-tensor, `W4A8_MXFP4_FP8` and `W4A8_NVFP4_FP8` activation formats.
+
+The default `sentinel_max_tokens` is between 159 and 512 tokens per rank (capped at `max_num_tokens_per_rank`); `TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS` overrides it. The sentinel landing rows are added to the workspace, `ep_size × sentinel_max_tokens` of them per rank: for hidden 7168, top-8 BF16 rows this is about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64. If a `TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB` override cannot hold them, sentinel is turned off with a warning.
+
+The settings must be the same on every rank; an invalid or mismatched value raises an error at model construction on every rank. `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT`, `..._CFT_MAX_BATCH_FOR_DISPATCH` and `..._CFT_MAX_BATCH_FOR_COMBINE` are no longer read and log a warning; `FORCE_CFT=0` still selects `fence` for one release.
+
+Implementation Notes: [`MOE_DEVELOPER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md).
+
+#### Backend
+
+TensorRT-LLM provides many MoE implementations, differing in supported quantization formats, target GPU architecture, and expert-GEMM scheduling. This is the *Expert GEMM* box in the diagram above.
+
+| Backend | GPU arch | Quantization |
+|---|---|---|
+| `CUTLASS` | SM80+ | unquantized, FP8 QDQ, FP8 block-scale, NVFP4, W4A16_NVFP4, W4A8_AWQ, W8A16, MXFP4, MXFP8 |
+| `TRTLLM` | SM100 / SM103 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 |
+| `CUTEDSL` | SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode) | NVFP4, BF16 (SM107), W4A16_NVFP4 (SM120 / SM121) |
+| `CUTEDSL_FC12` | SM107 | NVFP4 |
+| `DEEPGEMM` | SM100 / SM103 / SM107 | FP8 block-scale |
+| `DENSEGEMM` | SM100 / SM103 | NVFP4 |
+| `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4 |
+| `MEGAMOE_DEEPGEMM` | SM100 / SM103 | W4A8_MXFP4_MXFP8 |
+| `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
+| `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |
+
+##### How to assign a backend?
+
+Set `moe_config.backend` in the `trtllm-serve` config yaml:
+
+```yaml
+moe_config:
+  backend: TRTLLM          # AUTO (default), CUTLASS, CUTEDSL, CUTEDSL_FC12, TRTLLM, DEEPGEMM,
+                           # DENSEGEMM, MEGAMOE_CUTEDSL, MEGAMOE_DEEPGEMM, MARLIN, ...
+```
+
+The *Backend Capability Matrix* and *Quantization Support* tables: [`MOE_DEVELOPER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md).
+
+For DeepSeek-V4 and DeepSeek-V4.1 on `MEGAMOE_CUTEDSL`, `moe_config.megamoe_fuse_shared_expert: true` (prototype) runs the model's single FP8 block-scale shared expert inside the MegaMoE kernel instead of as a separate MLP. It applies on SM100 / SM103 under attention DP with `moe_tensor_parallel_size` 1, to the target, one-model MTP and draft MoE layers together: either all of them fuse or none does. Otherwise the shared expert stays separate, and on `MEGAMOE_CUTEDSL` a warning names the reason.
+
+##### How to pin an implementation with `tactic`? (prototype)
+
+A backend names a family of implementations, picks one of them per layer, and falls back to CUTLASS when none of them can serve the layer. `moe_config.tactic` names the implementations themselves, by their id `provider.technique.kernel_name.quant`, and never falls back: a layer it applies to runs one of them or fails to build. (A MoE tactic selects implementations; it is unrelated to the autotuner's kernel tactics, which are still tuned inside the chosen implementation.)
+
+A tactic is the recommended way to pin an implementation, and choosing a `backend` other than `AUTO` is planned for deprecation where a tactic can replace it. Which tactic replaces a backend depends on the checkpoint's format, so read it from the *Family* column of the catalog below: the `CUTLASS` family also covers the `hopper_grouped_gemm` and `triton` FP8 block-scale implementations, so on an FP8 block-scale checkpoint `tactic: cutlass` names none of them; the deprecated `TRITON` backend maps to `cutlass`; `VANILLA` has no tactic; and `DEEPGEMM` on SM90 relies on falling back to the `hopper_grouped_gemm` implementation, which a tactic does not do.
+
+```yaml
+moe_config:
+  tactic: cutedsl.grouped_gemm   # leave backend at AUTO, the default
+```
+
+How a value is matched:
+
+- Write the full id, or any of its four segments joined by `.`, in any order and in any case. Every segment value belongs to one field only, so `mega_moe` alone is a valid tactic. `*` leaves a field open; quote a value that starts with it (`tactic: '*.nvfp4'`), since YAML reads a leading `*` as an alias.
+- Every implementation the segments match is a candidate. The candidates are narrowed to the format of the checkpoint's MoE experts, and the first of them in catalog order (*Priority* 1 is tried first) that can serve the layer runs. Its own requirements still apply: SM, activation, EPLB, LoRA, and optional packages such as FlashInfer for `flashinfer.cutedsl.b12x.nvfp4`.
+- After that narrowing the candidates must belong to one `backend` family, because the rest of the model is built for one family. `grouped_gemm.nvfp4` matches a CUTLASS and a CuteDSL implementation and is refused when the model is loaded; `cutlass.grouped_gemm.nvfp4` is not. A tactic with no implementation of the experts' format fails every MoE layer of that format: if its matches belong to one family, such as `trtllm.mega_moe`, the model is built for that family; if they span several, such as `mega_moe` on a BF16 model, it is built for the family `AUTO` resolves to, with a warning.
+- A layer no candidate can serve fails to build, and the error lists each candidate's reason.
+- A tactic applies to every MoE layer of the target model, including layers whose experts the checkpoint excludes from quantization, which run as BF16. For such a checkpoint, name a tactic whose family covers both formats, such as `trtllm_gen` or `trtllm.cutlass.grouped_gemm` for NVFP4 and BF16 on SM100, or `cutlass` for W4A16_NVFP4 and BF16 on SM90; if none exists on the GPU, select by `backend`. The error names the tactics that would. Qwen3-Next and MuseSpark Open are exceptions: their model code builds those target layers on CUTLASS, and on the model's backend or on TRTLLM under a MegaMoE family, and logs a warning that names the tactic. An MTP layer is a draft layer: `speculative_config.moe_tactic` pins it, excluded or not.
+- `tactic` cannot be combined with a `backend` other than `AUTO`. It governs the target model only; `speculative_config.moe_tactic` pins draft models and MTP layers, replacement-head MTP checkpoints included. With both draft fields unset, a draft inherits the target's backend, or resolves `AUTO` for its own weights when `tactic` pins the target. Replacing `backend: X` by a tactic therefore also changes the draft's default; to keep the draft on the same family, also set `speculative_config.moe_backend: X` or a `speculative_config.moe_tactic`. Nemotron-H embedded MTP layers must run `VANILLA` exactly when the target does.
+
+| `tactic` | Runs |
+|---|---|
+| `trtllm.cutlass.grouped_gemm.nvfp4` | exactly that implementation |
+| `cutedsl.grouped_gemm` | the CuteDSL grouped GEMM of the checkpoint's expert format |
+| `trtllm_gen` | the TRTLLM-Gen fused MoE of the checkpoint's expert format |
+| `mega_moe` | `trtllm.cutedsl.mega_moe.nvfp4` on an NVFP4 checkpoint, `deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8` on an MXFP4 one |
+
+How a partial tactic resolves, step by step, for `tactic: trtllm_gen` on an NVFP4 checkpoint and an SM100 GPU:
+
+1. When the configuration is validated, each segment finds its field by value: `trtllm_gen` is a `technique`, and it matches every `trtllm_gen` implementation in the catalog below, one per format. A mistyped segment, or a tactic that matches nothing, fails here, before the model loads.
+2. When the model loads, the matches are narrowed to the format the checkpoint declares for its MoE experts. NVFP4 leaves `trtllm.trtllm_gen.fused_moe.nvfp4`, of the `TRTLLM` family, so the model is built for `TRTLLM`.
+3. When each MoE layer is built, the candidates left are tried in catalog order and the first that can serve the layer runs; here that is `trtllm.trtllm_gen.fused_moe.nvfp4`, the only one.
+4. If no candidate can serve the layer, for example on an SM90 GPU, the layer fails to build and the error lists each candidate's reason. Nothing falls back to CUTLASS.
+
+`tactic: cutedsl` on the same checkpoint stops at step 2 instead: narrowed to NVFP4 it still matches implementations of four families (`CUTEDSL`, `CUTEDSL_FC12`, `DENSEGEMM` and `MEGAMOE_CUTEDSL`), and the error lists them by family. Adding a segment that leaves one family, such as `cutedsl.grouped_gemm`, resolves it.
+
+To find the id of what a run uses today, run it once without a tactic: the log reports each MoE implementation it builds, once, as `MoE layers run <class>, MoE implementation id <id> (moe_backend <family>)`.
+
+Every implementation a tactic can pin, generated from the implementation registry by `scripts/generate_moe_impl_catalog.py`. *Shortest tactic* is the fewest segments that match that implementation and no other, ties going to the earlier fields of the id, so it pins the implementation whatever the checkpoint. On a given checkpoint fewer segments can do, since the matches are narrowed to its expert format first: `mega_moe` runs `trtllm.cutedsl.mega_moe.nvfp4` on an NVFP4 checkpoint. An implementation added in a later release can match a shortest tactic too, so a configuration that must keep its kernel across releases gives the full id.
+
+<!-- BEGIN GENERATED MOE IMPL CATALOG: scripts/generate_moe_impl_catalog.py -->
+
+| Implementation id | Shortest tactic | `backend` family | Priority | Description |
+|---|---|---|---|---|
+| `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | `hopper_grouped_gemm` | `CUTLASS` | 20 | DeepGEMM grouped GEMM over FP8 block scales, driven by CutlassMoeFCRunner, SM90. |
+| `trtllm.triton.grouped_gemm.fp8_block_scales` | `triton` | `CUTLASS` | 21 | Internal Triton FP8 block-scale grouped GEMM, SM120/121. |
+| `trtllm.cutlass.grouped_gemm.nvfp4` | `cutlass.nvfp4` | `CUTLASS` | 22 | CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell. |
+| `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | `trtllm.w4a16_nvfp4` | `CUTLASS` | 23 | NVFP4 weights dequantized to the activation dtype every forward, SM80+. |
+| `trtllm.cutlass.grouped_gemm.mxfp8` | `mxfp8` | `CUTLASS` | 24 | CUTLASS grouped GEMM over MXFP8 weights and dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8` | `cutlass.w4a8_mxfp4_fp8` | `CUTLASS` | 25 | CUTLASS grouped GEMM over MXFP4 weights with static FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8` | `cutlass.w4a8_mxfp4_mxfp8` | `CUTLASS` | 26 | CUTLASS grouped GEMM over MXFP4 weights with dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a16_mxfp4` | `cutlass.w4a16_mxfp4` | `CUTLASS` | 27 | CUTLASS grouped GEMM over MXFP4 weights with high-precision activations, SM90. |
+| `trtllm.cutlass.grouped_gemm.w4a8_awq` | `w4a8_awq` | `CUTLASS` | 28 | CUTLASS grouped GEMM over INT4 group-scaled weights with FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w8a16` | `w8a16` | `CUTLASS` | 29 | CUTLASS grouped GEMM over INT8 per-channel weight-only, SM80+. |
+| `trtllm.cutlass.grouped_gemm.fp8` | `fp8` | `CUTLASS` | 30 | CUTLASS grouped GEMM over per-tensor FP8 (qdq) weights, SM89+. |
+| `trtllm.cutlass.grouped_gemm.none` | `cutlass.none` | `CUTLASS` | 31 | CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+. |
+| `marlin.cuda.fused_moe.nvfp4` | `marlin.nvfp4` | `MARLIN` | 18 | Marlin fused W4A16 MoE GEMM over NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `marlin.cuda.fused_moe.w4a16_nvfp4` | `marlin.w4a16_nvfp4` | `MARLIN` | 19 | Marlin fused W4A16 MoE GEMM over W4A16-NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `flashinfer.cutedsl.b12x.nvfp4` | `flashinfer.nvfp4` | `CUTEDSL` | 1 | FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM for prefill; SM120/SM121. |
+| `flashinfer.cutedsl.b12x.w4a16_nvfp4` | `flashinfer.w4a16_nvfp4` | `CUTEDSL` | 2 | FlashInfer CuTe DSL SM12x fused MoE, BF16 activations and NVFP4 weights; SM120/SM121. |
+| `trtllm.cutedsl.grouped_gemm.nvfp4` | `cutedsl.grouped_gemm.nvfp4` | `CUTEDSL` | 5 | CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, then FC2 + finalize; SM100/SM103/SM107. |
+| `trtllm.cutedsl.grouped_gemm.nvfp4_plus` | `nvfp4_plus` | `CUTEDSL` | 6 | CuTe DSL NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) grouped GEMM: gather + FC1 + fused SwiGLU, then FC2 + finalize; SM107. |
+| `trtllm.cutedsl.grouped_gemm.none` | `cutedsl.none` | `CUTEDSL` | 7 | CuTe DSL BF16 grouped GEMM on Rubin (SM107): gather + FC1 + fused SwiGLU, then FC2 + fused finalize. |
+| `trtllm.cutedsl.fused_fc12.nvfp4` | `fused_fc12` | `CUTEDSL_FC12` | 8 | Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
+| `deepgemm.cuda.grouped_gemm.fp8_block_scales` | `deepgemm.grouped_gemm` | `DEEPGEMM` | 16 | DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. |
+| `trtllm.cutedsl.dense_gemm.nvfp4` | `dense_gemm` | `DENSEGEMM` | 17 | CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency. |
+| `trtllm.trtllm_gen.fused_moe.none` | `trtllm_gen.none` | `TRTLLM` | 9 | TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.nvfp4` | `trtllm_gen.nvfp4` | `TRTLLM` | 10 | TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.fp8_block_scales` | `trtllm_gen.fp8_block_scales` | `TRTLLM` | 11 | TRTLLM-Gen batched-GEMM cubins over FP8 1x128 block scales, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.w4a16_mxfp4` | `trtllm_gen.w4a16_mxfp4` | `TRTLLM` | 12 | TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with bf16 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8` | `trtllm_gen.w4a8_mxfp4_mxfp8` | `TRTLLM` | 13 | TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with MXFP8 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8` | `w4a8_nvfp4_fp8` | `TRTLLM` | 14 | TRTLLM-Gen fp8_fp4 block-scale runner: NVFP4 weights, FP8 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8` | `trtllm_gen.w4a8_mxfp4_fp8` | `TRTLLM` | 15 | TRTLLM-Gen e4m3_mxe2m1 block-scale runner: MXFP4 weights, FP8 activations. |
+| `deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8` | `deepgemm.mega_moe` | `MEGAMOE_DEEPGEMM` | 3 | DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107. |
+| `trtllm.cutedsl.mega_moe.nvfp4` | `trtllm.mega_moe` | `MEGAMOE_CUTEDSL` | 4 | MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107. |
+
+Segment values a tactic can use, by field:
+
+- `provider`: `deepgemm`, `flashinfer`, `marlin`, `trtllm`
+- `technique`: `cuda`, `cutedsl`, `cutlass`, `triton`, `trtllm_gen`
+- `kernel_name`: `b12x`, `dense_gemm`, `fused_fc12`, `fused_moe`, `grouped_gemm`, `hopper_grouped_gemm`, `mega_moe`
+- `quant`: `fp8`, `fp8_block_scales`, `mxfp8`, `none`, `nvfp4`, `nvfp4_plus`, `w4a16_mxfp4`, `w4a16_nvfp4`, `w4a8_awq`, `w4a8_mxfp4_fp8`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w8a16`
+
+<!-- END GENERATED MOE IMPL CATALOG -->
+
+### Terminology
+
+- **`world_size`**: number of ranks (GPUs) the model is served on.
+- **NVLink domain**: the set of GPUs reachable over NVLink. GB300 (NVL72) forms one domain of up to 72 GPUs, so EP crosses the domain only when `world_size > 72`. B300 forms one domain per 8-GPU node, so EP crosses the domain when `world_size > 8` and falls back to the slower network.
+- **prefill / decode**: prefill processes the whole prompt at once (large GEMM `M`, compute bound), decode produces one token per request per step (small `M`, communication and memory bound). The two phases usually need different configurations.
+
+## Recommended Configuration
+
+To provide recommended MoE configurations, we use the following two derived variables.
+
+- `activated_tokens_per_rank = num_tokens * top_k / world_size` (pure EP, `moe_tp_size = 1`)
+  This is the total number of token-expert assignments processed by one rank, summed across its local experts. The per-rank workload is not determined by batch size alone: it also depends on `top_k` and `world_size`. Folding both in provides a unified threshold for the actual per-rank workload across models and batch sizes.
+
+- `dispatch_KB = activated_tokens_per_rank * hidden_size * bytes_per_elem / 1024`
+  This quantifies the communication volume between ranks as a byte count (`bytes_per_elem` is 0.5 for NVFP4 and 1.0 for W4A8_MXFP4_MXFP8), providing a unified threshold for selecting the communication method.
+
+### Decision Tree
+
+```
+═════════════════ STEP1: Parallelism ═════════════════
+
+Parallelism
+│
+└─ MoE Module                                        →  EP
+
+
+═════════════════ STEP2: Backend ═════════════════
+
+Backend
+│
+├─ SM90  (Hopper: H100 / H200)
+│      │
+│      ├─ gpt-oss  → CUTLASS/TRITON
+│      └─ else     → CUTLASS
+│
+├─ SM120 / SM121  (RTX PRO 6000 Blackwell / DGX Spark)
+│      │
+│      ├─ NVFP4, tokens per rank < 64, ep_size==1, no attention DP  → CUTEDSL
+│      └─ else                                                      → CUTLASS
+│
+└─ SM100 / SM103  (B300 / GB300)
+       │
+       ├─ attention TP                                          → TRTLLM
+       │
+       └─ attention DP
+              │
+              ├─ GB300 with world_size <= 72, or B300 with world_size <= 8
+              │  (EP within one NVLink domain)
+              │      │
+              │      ├─ NVFP4
+              │      │      ├─ decode (CUDA graph on)
+              │      │      │      ├─ activated_tokens_per_rank <= 512
+              │      │      │      │      ├─ world_size <= 8      → TRTLLM
+              │      │      │      │      └─ else                 → CUTEDSL
+              │      │      │      └─ else                        → MEGAMOE_CUTEDSL
+              │      │      │
+              │      │      └─ prefill (CUDA graph off)
+              │      │             ├─ activated_tokens_per_rank <= 16384
+              │      │             │                              → TRTLLM
+              │      │             └─ else                        → MEGAMOE_CUTEDSL
+              │      │
+              │      └─ W4A8_MXFP4_MXFP8                          → MEGAMOE_DEEPGEMM
+              │
+              └─ B300 with world_size > 8
+                 (EP crosses the NVLink domain)
+                        ├─ NVFP4             → CUTEDSL
+                        └─ W4A8_MXFP4_MXFP8  → TRTLLM
+
+
+═════════════════ STEP3: Communication ═════════════════
+
+Communication
+│
+├─ EP crosses the NVLink domain
+│  (B300 with world_size > 8)
+│      │
+│      ├─ dispatch_KB <= 8192  (~8 MB per rank)
+│      │      ├─ DEEPEPLOWLATENCY supported  → DEEPEPLOWLATENCY
+│      │      └─ else                        → AUTO
+│      │
+│      └─ else                               → ALLGATHER
+│
+└─ else                                      → AUTO
+```
+
+> `AUTO` is the default: leave `TRTLLM_FORCE_COMM_METHOD` unset and TensorRT-LLM
+> selects the strategy itself.
+
+> `DEEPEPLOWLATENCY supported`: `hidden_size` in
+> `{2048, 2560, 3584, 4096, 5120, 6144, 7168}` and `top_k <= 16`.
+
+> **Notes**
+> - The tree is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
+> - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`. GB300 is covered only through `world_size <= 72`; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.
+> - Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.
+> - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
+
+### Hints for Making the Choice
+
+#### Impacts of Each Option
+
+**Parallelism** decides how much work lands on each rank. Under expert parallelism a rank holds a subset of the experts, so a token has to be dispatched to whichever rank owns its target expert. A hybrid TP x EP layout splits every expert as well, which shrinks the dispatch, at the cost of a narrower GEMM on each rank and of every rank having to read every token.
+
+**Communication** sets how the dispatch and the combine are carried out. The tokens can be written straight into the peer's memory with no handshake, exchanged after a two-sided handshake, sent out over the network, or not routed at all, which means broadcasting every token to every rank and reducing the outputs back afterwards.
+
+**Backend** governs how the expert GEMM runs. The implementations differ in how their kernels are tuned, some picking parameters from the problem shape and some using a fixed configuration. The MegaMoE backends are the special case as they fold the exchange into the GEMM kernel and move data while they compute.
+
+#### A Uniform View for Three Options
+
+All three options switch for the same reason. Every configuration pays two kinds of cost, and the number of tokens in flight decides which one dominates.
+
+```
+          fixed cost                                  data volume
+   kernel launches, cross-rank                 bytes to dispatch and
+   synchronisation, handshakes,                combine, FLOPs the
+   peers to coordinate with                    expert GEMM runs
+          |                                             |
+          +---------------- threshold ------------------+
+          |                                             |
+   dominates when few tokens                    dominates when many
+   are in flight                                tokens are in flight
+```
+
+#### Rationale Behind Each Threshold
+
+**The MoE layout is always expert parallelism.** Under attention DP, expert parallelism is always the optimum at every workload point in the sweep. Under attention TP, a hybrid TP x EP layout can be slightly better at small token counts, but the gain is small (0.3% at the median and 4% at the 90th percentile). A deployment that is squeezing the last few percent out of a low-latency configuration should still measure `TP<k>EP<m>`.
+
+**The fused path is not always the best choice.** The fused scheme carries a fixed setup cost: three cross-rank NVLink barriers inside the kernel, plus metadata preparation whose cost follows the token bucket size rather than the number of tokens actually present. With few tokens in flight that cost exceeds the overlapped dispatch and combine cost, and fusion only takes off once the workload is large enough for the cost to be amortised and for the overlap to repay it. The threshold `activated_tokens_per_rank = 512` with CUDA graph on is derived from the `bench_moe` sweep over typical workloads.
+
+**We prefer `TRTLLM` over `CUTEDSL` when `world_size <= 8`.** A small world size leaves many experts on each rank (`num_experts / world_size` can be 32 to 224), so the grouped GEMM has many groups with a small `M` dimension. In these cases, TRTLLM-Gen's tuned kernels fit that shape better than the generic CuteDSL grouped GEMM.
+
+**The crossover moves out much further with CUDA graph off.** A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, `TRTLLM` drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and autotuner lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path's expert-GEMM advantage therefore stays out of the comparison until `TRTLLM`'s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.
+
+**Attention TP always uses `TRTLLM`.** Attention TP is a low-latency choice, and the MoE forward never gets a large batch: across the disaggregated-serving workloads behind this guide, attention TP appears only in the decode phase and `activated_tokens_per_rank` never exceeds 64. `CUTEDSL` does overtake `TRTLLM` once the expert GEMM becomes compute bound, but that only happens above roughly 24576 activated tokens per rank, which attention TP does not reach in a disaggregated deployment.
+
+#### Impacts of Crossing the NVLink Domain
+
+An NVL72 system keeps up to 72 GPUs in one domain, while B300 keeps 8 per node. Once expert parallelism extends beyond that, the tokens go over the network, where per-GPU bandwidth drops. The same bytes then cost close to twenty times more, which moves every crossover earlier and is why the cross-domain branch switches on absolute dispatch bytes (`dispatch_KB`) rather than on a token count (`activated_tokens_per_rank`).
+
+> The thresholds above were obtained from sweeps over typical workloads on key models, all measured with `--use_low_precision_moe_combine` enabled. This flag speeds up `NVLINK_ONE_SIDED` by about 4% while leaving the fused `NONE` path untouched.
+
+### Typical Deployment Scenarios
+
+#### Low Latency
+
+Optimize for the smallest possible per-step latency at low concurrency, accepting lower GPU utilization.
+
+| | |
+|---|---|
+| Attention | TP |
+| MoE parallelism | EP |
+| Backend | `TRTLLM` on SM100 / SM103 |
+| Communication | `NONE` (attention TP needs no dispatch) |
+| CUDA graph | On |
+
+The MoE forward here is launch-bound, not compute-bound: `activated_tokens_per_rank` stays small. Every fixed cost is therefore fully exposed. If you are chasing the last few percent, measure the hybrid `TP<k>EP<m>` layouts as well, under attention TP they can edge out pure EP at small token counts.
+
+#### High Throughput
+
+Optimize for aggregate throughput at high concurrency, accepting higher per-request latency.
+
+| | |
+|---|---|
+| Attention | DP |
+| MoE parallelism | EP, typically wide |
+| Backend | `MEGAMOE_CUTEDSL` (NVFP4) / `MEGAMOE_DEEPGEMM` (W4A8_MXFP4_MXFP8) |
+| Communication | `NONE` |
+| CUDA graph | On for decode, off for prefill |
+
+Attention DP accumulates tokens per rank as concurrency grows. Fusion is for that case: the MoE module has enough work to benefit from overlapping dispatch and combine with the GEMM operations. It is also important to keep expert parallelism inside one NVLink domain if you can.
+
+#### Disaggregated Serving
+
+In a disaggregated deployment the two phases are separate services and should be configured separately rather than compromised into one profile:
+
+- **Prefill / context servers**: large `M`, compute bound, CUDA graph off. Follow the CUDA-graph-off branch of the tree (crossover at `activated_tokens_per_rank = 16384`). This is also the only phase where DWDP applies.
+- **Decode / generation servers**: small `M` per step, communication and memory bound, CUDA graph on. Follow the CUDA-graph-on branch (crossover at 512). This is the phase where EPLB pays off, since expert imbalance shows up as a straggler on every step.
+
+## Tuning a Specific Workload
+
+The decision trees give a general configuration that works well across a wide range of deployments. For a specific workload and world size, searching the whole configuration space can find a better one.
+
+`bench_moe` runs the MoE module on its own, without deploying the full model. With the model, quantization, world size and token counts fixed, `--search full` expands backend, communication, parallel layout, and CUDA Graph. This includes layouts the decision trees do not select, such as MoE TP and the even-split hybrid `(D|T)TP<k>EP<m>` modes. It can be executed as:
+
+```bash
+PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} \
+mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 8 \
+  python3 -m bench_moe \
+  --world_size 8 \
+  --model deepseek_v4_pro \
+  --quant NVFP4 \
+  --search full \
+  --balanced_total_num_tokens 256 8192 \
+  --use_low_precision_moe_combine \
+  --output_file out/deepseek_v4_pro_ws8.json
+```
+
+This writes `out/deepseek_v4_pro_ws8.json` and `out/deepseek_v4_pro_ws8.analysis.xlsx`. If attention parallelism is already decided, pin `--parallel_mode DEP` or `TEP` and `--search backend comm` instead.
+
+The JSON has `results` (one object per candidate) and `rankings` grouped by `(num_tokens, parallel_mode)`. Start at `rankings`: `best` is the `status=success` candidate with the lowest `score_ms` in that group.
+
+```json
+{
+  "num_tokens": 256,
+  "parallel_mode": "DEP",
+  "best": {
+    "backend": "TRTLLM",
+    "comm_method": "NVLinkOneSided",
+    "cuda_graph": true,
+    "score_ms": 0.85,
+    "status": "success"
+  }
+}
+```
+
+`score_ms` is the trimmed mean of per-iteration slowest-rank forward times; lower is better. In the workbook, `best_by_workload` lists those winners and `all_results` is the full table. Take the `DEP` or `TEP` group that matches the serving job. CUDA Graph on/off share that group, so if the job pins Graph (on for decode, off for prefill), filter `cuda_graph` in `all_results`. Set the winner with `moe_config.backend` and `TRTLLM_FORCE_COMM_METHOD` as in *Configuration Options*.
+
+Search axes and further recipes: [`BENCH_MOE_USER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/microbenchmarks/bench_moe/BENCH_MOE_USER_GUIDE.md).
+
+One thing to know before trusting a `bench_moe` ranking: it has been cross-validated against end-to-end disaggregated serving, detailed in *Appendix*.
+
+## Advanced Techniques
+
+The two techniques below go beyond picking a configuration: they change how experts are placed or how their weights move, and each targets a cost that the options above cannot remove.
+
+### Expert Parallelism Load Balancer (EPLB)
+
+Expert Parallelism Load Balancer (EPLB), introduced in [DeepSeek-V3](https://arxiv.org/abs/2412.19437), is proposed to remove the straggler effect caused by uneven expert activation under large-scale expert parallelism, where the ranks holding the most-activated experts dominate the latency of the whole module while the rest idle. It replicates hot experts and packs the resulting slots onto ranks so that the expected load is even, deriving the assignment from measured routing statistics.
+
+It is recommended to enable EPLB on MoE models when expert parallelism is large (`ep_size` typically `> 8`), the MoE is a significant fraction of runtime, and ranks are imbalanced. This setting usually corresponds to the decode phase of a disaggregated deployment.
+
+EPLB can use an offline plan or recompute the placement online. Offline EPLB is suitable when the traffic pattern is known and stable. Online EPLB is for production when the traffic mix can drift, because hot experts differ across datasets and requests. The online path follows that drift without regenerating a placement. The cost is a full host copy of the experts, background weight-update threads, and platform requirements (GDRCopy, huge pages). At small per-GPU batches, the statistics and update work may not hide behind the MoE GEMMs.
+
+Usage: [`examples/wide_ep/ep_load_balancer/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/ep_load_balancer/README.md).
+
+### Distributed Weight Data Parallelism (DWDP)
+
+[Distributed Weight Data Parallelism (DWDP)](https://doi.org/10.48550/arXiv.2604.01621) targets layer-wise synchronization and token-exchange overhead in the prefill phase, where differences in sequence lengths and KV-cache hits can leave workers waiting for the slowest rank. DWDP keeps a resident subset of experts on each worker and asynchronously prefetches the remaining expert weights from its NVLink peers. Each worker computes on its own tokens, replacing synchronized token dispatch/combine with weight transfers that overlap with computation.
+
+DWDP can be applied to the prefill phase of a serving system when the context batch is large enough for computation to hide the weight prefetch. Decode typically has too little computation to hide these transfers, so generation keeps the normal EP dispatch. Experimental cost of DWDP is a TTFT regression, from a lower service rate on the context stage, plus extra prefetch memory: each rank stores only its local experts, but adds `num_prefetch_slots` prefetch slots (two by default) of about one layer of remote experts each; more slots let the prefetch run further ahead of the compute. DWDP cannot run on the same MoE path as EPLB. A disaggregated deployment can use DWDP on context servers and EPLB on generation servers.
+
+Each worker of a DWDP group stores a contiguous range of the routed experts and prefetches the others. Leave `dwdp_config.num_experts_per_worker` and `num_prefetch_experts` at 0 (the default) for the balanced partition: each worker stores `floor` or `ceil` of `num_experts / dwdp_size` experts, the lower ranks the larger count, and no expert is stored twice. Set both for a strided partition, where worker `r` stores the experts `[r * num_prefetch_experts, r * num_prefetch_experts + num_experts_per_worker)`: `num_prefetch_experts` is the stride between consecutive workers, not a number of prefetched experts. With `N = dwdp_size`, a strided partition takes one of three forms:
+
+- equal values whose ranges cover the experts exactly: `N * num_experts_per_worker == num_experts`;
+- equal values whose last range is cut short at `num_experts` and still holds at least one expert: `(N - 1) * num_experts_per_worker < num_experts < N * num_experts_per_worker`;
+- a smaller stride, whose ranges overlap, only when the last range ends exactly at `num_experts`: `(N - 1) * num_prefetch_experts + num_experts_per_worker == num_experts`.
+
+Any other combination raises on every rank when the model is built, since the expert count comes from the model.
+
+DWDP needs `moe_config.backend: CUTEDSL` (or `CUTEDSL_FC12`), or a tactic that names a CuteDSL NVFP4 implementation such as `cutedsl.grouped_gemm.nvfp4` or `fused_fc12`, and the launch is refused otherwise: it manages the MoE layers that run it with NVFP4 weights and no locality domains. Any other MoE layer, such as a BF16 MTP layer, keeps every expert on every rank, in memory the KV cache would otherwise get; the first such layer of each backend and reason logs a warning, and DWDP setup logs how many layers each reason covers.
+
+Usage: [`examples/dwdp/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md) and [blog19](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md).
+
+#### Dense DWDP
+
+Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.
+
+Dense DWDP frees memory; it does not by itself make a server faster. The gathers overlap with the compute of the layers before them, so with the same settings a server runs at about the speed it had without dense DWDP. The gain comes from spending the freed memory: raise `max_num_tokens` or the KV-cache share (`kv_cache_config.free_gpu_memory_fraction`) with it.
+
+It runs in one of two modes:
+
+- With expert DWDP, on the context servers of a DWDP group: the dense rows are sharded over the DWDP group, and the dense copies run on the copy stream of the expert prefetch, with its transfer.
+
+  ```yaml
+  dwdp_config:
+    dwdp_size: 16
+    enable_dense: true
+  moe_config:
+    backend: CUTEDSL
+  disable_overlap_scheduler: true
+  cuda_graph_config: null
+  ```
+
+- Without expert DWDP, on one attention-DP context instance: the dense rows are sharded over the attention-DP ranks of the instance, the copies run on a copy stream of their own, and the overlap scheduler may stay on.
+
+  ```yaml
+  tensor_parallel_size: 16
+  enable_attention_dp: true
+  dwdp_config:
+    enable_experts: false
+    enable_dense: true
+  cuda_graph_config: null
+  ```
+
+`dwdp_config.copy_mode` picks the transfer of every DWDP copy, the expert prefetch and the dense gathers alike: `per_slice` (one copy-engine copy per slice), `batched` (one batched copy-engine copy per layer) or `gather` (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). Left unset, the expert prefetch keeps its usual selection (`per_slice`, `batched` with `contention_opt`, `gather` with the `TRTLLM_DWDP_PREFETCH_GATHER` environment variable, which is deprecated), the dense copies follow it, and dense DWDP without expert DWDP uses `batched`. With `copy_mode: gather`, `dwdp_config.gather_kernel` picks the gather kernel: `register` or `tma` (bulk copies staged in shared memory, SM90 or newer). It replaces the deprecated `TRTLLM_DWDP_GATHER_KERNEL` environment variable, which still applies while `gather_kernel` is unset.
+
+`LLM()` and `trtllm-serve` check these settings when they build the LLM arguments, and each worker checks its host before the model is built. Dense DWDP needs:
+
+- eager execution: no `cuda_graph_config`, `torch_compile_config` or prefill CUDA graphs;
+- no `sleep_config`, `lora_config` or `speculative_config`;
+- `enable_locality_domains` off, and pipeline and context parallel size 1;
+- FABRIC peer memory handles (multi-node NVLink systems);
+- with expert DWDP, `dwdp_size > 1` and `disable_overlap_scheduler: true`, as expert DWDP requires, and tensor parallel size 1;
+- without expert DWDP, `enable_attention_dp: true` with `tensor_parallel_size > 1`, the MPI backend, and the gather kernel when `copy_mode` is `gather`. The expert DWDP fields (`dwdp_size`, `num_groups`, `num_experts_per_worker`, `num_prefetch_experts`, `contention_opt`, `num_prefetch_slots`) keep their defaults.
+
+Every server of a DWDP group must set the same `enable_dense`: setup compares it in its first collective, and a disagreement, or a setup failure on any rank, makes every rank of the group raise. A server whose launch is refused exits before it reaches that collective, and its DWDP peers wait for it there: with the store rendezvous until `TRTLLM_DWDP_RENDEZVOUS_TIMEOUT_S` (1800 s by default), under MPI without a limit. When a group does not come up, look for a refused server among its logs. Dense DWDP is meant for context servers; on a generation server every decode step would gather every covered layer. `trtllm-serve` refuses `enable_dense` on a generation server (`--server_role GENERATION`, `TRTLLM_DISAGG_ROLE=generation`, or a generation server of a disaggregated MPI launch, on every rank before the launch splits) and warns on a server without the context role, so launch context servers with `--server_role CONTEXT` (a gRPC server, which takes no `--server_role`, with `TRTLLM_DISAGG_ROLE=context`). A Kimi-K3 server with expert DWDP and `enable_dense` off still runs the first collective of dense setup at startup, so that a group whose servers disagree fails at once.
+
+## Appendix
+
+### MoE Perf Dashboard
+
+The **MoE Perf Dashboard** publishes MoE performance of typical workloads on key models. The recommended configuration in this guide is summarized from these sweeps. Browse it at [MoE Perf Dashboard](./moe-perf-dashboard.md).
+
+Covered Models with MoE Configuration:
+
+| Model | `num_experts` | `top_k` | `hidden_size` | `intermediate_size` |
+|---|---|---|---|---|
+| DeepSeek-V4-Pro | 384 | 6 | 7168 | 3072 |
+| GLM-5 | 256 | 8 | 6144 | 2048 |
+| Kimi-K2 | 384 | 8 | 7168 | 2048 |
+| Kimi-K3 | 896 | 16 | 3584 | 3072 |
+| Qwen3.8 | 512 | 10 | 8192 | 2048 |
+
+### Cross Validation of Microbenchmark with End-to-end Performance
+
+The microbenchmark ranks MoE configurations by module latency, without serving the full model. This ranking is validated against disaggregated serving.
+
+#### Baseline: the Pareto serving configuration
+
+The **baseline** is the MoE configuration on the **Pareto Curve** of the [InferenceX](https://inferencex.com) Dashboard. The curve comes from InferenceX's public benchmark (fixed ISL/OSL, sweeping concurrency and parallelism), and each point is Pareto-optimal for system throughput and per-user interactivity (`tps_per_user`).
+
+These configurations are published in [InferenceX](https://github.com/SemiAnalysisAI/InferenceX):
+- [Dashboard](https://inferencex.com): each point's tooltip shows the recipe (model, framework, precision, parallelism, ISL/OSL, concurrency) and a link to the GitHub Actions run.
+- [`nvidia-master.yaml`](https://github.com/SemiAnalysisAI/InferenceX/blob/main/inferencex-e2e/configs/nvidia-master.yaml): lists the disagg topology (`num-worker`, `tp`, `ep`, `dp-attn`, ISL/OSL, concurrency) and the `CONFIG_FILE` path.
+- [`NVIDIA/srt-slurm`](https://github.com/NVIDIA/srt-slurm): the `CONFIG_FILE` YAML holds the serving configuration (`moe_config.backend`, EP/TP, CUDA Graph, batch, MTP), for example [`ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml`](https://github.com/NVIDIA/srt-slurm/blob/sa-submission-q2-2026/recipes/trtllm/gb300-fp4/1k1k/mtp/ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml).
+
+#### How a Pareto point is compared to `bench_moe` microbenchmark?
+
+Each serving case `(ISL, OSL, instance layout, batch, MTP, concurrency)` is mapped to a `bench_moe` shape: the same model configuration, quantization, hardware, world size, `num_tokens` of the MoE forward, and CUDA Graph on or off. Candidates with the same deployed attention parallelism (DP or TP) are then ranked by module latency (`score_ms`, lower is better).
+
+The deployed MoE config is compared with that best `bench_moe` candidate and labeled **Match** if they are the same, **Mismatch** otherwise. Each Mismatch is evaluated in disaggregated serving with both the Pareto-curve configuration and the `bench_moe` candidate, and compared on `tps_per_user` (tokens per second per user).
+
+- **Improvement**: the `bench_moe` candidate raises `tps_per_user` by more than 3%.
+- **Flat**: the change is within ±3%.
+- **Regression**: the `bench_moe` candidate lowers `tps_per_user` by more than 3%.
+
+| Model | Hardware | Match | Mismatch | Improvement | Flat | Regression | Regression after Perfect Routing |
+|---|---|---|---|---|---|---|---|
+| DeepSeek-V4-Pro | GB300 | 92/108 (85.19%, prefill 54/54, decode 38/54) | 16/108 | 9/16 | 6/16 | 1/16 | 0/16 |
+| Kimi-K2 | GB200 | 33/50 (66%, prefill 25/25, decode 8/25) | 17/50 | 4/17 | 10/17 | 3/17 | 0/17 |
+| Kimi-K2 | GB300 | 35/50 (70%, prefill 25/25, decode 10/25) | 15/50 | 1/15 | 13/15 | 1/15 | 0/15 |
+| GLM-5 | GB200 | 75/92 (81.52%, prefill 43/46, decode 32/46) | 17/92 | 3/17 | 13/17 | 1/17 | 0/17 |
+| GLM-5 | GB300 | 36/90 (40.00%, prefill 1/45, decode 35/45) | 54/90 | 5/54 | 49/54 | 0/54 | 0/54 |
+| DeepSeek-R1 | GB200 | 92/104 (88.46%, prefill 49/52, decode 43/52) | 12/104 | 5/12 | 7/12 | 0/12 | 0/12 |
+
+Regression cases are re-run with **perfect routing** (balanced expert load). They go to zero in the table, indicating the end-to-end gap came from router skew, as `bench_moe` ranks under balanced expert load.
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+moe-perf-dashboard.md
+```

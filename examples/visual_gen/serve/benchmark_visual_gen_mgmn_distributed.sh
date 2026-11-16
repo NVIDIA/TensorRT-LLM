@@ -26,7 +26,8 @@
 #    - Replace <account> with your SLURM account name
 #    - Replace <partition> with your SLURM partition name
 #    - Adjust -N, --ntasks-per-node, and --gpus-per-node to match your config
-#    - Total GPUs must equal: cfg_size * ulysses_size (set in SERVER_CONFIG)
+#    - Total GPUs must equal: cfg_size * tp_size * ulysses_size * cp_size, where cp_size
+#      is attn2d_size[0] * attn2d_size[1] or ring_size (all set in SERVER_CONFIG)
 #
 # 2. Environment Variables (set before running sbatch, or edit defaults below):
 #    - CONTAINER_IMAGE: Docker image or enroot .sqsh image with TensorRT-LLM installed
@@ -34,22 +35,22 @@
 #    - MOUNT_DEST:      mount destination path inside the container (default: $HOME)
 #    - PROJECT_ROOT:    path to TensorRT-LLM source on the shared filesystem
 #    - MODEL:           HuggingFace Hub model ID or local path (default: Wan-AI/Wan2.2-T2V-A14B-Diffusers)
-#    - SERVER_CONFIG:   YAML config for trtllm-serve; set cfg_size * ulysses_size
-#                       to match total allocated GPUs (default: examples/visual_gen/serve/configs/wan.yml inside PROJECT_ROOT)
+#    - SERVER_CONFIG:   YAML config for trtllm-serve; its parallel_config must multiply
+#                       out to the total allocated GPUs (default: examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml inside PROJECT_ROOT)
 #    - BACKEND:         benchmark backend (default: openai-videos)
 #    - SERVER_PORT:     HTTP port for trtllm-serve (default: 8000)
 #    - SERVER_TIMEOUT:  seconds to wait for server readiness (default: 3600)
 #    - MASTER_PORT:     NCCL rendezvous port (default: 29500)
 #    - RESULT_DIR:      directory to save benchmark results (default: ./benchmark_results)
 #
-# 3. Benchmark parameters (SIZE, NUM_FRAMES, FPS, NUM_INFERENCE_STEPS, etc.):
+# 3. Benchmark parameters (WIDTH, HEIGHT, NUM_FRAMES, FPS, NUM_INFERENCE_STEPS, etc.):
 #    Override via environment variables or edit defaults in the section below.
 #
 # EXAMPLE USAGE:
 #   export CONTAINER_IMAGE="/path/to/tensorrt-llm.sqsh"
 #   export PROJECT_ROOT="/path/to/TensorRT-LLM"
 #   export MODEL="Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-#   export SERVER_CONFIG="/path/to/wan.yml"
+#   export SERVER_CONFIG="${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml"
 #   sbatch benchmark_visual_gen_mgmn_distributed.sh
 #
 ##############################################################################
@@ -64,12 +65,13 @@ export MOUNT_DIR="${MOUNT_DIR:-$HOME}"
 export MOUNT_DEST="${MOUNT_DEST:-$HOME}"
 
 export MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
-export SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/serve/configs/wan.yml}"
+export SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml}"
 export BACKEND="${BACKEND:-openai-videos}"
 export SERVER_PORT="${SERVER_PORT:-8000}"
 
 # Generation defaults
-export SIZE="${SIZE:-1280x720}"
+export WIDTH="${WIDTH:-1280}"
+export HEIGHT="${HEIGHT:-720}"
 export NUM_FRAMES="${NUM_FRAMES:-81}"
 export FPS="${FPS:-16}"
 export NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
@@ -108,6 +110,11 @@ wait_for_server() {
             echo "Server is ready (took ${elapsed}s)"
             return 0
         fi
+        # A dead server never answers /health; stop once its srun has exited.
+        if [ -n "${SERVER_PID:-}" ] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            echo "ERROR: server srun (PID ${SERVER_PID}) exited before becoming ready" >&2
+            return 1
+        fi
         sleep $interval
         elapsed=$((elapsed + interval))
         if [ $((elapsed % 30)) -eq 0 ]; then
@@ -139,7 +146,7 @@ echo "Server:              http://${MASTER_ADDR}:${SERVER_PORT}"
 echo "Nodes:               ${SLURM_NNODES}"
 echo "GPUs per node:       ${SLURM_GPUS_PER_NODE}"
 echo "Backend:             ${BACKEND}"
-echo "Size:                ${SIZE}"
+echo "Size:                ${WIDTH}x${HEIGHT}"
 if [ "$BACKEND" = "openai-videos" ]; then
 echo "Num frames:          ${NUM_FRAMES}"
 echo "FPS:                 ${FPS}"
@@ -166,6 +173,7 @@ echo "  Command: ${SERVER_CMD}"
 echo ""
 
 srun -l \
+    --kill-on-bad-exit=1 \
     --export=ALL \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
@@ -176,32 +184,44 @@ SERVER_PID=$!
 trap cleanup EXIT
 echo "  Server srun PID: ${SERVER_PID}"
 
-wait_for_server
+wait_for_server || exit 1
 
 # ---------------------------------------------------------------------------
 # Step 2: Run benchmark (rank-0 node only)
 # ---------------------------------------------------------------------------
+
+WORKLOAD_FILE="${RESULT_DIR}/workload.yaml"
+mkdir -p "${RESULT_DIR}"
+{
+  echo "backend: ${BACKEND}"
+  echo "common_params:"
+  echo "  width: ${WIDTH}"
+  echo "  height: ${HEIGHT}"
+  echo "  num_inference_steps: ${NUM_INFERENCE_STEPS}"
+  echo "  guidance_scale: ${GUIDANCE_SCALE}"
+  echo "  seed: ${SEED}"
+  if [ "$BACKEND" = "openai-videos" ]; then
+    echo "  num_frames: ${NUM_FRAMES}"
+    echo "  frame_rate: ${FPS}"
+  fi
+  echo "requests:"
+  # YAML single-quoted: ' is the only character needing an escape, by doubling.
+  for _ in $(seq 1 "${NUM_PROMPTS}"); do
+    echo "  - prompt: '${PROMPT//\'/\'\'}'"
+  done
+} > "${WORKLOAD_FILE}"
 
 export BENCHMARK_CMD="python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
     --model ${MODEL} \
     --backend ${BACKEND} \
     --host ${MASTER_ADDR} \
     --port ${SERVER_PORT} \
-    --prompt \"${PROMPT}\" \
-    --num-prompts ${NUM_PROMPTS} \
-    --size ${SIZE} \
-    --num-inference-steps ${NUM_INFERENCE_STEPS} \
-    --guidance-scale ${GUIDANCE_SCALE} \
-    --seed ${SEED} \
+    --workload ${WORKLOAD_FILE} \
     --max-concurrency ${MAX_CONCURRENCY} \
     --save-result \
     --save-detailed \
     --result-dir ${RESULT_DIR} \
     --metric-percentiles 50,90,99"
-
-if [ "$BACKEND" = "openai-videos" ]; then
-    BENCHMARK_CMD="${BENCHMARK_CMD} --num-frames ${NUM_FRAMES} --fps ${FPS}"
-fi
 
 echo ""
 echo "Step 2: Running benchmark..."
@@ -217,7 +237,7 @@ srun -l \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
     --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    sh -c 'eval "${BENCHMARK_CMD}"'
+    sh -c 'eval "${BENCHMARK_CMD}"' || exit 1
 
 echo ""
 echo "============================================"

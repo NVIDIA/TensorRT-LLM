@@ -1,4 +1,4 @@
-from utils.es import get_latest_license_preapproved_container_deps
+from utils.es import get_preapproved_deps
 
 from .common import load_json
 
@@ -42,7 +42,7 @@ def get_vulns(release_path):
 
 
 def get_preapproved_deps_map(scan_type):
-    preapproved_deps = get_latest_license_preapproved_container_deps(scan_type)
+    preapproved_deps = get_preapproved_deps(scan_type)
     map_preapproved_deps = {}
     for item in preapproved_deps:
         # Key by (name, type) so approvals are type-specific.

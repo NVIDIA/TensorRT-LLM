@@ -13,12 +13,44 @@ from tensorrt_llm._torch.modules.fla.utils import input_guard
 from tensorrt_llm._utils import get_sm_version
 
 _SMALL_GRID_HEAD_TILES = 512
+_BV16_MAX_HEAD_TILES = 64
+_BV32_MAX_HEAD_TILES = 128
+_RATIO2_FINE_MAPPING_MAX_HEAD_TILES = 256
 _EIGHT_WARP_COMMIT_HEAD_TILES = 1024
 _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
+# Decode batch size from which the partitioned replay and one all-layer checkpoint commit are used; smaller
+# batches commit inside each layer's replay (see MambaHybridCacheManager.gdn_replay_partitioned).
 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
+
+
+def _default_cached_replay_block_v(
+    use_tuned_bf16_mapping: bool,
+    head_tiles: int,
+    value_dim: int,
+) -> int:
+    """Select the replay value tile without changing its cache layout."""
+    if use_tuned_bf16_mapping:
+        if head_tiles <= _BV16_MAX_HEAD_TILES:
+            return 16
+        if head_tiles <= _BV32_MAX_HEAD_TILES:
+            return 32
+        if head_tiles <= _SMALL_GRID_HEAD_TILES:
+            return 64
+    return triton.next_power_of_2(value_dim)
+
+
+def _supports_fine_grained_replay_tiling(
+    num_key_heads: int,
+    num_value_heads: int,
+    head_tiles: int,
+) -> bool:
+    """Return whether the measured fine-grained value tiling applies."""
+    return num_value_heads == 4 * num_key_heads or (
+        num_value_heads == 2 * num_key_heads and head_tiles <= _RATIO2_FINE_MAPPING_MAX_HEAD_TILES
+    )
 
 
 @triton.jit
@@ -44,6 +76,7 @@ def _cached_replay_kernel(
     o,
     h0_source,
     h0_indices,
+    replay_indices,
     old_u,
     old_k,
     old_G,
@@ -51,6 +84,13 @@ def _cached_replay_kernel(
     pnat,
     scale,
     pool_stride_slot,
+    old_u_stride_slot,
+    old_k_stride_slot,
+    old_G_stride_slot,
+    pnat_stride,
+    cache_buf_idx_stride,
+    g_stride_row,
+    beta_stride_row,
     A_log,
     dt_bias,
     T: tl.constexpr,
@@ -77,7 +117,9 @@ def _cached_replay_kernel(
 
     old_u/old_k/old_G contain the prefix-invariant cached update vectors,
     normalized keys, and cumulative log-decay from the current checkpoint.
-    Only the T new cached updates are solved on each verify step.
+    Only the T new cached updates are solved on each verify step. The
+    checkpoint is addressed by the state slot from ``h0_indices``; the history
+    and its bookkeeping by the replay slot from ``replay_indices``.
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -94,19 +136,23 @@ def _cached_replay_kernel(
 
     slot = tl.load(h0_indices + i_n)
     if slot >= 0:
-        b_pnat = tl.load(pnat + slot)
-        b_buf = tl.load(cache_buf_idx + slot)
+        replay_slot = tl.load(replay_indices + i_n).to(tl.int64)
+        b_pnat = tl.load(pnat + replay_slot * pnat_stride)
+        b_buf = tl.load(cache_buf_idx + replay_slot * cache_buf_idx_stride)
         is_write = (b_pnat + T) > HIST
-        w_buf = tl.where(is_write, 1 - b_buf, b_buf)
+        w_buf = tl.where(is_write, 1 - b_buf, b_buf).to(tl.int64)
         w_off = tl.where(is_write, 0, b_pnat)
         is_hist = (o_hist < b_pnat) & mask_hist_capacity
 
-        hk_base = old_k + (slot.to(tl.int64) * 2 + b_buf) * HIST * H * K + i_h * K
-        hu_base = old_u + (slot.to(tl.int64) * 2 + b_buf) * HIST * HV * V + i_hv * V
-        hG_base = old_G + ((slot.to(tl.int64) * 2 + b_buf) * HV + i_hv) * HIST
-        wk_base = old_k + (slot.to(tl.int64) * 2 + w_buf) * HIST * H * K + i_h * K
-        wu_base = old_u + (slot.to(tl.int64) * 2 + w_buf) * HIST * HV * V + i_hv * V
-        wG_base = old_G + ((slot.to(tl.int64) * 2 + w_buf) * HV + i_hv) * HIST
+        k_slot = old_k + replay_slot * old_k_stride_slot
+        u_slot = old_u + replay_slot * old_u_stride_slot
+        G_slot = old_G + replay_slot * old_G_stride_slot
+        hk_base = k_slot + b_buf.to(tl.int64) * HIST * H * K + i_h * K
+        hu_base = u_slot + b_buf.to(tl.int64) * HIST * HV * V + i_hv * V
+        hG_base = G_slot + (b_buf.to(tl.int64) * HV + i_hv) * HIST
+        wk_base = k_slot + w_buf * HIST * H * K + i_h * K
+        wu_base = u_slot + w_buf * HIST * HV * V + i_hv * V
+        wG_base = G_slot + (w_buf * HV + i_hv) * HIST
 
         if USE_L2_SHARED_INPUTS:
             b_kh = tl.load(
@@ -192,12 +238,12 @@ def _cached_replay_kernel(
                 other=0,
             )
         b_g = tl.load(
-            g + (i_n * T + o_t) * HV + i_hv,
+            g + (i_n * T + o_t) * g_stride_row + i_hv,
             mask=mask_t,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta + (i_n * T + o_t) * HV + i_hv,
+            beta + (i_n * T + o_t) * beta_stride_row + i_hv,
             mask=mask_t,
             other=0.0,
         ).to(tl.float32)
@@ -220,8 +266,8 @@ def _cached_replay_kernel(
         if USE_QK_L2NORM_IN_KERNEL:
             b_kf = b_k.to(tl.float32)
             b_qf = b_q.to(tl.float32)
-            inv_k = 1.0 / (tl.sqrt(tl.sum(b_kf * b_kf, 1)) + 1e-6)
-            inv_q = scale / (tl.sqrt(tl.sum(b_qf * b_qf, 1)) + 1e-6)
+            inv_k = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + 1e-6)
+            inv_q = scale / tl.sqrt(tl.sum(b_qf * b_qf, 1) + 1e-6)
             b_kn = (b_kf * inv_k[:, None]).to(b_k.dtype)
             b_qn = (b_qf * inv_q[:, None]).to(b_q.dtype)
         else:
@@ -360,16 +406,22 @@ def _cached_replay_kernel(
 @triton.jit
 def _cached_replay_layered_commit_kernel(
     h0_source,
+    h0_descriptors,
     old_u,
     old_k,
     old_G,
+    history_descriptors,
     replay_work_items,
     n_writes,
+    work_item_stride,
     pool_stride_layer,
     pool_stride_slot,
     old_u_stride_layer,
     old_k_stride_layer,
     old_G_stride_layer,
+    old_u_stride_slot,
+    old_k_stride_slot,
+    old_G_stride_slot,
     HIST: tl.constexpr,
     BH: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
@@ -384,9 +436,19 @@ def _cached_replay_layered_commit_kernel(
     USE_L2_STATE_CACHE: tl.constexpr,
     USE_L2_STREAMING_INPUTS: tl.constexpr,
     USE_L2_SHARED_INPUTS: tl.constexpr,
+    USE_H0_DESCRIPTORS: tl.constexpr,
+    USE_HISTORY_DESCRIPTORS: tl.constexpr,
+    REPLAY_SLOT_FIELD: tl.constexpr,
     PIPE_STAGES: tl.constexpr,
 ):
-    """Advance every local GDN layer from one cached-history snapshot."""
+    """Advance every local GDN layer from one cached-history snapshot.
+
+    A work item addresses the checkpoint by its state slot (field 1) and the
+    history by its replay slot (field ``REPLAY_SLOT_FIELD``, or the state slot
+    when that is negative). Each layer's history is either at a fixed layer
+    stride from ``old_*`` or, with ``USE_HISTORY_DESCRIPTORS``, at the pointers
+    and slot strides of its ``history_descriptors`` row.
+    """
     pid = tl.program_id(0)
     total_work = tl.load(n_writes) * NUM_LAYERS * HV * NV
     for tile_id in tl.range(
@@ -404,10 +466,14 @@ def _cached_replay_layered_commit_kernel(
         work_idx = tile_id // NUM_LAYERS
         i_h = i_hv // (HV // H)
 
-        work_base = replay_work_items + work_idx * 4
+        work_base = replay_work_items + work_idx * work_item_stride
         slot = tl.load(work_base + 1).to(tl.int64)
         b_pnat = tl.load(work_base + 2)
-        b_buf = tl.load(work_base + 3)
+        b_buf = tl.load(work_base + 3).to(tl.int64)
+        if REPLAY_SLOT_FIELD >= 0:
+            replay_slot = tl.load(work_base + REPLAY_SLOT_FIELD).to(tl.int64)
+        else:
+            replay_slot = slot
         layer_i64 = layer.to(tl.int64)
 
         o_k = tl.arange(0, BK)
@@ -417,13 +483,21 @@ def _cached_replay_layered_commit_kernel(
         mask_v = o_v < V
         is_hist = (o_hist < b_pnat) & (o_hist < HIST)
 
-        hk_base = (
-            old_k + layer_i64 * old_k_stride_layer + (slot * 2 + b_buf) * HIST * H * K + i_h * K
-        )
-        hu_base = (
-            old_u + layer_i64 * old_u_stride_layer + (slot * 2 + b_buf) * HIST * HV * V + i_hv * V
-        )
-        hG_base = old_G + layer_i64 * old_G_stride_layer + ((slot * 2 + b_buf) * HV + i_hv) * HIST
+        if USE_HISTORY_DESCRIPTORS:
+            descriptor = history_descriptors + layer_i64 * 6
+            layer_u = tl.load(descriptor).to(tl.pointer_type(old_u.type.element_ty))
+            layer_k = tl.load(descriptor + 1).to(tl.pointer_type(old_k.type.element_ty))
+            layer_G = tl.load(descriptor + 2).to(tl.pointer_type(old_G.type.element_ty))
+            u_slot = layer_u + replay_slot * tl.load(descriptor + 3)
+            k_slot = layer_k + replay_slot * tl.load(descriptor + 4)
+            G_slot = layer_G + replay_slot * tl.load(descriptor + 5)
+        else:
+            u_slot = old_u + layer_i64 * old_u_stride_layer + replay_slot * old_u_stride_slot
+            k_slot = old_k + layer_i64 * old_k_stride_layer + replay_slot * old_k_stride_slot
+            G_slot = old_G + layer_i64 * old_G_stride_layer + replay_slot * old_G_stride_slot
+        hk_base = k_slot + b_buf * HIST * H * K + i_h * K
+        hu_base = u_slot + b_buf * HIST * HV * V + i_hv * V
+        hG_base = G_slot + (b_buf * HV + i_hv) * HIST
 
         if USE_L2_SHARED_INPUTS:
             b_kh = tl.load(
@@ -454,14 +528,22 @@ def _cached_replay_layered_commit_kernel(
         b_Gh = tl.load(hG_base + o_hist, mask=is_hist, other=0.0).to(tl.float32)
         g_start = tl.load(hG_base + b_pnat - 1).to(tl.float32)
 
-        p_h0 = (
-            h0_source
-            + layer_i64 * pool_stride_layer
-            + slot * pool_stride_slot
-            + i_hv * V * K
-            + o_k[:, None]
-            + o_v[None, :] * K
-        )
+        if USE_H0_DESCRIPTORS:
+            descriptor = h0_descriptors + layer_i64 * 2
+            layer_h0 = tl.load(descriptor).to(tl.pointer_type(h0_source.type.element_ty))
+            layer_slot_stride = tl.load(descriptor + 1)
+            p_h0 = (
+                layer_h0 + slot * layer_slot_stride + i_hv * V * K + o_k[:, None] + o_v[None, :] * K
+            )
+        else:
+            p_h0 = (
+                h0_source
+                + layer_i64 * pool_stride_layer
+                + slot * pool_stride_slot
+                + i_hv * V * K
+                + o_k[:, None]
+                + o_v[None, :] * K
+            )
         if USE_L2_STATE_CACHE:
             b_h = tl.load(
                 p_h0,
@@ -491,29 +573,140 @@ def _cached_replay_layered_commit_kernel(
         )
 
 
+def _assert_dense_from(tensor: torch.Tensor, dim: int, name: str) -> None:
+    """Dimensions ``dim`` onward must be dense; the ones before may have any stride."""
+    expected = []
+    step = 1
+    for size in reversed(tensor.shape[dim:]):
+        expected.append(step)
+        step *= size
+    actual = tensor.stride()[dim:]
+    assert all(
+        size == 1 or stride == want
+        for size, stride, want in zip(tensor.shape[dim:], actual, reversed(expected))
+    ), f"{name} must be dense from dimension {dim}; got strides {tensor.stride()}"
+
+
+# Columns of a history descriptor row: per-layer base pointers of old_u, old_k
+# and old_G, then their slot strides in elements.
+_HISTORY_DESCRIPTOR_WIDTH = 6
+
+
+def build_gdn_history_descriptors(
+    old_u: list[torch.Tensor], old_k: list[torch.Tensor], old_G: list[torch.Tensor]
+) -> torch.Tensor:
+    """Describe per-layer ``[slots, 2, ...]`` history views for the all-layer commit.
+
+    Use it when the layers' views are not evenly spaced in memory. Every view
+    must be dense after its slot dimension.
+    """
+    assert len(old_u) == len(old_k) == len(old_G) > 0
+    rows = []
+    for u, k, G in zip(old_u, old_k, old_G, strict=True):
+        for name, tensor in (("old_u", u), ("old_k", k), ("old_G", G)):
+            _assert_dense_from(tensor, 1, name)
+        rows.append(
+            (u.data_ptr(), k.data_ptr(), G.data_ptr(), u.stride(0), k.stride(0), G.stride(0))
+        )
+    return torch.tensor(rows, dtype=torch.int64, device=old_u[0].device)
+
+
 def commit_gdn_cached_replay_history_layers(
     *,
     ssm_states: torch.Tensor,
+    ssm_state_descriptors: Optional[torch.Tensor] = None,
+    ssm_state_num_layers: Optional[int] = None,
+    ssm_state_layer_stride: Optional[int] = None,
+    ssm_state_slot_stride: Optional[int] = None,
     old_u: torch.Tensor,
     old_k: torch.Tensor,
     old_G: torch.Tensor,
     replay_work_items: torch.Tensor,
     n_writes: torch.Tensor,
     history_size: int,
+    history_descriptors: Optional[torch.Tensor] = None,
     persistent_waves: int = 2,
     commit_block_v: Optional[int] = None,
     commit_num_warps: Optional[int] = None,
     commit_pipeline_stages: Optional[int] = None,
 ) -> None:
-    """Advance all local layer checkpoints from cached replay histories."""
-    num_layers, _, HV, V, K = ssm_states.shape
-    assert old_u.ndim == 6 and old_k.ndim == 6 and old_G.ndim == 5
+    """Advance all local layer checkpoints from cached replay histories.
+
+    The history is either stacked ``[layers, slots, 2, ...]`` tensors, with any
+    layer and slot strides, or, with ``history_descriptors`` from
+    :func:`build_gdn_history_descriptors`, the first layer's ``[slots, 2, ...]``
+    views (for dtype and shape) and one descriptor row per layer. Work items of
+    width ``REPLAY_WORK_ITEM_WIDTH`` address the history by their replay slot;
+    narrower rows by their state slot.
+    """
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import REPLAY_WORK_REPLAY_SLOT
+
+    use_state_descriptors = ssm_state_descriptors is not None
+    state_stride_args = (
+        ssm_state_num_layers,
+        ssm_state_layer_stride,
+        ssm_state_slot_stride,
+    )
+    use_state_strides = any(value is not None for value in state_stride_args)
+    assert not (use_state_descriptors and use_state_strides)
+    if use_state_descriptors or use_state_strides:
+        assert ssm_states.ndim == 4
+        _, HV, V, K = ssm_states.shape
+        if use_state_descriptors:
+            assert ssm_state_descriptors is not None
+            assert ssm_state_descriptors.ndim == 2 and ssm_state_descriptors.shape[1] == 2
+            assert ssm_state_descriptors.dtype == torch.int64
+            assert ssm_state_descriptors.device == ssm_states.device
+            assert ssm_state_descriptors.is_contiguous()
+            num_layers = ssm_state_descriptors.shape[0]
+            pool_stride_layer = 0
+            pool_stride_slot = 0
+        else:
+            assert all(value is not None for value in state_stride_args)
+            assert ssm_state_num_layers is not None
+            assert ssm_state_layer_stride is not None
+            assert ssm_state_slot_stride is not None
+            num_layers = ssm_state_num_layers
+            pool_stride_layer = ssm_state_layer_stride
+            pool_stride_slot = ssm_state_slot_stride
+            assert num_layers > 0 and pool_stride_slot > 0
+            assert num_layers == 1 or pool_stride_layer != 0
+    else:
+        assert ssm_states.ndim == 5
+        num_layers, _, HV, V, K = ssm_states.shape
+        pool_stride_layer = ssm_states.stride(0)
+        pool_stride_slot = ssm_states.stride(1)
+    use_history_descriptors = history_descriptors is not None
+    if use_history_descriptors:
+        assert old_u.ndim == 5 and old_k.ndim == 5 and old_G.ndim == 4
+        assert history_descriptors.shape == (num_layers, _HISTORY_DESCRIPTOR_WIDTH)
+        assert history_descriptors.dtype == torch.int64
+        assert history_descriptors.device == ssm_states.device
+        assert history_descriptors.is_contiguous()
+        history_dense_dim = 1
+        layer_strides = (0, 0, 0)
+        slot_strides = (0, 0, 0)
+    else:
+        assert old_u.ndim == 6 and old_k.ndim == 6 and old_G.ndim == 5
+        assert old_u.shape[0] == num_layers
+        assert old_k.shape[0] == num_layers
+        assert old_G.shape[0] == num_layers
+        history_dense_dim = 2
+        layer_strides = (old_u.stride(0), old_k.stride(0), old_G.stride(0))
+        slot_strides = (old_u.stride(1), old_k.stride(1), old_G.stride(1))
     H = old_k.shape[-2]
-    assert old_u.shape[0] == num_layers and old_u.shape[-2:] == (HV, V)
-    assert old_k.shape[0] == num_layers and old_k.shape[-1] == K
-    assert old_G.shape[0] == num_layers and old_G.shape[-2:] == (HV, history_size)
-    assert old_u.is_contiguous() and old_k.is_contiguous() and old_G.is_contiguous()
-    assert replay_work_items.ndim == 2 and replay_work_items.shape[1] == 4
+    assert old_u.shape[-4:] == (2, history_size, HV, V)
+    assert old_k.shape[-4:] == (2, history_size, H, K)
+    assert old_G.shape[-3:] == (2, HV, history_size)
+    for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):
+        _assert_dense_from(tensor, history_dense_dim, name)
+    # Rows start with (position, state slot, PNAT, active buffer); full-width
+    # rows add the replay slot.
+    assert replay_work_items.ndim == 2 and replay_work_items.shape[1] >= 4
+    assert replay_work_items.stride(1) == 1
+    replay_slot_field = (
+        REPLAY_WORK_REPLAY_SLOT if replay_work_items.shape[1] > REPLAY_WORK_REPLAY_SLOT else -1
+    )
     assert replay_work_items.dtype == torch.int32
     assert n_writes.dtype == torch.int32 and n_writes.numel() == 1
     assert persistent_waves > 0
@@ -569,16 +762,22 @@ def commit_gdn_cached_replay_history_layers(
     num_persistent = min(num_sms * persistent_waves, total_tiles)
     _cached_replay_layered_commit_kernel[(num_persistent,)](
         h0_source=ssm_states,
+        h0_descriptors=(ssm_state_descriptors if ssm_state_descriptors is not None else n_writes),
         old_u=old_u,
         old_k=old_k,
         old_G=old_G,
+        history_descriptors=(history_descriptors if use_history_descriptors else n_writes),
         replay_work_items=replay_work_items,
         n_writes=n_writes,
-        pool_stride_layer=ssm_states.stride(0),
-        pool_stride_slot=ssm_states.stride(1),
-        old_u_stride_layer=old_u.stride(0),
-        old_k_stride_layer=old_k.stride(0),
-        old_G_stride_layer=old_G.stride(0),
+        work_item_stride=replay_work_items.stride(0),
+        pool_stride_layer=pool_stride_layer,
+        pool_stride_slot=pool_stride_slot,
+        old_u_stride_layer=layer_strides[0],
+        old_k_stride_layer=layer_strides[1],
+        old_G_stride_layer=layer_strides[2],
+        old_u_stride_slot=slot_strides[0],
+        old_k_stride_slot=slot_strides[1],
+        old_G_stride_slot=slot_strides[2],
         HIST=history_size,
         BH=BH,
         NUM_LAYERS=num_layers,
@@ -593,6 +792,9 @@ def commit_gdn_cached_replay_history_layers(
         USE_L2_STATE_CACHE=use_large_workload_mapping,
         USE_L2_STREAMING_INPUTS=use_large_workload_mapping,
         USE_L2_SHARED_INPUTS=use_large_workload_mapping,
+        USE_H0_DESCRIPTORS=use_state_descriptors,
+        USE_HISTORY_DESCRIPTORS=use_history_descriptors,
+        REPLAY_SLOT_FIELD=replay_slot_field,
         PIPE_STAGES=commit_pipeline_stages,
         num_warps=commit_num_warps,
         num_stages=commit_pipeline_stages,
@@ -604,6 +806,8 @@ def commit_gdn_cached_replay_history_layers(
         "q",
         "k",
         "v",
+        "g",
+        "beta",
         "packed_qkv",
         "ssm_states",
         "old_u",
@@ -648,13 +852,27 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     packed_qkv: Optional[torch.Tensor] = None,
     use_all_layer_commit: bool = False,
     output: Optional[torch.Tensor] = None,
+    replay_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """GDN replay using cached causal updates rather than raw history."""
+    """GDN replay using cached causal updates rather than raw history.
+
+    ``state_indices`` address the checkpoint in ``ssm_states``. The history
+    (``old_u``, ``old_k``, ``old_G``: ``[slots, 2, ...]``, dense after the slot
+    dimension) and its per-slot ``prev_num_accepted_tokens`` and
+    ``cache_buf_idx`` (any element stride) are addressed by ``replay_indices``,
+    which default to ``state_indices``.
+    """
     del old_beta  # Signature-compatible placeholder; cached updates embed beta.
     N, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[3]
     assert q.shape == k.shape
     assert v.shape[:2] == (N, T)
+    assert g.shape == (N, T, HV)
+    assert beta.shape == (N, T, HV)
+    assert g.stride(2) == 1, "g head dimension must be contiguous"
+    assert beta.stride(2) == 1, "beta head dimension must be contiguous"
+    assert g.stride(0) == T * g.stride(1), "g token rows must have a uniform stride"
+    assert beta.stride(0) == T * beta.stride(1), "beta token rows must have a uniform stride"
     use_packed_qkv = packed_qkv is not None
     if use_packed_qkv:
         qkv_width = 2 * H * K + HV * V
@@ -669,25 +887,28 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
         v = v.contiguous()
         packed_qkv = q
     BK = triton.next_power_of_2(K)
-    # GB200 dispatch for the production Qwen3.5 MTP per-CTA shape. Balanced
-    # DEP and TEP runs at the same global batch have the same N * HV head-tile
-    # count, so use that workload measure instead of topology-specific H/HV
-    # values or the per-rank batch alone.
-    use_tuned_bf16_mapping = (
-        T == 4
+    # The complete workload mapping is retained for the 4:1 shape; the
+    # 2:1 fine tiling is enabled only through the measured low-batch range.
+    # Other step widths take the BV=16 tiling up to _BV16_MAX_HEAD_TILES; its
+    # outputs and committed states equal the BV=128 launch bitwise.
+    head_tiles = N * HV
+    use_production_bf16_shape = (
+        (T == 4 or (2 <= T and head_tiles <= _BV16_MAX_HEAD_TILES))
         and history_size <= 16
-        and HV == 4 * H
         and K == 128
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
-    head_tiles = N * HV
-    use_small_grid_mapping = use_tuned_bf16_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
+    use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
+    use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
+        H, HV, head_tiles
+    )
+    use_small_grid_mapping = use_fine_grained_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
     if block_v is None:
-        block_v = 64 if use_small_grid_mapping else triton.next_power_of_2(V)
+        block_v = _default_cached_replay_block_v(use_fine_grained_mapping, head_tiles, V)
     if num_warps is None:
         num_warps = (
-            2 if use_tuned_bf16_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
+            2 if use_fine_grained_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
         )
     BV = block_v
     use_large_workload_mapping = (
@@ -729,12 +950,20 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
 
     s_h0_0, s_h0_1, s_h0_2, s_h0_3 = ssm_states.stride()
     assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
+    assert old_u.shape[1:] == (2, history_size, HV, V)
+    assert old_k.shape[1:] == (2, history_size, H, K)
+    assert old_G.shape[1:] == (2, HV, history_size)
     for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):
-        assert tensor.is_contiguous(), f"{name} must be contiguous"
+        _assert_dense_from(tensor, 1, name)
+    if replay_indices is None:
+        replay_indices = state_indices
+    else:
+        assert replay_indices.shape[0] >= N and replay_indices.stride(0) == 1
+    assert prev_num_accepted_tokens.ndim == 1 and cache_buf_idx.ndim == 1
     if (replay_work_items is None) != (n_writes is None):
         raise ValueError("replay_work_items and n_writes must either both be set or both be None")
     if replay_work_items is not None:
-        assert replay_work_items.shape == (N, 4)
+        assert replay_work_items.shape[0] == N and replay_work_items.shape[1] >= 4
         assert replay_work_items.dtype == torch.int32
         assert replay_work_items.is_contiguous()
         assert n_writes is not None and n_writes.dtype == torch.int32
@@ -766,6 +995,7 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
             o=output,
             h0_source=ssm_states,
             h0_indices=state_indices,
+            replay_indices=replay_indices,
             old_u=old_u,
             old_k=old_k,
             old_G=old_G,
@@ -773,6 +1003,13 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
             pnat=prev_num_accepted_tokens,
             scale=scale,
             pool_stride_slot=s_h0_0,
+            old_u_stride_slot=old_u.stride(0),
+            old_k_stride_slot=old_k.stride(0),
+            old_G_stride_slot=old_G.stride(0),
+            pnat_stride=prev_num_accepted_tokens.stride(0),
+            cache_buf_idx_stride=cache_buf_idx.stride(0),
+            g_stride_row=g.stride(1),
+            beta_stride_row=beta.stride(1),
             A_log=A_log,
             dt_bias=dt_bias,
             T=T,

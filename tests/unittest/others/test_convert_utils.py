@@ -22,9 +22,12 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+import pytest
 import torch
 
 from tensorrt_llm.models.convert_utils import load_state_dict
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestLoadStateDict(unittest.TestCase):

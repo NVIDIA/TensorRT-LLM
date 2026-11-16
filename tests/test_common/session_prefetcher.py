@@ -40,15 +40,14 @@ post-drain rebuild, post-retire replacement) via ``take``/``schedule_shadow``
 — the two layers compose: reuse covers the steady state, prefetch covers the
 misses.
 
-Rollout: currently in a CANARY phase (reviewer request) — with no explicit
-setting the plugin is active only on the stage groups in
-``_CANARY_STAGE_PREFIXES`` (CI exports the stage name as ``stageName``).
-``TRTLLM_TEST_PREFETCH_SESSION=1``/``0`` overrides in either direction and
-remains the permanent kill switch. Suites that never import tensorrt_llm's
-executor modules pay nothing — not even the tensorrt_llm import.
+Enabled by default; ``TRTLLM_TEST_PREFETCH_SESSION=0`` disables BOTH pool
+prefetch and weight warming (one kill switch for the whole plugin). Suites
+that never import tensorrt_llm's executor modules pay nothing — not even
+the tensorrt_llm import.
 """
 
 import glob
+import math
 import os
 import sys
 import threading
@@ -72,16 +71,59 @@ _PATCH_TARGETS = (
     "tensorrt_llm.llmapi.llm",
 )
 
-# Canary rollout stage GROUPS (one multi-GPU LLM-dense, one single-GPU
-# LLM-dense). Prefixes, not exact names: the numbered shard suffix (-1/-2/…)
-# is assigned by dynamic load balancing and cannot be targeted stably.
-# Graduation plan: after a week of clean canary runs (zero failures
-# attributed to the plugin, healthy session-summary counters) this gate is
-# removed and the plugin returns to enabled-by-default.
-_CANARY_STAGE_PREFIXES = (
-    "DGX_H100-4_GPUs-PyTorch-DeepSeek",
-    "A10-PyTorch",
-)
+# Identity collection is followed by one lightweight diagnostic submitted to
+# the workers. Keep enough room for that hand-off after the lower-level
+# bootstrap deadline expires.
+_SHADOW_BUILD_FINISH_GRACE = 30.0
+_FALLBACK_IDENTITY_TIMEOUT = 300.0
+
+
+def _log(message: str) -> None:
+    """Write one diagnostic line straight to file descriptor 1.
+
+    Most messages come from the build, warm, and discard threads. ``print()``
+    would resolve ``sys.stdout``, which pytest swaps on every test phase and
+    frees at teardown of each test's ``capfd``/``capsys`` capture. CPython
+    3.12.3, the CI interpreter, keeps only a borrowed reference to it inside
+    ``print()``, so a print racing that teardown can write to a freed stream
+    and crash the pytest process. Writing the descriptor reaches the same
+    destination, since pytest's fd capture redirects fd 1, without touching a
+    Python stream object.
+
+    Best-effort: a failed write is dropped so it can never skip the cleanup
+    that follows a log call.
+    """
+    try:
+        os.write(1, f"{message}\n".encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
+def _fallback_identity_timeout() -> float:
+    """Mirror the lower-level env contract while its module is still loading."""
+    raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                return value
+        except ValueError:
+            pass
+    return _FALLBACK_IDENTITY_TIMEOUT
+
+
+def _shadow_build_wait_timeout() -> float:
+    """Upper-level wait budget derived from the MPI bootstrap deadline.
+
+    Do not import TensorRT-LLM here: this plugin must stay usable by pure-logic
+    tests and suites without built bindings. A real shadow build imports
+    ``mpi_session`` before it can construct a pool, so the live lower-level
+    setting is present by the time ``take()`` waits on that build.
+    """
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    timeout_fn = getattr(mpi_session, "_identity_barrier_timeout", None)
+    identity_timeout = timeout_fn() if timeout_fn is not None else _fallback_identity_timeout()
+    return identity_timeout + _SHADOW_BUILD_FINISH_GRACE
 
 
 def _reuse_layer_active() -> bool:
@@ -202,10 +244,9 @@ def warm_page_cache(model_dir: str) -> float:
     if available is not None and total_bytes > available:
         # Larger than RAM: pages would be evicted before the test loads them —
         # pure filer traffic with zero benefit (e.g. multi-hundred-GB models).
-        print(
+        _log(
             f"[session-prefetch] skipping warm of {model_dir}: {total_bytes >> 30} GiB "
-            f"exceeds available host memory ({available >> 30} GiB)",
-            flush=True,
+            f"exceeds available host memory ({available >> 30} GiB)"
         )
         return 0.0
     t0 = time.monotonic()
@@ -225,10 +266,9 @@ def warm_page_cache(model_dir: str) -> float:
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="session-prefetch-io") as ex:
         total = sum(ex.map(_read, files))
     gib = total / (1 << 30)
-    print(
+    _log(
         f"[session-prefetch] warmed page cache: {gib:.1f} GiB from "
-        f"{model_dir} in {time.monotonic() - t0:.1f}s",
-        flush=True,
+        f"{model_dir} in {time.monotonic() - t0:.1f}s"
     )
     return gib
 
@@ -255,11 +295,67 @@ class _Built(NamedTuple):
     snapshot: object
 
 
+def _prefetched_workers_alive(session: object) -> bool:
+    """Whether every recorded worker is still the process spawned for this pool.
+
+    ``MpiPoolSession(wait_shutdown=True)`` records a complete set of
+    ``(pid, start_time)`` identities before a pool can be published. Checking
+    both values rejects workers that exited after publication without
+    mistaking a recycled PID for the original process.
+    """
+    identities = getattr(session, "_worker_identities", ())
+    if len(identities) != getattr(session, "n_workers", None):
+        return False
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return False
+    return all(
+        start_time is not None and process_start_time(pid) == start_time
+        for pid, start_time in identities
+    )
+
+
+def _reap_dead_pool(session: object) -> None:
+    """Abandon a part-dead pool and SIGKILL whichever workers are still up.
+
+    ``abandon()`` only disconnects the parent side. With a rank already gone the
+    manager thread stays wedged in MPI, so the survivors are never told to exit
+    and keep their GPU memory while the replacement pool spawns on top of them.
+    Mirrors ``MpiPoolSession._teardown_unidentified_pool``, recycling guard
+    included.
+    """
+    import signal
+
+    try:
+        session.abandon()
+    except Exception as exc:  # noqa: BLE001
+        # Broad on purpose: this pool is already known part-dead, so abandon()
+        # reaches into mpi4py with a rank missing and can fail in ways MPI does
+        # not enumerate. Swallowing is required -- the SIGKILL sweep below is
+        # what actually reclaims the survivors' GPU memory, and it must run
+        # whatever abandon() did. Surface it instead of passing silently.
+        _log(f"[session-prefetch] WARNING: abandon() failed on a part-dead pool: {exc!r}")
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return
+    for pid, start_time in getattr(session, "_worker_identities", ()):
+        if start_time is None or process_start_time(pid) != start_time:
+            continue  # already gone, or the PID was recycled
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
+        self._drain_lock = threading.Lock()
         self._thread = None
         self._building_spec = None  # spec of the in-flight build, while _thread is set
+        self._build_timed_out = False
         self._build_gen = 0  # bumped when a pending build is abandoned
         self._built = None  # Optional[_Built], set only by _publish()
         self._patched = set()
@@ -280,17 +376,12 @@ class SessionPrefetcher:
         # pool plus a spare. Disable in xdist workers.
         if os.environ.get("PYTEST_XDIST_WORKER"):
             return False
-        explicit = os.environ.get("TRTLLM_TEST_PREFETCH_SESSION")
-        if explicit is not None:
-            return explicit.lower() in ("1", "true", "yes", "on")
-        # Canary rollout (reviewer request): with no explicit setting, enable
-        # only on the canary stage GROUPS. CI exports the stage name as
-        # ``stageName``; prefix matching covers dynamically numbered shards
-        # (per-shard targeting is impossible — the split is rebalanced as the
-        # test list changes). Everywhere else (including runs without a
-        # stageName) the plugin stays off until the canary graduates.
-        stage = os.environ.get("stageName", "")
-        return any(stage.startswith(p) for p in _CANARY_STAGE_PREFIXES)
+        return os.environ.get("TRTLLM_TEST_PREFETCH_SESSION", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
     @staticmethod
     def _next_model_map(items):
@@ -344,14 +435,16 @@ class SessionPrefetcher:
                 else:
                     self.stats["warm_noops"] += 1  # no local weights / RAM guard
         except Exception as e:  # warming must never break the tests
-            print(f"[session-prefetch] page-cache warm failed (harmless): {e}", flush=True)
+            _log(f"[session-prefetch] page-cache warm failed (harmless): {e}")
 
     def schedule_shadow(self, spec: int, env_overlay=None) -> None:
         """Start building a spare ``spec``-worker pool in the background.
 
         Heuristic: the next test most likely needs a pool of the same size as
-        the current one. A miss is discarded at ``take()`` and the sync build
-        is no slower than without prefetch.
+        the current one. A mismatched in-flight build is drained before a
+        synchronous miss to preserve allocation-wide single-flight. This can
+        add latency when the size prediction is wrong, but avoids two MPI
+        bootstraps contending on the same allocation.
 
         ``env_overlay``: extra env vars to freeze into the WORKERS at spawn
         (session_reuse restocks shadows with its worker-side weight cache
@@ -365,6 +458,7 @@ class SessionPrefetcher:
             if self._thread is not None or (self._built is not None and self._built.spec == spec):
                 return  # already building / built
             self._building_spec = spec
+            self._build_timed_out = False
             self._thread = threading.Thread(
                 target=self._build,
                 args=(spec, self._build_gen, env_overlay),
@@ -386,17 +480,13 @@ class SessionPrefetcher:
             # out blocks its shutdown on actual worker exit.
             session = MpiPoolSession(n_workers=spec, wait_shutdown=True, env_overrides=env_overlay)
             if any(session.submit_sync(_worker_import_report_cuda)):
-                print(
+                _log(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
-                    "CUDA context in the prefetched workers (library version behavior)",
-                    flush=True,
+                    "CUDA context in the prefetched workers (library version behavior)"
                 )
             self._publish(spec, session, snapshot, gen)
         except Exception as e:  # prefetch must never break the tests
-            print(
-                f"[session-prefetch] background build failed (falling back to synchronous): {e}",
-                flush=True,
-            )
+            _log(f"[session-prefetch] background build failed (falling back to synchronous): {e}")
 
     def _publish(self, spec, session, snapshot, gen: int) -> None:
         """Publish a finished background build, unless it was abandoned.
@@ -413,48 +503,83 @@ class SessionPrefetcher:
                 self.stats["pools_built"] += 1
                 return
             self.stats["pools_discarded_superseded"] += 1
-        print("[session-prefetch] discarding superseded background build", flush=True)
+        _log("[session-prefetch] discarding superseded background build")
         session.shutdown()
 
-    def _drain(self, timeout: float):
-        """Join a pending build (abandoning it on timeout) and pop the slot."""
-        # Read _thread under the lock: schedule_shadow() assigns-then-starts
-        # inside its critical section, and an unlocked read here can observe
-        # the assigned-but-not-yet-started thread ("cannot join thread before
-        # it is started" when a test creates LLMs concurrently).
-        with self._lock:
-            thread = self._thread
-        if thread is not None:
-            thread.join(timeout=timeout)
-        with self._lock:
-            if thread is not None and thread.is_alive():
-                # Abandon the overdue build: bump the generation so its late
-                # _publish() shuts the pool down instead of landing.
-                self._build_gen += 1
-            self._thread = None
-            built, self._built = self._built, None
-        return built
+    def _drain(self, timeout: float | None = None) -> _Built | None:
+        """Join a pending build and pop the completed shadow slot.
 
-    def take(self, spec: int):
+        A live build is kept registered and marked terminal on timeout.
+        Callers fail closed instead of starting a second pool while the first
+        bootstrap is still running; later calls fail immediately until the
+        thread exits, then clear the terminal state.
+        """
+        # Serialize drains so concurrent LLM construction cannot make multiple
+        # callers wait through the full deadline before one records the
+        # terminal timeout.
+        with self._drain_lock:
+            # Read _thread under the lock: schedule_shadow() assigns-then-starts
+            # inside its critical section, and an unlocked read here can observe
+            # the assigned-but-not-yet-started thread ("cannot join thread before
+            # it is started" when a test creates LLMs concurrently).
+            with self._lock:
+                thread = self._thread
+                build_timed_out = self._build_timed_out
+            if thread is not None:
+                if build_timed_out and thread.is_alive():
+                    raise TimeoutError(
+                        "session-prefetch shadow build previously timed out and "
+                        "is still running; refusing to start a concurrent MPI pool"
+                    )
+                if not build_timed_out:
+                    if timeout is None:
+                        timeout = _shadow_build_wait_timeout()
+                    thread.join(timeout=timeout)
+            with self._lock:
+                if thread is not None and thread.is_alive():
+                    # Invalidate a late publish but retain _thread so
+                    # schedule_shadow() cannot start another build alongside it.
+                    if not self._build_timed_out:
+                        self._build_timed_out = True
+                        self._build_gen += 1
+                        self.stats["pool_build_timeouts"] += 1
+                    raise TimeoutError(
+                        "session-prefetch shadow build did not finish within "
+                        f"{timeout}s; refusing to start a concurrent MPI pool"
+                    )
+                self._thread = None
+                self._building_spec = None
+                self._build_timed_out = False
+                built, self._built = self._built, None
+            return built
+
+    def take(self, spec: int) -> object | None:
         """Return a prefetched session for ``spec``, or None to build sync."""
         if not self.enabled:
             return None
-        with self._lock:
-            wrong_size_in_flight = (
-                self._thread is not None and self._built is None and self._building_spec != spec
-            )
-        if wrong_size_in_flight:
-            # Joining would stall this caller for most of a spawn only to
-            # discard the mismatched result — slower than no prefetch at all.
-            # Fall back to the synchronous spawn now and leave the build to
-            # land for a later take of its own size.
-            self.stats["pools_skipped_size_in_flight"] += 1
-            return None
-        # Slowest legitimate build measured is ~117s (busy node); 180s gives
-        # 1.5x margin. On a genuine hang we give up and fall back to a
-        # synchronous build instead of stalling the suite.
-        built = self._drain(timeout=180)
+        # The upper-level deadline is derived from the identity barrier's
+        # bootstrap deadline plus a small post-bootstrap diagnostic grace.
+        # It must never expire while the lower layer still considers the
+        # in-flight pool healthy. A wrong-size build is also drained before
+        # returning a miss: starting the requested size alongside it would
+        # recreate the same concurrent-bootstrap contention.
+        built = self._drain()
         if built is None:
+            return None
+        if not _prefetched_workers_alive(built.session):
+            # A worker may die after the background build publishes its pool.
+            # Never hand that unusable executor to the next test: its queued
+            # initialization task would have no worker and can wait until the
+            # outer pytest timeout. The dead world cannot be joined, so
+            # abandon it before the synchronous fallback.
+            self.stats["pools_discarded_dead"] += 1
+            _log("[session-prefetch] discarding prefetched pool with dead worker")
+            threading.Thread(
+                target=_reap_dead_pool,
+                args=(built.session,),
+                daemon=True,
+                name="session-prefetch-discard-dead",
+            ).start()
             return None
         if built.spec == spec and built.snapshot == _spawn_snapshot():
             # An instant handover is safe against the previous worker's GPU
@@ -462,7 +587,7 @@ class SessionPrefetcher:
             # wait_shutdown=True, so its shutdown() blocked until the workers
             # actually exited (and released their memory).
             self.stats["pools_handed_over"] += 1
-            print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
+            _log(f"[session-prefetch] handing over prefetched {spec}-worker pool")
             return built.session
         # Spec/env/sys.path mismatch (test skipped, reordered, or changed
         # state the frozen workers would not see): discard.
@@ -485,27 +610,12 @@ class SessionPrefetcher:
             # workers exited (and released GPU memory) — the NEXT pool is
             # handed over instantly, without the ~50s sync spawn that used to
             # hide the release window. Such spawns fail closed when identity
-            # collection cannot complete; a prefetch layer must not turn that
-            # into a test failure, so retry once and then degrade LOUDLY to a
-            # plain pool (pre-prefetch semantics: shutdown returns at
-            # disconnect).
+            # collection cannot complete. Do not immediately retry or degrade
+            # to a plain pool: unidentified workers may still be exiting, and
+            # wait_shutdown=False cannot protect the next handover.
             session = self.take(n_workers)
             if session is None:
-                try:
-                    session = real_cls(n_workers=n_workers, wait_shutdown=True)
-                except Exception as e:
-                    print(f"[session-prefetch] pool spawn failed, retrying once: {e}", flush=True)
-                    try:
-                        session = real_cls(n_workers=n_workers, wait_shutdown=True)
-                    except Exception as e2:
-                        print(
-                            "[session-prefetch] wait_shutdown spawn failed twice: "
-                            f"{e2}; falling back to a plain pool (handover "
-                            "protection degraded for the NEXT pool on this node)",
-                            flush=True,
-                        )
-                        self.stats["pools_spawned_degraded"] += 1
-                        session = real_cls(n_workers=n_workers)
+                session = real_cls(n_workers=n_workers, wait_shutdown=True)
             self.schedule_shadow(n_workers)  # re-arm for the NEXT test
             return session
 
@@ -549,16 +659,24 @@ class SessionPrefetcher:
     def dispose(self) -> None:
         """Shut down any unconsumed shadow pool (end-of-session cleanup).
 
-        60s (vs take()'s 180s): at session end there is no test left to hand
-        the pool to, so a still-running build is only worth a short grace
-        before it is abandoned to its generation-bump cleanup. Idempotent: a
-        repository-root run dispatches sessionfinish from both the repo-root
-        and the subtree conftest.
+        Uses the same coordinated deadline as ``take()``. Ending the pytest
+        session is not permission to abandon a bootstrap while the lower
+        layer still considers it healthy. Idempotent: a repository-root run
+        dispatches sessionfinish from both the repo-root and the subtree
+        conftest.
         """
         if self._disposed:
             return
         self._disposed = True
-        built = self._drain(timeout=60)
+        try:
+            built = self._drain()
+        except TimeoutError as e:
+            # Do not turn pytest_sessionfinish into an internal error. The
+            # build remains registered, preventing another shadow from being
+            # launched; the daemon thread is bounded by the lower-level
+            # identity timeout unless the MPI runtime itself is wedged.
+            _log(f"[session-prefetch] cleanup timed out: {e}")
+            built = None
         if built is not None:
             built.session.shutdown()
         # One line per session, emitted OUTSIDE pytest's per-test capture
@@ -569,7 +687,7 @@ class SessionPrefetcher:
             parts = ", ".join(f"{k}={v}" for k, v in sorted(self.stats.items()))
             if self._warmed_gib:
                 parts += f", warmed_gib={self._warmed_gib:.1f}"
-            print(f"[session-prefetch] session summary: {parts}", flush=True)
+            _log(f"[session-prefetch] session summary: {parts}")
 
 
 PREFETCHER = SessionPrefetcher()

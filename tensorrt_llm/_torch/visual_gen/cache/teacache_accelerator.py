@@ -52,7 +52,7 @@ class TeaCacheAccelerator(CacheAccelerator):
             backend.disable(module)
         self._backends = []
 
-    def refresh(self, num_inference_steps: int) -> None:
+    def refresh(self, num_inference_steps: int, separate_cfg: bool | None = None) -> None:
         for _, backend in self._backends:
             backend.refresh(num_inference_steps)
 

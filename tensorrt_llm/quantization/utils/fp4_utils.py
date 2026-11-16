@@ -1,6 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # The declarations must be aligned with thUtils.h
 SF_DTYPE = torch.uint8
@@ -9,6 +18,19 @@ FLOAT4_E2M1X2 = torch.uint8
 # Number of elements sharing one NVFP4 E4M3 scale factor
 # (SF_VEC_SIZE in cpp/tensorrt_llm/kernels/quantization.h).
 NVFP4_SF_VEC_SIZE = 16
+
+# Scale block widths the dense W4A16_NVFP4 Linear dequantization path accepts.
+# W4A16_NVFP4 MoE remains restricted to 16-element blocks.
+# The W4A4 NVFP4 GEMMs are hardware-bound to NVFP4_SF_VEC_SIZE; ModelOpt's
+# nvfp4_*_weight_only recipes may export 32-element blocks.
+W4A16_NVFP4_LINEAR_SF_VEC_SIZES = (16, 32)
+
+# NVFP4_PLUS: E2M1 values with one UE5M3 scale per 32 values and no per-tensor
+# scale. UE5M3 has 5 exponent bits (bias 15), 3 mantissa bits and subnormals;
+# codes 0x00-0xFE are finite (0 to 114688) and 0xFF is NaN.
+NVFP4_PLUS_SF_VEC_SIZE = 32
+UE5M3_MAX = 114688.0
+UE5M3_NAN = 0xFF
 
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
@@ -20,7 +42,25 @@ float4_e2m1x2 = FLOAT4_E2M1X2
 float4_sf_dtype = SF_DTYPE
 fp4_buckets = FP4_BUCKETS
 
-__all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
+__all__ = [
+    'float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets',
+    'NVFP4_SF_VEC_SIZE', 'W4A16_NVFP4_LINEAR_SF_VEC_SIZES',
+    'nvfp4_scaling_vector_size', 'NVFP4_PLUS_SF_VEC_SIZE', 'UE5M3_MAX',
+    'ue5m3_to_float', 'float_to_ue5m3', 'e8m0_to_ue5m3',
+    'nvfp4_plus_quantize_ref', 'nvfp4_plus_dequantize_ref'
+]
+
+
+def nvfp4_scaling_vector_size(quant_config: QuantConfig | None) -> int:
+    """Resolve a checkpoint's NVFP4 scale width without reinterpreting explicit values.
+
+    An omitted group_size retains the standard NVFP4 width even though
+    QuantConfig defaults to 128 for AWQ/GPTQ. Explicit values, including 128,
+    are passed through for algorithm-specific validation.
+    """
+    if quant_config is None or "group_size" not in quant_config.model_fields_set:
+        return NVFP4_SF_VEC_SIZE
+    return NVFP4_SF_VEC_SIZE if quant_config.group_size is None else quant_config.group_size
 
 
 def pad_up(x: int, y: int) -> int:
@@ -208,3 +248,84 @@ def shuffle_matrix_sf_a(
 
     # 128x4
     return torch.ops.trtllm.block_scale_interleave(w_shuffled)
+
+
+def ue5m3_to_float(codes: torch.Tensor) -> torch.Tensor:
+    """Decode UE5M3 scale codes (uint8) to float32; 0xFF decodes to NaN."""
+    code = codes.to(torch.int32)
+    exponent = code >> 3
+    mantissa = code & 7
+    normal = (((exponent + 112) << 23) | (mantissa << 20)).view(torch.float32)
+    subnormal = mantissa.to(torch.float32) * 2.0**-17
+    value = torch.where(exponent == 0, subnormal, normal)
+    return value.masked_fill(code == UE5M3_NAN, float("nan"))
+
+
+def float_to_ue5m3(value: torch.Tensor) -> torch.Tensor:
+    """Round non-negative scales up to UE5M3 codes (uint8).
+
+    Matches ``cvt.rp.ue5m3x2.f32`` for finite inputs, except that values above
+    the largest finite UE5M3 value saturate to it instead of becoming NaN.
+    """
+    v = value.to(torch.float32).clamp(max=UE5M3_MAX)
+    # Normal range: round the FP32 mantissa up to 3 bits (a carry moves into
+    # the exponent), then rebias the exponent from 127 to 15.
+    normal = ((v.view(torch.int32) + 0xFFFFF) >> 20) - (112 << 3)
+    # Below 2**-14 the codes are multiples of 2**-17, so the code is the count.
+    subnormal = torch.ceil(v * 2.0**17).to(torch.int32)
+    code = torch.where(v < 2.0**-14, subnormal, normal).clamp(0, UE5M3_NAN - 1)
+    return code.masked_fill(torch.isnan(v), UE5M3_NAN).to(torch.uint8)
+
+
+def e8m0_to_ue5m3(e8m0: torch.Tensor) -> torch.Tensor:
+    """Convert MXFP4 E8M0 block scales to UE5M3 codes without changing values.
+
+    E8M0 code ``e`` is ``2**(e - 127)``; UE5M3 holds every power of two from
+    2**-17 to 2**16. Smaller scales become 0: their blocks are below
+    6 * 2**-18 in magnitude. Larger scales and NaN raise ``ValueError``.
+    """
+    exponent = e8m0.view(torch.uint8).to(torch.int32) - 127
+    if bool((exponent > 16).any()):
+        raise ValueError(
+            "E8M0 scale above 2**16 (or NaN) cannot be represented in UE5M3")
+    normal = (exponent + 15) << 3
+    subnormal = 1 << (exponent + 17).clamp(min=0)
+    code = torch.where(exponent >= -14, normal,
+                       torch.where(exponent >= -17, subnormal, 0))
+    return code.to(torch.uint8)
+
+
+def _float_to_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round to E2M1 codes (uint8, 0-15) to nearest even, saturating at 6."""
+    mag = x.abs()
+    code = ((mag > 0.25).to(torch.int32) + (mag >= 0.75) + (mag > 1.25) +
+            (mag >= 1.75) + (mag > 2.5) + (mag >= 3.5) + (mag > 5.0))
+    return (code + torch.signbit(x) * 8).to(torch.uint8)
+
+
+def nvfp4_plus_quantize_ref(
+        x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` [..., K] (K % 32 == 0) to NVFP4_PLUS in plain PyTorch.
+
+    Returns the packed E2M1 values [..., K // 2] (element 2j in the low nibble
+    of byte j) and the UE5M3 scales [..., K // 32] in row-major order.
+    """
+    blocks = x.float().unflatten(-1, (-1, NVFP4_PLUS_SF_VEC_SIZE))
+    sf = float_to_ue5m3(blocks.abs().amax(-1) / 6.0)
+    scale = ue5m3_to_float(sf)
+    inv_scale = torch.where(scale > 0, 1.0 / scale, torch.zeros_like(scale))
+    e2m1 = _float_to_e2m1(blocks * inv_scale.unsqueeze(-1)).flatten(-2)
+    return e2m1[..., 0::2] | (e2m1[..., 1::2] << 4), sf
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
+                -2.0, -3.0, -4.0, -6.0)
+
+
+def nvfp4_plus_dequantize_ref(fp4: torch.Tensor,
+                              sf: torch.Tensor) -> torch.Tensor:
+    """Dequantize packed E2M1 [..., K // 2] with row-major UE5M3 scales [..., K // 32]."""
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=fp4.device)
+    codes = torch.stack([fp4 & 0xF, fp4 >> 4], dim=-1).flatten(-2)
+    values = lut[codes.long()].unflatten(-1, (-1, NVFP4_PLUS_SF_VEC_SIZE))
+    return (values * ue5m3_to_float(sf).unsqueeze(-1)).flatten(-2)

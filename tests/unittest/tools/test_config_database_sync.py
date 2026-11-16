@@ -24,6 +24,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = pytest.mark.cpu_only
+
+
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 EXPECTED_MODEL_METADATA = {
     "deepseek-ai/DeepSeek-R1-0528": {
@@ -258,7 +261,6 @@ class TestConfigDatabaseSync(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
             RecipeList.model_validate(duplicate_profile)
 
-    @pytest.mark.skip(reason="https://nvbugs/6337224")
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.
 

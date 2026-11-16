@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from pathlib import Path
 from typing import Optional, Type
@@ -7,12 +10,15 @@ from .deepseekv3_parser import DeepSeekV3Parser
 from .deepseekv4_parser import DeepSeekV4Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
+from .deepseekv41_parser import DeepSeekV41Parser
 from .gemma4_parser import Gemma4ToolParser
 from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
+from .kimi_k3_tool_parser import KimiK3ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
 from .minimax_m3_parser import MiniMaxM3ToolParser
+from .musespark_parser import MuseSparkToolParser
 from .poolside_v1_parser import PoolsideV1ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
@@ -27,8 +33,11 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek_v3",
     "deepseek_v32": "deepseek_v32",
     "deepseek_v4": "deepseek_v4",
+    "deepseek_v41": "deepseek_v41",
+    "deepseek_v41_text": "deepseek_v41",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
+    "kimi_k3": "kimi_k3",
     "glm4": "glm4",
     "glm4_moe": "glm47",
     "glm4_moe_lite": "glm47",
@@ -37,6 +46,11 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "gemma4_text": "gemma4",
     "laguna": "poolside_v1",
     "minimax_m3_vl": "minimax_m3",
+    "muse_spark": "musespark",
+    # Nemotron 3.5 Super VL. Its chat template instructs the model to emit
+    # the Qwen3-Coder <tool_call><function=...><parameter=...> XML shape,
+    # not JSON, so it shares that parser.
+    "nemotron_h_omni": "qwen3_coder",
 }
 
 
@@ -58,25 +72,32 @@ class ToolParserFactory:
         "qwen3": Qwen3ToolParser,
         "qwen3_coder": Qwen3CoderToolParser,
         "kimi_k2": KimiK2ToolParser,
+        "kimi_k3": KimiK3ToolParser,
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
         "deepseek_v4": DeepSeekV4Parser,
+        "deepseek_v41": DeepSeekV41Parser,
         "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
         "minimax_m3": MiniMaxM3ToolParser,
+        "musespark": MuseSparkToolParser,
         "poolside_v1": PoolsideV1ToolParser,
     }
 
     @staticmethod
-    def create_tool_parser(tool_parser: str) -> BaseToolParser:
+    def create_tool_parser(
+        tool_parser: str, *, grammar_constrained: bool = False
+    ) -> BaseToolParser:
         try:
             tool_parser_class = ToolParserFactory.parsers[tool_parser.lower()]
-            return tool_parser_class()
         except KeyError as e:
             raise ValueError(
                 f"Invalid tool_parser: {tool_parser}\n"
                 f"Supported parsers: {list(ToolParserFactory.parsers.keys())}"
             ) from e
+        parser = tool_parser_class()
+        parser.grammar_constrained = grammar_constrained
+        return parser

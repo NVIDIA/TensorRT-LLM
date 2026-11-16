@@ -30,6 +30,7 @@ import csv
 import datetime
 import glob
 import json
+import logging
 import math
 import os
 import re
@@ -85,9 +86,12 @@ def build_cases(cfg):
     versions = cfg["test_matrix"].get("cache_manager_versions", ["V1"])
     cases = []
     for combination in combinations:
+        before = len(cases)
         for ver in versions:
             # The V2 cache manager only supports the Python cache transceiver.
             if ver == "V2" and combination["runtime"] == "CPP":
+                continue
+            if ver == "V1" and combination["runtime"] == "PYTHON":
                 continue
             cases.append(
                 {
@@ -97,6 +101,17 @@ def build_cases(cfg):
                     "label": f"{combination['backend']}/{combination['runtime']}/{ver}",
                 }
             )
+        if len(cases) == before:
+            logging.getLogger(__name__).warning(
+                "Configured combination %s/%s has no supported cache manager version in %s",
+                combination["backend"],
+                combination["runtime"],
+                versions,
+            )
+    if not cases:
+        raise ValueError(
+            "Test matrix contains no supported cases: use CPP with V1 or PYTHON with V2."
+        )
     return cases
 
 
@@ -227,7 +242,16 @@ def _parse_cpp_recv_csvs(csv_dir):
 
 
 def _parse_python_csvs(csv_dir):
-    """Return {rid: [per_rank_GBps, ...]} from perf_logger py_*_*.csv files.
+    """Return {rid: [per_rank_GBps, ...]} from Python perf_logger task CSVs.
+
+    PerfLogManager names its per-task CSV by priority of the env vars it sees:
+    with TRTLLM_KVCACHE_TIME_OUTPUT_PATH set (which this harness always sets
+    for the C++ transceiver), files are "{dir}/{instanceUuid}_{rank}.csv";
+    only the legacy TLLM_KV_TRANSFER_PERF_LOG_FILE fallback produces the old
+    "py_{instanceUuid}_{rank}.csv" prefix. So identify Python task CSVs by
+    their header columns (unique_rid + throughput_mbs) rather than by file
+    name -- C++ send/recv CSVs and the gen_transfer_summary CSV have neither
+    column and are skipped.
 
     `throughput_mbs` is recorded for send tasks in MiB/s (perf_logger divides by
     1024*1024). We convert MiB/s -> GB/s (`* 1024^2 / 1e9`) so it matches the
@@ -235,14 +259,17 @@ def _parse_python_csvs(csv_dir):
     `_parse_cpp_recv_csvs`.
     """
     per_rid = {}  # rid -> list[per-rank throughput GB/s]
-    for path in glob.glob(os.path.join(csv_dir, "py_*_*.csv")):
+    for path in glob.glob(os.path.join(csv_dir, "*.csv")):
         with open(path) as f:
             reader = csv.DictReader(f)
+            fields = reader.fieldnames or []
+            if "unique_rid" not in fields or "throughput_mbs" not in fields:
+                continue  # not a Python perf_logger task CSV (e.g. C++ send/recv)
             for row in reader:
-                if "unique_rid" not in row or "throughput_mbs" not in row:
-                    continue
-                if "Send" not in row.get("task_type", ""):
-                    continue  # throughput is meaningful only for send tasks
+                if row.get("task_type") != "KVSendTask":
+                    continue  # only KV sends carry meaningful throughput;
+                    # AuxSendTask rows are tiny metadata sends that would
+                    # drag the median down, KVRecvTask rows have none
                 try:
                     rid = int(float(row["unique_rid"]))
                     mbs = float(row["throughput_mbs"])
@@ -311,8 +338,12 @@ class _TransportAcc:
 
     def feed(self, line):
         if _CONFIG_HEADER.search(line):
+            # Supports the older UCX single-line format.
             self._in_kv = _is_kv_data_header(line)
             return
+        # UCX 1.22 may put the operation description on the next line.
+        if _is_kv_data_header(line):
+            self._in_kv = True
         transports = _proto_row_transports(line)
         if not transports:
             return

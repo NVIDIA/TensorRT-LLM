@@ -32,7 +32,7 @@ def make_per_expert_lora(
 
     Returns shapes `A: [E, rank, in_dim]` and `B: [E, out_dim, rank]`, with an
     independent low-rank pair per expert, suitable for `torch.stack(...)` in
-    `tensorrt_llm/lora_manager.py`.
+    `tensorrt_llm/_torch/peft/lora/manager.py`.
 
     Args:
         num_experts: number of experts in this MoE layer.

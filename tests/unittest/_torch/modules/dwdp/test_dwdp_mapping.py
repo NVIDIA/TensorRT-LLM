@@ -27,8 +27,19 @@ Covers:
 """
 
 import unittest
+from unittest.mock import patch
+
+import pytest
 
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _force_mpi_topology_mapping():
+    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
+        yield
 
 
 class TestMappingDwdp(unittest.TestCase):
@@ -117,11 +128,11 @@ class TestMappingDwdp(unittest.TestCase):
     # moe_ep_rank conditional branch
     # ------------------------------------------------------------------
 
-    def test_moe_ep_rank_zero_when_dwdp_enabled(self):
+    def test_moe_ep_rank_zero_when_dwdp_enabled(self) -> None:
         """DWDP on: moe_ep_rank is always 0 (matches moe_ep_size = 1).
 
         The actual rank-specific expert range comes from
-        ``DwdpManager.start_expert_id`` via ``_init_dwdp_expert_layout``,
+        ``DwdpManager.expert_partition`` via ``_init_dwdp_expert_layout``,
         not from ``moe_ep_rank``.
         """
         for dwdp_rank in range(4):

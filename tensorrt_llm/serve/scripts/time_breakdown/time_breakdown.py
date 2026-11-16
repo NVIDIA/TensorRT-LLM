@@ -14,12 +14,12 @@ Features:
 - Hover to show individual segment details
 
 Usage as CLI:
-    python time_breakdown.py <json_file> [options]
+    python time_breakdown.py <json_or_jsonl_file> [options]
 
 Usage as library:
     from time_breakdown import RequestTimeBreakdown
     analyzer = RequestTimeBreakdown()
-    timing_data = analyzer.parse_json_file("perf_metrics.json")
+    timing_data = analyzer.parse_json_file("perf_metrics.jsonl")
     analyzer.create_timing_diagram(timing_data, "output.html")
 """
 
@@ -28,10 +28,12 @@ import json
 import math
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import plotly.graph_objects as go
+
+from tensorrt_llm.serve._perf_metrics_schema import PerfMetricsRecord
 
 
 @dataclass
@@ -181,7 +183,7 @@ class TimingMetricsConfig:
 class RequestDataParser:
     """Parser for disaggregated format with ctx_perf_metrics and gen_perf_metrics."""
 
-    def parse_request(self, request_data: Dict,
+    def parse_request(self, request_data: PerfMetricsRecord,
                       request_index: int) -> Dict[str, Any]:
         # Check if both ctx_perf_metrics and gen_perf_metrics exist and are not None
         ctx_perf = request_data.get('ctx_perf_metrics')
@@ -207,15 +209,18 @@ class RequestDataParser:
                                                    float('nan'))
         ctx_first_token_time = ctx_metrics.get('first_token_time', float('nan'))
         ctx_server_arrival_time = ctx_metrics.get('server_arrival_time',
-                                                  float('nan'))
-        ctx_server_first_token_time = ctx_metrics.get('server_first_token_time',
-                                                      float('nan'))
+                                                  ctx_arrival_time)
+        ctx_server_first_token_time = ctx_metrics.get(
+            'server_first_token_time',
+            ctx_metrics.get('last_token_time', float('nan')))
 
         # Generation timing
-        gen_server_first_token_time = gen_metrics.get('server_first_token_time',
-                                                      float('nan'))
-        gen_server_arrival_time = gen_metrics.get('server_arrival_time',
-                                                  float('nan'))
+        gen_server_first_token_time = gen_metrics.get(
+            'server_first_token_time',
+            gen_metrics.get('last_token_time', float('nan')))
+        gen_server_arrival_time = gen_metrics.get(
+            'server_arrival_time', gen_metrics.get('arrival_time',
+                                                   float('nan')))
         gen_arrival_time = gen_metrics.get('arrival_time', float('nan'))
         gen_first_token_time = gen_metrics.get('first_token_time', float('nan'))
         gen_first_scheduled_time = gen_metrics.get('first_scheduled_time',
@@ -240,15 +245,13 @@ class RequestDataParser:
         else:
             request_id = request_data.get('request_id', request_index)
 
-        # Time breakdown metrics - check new unified structure first, then fall back to legacy
+        # Time breakdown metrics
         step_metrics = None
         ctx_gpu_forward_time = None
         ctx_gpu_sample_time = None
         ctx_chunk_metrics = None
 
-        # Try new unified time_breakdown_metrics structure
         if is_disaggregated:
-            # time_breakdown_metrics is at gen_perf_metrics top level, not inside perf_metrics
             time_breakdown = (gen_perf or {}).get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')
@@ -260,7 +263,6 @@ class RequestDataParser:
                 # Legacy: step_metrics inside perf_metrics
                 gen_perf_data = (gen_perf or {}).get('perf_metrics') or {}
                 step_metrics = gen_perf_data.get('step_metrics')
-            # ctx GPU timing / chunk metrics from ctx_perf
             if ctx_gpu_forward_time is None:
                 ctx_time_breakdown = (ctx_perf
                                       or {}).get('time_breakdown_metrics')
@@ -278,7 +280,6 @@ class RequestDataParser:
                     ctx_gpu_sample_time = (ctx_perf
                                            or {}).get('ctx_gpu_sample_time')
         else:
-            # Try time_breakdown_metrics at top level first (new structure)
             time_breakdown = request_data.get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')
@@ -334,18 +335,56 @@ class RequestTimeBreakdown:
 
     def parse_json_file(self, json_file_path: str) -> List[Dict]:
         """Parse JSON performance metrics file and extract timing information."""
-        try:
-            with open(json_file_path, 'r') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            print(f"Error: File '{json_file_path}' not found.")
-            sys.exit(1)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON file '{json_file_path}': {e}")
-            sys.exit(1)
 
+        def iter_records(json_file):
+            if json_file_path.endswith('.jsonl'):
+                for line_number, line in enumerate(json_file, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            f"Error parsing JSONL file '{json_file_path}' at "
+                            f"line {line_number}: {error}") from error
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            f"Expected a JSON object at line {line_number}: "
+                            f"{json_file_path}")
+                    yield record
+                return
+
+            try:
+                data = json.load(json_file)
+            except json.JSONDecodeError as error:
+                json_file.seek(0)
+                if not any(line.strip() for line in json_file):
+                    return
+                raise ValueError(
+                    f"Error parsing JSON file '{json_file_path}': {error}"
+                ) from error
+
+            if isinstance(data, dict):
+                yield data
+            elif isinstance(data, list):
+                yield from data
+            else:
+                raise ValueError(
+                    "Expected a JSON array, JSON object, or JSONL file: "
+                    f"{json_file_path}")
+
+        with open(json_file_path, 'r') as json_file:
+            return self.parse_records(iter_records(json_file))
+
+    def parse_records(self, records: Iterable[Dict]) -> List[Dict]:
+        """Extract timing information from already-decoded perf-metrics records.
+
+        Same reduction as :meth:`parse_json_file`, minus the file decoding, so a caller
+        that already holds the records in memory does not have to write them out and read
+        them back just to get the breakdown.
+        """
         timing_data = []
-        for i, request in enumerate(data):
+        for i, request in enumerate(records):
             parsed_data = self.parser.parse_request(request, i)
 
             # Calculate durations for each metric
@@ -2133,6 +2172,67 @@ class RequestTimeBreakdown:
                 )
                 print(f"  Median: {np.median(valid_times):.3f}")
 
+    def compute_statistics(
+            self, timing_data: List[Dict]) -> Dict[str, Dict[str, float]]:
+        """Aggregate every span across all requests.
+
+        Returns ``{span_name: {mean, median, p75, p99, count}}`` with durations in
+        **milliseconds** (the unit every other serving benchmark metric uses).
+
+        A span that is zero for every request is omitted rather than reported as
+        ``0.0``: :meth:`TimingMetric.calculate_duration` returns 0 when an endpoint
+        timestamp is missing, so 0 means "not measured", not "took no time".
+        Reporting it as 0.0 would silently fabricate a data point.
+
+        This is a *coarse* view, and deliberately so. ``calculate_duration`` also
+        returns 0 when ``start_time > end_time``, so a span whose two events
+        genuinely overlapped is indistinguishable here from one that was never
+        measured, and both are dropped -- which biases the surviving mean of such a
+        span towards its non-overlapped tail. Overlap is real for per-step spans
+        under the overlap scheduler, so anything needing an unbiased mean should
+        use the perf-sanity aggregator
+        (``tests/integration/defs/perf/time_breakdown_metrics.py``), which keeps
+        signed spans and covers per-step and per-chunk detail this config does not
+        model at all.
+        """
+        stats: Dict[str, Dict[str, float]] = {}
+        for metric in self.config.metrics:
+            key = f'{metric.name}_time'
+            valid = [
+                data[key] * 1000 for data in timing_data
+                if data.get(key) is not None and data[key] != 0
+            ]
+            if not valid:
+                continue
+            stats[metric.name] = {
+                'mean': float(np.mean(valid)),
+                'median': float(np.median(valid)),
+                'p75': float(np.percentile(valid, 75)),
+                'p99': float(np.percentile(valid, 99)),
+                'count': len(valid),
+            }
+        return stats
+
+    def export_statistics_json(
+            self,
+            timing_data: List[Dict],
+            output_path: str,
+            span_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Write :meth:`compute_statistics` output to ``output_path`` as JSON.
+
+        Pass ``span_stats`` when the caller has already reduced ``timing_data``,
+        so the reduction is not repeated over every request.
+        """
+        payload = {
+            'total_requests':
+            len(timing_data),
+            'spans': (self.compute_statistics(timing_data)
+                      if span_stats is None else span_stats),
+        }
+        with open(output_path, 'w', encoding='utf-8') as out_file:
+            json.dump(payload, out_file, indent=2, sort_keys=True)
+        return payload
+
 
 def main():
     """Main CLI entry point."""
@@ -2141,16 +2241,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python time_breakdown.py perf_metrics.json
-  python time_breakdown.py perf_metrics.json -o my_timing.html
-  python time_breakdown.py perf_metrics.json --stats-only
-  python time_breakdown.py perf_metrics.json --max-requests 50 --sort-by e2e
-  python time_breakdown.py perf_metrics.json --max-requests 100 --sort-by arrival
+  python time_breakdown.py perf_metrics.jsonl
+  python time_breakdown.py perf_metrics.jsonl -o my_timing.html
+  python time_breakdown.py perf_metrics.jsonl --stats-only
+  python time_breakdown.py perf_metrics.jsonl --max-requests 50 --sort-by e2e
+  python time_breakdown.py perf_metrics.jsonl --max-requests 100 --sort-by arrival
+  python time_breakdown.py perf_metrics.jsonl --stats-only --export-stats-json stats.json
         """)
 
-    parser.add_argument('json_file',
-                        type=str,
-                        help='Path to JSON performance metrics file')
+    parser.add_argument(
+        'json_file',
+        type=str,
+        help='Path to a JSON or server-produced JSONL performance metrics file')
     parser.add_argument('-o',
                         '--output',
                         type=str,
@@ -2162,6 +2264,13 @@ Examples:
     parser.add_argument('--show-stats',
                         action='store_true',
                         help='Show statistics with diagram')
+    parser.add_argument(
+        '--export-stats-json',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Write per-span mean/median/P75/P99 (in milliseconds) to PATH as '
+        'JSON. Combine with --stats-only to skip rendering the HTML diagram')
     parser.add_argument(
         '--max-requests',
         type=int,
@@ -2180,21 +2289,33 @@ Examples:
 
     analyzer = RequestTimeBreakdown()
     print(f"Parsing: {args.json_file}")
-    timing_data = analyzer.parse_json_file(args.json_file)
+    try:
+        timing_data = analyzer.parse_json_file(args.json_file)
+    except FileNotFoundError:
+        print(f"Error: File '{args.json_file}' not found.")
+        return 1
+    except ValueError as error:
+        print(error)
+        return 1
 
     if not timing_data:
         print("No timing data found.")
-        sys.exit(1)
+        return 1
 
     if args.stats_only or args.show_stats:
         analyzer.show_statistics(timing_data)
+
+    if args.export_stats_json:
+        analyzer.export_statistics_json(timing_data, args.export_stats_json)
+        print(f"Span statistics saved to: {args.export_stats_json}")
 
     if not args.stats_only:
         analyzer.create_timing_diagram(timing_data,
                                        args.output,
                                        max_requests=args.max_requests,
                                        sort_by=args.sort_by)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

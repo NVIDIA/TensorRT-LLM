@@ -1,4 +1,4 @@
-# Torch Compile & Piecewise CUDA Graph
+# Torch Compile & Prefill CUDA Graph
 
 In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.
 
@@ -6,13 +6,14 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Table of Contents
 
-- [Torch Compile & Piecewise CUDA Graph](#torch-compile--piecewise-cuda-graph)
+- [Torch Compile & Prefill CUDA Graph](#torch-compile--prefill-cuda-graph)
   - [Table of Contents](#table-of-contents)
   - [Usage](#usage)
   - [Tips for Piecewise CUDA Graph](#tips-for-piecewise-cuda-graph)
     - [Piecewise CUDA Graph & Generation Only CUDA Graph](#piecewise-cuda-graph--generation-only-cuda-graph)
     - [Piecewise CUDA Graph Padding](#piecewise-cuda-graph-padding)
     - [Performance Tuning](#performance-tuning)
+    - [Torch Compile Optimizations](#torch-compile-optimizations)
   - [Known Issue](#known-issue)
   - [Development Guide](#development-guide)
     - [Background Knowledge](#background-knowledge)
@@ -41,11 +42,39 @@ To enable torch.compile and Piecewise CUDA Graph, add the following configuratio
 
 ```yaml
 ... # Other extra config
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}' # e.g. [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
 ```
+
+`TorchCompileConfig.enable_piecewise_cuda_graph` and
+`TorchCompileConfig.capture_num_tokens` are deprecated aliases for these
+prefill-specific options.
+
+The experimental breakable implementation can capture the model body without
+torch.compile:
+
+```yaml
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens: [128, 256, 512]
+```
+
+The breakable backend is experimental. The integration coverage in this change
+includes BF16 Qwen3.5 on one GPU and NVFP4 DeepSeek models on multiple GPUs,
+with both context-only and mixed context/decode batches using the KV cache.
+
+The following restrictions are enforced:
+
+- `torch_compile_config`, LoRA, and multimodal models are rejected during
+  engine initialization.
+- Speculative decoding is supported.
+- Context-logit requests run eagerly instead of replaying a breakable CUDA
+  graph.
+
+Other model families, quantization modes, and parallel configurations are not
+yet covered by this experimental backend's integration tests and should be
+validated before use.
 
 ## Tips for Piecewise CUDA Graph
 
@@ -59,9 +88,10 @@ cuda_graph_config:
   max_batch_size: 1024 # Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.
 
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # Specify capture_num_tokens for piecewise cuda graph
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
+
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}'
 ```
 
 ### Piecewise CUDA Graph Padding
@@ -84,25 +114,42 @@ Guidelines for `capture_num_tokens`:
 
 Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the context (prefill) phase, primarily due to the attention operator’s substantial host-side overhead.
 
-## Known Issue
+### Torch Compile Optimizations
 
-Torch compile cannot work with multi-ModelEngine config.
+Enabling `prefill_cuda_graph_backend: piecewise` also enables `torch.compile`. By default, decoder forwards are routed through the compiled callable, including autotuning and auxiliary warmups as well as context, mixed, and generation-only batches. For some models, running these forwards through the compiled callable can improve performance through optimizations such as kernel fusion. In other cases, most of the benefit comes from applying piecewise CUDA graphs to context and mixed batches only.
 
-1. Speculative Decoding in Two-Model Style
+The `compile_only_piecewise_graphs` option restricts compilation to forwards that are eligible for piecewise CUDA graphs, including the corresponding specialization warmup and capture forwards:
 
-``` yaml
-speculative_config:
-  decoding_type: "MTP"
-  mtp_eagle_one_model: False # Not supported
-
-speculative_config:
-  decoding_type: "Eagle3"
-  eagle3_one_model: False # Not supported
+```yaml
+prefill_cuda_graph_backend: piecewise
+torch_compile_config:
+  compile_only_piecewise_graphs: true
 ```
 
-2. Multimodal Model Family
+With this option enabled, ineligible context and mixed forwards use the eager decoder. Ordinary CUDA graphs are also captured from the eager decoder and subsequently replayed as CUDA graphs. Auxiliary kernel and memory-pool warmups bypass `torch.compile`. Avoiding unnecessary tracing and compilation can significantly reduce startup time.
+
+The `compile_only_piecewise_graphs` option was validated with a Qwen3 8B FP8 model, where no performance impact was measured in the tested TP1 and TP2 configurations. However, performance and numerical behavior can be model- and configuration-dependent, so these should be evaluated on a case-by-case basis before deployment.
+This option requires `prefill_cuda_graph_backend: piecewise` and currently supports only models derived from `DecoderModelForCausalLM`. With attention DP, the compiled path follows the group-wide prefill graph eligibility decision.
+
+
+## Known Issue
+
+Torch compile cannot work with multi-ModelEngine config, which currently means
+the Multimodal Model Family.
 
 ## Development Guide
+
+Executor host-upload buffers must keep stable device addresses across capture and replay. Their internal
+`DeviceCopyBuffer` owns the tensor and last-uploaded host snapshot; every cached writer must use the same
+owner's `update(host)` method. A Mamba metadata CUDA alias shares its cache manager's owner, rather than
+creating another cache over the same storage. Returned tensors are borrowed views, not immutable tensors;
+writing them directly bypasses the cached-upload contract.
+
+Changed updates use independent host staging, pinned according to the owner's configuration, and write only
+the supplied prefix. Shorter updates preserve the device tail and its cached values; unchanged prefixes
+enqueue no upload. The C++ Mamba manager uses `force=True` to retain its unconditional-upload behavior while
+keeping aliases' shared snapshot coherent. `TLLM_DEBUG_MODE=1` verifies skipped values outside CUDA graph
+capture; capture does not add a device synchronization for this check.
 
 ### Background Knowledge
 

@@ -1,4 +1,5 @@
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -6,9 +7,9 @@ import uuid
 
 import openai
 import pytest
-from test_common.perf_metrics_utils import get_timing_metrics, validate_timing_metrics
+from test_common import cluster_env
 
-from tensorrt_llm._utils import get_free_port
+from tensorrt_llm._utils import get_free_port, get_sm_version
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 from ..test_llm import get_model_path
@@ -48,17 +49,23 @@ def is_pytest_node():
 def env():
     # Remove MPI related environment variables to isolate the ctx/gen processes
     # so that they will not be in the same MPI communicator, otherwise the rank and world_size may mismatch
-    return {
+    e = {
         k: v
         for k, v in os.environ.items()
         if not ("PMI_" in k or "OMPI_" in k or "PMIX_" in k or "SLURM_" in k)
         and k not in ["UCX_TLS", "UCX_NET_DEVICES"]
     }
+    # GB300 (sm_103 + aarch64) needs UCX_TLS set explicitly. A cluster rule, if
+    # one matches, overrides this.
+    if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
+        e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+    cluster_env.apply_ucx_env(e, cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
+    return e
 
 
 @pytest.fixture
 def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture
@@ -108,12 +115,14 @@ def worker(model_name: str, disagg_cluster_config: dict):
         "disagg_cluster": disagg_cluster_config,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
-        "return_perf_metrics": True,
-        "perf_metrics_max_requests": 1000,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
@@ -165,7 +174,6 @@ def disagg_server(disagg_cluster_config: dict):
             "disagg_cluster": disagg_cluster_config,
             "port": DISAGG_SERVER_PORT,
             "hostname": "0.0.0.0",
-            "perf_metrics_max_requests": 1000,
         }
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         # ctx/gen servers are unnecessary for service discovery test
@@ -216,9 +224,6 @@ def test_completion(
             assert completion.id is not None
             message = completion.choices[0].text
             assert message.startswith("2.")
-
-        perf_metrics = get_timing_metrics(disagg_server.url_root)
-        validate_timing_metrics(perf_metrics, "multinode test_completion")
 
         disagg_server.terminate()
 

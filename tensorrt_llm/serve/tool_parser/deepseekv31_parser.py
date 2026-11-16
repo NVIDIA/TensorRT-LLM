@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/94e1251131ca27260cb0e8938aeb7b4a4e630b19/python/sglang/srt/function_call/deepseekv31_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import re
 from typing import List
@@ -95,27 +97,38 @@ class DeepSeekV31Parser(BaseToolParser):
         current_text = self._buffer
 
         # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
+        start_tokens = [self.bot_token, "<｜tool▁call▁begin｜>"]
+        start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
+        has_tool_call = bool(start_indices)
 
         if not has_tool_call:
             if any(
-                e_token.startswith(new_text)
-                for e_token in [self.bot_token, "<｜tool▁call▁begin｜>"]
+                self._ends_with_partial_token(current_text, b_token) for b_token in start_tokens
             ):
                 return StreamingParseResult()
+            normal_text = current_text
             self._buffer = ""
             for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Text before the earliest start token is content, so stream it and keep the
+        # buffer from that token onwards.
+        prefix_len = min(start_indices, default=0)
+        normal_text = current_text[:prefix_len]
+        if normal_text:
+            current_text = current_text[prefix_len:]
+            self._buffer = current_text
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
+            # Lazy groups keep the match within the first call of the buffer; a
+            # later call is matched once this one is reported and removed.
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -183,17 +196,17 @@ class DeepSeekV31Parser(BaseToolParser):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

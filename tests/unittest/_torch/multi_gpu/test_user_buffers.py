@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 import sys
 import traceback
@@ -18,6 +21,8 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              userbuffers_allreduce_finalize)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -38,7 +43,7 @@ def _assert_match_counts(backend, expected_match_count_by_pass):
     # - "<pass_name>" for passes that are registered once
     # - "<pass_name>:<allreduce_variant>" for UB passes that are registered
     #   per allreduce backend, where <allreduce_variant> is "allreduce" or
-    #   "tunable_allreduce"
+    #   "tunable_allreduce" or "autotuned_allreduce"
     assert dict(backend.match_count_by_pass) == expected_match_count_by_pass
 
 
@@ -497,9 +502,12 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
                           mapping=mapping)
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
 
-        with torch.inference_mode():
-            ref_dequantized, ref_residual, ref_scale = model(a, c)
-            fused_dequantized, fused_residual, fused_scale = model_opt(a, c)
+        with torch.inference_mode(), nccl_window_tensor_scope((a, c)):
+            # Snapshot outputs before releasing leases for rank-local checks.
+            ref_dequantized, ref_residual, ref_scale = (
+                output.clone() for output in model(a, c))
+            fused_dequantized, fused_residual, fused_scale = (
+                output.clone() for output in model_opt(a, c))
 
         _assert_match_counts(
             backend, {
@@ -509,10 +517,14 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 1,
-                "ub_prologue:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
                 "ub_finalize:tunable_allreduce": 0,
                 "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 1,
+                "ub_prologue:autotuned_allreduce": 1,
+                "ub_finalize:autotuned_allreduce": 0,
+                "insert_copy_for_graph_output:autotuned_allreduce": 0,
                 "add_norm_fallback": 0,
             })
 
@@ -563,6 +575,10 @@ def run_single_rank_backend_passes_are_per_instance(tensor_parallel_size):
                 "ub_prologue:tunable_allreduce",
                 "ub_finalize:tunable_allreduce",
                 "insert_copy_for_graph_output:tunable_allreduce",
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce",
+                "ub_prologue:autotuned_allreduce",
+                "ub_finalize:autotuned_allreduce",
+                "insert_copy_for_graph_output:autotuned_allreduce",
                 "add_norm_fallback",
             ]
 
@@ -610,8 +626,8 @@ def run_single_rank_ub_pass(
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
-            output_fused = model_opt(input)
+        with torch.inference_mode(), nccl_window_tensor_scope(input) as scope:
+            output_fused = scope.escape(model_opt(input))
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire
         # for optimizer changes, but on semantic pass names instead of
@@ -624,10 +640,14 @@ def run_single_rank_ub_pass(
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 2,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()
@@ -949,7 +969,9 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
+        with torch.inference_mode(), nccl_window_tensor_scope(
+            (mm0_input_0, mm0_input_1, mm1_input_0, mm1_input_1, residual_0,
+             residual_1)) as scope:
             output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
                                      mm1_input_1, residual_0, residual_1)
             torch.cuda.synchronize()
@@ -960,6 +982,7 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
             torch.cuda.synchronize()
             output_ref = model(mm0_input_0, mm0_input_1, mm1_input_0,
                                mm1_input_1, residual_0, residual_1)
+            scope.escape((output_fused, output_ref))
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire
         # for optimizer changes, but on semantic pass names instead of
@@ -972,10 +995,14 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 1,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 1,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()
@@ -1207,9 +1234,9 @@ def run_single_rank_ub_pass_fp4(
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
-            output_ref = model(input)
-            output_fused = model_opt(input)
+        with torch.inference_mode(), nccl_window_tensor_scope(input) as scope:
+            output_ref = scope.escape(model(input))
+            output_fused = scope.escape(model_opt(input))
 
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire
@@ -1223,10 +1250,14 @@ def run_single_rank_ub_pass_fp4(
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 2,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()

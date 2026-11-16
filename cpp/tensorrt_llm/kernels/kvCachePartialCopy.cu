@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,8 +75,8 @@ void hostKVCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int 
     dim3 block = {blockX, blockY, blockZ};
     dim3 grid = {(numHidden + block.x - 1) / block.x, (numTokensToCopy + block.y - 1) / block.y,
         (numHeads + block.z - 1) / block.z};
-    auto srcData = bufferCast<T>(src);
-    auto dstData = bufferCast<T>(dst);
+    auto srcData = src.getBufferPtr<T>();
+    auto dstData = dst.getBufferPtr<T>();
     cuKVCacheBlockPartialCopy<<<grid, block, 0, stream>>>(
         dstData, srcData, numLayers * kvFactor, numHeads, tokensPerBlock, numHidden, numTokensToCopy);
 }

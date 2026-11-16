@@ -20,25 +20,12 @@ CPU-only — no GPU, MPI, or tensorrt_llm dependency.
 import csv
 import json
 import os
-import sys
 
 import pytest
 
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        "examples",
-        "disaggregated",
-        "slurm",
-        "cache_transceiver_test",
-    ),
-)
+__extra_import_path__ = ["~/examples/disaggregated/slurm/cache_transceiver_test"]
 
-from report import (  # noqa: E402
+from report import (
     RID_COMBINATION_STRIDE,
     RID_REQLEN_STRIDE,
     _is_kv_data_header,
@@ -55,6 +42,7 @@ from report import (  # noqa: E402
     emit_launch_vars,
     emit_ucx_env,
 )
+from submit import validate
 
 
 @pytest.fixture
@@ -112,12 +100,39 @@ def sample_cfg():
 # build_cases
 # ---------------------------------------------------------------------------
 class TestBuildCases:
+    @pytest.mark.parametrize("versions", [None, ["V1"]])
+    def test_python_only_without_v2_rejects_empty_matrix(self, sample_cfg, versions):
+        """A requested Python test cannot silently succeed without running a case."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        if versions is None:
+            sample_cfg["test_matrix"].pop("cache_manager_versions")
+        else:
+            sample_cfg["test_matrix"]["cache_manager_versions"] = versions
+        with pytest.raises(ValueError, match="no supported cases"):
+            build_cases(sample_cfg)
+
+    def test_dropped_combination_identified(self, sample_cfg, caplog):
+        """Warn about a requested runtime even when other combinations remain valid."""
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        cases = build_cases(sample_cfg)
+        assert cases
+        assert "NIXL/PYTHON has no supported cache manager version" in caplog.text
+
+    def test_submit_rejects_empty_matrix_before_launch(self, sample_cfg, capfd):
+        """Submission fails before reserving GPUs for an unsupported matrix."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        with pytest.raises(SystemExit) as error:
+            validate(sample_cfg)
+        assert error.value.code == 1
+        assert "Test matrix contains no supported cases" in capfd.readouterr().err
+
     def test_basic(self, sample_cfg):
         cases = build_cases(sample_cfg)
         labels = [c["label"] for c in cases]
         assert "UCX/CPP/V1" in labels
         assert "NIXL/CPP/V1" in labels
-        assert "NIXL/PYTHON/V1" in labels
+        assert "NIXL/PYTHON/V1" not in labels
         assert "NIXL/PYTHON/V2" in labels
         # V2 + CPP should be skipped
         assert "UCX/CPP/V2" not in labels
@@ -227,7 +242,7 @@ class TestParsePythonCsvs:
                 {
                     "unique_rid": "0",
                     "throughput_mbs": "1048.576",
-                    "task_type": "Send",
+                    "task_type": "KVSendTask",
                     "other": "",
                 }
             )
@@ -236,7 +251,17 @@ class TestParsePythonCsvs:
                 {
                     "unique_rid": "0",
                     "throughput_mbs": "2000.0",
-                    "task_type": "Recv",
+                    "task_type": "KVRecvTask",
+                    "other": "",
+                }
+            )
+            # Aux sends are tiny metadata transfers; they must not drag the
+            # KV bandwidth stats down.
+            w.writerow(
+                {
+                    "unique_rid": "0",
+                    "throughput_mbs": "1.0",
+                    "task_type": "AuxSendTask",
                     "other": "",
                 }
             )
@@ -245,6 +270,47 @@ class TestParsePythonCsvs:
         # 1048.576 MiB/s * 1024^2 / 1e9 ≈ 1.0995 GB/s
         assert len(result[0]) == 1
         assert abs(result[0][0] - 1048.576 * 1024 * 1024 / 1e9) < 0.001
+
+    def test_cpp_naming_without_py_prefix(self, tmp_path):
+        """PerfLogManager prefers the C++ output-path env var for naming.
+
+        With TRTLLM_KVCACHE_TIME_OUTPUT_PATH set, Python task CSVs are named
+        "<instanceUuid>_<rank>.csv" (no py_ prefix); the parser must find them
+        by header columns instead of file name.
+        """
+        csv_path = tmp_path / "cd93dae6-1111-2222-3333-444455556666_3.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=["unique_rid", "throughput_mbs", "task_type"],
+            )
+            w.writeheader()
+            w.writerow({"unique_rid": "0", "throughput_mbs": "1048.576", "task_type": "KVSendTask"})
+        result = _parse_python_csvs(str(tmp_path))
+        assert 0 in result
+        assert abs(result[0][0] - 1048.576 * 1024 * 1024 / 1e9) < 0.001
+
+    def test_ignores_cpp_csvs_in_same_dir(self, tmp_path):
+        """C++ CSVs sharing the directory must not contribute samples.
+
+        C++ send/recv and gen-summary CSVs lack the unique_rid/throughput_mbs
+        columns, so the header check skips them.
+        """
+        with open(
+            tmp_path / "3c9f0e2a-aaaa-bbbb-cccc-ddddeeeeffff_0_recv.csv", "w", newline=""
+        ) as f:
+            w = csv.writer(f)
+            w.writerow(["RequestID", "Bandwidth(Gbps)"])
+            w.writerow([0, 10.0])
+        with open(
+            tmp_path / "3c9f0e2a-aaaa-bbbb-cccc-ddddeeeeffff_0_gen_transfer_summary.csv",
+            "w",
+            newline="",
+        ) as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "RequestID", "gen_side_transfer_time(ms)", "kv_cache_size"])
+            w.writerow(["2026-01-01 00:00:00.000", 0, 1.0, 1024])
+        assert _parse_python_csvs(str(tmp_path)) == {}
 
     def test_empty_dir(self, tmp_path):
         assert _parse_python_csvs(str(tmp_path)) == {}
@@ -342,7 +408,7 @@ class TestParseProtoInfo:
                 "[CTT_CASE_BEGIN] ci=0 label=UCX/CPP/V1",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | cuda_ipc/cuda |",
-                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V2",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | rc_mlx5/cuda |",
             ],
@@ -355,7 +421,7 @@ class TestParseProtoInfo:
         self._write_log(
             tmp_path / "rank0.log",
             [
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2",
                 "export UCX_TLS=all,self",
                 "cfg#0 tagged message (cuda/cuda)",
                 "  | eager short | self/memory |",
@@ -404,7 +470,7 @@ class TestRankBest:
     def test_picks_highest_bw(self):
         by_combination = [
             {
-                "combination": "NIXL/PYTHON/V1",
+                "combination": "NIXL/PYTHON/V2",
                 "sweeps": [
                     {
                         "sweep": "all",
@@ -459,7 +525,7 @@ class TestAggregate:
         sample_cfg["environment"]["work_dir"] = str(work)
         # Use only 1 sweep and 1 combination for simplicity
         sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
-        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V2"]
         sample_cfg["ucx_env_sweep"] = [{"name": "default", "env": {"UCX_TLS": "all"}}]
         sample_cfg["test_matrix"]["request_lengths"] = [100, 1000]
         sample_cfg["test_matrix"]["warmup_requests"] = 1
@@ -515,7 +581,7 @@ class TestAggregate:
         assert "by_combination" in data
         assert data["req_len"] == 1000
         assert len(data["by_combination"]) == 1
-        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V1"
+        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V2"
 
         # Best file should also be written
         best_path = str(work / "results.best.json")
@@ -525,7 +591,7 @@ class TestAggregate:
         work = self._setup_work_dir(tmp_path, sample_cfg)
         with open(work / "logs" / "sweep0_gen_rank0.log", "w") as f:
             f.write(
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1\n"
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2\n"
                 "export UCX_TLS=all,self\n"
                 "cfg#0 tagged message (cuda/cuda)\n"
                 "  | eager short | self/memory |\n"

@@ -534,7 +534,7 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 
 **Model Structure:**
 - Inherit from `StrictBaseModel` (which sets `extra="forbid"`) to fail fast when users specify invalid field names
-- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MedusaDecodingConfig`, etc.)
+- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MTPDecodingConfig`, etc.)
 - **Do not define `__init__` methods** - this bypasses Pydantic's validation and type coercion, and can cause subtle bugs with model inheritance. Instead:
   - For validation logic, use `@field_validator` or `@model_validator`
   - For post-validation initialization (e.g. setting up private fields and state), use [`model_post_init()`](https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_post_init)
@@ -658,8 +658,8 @@ Except in exceptional circumstances, use the built-in exception types.  For whic
 
 #### Static Typing
 
-1. Static type checking at pre-commit time is opt-in by submodule PICs. This is highly recommended because static type checking eliminates an entire class of bugs and makes your code more readable and maintainable overall.
-2. The presubmit system currently uses mypy.  However, many developers use pyright variants in their editors, so the code also has some `#pyright:` annotations.  As we don’t currently enforce pyright, maintaining these is best effort.  But if you notice they are broken, please fix them.
+1. Pre-commit and presubmit run advisory Pyrefly checks on product and test Python code. Pre-commit checks supplied files and filters diagnostics to added and modified lines when available; Jenkins scans all configured sources. Product checks use `pyproject.toml`; the wrapper generates a temporary configuration from `[tool.pyrefly-tests]` for a separate test pass so test helper search paths do not affect product import resolution. The test configuration disables `missing-argument`, `unexpected-keyword`, and `bad-argument-count`; these diagnostics remain enabled for product code. See `AGENTS.md` for report behavior and exclusions. Static type checking helps detect bugs and makes code more readable and maintainable.
+2. Many developers use pyright variants in their editors, so the code also has some `#pyright:` annotations. As we don’t currently enforce pyright, maintaining these is best effort. But if you notice they are broken, please fix them.
 3. Do not use `typing.Any` if you can avoid it. Similarly, avoid bypassing the type checker with `# type: ignore` annotations.
 4. Always annotate functions. Make the return type `None` if the function does not return anything (if you leave it empty, the type checker will infer the return type as `Any`).
 5. Annotate class members and other variables when necessary. Always annotate `dataclass` and `NamedTuple` members.

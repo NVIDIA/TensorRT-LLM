@@ -1,23 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Request schedulers used by the PyTorch executor."""
+
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
+from typing import Any, Callable, Optional, TypeAlias, TypeVar, cast
 
+import torch
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
+from ...tensor_lru_cache import CacheAcquireResult, TensorLRUCache
+
 # Assuming these imports exist in your environment
-from ..llm_request import LlmRequest, LlmRequestState
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    MultimodalEncoderRequestState,
+    get_mm_context_chunk_start,
+    get_mm_items_for_chunk,
+    get_mm_pending_items,
+    make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
+)
 
 RequestList = list[LlmRequest]
 PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
 PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
+# Radix-tree key returned by `PrefixReuseSummary.first_new_block`. Used only as a
+# hashable set element, so the mock KV manager in the unit tests substitutes a
+# plain tuple; the alias documents the production type.
+BlockKey: TypeAlias = tb_internal.batch_manager.BlockKey
 T = TypeVar("T")
 
 
@@ -53,17 +75,53 @@ def _call_with_optional_summary(
     return fn(*args, cached_summary=cached_summary)
 
 
-SchedulerOutput = namedtuple(
-    "SchedulerOutput",
-    [
-        "encoder_requests",
-        "context_requests",
-        "generation_requests",
-        "paused_requests",
-        "fitting_disagg_gen_init_requests",
-        "num_fitting_requests",
-    ],
-)
+class SchedulerOutput(
+    namedtuple(
+        "_SchedulerOutputBase",
+        [
+            "encoder_requests",
+            "context_requests",
+            "generation_requests",
+            "paused_requests",
+            "fitting_disagg_gen_init_requests",
+            "num_fitting_requests",
+            # Multimodal encoder scheduling outputs.
+            "scheduled_mm_encoder_items",
+            "recompute_paused_requests",
+        ],
+    )
+):
+    """Scheduler result.
+
+    The optional multimodal fields default to ``None``. The V2-only
+    ``recompute_paused_requests`` defaults to a fresh empty list so existing
+    V1 schedulers can keep constructing the original six-field output.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        encoder_requests: RequestList,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        num_fitting_requests: int,
+        scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
+        recompute_paused_requests: RequestList | None = None,
+    ):
+        return super(SchedulerOutput, cls).__new__(
+            cls,
+            encoder_requests,
+            context_requests,
+            generation_requests,
+            paused_requests,
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests,
+            scheduled_mm_encoder_items,
+            [] if recompute_paused_requests is None else recompute_paused_requests,
+        )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
@@ -132,6 +190,15 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
     return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
 
 
+class RemoteTailPhase(Enum):
+    """Fleet-wide GEN admission for remote-tail attention DP."""
+
+    NONE = "none"
+    CONTEXT = "context"
+    DECODE = "decode"
+    MIXED = "mixed"
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
@@ -151,14 +218,39 @@ class ScheduledRequests:
     generation_requests: RequestList
     """Requests that are in the generation phase."""
     paused_requests: RequestList
-    """Requests that are paused."""
+    """Requests whose KV cache was suspended without resetting request state."""
+    recompute_paused_requests: RequestList
+    """Requests that must release resources and restart from context."""
+    added_inflight_req_ids: list[int]
+    """Request ids this batch inserted into the executor's inflight set.
+
+    Recorded by ``PyExecutor._add_inflight_ids`` so the paired
+    ``_remove_inflight_ids`` erases exactly what was added. The batch is trimmed
+    between the two calls -- ``ResourceManager.prepare_resources`` shrinks
+    over-budget context chunks at its end, which can move a request out of
+    ``context_requests_last_chunk`` -- so the ids are no longer derivable from
+    the request lists at removal time.
+    """
+    scheduled_mm_encoder_items: dict[int, list[int]] | None
+    """Maps a request id to the prompt-ordered indices of its multimodal items
+    selected for encoder execution this iteration (only items whose encoder
+    outputs are still missing). ``None`` when no items were scheduled."""
+    paused_in_place_ids: frozenset[int]
+    """Generation requests paused in place or displaced by a forced resume:
+    left out of this batch, but their drafter state must be kept."""
 
     def __init__(self):
+        self.attention_dp_phase: RemoteTailPhase | None = None
+        self.is_attention_dp_phase_idle = False
         self.encoder_requests: RequestList = []
         self.context_requests_chunking: RequestList = []
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.recompute_paused_requests: RequestList = []
+        self.added_inflight_req_ids: list[int] = []
+        self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.paused_in_place_ids: frozenset[int] = frozenset()
 
     @property
     def is_generation_only(self) -> bool:
@@ -168,7 +260,10 @@ class ScheduledRequests:
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return self.num_context_requests == 0
+        return (
+            self.num_context_requests == 0
+            and self.attention_dp_phase is not RemoteTailPhase.CONTEXT
+        )
 
     @property
     def batch_size(self) -> int:
@@ -215,7 +310,46 @@ class ScheduledRequests:
             self.append_context_request(req)
 
 
+@dataclass(frozen=True)
+class ContextChunk:
+    """A proposed prompt window after actual KV reuse and recompute are resolved.
+
+    The bounds are immutable for one scheduling pass. A consumer may shorten
+    the request's chunk within this window, but must not extend it or infer
+    its start from estimated prefix reuse.
+    """
+
+    request: LlmRequest
+    start: int
+    end: int
+
+    @classmethod
+    def from_request(cls, request: LlmRequest) -> "ContextChunk":
+        """Snapshot an already prepared request's actual prompt window."""
+        start = request.context_current_position
+        return cls(request, start, min(request.prompt_len, start + request.context_chunk_size))
+
+
 class RequestScheduler(ABC):
+    @property
+    @abstractmethod
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        """Return the half-open state range admitted to a forward batch."""
+        raise NotImplementedError
+
+    def is_request_in_schedulable_state(self, request: LlmRequest) -> bool:
+        """Return whether request state permits admission to a forward batch."""
+        if is_decoder_context_request_waiting_for_encoder_output(request):
+            return False
+        if request.state in (
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        ):
+            return False
+        schedule_from, schedule_to = self.scheduling_state_range
+        return schedule_from.value <= request.state_value < schedule_to.value
+
     @abstractmethod
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -237,6 +371,46 @@ class RequestScheduler(ABC):
         """
         raise NotImplementedError
 
+    def release_context_admission(self, request: LlmRequest) -> None:
+        """Undo the admission of a first-chunk context withheld from the batch.
+
+        Only schedulers that allocate KV cache while scheduling have anything
+        to release; the default is a no-op.
+        """
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        """Register the executor's disaggregated KV-transfer window
+        (DisaggTransferAdmissionController), when it bounds admission.
+
+        Only schedulers that allocate KV cache while scheduling use it, to skip
+        the generation-init requests the window would defer; the default is a
+        no-op.
+        """
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Register a live probe for rank-local receive resources being retired.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
+
 
 @dataclass
 class SerializableSchedulerOutput:
@@ -257,6 +431,11 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    # request id -> prompt-ordered indices of its MM items selected for
+    # encoder execution this iteration
+    scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+    recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
+    """Request ids of recompute-paused requests."""
 
     @classmethod
     def from_scheduler_result(
@@ -281,6 +460,10 @@ class SerializableSchedulerOutput:
             ],
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
+            scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
+            recompute_paused_requests=[
+                req.request_id for req in scheduled_requests.recompute_paused_requests
+            ],
         )
 
     def to_scheduler_result(
@@ -302,6 +485,10 @@ class SerializableSchedulerOutput:
         ]
         scheduled_requests.paused_requests = [
             id_to_request[req_id] for req_id in self.paused_requests
+        ]
+        scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
+        scheduled_requests.recompute_paused_requests = [
+            id_to_request[req_id] for req_id in self.recompute_paused_requests
         ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
@@ -392,18 +579,30 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config[0], ctx_chunk_config[1], max_num_tokens
+            )
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config_cpp, max_num_tokens)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens,
+            no_schedule_until_state=no_schedule_until_state,
+            no_schedule_after_state=no_schedule_after_state,
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -426,6 +625,13 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
+        )
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -453,6 +659,704 @@ class SimpleScheduler(RequestScheduler):
         return len(fitting_requests) == len(requests)
 
 
+@dataclass
+class _MultimodalEncoderStep:
+    """MM encoder items selected for one iteration and the budget they leave."""
+
+    batch_slots: int
+    tokens: int
+    bytes_per_encoder_embedding: int
+    selected: dict[int, list[int]] = dataclasses.field(default_factory=dict)
+    cache_keys: set[Hashable] = dataclasses.field(default_factory=set)
+    output_bytes: int = 0
+
+    def try_select(
+        self, request: LlmRequest, state: MultimodalEncoderRequestState, item_idx: int
+    ) -> bool:
+        """Select one bound item for encoding if it fits the remaining budget."""
+        cost = state.encoder_token_lengths[item_idx]
+        if self.batch_slots == 0 or cost > self.tokens:
+            return False
+        self.batch_slots -= 1
+        self.tokens -= cost
+        self.selected.setdefault(request.request_id, []).append(item_idx)
+        self.cache_keys.add(state.item_cache_keys[item_idx])
+        self.output_bytes += state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+        return True
+
+    def unselect(
+        self, request: LlmRequest, state: MultimodalEncoderRequestState, item_idx: int
+    ) -> None:
+        """Undo `try_select` for one item, if this request selected it."""
+        item_indices = self.selected.get(request.request_id)
+        if item_indices is None or item_idx not in item_indices:
+            return
+        item_indices.remove(item_idx)
+        if not item_indices:
+            del self.selected[request.request_id]
+        self.batch_slots += 1
+        self.tokens += state.encoder_token_lengths[item_idx]
+        self.cache_keys.discard(state.item_cache_keys[item_idx])
+        self.output_bytes -= state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+
+
+class MultimodalScheduler(RequestScheduler):
+    """Add per-item MM encoder limits and cache lookup to the LLM scheduler.
+
+    The wrapper is constructed only for ``MultimodalModelMixin`` models. It
+    deliberately reuses the wrapped scheduler's capacity and microbatch
+    schedulers so MM encoder costs never enter the LLM token budget.
+
+    ``max_batch_size`` and ``max_num_tokens`` are shared across requests and
+    modalities. For multimodal encoders, one atomic image or video occupies
+    one encoder batch slot even when it expands into several model-internal
+    attention sequences. Those attention metadata capacities are derived
+    separately from the token budget and model geometry.
+
+    With KV cache manager V2, a request needs only the items that its remaining
+    prompt uses: an item wholly inside the confirmed reusable KV prefix is
+    never encoded, and the executor releases it once prefill moves past it.
+    V1 keeps whole-request encoder scheduling. Each pass selects items in one
+    of two ways:
+
+    * Whole request: acquire every remaining item of a request and admit it to
+      the LLM batch once all of them are ready. ``DEFAULT`` uses this while the
+      FCFS-front MM request fits the cache and one encoder step. Without
+      context chunking both policies use it, because no legal chunk boundary
+      exists before a later item.
+    * Context chunk: start from the chunks the wrapped scheduler proposes,
+      acquire only the items each chunk uses, and end a chunk before its first
+      item that cannot be produced this iteration.
+
+    Cache hits and items already selected through the same cache entry use no
+    encoder budget. The cache tracks bytes and references, retains reusable
+    outputs, and chooses LRU entries to remove when space is needed.
+    """
+
+    prepares_future_items = False
+    """Whether leftover encoder budget prepares later items of active requests."""
+
+    def __init__(
+        self,
+        scheduler: RequestScheduler,
+        max_batch_size: int,
+        max_num_tokens: int,
+        *,
+        encoder_cache: TensorLRUCache[Hashable],
+        get_item_cache_keys: Callable[[LlmRequest], list[Hashable] | None],
+        bytes_per_encoder_embedding: int,
+        retain_cache_entries: bool,
+        context_chunk_unit_size: int | None = None,
+    ) -> None:
+        self.scheduler = scheduler
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        self.encoder_cache = encoder_cache
+        self.get_item_cache_keys = get_item_cache_keys
+        self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
+        self.retain_cache_entries = retain_cache_entries
+        # Only V2 supplies resolved prompt windows; V1 leaves this unset.
+        self.context_chunk_unit_size = context_chunk_unit_size
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return self.scheduler.scheduling_state_range
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Forward the local retirement probe to the wrapped scheduler.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+        self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
+
+    def _new_encoder_step(self) -> _MultimodalEncoderStep:
+        return _MultimodalEncoderStep(
+            self.max_batch_size, self.max_num_tokens, self.bytes_per_encoder_embedding
+        )
+
+    def _get_request_item_cache_keys(
+        self, request: LlmRequest, state: MultimodalEncoderRequestState
+    ) -> tuple[list[Hashable], bool]:
+        """Return every item's cache key and whether released entries stay reusable."""
+        stable_keys = self.get_item_cache_keys(request)
+        if stable_keys is None:
+            # Hashing can fail or callers can supply processed inputs without
+            # hashes. These items still need cache-backed output storage, but
+            # their request-local keys must not enable cross-request reuse.
+            return [
+                make_mm_encoder_transient_cache_key(request.request_id, item_idx)
+                for item_idx in range(state.num_items)
+            ], False
+        return stable_keys, self.retain_cache_entries
+
+    def _acquire_item_cache_entry(
+        self,
+        state: MultimodalEncoderRequestState,
+        item_idx: int,
+        cache_key: Hashable,
+        retain_after_release: bool,
+    ) -> CacheAcquireResult | None:
+        """Acquire one item's cache entry and bind it to the request."""
+        expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+        acquire_result = self.encoder_cache.acquire(
+            cache_key, expected_bytes, retain_after_release=retain_after_release
+        )
+        if acquire_result is not None:
+            state.set_item_cache_key(
+                item_idx, cache_key, ready=acquire_result is CacheAcquireResult.READY_HIT
+            )
+        return acquire_result
+
+    def _acquire_request_cache_entries(
+        self,
+        request: LlmRequest,
+        state: MultimodalEncoderRequestState,
+        item_indices: list[int],
+    ) -> list[int] | None:
+        """Acquire every missing cache entry of the given items, or undo the attempt if full."""
+        item_cache_keys, retain_after_release = self._get_request_item_cache_keys(request, state)
+        acquired_item_indices: list[int] = []
+        for item_idx in item_indices:
+            if state.item_cache_keys[item_idx] is not None:
+                continue
+            if (
+                self._acquire_item_cache_entry(
+                    state, item_idx, item_cache_keys[item_idx], retain_after_release
+                )
+                is None
+            ):
+                self._release_acquired_cache_entries(state, acquired_item_indices)
+                return None
+            acquired_item_indices.append(item_idx)
+        return acquired_item_indices
+
+    def _release_acquired_cache_entries(
+        self,
+        state: MultimodalEncoderRequestState,
+        acquired_item_indices: list[int],
+    ) -> None:
+        for item_idx in acquired_item_indices:
+            cache_key = state.clear_item_cache_key(item_idx)
+            self.encoder_cache.release(cache_key)
+
+    def _cache_claims(self, active_requests: RequestList) -> tuple[int, set[Hashable]]:
+        """Return protected cache bytes and the keys already referenced by live requests."""
+        stats = self.encoder_cache.stats()
+        held_keys = {
+            cache_key
+            for request in active_requests
+            if (state := request.py_mm_encoder_state) is not None
+            for cache_key in state.item_cache_keys
+            if cache_key is not None
+        }
+        return stats.reserved_bytes + stats.in_use_bytes, held_keys
+
+    def _output_budget_blocks(
+        self, request: LlmRequest, held_bytes: int, held_keys: set[Hashable]
+    ) -> bool:
+        """Check whether unclaimed pending entries can fit beside protected cache entries."""
+        state = request.py_mm_encoder_state
+        embedding_lengths = state.embedding_lengths
+        stable_keys = self.get_item_cache_keys(request)
+        item_cache_keys = (
+            stable_keys
+            if stable_keys is not None
+            else [
+                make_mm_encoder_transient_cache_key(request.request_id, item_idx)
+                for item_idx in range(state.num_items)
+            ]
+        )
+        # Shared READY entries and reservations need no extra bytes. Retained
+        # entries without live references are evictable and do not claim space.
+        additional_entries = {
+            item_cache_keys[item_idx]: (
+                embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+            )
+            for item_idx in get_mm_pending_items(request)
+            if item_cache_keys[item_idx] not in held_keys
+        }
+        request_bytes = sum(additional_entries.values())
+        return held_bytes + request_bytes > self.encoder_cache.max_bytes >= request_bytes
+
+    def _holders_first(
+        self, active_requests: RequestList, held_bytes: int, held_keys: set[Hashable]
+    ) -> RequestList:
+        """Let cache holders prefill before a context blocked on their protected entries.
+
+        Combined schedulers grow KV and charge token budget before encoder
+        readiness is known. A cache-blocked context must not take the budget
+        needed by holders to prefill and release their cache references.
+        """
+        if not held_bytes:
+            return active_requests
+        for position, request in enumerate(active_requests):
+            state = request.py_mm_encoder_state
+            if (
+                state is None
+                or any(cache_key is not None for cache_key in state.item_cache_keys)
+                or not self._output_budget_blocks(request, held_bytes, held_keys)
+            ):
+                continue
+            holders = [
+                holder
+                for holder in active_requests[position + 1 :]
+                if holder.py_mm_encoder_state is not None
+                and any(
+                    cache_key is not None
+                    for cache_key in holder.py_mm_encoder_state.item_cache_keys
+                )
+            ]
+            if not holders:
+                return active_requests
+            holder_ids = {holder.py_request_id for holder in holders}
+            others = [
+                other
+                for other in active_requests[position:]
+                if other.py_request_id not in holder_ids
+            ]
+            return [*active_requests[:position], *holders, *others]
+        return active_requests
+
+    @staticmethod
+    def _is_ready_after_encoder_step(request: LlmRequest, step: _MultimodalEncoderStep) -> bool:
+        """Return whether every item the remaining prefill uses is ready after this step."""
+        state = request.py_mm_encoder_state
+        return state is None or all(
+            state.item_cache_keys[item_idx] in step.cache_keys
+            for item_idx in get_mm_pending_items(request)
+        )
+
+    def _select_items(self, requests: RequestList, step: _MultimodalEncoderStep) -> None:
+        """Acquire whole-request output entries and select the items that need encoding.
+
+        Requests are visited in the given order, which callers keep in FCFS
+        admission order, with no explicit `MultimodalEncoderProgress`-based
+        priority: a request left `PARTIAL` by a budget split necessarily sits
+        ahead of anything admitted later, so its remaining items resume before
+        newer work by order alone.
+
+        Cache hits and items already selected through the same cache entry use
+        no encoder compute budget. Newly acquired entries are kept when the
+        request becomes ready from cache hits or a pending output will be
+        produced this iteration. The caller passes the summed output bytes of
+        the selected producers once to `ensure_capacity` before producer
+        commits.
+        """
+        for request in requests:
+            state = request.py_mm_encoder_state
+            if state is None:
+                continue
+            pending_item_indices = get_mm_pending_items(request)
+            if not pending_item_indices:
+                continue
+            acquired_item_indices = self._acquire_request_cache_entries(
+                request, state, pending_item_indices
+            )
+            if acquired_item_indices is None:
+                continue
+            pending_items = [
+                (item_idx, cast(Hashable, state.item_cache_keys[item_idx]))
+                for item_idx in pending_item_indices
+                if not state.item_ready[item_idx]
+            ]
+            will_make_progress = any(cache_key in step.cache_keys for _, cache_key in pending_items)
+            for item_idx, cache_key in pending_items:
+                if cache_key in step.cache_keys:
+                    continue
+                if not step.try_select(request, state, item_idx):
+                    break
+                will_make_progress = True
+
+            # Release newly acquired entries if none of this request's pending
+            # outputs will be produced in this iteration.
+            if acquired_item_indices and pending_items and not will_make_progress:
+                self._release_acquired_cache_entries(state, acquired_item_indices)
+
+    def _selects_whole_requests(self, requests: RequestList) -> bool:
+        """Return whether this pass selects whole requests rather than context chunks.
+
+        The first request with pending items decides: it keeps whole-request
+        selection once it holds every entry it still needs, and starts it only
+        when its unbound remaining outputs fit the free cache space and its
+        unbound items fit one encoder step. Whole-request selection cannot
+        reclaim space that other requests hold, so a request that only fits
+        the empty cache follows context chunks instead.
+        """
+        if self.context_chunk_unit_size is None:
+            return True
+        if self.prepares_future_items:
+            return False
+        for request in requests:
+            pending_item_indices = get_mm_pending_items(request)
+            if not pending_item_indices:
+                continue
+            state = cast(MultimodalEncoderRequestState, request.py_mm_encoder_state)
+            if all(
+                state.item_cache_keys[item_idx] is not None for item_idx in pending_item_indices
+            ):
+                return True
+            item_cache_keys, _ = self._get_request_item_cache_keys(request, state)
+            # Read cache keys only; do not change cache state for this check.
+            unbound_items = [
+                item_idx
+                for item_idx in get_mm_items_for_chunk(
+                    request, get_mm_context_chunk_start(request), request.prompt_len
+                )
+                if state.item_cache_keys[item_idx] is None
+            ]
+            output_bytes = {
+                item_cache_keys[item_idx]: state.embedding_lengths[item_idx]
+                * self.bytes_per_encoder_embedding
+                for item_idx in unbound_items
+            }
+            encoder_tokens = {
+                item_cache_keys[item_idx]: state.encoder_token_lengths[item_idx]
+                for item_idx in unbound_items
+            }
+            cache_stats = self.encoder_cache.stats()
+            free_bytes = (
+                cache_stats.max_bytes - cache_stats.reserved_bytes - cache_stats.in_use_bytes
+            )
+            return (
+                sum(output_bytes.values()) <= free_bytes
+                and len(encoder_tokens) <= self.max_batch_size
+                and sum(encoder_tokens.values()) <= self.max_num_tokens
+            )
+        return True
+
+    @staticmethod
+    def _get_item_prompt_start(request: LlmRequest, item_idx: int, begin: int) -> int:
+        """Return the prompt position of an item's first row, or ``begin`` if unknown."""
+        mm_data = request.py_multimodal_data
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum") if isinstance(mm_data, dict) else None
+        state = request.py_mm_encoder_state
+        if cumsum is None or state is None:
+            return begin
+        row_start = sum(state.embedding_lengths[:item_idx])
+        return int(torch.searchsorted(cumsum, row_start + 1).item())
+
+    def _get_chunk_size_before_item(self, chunk: ContextChunk, item_idx: int) -> int:
+        """Return an aligned context chunk size that ends before the given item."""
+        unit_size = self.context_chunk_unit_size
+        if unit_size is None:
+            return 0
+        request, begin = chunk.request, chunk.start
+        limit = min(
+            self._get_item_prompt_start(request, item_idx, begin),
+            chunk.end,
+        )
+        aligned_end = (limit // unit_size) * unit_size
+        snapshot_end = max(
+            (point for point in request.expect_snapshot_points if begin < point <= limit),
+            default=0,
+        )
+        return max(0, max(aligned_end, snapshot_end) - begin)
+
+    @staticmethod
+    def _get_reclaimable_items(
+        active_requests: RequestList,
+        protected_items: set[tuple[int, int]],
+        step: _MultimodalEncoderStep,
+    ) -> list[tuple[LlmRequest, int]]:
+        """Return held outputs that no chunk of this pass uses, newest first.
+
+        A dropped output is acquired and encoded again when a later chunk uses
+        it. Outputs at a request's next chunk start come last: that request
+        needs them immediately, but requests that each hold one and need
+        another item could otherwise block each other permanently.
+        """
+        candidates = []
+        chunk_start_candidates = []
+        for request in reversed(active_requests):
+            state = request.py_mm_encoder_state
+            if state is None:
+                continue
+            begin = get_mm_context_chunk_start(request)
+            next_items = set(get_mm_items_for_chunk(request, begin, begin + 1))
+            for item_idx in reversed(get_mm_items_for_chunk(request, begin, request.prompt_len)):
+                cache_key = state.item_cache_keys[item_idx]
+                if (
+                    cache_key is None
+                    or cache_key in step.cache_keys
+                    or (request.request_id, item_idx) in protected_items
+                ):
+                    continue
+                if item_idx in next_items:
+                    chunk_start_candidates.append((request, item_idx))
+                else:
+                    candidates.append((request, item_idx))
+        return candidates + chunk_start_candidates
+
+    def _reclaim_and_acquire_item_cache_entry(
+        self,
+        state: MultimodalEncoderRequestState,
+        item_idx: int,
+        cache_key: Hashable,
+        retain_after_release: bool,
+        active_requests: RequestList,
+        protected_items: set[tuple[int, int]],
+        step: _MultimodalEncoderStep,
+    ) -> CacheAcquireResult | None:
+        """Release later outputs only when they can make the target entry fit."""
+        candidates = self._get_reclaimable_items(active_requests, protected_items, step)
+        stats = self.encoder_cache.stats()
+        available_bytes = stats.max_bytes - stats.reserved_bytes - stats.in_use_bytes
+        releasable_bytes = self.encoder_cache.releasable_bytes(
+            candidate_request.py_mm_encoder_state.item_cache_keys[candidate_idx]
+            for candidate_request, candidate_idx in candidates
+        )
+        expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+        if expected_bytes > available_bytes + releasable_bytes:
+            return None
+
+        for candidate_request, candidate_idx in candidates:
+            candidate_state = cast(
+                MultimodalEncoderRequestState, candidate_request.py_mm_encoder_state
+            )
+            self.encoder_cache.release(candidate_state.clear_item_cache_key(candidate_idx))
+            acquire_result = self._acquire_item_cache_entry(
+                state, item_idx, cache_key, retain_after_release
+            )
+            if acquire_result is not None:
+                return acquire_result
+        return None
+
+    def _select_items_for_context_chunks(
+        self,
+        chunks: list[ContextChunk],
+        active_requests: RequestList,
+        paused_request_ids: set[int],
+        step: _MultimodalEncoderStep,
+        *,
+        output_capacity_blocked_ids: set[int] | None = None,
+    ) -> RequestList:
+        """Select the items each proposed context chunk uses and return the runnable contexts.
+
+        A chunk ends before its first item that cannot be acquired or encoded
+        this iteration, and entries acquired in this pass for items past the
+        final chunk are released again. A request whose chunk becomes empty
+        waits for a later iteration.
+        """
+        ready_context_requests: RequestList = []
+        protected_items: set[tuple[int, int]] = set()
+        # KV reuse can start a prefill past outputs that were bound while it was at zero.
+        for chunk in chunks:
+            release_consumed_mm_items(chunk.request, self.encoder_cache)
+        for chunk in chunks:
+            request = chunk.request
+            state = request.py_mm_encoder_state
+            if state is None:
+                ready_context_requests.append(request)
+                continue
+            begin = chunk.start
+            chunk_items = get_mm_items_for_chunk(request, begin, chunk.end)
+            item_cache_keys, retain_after_release = self._get_request_item_cache_keys(
+                request, state
+            )
+            acquired_item_indices: list[int] = []
+            unavailable_item = None
+            for item_idx in chunk_items:
+                # Never reclaim an output that an earlier chunk of this pass uses.
+                protected_items.add((request.request_id, item_idx))
+                if state.item_ready[item_idx]:
+                    continue
+                if state.item_cache_keys[item_idx] is None:
+                    acquire_args = (
+                        state,
+                        item_idx,
+                        item_cache_keys[item_idx],
+                        retain_after_release,
+                    )
+                    acquire_result = self._acquire_item_cache_entry(*acquire_args)
+                    if acquire_result is None:
+                        acquire_result = self._reclaim_and_acquire_item_cache_entry(
+                            *acquire_args, active_requests, protected_items, step
+                        )
+                    if acquire_result is None:
+                        if output_capacity_blocked_ids is not None:
+                            output_capacity_blocked_ids.add(request.py_request_id)
+                        unavailable_item = item_idx
+                        break
+                    acquired_item_indices.append(item_idx)
+                    if acquire_result is CacheAcquireResult.READY_HIT:
+                        continue
+                if state.item_cache_keys[item_idx] in step.cache_keys:
+                    continue
+                if not step.try_select(request, state, item_idx):
+                    unavailable_item = item_idx
+                    break
+
+            if unavailable_item is not None:
+                request.context_chunk_size = self._get_chunk_size_before_item(
+                    chunk, unavailable_item
+                )
+                # A request that cannot run any chunk keeps the items of its
+                # smallest next chunk, so their outputs accumulate when they
+                # do not fit one encoder step together.
+                kept_end = begin + (request.context_chunk_size or self.context_chunk_unit_size or 0)
+                final_items = set(get_mm_items_for_chunk(request, begin, kept_end))
+                for item_idx in chunk_items:
+                    if item_idx not in final_items:
+                        step.unselect(request, state, item_idx)
+                self._release_acquired_cache_entries(
+                    state,
+                    [item_idx for item_idx in acquired_item_indices if item_idx not in final_items],
+                )
+            if request.context_chunk_size > 0:
+                ready_context_requests.append(request)
+
+        if self.prepares_future_items:
+            self._select_future_items(active_requests, paused_request_ids, step)
+        return ready_context_requests
+
+    def _select_future_items(
+        self,
+        active_requests: RequestList,
+        paused_request_ids: set[int],
+        step: _MultimodalEncoderStep,
+    ) -> None:
+        """Spend leftover encoder budget on later items in context-chunk mode, in FCFS order."""
+        for request in active_requests:
+            state = request.py_mm_encoder_state
+            if state is None or request.request_id in paused_request_ids:
+                continue
+            pending_item_indices = get_mm_pending_items(request)
+            if not pending_item_indices:
+                continue
+            item_cache_keys, retain_after_release = self._get_request_item_cache_keys(
+                request, state
+            )
+            for item_idx in pending_item_indices:
+                acquired = False
+                if state.item_cache_keys[item_idx] is None:
+                    acquire_result = self._acquire_item_cache_entry(
+                        state, item_idx, item_cache_keys[item_idx], retain_after_release
+                    )
+                    if acquire_result is None:
+                        break
+                    if acquire_result is CacheAcquireResult.READY_HIT:
+                        continue
+                    acquired = True
+                if state.item_cache_keys[item_idx] in step.cache_keys:
+                    continue
+                if not step.try_select(request, state, item_idx):
+                    if acquired:
+                        self._release_acquired_cache_entries(state, [item_idx])
+                    break
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        """Plan encoder inputs for the actual prompt windows proposed by the LLM.
+
+        DEFAULT spends encoder budget only on proposed contexts. EAGER also
+        prepares later items of active requests with the remaining budget.
+        Both use the same prepared-window and reservation lifecycle.
+        """
+        if not any(request.py_mm_encoder_state is not None for request in active_requests):
+            return self.scheduler.schedule_request(active_requests, inflight_request_ids)
+
+        step = self._new_encoder_step()
+        scheduling_requests = active_requests
+        if self.context_chunk_unit_size is None:
+            held_bytes, held_keys = self._cache_claims(active_requests)
+            scheduling_requests = self._holders_first(active_requests, held_bytes, held_keys)
+        scheduler_output = self.scheduler.schedule_request(
+            scheduling_requests, inflight_request_ids
+        )
+        context_ids = {request.py_request_id for request in scheduler_output.context_requests}
+        proposed_context_requests = [
+            request for request in active_requests if request.py_request_id in context_ids
+        ]
+        chunks = [ContextChunk.from_request(request) for request in proposed_context_requests]
+        context_requests = [chunk.request for chunk in chunks]
+        selects_whole_requests = self._selects_whole_requests(context_requests)
+        output_capacity_blocked_ids: set[int] = set()
+        paused_ids = {request.request_id for request in scheduler_output.paused_requests}
+        if selects_whole_requests:
+            self._select_items(context_requests, step)
+            context_requests = [
+                request
+                for request in context_requests
+                if self._is_ready_after_encoder_step(request, step)
+            ]
+            if self.prepares_future_items:
+                # Whole-request contexts hold every output until prefill ends.
+                # Reserve their outputs together so partial claims cannot block each other.
+                self._select_items(
+                    [
+                        request
+                        for request in active_requests
+                        if request.request_id not in paused_ids
+                    ],
+                    step,
+                )
+        else:
+            context_requests = self._select_items_for_context_chunks(
+                chunks,
+                active_requests,
+                paused_ids,
+                step,
+                output_capacity_blocked_ids=output_capacity_blocked_ids,
+            )
+
+        held_bytes, held_keys = self._cache_claims(active_requests)
+        runnable_ids = {request.py_request_id for request in context_requests}
+        for chunk in chunks:
+            request = chunk.request
+            state = cast(MultimodalEncoderRequestState, request.py_mm_encoder_state)
+            if (
+                state is None
+                or request.py_request_id in runnable_ids
+                or not request.is_first_context_chunk
+                or any(cache_key is not None for cache_key in state.item_cache_keys)
+                or request.py_request_id in step.selected
+            ):
+                continue
+            if selects_whole_requests:
+                output_capacity_blocked = self._output_budget_blocks(request, held_bytes, held_keys)
+            else:
+                output_capacity_blocked = request.py_request_id in output_capacity_blocked_ids
+            if output_capacity_blocked:
+                self.scheduler.release_context_admission(request)
+        self.encoder_cache.ensure_capacity(step.output_bytes)
+        return scheduler_output._replace(
+            context_requests=[
+                request
+                for request in scheduler_output.context_requests
+                if request.py_request_id in runnable_ids
+            ],
+            scheduled_mm_encoder_items=step.selected or None,
+        )
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        return self.scheduler.can_schedule(requests)
+
+
+class MultimodalEagerEncoderScheduler(MultimodalScheduler):
+    """Eagerly schedule encoder work for already-active MM requests.
+
+    With context chunking, this policy first serves the items that the
+    proposed LLM chunks use, then spends leftover encoder budget on later
+    items of active requests in FCFS order, including requests that are not
+    selected for the current LLM batch. Without chunking, it prepares whole
+    requests with the remaining budget. It does not admit waiting requests
+    or bypass LLM capacity for decoder execution.
+    """
+
+    prepares_future_items = True
+
+
 class ChunkingPolicy(Enum):
     EQUAL_PROGRESS = 1
     FIRST_COME_FIRST_SERVED = 2
@@ -463,6 +1367,47 @@ class ChunkingPolicy(Enum):
 class ContextChunkingConfig:
     chunking_policy: ChunkingPolicy
     chunk_unit_size: int
+
+
+def _to_chunking_policy(policy: Any) -> ChunkingPolicy:
+    """Return the ``ChunkingPolicy`` for a policy given in any of its representations.
+
+    The executor hands the schedulers a ``ContextChunkingPolicy`` (llmapi StrEnum);
+    callers may also pass a ``ChunkingPolicy``, the C++ binding enum or a string,
+    so the name is matched rather than the object. Unknown names fall back to
+    FIRST_COME_FIRST_SERVED.
+    """
+    if isinstance(policy, ChunkingPolicy):
+        return policy
+    name = str(policy)
+    if "EQUAL_PROGRESS" in name:
+        return ChunkingPolicy.EQUAL_PROGRESS
+    if "FORCE_CHUNK" in name:
+        return ChunkingPolicy.FORCE_CHUNK
+    return ChunkingPolicy.FIRST_COME_FIRST_SERVED
+
+
+def _check_forced_chunk_context_limit(
+    policy: Any, chunk_unit_size: int, max_num_tokens: Optional[int]
+) -> None:
+    """Reject a ``max_num_tokens`` below one FORCE_CHUNK unit.
+
+    ``max_num_tokens`` is the schedulers' context-length limit. They reject such
+    a limit on every context request (see ``_chunk_forced`` and
+    ``microBatchScheduler.cpp``), so the configuration is rejected when the
+    scheduler is created instead.
+    """
+    if _to_chunking_policy(policy) != ChunkingPolicy.FORCE_CHUNK or max_num_tokens is None:
+        return
+    if max_num_tokens < chunk_unit_size:
+        raise ValueError(
+            f"max_num_tokens ({max_num_tokens}) must be at least the "
+            f"FORCE_CHUNK context chunk unit ({chunk_unit_size}). Increase "
+            "max_num_tokens. FORCE_CHUNK is selected for a hybrid linear-attention "
+            "model with kv_cache_config.enable_block_reuse, with the KV cache block "
+            "size as the unit; otherwise it comes from "
+            "scheduler_config.context_chunking_policy."
+        )
 
 
 class MicroBatchScheduler:
@@ -498,6 +1443,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
         self.max_context_length = max_num_tokens
+        if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config.chunking_policy, ctx_chunk_config.chunk_unit_size, max_num_tokens
+            )
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
@@ -711,7 +1660,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 )
 
         # Sort requests for consistency with C++
-        # C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        # C++ reference: sortRequests in microBatchScheduler.cpp
         encoder_requests.sort(key=_get_lora_task_id)
         self._sort_requests(context_requests, generation_requests, not all_context_requests_fit)
 
@@ -732,7 +1681,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     ) -> None:
         """
         Sort requests for consistency with C++.
-        C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        C++ reference: sortRequests in microBatchScheduler.cpp
 
         1. If chunks are present, move context requests that reached the last
            context chunk to the end of the vector.
@@ -1049,8 +1998,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
 
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[BlockKey] = set()
+        newly_contributed_cross_context_blocks: set[BlockKey] = set()
         # Summary caches are populated lazily by _beneficial_to_skip during the
         # pending-loop; enough_available_blocks / decrement_reserved_blocks read
         # them via .get() so only requests that actually walked the tree pay
@@ -1117,17 +2066,21 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             "a cross_kv_cache_manager."
                         )
 
-                    if (
+                    # Computed once and reused at the registration sites below, so
+                    # the check and the registration cannot drift apart. Mirrors
+                    # C++ `skipTrackingApplies` (capacityScheduler.cpp:369-370).
+                    skip_tracking_applies = (
                         not self.static_batch
                         and skipping_is_relevant
-                        and not req.is_disagg_generation_init_state
-                        and scheduler._beneficial_to_skip(
-                            req,
-                            newly_contributed_context_blocks,
-                            newly_contributed_cross_context_blocks,
-                            summary_by_req=summary_by_req,
-                            cross_summary_by_req=cross_summary_by_req,
-                        )
+                        and scheduler._skip_tracking_applies(req)
+                    )
+
+                    if skip_tracking_applies and scheduler._beneficial_to_skip(
+                        req,
+                        newly_contributed_context_blocks,
+                        newly_contributed_cross_context_blocks,
+                        summary_by_req=summary_by_req,
+                        cross_summary_by_req=cross_summary_by_req,
                     ):
                         continue
 
@@ -1159,6 +2112,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             lora_task_id, is_new_task, needed_peft_pages = (
                                 scheduler._get_peft_task_info(req, uniq_task_ids)
                             )
+                            # A PEFT-page shortage skips to the next request without
+                            # registering anything: this request contributes no blocks
+                            # in this iteration.
                             if needed_peft_pages > available_peft_pages:
                                 continue
                             available_peft_pages -= needed_peft_pages
@@ -1166,6 +2122,18 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                                 uniq_task_ids.add(lora_task_id)
 
                         scheduled_requests.append(req)
+                        # No-op today: `_skip_tracking_applies` is context-init-only,
+                        # whereas C++ also registers the cross key for admitted
+                        # encoder requests — a pre-existing divergence. Call site kept
+                        # symmetric so closing that gap stays a one-predicate change.
+                        if skip_tracking_applies:
+                            scheduler._register_contributed_blocks(
+                                req,
+                                newly_contributed_context_blocks,
+                                newly_contributed_cross_context_blocks,
+                                summary_by_req=summary_by_req,
+                                cross_summary_by_req=cross_summary_by_req,
+                            )
 
                     elif req.is_context_init_state or req.is_disagg_generation_init_state:
                         enough_blocks = reserved_blocks.enough_available_blocks(
@@ -1180,7 +2148,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                         if not enough_blocks or not enough_cross_blocks:
                             break
 
-                        # PEFT check only when needed
+                        # PEFT check only when needed. A shortage skips to the next
+                        # request without registering anything: this request
+                        # contributes no blocks in this iteration.
                         if has_peft:
                             lora_task_id, is_new_task, needed_peft_pages = (
                                 scheduler._get_peft_task_info(req, uniq_task_ids)
@@ -1198,6 +2168,14 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                         if reserved_cross_blocks is not None:
                             reserved_cross_blocks.decrement_reserved_blocks(
                                 req, cached_summary=cached_cross_summary
+                            )
+                        if skip_tracking_applies:
+                            scheduler._register_contributed_blocks(
+                                req,
+                                newly_contributed_context_blocks,
+                                newly_contributed_cross_context_blocks,
+                                summary_by_req=summary_by_req,
+                                cross_summary_by_req=cross_summary_by_req,
                             )
 
         return scheduled_requests, []
@@ -1277,10 +2255,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                     f"Encoder-init request {req.request_id} requires a cross_kv_cache_manager."
                 )
 
+            # No cross tracking on this path (C++ passes std::nullopt for
+            # crossSummary), so pass None and skip the cross-pool walk entirely.
             if skipping_is_relevant and scheduler._beneficial_to_skip(
                 req,
                 newly_contributed_context_blocks,
-                set(),
+                None,
                 summary_by_req=summary_by_req,
             ):
                 req_it += 1
@@ -1300,6 +2280,17 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 
             if was_scheduled:
                 logger.debug(f"MaxUtilizationScheduler: request ID {req.request_id} -> start")
+                # Register only now. The failure branch below pauses a started request and
+                # retries this same request without advancing req_it; registering at check
+                # time would put this request's own first_new_block in the set and make it
+                # skip itself on that retry — wasting the capacity the pause just freed.
+                if skipping_is_relevant:
+                    scheduler._register_contributed_blocks(
+                        req,
+                        newly_contributed_context_blocks,
+                        None,
+                        summary_by_req=summary_by_req,
+                    )
                 req_it += 1
             else:
                 last_started_idx = None
@@ -1617,15 +2608,17 @@ class PyCapacityScheduler:
             return False
         return True
 
-    def _prefill_contributed_blocks(self, active_requests: RequestList) -> tuple[set, set]:
+    def _prefill_contributed_blocks(
+        self, active_requests: RequestList
+    ) -> tuple[set[BlockKey], set[BlockKey]]:
         """
         Collect blocks contributed by chunked context requests already executing.
         These blocks can be reused by later requests.
 
         C++ reference: capacityScheduler.cpp:34-68 (prefillWithChunkedContextsAlreadyExecuting)
         """
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[BlockKey] = set()
+        newly_contributed_cross_context_blocks: set[BlockKey] = set()
 
         if self.kv_cache_manager is None or not self.enable_prefix_aware_scheduling:
             return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
@@ -1661,11 +2654,71 @@ class PyCapacityScheduler:
         """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`."""
         return {}, {}
 
+    def _skip_tracking_applies(self, req: LlmRequest) -> bool:
+        """Whether this request participates in duplicate-deferral tracking at all.
+
+        Gates both `_beneficial_to_skip` and `_register_contributed_blocks` so the
+        check and the registration can never drift apart. Callers hoist this into
+        one per-request local and reuse it at every site.
+
+        Mirrors C++ `isFirstChunkContext` (capacityScheduler.cpp:323-324, :547-548),
+        including its defensive `!isDisaggGenerationInitState()`: that state is
+        disjoint from CONTEXT_INIT today, so the clause is redundant, but keeping
+        it here means the whole predicate lives in exactly one place.
+        """
+        if not self.enable_prefix_aware_scheduling:
+            return False
+        return (
+            req.is_context_init_state
+            and req.is_first_context_chunk
+            and not req.is_disagg_generation_init_state
+        )
+
+    def _ctx_first_new_block(
+        self, req: LlmRequest, summary_by_req: Optional[PrefixSummaryCache] = None
+    ) -> Optional[BlockKey]:
+        """Return the self-pool firstNewBlock key for `req`, or None if there is none.
+
+        Populates `summary_by_req` on the way so later helpers
+        (`enough_available_blocks`, `decrement_reserved_blocks`) reuse the same
+        radix-tree walk. This mirrors the C++ single-walk-per-request convention.
+        """
+        if self.kv_cache_manager is None or not self.kv_cache_manager.enable_block_reuse:
+            return None
+        req_id = req.py_request_id
+        summary = summary_by_req.get(req_id) if summary_by_req is not None else None
+        if summary is None:
+            unique_tokens = req.get_unique_tokens(0)
+            summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+            if summary_by_req is not None:
+                summary_by_req[req_id] = summary
+        return summary.first_new_block
+
+    def _cross_first_new_block(
+        self, req: LlmRequest, cross_summary_by_req: Optional[PrefixSummaryCache] = None
+    ) -> Optional[BlockKey]:
+        """Return the cross-pool firstNewBlock key for `req`, or None if there is none."""
+        if (
+            self.cross_kv_cache_manager is None
+            or not self.cross_kv_cache_manager.enable_block_reuse
+        ):
+            return None
+        req_id = req.py_request_id
+        summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
+        if summary is None:
+            encoder_unique_tokens = req.get_encoder_unique_tokens()
+            if encoder_unique_tokens is None:
+                return None
+            summary = self.cross_kv_cache_manager.analyze_prefix_reuse(encoder_unique_tokens, req)
+            if cross_summary_by_req is not None:
+                cross_summary_by_req[req_id] = summary
+        return summary.first_new_block
+
     def _beneficial_to_skip(
         self,
         req: LlmRequest,
-        newly_contributed_context_blocks: set,
-        newly_contributed_cross_context_blocks: set,
+        newly_contributed_context_blocks: set[BlockKey],
+        newly_contributed_cross_context_blocks: Optional[set[BlockKey]],
         summary_by_req: Optional[PrefixSummaryCache] = None,
         cross_summary_by_req: Optional[PrefixSummaryCache] = None,
     ) -> bool:
@@ -1674,62 +2727,68 @@ class PyCapacityScheduler:
         A request should be skipped if it can reuse blocks contributed by
         already scheduled context requests.
 
-        When the request is NOT skipped, its firstNewBlock contributions are
-        registered so that subsequent duplicate requests can be deferred.
+        Pure with respect to the contribution sets: this does NOT register the
+        request's own firstNewBlock. Callers must invoke
+        `_register_contributed_blocks` once the request has actually been
+        scheduled — registering at check time would defer later duplicates on
+        behalf of a contributor the budget checks then reject, and in
+        MaxUtilization it would make a request skip itself on the retry that
+        follows a pause.
+
+        `newly_contributed_cross_context_blocks=None` means the caller does no
+        cross-pool tracking, and suppresses the cross walk entirely. Mirrors the
+        `std::nullopt` crossSummary the C++ MaxUtilization path passes.
 
         C++ reference: capacityScheduler.cpp (beneficialToSkip / oneManagerBeneficialToSkip)
         """
-        if not self.enable_prefix_aware_scheduling:
-            return False
-        if not (req.is_context_init_state and req.is_first_context_chunk):
+        if not self._skip_tracking_applies(req):
             return False
 
-        ctx_new_block = None
-        cross_new_block = None
-        req_id = req.py_request_id
-
-        if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
-            # Use the cached summary when present; otherwise walk the tree
-            # once and stash the result so later helpers
-            # (`enough_available_blocks`, `decrement_reserved_blocks`) can
-            # reuse it. This mirrors C++ capacityScheduler.cpp:295-302.
-            summary = summary_by_req.get(req_id) if summary_by_req is not None else None
-            if summary is None:
-                unique_tokens = req.get_unique_tokens(0)
-                summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
-                if summary_by_req is not None:
-                    summary_by_req[req_id] = summary
-            if summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_context_blocks:
-                    return True
-                ctx_new_block = summary.first_new_block
-
+        ctx_new_block = self._ctx_first_new_block(req, summary_by_req)
+        if ctx_new_block is not None and ctx_new_block in newly_contributed_context_blocks:
+            return True
+        if newly_contributed_cross_context_blocks is None:
+            return False
+        cross_new_block = self._cross_first_new_block(req, cross_summary_by_req)
         if (
-            self.cross_kv_cache_manager is not None
-            and self.cross_kv_cache_manager.enable_block_reuse
+            cross_new_block is not None
+            and cross_new_block in newly_contributed_cross_context_blocks
         ):
-            summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
-            if summary is None:
-                encoder_unique_tokens = req.get_encoder_unique_tokens()
-                if encoder_unique_tokens is not None:
-                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                        encoder_unique_tokens, req
-                    )
-                    if cross_summary_by_req is not None:
-                        cross_summary_by_req[req_id] = summary
-            if summary is not None and summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_cross_context_blocks:
-                    return True
-                cross_new_block = summary.first_new_block
+            return True
+        return False
 
-        # Request is NOT skipped — register contributions so subsequent duplicate
-        # requests can be deferred correctly.
+    def _register_contributed_blocks(
+        self,
+        req: LlmRequest,
+        newly_contributed_context_blocks: set[BlockKey],
+        newly_contributed_cross_context_blocks: Optional[set[BlockKey]],
+        summary_by_req: Optional[PrefixSummaryCache] = None,
+        cross_summary_by_req: Optional[PrefixSummaryCache] = None,
+    ) -> None:
+        """
+        Register the blocks this request will newly contribute to the reuse tree.
+
+        Call only after the request has been scheduled. This upholds the
+        invariant that no request is deferred in an iteration where its
+        contributor was not scheduled.
+
+        `newly_contributed_cross_context_blocks=None` means the caller does no
+        cross-pool tracking, and suppresses the cross walk entirely. Mirrors the
+        `std::nullopt` crossSummary the C++ MaxUtilization path passes.
+
+        C++ reference: capacityScheduler.cpp (registerContributedBlocks)
+        """
+        if not self._skip_tracking_applies(req):
+            return
+
+        ctx_new_block = self._ctx_first_new_block(req, summary_by_req)
         if ctx_new_block is not None:
             newly_contributed_context_blocks.add(ctx_new_block)
+        if newly_contributed_cross_context_blocks is None:
+            return
+        cross_new_block = self._cross_first_new_block(req, cross_summary_by_req)
         if cross_new_block is not None:
             newly_contributed_cross_context_blocks.add(cross_new_block)
-
-        return False
 
     def _disabled_prefix_summary(self, req: LlmRequest) -> Optional[PrefixReuseSummary]:
         if self.enable_prefix_aware_scheduling:
@@ -1846,25 +2905,22 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None
         if ctx_chunk_config:
-            # Fix: Use string comparison to identify the policy.
-            # This works regardless of whether the input is a Python Enum, C++ Binding Enum, or String.
-            input_policy = ctx_chunk_config[0]
-
-            if "EQUAL_PROGRESS" in str(input_policy):
-                policy_enum = ChunkingPolicy.EQUAL_PROGRESS
-            elif "FORCE_CHUNK" in str(input_policy):
-                policy_enum = ChunkingPolicy.FORCE_CHUNK
-            else:
-                # Default to FCFS for FIRST_COME_FIRST_SERVED or others
-                policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
-
-            py_chunk_config = ContextChunkingConfig(policy_enum, ctx_chunk_config[1])
+            py_chunk_config = ContextChunkingConfig(
+                _to_chunking_policy(ctx_chunk_config[0]), ctx_chunk_config[1]
+            )
 
         self.micro_batch_scheduler = PyMicroBatchScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
             no_schedule_until_state=no_schedule_until_state,
+        )
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
         )
 
     def schedule_request(

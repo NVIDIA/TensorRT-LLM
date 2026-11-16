@@ -14,6 +14,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           maybe_compute_mm_embed_cumsum)
 
+pytestmark = pytest.mark.cpu_only
+
 # Embedding dim kept small — functions under test only index along dim 0.
 _EMBED_DIM = 4
 
@@ -591,6 +593,31 @@ class TestGetMultimodalEmbeddings:
         ],
                              dim=0)
         torch.testing.assert_close(result[0], expected)
+
+    def test_cached_embeddings_own_their_storage(self):
+        """Cached rows must outlive the encoder output, which can be an NCCL window tensor."""
+        encoder_output = torch.randn(13, _EMBED_DIM)
+
+        def mock_encoder(params):
+            return [encoder_output]
+
+        multimodal_params = [
+            _make_mm_params_with_data(has_cached_embedding=False,
+                                      total_mm_tokens=5),
+            _make_mm_params_with_data(has_cached_embedding=False,
+                                      total_mm_tokens=8)
+        ]
+
+        get_multimodal_embeddings(mock_encoder, multimodal_params)
+
+        cached = [
+            param.multimodal_data["multimodal_embedding"]
+            for param in multimodal_params
+        ]
+        for embedding in cached:
+            assert (embedding.untyped_storage().data_ptr()
+                    != encoder_output.untyped_storage().data_ptr())
+        torch.testing.assert_close(torch.cat(cached, dim=0), encoder_output)
 
     def test_special_tokens_basic_caching(self):
         """Test caching behavior with special tokens present."""

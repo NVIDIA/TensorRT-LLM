@@ -65,6 +65,14 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
+    # The encoders write a blank line between a reply's content and its tool-call
+    # block: it belongs to the format, not to the content.
+    _CALLS_SEPARATOR = "\n\n"
+
+    # Invoke header up to the function name, which is arbitrary text.
+    _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+    _INVOKE_BEGIN_TEMPLATE = '<｜DSML｜invoke name="{name}">'  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -76,6 +84,12 @@ class DeepSeekV32Parser(BaseToolParser):
         )
         self._last_arguments = ""
         self.current_tool_id = -1
+        # Between a block's opening and closing tags, the newlines that separate
+        # the invokes and precede the closing tag are the format's layout (the
+        # checkpoint's encoder writes them), not content.
+        self._in_calls_block = False
+        # Set while an increment re-reads what its last invoke left behind.
+        self._reading_rest = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -106,7 +120,10 @@ class DeepSeekV32Parser(BaseToolParser):
         for param_name, param_type, param_value in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters[param_name] = param_value.strip()
+                # Taken as written: the encoder renders a string value verbatim
+                # between the tags, so its whitespace (a file's last newline, a
+                # line's indentation) is part of the value.
+                parameters[param_name] = param_value
             else:
                 # Try to parse as JSON for other types
                 try:
@@ -125,7 +142,7 @@ class DeepSeekV32Parser(BaseToolParser):
         if self._eos_token in text:
             text = text.replace(self._eos_token, "")
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        normal_text = text[:idx].removesuffix(self._CALLS_SEPARATOR) if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -143,7 +160,7 @@ class DeepSeekV32Parser(BaseToolParser):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            invoke_pattern = self.invoke_begin_regex + r"(.*?)" + re.escape(self.invoke_end_token)
             invoke_matches = re.findall(invoke_pattern, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
@@ -159,6 +176,27 @@ class DeepSeekV32Parser(BaseToolParser):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def _separator_prefix_at_end(self, text: str) -> str:
+        """The tail of ``text`` that could still begin the blank line before a calls block."""
+        for size in range(len(self._CALLS_SEPARATOR), 0, -1):
+            if text.endswith(self._CALLS_SEPARATOR[:size]):
+                return text[-size:]
+        return ""
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit, as content, what the stream ended while holding back.
+
+        That is a trailing blank line no tool-call block followed, or a tail that
+        never completed into a delimiter. Inside an unfinished calls block nothing
+        is emitted.
+        """
+        if self._in_calls_block:
+            return StreamingParseResult()
+        held, self._buffer = self._buffer, ""
+        for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
+            held = held.replace(e_token, "")
+        return StreamingParseResult(normal_text=held)
+
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """Streaming incremental parsing tool calls for DeepSeekV32 format.
 
@@ -167,42 +205,86 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        start_tokens = [self.bot_token, self._INVOKE_HEADER_PREFIX]
+        start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
+        has_tool_call = bool(start_indices)
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        # Hold the buffer back only while its tail could still complete into one of
+        # the DSML delimiters.
+        partial_tokens = [
+            self.bot_token,
+            self._INVOKE_HEADER_PREFIX,
+            self.eot_token,
+            self.invoke_end_token,
+            self._eos_token,
+        ]
+        ends_with_partial_token = any(
+            self._ends_with_partial_token(current_text, token) for token in partial_tokens
+        )
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
+        if self._in_calls_block and not has_tool_call:
+            closing = current_text.find(self.eot_token)
+            layout = current_text if closing == -1 else current_text[:closing]
+            if not layout.strip():
+                if closing == -1:
+                    # Still layout until the next invoke or the closing tag.
+                    return StreamingParseResult()
+                self._in_calls_block = False
+                current_text = current_text[closing + len(self.eot_token) :]
+                self._buffer = current_text
+                ends_with_partial_token = any(
+                    self._ends_with_partial_token(current_text, token) for token in partial_tokens
+                )
 
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
-            self._buffer = ""
+        if not has_tool_call and not ends_with_partial_token:
+            normal_text = current_text
+            # Trailing newlines may begin the blank line before a tool-call block,
+            # which is not content: hold them until the next increment, or
+            # finish(), shows what follows.
+            held = "" if self._in_calls_block else self._separator_prefix_at_end(normal_text)
+            self._buffer = held
+            normal_text = normal_text[: len(normal_text) - len(held)]
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Text before the earliest start token is content, so stream it and keep the
+        # buffer from that token onwards.
+        prefix_len = min(start_indices, default=0)
+        normal_text = current_text[:prefix_len]
+        if normal_text:
+            current_text = current_text[prefix_len:]
+            self._buffer = current_text
+        if has_tool_call:
+            if self._in_calls_block and not normal_text.strip():
+                # The separator before the next invoke.
+                normal_text = ""
+            elif not self._in_calls_block and current_text.startswith(self.bot_token):
+                normal_text = normal_text.removesuffix(self._CALLS_SEPARATOR)
+            self._in_calls_block = True
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         all_calls: list[ToolCallItem] = []
+        invokes_exhausted = False
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    pattern=(
+                        self.invoke_begin_regex
+                        + r"(.*?)("
+                        + re.escape(self.invoke_end_token)
+                        + r"|$)"
+                    ),
                     string=current_text,
                     flags=re.DOTALL,
                 )
 
                 if not invoke_match:
+                    invokes_exhausted = True
                     break
 
                 func_name = invoke_match.group(1).strip()
@@ -287,16 +369,32 @@ class DeepSeekV32Parser(BaseToolParser):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            # The rest of this increment may close the block and carry text after
+            # it. Read it now: a later increment may never come, and nothing
+            # flushes this parser when the stream ends.
+            if (
+                invokes_exhausted
+                and self._in_calls_block
+                and not self._reading_rest
+                and self.eot_token in self._buffer
+                and not any(token in self._buffer for token in start_tokens)
+            ):
+                self._reading_rest = True
+                try:
+                    rest = self.parse_streaming_increment("", tools)
+                finally:
+                    self._reading_rest = False
+                normal_text += rest.normal_text
+                all_calls.extend(rest.calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger=f'<｜DSML｜invoke name="{name}">',
+            begin=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
+            end=self.invoke_end_token,
+            trigger=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
         )

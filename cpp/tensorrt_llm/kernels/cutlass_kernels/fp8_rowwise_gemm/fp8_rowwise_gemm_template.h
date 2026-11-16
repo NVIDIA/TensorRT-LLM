@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -382,7 +382,7 @@ size_t genericFp8RowwiseGemmKernelLauncherSm90(void* D, void const* A, void cons
 #else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
         "[TensorRT LLM Error][Fp8RowwiseGemmKernelLauncherSm90] Please recompile with support for hopper by passing "
-        "90-real as an arch to build_wheel.py.");
+        "90 as an arch to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
@@ -687,7 +687,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
         return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
     }
-    else if (mSm == 100 || mSm == 103)
+    else if (tk::isSM100Family(mSm))
     {
         return dispatchGemmToCutlassSm100<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
@@ -759,7 +759,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
             }
         }
     }
-    else if (mSm == 100 || mSm == 103)
+    else if (tk::isSM100Family(mSm))
     {
         std::vector<tkc::CutlassTileConfigSM100> tilesSm100 = {
             tkc::CutlassTileConfigSM100::CtaShape64x32x128B,

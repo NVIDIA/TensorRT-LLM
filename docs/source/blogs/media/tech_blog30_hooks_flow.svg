@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 432" width="1000" height="432">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="432" fill="#f5f5f5"/>
+<text x="20" y="30" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="11" font-weight="600" fill="#2d3142" text-anchor="start">BaseResourceManager</text>
+<text x="322" y="30" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="11" font-weight="600" fill="#76B900" text-anchor="start">KVCacheCompressionManager (inherits BaseResourceManager)</text>
+<text x="790" y="30" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="11" font-weight="600" fill="#76B900" text-anchor="start">Methods</text>
+<rect x="310" y="44" width="450" height="372" rx="8" fill="none" stroke="#76B900" stroke-width="1.25"/>
+<rect x="20" y="64" width="260" height="64" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="94" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">prepare_resources(batch)</text>
+<text x="32" y="116" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">before the forward pass</text>
+<rect x="20" y="152" width="260" height="64" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="182" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">forward pass</text>
+<text x="32" y="204" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">attention reads a fixed cache</text>
+<rect x="20" y="240" width="260" height="64" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="270" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">update_resources(batch)</text>
+<text x="32" y="292" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">after the forward pass</text>
+<rect x="20" y="328" width="260" height="64" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="358" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">free_resources(request)</text>
+<text x="32" y="380" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">when a request ends or aborts</text>
+<path d="M150.0,130 L150.0,150" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M150.0,218 L150.0,238" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M150.0,306 L150.0,326" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="160.0" y="320" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">request ends</text>
+<rect x="322.0" y="64" width="207.0" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="334.0" y="81" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">STAGE 1 · PREFILL-CHUNK</text>
+<text x="334.0" y="102" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_request_init</text>
+<text x="334.0" y="116" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">first prefill chunk</text>
+<rect x="541.0" y="64" width="207.0" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="553.0" y="81" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">STAGE 3 · DECODE</text>
+<text x="553.0" y="102" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_generation_step_begin</text>
+<text x="553.0" y="116" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">before each decode step</text>
+<path d="M282,96.0 L320,96.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="322.0" y="240" width="207.0" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="334.0" y="257" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">STAGE 2 · AFTER-PREFILL</text>
+<text x="334.0" y="278" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_context_step_end</text>
+<text x="334.0" y="292" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">prefill just finished</text>
+<rect x="541.0" y="240" width="207.0" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="553.0" y="257" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">STAGE 3 · DECODE</text>
+<text x="553.0" y="278" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_generation_step_end</text>
+<text x="553.0" y="292" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">after each decode step</text>
+<path d="M282,272.0 L320,272.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="322.0" y="328" width="426.0" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="334.0" y="345" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">STAGE 4 · TOOL-CALL, STAGE 5 · AFTER-REQUEST</text>
+<text x="334.0" y="366" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_request_finish</text>
+<text x="334.0" y="380" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">tool call pause or request end</text>
+<path d="M282,360.0 L320,360.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="322" y="188.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">no hook during the forward pass</text>
+<rect x="790" y="240" width="190" height="64" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="802" y="257" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">TRIATTENTION</text>
+<text x="802" y="278" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#2d3142" text-anchor="start">on_generation_step_end</text>
+<text x="802" y="292" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">overrides this hook</text>
+<path d="M762,272.0 L788,272.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="790" y="350" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">other hooks keep their</text>
+<text x="790" y="366" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">empty default</text>
+</svg>

@@ -1,5 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,12 +26,20 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.utils import gelu_tanh
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
+    WanPerTokenAdaLN,
+    WanPerTokenAdaLNRuntime,
+    apply_fused_layernorm_adaln_quant,
+    apply_fused_layernorm_affine_quant,
+    get_nvfp4_input_scale,
+)
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.token_order import TokenReorder, resolve_token_order
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -28,6 +51,7 @@ except ImportError:
     # Removed in transformers>=5
     def get_parameter_device(module):
         return next(module.parameters()).device
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -328,6 +352,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
 
@@ -359,6 +384,19 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
+        # FP4 input scales propagated from downstream Linear modules in post_load_weights().
+        # None until post_load_weights is called; fusion is skipped when None.
+        self._norm1_fp4_scale: Optional[torch.Tensor] = None
+        self._norm2_fp4_scale: Optional[torch.Tensor] = None
+        self._norm3_fp4_scale: Optional[torch.Tensor] = None
+        self._fused_ln_supported = hidden_size == 5120
+
+        self._pertoken_adaln = WanPerTokenAdaLN(
+            hidden_size,
+            dtype,
+            competing_fusion=self._fused_ln_supported,
+        )
+
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -370,7 +408,7 @@ class WanBlock(nn.Module):
             reduce_output=(tp_size != 1),
         )
 
-        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # VSA gates are shared by the backend-specific fine-stage implementations.
         # G_c weights the coarse branch; G_f weights the fine branch.
         self.to_gate_compress = None
         self.to_gate_fine = None
@@ -378,10 +416,15 @@ class WanBlock(nn.Module):
         _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
         _is_vsa = (
             _attn_cfg is not None
-            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
+        if _is_vsa and model_config.parallel.token_sharded_tp:
+            raise ValueError(
+                "Token-sharded TP does not support Video Sparse Attention yet: the VSA gates are "
+                "projected from the token-sharded block input. Unset parallel_config.tp_layout "
+                "or disable VSA."
+            )
         if _is_vsa:
             q_dim = num_heads * head_dim
             gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
@@ -396,6 +439,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
             self.to_gate_fine = Linear(
                 hidden_size,
@@ -408,6 +455,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
 
         # I2V: Additional K/V projections for image embeddings.
@@ -454,6 +505,48 @@ class WanBlock(nn.Module):
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
 
+    def _fused_adaln_quant(self, x, scale_msa, shift_msa, temb, fp4_scale, eps):
+        """Shared norm1/norm3 path: flatten x to 2D, build the per-token or
+        per-batch modulation rows, and run the fused LayerNorm+AdaLN+NVFP4 op.
+
+        Returns the 2D fused result (Fp4QuantizedTensor when quantizing,
+        else a dense tensor). The caller reshapes it back to 3D (norm1) or
+        feeds it straight to the MLP's 2D fused-GELU kernel (norm3).
+        """
+        _x_2d = x.reshape(-1, x.shape[-1])
+        if temb.ndim == 4:
+            # scale/shift are [B, S, D] here; flatten per-token so each row of
+            # _x_2d gets its own modulation row (seq_len_per_batch=1).
+            _scale_2d = scale_msa.reshape(-1, scale_msa.shape[-1])
+            _shift_2d = shift_msa.reshape(-1, shift_msa.shape[-1])
+            _seq_len_per_batch = 1
+        else:
+            # scale/shift are [B, D] here; one modulation row per batch element.
+            _batch_size = temb.shape[0]
+            _scale_2d = scale_msa.reshape(_batch_size, -1)
+            _shift_2d = shift_msa.reshape(_batch_size, -1)
+            _seq_len_per_batch = _x_2d.shape[0] // _batch_size
+        return apply_fused_layernorm_adaln_quant(
+            _x_2d,
+            _scale_2d,
+            _shift_2d,
+            _seq_len_per_batch,
+            fp4_scale,
+            eps=eps,
+        )
+
+    @staticmethod
+    def _reshape_fused_output(normed, shape):
+        """Reshape a fused-op output (Fp4QuantizedTensor or dense) from the
+        2D op layout back to shape."""
+        if isinstance(normed, Fp4QuantizedTensor):
+            return Fp4QuantizedTensor(
+                normed.fp4_tensor.reshape(*shape[:-1], normed.fp4_tensor.shape[-1]),
+                normed.scaling_factor,
+                normed.is_sf_swizzled,
+            )
+        return normed.reshape(shape)
+
     def forward(
         self,
         x,
@@ -463,26 +556,39 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        if temb.ndim == 4:
-            # temb: batch_size, seq_len, 6, hidden_size
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0).float() + temb.float()
-            ).chunk(6, dim=2)
-            # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
-        else:
-            # temb: batch_size, 6, hidden_size
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.float() + temb.float()
-            ).chunk(6, dim=1)
+        pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
+        if pertoken_adaln is None:
+            if temb.ndim == 4:
+                # temb: batch_size, seq_len, 6, hidden_size
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table.unsqueeze(0).float() + temb.float()
+                ).chunk(6, dim=2)
+                # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
+                shift_msa = shift_msa.squeeze(2)
+                scale_msa = scale_msa.squeeze(2)
+                gate_msa = gate_msa.squeeze(2)
+                c_shift_msa = c_shift_msa.squeeze(2)
+                c_scale_msa = c_scale_msa.squeeze(2)
+                c_gate_msa = c_gate_msa.squeeze(2)
+            else:
+                # temb: batch_size, 6, hidden_size
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table.float() + temb.float()
+                ).chunk(6, dim=1)
 
-        normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
-        normed = normed.to(x.dtype)
+        if self._fused_ln_supported:
+            # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
+            normed = self._fused_adaln_quant(
+                x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
+            )
+            normed = self._reshape_fused_output(normed, x.shape)
+        elif pertoken_adaln is not None:
+            normed = self._pertoken_adaln.normalize_input(
+                x, pertoken_adaln, self.norm1.variance_epsilon
+            )
+        else:
+            normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
+            normed = normed.to(x.dtype)
 
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
@@ -497,13 +603,45 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+            attn1_out = self.attn1.forward_async(
+                normed,
+                freqs=freqs,
+                timestep=timestep,
+                **attn1_kwargs,
+            )
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 
-        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
+        fused_norm2 = (
+            self._pertoken_adaln.add_self_attention_and_normalize(
+                x, attn1_out, pertoken_adaln, self.norm2
+            )
+            if pertoken_adaln is not None
+            else None
+        )
+        if fused_norm2 is not None:
+            norm_x, x = fused_norm2
+        else:
+            if pertoken_adaln is not None:
+                gate_msa = self._pertoken_adaln.self_attention_gate(pertoken_adaln)
+            x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
-        norm_x = self.norm2(x.float()).to(x.dtype)
+            if (
+                self._fused_ln_supported
+                and isinstance(self.norm2, LayerNorm)
+                and self.norm2.weight is not None
+            ):
+                _x_2d = x.reshape(-1, x.shape[-1])
+                norm_x = apply_fused_layernorm_affine_quant(
+                    _x_2d,
+                    self.norm2.weight,
+                    self.norm2.bias,
+                    self._norm2_fp4_scale,
+                    eps=self.norm2.variance_epsilon,
+                )
+                norm_x = self._reshape_fused_output(norm_x, x.shape)
+            else:
+                norm_x = self.norm2(x.float()).to(x.dtype)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -544,19 +682,45 @@ class WanBlock(nn.Module):
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output
-        x = x + self.attn2.to_out[0](attn2_output)
+        attn2_proj = self.attn2.to_out[0](attn2_output)
 
-        # 3. Feed-forward
-        normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
-        normed = normed.to(x.dtype)
+        # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
+        # quant) reshaped back to [B, S, D]; self.ffn consumes it.
+        if self._fused_ln_supported:
+            x = x + attn2_proj
+            normed = self._fused_adaln_quant(
+                x,
+                c_scale_msa,
+                c_shift_msa,
+                temb,
+                self._norm3_fp4_scale,
+                self.norm3.variance_epsilon,
+            )
+            normed = self._reshape_fused_output(normed, x.shape)
+        elif pertoken_adaln is not None:
+            normed, x = self._pertoken_adaln.add_cross_attention_and_normalize(
+                x,
+                attn2_proj,
+                pertoken_adaln,
+                self.norm3.variance_epsilon,
+            )
+        else:
+            x = x + attn2_proj
+            normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
+            normed = normed.to(x.dtype)
+        ffn_out = self.ffn(normed)
 
-        x = (x.float() + self.ffn(normed).float() * c_gate_msa).to(x.dtype)
+        if pertoken_adaln is not None:
+            c_gate_msa = self._pertoken_adaln.ffn_gate(pertoken_adaln)
+        x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
 
 
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
+    _supports_token_sharded_tp = True
+    _supports_token_order = True
 
     def __init__(
         self,
@@ -614,6 +778,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 "in_channels": in_channels,
                 "out_channels": out_channels,
                 "num_layers": num_layers,
+                "expand_timesteps": getattr(config, "expand_timesteps", False),
             },
         )()
 
@@ -645,8 +810,17 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 for i in range(num_layers)
             ]
         )
+        self._pertoken_adaln_runtime = WanPerTokenAdaLNRuntime(
+            [block._pertoken_adaln for block in self.blocks]
+        )
 
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, max_seq_len=1024)
+
+        # Optional Z-order token permutation around the block stack, for
+        # block-sparse attention (SolAttentionConfig.token_order="morton").
+        _attn_cfg = getattr(model_config, "attention", None)
+        _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
+        self._token_reorder = TokenReorder(resolve_token_order(_sa_cfg))
 
         # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm_out = LayerNorm(
@@ -673,6 +847,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         )
 
         self.__post_init__()
+        self._apply_tp_layout()
 
     @property
     def device(self):
@@ -742,12 +917,21 @@ class WanTransformer3DModel(BaseDiffusionModel):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
+        # Reorder tokens and RoPE together; the inverse is applied after the
+        # block stack (no-op for the native order).
+        self._token_reorder.prepare((T // pt, H // ph, W // pw), x.device)
+        x = self._token_reorder.permute(x, dim=1)
+        freqs_cos = self._token_reorder.permute(freqs_cos, dim=1)
+        freqs_sin = self._token_reorder.permute(freqs_sin, dim=1)
+
         # Shard sequence + matching RoPE across ranks (no-op when sharder is inactive).
         seq_len = x.shape[1]
         x = self.sharder.shard(x, dim=1)
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
+        # Token-sharded TP: x holds this rank's [n, g, D] sample groups; RoPE stays whole.
+        token_sharded = self.sharder.token_sharded_tp
 
         # Time and text/image embeddings. WAN timestep embeddings use the
         # scheduler's 1000-step scale internally.
@@ -771,11 +955,23 @@ class WanTransformer3DModel(BaseDiffusionModel):
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+            if self._token_reorder.active and temb_proj.shape[1] != seq_len:
+                raise ValueError(
+                    f"token_order={self._token_reorder.order!r} needs one timestep per "
+                    f"token: got {temb_proj.shape[1]} timesteps for {seq_len} tokens."
+                )
+            temb_proj = self._token_reorder.permute(temb_proj, dim=1)
             # Shard per-patch temb_proj to match the local sequence chunk
             temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
+            if self.config.expand_timesteps and not token_sharded:
+                # x is already sequence-sharded; uniform T2V timesteps only need
+                # a local broadcast view for fused AdaLN.
+                temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
+            # Token-sharded TP: the entries of this rank's sample groups (no-op otherwise).
+            temb_proj = self.sharder.shard_per_sample(temb_proj)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -791,6 +987,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
+        if not token_sharded:  # per-token AdaLN kernels stay off on token shards
+            x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
+
         # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
             x = block(
@@ -804,6 +1003,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
         x = self.sharder.gather(x, dim=1)
+        x = self._token_reorder.restore(x, dim=1)
 
         # Output projection and unpatchify
         if temb.ndim == 3:
@@ -903,3 +1103,13 @@ class WanTransformer3DModel(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, Linear):
                 module.post_load_weights()
+
+        # Wire each norm's fp4_scale from the first downstream Linear that consumes its output.
+        for block in self.blocks:
+            if not isinstance(block, WanBlock):
+                continue
+            # qkv_proj exists in FUSE_QKV mode; fall back to to_q in SEPARATE_QKV (async Ulysses).
+            attn1_qkv = getattr(block.attn1, "qkv_proj", None) or getattr(block.attn1, "to_q", None)
+            block._norm1_fp4_scale = get_nvfp4_input_scale(attn1_qkv)
+            block._norm2_fp4_scale = get_nvfp4_input_scale(getattr(block.attn2, "to_q", None))
+            block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))

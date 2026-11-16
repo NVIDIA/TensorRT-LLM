@@ -1,17 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import re
+from typing import Optional
 
 import torch
+from torch import nn
 
-import tensorrt_llm.logger as logger
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "NemotronHPuzzleForCausalLM")
-@register_mapper("HF", "NemotronHForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHPuzzleForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
+
+    @staticmethod
+    def map_mtp_module_name(name: str, num_hidden_layers: int) -> str:
+        """Map nested MTP sublayers and their exclusion patterns."""
+        name = re.sub(r"(model\.layers\.)?backbone", "model", name)
+        mtp_root = f"model.layers.{num_hidden_layers}"
+        if name in ("mtp", "mtp*", "mtp.*"):
+            return mtp_root
+        if name.startswith("mtp."):
+            return mtp_root + name[len("mtp"):]
+        return name
 
     def preprocess_weights(self, weights: dict) -> dict:
         config = self.config.pretrained_config
@@ -42,10 +58,14 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             w = torch.concat(w).contiguous()
             return w
 
-        is_nvfp4 = self.config.quant_config.quant_algo == "NVFP4"
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
+        # Full in_proj out_features = concat([z, x, B, C, dt]). Only its
+        # per-output-row block scale spans this dim 0 and takes the same
+        # structured split as the weight; per-tensor scalars (weight_scale_2,
+        # input_scale) do not and are left alone.
+        d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
 
         new_weights = {}
         for name, _ in weights.items():
@@ -61,20 +81,13 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             # MTP layers are stored as mtp.layers.0.xxx (sublayer 0, Attention) and mtp.layers.1.xxx (sublayer 1, MoE)
             if "mtp.layers." in key:
-                match = re.match(r'mtp\.layers\.(\d+)\.(.*)', key)
-                if match:
-                    sublayer_idx, rest = match.groups()
-                    key = f"model.layers.{config.num_hidden_layers}.layers.{sublayer_idx}.{rest}"
-                else:
-                    logger.error(f"Failed to match MTP pattern for: {name}")
+                key = self.map_mtp_module_name(key, config.num_hidden_layers)
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")
 
-            if ("mixer.in_proj" in key
-                    or "mixer.out_proj" in key) and "_scale" in key:
-                # Special handing for nvfp4 Mamba2 mixer in_proj.weight_scale.
-                if is_nvfp4 and "in_proj.weight_scale_2" not in key and "in_proj.weight_scale" in key:
+            if "mixer.in_proj" in key and "_scale" in key:
+                if self._num_rows(weights[name]) == d_in_proj:
                     new_weights[key] = _split_mamba2_mixer_in_proj(
                         weights[name])
                 else:
@@ -188,3 +201,41 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 new_weights[key] = weights[name]
 
         return new_weights
+
+    @staticmethod
+    def _num_rows(tensor) -> Optional[int]:
+        """Size of dim 0 (the output-channel axis), or None for a scalar.
+
+        Works for materialized tensors and lazy safetensors slices. A weight
+        scale that shares this axis with the weight (NVFP4 / MXFP8 / FP8 block
+        scale, FP8 rowwise) is per-output-channel and must undergo the same TP
+        transform as the weight; a per-tensor scalar scale has no such axis.
+        """
+        shape = tensor.get_shape() if hasattr(tensor,
+                                              "get_shape") else tensor.shape
+        return shape[0] if shape else None
+
+    def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
+                              weights: dict):
+        # Override of the base NVFP4-only rule: NemotronH attention may be
+        # FP8/MXFP8 (MIXED_PRECISION checkpoints), so duplicate ANY
+        # per-output-channel weight_scale (one that shares dim 0 with the
+        # weight) alongside the replicated kv weight, not just the NVFP4 case.
+        if new_name not in ('k_proj', 'v_proj'):
+            return weights
+
+        num_kv_heads = self._num_kv_heads
+        duplicated_keys = ["weight", "bias"]
+        weight, scale = weights.get("weight"), weights.get("weight_scale")
+        if (weight is not None and scale is not None
+                and self._num_rows(scale) == self._num_rows(weight)):
+            duplicated_keys.append("weight_scale")
+
+        return {
+            k:
+            self._duplicate_kv(weight=v[:],
+                               num_kv_heads=num_kv_heads,
+                               tensor_parallel_size=self._tp_size)
+            if k in duplicated_keys else v
+            for k, v in weights.items()
+        }

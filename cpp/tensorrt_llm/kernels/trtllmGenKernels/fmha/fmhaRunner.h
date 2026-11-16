@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,6 +44,10 @@ public:
     // Check if fmha is supported with additional info.
     std::pair<bool, std::string> isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const;
 
+    // Whether run() would compile the kernel it selects for these params with NVRTC instead of launching a
+    // precompiled one.
+    bool usesNvrtc(TllmGenFmhaRunnerParams const& runnerParams);
+
     // Get the total device memory.
     size_t getTotalDeviceMemory() const;
 
@@ -64,7 +68,8 @@ private:
     int mNumEltsPerSageAttnBlkK;
     int mNumEltsPerSageAttnBlkP;
     int mNumEltsPerSageAttnBlkV;
-    bool mFusesDsv4InvRopeFp8Quant{false};
+    // Whether DSv4 inverse-RoPE + FP8 quant epilogue fusion is enabled.
+    bool mFusesDsv4InvRopeFp8Quant;
 };
 
 } // namespace kernels

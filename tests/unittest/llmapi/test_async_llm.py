@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import os
 
@@ -16,7 +31,7 @@ from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_awaitable():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     prompt = "The future of AI is"
@@ -41,12 +56,20 @@ async def test_async_llm_awaitable():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
 
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
-    tags = [tag.value for tag in ExecutorMemoryType]
+    tags = [
+        tag.value
+        for tag in ExecutorMemoryType
+        if tag
+        not in (
+            ExecutorMemoryType.INIT_KV_CACHE,
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES,
+        )
+    ]
 
     async with AsyncLLM(
         model=llama_model_path,
@@ -113,9 +136,7 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
         print(f"Placement group ready with bundles {pg.bundle_specs}")
 
         llm = await AsyncLLM(
-            model=os.path.join(
-                str(llm_models_root()), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
-            ),
+            model=os.path.join(str(llm_models_root()), "Qwen3", "Qwen3-0.6B"),
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             tensor_parallel_size=tp_size,
             placement_groups=[pg],
@@ -141,8 +162,8 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_reset_prefix_cache():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=True)
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0, max_tokens=5, return_perf_metrics=True)
 
@@ -182,7 +203,7 @@ async def test_async_llm_reset_prefix_cache():
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_pause_resume():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=10)
 
@@ -209,7 +230,7 @@ async def test_async_llm_pause_resume():
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_pause_aborts_inflight():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is"
     inflight_params = SamplingParams(temperature=0, max_tokens=512)
     normal_params = SamplingParams(temperature=0, max_tokens=10)

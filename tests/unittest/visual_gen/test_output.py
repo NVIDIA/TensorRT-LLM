@@ -3,6 +3,9 @@
 """Unit tests for VisualGenOutput / VisualGenMetrics / VisualGenResult."""
 
 import asyncio
+import math
+import subprocess
+from contextlib import ExitStack
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,7 +19,11 @@ from tensorrt_llm._torch.visual_gen.output import (
     split_visual_gen_output,
     to_visual_gen_output,
 )
+from tensorrt_llm.media import encoding
 from tensorrt_llm.visual_gen import VisualGenMetrics, VisualGenOutput
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # VisualGenOutput shape and re-exports
@@ -32,6 +39,7 @@ def test_visual_gen_output_is_dataclass():
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
         "error",
@@ -60,6 +68,7 @@ def test_minimal_construction_defaults():
     assert out.image is not None
     assert out.video is None
     assert out.audio is None
+    assert out.action is None
     assert out.frame_rate is None
     assert out.audio_sample_rate is None
     assert out.error is None
@@ -299,6 +308,96 @@ def test_save_video_kwarg_overrides_rate(tmp_path):
         assert kwargs["frame_rate"] == 30.0
 
 
+@pytest.mark.parametrize("real_ffmpeg", [False, True], ids=["mocked-ffmpeg", "real-ffmpeg"])
+@pytest.mark.parametrize("batch_size", [None, 1, 2], ids=["single", "list", "batch-list"])
+@pytest.mark.parametrize(
+    "audio_samples, frame_rate",
+    [(96480, 24.0), (98000, 24.0), (100000, 24.0), (77000, 30000 / 1001)],
+    ids=["short-audio", "equal-audio", "long-audio", "fractional-fps"],
+)
+def test_save_video_preserves_frames_and_raw_audio(
+    tmp_path: Path,
+    batch_size: int | None,
+    audio_samples: int,
+    frame_rate: float,
+    real_ffmpeg: bool,
+) -> None:
+    """Public single/list saves retain every frame without padding the scoring waveform."""
+    if real_ffmpeg and not encoding._check_ffmpeg_available():
+        pytest.skip("ffmpeg is required for the real audio/video round-trip")
+    num_frames, height, width = 49, 16, 16
+    sample_rate = 48000
+    video = torch.arange(num_frames, dtype=torch.uint8)[:, None, None, None]
+    video = video.expand(num_frames, height, width, 3).contiguous()
+    audio = torch.linspace(-0.25, 0.25, audio_samples).repeat(2, 1)
+    if batch_size is not None:
+        video = video.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
+        audio = torch.stack([audio * (i + 1) / batch_size for i in range(batch_size)])
+    raw_audio = audio.clone()
+    raw_video = video.clone()
+    output = VisualGenOutput(
+        video=video, audio=audio, frame_rate=frame_rate, audio_sample_rate=sample_rate
+    )
+    paths = (
+        tmp_path / "single.mp4"
+        if batch_size is None
+        else [tmp_path / f"batch_{i}.mp4" for i in range(batch_size)]
+    )
+    encoder = encoding._FfmpegCliEncoder()
+    process = MagicMock(returncode=0)
+    process.communicate.return_value = (b"", b"")
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(encoding, "_get_video_encoder", return_value=encoder))
+        write_wav = stack.enter_context(
+            patch.object(encoder, "_write_wav", wraps=encoder._write_wav)
+        )
+        if not real_ffmpeg:
+            # Exercise the encoder and real WAV writing without an external binary.
+            stack.enter_context(patch.object(encoding, "_get_ffmpeg_path", return_value="ffmpeg"))
+            stack.enter_context(patch.object(encoding.subprocess, "Popen", return_value=process))
+        saved = output.save(paths)
+    required_samples = math.ceil(num_frames * sample_rate / frame_rate)
+    assert write_wav.call_count == (batch_size or 1)
+    for i, call in enumerate(write_wav.call_args_list):
+        saved_audio = torch.from_numpy(call.args[1])
+        assert saved_audio.shape == (max(audio_samples, required_samples), 2)
+        audio_i = raw_audio if batch_size is None else raw_audio[i]
+        expected_audio = (audio_i.T * 32767).to(torch.int16)
+        torch.testing.assert_close(saved_audio[:audio_samples], expected_audio, rtol=0, atol=0)
+        assert torch.count_nonzero(saved_audio[audio_samples:]) == 0
+    if real_ffmpeg:
+        for path in saved if isinstance(saved, list) else [saved]:
+            decoded = subprocess.run(
+                [
+                    encoding._get_ffmpeg_path(),
+                    "-v",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-",
+                ],
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+            assert len(decoded.stdout) == num_frames * height * width * 3
+    else:
+        assert process.communicate.call_count == (batch_size or 1)
+        for i, call in enumerate(process.communicate.call_args_list):
+            video_i = raw_video if batch_size is None else raw_video[i]
+            assert bytes(call.kwargs["input"]) == video_i.numpy().tobytes()
+    assert output.audio is audio
+    assert output.video is video
+    torch.testing.assert_close(output.audio, raw_audio, rtol=0, atol=0)
+    torch.testing.assert_close(output.video, raw_video, rtol=0, atol=0)
+
+
 def test_save_errored_output_raises(tmp_path):
     """save() on an errored output raises RuntimeError mentioning the error."""
     out = VisualGenOutput(request_id=3, error="kernel launch failed")
@@ -321,6 +420,18 @@ def test_save_no_media_raises(tmp_path):
     out = VisualGenOutput(request_id=5)
     with pytest.raises(ValueError, match="no media"):
         out.save(tmp_path / "x.png")
+
+
+def test_save_action_with_non_tensor_format_raises(tmp_path):
+    """Action-bearing outputs require safetensors/pt to preserve action data."""
+    out = VisualGenOutput(
+        request_id=6,
+        video=torch.zeros(4, 8, 8, 3, dtype=torch.uint8),
+        action=torch.zeros(4, 7),
+        frame_rate=16.0,
+    )
+    with pytest.raises(NotImplementedError, match="tensor payload"):
+        out.save(tmp_path / "x.mp4")
 
 
 # ---------------------------------------------------------------------------
@@ -753,13 +864,14 @@ def test_encoding_not_top_level_reexport():
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_output_has_eight_fields():
-    """PipelineOutput has the eight expected fields."""
+def test_pipeline_output_has_nine_fields():
+    """PipelineOutput has the nine expected fields."""
     field_names = {f.name for f in fields(PipelineOutput)}
     assert field_names == {
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
         "pre_denoise",
@@ -785,3 +897,62 @@ def test_media_output_unimportable():
     """``MediaOutput`` is not importable from any path."""
     with pytest.raises(ImportError):
         from tensorrt_llm._torch.visual_gen.output import MediaOutput  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Single-prompt failure classes reach the caller as distinct exception types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error_type, expected",
+    [
+        ("client", ValueError),
+        ("capacity", MemoryError),
+        (None, RuntimeError),
+    ],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_single_prompt_failure_raises_by_error_class(error_type, expected):
+    """The worker's failure class survives to the public API as a built-in.
+
+    Asserts the *exact* type: the routes map these three to 400 / 503 / 500,
+    so a subclass relationship creeping back in would silently collapse two
+    of the cases into one.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    resp = DiffusionResponse(request_id=20, error_msg="boom", error_type=error_type)
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=20, executor=fx, batch_size=None)
+        with pytest.raises(expected) as excinfo:
+            handle.result(timeout=5.0)
+        assert type(excinfo.value) is expected
+        assert "boom" in str(excinfo.value)
+    finally:
+        fx.stop()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    ["client", "capacity", None],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_batch_failure_never_raises_regardless_of_error_class(error_type):
+    """Batch handles keep Option B semantics for every failure class.
+
+    Per-item ``error`` is set and nothing raises, unlike the single-prompt
+    path which raises by class.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    resp = DiffusionResponse(request_id=21, error_msg="boom", error_type=error_type)
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=21, executor=fx, batch_size=2)
+        outs = handle.result(timeout=5.0)
+        assert len(outs) == 2
+        assert all(o.error is not None for o in outs)
+    finally:
+        fx.stop()

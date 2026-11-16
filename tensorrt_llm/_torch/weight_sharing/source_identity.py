@@ -42,15 +42,16 @@ Layered design
 --------------
 The fingerprint is split so comparison can be selective:
 
-* **global fingerprint** -- immutable checkpoint artifact, rank-invariant
-  model identity, quantization, backend selection, fusion flags, and parallel
-  *sizes* (TP/PP/EP/CP).
+* **global fingerprint** -- immutable checkpoint artifact, transform-layout
+  ABI, rank-invariant model identity, quantization, backend selection, fusion
+  flags, and parallel *sizes* (TP/PP/EP/CP).
 * **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice plus the
   realized local parameter/buffer `(shape, dtype)` layout. Receiver rank `N`
   must align with the source rank that produced shard `N`.
 
 A caller that wants *enforced* sharing across otherwise-divergent runs can skip
-the global comparison (`compare_global=False`) and trust the source.
+the global comparison (`compare_global=False`) and trust the source. Identity
+format and transform-layout ABI compatibility remain mandatory.
 
 Adding fields
 -------------
@@ -82,7 +83,7 @@ if TYPE_CHECKING:
 # Bump when the fingerprint projection changes in a way that makes previously
 # stored identities incomparable. Two identities with different format versions
 # never match.
-SOURCE_IDENTITY_FORMAT_VERSION = 2
+SOURCE_IDENTITY_FORMAT_VERSION = 4
 
 _PRETRAINED_METADATA_FIELDS = frozenset(
     {
@@ -142,6 +143,15 @@ def _pretrained_config_payload(pretrained: Any) -> Any:
     return payload
 
 
+def _canonical_moe_tactic(tactic: str) -> str:
+    """``tactic`` in one spelling. Segment order and case do not change which
+    implementations a tactic names, so they must not change the fingerprint."""
+    # Importing resolution registers every implementation, and with them the segment values.
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MOE_IMPL_REGISTRY
+
+    return MOE_IMPL_REGISTRY.parse_query(tactic).compact()
+
+
 def _canonical_hash(obj: Any) -> str:
     """Compute a stable SHA-256 hash of an arbitrary JSON-able object.
 
@@ -181,6 +191,33 @@ def _quant_to_dict(quant_config: Any) -> Any:
     return str(quant_config)
 
 
+def _quant_fingerprint_projection(quant_config: Any) -> Any:
+    """Project a quantization config for the quant fingerprint.
+
+    A module is excluded when any `exclude_modules` pattern matches it, so the
+    patterns are hashed as a set: two configs that exclude the same modules
+    hash the same whatever order or repeats their producer wrote. The config's
+    own list is left in checkpoint order.
+
+    Args:
+        quant_config: A `QuantConfig` (pydantic model), an object exposing
+            `to_dict`, or `None`.
+
+    Returns:
+        The `_quant_to_dict` projection, with `exclude_modules` replaced by its
+        sorted unique patterns when it is a list or tuple.
+    """
+    projection = _quant_to_dict(quant_config)
+    if isinstance(projection, dict) and isinstance(
+        projection.get("exclude_modules"), (list, tuple)
+    ):
+        projection = {
+            **projection,
+            "exclude_modules": sorted(set(projection["exclude_modules"]), key=str),
+        }
+    return projection
+
+
 @dataclass(frozen=True)
 class IdentityMatchResult:
     """Outcome of comparing two :class:`SourceIdentity` instances."""
@@ -198,10 +235,10 @@ class IdentityCheckPolicy(Enum):
     * `WARN_FALLBACK` (default): log a warning and fall back to non-shared
       loading. Never raises.
     * `STRICT`: raise :class:`SourceIdentityMismatchError` on mismatch.
-    * `ENFORCE`: always share regardless of concrete-identity mismatch (the
+    * `ENFORCE`: share despite concrete artifact/config/shard differences (the
       caller explicitly trusts the source, e.g. enforced cross-run sharing).
-      Still requires both local and source identities to be present. Logs at
-      debug.
+      Identity format and transform-layout ABI must still match, and both
+      identities must be present.
     """
 
     WARN_FALLBACK = "warn_fallback"
@@ -242,6 +279,17 @@ class SourceIdentity:
     pp_size: int = 1
     ep_size: int = -1
     dtype: Optional[str] = None
+    # Layout semantics are safety-critical and always compared, including
+    # under ENFORCE. `None` denotes a source that does not use a qualified
+    # post-transform layout contract. Keep this last to preserve existing
+    # positional construction of the discovery fields above.
+    transform_abi_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.transform_abi_id is not None and (
+            not isinstance(self.transform_abi_id, str) or not self.transform_abi_id
+        ):
+            raise ValueError("SourceIdentity transform_abi_id must be a non-empty string")
 
     # ---- construction --------------------------------------------------
 
@@ -254,6 +302,7 @@ class SourceIdentity:
         checkpoint_dir: Optional[str] = None,
         artifact_identity: Optional[ArtifactIdentity] = None,
         model_name: Optional[str] = None,
+        transform_abi_id: Optional[str] = None,
     ) -> "SourceIdentity":
         """Build an identity from a torch-backend :class:`ModelConfig`.
 
@@ -274,6 +323,9 @@ class SourceIdentity:
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
+            transform_abi_id: Stable identifier for the post-transform tensor
+                layout and receiver-finalization contract. `None` when the
+                source does not use a qualified post-transform layout.
 
         Returns:
             A fully populated :class:`SourceIdentity` for
@@ -305,6 +357,7 @@ class SourceIdentity:
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
             rank=rank,
             shard_fingerprint=cls._build_shard_fingerprint(mapping, model),
+            transform_abi_id=transform_abi_id,
             model_name=model_name,
             tp_size=getattr(mapping, "tp_size", 1),
             pp_size=getattr(mapping, "pp_size", 1),
@@ -336,12 +389,15 @@ class SourceIdentity:
 
         Returns:
             A hex digest covering `quant_config`, `quant_config_dict`, and
-            the dynamic-quantization flag.
+            the dynamic-quantization flag. Exclusion patterns are hashed as a
+            set.
         """
         payload = {
-            "quant_config": _quant_to_dict(getattr(model_config, "quant_config", None)),
+            "quant_config": _quant_fingerprint_projection(
+                getattr(model_config, "quant_config", None)
+            ),
             "quant_config_dict": {
-                name: _quant_to_dict(qc)
+                name: _quant_fingerprint_projection(qc)
                 for name, qc in (getattr(model_config, "quant_config_dict", None) or {}).items()
             },
             "force_dynamic_quantization": getattr(
@@ -359,7 +415,10 @@ class SourceIdentity:
 
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
-            backends, fusion flags, and the all-reduce strategy.
+            backends, fusion flags, the all-reduce strategy, and -- only when
+            one is configured -- the MoE load-balancer config, the MoE
+            tactics of the target and of its draft, which pin implementations
+            within the ``moe_backend`` family, and the draft's ``moe_backend``.
         """
         payload = {
             "attn_backend": getattr(model_config, "attn_backend", None),
@@ -384,6 +443,19 @@ class SourceIdentity:
             "use_cute_dsl_bf16_bmm": getattr(model_config, "use_cute_dsl_bf16_bmm", False),
             "use_cute_dsl_bf16_gemm": getattr(model_config, "use_cute_dsl_bf16_gemm", False),
         }
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        if load_balancer is not None:
+            payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
+        moe_tactic = getattr(model_config, "moe_tactic", None)
+        if moe_tactic is not None:
+            payload["moe_tactic"] = _canonical_moe_tactic(moe_tactic)
+        spec_config = getattr(model_config, "spec_config", None)
+        draft_moe_tactic = getattr(spec_config, "moe_tactic", None)
+        if draft_moe_tactic is not None:
+            payload["draft_moe_tactic"] = _canonical_moe_tactic(draft_moe_tactic)
+        draft_moe_backend = getattr(spec_config, "moe_backend", None)
+        if draft_moe_backend is not None:
+            payload["draft_moe_backend"] = draft_moe_backend
         return _canonical_hash(payload)
 
     @staticmethod
@@ -443,6 +515,7 @@ class SourceIdentity:
             {
                 "format_version": self.format_version,
                 "artifact": self.artifact_identity.to_dict(),
+                "transform_abi_id": self.transform_abi_id,
                 "model": self.model_fingerprint,
                 "quant": self.quant_fingerprint,
                 "backend": self.backend_fingerprint,
@@ -470,6 +543,11 @@ class SourceIdentity:
 
         if self.format_version != other.format_version:
             mismatched.append("format_version")
+
+        # A transform ABI mismatch changes the meaning of transferred tensors,
+        # so no identity policy may bypass it.
+        if self.transform_abi_id != other.transform_abi_id:
+            mismatched.append("transform_abi_id")
 
         if compare_global:
             if self.artifact_identity != other.artifact_identity:
@@ -507,6 +585,7 @@ class SourceIdentity:
             "parallel_fingerprint": self.parallel_fingerprint,
             "rank": self.rank,
             "shard_fingerprint": self.shard_fingerprint,
+            "transform_abi_id": self.transform_abi_id,
             "model_name": self.model_name,
             "tp_size": self.tp_size,
             "pp_size": self.pp_size,
@@ -537,6 +616,7 @@ class SourceIdentity:
             parallel_fingerprint=data["parallel_fingerprint"],
             rank=data["rank"],
             shard_fingerprint=data["shard_fingerprint"],
+            transform_abi_id=data["transform_abi_id"],
             model_name=data.get("model_name"),
             tp_size=data.get("tp_size", 1),
             pp_size=data.get("pp_size", 1),
@@ -596,10 +676,15 @@ def check_weight_sharing_compatibility(
     if policy is IdentityCheckPolicy.ENFORCE:
         result = local.matches(source, compare_global=False, compare_shard=False)
         if not result.matched:
-            logger.debug(
-                f"SourceIdentity ENFORCE: sharing despite mismatch in {result.mismatched_fields}."
+            logger.warning(
+                "SourceIdentity ENFORCE cannot bypass identity format or "
+                f"transform-layout ABI mismatch in {result.mismatched_fields}."
             )
-        return IdentityCheckDecision(should_share=True, match_result=result, policy=policy)
+        return IdentityCheckDecision(
+            should_share=result.matched,
+            match_result=result,
+            policy=policy,
+        )
 
     result = local.matches(source, compare_global=compare_global, compare_shard=compare_shard)
     if result.matched:

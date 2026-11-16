@@ -32,32 +32,19 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+    create_attention_metadata_state,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-        create_attention_metadata_state,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    from .tp_shard_utils import copy_tp_parameter
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from ._worker_pool import run_distributed
+from .tp_shard_utils import copy_tp_parameter
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -72,61 +59,12 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    """Initialize distributed environment for a worker process."""
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    """Clean up distributed environment."""
-    # Reset the DeviceMesh singleton before destroying the process group
-    # to prevent NCCL process group destructor segfaults during interpreter exit.
-    try:
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        DeviceMeshTopologyImpl.device_mesh = None
-        DeviceMeshTopologyImpl.tp_mesh = None
-    except ImportError:
-        pass
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    """Worker function that runs in each process. Module-level for pickling."""
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     """Run a test function in a distributed environment."""
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
-
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    backend = "nccl" if use_cuda else "gloo"
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 
@@ -167,7 +105,9 @@ _WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 # =============================================================================
 
 
-def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA"):
+def _make_model_config(
+    pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_layout=None
+):
     """Create DiffusionModelConfig for testing with TP and/or Ulysses."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = tp_size * ulysses_size
@@ -184,6 +124,7 @@ def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANI
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
+        parallel=ParallelConfig(tp_size=tp_size, ulysses_size=ulysses_size, tp_layout=tp_layout),
         cache=None,
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
@@ -532,6 +473,55 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
 # =============================================================================
 # Test classes
 # =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "expected_head_range"),
+    [(0, (0, 8)), (1, (8, 12))],
+)
+def test_wan_vsa_gates_follow_ulysses_aligned_tp_q_shard(
+    monkeypatch: pytest.MonkeyPatch, tp_rank: int, expected_head_range: tuple[int, int]
+) -> None:
+    """VSA gates must select the same TP-local heads as the Q projection."""
+    from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import VideoSparseAttentionConfig
+
+    monkeypatch.setattr(
+        attention_module,
+        "wrap_parallel_attention",
+        lambda attention, **_kwargs: attention,
+    )
+    mapping = Mapping(world_size=2, rank=tp_rank, tp_size=2)
+    monkeypatch.setattr(type(mapping), "tp_rank", property(lambda self: self.rank))
+    head_dim = 128
+    model_config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=12 * head_dim,
+            num_attention_heads=12,
+            attention_head_dim=head_dim,
+            ffn_dim=512,
+            eps=1e-6,
+            cross_attn_norm=True,
+        ),
+        mapping=mapping,
+        visual_gen_mapping=SimpleNamespace(ulysses_size=4, cp_size=1),
+        attention=AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.5),
+        ),
+        skip_create_weights_in_init=True,
+    )
+
+    block = WanBlock(model_config, _layer_idx=0)
+
+    expected_shard = tuple(index * head_dim for index in expected_head_range)
+    assert (block.attn1.local_q_dim_start, block.attn1.local_q_dim_end) == expected_shard
+    assert block.to_gate_compress.tp_sharding == expected_shard
+    assert block.to_gate_fine.tp_sharding == expected_shard
+    assert block.to_gate_compress.out_features == block.attn1.local_q_dim
+    assert block.to_gate_fine.out_features == block.attn1.local_q_dim
 
 
 class TestWanT2VTP:

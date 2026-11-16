@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adopted from
 # https://github.com/vllm-project/vllm/blob/200bbf92e8861e2458a6f90bca73f40cc3b1ad1f/benchmarks/benchmark_serving.py
 # SPDX-License-Identifier: Apache-2.0
@@ -28,6 +29,7 @@ from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -60,18 +62,18 @@ class BenchmarkMetrics:
     request_goodput: float
     output_throughput: float
     total_token_throughput: float
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    percentiles_ttft_ms: list[tuple[float, float]]
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    percentiles_tpot_ms: list[tuple[float, float]]
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    percentiles_itl_ms: list[tuple[float, float]]
+    mean_ttft_ms: float | None
+    median_ttft_ms: float | None
+    std_ttft_ms: float | None
+    percentiles_ttft_ms: list[tuple[float, float | None]]
+    mean_tpot_ms: float | None
+    median_tpot_ms: float | None
+    std_tpot_ms: float | None
+    percentiles_tpot_ms: list[tuple[float, float | None]]
+    mean_itl_ms: float | None
+    median_itl_ms: float | None
+    std_itl_ms: float | None
+    percentiles_itl_ms: list[tuple[float, float | None]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
     # a request to receiving a complete response.
@@ -152,7 +154,8 @@ def calculate_metrics(
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
-    all_tpots: list[float] = []
+    all_tpots: list[float | None] = []
+    all_ttfts: list[float | None] = []
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
@@ -176,15 +179,21 @@ def calculate_metrics(
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
-            tpot = 0
-            if output_len > 1:
-                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            # Non-streaming backends use -1 when TTFT cannot be measured.
+            # Keep missing values aligned for per-request SLO evaluation.
+            ttft = outputs[i].ttft if outputs[i].ttft >= 0 else None
+            all_ttfts.append(ttft)
+            tpot = None
+            if ttft is not None:
+                ttfts.append(ttft)
+                # A single-token response has no decode interval. Preserve its
+                # zero TPOT for goodput, but exclude it from TPOT statistics.
+                tpot = 0.0
+                if output_len > 1:
+                    tpot = (outputs[i].latency - ttft) / (output_len - 1)
+                    tpots.append(tpot)
+                itls += outputs[i].itl
             all_tpots.append(tpot)
-            itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
@@ -207,7 +216,7 @@ def calculate_metrics(
         slo_values = []
 
         if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
+            valid_metrics.append(all_ttfts)
             slo_values.append(goodput_config_dict["ttft"] /
                               MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
@@ -220,7 +229,8 @@ def calculate_metrics(
                               MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            is_good_req = all(r is not None and s >= r
+                              for s, r in zip(slo_values, req_metric))
             if is_good_req:
                 good_completed += 1
 
@@ -247,22 +257,27 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
-                            for p in selected_percentiles],
+        mean_ttft_ms=float(np.mean(ttfts)) * 1000 if ttfts else None,
+        std_ttft_ms=float(np.std(ttfts)) * 1000 if ttfts else None,
+        median_ttft_ms=float(np.median(ttfts)) * 1000 if ttfts else None,
+        percentiles_ttft_ms=[
+            (p, float(np.percentile(ttfts, p)) * 1000 if ttfts else None)
+            for p in selected_percentiles
+        ],
+        mean_tpot_ms=float(np.mean(tpots)) * 1000 if tpots else None,
+        std_tpot_ms=float(np.std(tpots)) * 1000 if tpots else None,
+        median_tpot_ms=float(np.median(tpots)) * 1000 if tpots else None,
+        percentiles_tpot_ms=[
+            (p, float(np.percentile(tpots, p)) * 1000 if tpots else None)
+            for p in selected_percentiles
+        ],
+        mean_itl_ms=float(np.mean(itls)) * 1000 if itls else None,
+        std_itl_ms=float(np.std(itls)) * 1000 if itls else None,
+        median_itl_ms=float(np.median(itls)) * 1000 if itls else None,
+        percentiles_itl_ms=[
+            (p, float(np.percentile(itls, p)) * 1000 if itls else None)
+            for p in selected_percentiles
+        ],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
         median_e2el_ms=np.median(e2els or 0) * 1000,
@@ -529,6 +544,10 @@ async def benchmark(
         print(
             f"=====================!CHECK LOG FOR ERRORS!====================")
 
+    measured_ttfts = [
+        output.ttft if output.success and output.ttft >= 0 else None
+        for output in outputs
+    ]
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -553,7 +572,7 @@ async def benchmark(
         },
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
-        "ttfts": [output.ttft for output in outputs],
+        "ttfts": measured_ttfts,
         "itls": [output.itl for output in outputs],
         "e2els": [output.latency for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
@@ -566,6 +585,9 @@ async def benchmark(
             "output_tps_per_w": metrics.output_tps_per_w,
             "total_gpu_power_w": metrics.total_gpu_power_w,
         }
+
+    def format_metric(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
 
     def process_one_metric(
         # E.g., "ttft"
@@ -589,28 +611,38 @@ async def benchmark(
         display_unit = f" ({unit_suffix})" if unit_suffix else ""
 
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
+        print("{:<40} {:<10}".format(
             f"Mean {metric_name}{display_unit}:",
-            getattr(metrics, f"mean_{metric_attribute_name}{attr_suffix}")))
-        print("{:<40} {:<10.2f}".format(
+            format_metric(
+                getattr(metrics,
+                        f"mean_{metric_attribute_name}{attr_suffix}"))))
+        print("{:<40} {:<10}".format(
             f"Median {metric_name}{display_unit}:",
-            getattr(metrics, f"median_{metric_attribute_name}{attr_suffix}")))
+            format_metric(
+                getattr(metrics,
+                        f"median_{metric_attribute_name}{attr_suffix}"))))
         if hasattr(metrics, f"std_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Std Dev {metric_name}{display_unit}:",
-                getattr(metrics, f"std_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"std_{metric_attribute_name}{attr_suffix}"))))
             result[f"std_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"std_{metric_attribute_name}{attr_suffix}")
         if hasattr(metrics, f"min_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Min {metric_name}{display_unit}:",
-                getattr(metrics, f"min_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"min_{metric_attribute_name}{attr_suffix}"))))
             result[f"min_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"min_{metric_attribute_name}{attr_suffix}")
         if hasattr(metrics, f"max_{metric_attribute_name}{attr_suffix}"):
-            print("{:<40} {:<10.2f}".format(
+            print("{:<40} {:<10}".format(
                 f"Max {metric_name}{display_unit}:",
-                getattr(metrics, f"max_{metric_attribute_name}{attr_suffix}")))
+                format_metric(
+                    getattr(metrics,
+                            f"max_{metric_attribute_name}{attr_suffix}"))))
             result[f"max_{metric_attribute_name}{attr_suffix}"] = getattr(
                 metrics, f"max_{metric_attribute_name}{attr_suffix}")
 
@@ -622,8 +654,9 @@ async def benchmark(
         for p, value in getattr(
                 metrics, f"percentiles_{metric_attribute_name}{attr_suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(
-                f"P{p_word} {metric_name}{display_unit}:", value))
+            print("{:<40} {:<10}".format(
+                f"P{p_word} {metric_name}{display_unit}:",
+                format_metric(value)))
             result[f"p{p_word}_{metric_attribute_name}{attr_suffix}"] = value
 
     # Print avg_decoded_tokens_per_iter statistics if available
@@ -670,6 +703,10 @@ def check_goodput_args(args):
                 raise ValueError(f"Invalid value found, {slo_name}: {slo_val}. "
                                  "The service level objective value should be "
                                  "non-negative.")
+    if args.non_streaming and {"ttft", "tpot"} & goodput_config_dict.keys():
+        raise ValueError(
+            "TTFT and TPOT goodput objectives require streaming responses. "
+            "Use an e2el objective with --non-streaming.")
     return goodput_config_dict
 
 
@@ -701,8 +738,10 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     ignored_metrics = ["ttfts", "itls", "e2els", "generated_texts", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
-        metrics={k: [results[k]]
-                 for k in metrics if k in results},
+        metrics={
+            k: [results[k]]
+            for k in metrics if k in results and results[k] is not None
+        },
         extra_info={
             k: results[k]
             for k in results if k not in metrics and k not in ignored_metrics
@@ -736,32 +775,59 @@ async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
             return None
 
 
-async def fetch_perf_metrics(base_url: str) -> dict:
-    """
-    Fetch performance metrics from the /perf_metrics endpoint.
+def _snapshot_perf_metrics(output_dir: str) -> dict[Path, int]:
+    directory = Path(output_dir)
+    if not directory.exists():
+        return {}
+    if not directory.is_dir():
+        raise ValueError(
+            f"Performance metrics output path is not a directory: {output_dir}")
+    return {
+        path: path.stat().st_size
+        for path in directory.glob("perf_metrics-*.jsonl")
+    }
 
-    Args:
-        base_url: The base URL of the server
 
-    Returns:
-        Dictionary containing the performance metrics
-    """
-    perf_url = f"{base_url}/perf_metrics"
+def _perf_metrics_files(output_dir: str, offsets: dict[Path,
+                                                       int]) -> list[Path]:
+    paths = sorted(Path(output_dir).glob("perf_metrics-*.jsonl"))
+    by_kind = {}
+    for path in paths:
+        if path.stat().st_size <= offsets.get(path, 0):
+            continue
+        kind = path.name.removeprefix("perf_metrics-").split("-", 1)[0]
+        by_kind.setdefault(kind, []).append(path)
+    if "disagg" in by_kind:
+        return by_kind["disagg"]
+    if "server" in by_kind:
+        return by_kind["server"]
+    return []
 
-    async with aiohttp.ClientSession(trust_env=True,
-                                     timeout=AIOHTTP_TIMEOUT) as session:
-        try:
-            async with session.get(perf_url) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    print(
-                        f"Failed to fetch performance metrics. Status: {response.status}"
-                    )
-                    return {}
-        except Exception as e:
-            print(f"Error fetching performance metrics: {e}")
-            return {}
+
+def _read_new_perf_metrics(
+    output_dir: str,
+    offsets: dict[Path, int],
+    expected_count: int,
+    timeout: float = 10,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    records = []
+    while time.monotonic() < deadline:
+        records = []
+        for path in _perf_metrics_files(output_dir, offsets):
+            with path.open("r", encoding="utf-8") as metrics_file:
+                metrics_file.seek(offsets.get(path, 0))
+                for line in metrics_file:
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        if len(records) >= expected_count:
+            return records
+        time.sleep(0.1)
+    return records
 
 
 def main(args: argparse.Namespace):
@@ -861,11 +927,12 @@ def main(args: argparse.Namespace):
         )
 
     elif args.dataset_name == "trtllm_custom":
-        input_requests = CustomDataset(dataset_path=args.dataset_path,
-                                       random_seed=args.seed).sample(
-                                           num_requests=args.num_prompts,
-                                           tokenizer=tokenizer,
-                                       )
+        input_requests = CustomDataset(
+            dataset_path=args.dataset_path, random_seed=args.seed).sample(
+                num_requests=args.num_prompts,
+                tokenizer=tokenizer,
+                output_len=args.trtllm_custom_output_len,
+            )
 
     else:
 
@@ -965,6 +1032,10 @@ def main(args: argparse.Namespace):
     # Avoid GC - reduce pause times.
     gc.disable()
 
+    perf_metrics_output_dir = getattr(args, 'save_request_time_breakdown', None)
+    perf_metrics_offsets = (_snapshot_perf_metrics(perf_metrics_output_dir)
+                            if perf_metrics_output_dir else {})
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1045,54 +1116,82 @@ def main(args: argparse.Namespace):
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
-    # Save per-request breakdown if requested
-    if args.save_request_time_breakdown:
-        print("Fetching request performance metrics...")
-        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+    if perf_metrics_output_dir:
+        expected_count = benchmark_result["completed"] + int(
+            not args.no_test_input)
+        perf_metrics = _read_new_perf_metrics(perf_metrics_output_dir,
+                                              perf_metrics_offsets,
+                                              expected_count)
+        if not perf_metrics:
+            print("No new public-server performance metrics found; "
+                  "skipping time breakdown report.")
+            return
+        if len(perf_metrics) < expected_count:
+            print(f"Warning: found {len(perf_metrics)} of "
+                  f"{expected_count} expected performance metrics records.")
 
-        if perf_metrics:
-            # Generate filename for perf metrics
-            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-            base_model_id = model_id.split("/")[-1]
-            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                                   if args.max_concurrency is not None else "")
-            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_model_id = model_id.split("/")[-1]
+        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                               if args.max_concurrency is not None else "")
+        output_stem = (f"{backend}-{args.request_rate}qps{max_concurrency_str}-"
+                       f"{base_model_id}-{current_dt}-perf_metrics")
+        if args.result_dir:
+            output_stem = os.path.join(args.result_dir, output_stem)
+        # Reduce the records we already hold rather than writing them out and reading
+        # them back: the round trip made the whole breakdown depend on output_stem
+        # being writable, so a read-only working directory (no --result-dir) cost the
+        # measurement instead of just the artifact.
+        analyzer = RequestTimeBreakdown()
+        timing_data = analyzer.parse_records(perf_metrics)
+        if not timing_data:
+            print("No time data found; skipping time breakdown report.")
+            return
 
-            if args.result_dir:
-                perf_filename = os.path.join(args.result_dir, perf_filename)
+        # Deliberately not printed as scrapeable "Time Breakdown ..." lines. The
+        # perf-sanity harness aggregates the same spans itself from the worker
+        # JSONLs, and a second producer of those lines is worse than none: this
+        # view is built from the client's copy of the file only, drops spans whose
+        # events overlapped (see compute_statistics), and models neither the
+        # per-step nor the per-chunk spans. Printing it made the harness's
+        # "no breakdown lines were parsed" check pass on the fallback, hiding the
+        # aggregation failure the check exists to surface. Written as an artifact
+        # instead, for whoever passed --save-request-time-breakdown by hand.
+        span_stats = analyzer.compute_statistics(timing_data)
 
-            # Save perf metrics to JSON file
-            with open(perf_filename, "w", encoding='utf-8') as outfile:
-                try:
-                    json.dump(perf_metrics, outfile, indent=2)
-                except Exception as e:
-                    print(f"Failed to save perf metrics: {e}")
-
+        # Each artifact is written independently: an unwritable output_stem would
+        # otherwise raise out of main() and make the client exit non-zero, which the
+        # harness reads as a failed benchmark. output_stem is relative to the current
+        # directory unless --result-dir was given. Report and continue. span_stats is
+        # passed in so the reduction is not run a second time over every request.
+        perf_filename = f"{output_stem}.jsonl"
+        try:
+            with open(perf_filename, "w", encoding="utf-8") as outfile:
+                for record in perf_metrics:
+                    outfile.write(
+                        json.dumps(record, separators=(",", ":")) + "\n")
             print(f"Request performance metrics saved to: {perf_filename}")
+        except OSError as exc:
+            print(f"Could not write {perf_filename}: {exc}")
 
-            # Create timing diagram from the saved JSON file
-            try:
-                analyzer = RequestTimeBreakdown()
+        stats_filename = f"{output_stem}-time_breakdown_stats.json"
+        try:
+            analyzer.export_statistics_json(timing_data,
+                                            stats_filename,
+                                            span_stats=span_stats)
+            print(f"Span statistics saved to: {stats_filename}")
+        except OSError as exc:
+            print(f"Could not write {stats_filename}: {exc}")
 
-                print("Creating time diagram from request time breakdown...")
-                timing_data = analyzer.parse_json_file(perf_filename)
-
-                if timing_data:
-                    # Generate HTML filename for the timing diagram
-                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
-                    analyzer.create_timing_diagram(timing_data,
-                                                   diagram_filename)
-
-                    print(f"Time diagram saved to: {diagram_filename}")
-                else:
-                    print(
-                        "No time data found in request time breakdown - skipping diagram creation."
-                    )
-            except Exception as e:
-                print(f"Failed to create time diagram: {e}")
-                print("Performance metrics were still saved successfully.")
-        else:
-            print("Failed to fetch per-request performance metrics.")
+        diagram_filename = f"{output_stem}-time_diagram.html"
+        try:
+            analyzer.create_timing_diagram(timing_data, diagram_filename)
+            print(f"Time diagram saved to: {diagram_filename}")
+        except (OSError, ValueError, TypeError) as exc:
+            # plotly is a module-scope import of time_breakdown, so ImportError cannot
+            # surface here -- it would already have failed this module's import. What can
+            # surface is plotly rejecting the figure it was handed (ValueError/TypeError).
+            print(f"Could not write {diagram_filename}: {exc}")
 
 
 if __name__ == "__main__":
@@ -1427,6 +1526,16 @@ if __name__ == "__main__":
         "from the sampled HF dataset.",
     )
 
+    trtllm_custom_group = parser.add_argument_group(
+        "trtllm_custom dataset options")
+    trtllm_custom_group.add_argument(
+        "--trtllm-custom-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the per-sample "
+        "\"max_tokens\" from the trtllm_custom dataset.",
+    )
+
     sampling_group = parser.add_argument_group("sampling parameters")
     sampling_group.add_argument(
         "--top-p",
@@ -1487,9 +1596,14 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--save-request-time-breakdown",
-        action="store_true",
-        help=
-        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="PERF_METRICS_OUTPUT_DIR",
+        help=("Read JSONL records dumped by the server's "
+              "perf_metrics_output_dir, save the benchmark records, and "
+              "create an interactive time breakdown diagram. If no directory "
+              "is provided, use the current directory."),
     )
 
     args = parser.parse_args()

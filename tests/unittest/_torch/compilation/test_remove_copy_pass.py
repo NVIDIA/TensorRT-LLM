@@ -12,14 +12,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from operator import getitem
 
 import pytest
 import torch
-from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
+from torch._higher_order_ops.auto_functionalize import auto_functionalized, auto_functionalized_v2
 from torch.fx import Graph
 
+# Registers torch.ops.trtllm.mla_custom_op_inplace, used below. The op is a
+# module-import side effect that the eagerly loaded model zoo used to provide
+# (models/__init__ -> modeling_deepseekv3 -> attention.mla); with the zoo lazy,
+# every test must import the ops it uses itself.
+import tensorrt_llm._torch.attention.mla  # noqa: F401
 import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
+from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
+    fused_sigmoid_mul_inplace,  # noqa: F401
+)
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_remove_copy_preserves_minimax_producer_outputs(use_v2: bool) -> None:
+    """Preserve query outputs and cache aliases when removing functionalization."""
+    import tensorrt_llm._torch.models.modeling_minimaxm3  # noqa: F401
+
+    graph = Graph()
+    hidden = graph.placeholder("hidden")
+    positions = graph.placeholder("positions")
+    main = graph.placeholder("main")
+    index = graph.placeholder("index")
+    scales = graph.placeholder("scales")
+    slots = graph.placeholder("slots")
+    op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
+    kwargs = dict(hidden_states=hidden, position_ids=positions, out_cache_loc=slots, layer_idx="3")
+    if use_v2:
+        kwargs.update(
+            _all_bases=(main, index, scales),
+            _kv_cache_base_index=0,
+            _index_k_cache_base_index=1,
+            _kv_scale_cache_base_index=2,
+        )
+    else:
+        kwargs.update(kv_cache=main, index_k_cache=index, kv_scale_cache=scales)
+    functionalized = graph.call_function(
+        auto_functionalized_v2 if use_v2 else auto_functionalized, args=(op,), kwargs=kwargs
+    )
+    q = graph.call_function(getitem, args=(functionalized, 0))
+    index_q = graph.call_function(getitem, args=(functionalized, 1))
+    q.meta["val"] = torch.empty(4, 3)
+    index_q.meta["val"] = torch.empty(4, 1)
+    functionalized.meta["val"] = (
+        q.meta["val"],
+        index_q.meta["val"],
+        torch.empty(8, 3),
+        torch.empty(8, 1),
+        torch.empty(8, 1),
+    )
+    updated_main = graph.call_function(getitem, args=(functionalized, 2))
+    updated_index = graph.call_function(getitem, args=(functionalized, 3))
+    updated_scales = graph.call_function(getitem, args=(functionalized, 4))
+    output = graph.output((q, index_q, updated_main, updated_index, updated_scales))
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+    calls = [node for node in graph.nodes if node.target == op]
+    assert len(calls) == 1
+    assert calls[0].kwargs["kv_cache"] is main
+    assert calls[0].kwargs["index_k_cache"] is index
+    assert calls[0].kwargs["kv_scale_cache"] is scales
+    assert calls[0].kwargs["out_cache_loc"] is slots
+    assert calls[0].meta["val"] == (q.meta["val"], index_q.meta["val"])
+    new_q, new_index_q, new_main, new_index, new_scales = output.args[0]
+    assert new_q.args == (calls[0], 0)
+    assert new_index_q.args == (calls[0], 1)
+    assert new_main is main and new_index is index and new_scales is scales
+    assert new_q.meta["val"] is q.meta["val"]
+    assert new_index_q.meta["val"] is index_q.meta["val"]
+    assert all(
+        node.target not in (auto_functionalized, auto_functionalized_v2) for node in graph.nodes
+    )
+    graph.lint()
 
 
 def test_remove_copy_for_mutates_args_auto_functionalized_v2(
@@ -57,7 +131,78 @@ def test_remove_copy_for_mutates_args_auto_functionalized_v2(
     graph.lint()
 
 
-def test_remove_copy_for_mutates_args_restores_optional_none() -> None:
+def test_remove_copy_for_fused_sigmoid_mul_inplace() -> None:
+    graph = Graph()
+    attention_output = graph.placeholder("attention_output")
+    gate = graph.placeholder("gate")
+    inplace_func = torch.ops.trtllm.fused_sigmoid_mul_inplace.default
+    functionalized = graph.call_function(
+        auto_functionalized_v2,
+        args=(inplace_func,),
+        kwargs={
+            "_all_bases": (attention_output,),
+            "_attention_output_base_index": 0,
+            "gate": gate,
+        },
+    )
+    mutated_output = graph.call_function(getitem, args=(functionalized, 1))
+    clone = graph.call_function(torch.ops.aten.clone.default, args=(mutated_output,))
+    graph.output(clone)
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+    inplace_nodes = [node for node in graph.nodes if node.target == inplace_func]
+    assert len(inplace_nodes) == 1
+    assert inplace_nodes[0].kwargs == {
+        "attention_output": attention_output,
+        "gate": gate,
+    }
+    assert clone.args[0] is attention_output
+    assert all(node.target != auto_functionalized_v2 for node in graph.nodes)
+    graph.lint()
+
+
+@pytest.mark.parametrize(
+    "inplace_func",
+    [
+        torch.ops.trtllm.pp_recv_tensors.default,
+        torch.ops.trtllm.pp_send_tensors.default,
+    ],
+)
+def test_remove_copy_for_mutates_tensor_list(
+    inplace_func: Callable[..., object],
+) -> None:
+    graph = Graph()
+    tensor_0 = graph.placeholder("tensor_0")
+    tensor_1 = graph.placeholder("tensor_1")
+    functionalized = graph.call_function(
+        auto_functionalized_v2,
+        args=(inplace_func,),
+        kwargs={
+            "_all_bases": (tensor_0, tensor_1),
+            "_tensors_length": 2,
+            "_tensors_0_base_index": 0,
+            "_tensors_1_base_index": 1,
+        },
+    )
+    mutated_0 = graph.call_function(getitem, args=(functionalized, 1))
+    mutated_1 = graph.call_function(getitem, args=(functionalized, 2))
+    clone_0 = graph.call_function(torch.ops.aten.clone.default, args=(mutated_0,))
+    clone_1 = graph.call_function(torch.ops.aten.clone.default, args=(mutated_1,))
+    graph.output((clone_0, clone_1))
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+    inplace_nodes = [node for node in graph.nodes if node.target == inplace_func]
+    assert len(inplace_nodes) == 1
+    assert inplace_nodes[0].kwargs == {"tensors": [tensor_0, tensor_1]}
+    assert clone_0.args[0] is tensor_0
+    assert clone_1.args[0] is tensor_1
+    assert all(node.target != auto_functionalized_v2 for node in graph.nodes)
+    graph.lint()
+
+
+def test_remove_copy_for_mla_restores_final_output_mutation() -> None:
     graph = Graph()
     hidden_states = graph.placeholder("hidden_states")
     output = graph.placeholder("output")
@@ -70,11 +215,8 @@ def test_remove_copy_for_mutates_args_restores_optional_none() -> None:
             "position_ids": None,
             "layer_idx": "0",
             "latent_cache_gen": None,
-            "enable_dsv4_epilogue_fusion": False,
             "_all_bases": (output,),
             "_output_base_index": 0,
-            "_dsv4_output_base_index": None,
-            "_dsv4_output_sf_base_index": None,
         },
     )
     mutated_output = graph.call_function(getitem, args=(functionalized, 1))
@@ -86,49 +228,54 @@ def test_remove_copy_for_mutates_args_restores_optional_none() -> None:
     inplace_nodes = [node for node in graph.nodes if node.target == inplace_func]
     assert len(inplace_nodes) == 1
     assert inplace_nodes[0].kwargs["output"] is output
-    assert inplace_nodes[0].kwargs["dsv4_output"] is None
-    assert inplace_nodes[0].kwargs["dsv4_output_sf"] is None
     assert clone.args[0] is output
     graph.lint()
 
 
-def test_remove_copy_for_mutates_args_rejects_getitem_for_optional_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    graph = Graph()
-    hidden_states = graph.placeholder("hidden_states")
-    output = graph.placeholder("output")
-    inplace_func = torch.ops.trtllm.mla_custom_op_inplace.default
-    functionalized = graph.call_function(
-        auto_functionalized_v2,
-        args=(inplace_func,),
-        kwargs={
-            "hidden_states": hidden_states,
-            "position_ids": None,
-            "layer_idx": "0",
-            "latent_cache_gen": None,
-            "enable_dsv4_epilogue_fusion": False,
-            "_all_bases": (output,),
-            "_output_base_index": 0,
-            "_dsv4_output_base_index": None,
-            "_dsv4_output_sf_base_index": None,
-        },
-    )
-    optional_output = graph.call_function(getitem, args=(functionalized, 2))
-    clone = graph.call_function(torch.ops.aten.clone.default, args=(optional_output,))
-    graph.output(clone)
+def test_inplace_info_declares_every_mutated_arg():
+    """Every inplace_info entry must name ALL of its op's mutates_args.
 
-    monkeypatch.setattr(
-        remove_copy_pass,
-        "inplace_info",
-        lambda: {inplace_func: {1: "output", 2: "dsv4_output"}},
-    )
+    remove_copy_for_mutates_args rebuilds the direct call from
+    ``{k: v for k, v in node.kwargs.items() if not k.startswith("_")}`` plus the
+    names in inplace_info. auto_functionalize hoists every mutable argument into
+    underscore-prefixed metadata, so a mutable arg missing from the map is
+    dropped from the rewritten call entirely, and the failure surfaces far away
+    as a "missing value for argument" error (nvbugs/6474888) or, for an
+    optional mutable argument, as a silently skipped write.
 
-    with pytest.raises(
-        AssertionError,
-        match=(
-            "getitem user for optional output 'dsv4_output' has no "
-            "base tensor -- graph is malformed"
-        ),
+    Asserting the invariant rather than one op is deliberate: the same
+    omission is available to every in-place custom op.
+    """
+    from tensorrt_llm._torch.compilation.utils import inplace_info
+
+    table = inplace_info()
+    assert table, "inplace_info() is empty; no op was registered, so this test would be vacuous"
+    registered = {op._schema.name for op in table}
+    for required in (
+        "trtllm::mla_custom_op_inplace",
+        "trtllm::compressor_postprocess_scatter",
     ):
-        remove_copy_pass.remove_copy_for_mutates_args(graph)
+        assert required in registered, (
+            f"{required} is absent from inplace_info(); the regression this "
+            f"test exists for could not be detected. Registered: {sorted(registered)}"
+        )
+
+    mismatches = []
+    for op_overload, declared in table.items():
+        schema = op_overload._schema
+        actual = [
+            argument.name
+            for argument in schema.arguments
+            if argument.alias_info is not None and argument.alias_info.is_write
+        ]
+        # Ordered comparison: inplace_info values follow the op's schema
+        # declaration order. The keys are not asserted:
+        # verify_dynamic_tree_rejection_out_op keys by position in the full
+        # argument list rather than among the mutable arguments.
+        if list(declared.values()) != actual:
+            mismatches.append(
+                f"{schema.name}: inplace_info declares {list(declared.values())}, "
+                f"op mutates {actual}"
+            )
+
+    assert not mismatches, "inplace_info is out of sync with op schemas:\n" + "\n".join(mismatches)

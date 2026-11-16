@@ -355,6 +355,7 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
             "backend": result.actual_backend,
             "comm_method": result.actual_comm_method,
             "comm_fallback_reason": result.actual_comm_fallback_reason,
+            "epilogue_activation": result.actual_epilogue_activation,
             "scheduler_kind": result.scheduler_kind,
             "moe_ep_size": result.moe_ep_size,
             "moe_tp_size": result.moe_tp_size,

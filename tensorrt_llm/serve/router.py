@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import asyncio
+import sys
 import time
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict
-from typing import Awaitable, Callable, Dict, Iterable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
 import msgpack
@@ -25,25 +27,44 @@ from blake3 import blake3
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import get_request_conversation_id
+from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ResponsesRequest)
+from tensorrt_llm.serve.output_length_predictor import (OUTPUT_LENGTH_KEY,
+                                                        request_inputs)
 # Shared tokenization / block-hashing utilities (single source of truth).
 # Re-exported here for backward compat.
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
-    BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
-    get_request_num_tokens, hash_v1_block_key, truncate_sha256_hash_to_int64,
-    v2_sha256_block_hasher)
+    BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
+    hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
+from tensorrt_llm.serve.seat_pool import (NoGenerationSeatError, SeatPool,
+                                          Waiter, priority_or_default)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
+# Retries ride out a burst that fills the coordinator's accept queue; select is
+# idempotent per req_id (see _post_select), so a replay is safe.
+COORDINATOR_SELECT_MAX_ATTEMPTS = 4
+COORDINATOR_SELECT_RETRY_DELAY_S = 0.05
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
 COORDINATOR_FINISH_TIMEOUT_S = 5.0
 COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
+# Backoff cap of a pooled /finish, which is retried until delivered (see _finish_async).
+COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S = 5.0
+# A fleet worker's bound on a pooled generation /select, which waits for a free seat.
+POOLED_SELECT_TIMEOUT_S = 3600.0
+# How long, and for how many request ids, a pooled router placed by id remembers a /finish: a
+# /select for that id arriving later (it raced the finish of a cancelled request) is refused.
+POOLED_FINISHED_TTL_S = 600.0
+POOLED_FINISHED_MAX = 1 << 17
+_UNREAD = object()
+# The context servers report a null kv_transfer_timeout_ms: no seat-wait bound.
+_NO_KV_TIMEOUT = object()
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -51,6 +72,17 @@ ROUTE_AFFINITY_HASH_SEED = b"TensorRT-LLM-route-affinity-v1!!"
 # Leading token-id count folded into the affinity key so pre-tokenized
 # requests (placeholder message content) still key per conversation.
 ROUTE_AFFINITY_TOKEN_PREFIX = 256
+
+# ConversationRouter remembers every CONVERSATION_CONTENT_STRIDE-th block hash
+# of the first request of the CONVERSATION_CONTENT_CACHE_SIZE most recent new
+# conversation_ids, to place later new conversation_ids by prefix match.
+CONVERSATION_CONTENT_STRIDE = 8
+CONVERSATION_CONTENT_CACHE_SIZE = 4096
+# blake3 key of the first link of a conversation's content-key chain (32 bytes).
+CONVERSATION_CONTENT_HASH_SEED = b"TensorRT-LLM-conv-content-v1!!!!"
+# Route-info flag of a get_next_server_by_key answer that placed nothing: the
+# caller must repeat it with ConversationRouter.content_routing_key().
+ROUTING_CONTENT_REQUIRED = "routing_content_required"
 
 
 class ServerState:
@@ -76,23 +108,21 @@ class ServerState:
 
     async def increment_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        await self.increment_load_by(num_tokens)
+
+    async def increment_load_by(self, num_tokens: int = 0):
         async with self._lock:
             self._num_active_requests += 1
             self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        await self.decrement_load_by(num_tokens)
+
+    async def decrement_load_by(self, num_tokens: int = 0):
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
-
-    async def is_healthy(self) -> bool:
-        try:
-            async with self._session.get(
-                    f"{self._base_url}/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
 
 
 class KvCacheAwareServerState(ServerState):
@@ -306,11 +336,16 @@ class LoadBalancingMixin:
             await self._server_state[server].decrement_load(request)
         return server
 
-    def _select_least_loaded(self,
-                             exclude_server: Optional[str] = None
-                             ) -> Optional[str]:
-        """Pick the server with the lowest load. Round-robin breaks ties."""
-        candidates = [s for s in self._servers if s != exclude_server]
+    def _select_least_loaded(
+            self,
+            exclude_server: Optional[str] = None,
+            candidates: Optional[List[str]] = None) -> Optional[str]:
+        """Pick the server with the lowest load. Round-robin breaks ties.
+
+        ``candidates`` (default: every server but ``exclude_server``) are the servers to pick from.
+        """
+        if candidates is None:
+            candidates = [s for s in self._servers if s != exclude_server]
         if not candidates:
             return None
         loads = {s: self._get_server_load(s) for s in candidates}
@@ -324,6 +359,11 @@ class LoadBalancingMixin:
 
 
 class Router(ABC):
+
+    # True for a router whose placement may wait for capacity (a generation seat). The coordinator
+    # then runs its select outside the reservation lock that its finish takes, waits for it longer
+    # (POOLED_SELECT_TIMEOUT_S), and fails its waiters (fail_waiters) when it stops.
+    pooled: bool = False
 
     def __init__(
             self,
@@ -383,6 +423,10 @@ class Router(ABC):
     @property
     def server_role(self) -> ServerRole:
         return self._server_role
+
+    def server_infos(self) -> dict[str, dict]:
+        """The ``/server_info`` of every prepared server, by server."""
+        return self._server_info
 
     @staticmethod
     def _ensure_url(server: str) -> str:
@@ -486,6 +530,21 @@ class Router(ABC):
                              success: bool = True,
                              req_id: Optional[int] = None):
         pass
+
+    async def fail_waiters(self, reason: str) -> int:
+        """Fail every request waiting for capacity (``pooled`` routers); returns how many."""
+        del reason
+        return 0
+
+    def set_unpredicted_priority(self, priority: float) -> None:
+        """The priority of requests whose model has no ``priority`` field (``pooled`` routers)."""
+        del priority
+
+    async def renew_request(self,
+                            request: OpenAIRequest,
+                            req_id: Optional[int] = None) -> None:
+        """Extend a request reservation when retrying a backend request."""
+        del request, req_id
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -750,6 +809,9 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers, use_tokens)
+        # The coordinator path cannot retain the request object, so preserve its
+        # token weight by disaggregated request ID until /finish arrives.
+        self._coord_request_tokens: dict[int, int] = {}
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -783,6 +845,427 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         async with self._lock:
             await self._unregister_request(request)
 
+    # ---- coordinator delegation -------------------------------------------------
+
+    def routing_key(self, request: OpenAIRequest) -> dict[str, int]:
+        """Return the request's load weight for coordinator-side placement."""
+        return {
+            "num_tokens":
+            get_request_num_tokens(request) if self._use_tokens else 0,
+        }
+
+    async def get_next_server_by_key(self,
+                                     routing_key,
+                                     exclude_server=None,
+                                     req_id=None):
+        """Place globally and retain the worker-provided token weight by ID."""
+        if req_id is None:
+            raise ValueError(
+                "Load-balancing coordinator routing requires a request ID")
+        self._validate_servers_available()
+        num_tokens = int((routing_key or {}).get("num_tokens", 0))
+        async with self._lock:
+            server = self._select_least_loaded(exclude_server)
+            if server is None:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+            await self._server_state[server].increment_load_by(num_tokens)
+            self._req_routing_table[req_id] = server
+            self._coord_request_tokens[req_id] = num_tokens
+        return server, {
+            "server_info": self._server_info.get(server, {})
+        }, req_id
+
+    async def finish_request_by_id(self, req_id, success=True):
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            server = self._req_routing_table.pop(req_id, None)
+            num_tokens = self._coord_request_tokens.pop(req_id, 0)
+            if server is not None and server in self._server_state:
+                await self._server_state[server].decrement_load_by(num_tokens)
+
+
+class PooledLoadBalancingRouter(LoadBalancingRouter):
+    """Generation router that queues requests until a server has a free seat.
+
+    Built for ``load_balancing`` with ``max_requests_per_server`` (generation only). A
+    server with fewer active requests than that has a free seat. With a free seat and
+    nobody waiting, a request is placed at once by the parent's rule (least loaded,
+    round-robin among ties); otherwise it waits in one queue (:class:`SeatPool`), and
+    each finished request gives its seat to the first waiter in order: the highest
+    request priority first, ties in arrival order, and with ``max_queue_wait_s`` the
+    requests that waited that long first. In disaggregated serving the coordinator owns
+    the queue; its ``select`` waits for the seat outside the reservation lock.
+
+    A request whose context phase has finished (``disaggregated_params.orig_elapsed_s``
+    set) ages from its arrival at the orchestrator. With ``kv_transfer_timeout_ms`` every
+    request fails once it has waited that long for a seat (see :mod:`seat_pool` for what the
+    context side does by then). The value is the smallest one the context servers report in
+    ``/server_info`` (:meth:`set_context_router`), else the configured one; there is no bound
+    when they all report null.
+
+    A seat is released on the server state it was taken from: a server that leaves while
+    requests hold its seats keeps that state, and gets it back if it rejoins, so its seat
+    count stays right across a re-registration.
+
+    Placed by request id (the coordinator), the router remembers each finished id for
+    ``POOLED_FINISHED_TTL_S`` and refuses a later select for it: a cancelled request's
+    /finish can overtake its own /select. After :meth:`fail_waiters` (shutdown) it refuses
+    every new request.
+    """
+
+    pooled = True
+
+    def __init__(self,
+                 server_role: ServerRole,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 use_tokens: bool = False,
+                 max_requests_per_server: int = 1,
+                 max_queue_wait_s: Optional[float] = None,
+                 kv_transfer_timeout_ms: Optional[float] = None,
+                 **kwargs: Any) -> None:
+        if server_role != ServerRole.GENERATION:
+            raise ValueError(
+                "max_requests_per_server is a generation router option")
+        if use_tokens:
+            raise ValueError(
+                "max_requests_per_server counts requests; it cannot be "
+                "combined with use_tokens")
+        super().__init__(server_role,
+                         servers,
+                         metadata_server_cfg,
+                         metadata_server,
+                         use_tokens=False,
+                         **kwargs)
+        self._configured_kv_timeout_ms = kv_transfer_timeout_ms
+        self._pool = SeatPool(
+            max_requests_per_server,
+            max_queue_wait_s,
+            kv_transfer_timeout_s=(None if kv_transfer_timeout_ms is None else
+                                   kv_transfer_timeout_ms / 1000.0))
+        # The server state each granted seat was taken from, by request id.
+        self._seat_state: dict[int, ServerState] = {}
+        # Removed servers that still have seated requests, by server.
+        self._departed_state: dict[str, ServerState] = {}
+        self._context_router: Optional[Router] = None
+        # The value last read from the context servers (_UNREAD: none yet).
+        self._reported_kv_timeout_ms: Any = _UNREAD
+        # Request ids finished by id -> when, oldest first.
+        self._finished_ids: OrderedDict[int, float] = OrderedDict()
+        # Set by fail_waiters: why new requests are refused.
+        self._stopping_reason: Optional[str] = None
+        # The priority of a request whose model has no priority field (set_unpredicted_priority).
+        self._unpredicted_priority: Optional[float] = None
+        logger.info(f"PooledLoadBalancingRouter: "
+                    f"{self._pool.describe(len(self._servers))}")
+        self._warn_if_cap_exceeds_kv_timeout(kv_transfer_timeout_ms)
+
+    def _warn_if_cap_exceeds_kv_timeout(
+            self, kv_transfer_timeout_ms: Optional[float]) -> None:
+        max_queue_wait_s = self._pool.max_wait_s
+        if (max_queue_wait_s is not None and kv_transfer_timeout_ms is not None
+                and max_queue_wait_s * 1000.0 > kv_transfer_timeout_ms):
+            logger.warning(
+                f"max_queue_wait_s ({max_queue_wait_s} s) exceeds the context "
+                f"servers' kv_transfer_timeout_ms ({kv_transfer_timeout_ms} "
+                f"ms): a request fails at that timeout before the cap can "
+                f"move it ahead")
+
+    def set_context_router(self, context_router: Router) -> None:
+        """Bound the seat wait by the KV transfer timeout the context servers report."""
+        self._context_router = context_router
+
+    def _refresh_kv_timeout(self) -> None:
+        """Use the smallest ``kv_transfer_timeout_ms`` in the context servers' ``/server_info``.
+
+        No bound when every context server that reports the key reports null (no timeout).
+        """
+        if self._context_router is None:
+            return
+        reported = [
+            info["kv_transfer_timeout_ms"]
+            for info in self._context_router.server_infos().values()
+            if "kv_transfer_timeout_ms" in info
+        ]
+        bounds = [
+            value for value in reported if isinstance(value, (int, float))
+            and not isinstance(value, bool) and value > 0
+        ]
+        if bounds:
+            value = min(bounds)
+        elif reported and all(value is None for value in reported):
+            value = _NO_KV_TIMEOUT
+        else:
+            value = None
+        if value == self._reported_kv_timeout_ms:
+            return
+        self._reported_kv_timeout_ms = value
+        if value is _NO_KV_TIMEOUT:
+            value = None
+            logger.info(
+                "PooledLoadBalancingRouter: the context servers have no "
+                "kv_transfer_timeout_ms; generation requests wait for a "
+                "seat without a bound")
+        elif value is None:
+            value = self._configured_kv_timeout_ms
+            logger.warning(
+                "PooledLoadBalancingRouter: no context server reports "
+                "kv_transfer_timeout_ms in /server_info; generation requests "
+                f"wait at most the configured {value} ms for a seat")
+        else:
+            logger.info(f"PooledLoadBalancingRouter: generation requests wait "
+                        f"at most {value} ms for a seat, the context servers' "
+                        f"smallest kv_transfer_timeout_ms")
+        self._pool.kv_transfer_timeout_s = (None if value is None else value /
+                                            1000.0)
+        self._warn_if_cap_exceeds_kv_timeout(value)
+
+    def set_unpredicted_priority(self, priority: float) -> None:
+        """Give requests whose model has no ``priority`` field (``/v1/responses``) this priority.
+
+        ``output_length_prediction`` sets the prior's priority here; without it they rank at
+        the default priority.
+        """
+        self._unpredicted_priority = priority
+
+    def _request_priority(self, request: OpenAIRequest) -> Optional[float]:
+        """The request's ``priority`` field, else the unpredicted priority.
+
+        A ``priority`` a client sent to a request model that allows extra fields
+        (``ResponsesRequest``) is not a priority field and is ignored.
+        """
+        if "priority" in getattr(type(request), "model_fields", {}):
+            return request.priority
+        return self._unpredicted_priority
+
+    @staticmethod
+    def _orig_elapsed_s(request: OpenAIRequest) -> Optional[float]:
+        params = getattr(request, "disaggregated_params", None)
+        return getattr(params, "orig_elapsed_s", None)
+
+    def routing_key(self, request: OpenAIRequest) -> dict:
+        """The parent's key plus the priority and, past the context phase, ``orig_elapsed_s``."""
+        key = super().routing_key(request)
+        key["priority"] = priority_or_default(self._request_priority(request))
+        orig_elapsed_s = self._orig_elapsed_s(request)
+        if orig_elapsed_s is not None:
+            key["orig_elapsed_s"] = orig_elapsed_s
+        return key
+
+    def _on_servers_updated(self, old_servers: list[str],
+                            new_servers: list[str]) -> None:
+        # A leaving server keeps its state while requests hold its seats; it
+        # gets that state back if it rejoins, so their releases stay counted.
+        for server in old_servers:
+            state = self._server_state.get(server)
+            if (server not in new_servers and state is not None
+                    and state._num_active_requests > 0):
+                self._departed_state[server] = state
+        super()._on_servers_updated(old_servers, new_servers)
+        for server in new_servers:
+            state = self._departed_state.pop(server, None)
+            if state is not None:
+                self._server_state[server] = state
+        if len(self._pool):
+            # New servers may seat waiters; called with the lock held.
+            try:
+                asyncio.get_running_loop().create_task(self._redispatch())
+            except RuntimeError:
+                pass
+
+    async def _redispatch(self) -> None:
+        async with self._lock:
+            await self._dispatch_locked()
+
+    def _active_servers(self) -> List[str]:
+        return [s for s in self._servers if s in self._server_state]
+
+    def _expire_locked(self, waiter: Optional[Waiter] = None) -> None:
+        """Fail the waiters past their KV transfer deadline, and ``waiter``."""
+        for expired in self._pool.expire(waiter):
+            if not expired.future.done():
+                expired.future.set_exception(
+                    NoGenerationSeatError(self._pool.expiry_message(expired)))
+
+    async def fail_waiters(self, reason: str) -> int:
+        """Fail the requests waiting for a seat and refuse new ones (shutdown)."""
+        async with self._lock:
+            self._stopping_reason = reason
+            waiters = self._pool.waiters()
+            for waiter in waiters:
+                self._pool.remove(waiter.rid)
+                if not waiter.future.done():
+                    waiter.future.set_exception(NoGenerationSeatError(reason))
+        return len(waiters)
+
+    async def _dispatch_locked(self) -> None:
+        """Give free seats to waiters, best first. Called with ``self._lock`` held."""
+        self._expire_locked()
+        while len(self._pool):
+            free = [
+                s for s in self._active_servers()
+                if self._get_server_load(s) < self._pool.seats
+            ]
+            picked = self._pool.pick(free)
+            if picked is None:
+                break
+            waiter, candidates = picked
+            server = self._select_least_loaded(candidates=candidates)
+            state = self._server_state[server]
+            await state.increment_load_by(0)
+            self._req_routing_table[waiter.rid] = server
+            self._seat_state[waiter.rid] = state
+            self._pool.record_grant(waiter)
+            if not waiter.future.done():
+                waiter.future.set_result(server)
+        servers = self._active_servers()
+        self._pool.maybe_log_stats(
+            sum(self._get_server_load(s) for s in servers),
+            self._pool.seats * len(servers))
+
+    async def _acquire(self,
+                       rid: int,
+                       priority: Optional[float],
+                       exclude_server: Optional[str],
+                       orig_elapsed_s: Optional[float] = None,
+                       by_id: bool = False) -> str:
+        """Wait for a seat and return its server.
+
+        A repeated call for a request that holds a seat returns that seat; one for a
+        waiting request shares its place in the queue. Raises ``NoGenerationSeatError``
+        once the request has waited the context servers' KV transfer timeout (every
+        waiter, when that timeout is known) or when :meth:`fail_waiters` runs at
+        shutdown (also for a new request afterwards), and ``ValueError`` if the request
+        is finished while it waits or, with ``by_id``, was finished before this call.
+        """
+        async with self._lock:
+            server = self._req_routing_table.get(rid)
+            if server is not None:
+                return server
+            waiter = self._pool.waiter(rid)
+            if waiter is None:
+                if self._stopping_reason is not None:
+                    raise NoGenerationSeatError(self._stopping_reason)
+                if by_id and self._was_finished_locked(rid):
+                    raise ValueError(f"generation request {rid} was finished "
+                                     f"before its placement")
+                self._refresh_kv_timeout()
+                waiter = self._pool.add(
+                    rid, priority, exclude_server,
+                    asyncio.get_running_loop().create_future(), orig_elapsed_s)
+            waiter.holders += 1
+            await self._dispatch_locked()
+            waiter.arriving = False
+        try:
+            try:
+                return await asyncio.wait_for(asyncio.shield(waiter.future),
+                                              self._pool.remaining_s(waiter))
+            except asyncio.TimeoutError:
+                async with self._lock:
+                    if not waiter.future.done():
+                        self._expire_locked(waiter)
+                return await asyncio.shield(waiter.future)
+        except asyncio.CancelledError:
+            async with self._lock:
+                waiter.holders -= 1
+                if waiter.holders <= 0:
+                    if (waiter.future.done() and not waiter.future.cancelled()
+                            and waiter.future.exception() is None):
+                        # Placed, but nobody will use the seat: give it back.
+                        await self._release_locked(rid)
+                    elif self._pool.remove(rid) is not None:
+                        waiter.future.cancel()
+            raise
+
+    async def _release_locked(self, rid: int) -> None:
+        server = self._req_routing_table.pop(rid, None)
+        if server is None:
+            # Finished before its placement: drop it from the queue.
+            waiter = self._pool.remove(rid)
+            if waiter is not None and not waiter.future.done():
+                waiter.future.set_exception(
+                    ValueError(
+                        "generation request finished while waiting for a seat"))
+            return
+        # Release on the state the seat was taken from, even if its server has
+        # left (and maybe rejoined) since.
+        state = self._seat_state.pop(rid, None)
+        if state is not None:
+            await state.decrement_load_by(0)
+            if (state._num_active_requests <= 0
+                    and self._departed_state.get(server) is state):
+                del self._departed_state[server]
+        await self._dispatch_locked()
+
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
+        self._validate_servers_available()
+        server = await self._acquire(id(request),
+                                     self._request_priority(request),
+                                     exclude_server,
+                                     self._orig_elapsed_s(request))
+        return server, {"server_info": self._server_info.get(server, {})}
+
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True,
+                             req_id: Optional[int] = None) -> None:
+        del session, success, req_id
+        async with self._lock:
+            await self._release_locked(id(request))
+
+    async def get_next_server_by_key(
+            self,
+            routing_key: Optional[dict],
+            exclude_server: Optional[str] = None,
+            req_id: Optional[int] = None) -> tuple[str, dict, int]:
+        if req_id is None:
+            raise ValueError(
+                "Pooled generation routing through the coordinator requires a "
+                "request ID")
+        self._validate_servers_available()
+        routing_key = routing_key or {}
+        server = await self._acquire(req_id,
+                                     routing_key.get("priority"),
+                                     exclude_server,
+                                     routing_key.get("orig_elapsed_s"),
+                                     by_id=True)
+        return server, {
+            "server_info": self._server_info.get(server, {})
+        }, req_id
+
+    async def finish_request_by_id(self,
+                                   req_id: Optional[int],
+                                   success: bool = True) -> None:
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            self._remember_finished_locked(req_id)
+            await self._release_locked(req_id)
+
+    def _remember_finished_locked(self, rid: int) -> None:
+        now = time.monotonic()
+        finished = self._finished_ids
+        finished[rid] = now
+        finished.move_to_end(rid)
+        while finished and (len(finished) > POOLED_FINISHED_MAX or next(
+                iter(finished.values())) <= now - POOLED_FINISHED_TTL_S):
+            finished.popitem(last=False)
+
+    def _was_finished_locked(self, rid: int) -> bool:
+        finished_at = self._finished_ids.get(rid)
+        return (finished_at is not None
+                and time.monotonic() - finished_at < POOLED_FINISHED_TTL_S)
+
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
@@ -803,14 +1286,17 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
+                 enable_tokenization_cache: bool = False,
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block,
-                                 custom_tokenizer,
-                                 tokenizer_dir,
-                                 use_harmony=use_harmony,
-                                 model_path=model_path)
+        self._init_block_hashing(
+            tokens_per_block,
+            custom_tokenizer,
+            tokenizer_dir,
+            use_harmony=use_harmony,
+            model_path=model_path,
+            enable_tokenization_cache=enable_tokenization_cache)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -927,7 +1413,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._server_state[server].set_hash_algo(worker_algo)
 
     @staticmethod
-    def _content_affinity_key(request: OpenAIRequest) -> Optional[int]:
+    def _content_affinity_key(
+            request: OpenAIRequest,
+            token_ids: Optional[List[int]] = None) -> Optional[int]:
+        """Conversation key from the first messages and the first prompt tokens.
+
+        ``token_ids`` are the router's own ids, for a request it did not write them
+        back into: the key must not depend on whether the ids were forwarded.
+        """
         messages = getattr(request, "messages", None)
         if not messages:
             return None
@@ -936,7 +1429,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             content = (message.get("content") if isinstance(message, dict) else
                        getattr(message, "content", ""))
             parts.append(str(content))
-        token_ids = getattr(request, "prompt_token_ids", None)
+        token_ids = getattr(request, "prompt_token_ids", None) or token_ids
         if token_ids:
             parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
         digest = blake3("".join(parts).encode("utf-8"),
@@ -962,7 +1455,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         Tokenization and per-algorithm block hashing are CPU-bound and run in a
         thread. The returned plain dict can be sent over HTTP unchanged.
         """
-        cache_salt_id = self._get_request_cache_salt_id(request)
+        cache_salt = self._get_request_cache_salt(request)
         # Hash for every algo any server might use (usually one).
         algos = ({self._routing_hash_algo}
                  if self._routing_hash_algo is not None else {
@@ -975,11 +1468,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
-                request, algos, cache_salt_id)
+                request, algos, cache_salt)
         return {
-            "block_hashes_by_algo": block_hashes_by_algo,
-            "conv_key": self._content_affinity_key(request),
-            "num_tokens": sum(len(token_list) for token_list in token_lists),
+            "block_hashes_by_algo":
+            block_hashes_by_algo,
+            "conv_key":
+            self._content_affinity_key(
+                request, token_lists[0] if len(token_lists) == 1 else None),
+            "num_tokens":
+            sum(len(token_list) for token_list in token_lists),
         }
 
     async def _route(self, key, exclude_server=None, request=None, req_id=None):
@@ -1219,13 +1716,50 @@ class _BlockHashTrie:
                     break
         return best_id, best_depth
 
+    def session_count(self, block_hashes: list[int]) -> int:
+        """Number of sessions whose hash path starts with *block_hashes*."""
+        node = self._root
+        for h in block_hashes:
+            node = node.children.get(h)
+            if node is None:
+                return 0
+        return len(node.session_ids)
+
+
+def _chained_chunk_hashes(data: bytes, chunk_bytes: int) -> list[int]:
+    """One key per full *chunk_bytes* chunk of *data*.
+
+    Each chunk is hashed with keyed blake3 under the previous chunk's full
+    digest, so each key identifies the whole prefix up to its chunk; the low 8
+    bytes of the digest are the key.
+    """
+    view = memoryview(data)
+    key = CONVERSATION_CONTENT_HASH_SEED
+    hashes = []
+    for start in range(0, len(view) - chunk_bytes + 1, chunk_bytes):
+        key = blake3(view[start:start + chunk_bytes], key=key).digest()
+        hashes.append(int.from_bytes(key[:8], "little"))
+    return hashes
+
 
 class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     """Router that provides session affinity for multi-turn conversations.
 
     Routing priority:
     1. Explicit ``conversation_params.conversation_id`` — sticky
-       routing to the previously assigned server.
+       routing to the previously assigned server.  A conversation_id
+       without a server is pinned to the server of the earlier
+       conversation whose first request shares the longest block prefix
+       with it (for example a subagent that starts from the context of an
+       earlier sibling), when that prefix covers at least
+       ``new_conversation_min_match_blocks`` blocks and is specific to a
+       few conversations; else to the least-loaded server.  A prefix is
+       specific when one earlier conversation has it, or when the
+       conversations that have it are at most a 1/N share (N servers) of
+       the remembered conversations.  A prefix that more conversations
+       share, such as a common system prompt, is a preamble: following it
+       would put more than one server's share of the new conversations on
+       one server.
     2. Implicit block-hash prefix matching — find the session whose
        stored block hashes share the longest prefix with the new request.
        If the match ratio exceeds ``match_threshold`` the request is
@@ -1243,6 +1777,13 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             approximate length of a shared system prompt so that every
             request does not trivially prefix-match on the common
             preamble.
+        new_conversation_min_match_blocks: Minimum shared prefix, in hash
+            blocks of ``tokens_per_block`` tokens or code points, for a new
+            conversation_id to follow an earlier conversation.  Matches are
+            found at a granularity of
+            ``CONVERSATION_CONTENT_STRIDE`` blocks.  ``0`` disables
+            following: new conversation_ids go to the least-loaded server
+            and request content is never hashed for them.
     """
 
     CHAR_PER_TOKEN = 5  # approximately 4 characters per token + 1 space
@@ -1258,17 +1799,30 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  hash_skip_count: int = 0,
                  max_sessions: int = 100000,
                  use_harmony: Optional[bool] = None,
+                 enable_tokenization_cache: bool = False,
+                 new_conversation_min_match_blocks: int = 32,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers)
-        self._init_block_hashing(tokens_per_block, use_harmony=use_harmony)
+        self._init_block_hashing(
+            tokens_per_block,
+            use_harmony=use_harmony,
+            enable_tokenization_cache=enable_tokenization_cache)
 
+        if new_conversation_min_match_blocks < 0:
+            raise ValueError("new_conversation_min_match_blocks must be >= 0")
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
         self._hash_skip_count = hash_skip_count
         self._max_sessions = max_sessions
+        self._new_conv_min_match_blocks = new_conversation_min_match_blocks
         self._disagg_node_id = kwargs.get("disagg_node_id", 0)
+
+        # conversation_id -> strided block hashes of its first request (LRU),
+        # indexed by a prefix tree separate from the implicit-session one.
+        self._conv_content: OrderedDict[str, list[int]] = OrderedDict()
+        self._conv_content_trie = _BlockHashTrie()
 
         # conversation_id -> (server, block_hashes)  LRU-ordered
         self._session_table: OrderedDict[str,
@@ -1364,6 +1918,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 entry = self._session_table.pop(conv_id, None)
                 if entry is not None:
                     self._hash_trie.remove(conv_id, entry[1])
+                self._forget_conversation_content(conv_id)
             self._server_content_load.pop(removed, None)
 
         self._server_sessions = new_server_sessions
@@ -1373,6 +1928,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     @staticmethod
     def _extract_text(request: OpenAIRequest) -> str:
         """Return a canonical text representation of the request content."""
+        if isinstance(request, ResponsesRequest):
+            return responses_request_text(request)
         if isinstance(request, ChatCompletionRequest):
             parts = []
             for msg in request.messages:
@@ -1397,6 +1954,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         Returns ``None`` when the request does not already carry them.
         """
+        if isinstance(request, ResponsesRequest):
+            token_ids = request.relayed_prompt_token_ids()
+            return None if token_ids is None else [token_ids]
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
@@ -1476,7 +2036,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # ── routing helpers ──
 
     def _get_conversation_id(self, request: OpenAIRequest) -> Optional[str]:
-        return get_request_conversation_id(request)
+        return get_request_routing_id(request)
 
     def _generate_implicit_id(self) -> str:
         self._implicit_id_counter += 1
@@ -1505,6 +2065,105 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._hash_trie.remove(conv_id, hashes)
         if server in self._server_sessions:
             self._server_sessions[server].discard(conv_id)
+        self._forget_conversation_content(conv_id)
+
+    # ── placement of new conversation_ids ──
+
+    def _is_routable_session(self, conv_id: str,
+                             exclude_server: Optional[str]) -> bool:
+        entry = self._session_table.get(conv_id)
+        return (entry is not None and entry[0] in self._server_state
+                and entry[0] != exclude_server)
+
+    def _needs_content(self, conv_id: str,
+                       exclude_server: Optional[str]) -> bool:
+        """Whether placing *conv_id* needs the content of its request."""
+        return (self._new_conv_min_match_blocks > 0
+                and not self._is_routable_session(conv_id, exclude_server))
+
+    def _conversation_content_hashes(self, request: OpenAIRequest) -> list[int]:
+        """One key per ``CONVERSATION_CONTENT_STRIDE`` blocks of *request*.
+
+        Each key identifies the whole prefix up to its chunk (chained keyed
+        blake3), so the list is a valid trie path. The keys are only compared
+        with each other, also between the workers and the coordinator of a
+        two-step setup, never with worker block keys; hashing bytes in a few
+        calls keeps a long first request cheap on the event loop. The input is
+        chosen as in ``_request_to_block_hashes``: token ids when the request
+        carries them or ``use_token_ids`` is set (as int32), else the text's
+        code points (as UTF-32), after ``hash_skip_count`` leading elements.
+        """
+        token_ids = self._try_extract_token_ids(request)
+        if token_ids is None and self._use_token_ids:
+            token_ids = self._tokenize(request)
+        if token_ids is not None:
+            tokens = array("i", token_ids[0][self._hash_skip_count:])
+            if sys.byteorder != "little":
+                tokens.byteswap()
+            data = tokens.tobytes()
+        else:
+            skip = self._hash_skip_count * self.CHAR_PER_TOKEN
+            data = self._extract_text(request)[skip:].encode(
+                "utf-32-le", errors="surrogatepass")
+        chunk_bytes = 4 * CONVERSATION_CONTENT_STRIDE * self._tokens_per_block
+        return _chained_chunk_hashes(data, chunk_bytes)
+
+    def _remember_conversation_content(self, conv_id: str,
+                                       content_hashes: list[int]):
+        self._conv_content[conv_id] = content_hashes
+        self._conv_content_trie.insert(conv_id, content_hashes)
+        while len(self._conv_content) > CONVERSATION_CONTENT_CACHE_SIZE:
+            old_id, old_hashes = self._conv_content.popitem(last=False)
+            self._conv_content_trie.remove(old_id, old_hashes)
+
+    def _forget_conversation_content(self, conv_id: str):
+        content_hashes = self._conv_content.pop(conv_id, None)
+        if content_hashes is not None:
+            self._conv_content_trie.remove(conv_id, content_hashes)
+
+    def _place_conversation(self, conv_id: str,
+                            content_hashes: Optional[list[int]],
+                            exclude_server: Optional[str]) -> str:
+        """Pin *conv_id*, which has no routable server, to a server.
+
+        It follows the earlier conversation whose first request shares the
+        longest prefix with *content_hashes* when that prefix is long enough
+        and specific to a few conversations (see the class docstring), else
+        goes to the least-loaded server.  Call with ``self._lock`` held.
+        """
+        self._forget_conversation_content(conv_id)
+        match_id, depth = None, 0
+        if content_hashes:
+            match_id, depth = self._conv_content_trie.find_longest_prefix_match(
+                content_hashes,
+                lambda cid: self._is_routable_session(cid, exclude_server))
+        match_blocks = depth * CONVERSATION_CONTENT_STRIDE
+        sharers = 0
+        follow = False
+        if (match_id is not None
+                and match_blocks >= self._new_conv_min_match_blocks):
+            # Conversations whose first request has the matched prefix; it is
+            # specific while they are one, or at most a server's share.
+            sharers = self._conv_content_trie.session_count(
+                content_hashes[:depth])
+            server_share = len(self._conv_content) // len(self._servers)
+            follow = sharers <= max(1, server_share)
+        if follow:
+            server = self._session_table[match_id][0]
+        else:
+            server = self._select_least_loaded(exclude_server)
+            if server is None:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+        # Store no block hashes in the session: the implicit-session trie is
+        # only read for conversation_id-less requests.
+        self._update_session(conv_id, server, [])
+        if content_hashes:
+            self._remember_conversation_content(conv_id, content_hashes)
+        logger.debug(f"ConversationRouter: NEW conv_id={conv_id} -> "
+                     f"server={server}, matched_blocks={match_blocks}, "
+                     f"sharers={sharers}")
+        return server
 
     # ── public interface ──
 
@@ -1517,34 +2176,29 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         conv_id = self._get_conversation_id(request)
 
-        # Explicit conversation_id: route by the session table alone and never
-        # touch request content. Block hashes are consumed only by the implicit
-        # prefix-match path below (requests with no conversation_id), so for a
-        # pinned session -- new or already-seen -- the GIL-bound
-        # _request_to_block_hashes is pure overhead that would serialize the
-        # single orchestrator event loop and cap dispatch throughput.
+        # Explicit conversation_id: a pinned session is routed by the session
+        # table alone and never touches request content, because the GIL-bound
+        # _request_to_block_hashes would serialize the single orchestrator
+        # event loop and cap dispatch throughput. Only the request of a
+        # conversation_id without a routable server is hashed, to place it,
+        # in a thread so that the event loop keeps dispatching meanwhile.
         if conv_id:
             weight = self._estimate_content_weight(request)
+            content_hashes = None
+            if self._needs_content(conv_id, exclude_server):
+                content_hashes = await asyncio.to_thread(
+                    self._conversation_content_hashes, request)
             async with self._lock:
-                entry = self._session_table.get(conv_id)
-                if (entry is not None and entry[0] in self._server_state
-                        and entry[0] != exclude_server):
+                if self._is_routable_session(conv_id, exclude_server):
                     # Sticky hit: keep the pinned server, refresh LRU only.
-                    server = entry[0]
+                    server = self._session_table[conv_id][0]
                     self._session_table.move_to_end(conv_id)
-                    await self._register_request(server, request)
-                    self._add_content_load(server, request, weight)
                 else:
-                    # New conversation_id (or its server is gone/excluded):
-                    # pin to the least-loaded server. Store no block hashes --
-                    # the trie is only read for conversation_id-less requests.
-                    server = self._select_least_loaded(exclude_server)
-                    if server is None:
-                        raise ValueError("No available servers after excluding "
-                                         f"{exclude_server}")
-                    await self._register_request(server, request)
-                    self._add_content_load(server, request, weight)
-                    self._update_session(conv_id, server, [])
+                    # New conversation_id (or its server is gone/excluded).
+                    server = self._place_conversation(conv_id, content_hashes,
+                                                      exclude_server)
+                await self._register_request(server, request)
+                self._add_content_load(server, request, weight)
                 return server, {
                     "server_info": self._server_info.get(server, {})
                 }
@@ -1597,32 +2251,54 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # -- coordinator-path: conversation_id-only sticky routing --
     # The coordinator has no request object, so per-request load is tracked by an
     # opaque handle instead of id(request). Only explicit conversation_id sessions
-    # are supported over the coordinator (no implicit content match).
+    # are supported over the coordinator (no implicit content match). A select
+    # for a conversation_id that needs its content to be placed places nothing
+    # and answers ROUTING_CONTENT_REQUIRED; the worker then repeats it with
+    # content_routing_key(), so only those requests are hashed.
 
     def routing_key(self, request: OpenAIRequest):
         """The conversation_id (or None); no tokenization on the worker."""
         return self._get_conversation_id(request)
 
+    def content_routing_key(self, request: OpenAIRequest) -> dict:
+        """Routing key carrying the content needed to place a new conversation."""
+        return {
+            "conversation_id": self._get_conversation_id(request),
+            "block_hashes": self._conversation_content_hashes(request),
+        }
+
     async def get_next_server_by_key(self,
                                      routing_key,
                                      exclude_server=None,
                                      req_id=None):
+        """Place by a ``routing_key()`` or ``content_routing_key()`` key.
+
+        Returns ``(None, {ROUTING_CONTENT_REQUIRED: True}, req_id)``, placing
+        nothing, when a ``routing_key()`` names a conversation_id whose
+        placement needs the request content.
+        """
         conv_id = routing_key
+        content_hashes = None
+        if isinstance(routing_key, dict):
+            conv_id = routing_key["conversation_id"]
+            content_hashes = routing_key["block_hashes"]
         self._validate_servers_available()
         async with self._lock:
-            entry = self._session_table.get(conv_id) if conv_id else None
-            if (entry is not None and entry[0] in self._server_state
-                    and entry[0] != exclude_server):
-                server = entry[0]
+            if conv_id and self._is_routable_session(conv_id, exclude_server):
+                server = self._session_table[conv_id][0]
                 self._session_table.move_to_end(conv_id)
+            elif conv_id:
+                if (content_hashes is None
+                        and self._needs_content(conv_id, exclude_server)):
+                    return None, {ROUTING_CONTENT_REQUIRED: True}, req_id
+                server = self._place_conversation(conv_id, content_hashes,
+                                                  exclude_server)
             else:
                 server = self._select_least_loaded(exclude_server)
                 if server is None:
                     raise ValueError(
                         f"No available servers after excluding {exclude_server}"
                     )
-                if conv_id:
-                    self._update_session(conv_id, server, [])
             # Request-count load (no request object at the coordinator). Keyed by
             # the disagg req_id -- the sole id crossing the HTTP hop on /finish.
             self._server_content_load[server] = (
@@ -1644,19 +2320,28 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     0, self._server_content_load[server] - 1)
 
 
+class _CoordinatorFinishError(RuntimeError):
+    """A non-200 ``/finish`` reply; a 4xx (malformed request) is not retried for pooled seats."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 class CoordinatorDelegatingRouter(Router):
     """Worker-side Router that delegates placement to the disagg coordinator.
 
-    Used only for *stateful* routers (conversation, kv_cache_aware): the worker
-    must not keep its own copy of that state, so it wraps a local router of the same
-    type and, for each request, computes the small ``routing_key`` locally and
-    POSTs it to the coordinator's ``/select``. ``finish_request`` POSTs the
-    returned handle to ``/finish`` so the coordinator releases per-request state.
+    Used for routers with global routing state (load_balancing, conversation,
+    kv_cache_aware): the worker must not keep its own copy of that state, so it
+    wraps a local router of the same type and, for each request, computes the small
+    ``routing_key`` locally and POSTs it to the coordinator's ``/select``.
+    ``finish_request`` POSTs the returned handle to ``/finish`` so the coordinator
+    releases per-request state.
     Server-pool / prepare / close operations delegate to the wrapped local router.
 
-    Stateless routers (round_robin, load_balancing) are NOT wrapped -- the worker
-    holds the real router and places locally, so they never reach this class (see
-    ``CoordinatorClient``). ``OpenAIClient`` already drives
+    The round-robin router is NOT wrapped -- the worker holds the real router and
+    places locally, so it never reaches this class (see ``CoordinatorClient``).
+    ``OpenAIClient`` already drives
     ``router.get_next_server`` / ``router.finish_request``, so the completions
     service needs no worker-specific branching.
     """
@@ -1678,11 +2363,28 @@ class CoordinatorDelegatingRouter(Router):
         self._local = local_router
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
+        # A pooled router's /select waits in the coordinator for a free seat.
+        self.pooled = local_router.pooled
+        self._select_timeout_s = (POOLED_SELECT_TIMEOUT_S
+                                  if self.pooled else request_timeout_s)
+        # Ask /select for the output-length prediction (output_length_prediction).
+        self._predict_output_length = False
         self._session: Optional[aiohttp.ClientSession] = None
+        # A pooled seat is a hard admission cap released only by its /finish: the pooled
+        # queue is unbounded, and each finish is retried until the coordinator would have
+        # expired the reservation itself.
         self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
-            maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
+            maxsize=0 if self.pooled else COORDINATOR_FINISH_QUEUE_SIZE)
         self._finish_workers: set[asyncio.Task] = set()
         self._dropped_finishes = 0
+        self._pooled_finish_window_s = None
+        if self.pooled:
+            from tensorrt_llm.serve.disagg_coordinator import (
+                pooled_reservation_timeout, reservation_timeout)
+
+            # The coordinator's own expiry of the seat (it gets the same request timeout).
+            self._pooled_finish_window_s = pooled_reservation_timeout(
+                reservation_timeout(request_timeout_s=request_timeout_s))
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -1705,6 +2407,48 @@ class CoordinatorDelegatingRouter(Router):
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
+
+    async def sync_servers(self, servers: list[str]) -> None:
+        """Mirror the coordinator server list without preparing worker state."""
+        async with self._local._lock:
+            old_servers = self._local._servers.copy()
+            if old_servers == servers:
+                return
+            self._local._servers = list(servers)
+            self._local._on_servers_updated(old_servers, self._local._servers)
+            self._local._prepared_ready_servers.intersection_update(servers)
+            self._local._server_info = {
+                server: info
+                for server, info in self._local._server_info.items()
+                if server in servers
+            }
+
+    def set_unpredicted_priority(self, priority: float) -> None:
+        # The local router computes the routing key's priority.
+        self._local.set_unpredicted_priority(priority)
+
+    def enable_output_length_prediction(self) -> bool:
+        """Have the coordinator predict a generation request's output length in ``/select``.
+
+        The routing key then carries the request's conversation id and prompt tokens; the
+        coordinator orders the placement by the predicted priority and returns the prediction
+        in the route info under ``OUTPUT_LENGTH_KEY``, which also sets ``request.priority``.
+        Returns whether it is on: only for a generation router with a dict routing key (not
+        ``conversation``, whose key is the conversation id).
+        """
+        self._predict_output_length = (
+            self._role == "generation"
+            and not isinstance(self._local, ConversationRouter))
+        return self._predict_output_length
+
+    def _output_length_inputs(self, request: OpenAIRequest) -> Optional[dict]:
+        if not self._predict_output_length or "priority" not in getattr(
+                type(request), "model_fields", {}):
+            return None
+        conv_id, isl = request_inputs(request)
+        if isl is None:
+            return None
+        return {"conv": conv_id, "isl": isl}
 
     def _request_id(self,
                     request: OpenAIRequest,
@@ -1740,6 +2484,9 @@ class CoordinatorDelegatingRouter(Router):
         # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
         # event loop driving the concurrent streams.
         key = await asyncio.to_thread(self._local.routing_key, request)
+        prediction_inputs = self._output_length_inputs(request)
+        if prediction_inputs is not None and isinstance(key, dict):
+            key[OUTPUT_LENGTH_KEY] = prediction_inputs
         # Send the request's existing disagg id as the cross-process key (the
         # coordinator keys pending state by it for /finish); placement must not
         # change it, since the ctx<->gen KV transfer is keyed by it.
@@ -1750,18 +2497,101 @@ class CoordinatorDelegatingRouter(Router):
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
-        async with self.session.post(f"{self._coordinator_url}/select",
-                                     data=msgpack.packb(payload,
-                                                        use_bin_type=True),
-                                     headers=_MSGPACK_HEADERS,
-                                     timeout=self._request_timeout_s) as resp:
-            body = msgpack.unpackb(await resp.read(), raw=False)
-            if resp.status != 200:
-                raise ValueError(f"coordinator /select returned {resp.status}: "
-                                 f"{body.get('error', body)}")
+        selection = asyncio.create_task(self._post_select(payload))
+        try:
+            body = await asyncio.shield(selection)
+            info = body.get("info") or {}
+            if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
+                # The coordinator placed nothing; repeat with the content key.
+                payload["routing_key"] = await asyncio.to_thread(
+                    self._local.content_routing_key, request)
+                selection = asyncio.create_task(self._post_select(payload))
+                body = await asyncio.shield(selection)
+                info = body.get("info") or {}
+        except asyncio.CancelledError:
+            if self.pooled:
+                # A pooled select may wait long for a seat. This finish fails
+                # its coordinator-side wait at once; the one below releases a
+                # seat granted before this finish arrived.
+                await self.finish_request(request,
+                                          success=False,
+                                          req_id=payload["req_id"])
+            # /finish must not overtake /select and leave a late reservation.
+            # Keep its existing HTTP timeout/retry bounds, even if the caller
+            # cancels again while we wait to release the original routing ID.
+            settled = asyncio.gather(selection, return_exceptions=True)
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    pass
+            await self.finish_request(request,
+                                      success=False,
+                                      req_id=payload["req_id"])
+            raise
+        except asyncio.TimeoutError:
+            # The coordinator may hold a reservation (or grant one later).
+            await self.finish_request(request,
+                                      success=False,
+                                      req_id=payload["req_id"])
+            raise
+        except Exception:
+            if self.pooled:
+                # A select the coordinator took may still wait there, or hold a
+                # seat whose reply was lost (a transport error, or a refused
+                # retry); /finish ends either.
+                await self.finish_request(request,
+                                          success=False,
+                                          req_id=payload["req_id"])
+            raise
         self._select_lat.record(time.monotonic() - _t0)
-        info = body.get("info") or {}
+        if body["server"] is None:
+            raise ValueError(f"coordinator /select placed no {self._role} "
+                             f"server: {info}")
+        # Only ConversationRouter asks for content, and it never asks for a prediction.
+        prediction = info.get(OUTPUT_LENGTH_KEY)
+        if isinstance(prediction, dict):
+            priority = prediction.get("priority")
+            if isinstance(priority, float) and 0.0 <= priority <= 1.0:
+                request.priority = priority
         return body["server"], info
+
+    async def _post_select(self, payload: dict) -> dict:
+        """POST /select, retrying connection-level failures.
+
+        A pooled connection the coordinator closed first fails instantly with
+        BrokenPipeError/ConnectionResetError; without a retry that transport
+        blip becomes a 500 on a live request. The coordinator's ``select`` is
+        idempotent for a repeated req_id -- it cancels the prior reservation and
+        re-places -- so replaying is safe even when the first attempt did reach
+        it. Only connection errors retry: an error status from the coordinator
+        is a real placement failure and must propagate, and a timeout means it
+        is already overloaded, so retrying would only add load.
+        """
+        data = msgpack.packb(payload, use_bin_type=True)
+        for attempt in range(1, COORDINATOR_SELECT_MAX_ATTEMPTS + 1):
+            try:
+                async with self.session.post(
+                        f"{self._coordinator_url}/select",
+                        data=data,
+                        headers=_MSGPACK_HEADERS,
+                        timeout=self._select_timeout_s) as resp:
+                    body = msgpack.unpackb(await resp.read(), raw=False)
+                    if resp.status != 200:
+                        message = (f"coordinator /select returned "
+                                   f"{resp.status}: {body.get('error', body)}")
+                        if body.get("no_generation_seat"):
+                            raise NoGenerationSeatError(message)
+                        raise ValueError(message)
+                return body
+            except aiohttp.ClientConnectionError as e:
+                if attempt == COORDINATOR_SELECT_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    f"CoordinatorDelegatingRouter select attempt {attempt} "
+                    f"failed: {e}; retrying")
+                await asyncio.sleep(COORDINATOR_SELECT_RETRY_DELAY_S *
+                                    (2**(attempt - 1)))
 
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1777,12 +2607,28 @@ class CoordinatorDelegatingRouter(Router):
         try:
             self._finish_queue.put_nowait((req_id, success))
         except asyncio.QueueFull:
+            # Non-pooled only (the pooled queue is unbounded).
             self._dropped_finishes += 1
             if self._dropped_finishes == 1 or self._dropped_finishes % 1000 == 0:
                 logger.warning(
                     f"CoordinatorDelegatingRouter finish queue full; "
                     f"coordinator expiration will release dropped requests "
                     f"(dropped={self._dropped_finishes})")
+
+    async def renew_request(self,
+                            request: OpenAIRequest,
+                            req_id: Optional[int] = None) -> None:
+        req_id = self._request_id(request, req_id)
+        payload = {"role": self._role, "req_id": req_id}
+        async with self.session.post(f"{self._coordinator_url}/renew",
+                                     data=msgpack.packb(payload,
+                                                        use_bin_type=True),
+                                     headers=_MSGPACK_HEADERS,
+                                     timeout=self._request_timeout_s) as resp:
+            body = msgpack.unpackb(await resp.read(), raw=False)
+            if resp.status != 200:
+                raise ValueError(f"coordinator /renew returned {resp.status}: "
+                                 f"{body.get('error', body)}")
 
     def _ensure_finish_workers(self) -> None:
         if self._finish_workers:
@@ -1800,8 +2646,19 @@ class CoordinatorDelegatingRouter(Router):
                 self._finish_queue.task_done()
 
     async def _finish_async(self, req_id: int, success: bool):
+        """POST /finish with retries.
+
+        A non-pooled finish only corrects a soft load counter and gives up after
+        ``COORDINATOR_FINISH_MAX_ATTEMPTS``. A pooled one frees a seat, so it is retried
+        with capped backoff until delivered, rejected as malformed (4xx), or past the
+        coordinator's own expiry of the reservation.
+        """
         _t0 = time.monotonic()
-        for attempt in range(1, COORDINATOR_FINISH_MAX_ATTEMPTS + 1):
+        give_up_at = (None if self._pooled_finish_window_s is None else _t0 +
+                      self._pooled_finish_window_s)
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/finish",
@@ -1823,22 +2680,34 @@ class CoordinatorDelegatingRouter(Router):
                             body = raw_body.decode(errors="replace")
                         error = body.get("error", body) if isinstance(
                             body, dict) else body
-                        raise RuntimeError(
+                        raise _CoordinatorFinishError(
+                            resp.status,
                             f"coordinator /finish returned {resp.status}: {error}"
                         )
                 self._finish_lat.record(time.monotonic() - _t0)
                 return
             except Exception as e:  # noqa: BLE001
-                if attempt == COORDINATOR_FINISH_MAX_ATTEMPTS:
+                delay = COORDINATOR_FINISH_RETRY_DELAY_S * (2**min(
+                    attempt - 1, 16))
+                if give_up_at is None:
+                    give_up = attempt == COORDINATOR_FINISH_MAX_ATTEMPTS
+                else:
+                    delay = min(delay,
+                                COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S)
+                    give_up = (isinstance(e, _CoordinatorFinishError)
+                               and 400 <= e.status < 500) or (time.monotonic() +
+                                                              delay
+                                                              >= give_up_at)
+                if give_up:
                     logger.warning(
                         f"CoordinatorDelegatingRouter finish failed after "
                         f"{attempt} attempts: {e}")
                     return
-                logger.warning(
-                    f"CoordinatorDelegatingRouter finish attempt {attempt} "
-                    f"failed: {e}; retrying")
-                await asyncio.sleep(COORDINATOR_FINISH_RETRY_DELAY_S *
-                                    (2**(attempt - 1)))
+                if attempt < COORDINATOR_FINISH_MAX_ATTEMPTS or attempt % 100 == 0:
+                    logger.warning(
+                        f"CoordinatorDelegatingRouter finish attempt {attempt} "
+                        f"failed: {e}; retrying")
+                await asyncio.sleep(delay)
 
     async def close(self):
         if self._finish_workers:
@@ -1896,6 +2765,11 @@ def create_router(
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
     extra_args = router_config.args if router_config else {}
+    if extra_args.get("max_requests_per_server") is not None:
+        if router_class is not LoadBalancingRouter:
+            raise ValueError("max_requests_per_server needs the load_balancing "
+                             f"router, not {router_type}")
+        router_class = PooledLoadBalancingRouter
     extra_args["disagg_node_id"] = disagg_node_id
 
     return router_class(router_config.server_role if router_config else None,
@@ -1915,24 +2789,22 @@ def build_disagg_routers(
     metadata_server: Optional[JsonDictionary] = None,
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
-    is_delegating_client: bool = False,
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
-    Each side is built independently via :func:`create_router`. Stateful router
-    types (conversation, kv_cache_aware) expose ``routing_key`` /
+    Each side is built independently via :func:`create_router`. Globally shared
+    router types (load_balancing, conversation, kv_cache_aware) expose ``routing_key`` /
     ``get_next_server_by_key``; when this process is a delegating client, the
     caller (:class:`CoordinatorClient`) wraps those in a
     :class:`CoordinatorDelegatingRouter` so placement is delegated to the
-    coordinator. Stateless types (round_robin, load_balancing) place locally.
-    ``is_delegating_client`` is accepted for call-site symmetry; router
-    construction itself does not depend on it.
+    coordinator. Round-robin placement stays local.
     """
-    del is_delegating_client  # no build-time behavior differs by this flag
     ctx_router = create_router(ctx_router_config, ctx_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)
     gen_router = create_router(gen_router_config, gen_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)
+    if gen_router.pooled:
+        gen_router.set_context_router(ctx_router)
     return ctx_router, gen_router

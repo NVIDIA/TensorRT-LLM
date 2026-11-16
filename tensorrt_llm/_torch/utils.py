@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
+import math
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, List, Optional
@@ -26,6 +31,12 @@ aux_stream_name_list = [
     'MoeOutputMemset',
     'MoeFc2Alpha',
     'EngramPrecompute',
+    'MlaIndexer',
+    'MlaIndexerAux',
+    'MlaCompressor',
+    'MoeSharedGate',
+    'MoeExpertPrefetch',
+    'MhcCoefficients',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -39,8 +50,31 @@ EventType = Enum(
 
 
 def is_gdn_replay_enabled() -> bool:
-    """Return whether GDN replay was explicitly enabled."""
-    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
+    """Return whether GDN replay is enabled (default: enabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
+
+
+def is_gdn_flashinfer_replay_enabled() -> bool:
+    """Return whether GDN replay may use the FlashInfer ring kernel (default: disabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY",
+                          "0") in ("1", "force")
+
+
+def is_gdn_flashinfer_replay_required() -> bool:
+    """Return whether ineligible FlashInfer GDN replay must raise instead of falling back."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
+
+
+# Engines of at most this many tokens per step and rank capture decode CUDA graphs at the highest of
+# PyTorch's stream priorities; captured kernels keep it, so the model stream goes ahead of the auxiliary
+# streams. Larger steps fill the GPU, and there the high priority starves the auxiliary streams.
+_DECODE_STREAM_PRIORITY_MAX_TOKENS = 256
+
+
+def decode_stream_priority(max_num_tokens: int) -> int:
+    """The stream priority of decode CUDA graphs (and DeepSeek-V4's shared expert) for an engine of
+    ``max_num_tokens`` per rank: PyTorch's highest, -3, or its default, 0."""
+    return -3 if max_num_tokens <= _DECODE_STREAM_PRIORITY_MAX_TOKENS else 0
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -55,8 +89,13 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
+# TRTLLM-Gen-local activation encoding, kept separate from the shared
+# ActivationType above: ActivationType mirrors the CUTLASS enum in common.h,
+# while ActType_TrtllmGen mirrors the independent batched-GEMM encoding below.
+# SiTu is supported by both backends, but its numeric value is backend-local.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -66,13 +105,18 @@ class ActType_TrtllmGen(IntEnum):
     Relu2 = 1
     # act = x0 * sigmoid(x0)
     Silu = 2
+    # SiTu gated activation (Kimi K3), gate on x1:
+    #   act = (beta * tanh(x0 / beta)) * (alpha * tanh(x1 / alpha) * sigmoid(x1))
+    # alpha/beta come from the per-expert gemm1_alpha/gemm1_beta runtime buffers.
+    SiTu = 3
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
-# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -82,8 +126,30 @@ def set_torch_compiling(enable: bool):
 
 
 def is_torch_compiling() -> bool:
+    """Return the runtime compile-dispatch policy, not Dynamo tracing state.
+
+    Prefill-only models scope this process-global flag to each full forward:
+    eligible prefill/mixed batches use True, original eager fallbacks False.
+    Other compiled models retain the engine-wide value.
+    """
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
 
 
 def set_piecewise_running(enable: bool):
@@ -110,13 +176,20 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
+    """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return 89 <= sm_version < 100
+
+
 def is_nvfp4_marlin_enabled() -> bool:
-    is_hopper = get_sm_version() == 90
+    is_supported_sm = is_nvfp4_marlin_supported_sm()
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     attrs = get_model_extra_attrs()
     is_marlin_specified = attrs is not None and "marlin" in attrs.get(
         'nvfp4_gemm_allowed_backends', [])
-    return is_hopper and has_marlin_kernel and is_marlin_specified
+    return is_supported_sm and has_marlin_kernel and is_marlin_specified
 
 
 @contextlib.contextmanager
@@ -153,8 +226,8 @@ def make_weak_ref(x):
     elif isinstance(x, list):
         return [make_weak_ref(i) for i in x]
     elif isinstance(x, dict):
-        return {k: make_weak_ref(v) for k, v in x.items()}
-    elif isinstance(x, (int, float, bool)):
+        return {make_weak_ref(k): make_weak_ref(v) for k, v in x.items()}
+    elif x is None or isinstance(x, (int, float, str, bool)):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
@@ -172,10 +245,80 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
+    # Reciprocal activation scale (max_raw / 448.0) carried from deferred
+    # dynamic NVFP4 producers for consumer GEMM alpha derivation:
+    # alpha = reciprocal_scale * weight_scale_2.
+    reciprocal_scale: Optional[torch.Tensor] = None
+    # The same activation as fp8_quantize_1x128_packed_ue8m0(x, False) returns it, when its
+    # producer wrote that too (E4M3 values, packed UE8M0 scales).
+    fp8_1x128: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def shape(self):
         return self.fp4_tensor.shape
+
+
+@dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with an FP32 scale per token.
+
+    ``unquantized_hidden_states`` optionally keeps the BF16/FP16 source for
+    non-FP8 consumers of the same input.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
+
+    Attributes:
+        fp8_tensor: Row-major E4M3 activation with shape
+            ``[num_tokens, hidden_size]``.
+        scaling_factor: Row-major UE8M0 scales stored as ``torch.uint8`` with
+            shape ``[num_tokens, ceil(hidden_size / 32)]``. Each value scales
+            one contiguous group of 32 activation elements.
+        is_sf_swizzled: Whether ``scaling_factor`` uses a backend-specific
+            swizzled layout. The carrier's ``split`` method requires the
+            default row-major layout and only supports the token dimension.
+    """
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.fp8_tensor.dtype
+
+    def numel(self) -> int:
+        return self.fp8_tensor.numel()
+
+    def split(
+        self,
+        split_size_or_sections: int | list[int],
+        dim: int = 0,
+    ) -> tuple["MxFp8QuantizedTensor", ...]:
+        """Split activation rows and their scales along the token dimension."""
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
@@ -330,21 +473,71 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
+def deep_gemm_jit_warmup_buckets(max_m: int):
+    """M grid for the DeepGemm runners that exist only to drive JIT warmup.
+
+    DeepGemm picks its tile layout from a heuristic over M and compiles one
+    kernel per selected layout. A layout no bucket selects gets compiled
+    mid-inference instead, inside that rank's forward, so that compile stalls
+    every rank of the attention-DP group.
+
+    Step 16 is exactly the right spacing, and it is needed over the whole
+    range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection
+    depends on M only through ``ceil_div(m, block_m)``, and every candidate
+    ``block_m`` is a multiple of 16, so the choice is constant on each window
+    ``[16j + 1, 16j + 16]``: one sample per window misses nothing, and anything
+    coarser skips whole windows.
+
+    A coarse high-M band is *not* safe -- ``compare`` tie-breaks on
+    ``last_wave_util = num_blocks % num_sms``, which keeps oscillating. At
+    148 SMs and ``n=128, k=512``, ``M in [2305, 2368]`` selects a layout of its
+    own (``block_m=16``: one wave, best last-wave utilization) that a step-128
+    grid steps over, sampling 2304 and 2432.
     """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16)
-    return scale_shape * 2
+    # A worker whose M never leaves the low band -- a disagg GEN worker runs at
+    # batch x MTP tokens -- must not be pulled up to the 4096 floor. Measured
+    # cost of doing so: +283 s of GEN autotune, +1096 tuning-cache entries.
+    if max_m < 128:
+        return tuple(range(8, 128, 8))
+    max_m = max(min(max_m, 8192), 4096)
+    low = range(8, 128, 8)
+    dense = range(128, max_m, 16)
+    return tuple(low) + tuple(dense) + (max_m, )
 
 
-def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16,
-                                                     is_swizzled_layout=False)
-    return scale_shape * 2
+def fp4_scale_infer_shape(input_shapes: List[List[int]],
+                          sf_vec_size: int = 16) -> int:
+    """Calculate the swizzled scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape,
+                                             sf_vec_size=sf_vec_size)
+    return scale_shape
+
+
+def mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the number of bytes in an R128c4 MXFP8 scale tensor."""
+    input_shape = input_shapes[0]
+    m = math.prod(input_shape[:-1])
+    k = input_shape[-1]
+    return pad_up(m, 128) * pad_up(ceil_div(k, 32), 4)
+
+
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the linear scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(
+        unpacked_shape,
+        sf_vec_size=16,
+        is_swizzled_layout=False,
+    )
+    return scale_shape
+
+
+def infer_output_m_shape(input_shapes: List[List[int]]) -> int:
+    """Infer the M dimension of the output tensor from the first input tensor."""
+    return input_shapes[0][0]
 
 
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):
@@ -380,12 +573,14 @@ def piecewise_cuda_graph(enable: bool):
         set_piecewise_cuda_graph_flag(prev_enable)
 
 
-def set_per_request_piecewise_cuda_graph_flag(enable: bool):
-    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+def set_per_request_prefill_cuda_graph_flag(enable: bool):
+    """Set whether the current batch can use its prefill CUDA graph backend."""
+    _global_attrs.per_request_prefill_cuda_graph_flag = enable
 
 
-def get_per_request_piecewise_cuda_graph_flag() -> bool:
-    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+def get_per_request_prefill_cuda_graph_flag() -> bool:
+    """Return whether the current batch can use its prefill CUDA graph backend."""
+    return getattr(_global_attrs, 'per_request_prefill_cuda_graph_flag', True)
 
 
 def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
@@ -471,7 +666,32 @@ def split(x: torch.Tensor,
     return torch.split(x, split_size, dim=dim)[idx]
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_relu2_impl() -> (tuple[Callable[[torch.Tensor], torch.Tensor],
+                                  Callable[[torch.Tensor], bool]] | None):
+    """Resolve the fused relu2 kernel once, or None if it is unavailable.
+
+    Kept lazy so importing this module does not pull in Triton, and so a build
+    without a working Triton falls back instead of failing at import time.
+    """
+    if os.environ.get("TRTLLM_FUSED_RELU2", "1") != "1":
+        return None
+    try:
+        from .fused_relu2_triton import fused_relu2, is_eligible
+        return fused_relu2, is_eligible
+    except ImportError:
+        return None
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
+    # Fusing the two elementwise passes halves the activation's memory traffic.
+    # Bit-identical to the eager form: both round once from the same fp32
+    # product -- the kernel squares in fp32 before the store, and PyTorch's
+    # eager mul on half types computes in fp32 opmath before rounding.
+    # Set TRTLLM_FUSED_RELU2=0 to disable.
+    impl = _fused_relu2_impl()
+    if impl is not None and impl[1](x):
+        return impl[0](x)
     return torch.square(F.relu(x))
 
 
@@ -655,3 +875,49 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+# ---------------------------------------------------------------------------
+# Helix CP round-robin ledger
+# ---------------------------------------------------------------------------
+# THE rule, stated once. Under helix context parallelism the KV ledger is a
+# round-robin over CP ranks at page granularity: ledger page b lives on rank
+# b % cp_size, so one "ledger block" spans tokens_per_block * cp_size global
+# token positions and contributes exactly tokens_per_block of them to each
+# rank. For a global prefix of length ``global_len`` this rank therefore owns
+#
+#     full, rem = divmod(global_len, tokens_per_block * cp_size)
+#     full * tokens_per_block + clamp(rem - cp_rank * tokens_per_block,
+#                                     0, tokens_per_block)
+#
+# tokens: every complete ledger block gives it a whole page, and the trailing
+# partial block gives it however much of its own page the remainder reaches.
+# Summed over all ranks this is exactly ``global_len``.
+#
+# Both forms below are that expression and nothing else. Keep them that way:
+# a drift between the scalar host-side packing and the tensor form used to
+# derive the device write slots puts KV on the wrong rank, and only shows up
+# on groups that straddle a page boundary.
+
+
+def helix_local_len(global_len: int, tokens_per_block: int, cp_size: int,
+                    cp_rank: int) -> int:
+    """Scalar form: tokens of the first ``global_len`` owned by ``cp_rank``."""
+    ledger = tokens_per_block * cp_size
+    full, rem = divmod(global_len, ledger)
+    return full * tokens_per_block + min(
+        max(rem - cp_rank * tokens_per_block, 0), tokens_per_block)
+
+
+def helix_local_len_tensor(global_lens: torch.Tensor, tokens_per_block: int,
+                           cp_size: int, cp_rank: int) -> torch.Tensor:
+    """Tensor form of :func:`helix_local_len`, applied elementwise.
+
+    Kept allocation-minimal: this runs on the CUDA-graph capture path, and the
+    ``clamp_`` is in place on the temporary the subtraction just produced.
+    """
+    ledger = tokens_per_block * cp_size
+    full = torch.div(global_lens, ledger, rounding_mode='floor')
+    rem = global_lens - full * ledger
+    return full * tokens_per_block + (rem - cp_rank * tokens_per_block).clamp_(
+        0, tokens_per_block)

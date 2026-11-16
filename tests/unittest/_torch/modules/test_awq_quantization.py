@@ -6,9 +6,9 @@ from transformers.configuration_utils import PretrainedConfig
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod, create_moe
-from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.moe.fused_moe import DefaultMoeRoutingMethod, create_moe
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -43,6 +43,7 @@ def test_linear_nvfp4_awq_pre_quant_scale(has_scale):
         quant_config=quant_config,
     ).cuda()
 
+    scale = None
     # Set pre_quant_scale based on test parameter (skip weight init as it's quantized)
     if has_scale:
         scale = torch.full((in_features,), 0.5, dtype=torch.bfloat16, device="cuda")
@@ -82,7 +83,7 @@ def test_linear_nvfp4_awq_pre_quant_scale(has_scale):
 
     assert captured_input is not None, "fp4_quantize was not called"
 
-    if has_scale:
+    if scale is not None:
         # Should be scaled
         expected = x * scale
         assert torch.allclose(captured_input, expected, rtol=1e-5, atol=1e-5), (
@@ -135,7 +136,8 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
         routing_method=routing_method,
         reduce_results=False,
         model_config=model_config,
-    ).cuda()
+    )
+    moe = moe.cuda()
 
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:

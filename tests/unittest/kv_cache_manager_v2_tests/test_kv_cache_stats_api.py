@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import pytest
 import torch
 
@@ -26,9 +25,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     KVCacheStatsDelta,
+    PoolGroupPeakBlockStats,
+    SsmSnapshotIterationStatsDelta,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def initialize_cuda_context() -> None:
+    torch.empty(1, device="cuda")
 
 
 def _make_config(*, enable_stats: bool = True) -> KVCacheManagerConfig:
@@ -63,6 +69,77 @@ def test_stats_delta_arithmetic() -> None:
     assert iteration.empty
     assert iteration.iter_cache_hit_rate == 0.0
 
+    snapshot = SsmSnapshotIterationStatsDelta(
+        iter_snapshot_lookups=4,
+        iter_snapshot_hits=3,
+        iter_snapshot_misses=1,
+        iter_reused_tokens=96,
+        iter_unreused_tokens=32,
+        iter_aligned_snapshot_hits=2,
+        iter_unaligned_snapshot_hits=1,
+    )
+    assert snapshot.iter_snapshot_hit_rate == 0.75
+    snapshot.clear()
+    assert snapshot.empty
+    assert snapshot.iter_snapshot_hit_rate == 0.0
+
+
+def test_cpp_stats_types_are_native() -> None:
+    from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+
+    assert KVCacheStatsDelta is cpp.KVCacheStatsDelta
+    assert KVCacheIterationStatsDelta is cpp.KVCacheIterationStatsDelta
+    assert PoolGroupPeakBlockStats is cpp.PoolGroupPeakBlockStats
+
+    stats = KVCacheStatsDelta(alloc_total_blocks=1, reused_blocks=2)
+    assert repr(stats) == (
+        "KVCacheStatsDelta(alloc_total_blocks=1, alloc_new_blocks=0, "
+        "reused_blocks=2, missed_blocks=0)"
+    )
+    peak = PoolGroupPeakBlockStats(available=3, unavailable=4, evictable=5)
+    assert peak == PoolGroupPeakBlockStats(3, 4, 5)
+    with pytest.raises(AttributeError):
+        peak.available = 6
+
+
+def test_native_cold_page_codec_is_consumed_after_failure() -> None:
+    from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import create_default_kv_cache_cold_page_codec
+
+    assert create_default_kv_cache_cold_page_codec is cpp.create_default_kv_cache_cold_page_codec
+    codec = create_default_kv_cache_cold_page_codec()
+
+    invalid_config = _make_config()
+    invalid_config.cache_tiers = []
+    with pytest.raises(AssertionError):
+        KVCacheManager(invalid_config, cold_page_codec=codec)
+
+    with pytest.raises(TypeError):
+        KVCacheManager(_make_config(), cold_page_codec=codec)
+
+
+def test_native_cold_page_codec_rejects_wrong_type() -> None:
+    with pytest.raises(TypeError, match="IKvCacheColdPageCodec instance or None"):
+        KVCacheManager(_make_config(), cold_page_codec=5)
+
+
+def test_manager_accepts_uint64_max_request_id() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    cuda_graph_dummy_request_id = (1 << 64) - 1
+    try:
+        cache = manager.create_kv_cache(id=cuda_graph_dummy_request_id)
+        assert cache.id == cuda_graph_dummy_request_id
+        manager.mark_stats_dirty(cuda_graph_dummy_request_id)
+        assert manager.get_dirty_stats_kv_cache_ids() == {cuda_graph_dummy_request_id}
+        manager.mark_stats_excluded(cuda_graph_dummy_request_id)
+        assert manager.is_stats_excluded(cuda_graph_dummy_request_id)
+        assert manager.get_dirty_stats_kv_cache_ids() == set()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
+
 
 @pytest.mark.parametrize("enable_stats", [False, True])
 def test_manager_stats_config_and_api(enable_stats: bool) -> None:
@@ -72,6 +149,7 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
         assert manager.init_config.enable_stats is enable_stats
         assert manager.get_committed_stats() == KVCacheStatsDelta()
         assert manager.get_and_reset_iteration_stats() == {}
+        assert manager.get_and_reset_ssm_snapshot_iteration_stats() == {}
         peak_stats = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         assert len(peak_stats) == 1
         assert peak_stats[0].available >= 0
@@ -111,6 +189,43 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
             assert request_stats == KVCacheStatsDelta()
             assert committed == KVCacheStatsDelta()
             assert iteration == {}
+        stream.synchronize()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
+
+
+def test_connector_reuse_is_committed_as_reused() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    try:
+        cache = manager.create_kv_cache(id=17, expected_prompt_length=16)
+        stream = torch.cuda.Stream()
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(12)
+        cache.record_connector_reuse(0, 8)
+
+        request_stats = cache.commit_pending_stats()
+        assert request_stats == KVCacheStatsDelta(
+            alloc_total_blocks=3, alloc_new_blocks=3, reused_blocks=2, missed_blocks=1
+        )
+        assert manager.get_committed_stats() == request_stats
+        (iteration,) = manager.get_and_reset_iteration_stats().values()
+        assert iteration.iter_reused_blocks == 2
+        assert iteration.iter_full_reused_blocks == 2
+        assert iteration.iter_missed_blocks == 1
+        assert list(manager.get_and_reset_iteration_connector_reused_blocks().values()) == [2]
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 8
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 0
+
+        # Once committed, the allocation is no longer pending and stays a miss. The tokens still
+        # count as connector cached tokens.
+        cache.record_connector_reuse(8, 12)
+        assert cache.commit_pending_stats() == KVCacheStatsDelta()
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 4
         stream.synchronize()
     finally:
         if cache is not None:

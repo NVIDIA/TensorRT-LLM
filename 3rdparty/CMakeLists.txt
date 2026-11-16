@@ -101,10 +101,26 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   # Extract optional fields with error handling
   string(JSON DEP_GIT_SHALLOW            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_shallow")
   string(JSON DEP_SOURCE_SUBDIR          ERROR_VARIABLE _err GET "${DEP_OBJECT}" "source_subdir")
+  string(JSON DEP_GIT_SUBMODULES         ERROR_VARIABLE _git_submodules_error GET "${DEP_OBJECT}" "git_submodules")
   string(JSON DEP_GIT_SUBMODULES_RECURSE ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_submodules_recurse")
   string(JSON DEP_USE_URL                ERROR_VARIABLE _err GET "${DEP_OBJECT}" "use_url")
   string(JSON DEP_PATCH_FILE            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "patch_file")
   # cmake-format: on
+
+  if(DEP_NAME STREQUAL "cutlass")
+    set(TRTLLM_CUTLASS_TAG "${DEP_GIT_TAG}")
+  elseif(DEP_NAME STREQUAL "msa")
+    # MSA JIT-compiles against the CUTLASS headers staged by TRT-LLM. Force
+    # revalidation when TRT-LLM changes its CUTLASS pin.
+    set(MSA_VALIDATED_CUTLASS_TAG "v4.4.2")
+    if(NOT MSA_VALIDATED_CUTLASS_TAG STREQUAL TRTLLM_CUTLASS_TAG)
+      message(
+        FATAL_ERROR
+          "MSA ${DEP_GIT_TAG} was validated with CUTLASS ${MSA_VALIDATED_CUTLASS_TAG}, "
+          "but fetch_content.json selects ${TRTLLM_CUTLASS_TAG}. Revalidate MSA and "
+          "update MSA_VALIDATED_CUTLASS_TAG.")
+    endif()
+  endif()
 
   # Build FetchContent_Declare arguments
   set(FETCH_ARGS "${DEP_NAME}")
@@ -127,19 +143,80 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
     list(APPEND FETCH_ARGS SOURCE_SUBDIR "${DEP_SOURCE_SUBDIR}")
   endif()
 
-  if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
-    set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+  # patch_file is one path or a list of paths, relative to this directory and
+  # applied in order.
+  set(_patch_files "")
+  string(
+    JSON
+    _patch_file_type
+    ERROR_VARIABLE
+    _err
+    TYPE
+    "${DEP_OBJECT}"
+    "patch_file")
+  if(_patch_file_type STREQUAL "ARRAY")
+    string(JSON _patch_count LENGTH "${DEP_OBJECT}" "patch_file")
+    if(_patch_count GREATER 0)
+      math(EXPR _patch_last "${_patch_count} - 1")
+      foreach(_patch_idx RANGE ${_patch_last})
+        string(JSON _patch GET "${DEP_OBJECT}" "patch_file" ${_patch_idx})
+        list(APPEND _patch_files "${CMAKE_CURRENT_SOURCE_DIR}/${_patch}")
+      endforeach()
+    endif()
+  elseif(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    list(APPEND _patch_files "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+  endif()
+
+  if(_patch_files)
+    set(_patch_command "${Python3_EXECUTABLE}"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/patch_dependency.py")
+    # Reconfigure, and rerun the patch step, when a patch changes.
+    set_property(
+      DIRECTORY
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS ${_patch_files})
+    list(LENGTH _patch_files _patch_count)
+    if(_patch_count EQUAL 1)
+      list(GET _patch_files 0 _patch_file)
+    else()
+      # patch_dependency.py applies a single patch, so concatenate the patches
+      # in order. They must touch disjoint hunks.
+      set(_patch_content "")
+      foreach(_patch IN LISTS _patch_files)
+        file(READ "${_patch}" _patch_part)
+        string(APPEND _patch_content "${_patch_part}")
+      endforeach()
+      set(_patch_file "${CMAKE_CURRENT_BINARY_DIR}/patches/${DEP_NAME}.patch")
+      file(WRITE "${_patch_file}" "${_patch_content}")
+    endif()
+    file(SHA256 "${_patch_file}" _patch_sha256)
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      bash
-      -c
-      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || echo 'Patch already applied, skipping.'"
-    )
+      ${_patch_command}
+      apply
+      "${DEP_NAME}"
+      "${_patch_file}"
+      --patch-sha256
+      ${_patch_sha256})
+    if(NOT DEP_USE_URL)
+      list(
+        APPEND
+        FETCH_ARGS
+        UPDATE_COMMAND
+        ${_patch_command}
+        update
+        "${DEP_NAME}"
+        "${DEP_GIT_TAG}")
+    endif()
   endif()
 
-  FetchContent_Declare(${FETCH_ARGS})
+  if(_git_submodules_error STREQUAL "NOTFOUND")
+    FetchContent_Declare(${FETCH_ARGS} GIT_SUBMODULES "${DEP_GIT_SUBMODULES}")
+  else()
+    FetchContent_Declare(${FETCH_ARGS})
+  endif()
 
   # Special handling: Export deep_ep commit to global property
   if(DEP_NAME STREQUAL "deep_ep_download")

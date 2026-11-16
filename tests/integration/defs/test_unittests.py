@@ -12,12 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
+import shlex
 import warnings
 from subprocess import CalledProcessError
+from typing import NoReturn, Optional
 
 from defs.conftest import tests_path
+
+_MAX_CULPRITS = 20
 
 
 def merge_report(base_file, extra_file, output_file, is_retry=False):
@@ -63,6 +68,124 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
+def _junit_culprits(xml_path: str) -> list[str]:
+    """Names of failed/errored tests in a JUnit report.
+
+    So a whole-case failure still names the specific culprit test(s) for
+    CI/triage attribution.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    culprits = []
+    for tc in root.iter('testcase'):
+        if not tc.get('name'):
+            continue
+        kind = 'FAILED' if tc.find('failure') is not None else (
+            'ERROR' if tc.find('error') is not None else None)
+        if kind:
+            culprits.append(
+                f"{kind} {tc.get('classname', '')}::{tc.get('name')}")
+    return culprits
+
+
+def _nodeid_matches_case(nodeid: str, case_selector: str) -> bool:
+    """Whether a possibly stage-prefixed node ID belongs to a case selector."""
+    node_path, node_separator, node_selection = nodeid.partition("::")
+    case_path, case_separator, case_selection = case_selector.partition("::")
+
+    if case_separator:
+        path_matches = (node_path == case_path
+                        or node_path.endswith("/" + case_path))
+    else:
+        path_matches = f"/{case_path}/" in f"/{node_path}/"
+    if not path_matches:
+        return False
+
+    if not case_separator:
+        return True
+    if not node_separator:
+        return False
+    if node_selection == case_selection:
+        return True
+    if "[" in case_selection:
+        return False
+    return (node_selection.startswith(case_selection + "::")
+            or node_selection.startswith(case_selection + "["))
+
+
+def _fail_unittests(reason: str,
+                    output_xml: str,
+                    output_dir: str,
+                    case: str,
+                    unfinished_test_path: Optional[str] = None) -> NoReturn:
+    """Raise a unittest failure naming the specific culprit test(s).
+
+    Culprits are failed/errored tests from the JUnit report, plus tests from
+    this case that were still in flight when a fatal OOM/timeout killed the run
+    (nodeids left by --periodic-save-unfinished-test).
+
+    unfinished_test_path is where the run recorded its unfinished tests; it
+    defaults to the shared unfinished_test.txt in output_dir. That default is
+    shared per node and only cleared on teardown, so it may retain stale
+    entries from other cases; it is filtered to this case's test path(s).
+    Reading it is best-effort and never masks the original failure.
+    """
+    junit_culprits = _junit_culprits(output_xml)
+    in_flight_culprits = []
+    unfinished = unfinished_test_path or os.path.join(output_dir,
+                                                      "unfinished_test.txt")
+    case_selectors = []
+    for arg in shlex.split(case):
+        selector = arg.rstrip("/")
+        path = selector.split("::", 1)[0]
+        if "/" in path or path.endswith(".py"):
+            case_selectors.append(selector)
+    try:
+        with open(unfinished, encoding="utf-8") as f:
+            for line in f:
+                nodeid = line.strip()
+                if not nodeid:
+                    continue
+                if not case_selectors or any(
+                        _nodeid_matches_case(nodeid, selector)
+                        for selector in case_selectors):
+                    in_flight_culprits.append("IN-FLIGHT " + nodeid)
+    except (OSError, UnicodeDecodeError):
+        pass
+    # A fatal retry's in-flight node is the strongest signal. Put it ahead of
+    # the earlier JUnit failures so the display cap cannot hide it, and remove
+    # duplicate unfinished records left by an interrupted cleanup.
+    culprits = list(dict.fromkeys(in_flight_culprits + junit_culprits))
+    if culprits:
+        displayed_culprits = ", ".join(culprits[:_MAX_CULPRITS])
+        omitted_culprits = len(culprits) - _MAX_CULPRITS
+        if omitted_culprits > 0:
+            displayed_culprits += f" (+{omitted_culprits} more)"
+        reason += "; culprit test(s): " + displayed_culprits
+    raise AssertionError(reason)
+
+
+def _parallel_config_key(case: str) -> str:
+    """The agg_unit_mem_df.csv lookup key for a unittest case.
+
+    ``--ignore=<path>`` arguments only drop tests from a case, so they do not
+    change its parallel factor. Stripping them keeps a CSV row matching when a
+    test list adds or removes ignored paths. Other arguments, such as quoted
+    ``-k`` expressions, are kept as they are.
+    """
+    return re.sub(r'\s+--ignore=\S+', '', case).strip()
+
+
+def _unittest_case_filename(case: str) -> str:
+    """Keep artifacts readable and distinguish full entries with a shared prefix."""
+    prefix = re.sub(r'[/\s"\']+', '-', case)[:63]
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -105,12 +228,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     parallel_dict = {}
     for _, row in agg_unit_mem_df.iterrows():
-        key = (row['gpu'], row['unittest_case_name'])
+        key = (row['gpu'], _parallel_config_key(row['unittest_case_name']))
         parallel_dict[key] = row['parallel_factor']
 
     print(parallel_dict)
 
-    cur_key = (gpu_name, case)
+    cur_key = (gpu_name, _parallel_config_key(case))
     print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]
@@ -131,16 +254,31 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     import shlex
     arg_list = shlex.split(case)
-    case_fn = re.sub(r'[/\s"\']+', '-', case)
-    if len(case_fn) > 80:
-        case_fn = case_fn[:80]
+    if unittest_markexpr:
+        if "-m" in arg_list:
+            markexpr_index = arg_list.index("-m") + 1
+            case_markexpr = arg_list[markexpr_index]
+            arg_list[markexpr_index] = (
+                f"({case_markexpr}) and ({unittest_markexpr})")
+        else:
+            arg_list += ["-m", unittest_markexpr]
+    case_fn = _unittest_case_filename(case)
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
-    # with "results" for JUnit reporting).
-    if case.startswith("unittest/_torch/modules/moe/"):
+    # with "results" for JUnit reporting). Their unfinished tests go to a
+    # separate file too, so the stage does not report them as terminated
+    # unexpectedly from the shared unfinished_test.txt. Otherwise, MoE sub-test
+    # history can contain only terminated unexpectedly errors without corresponding
+    # passing results, skewing the test quality metrics.
+    case_path = case.rstrip("/")
+    unfinished_test_path = None
+    if case_path == "unittest/_torch/moe" or case_path.startswith(
+            "unittest/_torch/moe/"):
         output_xml = os.path.join(output_dir,
                                   f'moe-results-sub-unittests-{case_fn}.xml')
+        unfinished_test_path = os.path.join(
+            output_dir, f'moe-unfinished-sub-unittests-{case_fn}.txt')
     else:
         output_xml = os.path.join(output_dir,
                                   f'results-sub-unittests-{case_fn}.xml')
@@ -157,7 +295,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-junit",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        "--periodic-hang-traceback",
     ]
+    if unfinished_test_path:
+        command += [f"--periodic-unfinished-test-path={unfinished_test_path}"]
+
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
 
@@ -171,16 +313,16 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if run_ray:
         command += ["--run-ray"]
 
-    if unittest_markexpr:
-        command += ["-m", unittest_markexpr]
-
     s3_secret_key = None
+    s3_output_module = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
     if s3_upload_path:
+        from test_common import s3_output as s3_output_module
+
         inner_output_dir = os.path.join(output_dir, "inner-s3", case_fn)
         inner_upload_path = os.path.join(s3_upload_path, "inner", case_fn)
         command += [
-            "-s",
+            "--capture=fd",
             f"--output-dir={inner_output_dir}",
             f"--s3-upload-path={inner_upload_path}",
             "--s3-upload-mode=deferred",
@@ -209,8 +351,15 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         # may resolve an older site-packages triton_kernels package.
         triton_kernels_src = os.path.join(llm_root, "triton_kernels")
         if os.path.isdir(triton_kernels_src):
+            # case_fn embeds a pytest node id, which contains "::". This
+            # directory goes into PYTHONPATH, and os.pathsep is ":" on Linux,
+            # so leaving it in splits this single entry into three: the
+            # directory truncated at ".py", an empty entry, and a bare relative
+            # path named after the test function. The override below would then
+            # never be found, and the relative fragment would resolve against
+            # whatever the working directory happens to be.
             pythonpath_overrides_dir = os.path.join(
-                output_dir, f"pythonpath-overrides-{case_fn}")
+                output_dir, f"pythonpath-overrides-{case_fn}".replace(":", "-"))
             os.makedirs(pythonpath_overrides_dir, exist_ok=True)
             triton_kernels_link = os.path.join(pythonpath_overrides_dir,
                                                "triton_kernels")
@@ -234,6 +383,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     def run_command(cmd, num_workers=1):
         try:
             env = {'PYTHONPATH': build_pythonpath()}
+            # This batch runs without -p cbts_plugin, so name the role for the CBTS coverage
+            # bootstrap instead of leaving it to guess. Ignored when coverage is not enabled;
+            # the bootstrap consumes the variable, so the pools this batch spawns do not
+            # inherit it.
+            env['CBTS_PROCESS_ROLE'] = 'inner_pytest'
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
@@ -257,6 +411,18 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 )
             print(f"{'='*60}\n")
             return False
+        finally:
+            if s3_output_module is not None:
+                try:
+                    drained = s3_output_module.drain_pending_uploads(
+                        inner_output_dir,
+                        secret_key=s3_secret_key,
+                    )
+                except Exception as e:
+                    print(f"Failed to drain pending S3 test logs: {e}")
+                else:
+                    if not drained:
+                        print("Some pending S3 test logs could not be drained")
         return True
 
     if num_workers == 1:
@@ -274,9 +440,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         ]
         passed = run_command(parallel_command, num_workers)
 
-        assert os.path.exists(
-            parallel_output_xml
-        ), "no report generated, fatal failure happened in unittests (parallel phase)"
+        if not os.path.exists(parallel_output_xml):
+            _fail_unittests(
+                "no report generated, fatal failure in unittests (parallel phase)",
+                parallel_output_xml, output_dir, case, unfinished_test_path)
 
         if dry_run or passed:
             os.rename(parallel_output_xml, output_xml)
@@ -297,6 +464,66 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                              True)
             else:
                 os.rename(parallel_output_xml, output_xml)
-                assert False, "no report generated, fatal failure happened in unittests (retry phase)"
+                _fail_unittests(
+                    "no report generated, fatal failure in unittests (retry phase)",
+                    output_xml, output_dir, case, unfinished_test_path)
 
-    assert passed, "failure reported in unittests"
+    if not passed:
+        _fail_unittests("failure reported in unittests", output_xml, output_dir,
+                        case, unfinished_test_path)
+
+
+def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):
+    """Launch the existing TP cases on two ranks instead of skipping in serial pytest."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_mpi_check_call
+
+    cases = [
+        "_torch/attention/sparse/csa2/test_module.py::test_two_rank_module_projection_parity",
+        "_torch/attention/sparse/csa2/test_module.py::test_tp_output_projection_uses_requested_allreduce_strategy",
+        "_torch/attention/sparse/csa2/test_indexer.py::test_multi_rank_candidate_publication_and_reindex",
+        "_torch/modeling/test_modeling_deepseekv41.py::test_attention_adapter_preserves_model_allreduce_strategy",
+    ]
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    output_dir = os.path.abspath(output_dir)
+    pythonpath_dir = os.path.join(output_dir, "csa2-tp-pythonpath")
+    os.makedirs(pythonpath_dir, exist_ok=True)
+    triton_source = os.path.join(llm_root, "triton_kernels")
+    triton_link = os.path.join(pythonpath_dir, "triton_kernels")
+    if os.path.lexists(triton_link):
+        if not os.path.islink(triton_link) or os.readlink(
+                triton_link) != triton_source:
+            raise RuntimeError(f"Unexpected triton_kernels path: {triton_link}")
+    else:
+        os.symlink(triton_source, triton_link)
+    # Each MPI rank must own its GPU and JUnit file. Preserve child exit codes.
+    launcher = (
+        "import sys, torch, pytest; from mpi4py import MPI; "
+        "rank = MPI.COMM_WORLD.Get_rank(); torch.cuda.set_device(rank); "
+        "output = sys.argv[1]; "
+        "raise SystemExit(pytest.main(sys.argv[2:] + ['-v', '--tb=short', "
+        "'--timeout=1200', f'--junitxml={output}/results-csa2-tp-rank{rank}.xml']))"
+    )
+    venv_mpi_check_call(
+        llm_venv,
+        ["mpirun", "--allow-run-as-root", "-n", "2"],
+        ["-c", launcher, output_dir] +
+        [os.path.join(test_root, case) for case in cases],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([
+                pythonpath_dir,
+                test_root,
+                os.environ.get("PYTHONPATH", ""),
+            ]),
+        },
+        timeout=1800,
+    )
+    for rank in range(2):
+        report = ET.parse(
+            os.path.join(output_dir, f"results-csa2-tp-rank{rank}.xml"))
+        testcases = report.findall(".//testcase")
+        assert testcases, f"MPI rank {rank} collected no tests"
+        assert all(case.find("skipped") is None for case in testcases), (
+            f"MPI rank {rank} skipped a required TP case")

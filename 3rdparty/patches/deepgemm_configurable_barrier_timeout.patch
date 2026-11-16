@@ -1,0 +1,479 @@
+--- a/csrc/apis/config.hpp
++++ b/csrc/apis/config.hpp
+@@ -27,6 +27,12 @@ static void register_apis(pybind11::module_& m) {
+     m.def("get_pdl", []() {
+         return *jit->default_launch_options.enable_pdl;
+     });
++    m.def("set_barrier_timeout_seconds", [&](const int& new_barrier_timeout_seconds) {
++        runtime->set_barrier_timeout_seconds(new_barrier_timeout_seconds);
++    });
++    m.def("get_barrier_timeout_seconds", [&]() {
++        return runtime->get_barrier_timeout_seconds();
++    });
+     m.def("use_deterministic_algorithms", [&](const bool enabled) {
+         heuristics_runtime->use_deterministic_algorithms(enabled);
+     });
+--- a/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp
+@@ -153,6 +153,7 @@ static void __instantiate_kernel() {{
+         y.data_ptr(),
+         cumulative_local_expert_recv_stats_ptr,
+         num_tokens,
++        runtime->get_barrier_timeout_seconds(),
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+         tensor_map_l1_acts,
+         tensor_map_l1_weights,
+--- a/csrc/jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp4_fp4_mega_moe.hpp
+@@ -202,6 +202,7 @@ static void __instantiate_kernel() {{
+         y.data_ptr(),
+         cumulative_local_expert_recv_stats_ptr,
+         num_tokens,
++        runtime->get_barrier_timeout_seconds(),
+         routed_scaling_factor,
+         l1_alphas, l2_alphas, a2_scales,
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -220,6 +220,7 @@ static void __instantiate_kernel() {{
+         y.data_ptr(),
+         cumulative_local_expert_recv_stats_ptr,
+         num_tokens,
++        runtime->get_barrier_timeout_seconds(),
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+         tensor_map_l1_acts,
+         tensor_map_l1_acts_sf,
+--- a/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
+@@ -37,6 +37,7 @@ public:
+         void* y;
+         int* cumulative_local_expert_recv_stats;
+         int num_tokens;
++        int barrier_timeout_seconds;
+         layout::SymBuffer<> sym_buffer_ptrs;
+ 
+         CUtensorMap tensor_map_l1_acts;
+@@ -107,6 +108,7 @@ static void __instantiate_kernel() {{
+             args.y,
+             args.cumulative_local_expert_recv_stats,
+             args.num_tokens,
++            args.barrier_timeout_seconds,
+             args.sym_buffer_ptrs,
+             args.tensor_map_l1_acts,
+             args.tensor_map_l1_acts_sf,
+@@ -255,6 +257,7 @@ static void sm90_fp8_mega_moe(
+         .y = y.data_ptr(),
+         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+         .num_tokens = num_tokens,
++        .barrier_timeout_seconds = runtime->get_barrier_timeout_seconds(),
+         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+         .tensor_map_l1_acts = tensor_map_l1_acts,
+         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -6,6 +6,7 @@
+ 
+ #include <cutlass/version.h>
+ #include <deep_jit/backend/cuda/backend.hpp>
++#include <deep_jit/utils/env.hpp>
+ 
+ namespace deep_gemm {
+ 
+@@ -27,6 +28,12 @@ inline void init_jit(const std::string& library_root_path) {
+             emplace_back("--diag-suppress=39,161,174,177,186,940");
+         runtime->default_compiler_options.nvcc_flags->
+             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
++        // Allow overriding the in-kernel barrier timeout default, see `comm/barrier.cuh`
++        // NOTES: compiler flags are part of the kernel cache key, so changing this value
++        // naturally invalidates the JIT cache
++        if (const auto barrier_timeout_seconds = deep_jit::get_env<int>("DG_JIT_BARRIER_TIMEOUT_SECONDS", 0); barrier_timeout_seconds > 0)
++            runtime->default_compiler_options.nvcc_flags->
++                emplace_back("-DDG_BARRIER_TIMEOUT_SECONDS=" + std::to_string(barrier_timeout_seconds));
+         // Preserve the existing 12.x family target when DeepJIT derives a different minor target.
+         if (runtime->device.get_arch_major() == 12 and runtime->device.get_arch_minor() != 0)
+             runtime->default_compiler_options.arch = "120f";
+--- a/csrc/runtime/runtime.hpp
++++ b/csrc/runtime/runtime.hpp
+@@ -18,6 +18,7 @@ namespace deep_gemm {
+ class Runtime {
+ public:
+     int num_sms = 0, tc_util = 0;
++    int barrier_timeout_seconds = 0;
+ 
+     // cuBLASLt utils
+     // cuBLAS will select worse heuristics when workspace > 16 MiB with shape, e.g. m=128, n=7168, k=16384
+@@ -92,6 +93,18 @@ public:
+         return tc_util == 0 ? 100 : tc_util;
+     }
+ 
++    // In-kernel barrier timeout of subsequent launches, see `comm/barrier.cuh`
++    // NOTES: 0 selects the JIT-time default (`DG_JIT_BARRIER_TIMEOUT_SECONDS`, or 60 s); the value
++    // is a kernel argument rather than part of the kernel signature, so changing it does not recompile
++    void set_barrier_timeout_seconds(const int& new_barrier_timeout_seconds) {
++        DG_HOST_ASSERT(0 <= new_barrier_timeout_seconds and new_barrier_timeout_seconds <= 86400);
++        barrier_timeout_seconds = new_barrier_timeout_seconds;
++    }
++
++    int get_barrier_timeout_seconds() const {
++        return barrier_timeout_seconds;
++    }
++
+ };
+ 
+ inline auto runtime = deep_jit::LazyInit<Runtime>([](){ return std::make_shared<Runtime>(); });
+--- a/deep_gemm/__init__.py
++++ b/deep_gemm/__init__.py
+@@ -22,6 +22,8 @@ from ._C import (
+     set_block_size_multiple_of,
+     set_pdl,
+     get_pdl,
++    set_barrier_timeout_seconds,
++    get_barrier_timeout_seconds,
+     use_deterministic_algorithms,
+ )
+ 
+--- a/deep_gemm/include/deep_gemm/comm/barrier.cuh
++++ b/deep_gemm/include/deep_gemm/comm/barrier.cuh
+@@ -9,15 +9,36 @@
+ 
+ namespace deep_gemm::comm {
+ 
+-// 60s timeout, at 2 GHz
+-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
++// Barrier timeout in seconds, overridable at JIT compile time. The host-side JIT runtime
++// turns the `DG_JIT_BARRIER_TIMEOUT_SECONDS` environment variable into this definition,
++// so slow-but-healthy rendezvous (e.g. large expert-parallel groups whose first
++// collective follows a long warm-up) can be distinguished from a genuine hang.
++#ifndef DG_BARRIER_TIMEOUT_SECONDS
++#define DG_BARRIER_TIMEOUT_SECONDS 60
++#endif
++
++// Timeout in cycles, at 2 GHz
++constexpr int64_t kNumCyclesPerSecond = 2000000000ll;
++constexpr int64_t kNumTimeoutCycles = static_cast<int64_t>(DG_BARRIER_TIMEOUT_SECONDS) * kNumCyclesPerSecond;
++
++// Kernels also take a runtime timeout in seconds (see `Runtime::set_barrier_timeout_seconds`),
++// which can change between launches without recompiling; 0 selects the default above
++CUTLASS_DEVICE int64_t get_num_timeout_cycles(const uint32_t& timeout_seconds) {
++    return timeout_seconds > 0 ? static_cast<int64_t>(timeout_seconds) * kNumCyclesPerSecond : kNumTimeoutCycles;
++}
++
++// Timeout reported by the diagnostics, in seconds
++CUTLASS_DEVICE long long get_timeout_seconds_for_print(const uint32_t& timeout_seconds) {
++    return static_cast<long long>(get_num_timeout_cycles(timeout_seconds) / kNumCyclesPerSecond);
++}
+ 
+ // Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
+ template <typename pred_t, typename print_timeout_t>
+-CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
++CUTLASS_DEVICE void wait_until(const uint32_t& timeout_seconds, const pred_t& pred, const print_timeout_t& print_timeout) {
++    const auto num_timeout_cycles = get_num_timeout_cycles(timeout_seconds);
+     const auto start_clock = clock64();
+     while (not pred()) {
+-        if (clock64() - start_clock >= kNumTimeoutCycles) {
++        if (clock64() - start_clock >= num_timeout_cycles) {
+             print_timeout();
+             DG_DEVICE_ASSERT(false and "Timeout");
+         }
+@@ -36,6 +57,7 @@ template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0,
+           typename sync_scope_t, typename WorkspaceT>
+ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
+                               const uint32_t& sm_idx, const uint32_t& thread_idx,
++                              const uint32_t& timeout_seconds,
+                               const sync_scope_t& sync_scope) {
+     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
+     static constexpr uint32_t kFinishSumTag = 0x80000000u;
+@@ -46,15 +68,16 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
+             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+         uint32_t new_value;
+         if constexpr (kTimeoutPolicy == BarrierTimeoutPolicy::Diagnostic) {
+-            wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
+-                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+-                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
++            wait_until(timeout_seconds, [&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
++                printf("DeepGEMM grid sync timeout (%llds): sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
++                       get_timeout_seconds_for_print(timeout_seconds), sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+             });
+         } else {
++            const auto num_timeout_cycles = get_num_timeout_cycles(timeout_seconds);
+             const auto start_clock = clock64();
+             do {
+                 new_value = ptx::ld_acq(count_ptr);
+-                if (clock64() - start_clock >= kNumTimeoutCycles) {
++                if (clock64() - start_clock >= num_timeout_cycles) {
+                     handle_grid_sync_timeout<kTimeoutPolicy>(
+                         sm_idx, thread_idx, kGridSyncIndex, old_value, new_value,
+                         old_value ^ kFinishSumTag);
+@@ -72,6 +95,7 @@ template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
+ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
+                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
++                                   const uint32_t& timeout_seconds,
+                                    const sync_scope_t& sync_scope,
+                                    const bool& sync_prologue = true,
+                                    const bool& sync_epilogue = true) {
+@@ -79,7 +103,7 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
+ 
+     // Grid sync before NVLink signaling
+     if (sync_prologue)
+-        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, sync_scope);
++        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, timeout_seconds, sync_scope);
+ 
+     // NVLink cross-rank barrier, only SM 0 participates
+     if (sm_idx == 0) {
+@@ -98,14 +122,15 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
+             ptx::red_add(counter_ptr, 1);
+             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+             if constexpr (kTimeoutPolicy == BarrierTimeoutPolicy::Diagnostic) {
+-                wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
+-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
++                wait_until(timeout_seconds, [&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
++                    printf("DeepGEMM NVLink barrier timeout (%llds): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
++                           get_timeout_seconds_for_print(timeout_seconds), sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                 });
+             } else {
++                const auto num_timeout_cycles = get_num_timeout_cycles(timeout_seconds);
+                 const auto start_clock = clock64();
+                 while (ptx::ld_acq_sys(signal_ptr) != target) {
+-                    if (clock64() - start_clock >= kNumTimeoutCycles) {
++                    if (clock64() - start_clock >= num_timeout_cycles) {
+                         handle_nvlink_barrier_timeout<kTimeoutPolicy>(
+                             sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target,
+                             signal_phase, signal_sign, kTag);
+@@ -117,7 +142,7 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
+ 
+     // Grid sync after NVLink completion
+     if (sync_epilogue)
+-        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, sync_scope);
++        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, timeout_seconds, sync_scope);
+ }
+ 
+ } // namespace deep_gemm::comm
+--- a/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
+@@ -53,6 +53,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+ sm100_bf16_mega_moe_impl(void* y,
+                          int* cumulative_local_expert_recv_stats,
+                          const uint32_t num_tokens,
++                         const uint32_t barrier_timeout_seconds,
+                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
+@@ -340,7 +341,7 @@ sm100_bf16_mega_moe_impl(void* y,
+ 
+         // Grid sync
+         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+-            workspace, sm_idx, thread_idx,
++            workspace, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+         );
+ 
+@@ -370,7 +371,7 @@ sm100_bf16_mega_moe_impl(void* y,
+         // Barrier before pulling
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+             /* After the NVLink barrier, there is a grid sync */ true
+@@ -611,7 +612,7 @@ sm100_bf16_mega_moe_impl(void* y,
+         // Wait for all ranks to finish cleaning
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* Before the NVLink barrier, there is a grid sync */ true,
+             /* At the end of kernel does not need to sync */ false
+@@ -1189,7 +1190,7 @@ sm100_bf16_mega_moe_impl(void* y,
+ 
+         // All local L2 writes are done after this grid sync
+         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+-            workspace, sm_idx, epilogue_thread_idx,
++            workspace, sm_idx, epilogue_thread_idx, barrier_timeout_seconds,
+             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+         );
+ 
+@@ -1216,8 +1217,10 @@ sm100_bf16_mega_moe_impl(void* y,
+             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
++            comm::wait_until(barrier_timeout_seconds,
++                             [&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
++                             [&]() { printf("DeepGEMM combine peers timeout (%llds): rank=%u, token=%u\n",
++                                            comm::get_timeout_seconds_for_print(barrier_timeout_seconds), sym_buffer.rank_idx, token_idx); });
+ 
+             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
+ 
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp4_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp4_fp4_mega_moe.cuh
+@@ -107,6 +107,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+ sm100_fp4_fp4_mega_moe_impl(void* y,
+                             int* cumulative_local_expert_recv_stats,
+                             const uint32_t num_tokens,
++                            const uint32_t barrier_timeout_seconds,
+                             const float routed_scaling_factor,
+                             // Optional per-local-expert scales: L1 has separate gate/up factors
+                             // (e.g. modelopt's per-projection `weight_scale_2`)
+@@ -453,7 +454,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
+ 
+         // Grid sync
+         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+-            workspace, sm_idx, thread_idx,
++            workspace, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+         );
+ 
+@@ -477,7 +478,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
+         // Barrier before pulling
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+             /* After the NVLink barrier, there is a grid sync */ true
+@@ -737,7 +738,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
+         // Wait for all ranks to finish cleaning
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* Before the NVLink barrier, there is a grid sync */ true,
+             /* At the end of kernel does not need to sync */ false
+@@ -1584,7 +1585,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
+         // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
++            workspace, sym_buffer, sm_idx, epilogue_thread_idx, barrier_timeout_seconds,
+             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+         );
+ 
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -60,6 +60,7 @@ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             int* cumulative_local_expert_recv_stats,
+                             const uint32_t num_tokens,
++                            const uint32_t barrier_timeout_seconds,
+                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
+@@ -390,7 +391,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+ 
+         // Grid sync
+         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+-            workspace, sm_idx, thread_idx,
++            workspace, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+         );
+ 
+@@ -420,7 +421,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         // Barrier before pulling
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+             /* After the NVLink barrier, there is a grid sync */ true
+@@ -680,7 +681,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         // Wait for all ranks to finish cleaning
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             /* Before the NVLink barrier, there is a grid sync */ true,
+             /* At the end of kernel does not need to sync */ false
+@@ -1397,7 +1398,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+ 
+         // All local L2 writes are done after this grid sync
+         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+-            workspace, sm_idx, epilogue_thread_idx,
++            workspace, sm_idx, epilogue_thread_idx, barrier_timeout_seconds,
+             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+         );
+ 
+@@ -1424,8 +1425,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
++            comm::wait_until(barrier_timeout_seconds,
++                             [&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
++                             [&]() { printf("DeepGEMM combine peers timeout (%llds): rank=%u, token=%u\n",
++                                            comm::get_timeout_seconds_for_print(barrier_timeout_seconds), sym_buffer.rank_idx, token_idx); });
+ 
+             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
+ 
+--- a/deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh
+@@ -115,6 +115,7 @@ struct MegaMoEPhasePolicy {
+     void* y, \
+     int* cumulative_local_expert_recv_stats, \
+     const uint32_t num_tokens, \
++    const uint32_t barrier_timeout_seconds, \
+     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer, \
+     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts, \
+     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf, \
+@@ -130,6 +131,7 @@ struct MegaMoEPhasePolicy {
+     void* y, \
+     int* cumulative_local_expert_recv_stats, \
+     const uint32_t num_tokens, \
++    const uint32_t barrier_timeout_seconds, \
+     const layout::SymBuffer<kNumRanks>& sym_buffer, \
+     const cute::TmaDescriptor& tensor_map_l1_acts, \
+     const cute::TmaDescriptor& tensor_map_l1_acts_sf, \
+@@ -142,7 +144,7 @@ struct MegaMoEPhasePolicy {
+     const float* __restrict__ l2_weights_sf
+ 
+ #define DG_SM90_FP8_MOE_KERNEL_ARGS \
+-    y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, \
++    y, cumulative_local_expert_recv_stats, num_tokens, barrier_timeout_seconds, sym_buffer, \
+     tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, \
+     l1_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, \
+     tensor_map_l2_acts_sf, tensor_map_l2_weights, l2_weights_sf
+@@ -543,7 +545,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
+                 kNumRanks, kNumSMs, kNumDispatchThreads,
+                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag,
+                 comm::BarrierTimeoutPolicy::TrapOnly>(
+-                workspace, sym_buffer, sm_idx, thread_idx,
++                workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+                 [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                 true, false);
+             return;
+@@ -593,7 +595,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
+         comm::grid_sync<
+             kNumSMs, kDispatchGridSyncIndex,
+             comm::BarrierTimeoutPolicy::TrapOnly>(
+-            workspace, sm_idx, thread_idx,
++            workspace, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+         );
+ 
+@@ -617,7 +619,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
+             kNumRanks, kNumSMs, kNumDispatchThreads,
+             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag,
+             comm::BarrierTimeoutPolicy::TrapOnly>(
+-            workspace, sym_buffer, sm_idx, thread_idx,
++            workspace, sym_buffer, sm_idx, thread_idx, barrier_timeout_seconds,
+             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+             false, true);
+ 
+@@ -2182,7 +2184,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
+             kNumRanks, kNumSMs, kNumEpilogueThreads,
+             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag,
+             comm::BarrierTimeoutPolicy::TrapOnly>(
+-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
++            workspace, sym_buffer, sm_idx, epilogue_thread_idx, barrier_timeout_seconds,
+             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+         );
+         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that

@@ -1,0 +1,1982 @@
+from __future__ import annotations
+
+import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+import anyio
+
+from agent_flow import (
+    CLAUDE_CODE_DEFAULT_MODEL,
+    CODEX_DEFAULT_MODEL,
+    AgentLayer,
+    AgentLayerConfig,
+    BackendConfig,
+    SessionConfig,
+)
+from agent_flow.console import print_message, print_rule
+from agent_flow.jobs.kinds import KINDS
+from agent_flow.jobs.registry import JobRegistry
+from agent_flow.logger import get_logger
+from agent_flow.orchestration import (
+    ExecutionGraph,
+    GraphState,
+    IsolationProvider,
+    NodeScheduler,
+    NodeState,
+    NoOpIsolation,
+)
+from agent_flow.orchestration.invalidation import invalidation_set
+
+from . import mcpless
+from .node_workspace import NODES_DIRNAME, node_dir_slug
+from .progress import (
+    BUILD_STAGE,
+    PLAN_STAGE,
+    ProgressContext,
+    append_human_feedback,
+    build_progress_tools,
+    find_entries,
+    init_progress_file,
+    latest_entry,
+    record_progress_entry,
+)
+from .prompts import DEFAULT_PROMPTS, MCP_TOOLS_EXTENSIONS, PromptBundle
+from .state import (
+    STAGE_CODER,
+    STAGE_PLAN_DRAFTER,
+    STAGE_PLAN_HUMAN,
+    STAGE_PLAN_REVIEWER,
+    STAGE_QA,
+    STAGE_REPLAN,
+    STAGE_REPLAN_HUMAN,
+    STAGE_REPLAN_REVIEWER,
+    STAGE_REVIEWER,
+    STATE_FILENAME,
+    WorkflowState,
+    load_state,
+    save_state,
+)
+from .status import StatusContext, build_status_tools
+
+_PLAN_STAGES = (STAGE_PLAN_DRAFTER, STAGE_PLAN_REVIEWER, STAGE_PLAN_HUMAN)
+_REPLAN_STAGES = (STAGE_REPLAN, STAGE_REPLAN_REVIEWER, STAGE_REPLAN_HUMAN)
+
+
+def _make_agent(
+    name: str,
+    system_prompt: str,
+    tools: list | None = None,
+    required_tools: list[str] | None = None,
+    backend_kind: str = "claude-code",
+    model: str = CLAUDE_CODE_DEFAULT_MODEL,
+    session_mode: str = "persistent",
+    human_input_enabled: bool = False,
+    cwd: str | Path | None = None,
+) -> AgentLayer:
+    return AgentLayer(
+        AgentLayerConfig(
+            name=name,
+            system_prompt=system_prompt,
+            backend=BackendConfig(
+                kind=backend_kind,
+                model=model,
+                tools=tools,
+                # ``None`` keeps the process CWD, which is what the linear path
+                # has always used. The concurrent path passes each node's
+                # worktree so the model edits code there, not in the shared
+                # checkout.
+                cwd=Path(cwd) if cwd is not None else None,
+            ),
+            session=SessionConfig(mode=session_mode),
+            required_tools=tuple(required_tools or ()),
+            human_input_enabled=human_input_enabled,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _DefaultNodePolicy:
+    """Workflow-agnostic default gate policy for the ``--concurrent`` path.
+
+    agent_team assigns no meaning to a node's opaque ``type``, so its default
+    treats every type the same: a ``coder ⇄ reviewer`` node that runs no QA and
+    is not a replan unit. It structurally satisfies node_runner's ``_NodePolicy``
+    Protocol (``runs_qa`` / ``is_replan_unit``) without importing any concrete
+    workflow's policy table — modeling_bringup injects its own stage/goal policy.
+    """
+
+    node_type: str
+    runs_qa: bool = False
+    is_replan_unit: bool = False
+
+
+def _default_policy_for_type(node_type: str) -> _DefaultNodePolicy:
+    """Return the workflow-agnostic default policy for ``node_type``.
+
+    Every type maps to the same "coder ⇄ reviewer, no QA, not a replan unit"
+    policy; the concrete meaning of a type is a wrapping workflow's concern.
+    """
+    return _DefaultNodePolicy(node_type=node_type)
+
+
+# --------------------------------------------------------------------------
+# Per-turn prompt protocol blocks
+#
+# The role *system* prompts are transport-neutral and get their tool names from
+# the pluggable ``MCP_TOOLS_EXTENSIONS`` (see ``PromptBundle``). The per-turn
+# prompts below must obey the same split, or ``--no-mcp-tools`` runs order a
+# role to call a tool the run never registered: the turn body says WHAT this
+# turn reads and records, and the mechanism comes from either this table (MCP
+# mode) or ``mcpless.build_recording_preamble`` (no-MCP mode), never both.
+#
+# Keyed by prompt *kind* rather than role, because the PlanDrafter's draft and
+# replan turns read different things. The ``human`` / ``replan_human`` turns
+# have no entry: ``ask_human`` requires an in-process MCP server, so those
+# modes are rejected at construction under ``--no-mcp-tools`` and only ever run
+# with tools present.
+# --------------------------------------------------------------------------
+
+_PROTOCOL_HEADER = (
+    "=== RECORDING PROTOCOL: in-process MCP tools ===\n"
+    "Use these tools for the reads and the recording described above:\n"
+)
+
+_LINEAR_MCP_PROTOCOL: dict[str, str] = {
+    "plan_drafter_draft": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the latest '
+        "REJECT feedback, when this is a re-draft.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` with "
+        'the `summary` and `decision: "DRAFT_READY"` described above.\n'
+        "Do NOT call `ask_human` in this phase."
+    ),
+    "plan_drafter_replan": _PROTOCOL_HEADER
+    + (
+        "- `read_latest_build_progress` (no agent filter, `iterations: 1`) — "
+        "the latest coder/reviewer/qa entries.\n"
+        "- `read_human_feedback` — any user-supplied guidance.\n"
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the '
+        "PlanReviewer's REJECT feedback, when your previous revision was "
+        "rejected.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` "
+        "exactly once, with the decision described above."
+    ),
+    "plan_reviewer": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_drafter"` — the '
+        "PlanDrafter's latest summary.\n"
+        # Deliberately generic: the turn body is what marks a replan as
+        # feedback-driven, and repeating that phrase here would leak the
+        # marker into every plan-review turn.
+        "- `read_human_feedback` — any user-supplied guidance this turn "
+        "points you at.\n"
+        "Before completing your turn, call `append_plan_reviewer_progress` "
+        "with the `summary` and `decision` described above."
+    ),
+    "coder": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        "- `read_latest_progress` with `iterations: 2` — the Reviewer's and "
+        "QA's latest REJECT feedback.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_coder_progress` (with the `summary`) and `update_status` "
+        "(overwriting status.md with the snapshot described above)."
+    ),
+    "reviewer": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        '- `read_latest_progress` with `agent: "coder"` — the Coder\'s latest '
+        "summary.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_reviewer_progress` (with the `summary` and `decision`) and "
+        "`update_status` (overwriting status.md as described above)."
+    ),
+    "qa": _PROTOCOL_HEADER
+    + (
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call the `append_qa_progress` tool with "
+        "the `summary`, `decision`, and `weighted_score` described above."
+    ),
+}
+
+
+def _with_protocol(body: str, kind: str, use_in_process_tools: bool) -> str:
+    """Append the MCP protocol block to ``body`` when this run has MCP tools."""
+    if not use_in_process_tools:
+        return body
+    return f"{body}\n\n{_LINEAR_MCP_PROTOCOL[kind]}"
+
+
+class AgentTeamWorkflow:
+    """Plan phase then build phase loop, both built on AgentLayer.
+
+    Plan: drafter ↔ reviewer ↔ human. Build: coder ↔ reviewer ↔ qa.
+    """
+
+    def __init__(
+        self,
+        workspace: Path,
+        num_iterations: int = 100,
+        coder_context_reset_interval: int = 2,
+        reviewer_context_reset_interval: int = 2,
+        min_score: float = 8.0,
+        plan_human_review_enabled: bool = False,
+        build_human_review_enabled: bool = False,
+        replan_on_qa: bool = False,
+        trigger_replan_with_feedback: bool = False,
+        clean: bool = False,
+        plan: str | Path | None = None,
+        acceptance_criteria: str | Path | None = None,
+        feedback: str | Path | None = None,
+        prompts: PromptBundle | None = None,
+        use_in_process_tools: bool = True,
+        concurrent: bool = False,
+        isolation: IsolationProvider | None = None,
+        policy_for_type: Callable[[str], object] | None = None,
+        max_parallel: int = 8,
+        max_replan_rounds: int = 3,
+    ) -> None:
+        self.workspace = workspace
+        # Prompt bundles are transport-neutral. The MCP-tool protocol block
+        # is appended per role only when the run actually registers those
+        # tools; under ``--no-mcp-tools`` it is dropped and ``mcpless``
+        # supplies the file-based protocol instead, so no role is ever told
+        # to call a tool it does not have.
+        self.prompts = prompts or DEFAULT_PROMPTS
+        if use_in_process_tools:
+            self.prompts = self.prompts.with_extensions(**MCP_TOOLS_EXTENSIONS)
+        self.task_path = workspace / "task.yaml"
+        self.plan_path = workspace / "plan.md"
+        self.acceptance_criteria_path = workspace / "acceptance-criteria.md"
+        self.progress_path = workspace / "progress.yaml"
+        self.status_path = workspace / "status.md"
+        self.state_path = workspace / STATE_FILENAME
+        # Whether roles may register in-process (SDK) MCP tools. Turned off by
+        # ``--no-mcp-tools`` for every role regardless of backend (see
+        # ``mcpless``): each one then runs with ``tools=None`` and
+        # progress/status flow through the backend's built-in file tools plus
+        # orchestrator parsing/injection instead of MCP tools.
+        self.use_in_process_tools = use_in_process_tools
+        # Per-turn handoff files live here in no-in-process-MCP mode.
+        self.turn_dir = workspace / ".turn"
+        if not use_in_process_tools and (plan_human_review_enabled or build_human_review_enabled):
+            raise ValueError(
+                "human review (--plan-human-review / --build-human-review) is "
+                "unsupported with --no-mcp-tools: the ask_human tool requires "
+                "an in-process MCP server. Rerun without those flags, or "
+                "without --no-mcp-tools."
+            )
+        # Concurrent-mode scheduler checkpoint (written by ``_run_concurrent_build``).
+        self.graph_state_path = workspace / ".graph_state.json"
+        self.num_iterations = num_iterations
+        self.coder_context_reset_interval = coder_context_reset_interval
+        self.reviewer_context_reset_interval = reviewer_context_reset_interval
+        self.min_score = min_score
+        self.plan_human_review_enabled = plan_human_review_enabled
+        self.build_human_review_enabled = build_human_review_enabled
+        # When True, the PlanDrafter is re-invoked after every QA turn in
+        # the build phase to revise plan.md / acceptance-criteria.md
+        # based on coder/reviewer/qa findings, and the PlanDrafter (not
+        # QA) decides when the workflow ends. Off by default — the
+        # classic build phase runs unchanged.
+        self.replan_on_qa = replan_on_qa
+        # When True, resuming with new --feedback jumps straight into the
+        # replan sub-cycle (STAGE_REPLAN) so the PlanDrafter folds the
+        # feedback — and the latest build findings — into the plan, instead
+        # of resuming at the saved build stage. Only fires on resume and
+        # only when --feedback is also supplied; a no-op otherwise. Reuses
+        # the post-QA replan machinery, so it requires replan_on_qa (the
+        # check below).
+        self.trigger_replan_with_feedback = trigger_replan_with_feedback
+        # When set on a fresh run, the matching plan-phase output is
+        # populated from this value. If *both* presets are provided the
+        # plan phase is skipped entirely and the workflow starts at the
+        # Coder; if only one is provided the plan phase still runs so
+        # the PlanDrafter fills in the missing file. Ignored when
+        # resuming from a checkpoint (on-disk files are preserved).
+        self.preset_plan = plan
+        self.preset_acceptance_criteria = acceptance_criteria
+        # Free-form human guidance the user wants the build-phase agents
+        # to take into account. May be a literal string or a path to a
+        # file. Appended (not overwritten) to ``progress.yaml``'s
+        # ``human_feedback`` list once state is loaded, so re-running
+        # with another ``--feedback`` adds another entry.
+        self.pending_feedback = feedback
+
+        # The backend every role agent runs on. Mirrors ``_make_agent``'s
+        # defaults so the ``--concurrent`` path builds its per-node agents on
+        # the same backend/model the linear role agents use; keep these in sync
+        # with ``_make_agent`` if the workflow's backend ever changes.
+        self.backend_kind = "claude-code"
+        self.model = CLAUDE_CODE_DEFAULT_MODEL
+
+        # Opt-in concurrent DAG execution (Task 13). When enabled, the build
+        # loop is replaced by ``_run_concurrent_build``: the plan's
+        # ``## Execution Graph`` is run through the ``NodeScheduler`` with a
+        # ``make_run_node`` per-node loop and an injected isolation provider.
+        # Defaults are supplied only in this mode so the linear path stays
+        # entirely inert: a git-free ``NoOpIsolation`` rooted at the workspace,
+        # and a workflow-agnostic policy that runs every node type through the
+        # ``coder ⇄ reviewer`` loop with no QA. A wrapping workflow
+        # (modeling_bringup) injects its own isolation/policy instead.
+        self.concurrent = concurrent
+        self.max_parallel = max_parallel
+        # Bound on concurrent-mode replan rounds: after a scheduler pass ends with
+        # FAILED nodes (and --replan-on-qa), the PlanDrafter may replan the failed
+        # subtree and the graph re-runs, at most this many times, so a repeatedly-
+        # failing subtree cannot loop forever.
+        self.max_replan_rounds = max_replan_rounds
+        self._isolation = isolation
+        self._policy_for_type = policy_for_type
+        if self.concurrent:
+            if self._isolation is None:
+                self._isolation = NoOpIsolation(base_cwd=self.workspace)
+            if self._policy_for_type is None:
+                self._policy_for_type = _default_policy_for_type
+
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        if clean:
+            # Wipe the workflow's managed files so the constructor
+            # proceeds as a fresh run. Other files in the workspace
+            # (user code, build outputs) are left alone.
+            for path in (
+                self.state_path,
+                self.plan_path,
+                self.acceptance_criteria_path,
+                self.progress_path,
+                self.status_path,
+                # Concurrent-mode derived state: the NodeScheduler checkpoint.
+                # Without this a ``--clean --concurrent`` rerun would silently
+                # resume the prior (possibly crashed) graph instead of starting
+                # over from the plan phase.
+                self.graph_state_path,
+            ):
+                path.unlink(missing_ok=True)
+            # Concurrent-mode per-node sub-workspaces (``<workspace>/nodes/``)
+            # are workflow-managed derived state too — remove them so a rerun
+            # re-plans from scratch rather than reading a prior run's per-node
+            # progress/contexts. (Git worktrees + ``node/*`` branches are the
+            # isolation provider's state and are NOT torn down here.)
+            shutil.rmtree(self.workspace / NODES_DIRNAME, ignore_errors=True)
+
+        # Resume is auto-detected from the checkpoint's presence;
+        # ``--clean`` has just wiped it if the user wanted to start over.
+        self.resume = self.state_path.is_file()
+
+        # ``--feedback`` only makes sense when resuming: it appends a
+        # ``human_feedback`` entry stamped with the *upcoming* iteration so
+        # the build-phase agents read it on their next turn. On a fresh run
+        # there are no prior iterations to course-correct, and the entry
+        # would land before the plan phase has even produced a plan — silently
+        # ignored by the build agents that consume it. Reject the
+        # combination so the user notices the mismatch; any guidance the
+        # user wants the workflow to honor from the start belongs in the
+        # task description (--task), not in --feedback.
+        if feedback is not None and not self.resume:
+            raise ValueError(
+                "--feedback is only valid when resuming from a checkpoint, "
+                "and no checkpoint was found in the workspace. If you have "
+                "guidance you want the workflow to honor from the start of "
+                "the task, put it in the task description (--task) instead. "
+                "Use --feedback only after a prior run has produced a "
+                "checkpoint, to course-correct subsequent iterations."
+            )
+
+        # The forced replan reuses the post-QA replan sub-cycle, which is
+        # only wired (prompts + build-phase progress access for the replan
+        # PlanDrafter) when replan_on_qa is enabled. Reject the bare flag so
+        # the user notices rather than silently getting a no-op.
+        if trigger_replan_with_feedback and not replan_on_qa:
+            raise ValueError(
+                "--trigger-replan-with-feedback requires --replan-on-qa: the "
+                "forced replan turn reuses the post-QA replan sub-cycle, "
+                "which is only available when --replan-on-qa is enabled."
+            )
+
+        if not self.resume:
+            # A preset will overwrite the matching file on purpose, so a
+            # non-empty file is fine in that case; everything else must
+            # still be empty.
+            guarded = [self.progress_path, self.status_path]
+            if plan is None:
+                guarded.insert(0, self.plan_path)
+            if acceptance_criteria is None:
+                guarded.insert(0, self.acceptance_criteria_path)
+            existing = [p for p in guarded if p.is_file() and p.read_text(encoding="utf-8").strip()]
+            if existing:
+                names = ", ".join(p.name for p in existing)
+                raise FileExistsError(
+                    f"{names} already contains content in {self.workspace} "
+                    f"but no checkpoint was found. Pass --clean to "
+                    f"overwrite, or delete the file(s) manually to start "
+                    f"fresh."
+                )
+
+            if plan is None:
+                self.plan_path.write_text("", encoding="utf-8")
+            if acceptance_criteria is None:
+                self.acceptance_criteria_path.write_text("", encoding="utf-8")
+            # When a preset is provided, the matching file is
+            # materialized in ``_init_state`` alongside task.yaml.
+            init_progress_file(self.progress_path)
+            self.status_path.write_text("", encoding="utf-8")
+            # task.yaml is (re)written from the resolved task in ``run``.
+
+        # The tool handlers close over this context; updating
+        # ``current_iteration`` before each agent call stamps every entry
+        # with the right iteration without the agent having to pass it.
+        self._progress_ctx = ProgressContext(path=self.progress_path)
+        progress_tools = build_progress_tools(
+            self._progress_ctx,
+            plan_drafter_replan_on_qa=self.replan_on_qa,
+        )
+
+        # Coder and Reviewer share status.md as a rolling scratchpad. The
+        # tools mutate ``status.md`` directly; no per-iteration context is
+        # needed because the file is overwritten each turn.
+        self._status_ctx = StatusContext(path=self.status_path)
+        status_tools = build_status_tools(self._status_ctx)
+
+        # PlanDrafter has ``human_input_enabled=True`` unconditionally so
+        # it can call the ``ask_human`` MCP tool during the human-review
+        # phase. The same agent (and persistent session) is used in the
+        # draft phase, but the prompt instructs it not to call
+        # ``ask_human`` there.
+        #
+        # The Coder also gets ``ask_human`` — but only when
+        # ``build_human_review_enabled`` is True (opt-in via
+        # ``--build-human-review``). The two flags are independent and
+        # both off by default: ``plan_human_review_enabled`` (opt-in
+        # via ``--plan-human-review``) gates the plan-stage human
+        # checkpoint; ``build_human_review_enabled`` gates the Coder's
+        # mid-build escape hatch.
+        self.plan_drafter = self._build_agent(
+            "plan_drafter",
+            self.prompts.plan_drafter,
+            progress_tools["plan_drafter"],
+            required_tools=["append_plan_drafter_progress"],
+            human_input_enabled=True,
+            backend_kind="codex",
+            model=CODEX_DEFAULT_MODEL,
+        )
+        self.plan_reviewer = self._build_agent(
+            "plan_reviewer",
+            self.prompts.plan_reviewer,
+            progress_tools["plan_reviewer"],
+            required_tools=["append_plan_reviewer_progress"],
+        )
+        self.coder = self._build_agent(
+            "coder",
+            self.prompts.coder,
+            progress_tools["coder"] + status_tools["coder"],
+            required_tools=["append_coder_progress", "update_status"],
+            human_input_enabled=self.build_human_review_enabled,
+        )
+        self.reviewer = self._build_agent(
+            "reviewer",
+            self.prompts.reviewer,
+            progress_tools["reviewer"] + status_tools["reviewer"],
+            required_tools=["append_reviewer_progress", "update_status"],
+            backend_kind="codex",
+            model=CODEX_DEFAULT_MODEL,
+        )
+        # QA is stateless so each iteration starts with a fresh session —
+        # no carry-over bias from prior runs. The handler set is also
+        # narrower (append only, no read_latest_progress, no status.md) so
+        # QA can only ground its verdict in task.yaml and
+        # acceptance-criteria.md.
+        self.qa = self._build_agent(
+            "qa",
+            self.prompts.qa,
+            progress_tools["qa"],
+            required_tools=["append_qa_progress"],
+            session_mode="stateless",
+        )
+        self._progress_tools = progress_tools
+        self._status_tools = status_tools
+
+    def _build_agent(
+        self,
+        name: str,
+        system_prompt: str,
+        tools: list | None,
+        *,
+        required_tools: list[str] | None = None,
+        human_input_enabled: bool = False,
+        session_mode: str = "persistent",
+        backend_kind: str = "claude-code",
+        model: str = CLAUDE_CODE_DEFAULT_MODEL,
+    ) -> AgentLayer:
+        """Construct a role agent, honoring the in-process-tools mode.
+
+        In no-in-process-MCP mode every role runs with ``tools=None``, no
+        required-tool policy, and no ``ask_human`` — so neither backend
+        registers a dynamically configured MCP server. In MCP mode this is a
+        passthrough to ``_make_agent``.
+        """
+        if not self.use_in_process_tools:
+            tools = None
+            required_tools = None
+            human_input_enabled = False
+        return _make_agent(
+            name,
+            system_prompt,
+            tools,
+            required_tools=required_tools,
+            backend_kind=backend_kind,
+            model=model,
+            session_mode=session_mode,
+            human_input_enabled=human_input_enabled,
+        )
+
+    def _invoke_agent(
+        self,
+        role: str,
+        agent,
+        prompt: str,
+        iteration: int,
+        *,
+        replan: bool = False,
+        feedback_triggered: bool = False,
+    ) -> None:
+        """Run one agent turn.
+
+        In MCP mode this is a passthrough (the agent records progress/status
+        via its MCP tools). In no-in-process-MCP mode it prepends a
+        recording-protocol preamble plus inline context, then reads back the
+        handoff file the agent wrote and records it into ``progress.yaml``. A
+        missing or invalid handoff triggers one corrective retry before
+        raising :class:`mcpless.HandoffError`.
+        """
+        if self.use_in_process_tools:
+            agent(prompt)
+            return
+
+        self.turn_dir.mkdir(parents=True, exist_ok=True)
+        handoff = mcpless.handoff_path(self.turn_dir, role)
+        context = mcpless.gather_context(
+            role,
+            progress_path=self.progress_path,
+            status_path=self.status_path,
+            replan=replan,
+            feedback_triggered=feedback_triggered,
+        )
+        preamble = mcpless.build_recording_preamble(role, handoff, self.status_path, context)
+        full_prompt = f"{preamble}\n\n{prompt}"
+
+        corrective = (
+            "\n\n=== RETRY ===\n"
+            "Your previous turn did not leave a valid handoff file. You MUST end "
+            f"this turn by writing `{handoff}` with the exact YAML keys described "
+            "above (and nothing else). Do this now."
+        )
+
+        last_error: Exception | None = None
+        for attempt in (0, 1):
+            if handoff.exists():
+                handoff.unlink()
+            agent(full_prompt if attempt == 0 else full_prompt + corrective)
+            if not handoff.exists():
+                last_error = mcpless.HandoffError(
+                    f"{role} did not write its handoff file {handoff}"
+                )
+                continue
+            try:
+                fields = mcpless.parse_handoff(role, handoff.read_text(encoding="utf-8"))
+            except mcpless.HandoffError as exc:
+                last_error = exc
+                continue
+            record_progress_entry(self.progress_path, role, iteration, fields)
+            return
+
+        assert last_error is not None
+        raise last_error
+
+    def __enter__(self) -> "AgentTeamWorkflow":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for layer in (self.plan_drafter, self.plan_reviewer, self.coder, self.reviewer, self.qa):
+            layer.__exit__(None, None, None)
+
+    # ------------------------------------------------------------- orchestration
+
+    def run(self, task: str) -> None:
+        log = get_logger().console
+
+        state = self._init_state(task, log)
+        if state is None:
+            return
+
+        self._record_pending_feedback(state, log)
+
+        try:
+            # ----- PLAN PHASE -----
+            if state.stage in _PLAN_STAGES:
+                self._run_plan_phase(state, log)
+
+            # ----- CONCURRENT BUILD PHASE (opt-in) -----
+            # When ``--concurrent`` is set, the plan's ``## Execution Graph`` is
+            # run through the DAG scheduler INSTEAD of the linear single-cursor
+            # build loop below. The linear loop stays byte-for-byte unchanged;
+            # this branch is purely additive.
+            if self.concurrent:
+                self._run_concurrent_build(state)
+                return
+
+            # ----- BUILD PHASE -----
+            for i in range(state.next_iteration_index, self.num_iterations):
+                iteration = i + 1
+                print_rule(
+                    f"[bold cyan]Iteration {iteration}/{self.num_iterations}[/bold cyan]",
+                    log,
+                )
+
+                # Each stage checkpoints before advancing, so a crash/Ctrl-C
+                # mid-iteration resumes at the same agent rather than
+                # rerunning earlier stages.
+                if state.stage == STAGE_CODER:
+                    if self._should_reset_coder(i):
+                        self._reset_coder()
+                    self._run_coder(iteration)
+                    state.stage = STAGE_REVIEWER
+                    self._checkpoint(state)
+
+                if state.stage == STAGE_REVIEWER:
+                    if self._should_reset_reviewer(i):
+                        self._reset_reviewer()
+                    self._run_reviewer(iteration)
+                    decision = self._latest_reviewer_decision()
+                    if decision != "APPROVE":
+                        # REJECT (or missing) → loop back to coder, skip QA.
+                        print_message(
+                            f"[bold yellow]↻ reviewer {decision or 'missing'} "
+                            f"— looping back to coder[/bold yellow]",
+                            log,
+                        )
+                        state.next_iteration_index = i + 1
+                        state.stage = STAGE_CODER
+                        self._checkpoint(state)
+                        continue
+                    state.stage = STAGE_QA
+                    self._checkpoint(state)
+
+                if state.stage == STAGE_QA:
+                    # QA is stateless, so its "reset every iteration" need
+                    # is satisfied by SessionConfig; no explicit reset call.
+                    self._run_qa(iteration)
+                    if self.replan_on_qa:
+                        # In replan mode the PlanDrafter — not QA — is the
+                        # terminator. Hand off to the replan sub-cycle and
+                        # let it decide DONE / loop / escalate.
+                        state.stage = STAGE_REPLAN
+                        self._checkpoint(state)
+                    else:
+                        decision = self._latest_qa_decision()
+                        score = self._latest_qa_score()
+                        state.next_iteration_index = i + 1
+                        score_ok = self.min_score <= 0 or (
+                            score is not None and score >= self.min_score
+                        )
+                        if decision == "APPROVE" and score_ok:
+                            state.done = True
+                            state.stage = STAGE_CODER
+                            self._checkpoint(state)
+                            print_message(
+                                f"[bold green]✔ QA APPROVE at iteration {iteration}[/bold green]",
+                                log,
+                            )
+                            break
+                        if decision == "APPROVE" and score is not None and score < self.min_score:
+                            print_message(
+                                f"[bold yellow]↻ qa APPROVE but score "
+                                f"{score:.2f} < {self.min_score:.2f} — "
+                                f"looping back to coder[/bold yellow]",
+                                log,
+                            )
+                        else:
+                            print_message(
+                                f"[bold yellow]↻ qa "
+                                f"{decision or 'missing'} — looping back "
+                                f"to coder[/bold yellow]",
+                                log,
+                            )
+                        state.stage = STAGE_CODER
+                        self._checkpoint(state)
+
+                if state.stage in _REPLAN_STAGES:
+                    # Sub-cycle: PlanDrafter(replan) [→ PlanReviewer
+                    # [→ Human]] → either DONE (break the build loop) or
+                    # back to STAGE_CODER for iteration i+1. Both classic
+                    # and replan modes share STAGE_QA entry, but only
+                    # replan_on_qa=True ever puts a STAGE_REPLAN_* value
+                    # on ``state.stage``.
+                    if self._run_replan_subcycle(state, log, i, iteration):
+                        break
+
+            # Budget exhausted without an APPROVE: mark the run done so a
+            # stale checkpoint doesn't auto-resume back into the loop.
+            if not state.done:
+                state.done = True
+                self._checkpoint(state)
+        except KeyboardInterrupt:
+            print_message(
+                "[bold yellow]⚠ interrupted — run again to continue from "
+                "the last checkpoint, or pass --clean to start fresh"
+                "[/bold yellow]",
+                log,
+            )
+            raise
+
+    def _run_concurrent_build(self, state: WorkflowState) -> None:
+        """Run the plan's Execution Graph through the DAG scheduler.
+
+        The ``--concurrent`` replacement for the linear build loop. Reads
+        ``plan.md``, extracts its ``## Execution Graph`` block, and drives every
+        node through :func:`~agent_flow.workflows.agent_team.node_runner.make_run_node`
+        under a :class:`~agent_flow.orchestration.NodeScheduler`, isolated by the
+        injected :class:`~agent_flow.orchestration.IsolationProvider`. Nodes whose
+        dependencies are all ``DONE`` run in parallel (up to ``max_parallel``);
+        the scheduler checkpoints to ``<workspace>/.graph_state.json`` so a crash
+        resumes without re-running finished nodes.
+
+        After the run, the orchestrator renders the DERIVED global observation
+        window — the whole-DAG ``status.md`` rollup and the node-tagged
+        ``progress.yaml`` timeline — from the final node states plus each node's
+        private files (single-writer aggregation, Task 14).
+
+        Raises:
+            ValueError: If ``plan.md`` has no ``## Execution Graph`` block — the
+                concurrent path requires the planner to declare the DAG.
+        """
+        # Imported lazily: ``node_runner`` imports ``_make_agent`` from this
+        # module, so a top-level import here would be circular.
+        from .aggregation import render_global_progress, render_global_status
+        from .execution_graph import extract_execution_graph
+        from .node_runner import make_run_node
+
+        log = get_logger().console
+
+        # ``run_node`` is graph-independent, so build it once and reuse it across
+        # replan rounds; the graph itself is re-extracted each round because a
+        # replan may have revised ``plan.md`` (and its ``## Execution Graph``).
+        run_node = make_run_node(
+            workspace=self.workspace,
+            prompts=self.prompts,
+            policy_for_type=self._policy_for_type,
+            num_iterations=self.num_iterations,
+            backend_kind=self.backend_kind,
+            model=self.model,
+            use_in_process_tools=self.use_in_process_tools,
+        )
+
+        # Pre-scheduler feedback replan. A ``--feedback`` concurrent resume folds
+        # the new feedback into ``plan.md`` BEFORE the first scheduler pass, so a
+        # stage the drafter adds dispatches in the SAME pass — in parallel with a
+        # node that was in flight when the run was stopped (``RUNNING`` → ``PENDING``
+        # on resume). The old behavior only replanned AFTER a scheduler pass drained,
+        # folding feedback into a *failed* subtree; that could not run added work
+        # concurrently with an in-flight node, and silently dropped the feedback when
+        # the pass finished with no failure. This mirrors the linear path's
+        # ``STAGE_REPLAN`` re-entry (feedback re-plans, then builds). Additive only:
+        # DONE nodes stay DONE via the checkpoint and no subtree is reset here — the
+        # post-scheduler loop below still handles genuine QA failures.
+        if state.feedback_replan:
+            print_rule(
+                "[bold cyan]Replan (pending --feedback, before scheduler)[/bold cyan]",
+                log,
+            )
+            self._run_plan_drafter(
+                iteration=0,
+                mode="replan",
+                feedback_triggered=True,
+            )
+            state.feedback_replan = False
+            self._checkpoint(state)
+
+        # Bounded replan loop. Each round: re-extract the (possibly revised) graph,
+        # run the scheduler (resuming from .graph_state.json). Under ``--replan-on-qa``
+        # the scheduler PAUSES on the first failure (healthy in-flight nodes →
+        # INTERRUPTED); the PlanDrafter then replans, and only the invalidation
+        # frontier (failed ∪ changed ∪ their dependents) is reset via
+        # :meth:`_apply_invalidation` before the next round resumes from the checkpoint
+        # (DONE preserved, INTERRUPTED re-attached). Without ``--replan-on-qa`` (or with
+        # no failures/pause) it is a single pass, exactly the prior behavior.
+        # ``max_replan_rounds`` caps the loop so a repeatedly-failing subtree cannot
+        # spin forever.
+        for replan_round in range(self.max_replan_rounds + 1):
+            plan_text = self.plan_path.read_text(encoding="utf-8")
+            graph = extract_execution_graph(plan_text)
+            if graph is None:
+                raise ValueError(
+                    '--concurrent requires an "## Execution Graph" block in plan.md '
+                    "(none found). Provide a plan whose graph the scheduler can run, "
+                    "or drop --concurrent to use the linear build loop."
+                )
+            scheduler = NodeScheduler(
+                graph,
+                run_node,
+                self._isolation,
+                max_parallel=self.max_parallel,
+                checkpoint_path=self.graph_state_path,
+                pause_on_failure=self.replan_on_qa,
+            )
+
+            print_rule("[bold cyan]Concurrent build (Execution Graph)[/bold cyan]", log)
+            result = anyio.run(scheduler.run)
+
+            # Render the orchestrator-owned global observation window: a whole-DAG
+            # rollup + a node-tagged timeline derived from the final node states and
+            # each node's private files. The orchestrator is the only writer of the
+            # top-level status.md / progress.yaml on the concurrent path.
+            node_ids = list(result.states.keys())
+            render_global_status(
+                workspace=self.workspace,
+                node_states=result.states,
+                node_ids=node_ids,
+            )
+            render_global_progress(workspace=self.workspace, node_ids=node_ids)
+
+            for node_id, node_state in result.states.items():
+                print_message(f"[bold]• node {node_id}: {node_state.value}[/bold]", log)
+            if result.succeeded:
+                print_message("[bold green]✔ all graph nodes DONE[/bold green]", log)
+                break
+            print_message(
+                "[bold yellow]⚠ graph finished with non-DONE nodes: "
+                f"failed={list(result.failed_ids)} blocked={list(result.blocked_ids)}"
+                "[/bold yellow]",
+                log,
+            )
+
+            # Pause/failure with replan enabled: replan synchronously against the
+            # frozen snapshot, then reset only the invalidation frontier and resume
+            # (re-attach). No replan requested, or nothing FAILED/paused → stop.
+            if not self.replan_on_qa or not (result.failed_ids or result.paused):
+                break
+            if replan_round == self.max_replan_rounds:
+                print_message(
+                    "[bold yellow]⚠ replan budget (--max-replan-rounds) exhausted[/bold yellow]",
+                    log,
+                )
+                break
+
+            print_rule("[bold cyan]Replan (pause → invalidate → resume)[/bold cyan]", log)
+            old_graph = graph
+            self._run_plan_drafter(
+                iteration=replan_round + 1,
+                mode="replan",
+                feedback_triggered=state.feedback_replan,
+            )
+            state.feedback_replan = False
+            if self._latest_plan_drafter_decision() == "DONE":
+                print_message(
+                    "[bold green]✔ plan_drafter DONE — accepting the outcome[/bold green]",
+                    log,
+                )
+                break
+            new_graph = extract_execution_graph(self.plan_path.read_text(encoding="utf-8"))
+            if new_graph is None:
+                raise ValueError('replan produced no "## Execution Graph" block')
+            # A FAILED node is always a retry candidate (the replan revises it — and a
+            # prose-only revision is invisible to the structural invalidation_set), so
+            # it must always be in the frontier. invalidation_set ADDS the downstream
+            # consumers of any node whose graph definition (depends_on/kind/added)
+            # changed. A healthy INTERRUPTED node that was NOT changed stays OUT of the
+            # frontier → its nodes/<id>/ + jobs.json survive and re-attach on resume.
+            frontier = set(result.failed_ids) | invalidation_set(old_graph, new_graph)
+            print_message(f"[cyan]invalidation frontier: {sorted(frontier)}[/cyan]", log)
+            self._apply_invalidation(frontier, new_graph)
+
+        # The loop exits either all-DONE, on PlanDrafter DONE, or on budget/flag —
+        # mark the run done so a bare rerun does not auto-resume into it.
+        state.done = True
+        self._checkpoint(state)
+
+    def _cancel_node_jobs(self, node_id: str, *, kinds: dict | None = None) -> None:
+        """Best-effort ``scancel`` of every job a node recorded before resetting it.
+
+        An invalidated node's in-flight job would produce a stale result, so kill
+        it (rather than orphan it) before its ``nodes/<id>/`` — which holds
+        ``jobs.json`` — is removed. Missing file, unknown kind, or a cancel error
+        are all swallowed: a dead/absent job must never crash the replan. ``kinds``
+        defaults to the module-level ``KINDS`` registry, resolved at call time so a
+        test's monkeypatch of it is honored.
+        """
+        if kinds is None:
+            kinds = KINDS
+        jobs_path = self.workspace / NODES_DIRNAME / node_dir_slug(node_id) / "jobs.json"
+        if not jobs_path.is_file():
+            return
+        for entry in JobRegistry(jobs_path).all():
+            kind = kinds.get(entry.kind)
+            if kind is None:
+                continue
+            try:
+                kind.cancel(entry.handle)
+            except Exception:
+                continue
+
+    def _apply_invalidation(self, invalid_ids: set[str], graph: ExecutionGraph) -> None:
+        """Reset exactly the invalidation frontier: scancel jobs, drop state, rmtree, reclaim.
+
+        Unlike the old reset-all-failed path, this touches ONLY ``invalid_ids``
+        (changed nodes ∪ their transitive dependents), so a healthy paused
+        (INTERRUPTED) node keeps its ``nodes/<id>/`` + ``jobs.json`` and its
+        still-running job — a later resume re-attaches it. DONE nodes are never in
+        the frontier and never touched.
+        """
+        if not invalid_ids:
+            return
+        graph_state = GraphState.load(self.graph_state_path)
+        for node_id in invalid_ids:
+            self._cancel_node_jobs(node_id)
+            graph_state.states[node_id] = NodeState.PENDING
+            graph_state.worktrees.pop(node_id, None)
+        graph_state.save(self.graph_state_path)
+        for node_id in invalid_ids:
+            shutil.rmtree(
+                self.workspace / NODES_DIRNAME / node_dir_slug(node_id),
+                ignore_errors=True,
+            )
+            node = graph.by_id.get(node_id)
+            if node is not None:
+                anyio.run(self._isolation.reclaim, node)
+
+    def _run_plan_phase(self, state: WorkflowState, log) -> None:
+        """Drive the plan phase to completion.
+
+        Loops indefinitely until the human approves (or the AI
+        PlanReviewer APPROVEs and human review is disabled), at which
+        point ``state.stage`` is advanced to ``STAGE_CODER``.
+        """
+        j = state.plan_next_iteration_index
+        while True:
+            plan_iter = j + 1
+            print_rule(
+                f"[bold magenta]Plan iter {plan_iter}[/bold magenta]",
+                log,
+            )
+
+            if state.stage == STAGE_PLAN_DRAFTER:
+                self._run_plan_drafter(plan_iter, mode="draft")
+                state.stage = STAGE_PLAN_REVIEWER
+                self._checkpoint(state)
+
+            if state.stage == STAGE_PLAN_REVIEWER:
+                self._run_plan_reviewer(plan_iter)
+                decision = self._latest_plan_reviewer_decision()
+                if decision != "APPROVE":
+                    print_message(
+                        f"[bold yellow]↻ plan_reviewer "
+                        f"{decision or 'missing'} — looping back to "
+                        f"plan_drafter[/bold yellow]",
+                        log,
+                    )
+                    state.plan_next_iteration_index = j + 1
+                    state.stage = STAGE_PLAN_DRAFTER
+                    self._checkpoint(state)
+                    j += 1
+                    continue
+                if not self.plan_human_review_enabled:
+                    print_message(
+                        "[bold green]✔ plan_reviewer APPROVE — entering "
+                        "build phase (plan-stage human review "
+                        "disabled)[/bold green]",
+                        log,
+                    )
+                    state.stage = STAGE_CODER
+                    state.next_iteration_index = 0
+                    self._checkpoint(state)
+                    return
+                state.stage = STAGE_PLAN_HUMAN
+                self._checkpoint(state)
+
+            if state.stage == STAGE_PLAN_HUMAN:
+                if not self.plan_human_review_enabled:
+                    # Resumed from a STAGE_PLAN_HUMAN checkpoint with
+                    # plan-stage human review now disabled — skip
+                    # straight to the build phase rather than calling
+                    # ask_human.
+                    state.stage = STAGE_CODER
+                    state.next_iteration_index = 0
+                    self._checkpoint(state)
+                    return
+                self._run_plan_drafter(plan_iter, mode="human")
+                decision = self._latest_plan_drafter_decision()
+                if decision == "HUMAN_APPROVED":
+                    print_message(
+                        "[bold green]✔ human approved plan — entering build phase[/bold green]",
+                        log,
+                    )
+                    state.stage = STAGE_CODER
+                    state.next_iteration_index = 0
+                    self._checkpoint(state)
+                    return
+                # POLISHING / unset / DRAFT_READY: re-invoke the drafter
+                # in human mode for another round. The AI PlanReviewer is
+                # intentionally not re-run here — the human is the final
+                # arbiter once they take over.
+                print_message(
+                    f"[bold yellow]↻ plan_drafter "
+                    f"{decision or 'missing'} (human stage) — re-invoking"
+                    f"[/bold yellow]",
+                    log,
+                )
+                state.plan_next_iteration_index = j + 1
+                state.stage = STAGE_PLAN_HUMAN
+                self._checkpoint(state)
+
+            j += 1
+
+    def _run_replan_subcycle(self, state: WorkflowState, log, i: int, iteration: int) -> bool:
+        """Run the post-QA replan sub-cycle for one build iteration.
+
+        Drives ``STAGE_REPLAN`` → optionally ``STAGE_REPLAN_REVIEWER`` →
+        optionally ``STAGE_REPLAN_HUMAN`` until the PlanDrafter signals
+        completion or back-to-coder. Returns ``True`` iff the workflow
+        is done (caller should ``break`` the build loop), ``False`` to
+        continue with the next build iteration.
+
+        Loops within the sub-cycle on REJECT from the replan-reviewer or
+        on POLISHING / unset from a human-mode turn — same shape as the
+        plan-phase human loop, but contained inside a single build
+        iteration. The state checkpoint between sub-stages preserves
+        resume correctness.
+        """
+        while True:
+            if state.stage == STAGE_REPLAN:
+                self._run_plan_drafter(
+                    iteration, mode="replan", feedback_triggered=state.feedback_replan
+                )
+                decision = self._latest_plan_drafter_decision()
+
+                # Hard score-floor enforcement (Q6 B): a low QA score
+                # cannot be papered over by the PlanDrafter declaring
+                # DONE. Downgrade to POLISHING and surface the warning.
+                # A missing weighted_score counts as below-floor, the
+                # same way the classic gate's score_ok requires a
+                # present-and-passing score — otherwise a QA entry that
+                # omits the score would let DONE bypass --min-score.
+                if decision == "DONE" and self.min_score > 0:
+                    score = self._latest_qa_score()
+                    if score is None or score < self.min_score:
+                        score_str = f"{score:.2f}" if score is not None else "missing"
+                        print_message(
+                            f"[bold yellow]⚠ plan_drafter returned DONE "
+                            f"but qa weighted_score {score_str} < "
+                            f"{self.min_score:.2f} — downgrading to "
+                            f"POLISHING[/bold yellow]",
+                            log,
+                        )
+                        decision = "POLISHING"
+
+                # DONE overruling a QA REJECT is allowed — the replan
+                # PlanDrafter is the terminator by design — but never
+                # silently: surface the override so the human can audit
+                # it in the log.
+                if decision == "DONE" and self._latest_qa_decision() == "REJECT":
+                    print_message(
+                        "[bold yellow]⚠ plan_drafter returned DONE "
+                        "overriding a QA REJECT — accepting (the replan "
+                        "PlanDrafter is the terminator), but review the "
+                        "final QA findings before trusting the run"
+                        "[/bold yellow]",
+                        log,
+                    )
+
+                if decision == "DONE":
+                    state.done = True
+                    state.next_iteration_index = i + 1
+                    state.stage = STAGE_CODER
+                    state.feedback_replan = False
+                    self._checkpoint(state)
+                    print_message(
+                        f"[bold green]✔ plan_drafter DONE at iteration {iteration}[/bold green]",
+                        log,
+                    )
+                    return True
+
+                if decision == "DRAFT_READY":
+                    state.stage = STAGE_REPLAN_REVIEWER
+                    self._checkpoint(state)
+                    continue
+
+                # POLISHING / HUMAN_APPROVED / unset → straight back to
+                # Coder for the next iteration. HUMAN_APPROVED is not
+                # the intended top-level exit (the prompt forbids it),
+                # but if the agent returns it we accept the same
+                # "continue with coder" semantics as POLISHING rather
+                # than stalling.
+                if decision not in ("POLISHING", "HUMAN_APPROVED"):
+                    print_message(
+                        f"[bold yellow]⚠ plan_drafter (replan) returned "
+                        f"{decision or 'missing'}; treating as "
+                        f"POLISHING[/bold yellow]",
+                        log,
+                    )
+                state.next_iteration_index = i + 1
+                state.stage = STAGE_CODER
+                state.feedback_replan = False
+                self._checkpoint(state)
+                return False
+
+            if state.stage == STAGE_REPLAN_REVIEWER:
+                self._run_plan_reviewer(
+                    iteration, phase="replan", feedback_triggered=state.feedback_replan
+                )
+                review_decision = self._latest_plan_reviewer_decision()
+                if review_decision != "APPROVE":
+                    print_message(
+                        f"[bold yellow]↻ replan_reviewer "
+                        f"{review_decision or 'missing'} — looping back "
+                        f"to replan[/bold yellow]",
+                        log,
+                    )
+                    state.stage = STAGE_REPLAN
+                    self._checkpoint(state)
+                    continue
+                if not self.plan_human_review_enabled:
+                    print_message(
+                        "[bold green]✔ replan_reviewer APPROVE — "
+                        "continuing with coder (plan-stage human review "
+                        "disabled)[/bold green]",
+                        log,
+                    )
+                    state.next_iteration_index = i + 1
+                    state.stage = STAGE_CODER
+                    state.feedback_replan = False
+                    self._checkpoint(state)
+                    return False
+                state.stage = STAGE_REPLAN_HUMAN
+                self._checkpoint(state)
+
+            if state.stage == STAGE_REPLAN_HUMAN:
+                if not self.plan_human_review_enabled:
+                    # Resumed with plan-stage human review now disabled
+                    # — skip straight back to the Coder rather than
+                    # blocking on ask_human.
+                    state.next_iteration_index = i + 1
+                    state.stage = STAGE_CODER
+                    state.feedback_replan = False
+                    self._checkpoint(state)
+                    return False
+                self._run_plan_drafter(iteration, mode="replan_human")
+                human_decision = self._latest_plan_drafter_decision()
+                if human_decision == "HUMAN_APPROVED":
+                    print_message(
+                        "[bold green]✔ human approved replan — continuing with coder[/bold green]",
+                        log,
+                    )
+                    state.next_iteration_index = i + 1
+                    state.stage = STAGE_CODER
+                    state.feedback_replan = False
+                    self._checkpoint(state)
+                    return False
+                # POLISHING / DRAFT_READY / unset / DONE → re-invoke the
+                # drafter in human mode for another round (the AI
+                # PlanReviewer is intentionally not re-run; the human is
+                # the final arbiter once they take over).
+                print_message(
+                    f"[bold yellow]↻ plan_drafter "
+                    f"{human_decision or 'missing'} (replan human stage) "
+                    f"— re-invoking[/bold yellow]",
+                    log,
+                )
+                state.stage = STAGE_REPLAN_HUMAN
+                self._checkpoint(state)
+                continue
+
+            # Defensive: an unexpected stage in the replan sub-cycle.
+            # Treat as a no-op exit so the build loop can advance.
+            return False
+
+    def _init_state(self, task: str | Path, log) -> WorkflowState | None:
+        """Load or create the workflow state; return ``None`` to no-op.
+
+        ``task`` is a path to the YAML file containing the task spec. The
+        file is copied verbatim into ``workspace/task.yaml`` on fresh runs;
+        on resume, the on-disk file is authoritative and the supplied path
+        is read only to detect drift.
+        """
+        source = Path(task)
+        if not source.is_file():
+            raise FileNotFoundError(f"--task must be a path to an existing YAML file; got {source}")
+        task_text = source.read_text(encoding="utf-8").strip()
+
+        if self.resume:
+            state = load_state(self.state_path)
+            if state.done:
+                if self.pending_feedback is None:
+                    print_message(
+                        "[bold green]✔ workflow already completed; pass "
+                        "--clean to rerun from scratch, or pass "
+                        "--feedback to resume with new guidance."
+                        "[/bold green]",
+                        log,
+                    )
+                    return None
+                # Re-engage the build phase so the agents can address the
+                # new --feedback the user just supplied. The pending
+                # feedback itself is appended by ``_record_pending_feedback``
+                # right after this method returns.
+                #
+                # If the prior run exhausted its budget (or QA accepted on
+                # the final iteration), ``next_iteration_index`` already
+                # equals ``num_iterations`` and the build loop's
+                # ``range(next_iteration_index, num_iterations)`` would be
+                # empty — the feedback would be appended and the workflow
+                # immediately marked done again. Grant a fresh budget of
+                # ``self.num_iterations`` more iterations starting from
+                # the prior tail so the audit log stays monotonic and the
+                # build loop actually runs. When the prior run finished
+                # under-budget (e.g. QA accepted at iter 50 of 100), the
+                # remaining slack is left intact.
+                print_message(
+                    "[bold cyan]→ workflow was complete; resuming build "
+                    "phase to address new --feedback.[/bold cyan]",
+                    log,
+                )
+                state.done = False
+                state.stage = STAGE_CODER
+                if state.next_iteration_index >= self.num_iterations:
+                    self.num_iterations = state.next_iteration_index + self.num_iterations
+                    state.num_iterations = self.num_iterations
+                self._checkpoint(state)
+            # --trigger-replan-with-feedback: when the user resumes with new
+            # --feedback, jump straight into the replan sub-cycle so the
+            # PlanDrafter folds the feedback (and the latest build findings)
+            # into plan.md / acceptance-criteria.md, rather than resuming at
+            # the saved build stage. Past the initial plan phase only — while
+            # the plan is still being drafted the feedback flows into that
+            # drafting directly. Requires replan_on_qa (enforced in __init__).
+            # Runs after the done-handling above, so a previously completed
+            # run re-engages in the replan sub-cycle rather than at the coder.
+            if (
+                self.trigger_replan_with_feedback
+                and self.pending_feedback is not None
+                and state.stage not in _PLAN_STAGES
+            ):
+                # Audit-trail note: the forced replan turn consumes one
+                # build-iteration number. The build loop stamps it with
+                # ``next_iteration_index + 1`` and the replan sub-cycle
+                # then advances ``next_iteration_index``, so the coder
+                # turn that follows runs at ``+ 2`` — that skipped number
+                # carries the replan PlanDrafter's entries in
+                # ``plan_stage`` but no coder/reviewer/qa entries in
+                # ``build_stage``. Harmless: numbering stays monotonic
+                # and progress readers key on entry presence, not on
+                # contiguous iteration numbers.
+                print_message(
+                    "[bold cyan]→ --trigger-replan-with-feedback: entering the "
+                    "replan sub-cycle to fold the new --feedback into the "
+                    "plan.[/bold cyan]",
+                    log,
+                )
+                state.done = False
+                state.stage = STAGE_REPLAN
+                state.feedback_replan = True
+                self._checkpoint(state)
+            # Concurrent --feedback resume: the concurrent build has no linear
+            # STAGE_REPLAN; the flag is consumed by ``_run_concurrent_build``, which
+            # replans the pending feedback into ``plan.md`` BEFORE its first scheduler
+            # pass (so an added stage runs in parallel with any resumed in-flight
+            # node, not after). So a --feedback resume on the concurrent path just
+            # flags it (no separate --trigger-replan-with-feedback needed). Requires
+            # --replan-on-qa (the build loop's gate), past the plan phase.
+            elif (
+                self.concurrent
+                and self.replan_on_qa
+                and self.pending_feedback is not None
+                and state.stage not in _PLAN_STAGES
+            ):
+                print_message(
+                    "[bold cyan]→ --feedback on a concurrent resume: replanning it "
+                    "into plan.md before the next scheduler pass.[/bold cyan]",
+                    log,
+                )
+                state.done = False
+                state.feedback_replan = True
+                self._checkpoint(state)
+            if self.preset_plan is not None or self.preset_acceptance_criteria is not None:
+                print_message(
+                    "[bold yellow]⚠ --plan / --acceptance-criteria "
+                    "ignored while resuming from checkpoint; pass --clean "
+                    "to start fresh.[/bold yellow]",
+                    log,
+                )
+            # task.yaml on disk is the source of truth on resume; compare it
+            # against the --task the user just passed to flag drift.
+            checkpoint_task_path = Path(state.task_path)
+            if checkpoint_task_path.is_file():
+                checkpoint_text = checkpoint_task_path.read_text(encoding="utf-8").strip()
+                if checkpoint_text and checkpoint_text != task_text:
+                    print_message(
+                        "[bold yellow]⚠ --task differs from the "
+                        "checkpointed task; using the checkpointed task to "
+                        "preserve context.[/bold yellow]",
+                        log,
+                    )
+            return state
+
+        self._materialize_task(source)
+
+        if self.preset_plan is not None:
+            self._materialize_plan(self._resolve_plan_input(self.preset_plan))
+        if self.preset_acceptance_criteria is not None:
+            self._materialize_acceptance_criteria(
+                self._resolve_acceptance_criteria_input(self.preset_acceptance_criteria)
+            )
+
+        initial_stage = STAGE_PLAN_DRAFTER
+        if self.preset_plan is not None and self.preset_acceptance_criteria is not None:
+            print_message(
+                "[bold cyan]→ using user-supplied plan and acceptance "
+                "criteria; skipping plan phase and starting at coder"
+                "[/bold cyan]",
+                log,
+            )
+            initial_stage = STAGE_CODER
+        elif self.preset_plan is not None:
+            print_message(
+                "[bold cyan]→ user-supplied plan loaded; running plan "
+                "phase to generate acceptance-criteria.md[/bold cyan]",
+                log,
+            )
+        elif self.preset_acceptance_criteria is not None:
+            print_message(
+                "[bold cyan]→ user-supplied acceptance criteria loaded; "
+                "running plan phase to generate plan.md[/bold cyan]",
+                log,
+            )
+
+        state = WorkflowState(
+            task_path=str(self.task_path), num_iterations=self.num_iterations, stage=initial_stage
+        )
+        # Checkpoint before running the plan phase so a crash mid-plan can
+        # be picked up on the next run.
+        self._checkpoint(state)
+        return state
+
+    def _record_pending_feedback(self, state: WorkflowState, log) -> None:
+        """Append the user's ``--feedback`` argument to ``progress.yaml``.
+
+        The CLI flag is provided per-invocation, so re-running with another
+        ``--feedback`` appends another entry rather than overwriting prior
+        ones. The entry is stamped with the upcoming iteration and the
+        currently-active stage so build-phase agents can ground their next
+        turn on it.
+        """
+        if self.pending_feedback is None:
+            return
+        text = self._resolve_feedback_input(self.pending_feedback)
+        if not text.strip():
+            print_message(
+                "[bold yellow]⚠ --feedback was empty; nothing recorded.[/bold yellow]",
+                log,
+            )
+            return
+        if state.stage in _PLAN_STAGES:
+            stage_key = PLAN_STAGE
+            iteration = state.plan_next_iteration_index + 1
+        else:
+            stage_key = BUILD_STAGE
+            iteration = state.next_iteration_index + 1
+        append_human_feedback(
+            self.progress_path,
+            summary=text.rstrip() + "\n",
+            iteration=iteration,
+            stage=stage_key,
+        )
+        print_message(
+            f"[bold cyan]→ recorded human_feedback (stage={stage_key}, "
+            f"iteration={iteration}); build-phase agents will read it on "
+            f"their next turn.[/bold cyan]",
+            log,
+        )
+
+    @staticmethod
+    def _resolve_feedback_input(feedback: str | Path) -> str:
+        """Return the literal feedback text.
+
+        If ``feedback`` is a ``Path`` (or a string that resolves to an
+        existing file), return its contents; otherwise treat the string
+        as the literal feedback text. ``--feedback`` accepts free-form
+        notes, so a long literal string can exceed the OS path-length
+        limit and make ``Path.is_file`` raise ``OSError``; treat any
+        path-probe error as "not a file" and fall back to the literal.
+        """
+        if isinstance(feedback, Path):
+            return feedback.read_text(encoding="utf-8")
+        try:
+            candidate = Path(feedback)
+            is_file = candidate.is_file()
+        except OSError:
+            return feedback
+        if is_file:
+            return candidate.read_text(encoding="utf-8")
+        return feedback
+
+    @staticmethod
+    def _resolve_plan_input(plan: str | Path) -> str | Path:
+        """Decide whether ``plan`` is a path-to-existing-file or content.
+
+        Mirrors the same rule as ``--task``: if the value is a path that
+        resolves to an existing file, treat it as the source to copy;
+        otherwise treat it as the literal plan text.
+        """
+        if isinstance(plan, Path):
+            return plan
+        candidate = Path(plan)
+        return candidate if candidate.is_file() else plan
+
+    @staticmethod
+    def _resolve_acceptance_criteria_input(criteria: str | Path) -> str | Path:
+        """Same path-or-content resolution rule as ``_resolve_plan_input``."""
+        if isinstance(criteria, Path):
+            return criteria
+        candidate = Path(criteria)
+        return candidate if candidate.is_file() else criteria
+
+    def _materialize_task(self, source: Path) -> None:
+        """Copy ``source`` verbatim into ``workspace/task.yaml``."""
+        if source.resolve() != self.task_path.resolve():
+            shutil.copyfile(source, self.task_path)
+
+    def _materialize_plan(self, source: str | Path) -> None:
+        """Populate ``workspace/plan.md`` from a preset plan.
+
+        Mirrors ``_materialize_task``: a ``Path`` is copied verbatim, a
+        string is written directly. Only used when ``--plan`` is set on a
+        fresh run.
+        """
+        if isinstance(source, Path):
+            if source.resolve() != self.plan_path.resolve():
+                shutil.copyfile(source, self.plan_path)
+        else:
+            self.plan_path.write_text(source.rstrip() + "\n", encoding="utf-8")
+
+    def _materialize_acceptance_criteria(self, source: str | Path) -> None:
+        """Populate ``workspace/acceptance-criteria.md`` from a preset.
+
+        Mirrors ``_materialize_plan``. Only used when
+        ``--acceptance-criteria`` is set on a fresh run.
+        """
+        if isinstance(source, Path):
+            if source.resolve() != self.acceptance_criteria_path.resolve():
+                shutil.copyfile(source, self.acceptance_criteria_path)
+        else:
+            self.acceptance_criteria_path.write_text(source.rstrip() + "\n", encoding="utf-8")
+
+    def _checkpoint(self, state: WorkflowState) -> None:
+        save_state(self.state_path, state)
+
+    def _should_reset_coder(self, i: int) -> bool:
+        if i == 0:
+            return False
+        # Iteration 1 completes the initial build; reset before iteration 2
+        # so refinement starts from a clean context.
+        if i == 1:
+            return True
+        if self.coder_context_reset_interval <= 0:
+            return False
+        return i % self.coder_context_reset_interval == 0
+
+    def _should_reset_reviewer(self, i: int) -> bool:
+        if i == 0 or self.reviewer_context_reset_interval <= 0:
+            return False
+        return i % self.reviewer_context_reset_interval == 0
+
+    def _reset_coder(self) -> None:
+        if not isinstance(self.coder, AgentLayer):
+            return
+        self.coder.__exit__(None, None, None)
+        self.coder = self._build_agent(
+            "coder",
+            self.prompts.coder,
+            self._progress_tools["coder"] + self._status_tools["coder"],
+            required_tools=["append_coder_progress", "update_status"],
+            human_input_enabled=self.build_human_review_enabled,
+        )
+
+    def _reset_reviewer(self) -> None:
+        if not isinstance(self.reviewer, AgentLayer):
+            return
+        self.reviewer.__exit__(None, None, None)
+        self.reviewer = self._build_agent(
+            "reviewer",
+            self.prompts.reviewer,
+            self._progress_tools["reviewer"] + self._status_tools["reviewer"],
+            required_tools=["append_reviewer_progress", "update_status"],
+            backend_kind="codex",
+            model=CODEX_DEFAULT_MODEL,
+        )
+
+    def _latest_reviewer_decision(self) -> str | None:
+        entry = latest_entry(self.progress_path, "reviewer")
+        if entry is None:
+            return None
+        d = str(entry.get("decision", "")).strip().upper()
+        return d if d in ("APPROVE", "REJECT") else None
+
+    def _latest_qa_decision(self) -> str | None:
+        entry = latest_entry(self.progress_path, "qa")
+        if entry is None:
+            return None
+        d = str(entry.get("decision", "")).strip().upper()
+        return d if d in ("APPROVE", "REJECT") else None
+
+    def _latest_qa_score(self) -> float | None:
+        entry = latest_entry(self.progress_path, "qa")
+        if entry is None:
+            return None
+        score = entry.get("weighted_score")
+        try:
+            return float(score) if score is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _latest_plan_reviewer_decision(self) -> str | None:
+        entry = latest_entry(self.progress_path, "plan_reviewer")
+        if entry is None:
+            return None
+        d = str(entry.get("decision", "")).strip().upper()
+        return d if d in ("APPROVE", "REJECT") else None
+
+    def _latest_plan_drafter_decision(self) -> str | None:
+        entry = latest_entry(self.progress_path, "plan_drafter")
+        if entry is None:
+            return None
+        d = str(entry.get("decision", "")).strip().upper()
+        return d if d in ("DRAFT_READY", "POLISHING", "HUMAN_APPROVED", "DONE") else None
+
+    def _replan_was_rejected(self) -> bool:
+        """True when the replan drafter is re-invoked right after a REJECT.
+
+        The replan-review REJECT loop re-enters ``STAGE_REPLAN``, and at
+        that point the newest ``plan_stage`` entry is the PlanReviewer's
+        REJECT (the drafter always appends its own entry after each
+        turn, so any older REJECT is followed by a drafter entry).
+        Derived from ``progress.yaml`` rather than in-memory state so an
+        interrupt/resume between the REJECT and the re-invoked replan
+        turn still surfaces the rejection to the drafter.
+        """
+        entries = find_entries(self.progress_path, stage=PLAN_STAGE)
+        if not entries:
+            return False
+        last = entries[-1]
+        return (
+            last.get("agent") == "plan_reviewer"
+            and str(last.get("decision", "")).strip().upper() == "REJECT"
+        )
+
+    # ------------------------------------------------------------------ agents
+
+    def _run_plan_drafter(
+        self, iteration: int, mode: str, feedback_triggered: bool = False
+    ) -> None:
+        """Invoke the PlanDrafter in ``draft`` / ``human`` / ``replan`` / ``replan_human`` mode.
+
+        ``replan`` is only used when ``replan_on_qa=True``: it runs after
+        every QA turn in the build phase and asks the PlanDrafter to
+        revise ``plan.md`` / ``acceptance-criteria.md`` based on the
+        latest coder/reviewer/qa findings. The ``iteration`` value
+        threads the build-phase iteration number through so the entry
+        in ``progress.yaml`` is stamped with the iteration whose QA
+        triggered the replan.
+
+        ``replan_human`` is the human sign-off on a mid-build replan
+        revision (``STAGE_REPLAN_HUMAN``). It shares the ``human``
+        ask/reply protocol but frames the exchange as a build-phase
+        plan revision — the plan-phase wording ("Plan iteration",
+        "proceed to implementation") would misrepresent a run that is
+        already mid-build.
+
+        ``feedback_triggered`` (replan mode only) marks a sub-cycle that
+        was forced by ``--trigger-replan-with-feedback`` rather than by a
+        QA verdict: the prompt tells the drafter the QA data may be stale
+        and that fresh human feedback — not the QA verdict — is the turn's
+        driver, so it may preempt in-progress work to act on the feedback
+        immediately.
+        """
+        self._progress_ctx.current_iteration = iteration
+        if mode == "draft":
+            prompt = _with_protocol(
+                (
+                    f"Workspace: {self.workspace}\n"
+                    f"Plan iteration: {iteration}\n"
+                    f"Phase: **draft** (PlanReviewer will check your work; do "
+                    f"NOT seek human sign-off in this phase).\n\n"
+                    f"Read `{self.task_path}` for the original task.\n"
+                    f"Read the current contents of `{self.plan_path}` and "
+                    f"`{self.acceptance_criteria_path}` — either may already "
+                    f"hold user-supplied content you should preserve or "
+                    f"refine; the other will be empty for you to draft from "
+                    f"scratch.\n"
+                    f"If this is a re-draft, take in the PlanReviewer's "
+                    f"latest REJECT feedback and address every item.\n\n"
+                    f"Write your complete implementation plan to "
+                    f"`{self.plan_path}` and your acceptance-criteria "
+                    f"checklist (`- [ ] ...`) to "
+                    f"`{self.acceptance_criteria_path}`. Both files must end "
+                    f"this turn populated and coherent with each other and "
+                    f"with `task.yaml`.\n\n"
+                    f"Before completing your turn, record a PlanDrafter "
+                    f"progress entry whose `summary` describes what you "
+                    f"wrote/changed in **both** files, with "
+                    f'`decision: "DRAFT_READY"`.'
+                ),
+                "plan_drafter_draft",
+                self.use_in_process_tools,
+            )
+        elif mode in ("human", "replan_human"):
+            if mode == "human":
+                framing = (
+                    f"Plan iteration: {iteration}\n"
+                    f"Phase: **human review** (PlanReviewer has APPROVEd "
+                    f"the plan; now obtain the human's approval).\n\n"
+                )
+                ask = (
+                    '"Should we proceed with this plan and acceptance '
+                    'criteria, or do you want changes?"'
+                )
+                approve_desc = "Plan and criteria look good — proceed to implementation."
+            else:
+                framing = (
+                    f"Build iteration: {iteration}\n"
+                    f"Phase: **replan human review** (mid-build: the "
+                    f"PlanReviewer has APPROVEd a plan revision produced "
+                    f"by the post-QA replan turn; now obtain the human's "
+                    f"sign-off before the build continues).\n\n"
+                )
+                ask = (
+                    '"Should the build continue with this revised plan '
+                    'and acceptance criteria, or do you want changes?"'
+                )
+                approve_desc = "Revision looks good — continue the build with it."
+            prompt = (
+                f"Workspace: {self.workspace}\n"
+                f"{framing}"
+                f"Call the `ask_human` tool with:\n"
+                f'  - `header`: "plan-review"\n'
+                f"  - `question`: a self-contained summary of the plan in "
+                f"`{self.plan_path}` **and** the acceptance criteria in "
+                f"`{self.acceptance_criteria_path}`, plus the explicit "
+                f"ask {ask}\n"
+                f"  - `options`: exactly two — "
+                f'`{{"label": "Approve", "description": "{approve_desc}"}}` '
+                f'and `{{"label": "Request changes", "description": '
+                f'"Provide feedback in the reply text; I will revise."'
+                f"}}`.\n\n"
+                f"On reply:\n"
+                f'  - exactly `"Approve"` → call '
+                f"`append_plan_drafter_progress` with "
+                f'`decision: "HUMAN_APPROVED"` and end the turn.\n'
+                f'  - `"Request changes"` or any free-form feedback → '
+                f"revise `{self.plan_path}` and/or "
+                f"`{self.acceptance_criteria_path}` to address it, then "
+                f"call `ask_human` again. Loop within this turn until "
+                f"the human approves.\n"
+                f'  - `"(no response from human)"` → stop asking, call '
+                f"`append_plan_drafter_progress` with "
+                f'`decision: "POLISHING"`, and end the turn.'
+            )
+        elif mode == "replan":
+            qa_decision = self._latest_qa_decision() or "missing"
+            score = self._latest_qa_score()
+            score_str = f"{score:.2f}" if score is not None else "missing"
+            min_score_str = f"{self.min_score:.2f}" if self.min_score > 0 else "disabled"
+            rejected_block = ""
+            if self._replan_was_rejected():
+                rejected_block = (
+                    "Your previous replan revision was REJECTed by the "
+                    "PlanReviewer. Take in that REJECT feedback and address "
+                    "every item in this revision before deciding again.\n\n"
+                )
+            feedback_note = (
+                "**Feedback-triggered replan**: this replan turn was "
+                "forced by fresh human feedback "
+                "(`--trigger-replan-with-feedback`), NOT by a QA verdict "
+                "— the QA data below predates the feedback and may be "
+                "stale. Take in the human feedback FIRST; the newest "
+                "entry is this turn's driver. Restructure the plan so "
+                "the very next Coder turn acts on that feedback: you may "
+                "preempt in-progress work per your protocol's "
+                "feedback-triggered replan rules (when your prompt "
+                "extension defines them), deciding which preempted work "
+                "is still needed — reschedule it — and which the "
+                "feedback makes obsolete — drop it with justification "
+                "in your `summary`.\n\n"
+                if feedback_triggered
+                else ""
+            )
+            prompt = _with_protocol(
+                f"Workspace: {self.workspace}\n"
+                f"Build iteration: {iteration}\n"
+                f"Phase: **replan** (PlanDrafter is re-invoked after every "
+                f"QA turn; decide DONE / POLISHING / DRAFT_READY based on "
+                f"what the build phase actually achieved).\n\n"
+                f"{feedback_note}"
+                f"Latest QA verdict: decision={qa_decision}, "
+                f"weighted_score={score_str}, min_score={min_score_str}.\n"
+                f"Hard rule: if `weighted_score` is below `min_score` (or "
+                f"missing) you may not return `DONE` — the orchestrator "
+                f"will downgrade it to `POLISHING` and log a warning.\n\n"
+                f"{rejected_block}"
+                f"Read `{self.task_path}` (ground truth), the current "
+                f"`{self.plan_path}`, and "
+                f"`{self.acceptance_criteria_path}` (the pass/fail "
+                f"checklist QA just used). Take in the latest "
+                f"coder/reviewer/qa entries from the build phase, and any "
+                f"user-supplied human feedback.\n\n"
+                f"Revise `{self.plan_path}` and "
+                f"`{self.acceptance_criteria_path}` where the build phase "
+                f"surfaced a real gap — sharpen vague guidance, fold in "
+                f"lessons learned, push to a new stage when the current "
+                f"one is solid. Do NOT relax a criterion to make a "
+                f"failing QA pass; if a criterion no longer reflects "
+                f"`task.yaml`, justify the change in your `summary`.\n\n"
+                f"Before completing your turn, record exactly one "
+                f"PlanDrafter progress entry. Decision map:\n"
+                f"  - `DONE` — every acceptance item verified at runtime, "
+                f"score >= min_score, no new stage to push to. Workflow "
+                f"ends.\n"
+                f"  - `POLISHING` — small revision (wording, an added "
+                f"pitfall, a clarification). Coder runs again "
+                f"immediately; no review chain.\n"
+                f"  - `DRAFT_READY` — substantive revision (criterion "
+                f"added/removed/materially reworded, new stage, goal "
+                f"extended). PlanReviewer reviews the revised files "
+                f"before the Coder runs again.\n"
+                f"Make `summary` self-contained: name the build-phase "
+                f"finding that motivated the revision, list the concrete "
+                f"changes to each file, and (for `DRAFT_READY`) justify "
+                f"every acceptance-criteria change.",
+                "plan_drafter_replan",
+                self.use_in_process_tools,
+            )
+        else:
+            raise ValueError(f"unknown plan_drafter mode: {mode!r}")
+        self._invoke_agent(
+            "plan_drafter",
+            self.plan_drafter,
+            prompt,
+            iteration,
+            replan=mode in ("replan", "replan_human"),
+        )
+
+    def _run_plan_reviewer(
+        self, iteration: int, phase: str = "initial", feedback_triggered: bool = False
+    ) -> None:
+        """Run the PlanReviewer in initial-plan or replan-review mode.
+
+        ``phase="initial"`` is the classic plan-phase review (a fresh
+        plan + criteria after the PlanDrafter's draft turn).
+        ``phase="replan"`` reuses the same agent on a revised plan and
+        criteria after the PlanDrafter returned ``DRAFT_READY`` from a
+        replan turn; the prompt tells the reviewer it is reviewing a
+        revision and to watch for unjustified relaxations to the
+        acceptance criteria.
+
+        ``feedback_triggered`` (replan phase only) tells the reviewer the
+        revision under review came from a feedback-forced replan turn, so
+        prompt extensions that define feedback-triggered edit rights can
+        apply them instead of treating the preemption as a violation.
+        """
+        if phase not in ("initial", "replan"):
+            raise ValueError(f"unknown plan_reviewer phase: {phase!r}")
+        self._progress_ctx.current_iteration = iteration
+        iter_label = "Build iteration" if phase == "replan" else "Plan iteration"
+        feedback_note = (
+            "This replan turn was **feedback-triggered** "
+            "(`--trigger-replan-with-feedback`): the PlanDrafter was "
+            "responding to fresh human feedback, not a QA verdict. Take in "
+            "that human feedback to see what the revision must "
+            "serve. Where your prompt extension defines "
+            "feedback-triggered edit rights (e.g. preempting in-progress "
+            "work), judge the revision under those rules; still REJECT "
+            "edits those rules do not allow.\n\n"
+            if (phase == "replan" and feedback_triggered)
+            else ""
+        )
+        phase_note = (
+            "Phase: **replan review** — the PlanDrafter has just revised "
+            "`plan.md` and `acceptance-criteria.md` after a build-phase "
+            "QA turn. Treat this as a re-review of a revision, not a "
+            "fresh plan: the rest of the project has been built against "
+            "the prior criteria. Watch especially for unjustified "
+            "changes to `acceptance-criteria.md` (deletions, weakenings, "
+            "scope reductions). REJECT silent relaxations; demand the "
+            "PlanDrafter justify each change in their `summary`.\n\n"
+            f"{feedback_note}"
+            if phase == "replan"
+            else ""
+        )
+        prompt = _with_protocol(
+            f"Workspace: {self.workspace}\n"
+            f"{iter_label}: {iteration}\n\n"
+            f"{phase_note}"
+            f"Read `{self.task_path}` (the user's original intent), "
+            f"`{self.plan_path}` (the PlanDrafter's plan), and "
+            f"`{self.acceptance_criteria_path}` (the pass/fail checklist "
+            f"QA will verify). Take in the PlanDrafter's latest "
+            f"summary.\n\n"
+            "Decide APPROVE or REJECT covering **both** plan-phase "
+            "outputs as a unit: the plan must satisfy task.yaml and be "
+            "concrete enough for the Coder to execute, and the "
+            "acceptance criteria must be a flat checklist of mechanically "
+            "checkable items faithful to task.yaml. Do NOT build, run, or "
+            "test code — that belongs to the build-phase Reviewer. This "
+            "is a paper review.\n\n"
+            "Before completing your turn, record a PlanReviewer progress "
+            "entry with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT`. On REJECT, list specific actionable items the "
+            "PlanDrafter must address, naming the file (`plan.md` or "
+            "`acceptance-criteria.md`) for each item.",
+            "plan_reviewer",
+            self.use_in_process_tools,
+        )
+        self._invoke_agent(
+            "plan_reviewer",
+            self.plan_reviewer,
+            prompt,
+            iteration,
+            feedback_triggered=feedback_triggered,
+        )
+
+    def _run_coder(self, iteration: int) -> None:
+        self._progress_ctx.current_iteration = iteration
+        prompt = _with_protocol(
+            f"Workspace: {self.workspace}\n"
+            f"Iteration: {iteration}\n\n"
+            f"Start by loading the rolling `status.md` scratchpad — that is "
+            f"your fastest way to pick up where the previous turn left "
+            f"off.\n\n"
+            f"Read `{self.task_path}` for the original task from the user, "
+            f"`{self.plan_path}` for the build plan, and "
+            f"`{self.acceptance_criteria_path}` for the pass/fail "
+            f"checklist QA will verify (your definition of done). Take in "
+            f"the Reviewer's latest REJECT feedback (if any) and the QA's "
+            f"latest REJECT report (if any) from the last 2 iterations. "
+            f"These are what you must address this iteration.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. Treat those entries as high-priority guidance "
+            f"from the human and address every unaddressed point this "
+            f"turn.\n\n"
+            "Implement or refine the code to address the feedback and "
+            "satisfy every acceptance criterion. Before completing your "
+            "turn, record a Coder progress entry with a `summary` of what "
+            "you built or changed, and refresh status.md with a short, "
+            "clean snapshot — current status, execution path, what's been "
+            "tried, what worked, what didn't, pointers for the next step.",
+            "coder",
+            self.use_in_process_tools,
+        )
+        self._invoke_agent("coder", self.coder, prompt, iteration)
+
+    def _run_reviewer(self, iteration: int) -> None:
+        self._progress_ctx.current_iteration = iteration
+        # Surface the replan-on-qa flag to the Reviewer so a prompt
+        # extension can branch on it (e.g. the modeling-bringup
+        # Stage/Goal protocol uses a different APPROVE gate in the two
+        # modes). The default agent-team Reviewer prompt ignores the
+        # line; no behavior change for callers that don't opt in.
+        replan_mode = "enabled" if self.replan_on_qa else "disabled"
+        prompt = _with_protocol(
+            f"Workspace: {self.workspace}\n"
+            f"Iteration: {iteration}\n"
+            f"Replan mode: {replan_mode}.\n\n"
+            f"Start by loading the rolling `status.md` scratchpad so you "
+            f"know what the Coder claims the current state is.\n\n"
+            f"Read `{self.plan_path}` for the build plan and "
+            f"`{self.acceptance_criteria_path}` for the pass/fail "
+            f"checklist. Take in the Coder's latest summary.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. When you decide APPROVE/REJECT, verify the "
+            f"Coder has actually addressed every unaddressed point — if "
+            f"not, REJECT and call them out by name.\n\n"
+            "Work closely with the Coder: inspect the changed files, then "
+            "**build the code, run it, and execute the relevant tests** "
+            "against the plan and the acceptance criteria. APPROVE only "
+            "when you have seen the change actually build and run "
+            "correctly and have evidence the criteria will hold for QA. "
+            "REJECT — with specific, actionable feedback citing exact "
+            "errors or failing tests — when the build/tests fail, "
+            "runtime behavior contradicts the plan, or any acceptance "
+            "criterion is clearly unmet. Keep the loop tight: skip long "
+            "benchmarks and full-suite stress runs (those belong to QA).\n\n"
+            "Before completing your turn, record a Reviewer progress entry "
+            "with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT` — cite the commands you ran and what you observed in "
+            "the summary — and refresh status.md to reflect the post-review "
+            "state, what was actually tested, and what the Coder must "
+            "address next on REJECT.",
+            "reviewer",
+            self.use_in_process_tools,
+        )
+        self._invoke_agent("reviewer", self.reviewer, prompt, iteration)
+
+    def _run_qa(self, iteration: int) -> None:
+        self._progress_ctx.current_iteration = iteration
+        gate_hint = ""
+        if self.min_score > 0:
+            gate_hint = (
+                f"\n\nThe orchestrator treats an APPROVE as final only when "
+                f"`weighted_score` is at least {self.min_score:.1f}/10; "
+                f"APPROVE below that floor is downgraded to a loop-back. "
+                f"Do not pad the score — if the artifact is not yet that "
+                f"good, say REJECT and list the gaps."
+            )
+        prompt = _with_protocol(
+            f"Workspace: {self.workspace}\n"
+            f"Iteration: {iteration}\n\n"
+            f"Read `{self.task_path}` (the user's stated intent — "
+            f"ultimate ground truth) and "
+            f"`{self.acceptance_criteria_path}` (the pass/fail "
+            f"checklist; the operational denominator for "
+            f"`weighted_score`). Do NOT read `plan.md`, "
+            f"`progress.yaml`, `status.md`, or any other intermediate "
+            f"artifact; your verdict must be grounded solely in "
+            f"those two specs and the actual code you build and "
+            f"run. On any conflict between the criteria and "
+            f"`task.yaml`, `task.yaml` wins — call out the gap.\n\n"
+            f"Take in any direct user guidance recorded via "
+            f"`--feedback`. Human feedback is "
+            f"the user's own voice, not a downstream agent's, so "
+            f"treat it on par with `task.yaml`: APPROVE requires that "
+            f"every unaddressed feedback point has been resolved at "
+            f"runtime. Flag any conflicts with `task.yaml` in your "
+            f"summary.\n\n"
+            "Discover the code under the workspace yourself (ls, grep, "
+            "etc.), build it, run tests, and verify every acceptance "
+            "criterion at runtime. Do not rely on code review alone.\n\n"
+            "Before completing your turn, record a QA progress entry "
+            "with:\n"
+            "- `summary`: per-criterion pass/fail with runtime "
+            "evidence, evaluation-criterion scores, strengths, "
+            "weaknesses, recommendation\n"
+            "- `decision`: exactly `APPROVE` or `REJECT`\n"
+            "- `weighted_score`: the weighted average in [0, 10]\n\n"
+            "APPROVE ends the workflow (subject to the score floor). "
+            "REJECT sends the work back to the Coder; put the gaps they "
+            "must fix in `summary`." + gate_hint,
+            "qa",
+            self.use_in_process_tools,
+        )
+        self._invoke_agent("qa", self.qa, prompt, iteration)
+
+
+if __name__ == "__main__":
+    from .cli import main
+
+    main()

@@ -4,18 +4,25 @@
 ## Issue Tracking
 
 * All enhancement, bugfix, or change requests must begin with the creation of a [TensorRT-LLM Issue Request](https://github.com/nvidia/TensorRT-LLM/issues).
-  * The issue request must be reviewed by TensorRT-LLM engineers and approved prior to code review.
 
 ## Coding Guidelines
 
 TensorRT-LLM Coding Style can be found [in this document](CODING_GUIDELINES.md).
 
-We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local Python environment.
+We use `pre-commit` for automatic code formatting and validation. Create and activate a local Python environment:
 
 ```bash
-pip install pre-commit mypy
-pre-commit install
+python3 -m venv .venv-precommit
+source .venv-precommit/bin/activate
+python3 -m pip install pre-commit pyrefly==1.4.0 'tomli>=2; python_version < "3.11"'
+python3 -m pre_commit install
 ```
+
+The type-check hook uses `python3` from `PATH`, so keep this environment activated
+when committing or running `pre-commit`. Install these dependencies with
+`python3 -m pip` to use the same interpreter as the hook. On Python 3.10, the
+workflow helpers need `tomli` to read TOML; Python 3.11 and newer provide `tomllib`.
+This setup does not require installing all of `requirements-dev.txt`.
 
 `pre-commit` will be triggered in every commit.
 
@@ -117,6 +124,23 @@ For NVIDIA developers,  please submit feature or bug fixes to the dedicated bran
 `release/v0.20` instead of the main branch.
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
+
+### Inactive pull requests
+
+TensorRT LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
+ready-for-review pull requests:
+
+* After more than 120 days without activity, the workflow reminds the author. Pull requests without merge conflicts
+  remain open and receive another reminder after each subsequent 120-day period without activity.
+* For a pull request with merge conflicts, the reminder warns that the pull request will close after another 60 days
+  without activity unless its conflicts are resolved.
+* A pull request is closed only when it still has merge conflicts and the warning remains its latest activity for more
+  than 60 days. Any subsequent activity resets the closure process.
+
+Maintainers can apply the `no-stale` label to exempt an intentionally parked pull request from reminders and
+automatic closure. If an inactive pull request is closed and the work is still relevant, open a new pull request.
+The original pull request may instead be reopened after its conflicts are resolved if its source branch is still
+available.
 
 
 ## Tests and Code Review for Protected APIs

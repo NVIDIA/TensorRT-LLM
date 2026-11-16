@@ -14,37 +14,51 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
-from typing import Dict, List, Optional, Type
+import math
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.attention import _helix_cp_allgather_input, _helix_cp_output_projection
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce, AllReduceParams
-from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe, get_moe_cls
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
-from ..modules.fused_moe.interface import MoE as MoEInterface
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
+    MiniMaxM2MoeRoutingMethod,
+    MoEImplClass,
+    RoutingMethodType,
+    SqrtSoftplusMoeRoutingMethod,
+    create_moe,
+    resolve_moe_cls,
+)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
-from .checkpoints.hf.weight_mapper import HfWeightMapper
+from .checkpoints.hf.weight_mapper import HfWeightMapper, convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model, register_mapper
+from .modeling_utils import (
+    DecoderModel,
+    moe_experts_quant_config,
+    register_auto_model,
+    register_mapper,
+)
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -52,7 +66,8 @@ from .modeling_utils import DecoderModel, register_auto_model, register_mapper
 
 
 class LagunaGate(nn.Module):
-    """Sigmoid router with e_score_correction_bias (MiniMaxM2 routing)."""
+    """Router with e_score_correction_bias and config-driven scoring: "sigmoid"
+    (MiniMaxM2 routing) or "sqrtsoftplus" (DeepSeek-V4-style sqrt-softplus)."""
 
     def __init__(
         self,
@@ -60,11 +75,18 @@ class LagunaGate(nn.Module):
         num_experts: int,
         top_k: int,
         dtype: Optional[torch.dtype] = None,
-        moe_backend_cls: Type[MoE] = None,
-    ):
+        moe_backend_cls: Optional[MoEImplClass] = None,
+        scoring_func: str = "sigmoid",
+    ) -> None:
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls
+        if scoring_func not in ("sigmoid", "sqrtsoftplus"):
+            raise ValueError(
+                f"Unsupported moe_router_score_func={scoring_func!r}; "
+                'expected "sigmoid" or "sqrtsoftplus".'
+            )
+        self.scoring_func = scoring_func
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype),
             requires_grad=False,
@@ -92,7 +114,12 @@ class LagunaGate(nn.Module):
 
     @property
     def routing_method(self):
-        return MiniMaxM2MoeRoutingMethod(
+        routing_cls = (
+            SqrtSoftplusMoeRoutingMethod
+            if self.scoring_func == "sqrtsoftplus"
+            else MiniMaxM2MoeRoutingMethod
+        )
+        return routing_cls(
             top_k=self.top_k,
             num_experts=self.weight.shape[0],
             callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
@@ -121,12 +148,26 @@ class LagunaMoE(nn.Module):
                 strategy=model_config.allreduce_strategy,
             )
 
+        experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.mlp.experts"
+        )
         self.gate = LagunaGate(
             hidden_size=self.hidden_dim,
             num_experts=self.num_experts,
             top_k=self.top_k,
             dtype=config.torch_dtype,
-            moe_backend_cls=get_moe_cls(model_config),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                override_quant_config=experts_quant_config,
+                routing=RoutingMethodType.MiniMax2,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            ),
+            scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
 
         self.experts = create_moe(
@@ -138,6 +179,7 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
@@ -304,7 +346,14 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
             attention_factor = rp_dict.get("attention_factor")
             if attention_factor is not None:
-                rp.mscale = float(attention_factor)
+                attention_factor = float(attention_factor)
+                # attention_factor is the FINAL YaRN scaling (HF semantics).
+                # create_sinusoidal_positions_yarn applies get_mscale(factor, rp.mscale)
+                # = 0.1*rp.mscale*ln(factor)+1 (mscale_all_dim=0), so setting mscale to the
+                # final value routes it through the log twice. Invert to reproduce it exactly.
+                rp.mscale = (
+                    ((attention_factor - 1.0) / (0.1 * math.log(rp.scale))) if rp.scale > 1 else 1.0
+                )
             rp.original_max_positions = int(
                 rp_dict.get("original_max_position_embeddings", config.max_position_embeddings)
             )
@@ -579,7 +628,7 @@ class LagunaForCausalLM(SpecDecOneEngineForCausalLM[LagunaModel, PretrainedConfi
 # ---------------------------------------------------------------------------
 
 
-@register_mapper("HF", "LagunaForCausalLM")
+@register_mapper(CheckpointFormat.HF, "LagunaForCausalLM")
 class LagunaHfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict) -> dict:
         weights = self.rename_by_params_map(
@@ -589,64 +638,13 @@ class LagunaHfWeightMapper(HfWeightMapper):
             weights,
         )
 
-        # Translate llm-compressor "compressed-tensors" NVFP4 naming into what
-        # TRT-LLM's NVFP4 linear / MoE loaders expect. llm-compressor stores
-        #   weight_packed        (uint8, packed FP4)
-        #   weight_scale         (FP8 per-group)
-        #   weight_global_scale  (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_weight)
-        #   input_global_scale   (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_input)
-        # TRT-LLM's loaders expect:
-        #   weight               (uint8 view of float4_e2m1x2)
-        #   weight_scale         (FP8, same)
-        #   weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
-        #   input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
-        # which is the reciprocal of the *_global_scale values.
         if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4():
-
-            def _invert_global_scale(t: torch.Tensor) -> torch.Tensor:
-                """Convert compressed-tensors multiplier form to TRT-LLM
-                divisor form, protecting against uncalibrated experts.
-
-                llm-compressor stores global_scale=(FP8_MAX*FP4_MAX)/amax;
-                TRT-LLM expects {weight_scale_2, input_scale}=amax/(FP8_MAX*FP4_MAX),
-                i.e. the reciprocal. Some checkpoints store 0 for experts with
-                no calibration data (amax unavailable); a naive 1/x would
-                produce Inf which then contaminates the MoE per-layer
-                max-reduction over experts and zeroes out *every* expert's
-                input_scale. We preserve 0 -> 0 so those entries are harmless
-                in the max reduction and the corresponding expert's alpha
-                evaluates to 0 (silencing the dead expert).
-                """
-                t = t.to(torch.float32)
-                out = torch.where(
-                    t > 0,
-                    1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
-                    torch.zeros_like(t),
-                )
-                # Belt-and-braces: any residual Inf/NaN becomes 0.
-                return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
-
-            renamed: dict = {}
-            for name, value in weights.items():
-                if name.endswith(".weight_packed"):
-                    new_name = name[: -len(".weight_packed")] + ".weight"
-                    renamed[new_name] = value
-                elif name.endswith(".weight_global_scale"):
-                    new_name = name[: -len(".weight_global_scale")] + ".weight_scale_2"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                elif name.endswith(".input_global_scale"):
-                    new_name = name[: -len(".input_global_scale")] + ".input_scale"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                else:
-                    renamed[name] = value
-            weights = renamed
+            weights = convert_compressed_tensors_nvfp4_weights(weights)
 
         return weights
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoEInterface)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -655,7 +653,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoEInterface):
+        if is_moe_weight_owner(module):
             # DeepSeekFP8 block-scales MoE expects "weight_scale_inv" but NVFP4
             # MoE expects the original "weight_scale" (plus "weight_scale_2").
             use_fp8_block_rename = (
@@ -682,6 +680,6 @@ class LagunaHfWeightMapper(HfWeightMapper):
             module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)
 
 
-@register_mapper("HF", "DFlashLagunaForCausalLM")
+@register_mapper(CheckpointFormat.HF, "DFlashLagunaForCausalLM")
 class DFlashLagunaHfWeightMapper(LagunaHfWeightMapper):
     """The DFlash drafter is a Laguna model; reuse Laguna's weight mapper."""

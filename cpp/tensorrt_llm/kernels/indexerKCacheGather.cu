@@ -63,7 +63,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param out_scale           Output scale data [num_tokens, scale_size] contiguous
  * @param k_token_start       Start offset into slot_mapping arrays
  * @param num_tokens          Number of tokens to gather
- * @param head_dim            Head dimension (must be 128)
+ * @param head_dim            Payload byte width (128 for FP8, 64 for packed FP4)
  * @param scale_size          Scale size in bytes (must be 4)
  * @param cache_stride_0      Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1      Stride for k_cache dimension 1 (in bytes)
@@ -108,7 +108,7 @@ __global__ void indexerKCacheGatherUnifiedKernel(uint8_t const* __restrict__ k_c
     // Convert flat index to memory offset using strides (k cache pool from cpp kv cache manager is non-contiguous)
     int64_t src_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
         cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-    int64_t dst_offset = token_idx * head_dim + head_dim_idx;
+    int64_t dst_offset = static_cast<int64_t>(token_idx) * head_dim + head_dim_idx;
 
     // 4 bytes read from non-contiguous cache, write to contiguous output
     *reinterpret_cast<uint32_t*>(&out_fp8[dst_offset]) = *reinterpret_cast<uint32_t const*>(&k_cache[src_offset]);
@@ -118,7 +118,7 @@ __global__ void indexerKCacheGatherUnifiedKernel(uint8_t const* __restrict__ k_c
     {
         int64_t src_offset_scale = flatIndexToMemoryOffset(flat_idx_scale_base, cache_dim_0, cache_dim_1, cache_dim_2,
             cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-        int64_t dst_offset_scale = token_idx * scale_size; // scale_size = 4
+        int64_t dst_offset_scale = static_cast<int64_t>(token_idx) * scale_size; // scale_size = 4
 
         // 4 bytes read for scale
         *reinterpret_cast<uint32_t*>(&out_scale[dst_offset_scale])

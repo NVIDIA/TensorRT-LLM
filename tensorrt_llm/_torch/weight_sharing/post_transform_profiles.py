@@ -26,16 +26,505 @@ qualified under the same architecture and lifecycle contract.
 
 from __future__ import annotations
 
+import abc
+import importlib
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
+
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from torch import nn
 
+# Stable identifier for the tensor names, layouts, aliases, and receiver-side
+# finalization contract produced by the currently qualified Llama target path.
+# Never change the meaning of an existing ABI ID. Introduce a new ID whenever
+# a transform changes transferred tensor semantics or the receiver must
+# interpret/finalize the transferred state differently.
+LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-llama-target-layout-v1"
+# Stable contract for unquantized Qwen2 dense fused-QKV and fused-gate-up
+# tensors plus the target-only receiver finalization used by its first profile.
+QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
+# Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
+# tensors, Q/K norm state, and target-only receiver finalization.
+QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for the Qwen3 dense layout above when `lm_head.weight` is an
+# alias of `model.embed_tokens.weight`. The shared table is one transferred
+# tensor, named `model.embed_tokens.weight`; no `lm_head.weight` tensor is
+# transferred, and the receiver's constructor rebuilds the alias.
+QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-tied-target-layout-v1"
+# Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
+# every Linear the realized quant config quantizes holds E4M3 weights [N, K],
+# FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
+# and `inv_input_scale` as loaded (1.0 unless a non-fused projection's
+# checkpoint stores an input scale). All other tensors, the Q/K norm state, and
+# the target-only receiver finalization follow the Qwen3 dense contract, and no
+# one-shot transform changes them.
+QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1"
+)
+# Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
+# tensors plus target-only receiver finalization. Mistral shares the dense
+# decoder base class with Llama but is a distinct root with its own contract.
+MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout-v1"
+# Stable contract for unquantized Phi3 dense fused-QKV and fused-gate-up
+# tensors plus target-only receiver finalization. Phi3 checkpoints store both
+# projections pre-fused and the root splits them per TP rank while loading.
+PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
+# Stable contract for the unquantized Qwen3.5 dense vision-language root: the
+# vision tower's fused-QKV tensors, the gated-delta-net input projections in
+# their dense per-rank `[Q|K|V|Z]` and `[b|a]` row order, rank-interleaved
+# `conv1d` weights and fp32 `A_log`/`dt_bias`, gated fused-QKV attention with
+# Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
+# finalization.
+QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
+_MISSING = object()
+
+
+def _canonical_string(value: object) -> str | None:
+    if value is None:
+        return None
+    value = getattr(value, "value", value)
+    if isinstance(value, (str, int, float, bool)):
+        return str(value).removeprefix("torch.")
+    rendered_value = str(value)
+    return rendered_value.removeprefix("torch.") if rendered_value.startswith("torch.") else None
+
+
+def _canonical_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _canonical_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _realized_rope_fusion(model: nn.Module) -> bool | None:
+    realized_values: set[bool] = set()
+    for module in model.modules():
+        value = getattr(module, "rope_fusion", _MISSING)
+        if value is _MISSING:
+            continue
+        canonical_value = _canonical_bool(value)
+        if canonical_value is None:
+            return None
+        realized_values.add(canonical_value)
+    return realized_values.pop() if len(realized_values) == 1 else None
+
+
+def _realized_sliding_window(model: nn.Module) -> str | None:
+    """Summarize the sliding-window attention realized by a constructed model.
+
+    Attention modules that can apply a window expose `attention_window_size`.
+    The result is `none` when every exposing module applies full attention,
+    `uniform` when all exposing modules share one positive window, `mixed` when
+    windowed and full-attention layers coexist or windows differ, and `None`
+    when no module exposes the attribute or a value is not a positive `int`.
+    """
+    realized_values: set[int | None] = set()
+    for module in model.modules():
+        value = getattr(module, "attention_window_size", _MISSING)
+        if value is _MISSING:
+            continue
+        if value is None:
+            realized_values.add(None)
+            continue
+        window_size = _canonical_int(value)
+        if window_size is None or window_size <= 0:
+            return None
+        realized_values.add(window_size)
+    if not realized_values:
+        return None
+    if realized_values == {None}:
+        return "none"
+    return "uniform" if len(realized_values) == 1 else "mixed"
+
+
+def _same_weight_memory(first: object, second: object) -> bool | None:
+    """Whether two weights are one tensor or identical views of the same memory.
+
+    Meta tensors have no memory to compare, so distinct meta tensors count as
+    unshared. Returns `None` when either weight is not a tensor.
+    """
+    if first is second:
+        return True
+    try:
+        if first.is_meta or second.is_meta:
+            return False
+        first_view = (
+            first.device,
+            first.dtype,
+            first.data_ptr(),
+            tuple(first.shape),
+            first.stride(),
+        )
+        second_view = (
+            second.device,
+            second.dtype,
+            second.data_ptr(),
+            tuple(second.shape),
+            second.stride(),
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    # Distinct empty tensors can both report a null data pointer.
+    return first_view == second_view and first_view[2] != 0
+
+
+def _realized_tied_word_embeddings(model: nn.Module) -> bool | None:
+    """Report whether a constructed model's LM head reads its token-embedding table.
+
+    The head is the one submodule named `lm_head` and the table is the one
+    submodule named `embed_tokens`, at any depth. The result is `True` when
+    their weights are the same tensor or identical views of the same memory,
+    and `False` when they are distinct tensors. It is `None` when the model
+    does not have exactly one of each, or when either has no tensor weight.
+
+    Matching by trailing name is deliberate: a root that holds a second head
+    or table, such as an in-tree MTP or draft model, always gets `None`, so no
+    profile that constrains the tie qualifies it. Such a root needs its own
+    rule for which head and table to compare before a profile can qualify it.
+    """
+    weights: dict[str, list[object]] = {"lm_head": [], "embed_tokens": []}
+    for name, module in model.named_modules():
+        module_weights = weights.get(name.rpartition(".")[2])
+        if module_weights is not None:
+            module_weights.append(getattr(module, "weight", None))
+    head_weights, table_weights = weights["lm_head"], weights["embed_tokens"]
+    if len(head_weights) != 1 or len(table_weights) != 1:
+        return None
+    if head_weights[0] is None or table_weights[0] is None:
+        return None
+    return _same_weight_memory(head_weights[0], table_weights[0])
+
+
+def _tie_mismatch_reason(declared: bool | None, realized: bool | None) -> str:
+    """Explain, for logs, how a declared embedding tie and the realized one disagree."""
+    if realized is None:
+        found = "the model has no single lm_head and embed_tokens weight pair to compare"
+    else:
+        sharing = "shared" if realized else "distinct"
+        found = f"the model's lm_head and embed_tokens weights are {sharing}"
+    if declared is None:
+        return f"the config declares no boolean tie_word_embeddings, and {found}"
+    return f"the config declares tie_word_embeddings={declared}, but {found}"
+
+
+def _canonical_optional_string(container: object, attribute: str) -> str | None:
+    value = getattr(container, attribute, _MISSING)
+    if value is _MISSING:
+        return None
+    return "none" if value is None else _canonical_string(value)
+
+
+def _declared_weight_block_size(pretrained_config: object) -> tuple[int, ...] | None:
+    """Return the weight block size a checkpoint's quantization config declares.
+
+    Hugging Face FP8 checkpoints declare `weight_block_size` in
+    `quantization_config`, either as a dict entry or as an attribute of a parsed
+    config. The result is `None` when no block size is declared or the value is
+    not a non-empty sequence of `int`, so a row that constrains
+    `weight_block_sizes` rejects it.
+    """
+    quantization_config = getattr(pretrained_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        block_size = quantization_config.get("weight_block_size")
+    else:
+        block_size = getattr(quantization_config, "weight_block_size", None)
+    if not isinstance(block_size, (list, tuple)) or not block_size:
+        return None
+    canonical_block_size = tuple(_canonical_int(value) for value in block_size)
+    return None if None in canonical_block_size else canonical_block_size
+
+
+@dataclass(frozen=True)
+class PostTransformConfigIdentity:
+    """Canonical model identity captured before constructor normalization."""
+
+    architecture: str | None
+    model_type: str | None
+
+    @classmethod
+    def from_model_config(cls, model_config: object) -> "PostTransformConfigIdentity":
+        """Capture registry dimensions from a resolved pre-construction config."""
+
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        architectures = getattr(pretrained_config, "architectures", None)
+        architecture = (
+            architectures[0]
+            if isinstance(architectures, (list, tuple))
+            and architectures
+            and isinstance(architectures[0], str)
+            else None
+        )
+        configured_model_type = getattr(pretrained_config, "model_type", None)
+        model_type = configured_model_type if isinstance(configured_model_type, str) else None
+        return cls(architecture=architecture, model_type=model_type)
+
+
+@dataclass(frozen=True)
+class PostTransformRuntimeConfig:
+    """Resolved runtime dimensions used to bound qualification evidence."""
+
+    dtype: str | None
+    quant_algorithm: str | None
+    kv_cache_quant_algorithm: str | None
+    layerwise_quantization: bool | None
+    force_dynamic_quantization: bool | None
+    lora_enabled: bool | None
+    sparse_attention_enabled: bool | None
+    attention_backend: str | None
+    moe_backend: str | None
+    tp_size: int | None
+    pp_size: int | None
+    cp_size: int | None
+    moe_tp_size: int | None
+    moe_ep_size: int | None
+    # MoE cluster (smart-router) parallel size from the final mapping.
+    moe_cluster_size: int | None
+    attention_tp_size: int | None
+    attention_cp_size: int | None
+    attention_dp: bool | None
+    multi_node: bool | None
+    # The declared `tie_word_embeddings` flag, or `None` when a constructed
+    # model does not realize the declared value.
+    tied_word_embeddings: bool | None
+    rope_type: str | None
+    rope_fusion: bool | None
+    # Realized sliding-window attention: `none`, `uniform`, `mixed`, or `None`
+    # when the constructed model does not determine it.
+    sliding_window: str | None
+    # SM version (`major * 10 + minor`) of the GPU that runs the load, or `None`
+    # when the caller did not supply it. Quantized transforms can realize a
+    # different tensor layout per architecture. A row that constrains
+    # `sm_versions` rejects an unknown SM, so the default fails closed.
+    sm_version: int | None = None
+    # Weight block size declared by the checkpoint's Hugging Face quantization
+    # config, or `None` when it declares none. A row that constrains
+    # `weight_block_sizes` rejects an undeclared block size.
+    weight_block_size: tuple[int, ...] | None = None
+
+    @classmethod
+    def from_model_config(
+        cls,
+        model_config: object,
+        *,
+        model: nn.Module | None = None,
+        sm_version: int | None = None,
+    ) -> "PostTransformRuntimeConfig":
+        """Capture the support-matrix dimensions from a final model config.
+
+        Args:
+            model_config: Final model config of the concrete load.
+            model: Constructed root model, used for dimensions that only the
+                built modules realize.
+            sm_version: SM version of the device that runs the load. The caller
+                supplies it so this module does not depend on CUDA.
+
+        Returns:
+            The canonical runtime dimensions of the load.
+        """
+
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        quant_config = getattr(model_config, "quant_config", None)
+        quant_config_dict = getattr(model_config, "quant_config_dict", _MISSING)
+        lora_config = getattr(model_config, "lora_config", _MISSING)
+        sparse_attention_config = getattr(model_config, "sparse_attention_config", _MISSING)
+        mapping = getattr(model_config, "mapping", None)
+        multi_node = _canonical_bool(mapping.is_multi_node()) if mapping is not None else None
+
+        if quant_config_dict is _MISSING:
+            layerwise_quantization = None
+        elif quant_config_dict is None:
+            layerwise_quantization = False
+        elif isinstance(quant_config_dict, dict):
+            layerwise_quantization = bool(quant_config_dict)
+        else:
+            layerwise_quantization = None
+
+        rope_scaling = getattr(pretrained_config, "rope_scaling", None)
+        if rope_scaling is None:
+            rope_type = "default"
+        elif isinstance(rope_scaling, dict):
+            rope_type = _canonical_string(rope_scaling.get("rope_type", rope_scaling.get("type")))
+        else:
+            rope_type = None
+
+        rope_fusion = _realized_rope_fusion(model) if model is not None else None
+        sliding_window = _realized_sliding_window(model) if model is not None else None
+        # A constructed model must realize the declared tie, so the config flag
+        # can neither claim nor hide an `lm_head`/`embed_tokens` alias.
+        tied_word_embeddings = _canonical_bool(
+            getattr(pretrained_config, "tie_word_embeddings", None)
+        )
+        if model is not None:
+            realized_tie = _realized_tied_word_embeddings(model)
+            if realized_tie != tied_word_embeddings:
+                # Qualification reports only the dimension; log the cause at
+                # debug level, since loads that never use MX also get here.
+                logger.debug(
+                    "Post-transform qualification treats tied_word_embeddings as unknown: "
+                    + _tie_mismatch_reason(tied_word_embeddings, realized_tie)
+                )
+                tied_word_embeddings = None
+
+        return cls(
+            dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),
+            quant_algorithm=_canonical_optional_string(quant_config, "quant_algo"),
+            kv_cache_quant_algorithm=_canonical_optional_string(
+                quant_config, "kv_cache_quant_algo"
+            ),
+            layerwise_quantization=layerwise_quantization,
+            force_dynamic_quantization=_canonical_bool(
+                getattr(model_config, "force_dynamic_quantization", None)
+            ),
+            lora_enabled=None if lora_config is _MISSING else lora_config is not None,
+            sparse_attention_enabled=(
+                None if sparse_attention_config is _MISSING else sparse_attention_config is not None
+            ),
+            attention_backend=_canonical_string(getattr(model_config, "attn_backend", None)),
+            moe_backend=_canonical_string(getattr(model_config, "moe_backend", None)),
+            tp_size=_canonical_int(getattr(mapping, "tp_size", None)),
+            pp_size=_canonical_int(getattr(mapping, "pp_size", None)),
+            cp_size=_canonical_int(getattr(mapping, "cp_size", None)),
+            moe_tp_size=_canonical_int(getattr(mapping, "moe_tp_size", None)),
+            moe_ep_size=_canonical_int(getattr(mapping, "moe_ep_size", None)),
+            moe_cluster_size=_canonical_int(getattr(mapping, "moe_cluster_size", None)),
+            attention_tp_size=_canonical_int(getattr(mapping, "attn_tp_size", None)),
+            attention_cp_size=_canonical_int(getattr(mapping, "attn_cp_size", None)),
+            attention_dp=_canonical_bool(getattr(mapping, "enable_attention_dp", None)),
+            multi_node=multi_node,
+            tied_word_embeddings=tied_word_embeddings,
+            rope_type=rope_type,
+            rope_fusion=rope_fusion,
+            sliding_window=sliding_window,
+            sm_version=_canonical_int(sm_version),
+            weight_block_size=_declared_weight_block_size(pretrained_config),
+        )
+
+
+@dataclass(frozen=True)
+class PostTransformRuntimeConstraints:
+    """Allowed values for one qualified runtime support-matrix row."""
+
+    _DIMENSIONS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("dtypes", "dtype"),
+        ("quant_algorithms", "quant_algorithm"),
+        ("kv_cache_quant_algorithms", "kv_cache_quant_algorithm"),
+        ("layerwise_quantization", "layerwise_quantization"),
+        ("force_dynamic_quantization", "force_dynamic_quantization"),
+        ("lora_enabled", "lora_enabled"),
+        ("sparse_attention_enabled", "sparse_attention_enabled"),
+        ("attention_backends", "attention_backend"),
+        ("moe_backends", "moe_backend"),
+        ("tp_sizes", "tp_size"),
+        ("pp_sizes", "pp_size"),
+        ("cp_sizes", "cp_size"),
+        ("moe_tp_sizes", "moe_tp_size"),
+        ("moe_ep_sizes", "moe_ep_size"),
+        ("moe_cluster_sizes", "moe_cluster_size"),
+        ("attention_tp_sizes", "attention_tp_size"),
+        ("attention_cp_sizes", "attention_cp_size"),
+        ("attention_dp", "attention_dp"),
+        ("multi_node", "multi_node"),
+        ("tied_word_embeddings", "tied_word_embeddings"),
+        ("rope_types", "rope_type"),
+        ("rope_fusion", "rope_fusion"),
+        ("sliding_windows", "sliding_window"),
+        ("sm_versions", "sm_version"),
+        ("weight_block_sizes", "weight_block_size"),
+    )
+
+    dtypes: frozenset[str | None] | None = None
+    quant_algorithms: frozenset[str | None] | None = None
+    kv_cache_quant_algorithms: frozenset[str | None] | None = None
+    layerwise_quantization: frozenset[bool | None] | None = None
+    force_dynamic_quantization: frozenset[bool | None] | None = None
+    lora_enabled: frozenset[bool | None] | None = None
+    sparse_attention_enabled: frozenset[bool | None] | None = None
+    attention_backends: frozenset[str | None] | None = None
+    moe_backends: frozenset[str | None] | None = None
+    tp_sizes: frozenset[int | None] | None = None
+    pp_sizes: frozenset[int | None] | None = None
+    cp_sizes: frozenset[int | None] | None = None
+    moe_tp_sizes: frozenset[int | None] | None = None
+    moe_ep_sizes: frozenset[int | None] | None = None
+    moe_cluster_sizes: frozenset[int | None] | None = None
+    attention_tp_sizes: frozenset[int | None] | None = None
+    attention_cp_sizes: frozenset[int | None] | None = None
+    attention_dp: frozenset[bool | None] | None = None
+    multi_node: frozenset[bool | None] | None = None
+    tied_word_embeddings: frozenset[bool | None] | None = None
+    rope_types: frozenset[str | None] | None = None
+    rope_fusion: frozenset[bool | None] | None = None
+    sliding_windows: frozenset[str | None] | None = None
+    sm_versions: frozenset[int | None] | None = None
+    weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
+
+    def __post_init__(self) -> None:
+        for constraint_name, _runtime_name in self._DIMENSIONS:
+            allowed_values = getattr(self, constraint_name)
+            if allowed_values is None:
+                continue
+            normalized_values = frozenset(allowed_values)
+            if not normalized_values:
+                raise ValueError(
+                    f"Post-transform runtime constraint {constraint_name} must not be empty"
+                )
+            object.__setattr__(self, constraint_name, normalized_values)
+
+    def unsupported_dimensions(
+        self, runtime_config: PostTransformRuntimeConfig | None
+    ) -> frozenset[str]:
+        """Return constrained dimensions not satisfied by a concrete run."""
+
+        unsupported = set()
+        for constraint_name, runtime_name in self._DIMENSIONS:
+            allowed_values = getattr(self, constraint_name)
+            if allowed_values is None:
+                continue
+            runtime_value = (
+                None if runtime_config is None else getattr(runtime_config, runtime_name)
+            )
+            if runtime_value not in allowed_values:
+                unsupported.add(runtime_name)
+        return frozenset(unsupported)
+
+    def overlaps(self, other: "PostTransformRuntimeConstraints") -> bool:
+        """Whether two rows admit at least one common runtime configuration."""
+
+        for constraint_name, _runtime_name in self._DIMENSIONS:
+            allowed_values = getattr(self, constraint_name)
+            other_allowed_values = getattr(other, constraint_name)
+            if (
+                allowed_values is not None
+                and other_allowed_values is not None
+                and allowed_values.isdisjoint(other_allowed_values)
+            ):
+                return False
+        return True
+
 
 class PostTransformTransferScope(str, Enum):
-    """The model component represented by a post-transform transfer."""
+    """The model component represented by a post-transform transfer.
+
+    `TARGET_MODEL` is a text-only root. `ModelLoader` also derives it for a
+    multimodal root that no profile registers, or whose language model it
+    cannot determine, so such a root never matches a multimodal profile.
+    `COMPLETE_MODEL` is a registered multimodal root together with its local
+    multimodal encoder. `LANGUAGE_MODEL` is a registered multimodal root
+    without a local encoder, for example when the encoder is disabled or runs
+    in a separate disaggregated worker.
+    """
 
     TARGET_MODEL = "target_model"
     LANGUAGE_MODEL = "language_model"
@@ -46,6 +535,13 @@ class PostTransformFeature(str, Enum):
     """Optional lifecycle features that require explicit qualification."""
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
+    LOCALITY_DOMAIN_LOCALIZED_WEIGHTS = "localized_weights"
+    # A realized MoE expert-parallel load balancer (EPLB) places experts in
+    # slots that can differ per rank and migrate at runtime.
+    MOE_LOAD_BALANCER = "moe_load_balancer"
+    # DWDP installs its own expert storage range on every MoE layer while the
+    # mapping reports MoE TP and EP sizes of 1.
+    DWDP = "dwdp"
 
 
 class PostTransformQualificationReason(str, Enum):
@@ -58,20 +554,77 @@ class PostTransformQualificationReason(str, Enum):
     SPECULATIVE_MODE_NOT_REGISTERED = "speculative_mode_not_registered"
     PROTOCOL_NOT_REGISTERED = "protocol_not_registered"
     TRANSFER_SCOPE_NOT_REGISTERED = "transfer_scope_not_registered"
+    RUNTIME_CONFIG_NOT_SUPPORTED = "runtime_config_not_supported"
     FEATURE_NOT_SUPPORTED = "feature_not_supported"
+
+
+class RootModelIdentity(abc.ABC):
+    """Describe a root model, and test for identity"""
+
+    @property
+    @abc.abstractmethod
+    def class_name(self) -> str: ...
+
+    @abc.abstractmethod
+    def matches(self, candidate: type[nn.Module]) -> bool: ...
+
+
+@dataclass(frozen=True)
+class EagerRootModelIdentity(RootModelIdentity):
+    class_: type[nn.Module]
+
+    @property
+    def class_name(self) -> str:
+        return self.class_.__name__
+
+    def matches(self, candidate: type[nn.Module]) -> bool:
+        return candidate is self.class_
+
+
+@dataclass(frozen=True)
+class LazyRootModelIdentity(RootModelIdentity):
+    module_name: str
+    class_name_: str
+
+    @property
+    def class_name(self) -> str:
+        # dataclass field cannot implement abstract property
+        return self.class_name_
+
+    def matches(self, candidate: type[nn.Module]) -> bool:
+        """Whether ``candidate`` is the very class this reference names.
+
+        Never really loads a module: ``candidate`` can only be this class if the
+        defining module has already executed in this interpreter, so the guard
+        below turns every answer that would need a load into a ``False`` and
+        ``importlib.import_module`` becomes a guarded dict read on
+        ``sys.modules``.
+        """
+        if self.module_name not in sys.modules:
+            return False
+        # Guarded above, so this resolves out of sys.modules without importing.
+        module = importlib.import_module(self.module_name)
+        return candidate is getattr(module, self.class_name)
 
 
 @dataclass(frozen=True)
 class PostTransformProfile:
-    """One exact root-model profile qualified for post-transform sharing."""
+    """One exact root-model profile qualified for post-transform sharing.
+
+    ``root_model_class`` can be initialized with either the root class directly,
+     or a ``RootModelIdentity`` instance, and will always be converted into a
+     ``RootModelIdentity``.
+    """
 
     profile_id: str
-    root_model_class: type[nn.Module]
+    root_model_class: RootModelIdentity | type[nn.Module]
     architecture: str
     model_type: str
     speculative_mode: str | None
     protocol_version: int
     transfer_scope: PostTransformTransferScope
+    transform_abi_id: str
+    runtime_constraints: PostTransformRuntimeConstraints
     supported_features: frozenset[PostTransformFeature] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -85,7 +638,17 @@ class PostTransformProfile:
             raise ValueError("Post-transform speculative_mode must not be empty")
         if self.protocol_version < 1:
             raise ValueError("Post-transform protocol_version must be positive")
+        if not isinstance(self.transform_abi_id, str) or not self.transform_abi_id:
+            raise ValueError("Post-transform transform_abi_id must be a non-empty string")
         object.__setattr__(self, "supported_features", frozenset(self.supported_features))
+        if not isinstance(self.runtime_constraints, PostTransformRuntimeConstraints):
+            raise TypeError(
+                "Post-transform runtime_constraints must be PostTransformRuntimeConstraints"
+            )
+        if not isinstance(self.root_model_class, RootModelIdentity):
+            object.__setattr__(
+                self, "root_model_class", EagerRootModelIdentity(self.root_model_class)
+            )
 
 
 @dataclass(frozen=True)
@@ -95,18 +658,41 @@ class PostTransformQualificationDecision:
     reason: PostTransformQualificationReason
     profile: PostTransformProfile | None = None
     unsupported_features: frozenset[PostTransformFeature] = field(default_factory=frozenset)
+    unsupported_runtime_dimensions: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "unsupported_features", frozenset(self.unsupported_features))
+        object.__setattr__(
+            self,
+            "unsupported_runtime_dimensions",
+            frozenset(self.unsupported_runtime_dimensions),
+        )
         if self.reason is PostTransformQualificationReason.QUALIFIED:
             if self.profile is None:
                 raise ValueError("A qualified decision must include its profile")
-            if self.unsupported_features:
-                raise ValueError("A qualified decision cannot include unsupported features")
-        elif self.unsupported_features and (
-            self.reason is not PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
-        ):
-            raise ValueError("Unsupported features require a feature_not_supported decision")
+            if self.unsupported_features or self.unsupported_runtime_dimensions:
+                raise ValueError("A qualified decision cannot include unsupported dimensions")
+        else:
+            if self.unsupported_features and (
+                self.reason is not PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+            ):
+                raise ValueError("Unsupported features require a feature_not_supported decision")
+            if self.unsupported_runtime_dimensions and (
+                self.reason is not PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+            ):
+                raise ValueError(
+                    "Unsupported runtime dimensions require a runtime_config_not_supported decision"
+                )
+            if (
+                self.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+                and not self.unsupported_features
+            ):
+                raise ValueError("A feature_not_supported decision must identify features")
+            if (
+                self.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+                and not self.unsupported_runtime_dimensions
+            ):
+                raise ValueError("A runtime_config_not_supported decision must identify dimensions")
 
     @property
     def qualified(self) -> bool:
@@ -115,6 +701,32 @@ class PostTransformQualificationDecision:
         return (
             self.reason is PostTransformQualificationReason.QUALIFIED and self.profile is not None
         )
+
+    @property
+    def transform_abi_id(self) -> str | None:
+        """The qualified layout ABI, or `None` for a rejected profile."""
+
+        return (
+            self.profile.transform_abi_id if self.qualified and self.profile is not None else None
+        )
+
+    def describe(self) -> str:
+        """Render the reason and the details this decision reports, for logs and errors.
+
+        For example `reason=feature_not_supported; unsupported_features=dwdp`.
+        Empty details are omitted: `qualify()` stops at a runtime mismatch
+        before it checks features, so an empty feature set there does not mean
+        that no unsupported feature is active.
+        """
+
+        parts = [f"reason={self.reason.value}"]
+        if self.unsupported_runtime_dimensions:
+            dimensions = ",".join(sorted(self.unsupported_runtime_dimensions))
+            parts.append(f"unsupported_runtime_dimensions={dimensions}")
+        if self.unsupported_features:
+            features = ",".join(sorted(feature.value for feature in self.unsupported_features))
+            parts.append(f"unsupported_features={features}")
+        return "; ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -127,30 +739,35 @@ class PostTransformProfileRegistry:
         object.__setattr__(self, "profiles", tuple(self.profiles))
 
         profile_ids: set[str] = set()
-        profile_keys: set[
-            tuple[type[nn.Module], str, str, str | None, int, PostTransformTransferScope]
-        ] = set()
+        # Keyed by root class *name*: resolving a LazyRootModelClass here would
+        # import every profiled model's module just to construct the registry.
+        profile_keys: dict[
+            tuple[str, str, str, str | None, int, PostTransformTransferScope],
+            list[PostTransformProfile],
+        ] = {}
         for profile in self.profiles:
             if profile.profile_id in profile_ids:
                 raise ValueError(f"Duplicate post-transform profile_id: {profile.profile_id!r}")
             profile_ids.add(profile.profile_id)
 
             key = (
-                profile.root_model_class,
+                profile.root_model_class.class_name,
                 profile.architecture,
                 profile.model_type,
                 profile.speculative_mode,
                 profile.protocol_version,
                 profile.transfer_scope,
             )
-            if key in profile_keys:
-                raise ValueError(
-                    "Duplicate post-transform profile for "
-                    f"{profile.root_model_class.__name__}/{profile.architecture}/"
-                    f"{profile.model_type}/{profile.speculative_mode or 'target-only'}/"
-                    f"v{profile.protocol_version}/{profile.transfer_scope.value}"
-                )
-            profile_keys.add(key)
+            for existing_profile in profile_keys.setdefault(key, []):
+                if profile.runtime_constraints.overlaps(existing_profile.runtime_constraints):
+                    raise ValueError(
+                        "Duplicate post-transform profile for "
+                        f"{profile.root_model_class.class_name}/{profile.architecture}/"
+                        f"{profile.model_type}/{profile.speculative_mode or 'target-only'}/"
+                        f"v{profile.protocol_version}/{profile.transfer_scope.value}: "
+                        "runtime constraints overlap"
+                    )
+            profile_keys[key].append(profile)
 
     def qualify(
         self,
@@ -162,6 +779,7 @@ class PostTransformProfileRegistry:
         protocol_version: int,
         transfer_scope: PostTransformTransferScope,
         enabled_features: frozenset[PostTransformFeature] = frozenset(),
+        runtime_config: PostTransformRuntimeConfig | None = None,
     ) -> PostTransformQualificationDecision:
         """Match a receiver request against the exact qualified profile set.
 
@@ -174,6 +792,8 @@ class PostTransformProfileRegistry:
             protocol_version: Post-transform transfer protocol version.
             transfer_scope: Component represented by the transfer.
             enabled_features: Optional lifecycle features active for this load.
+            runtime_config: Resolved dtype, quantization, backend, topology, and
+                model-feature dimensions for the concrete load.
 
         Returns:
             A structured qualification decision and the matching profile, when
@@ -181,7 +801,9 @@ class PostTransformProfileRegistry:
         """
 
         model_profiles = tuple(
-            profile for profile in self.profiles if profile.root_model_class is root_model_class
+            profile
+            for profile in self.profiles
+            if profile.root_model_class.matches(root_model_class)
         )
         if not model_profiles:
             return PostTransformQualificationDecision(
@@ -232,7 +854,27 @@ class PostTransformProfileRegistry:
                 PostTransformQualificationReason.TRANSFER_SCOPE_NOT_REGISTERED
             )
 
-        profile = scope_profiles[0]
+        runtime_matches = []
+        runtime_mismatches = []
+        for profile in scope_profiles:
+            unsupported_runtime_dimensions = profile.runtime_constraints.unsupported_dimensions(
+                runtime_config
+            )
+            if unsupported_runtime_dimensions:
+                runtime_mismatches.append((profile, unsupported_runtime_dimensions))
+            else:
+                runtime_matches.append(profile)
+        if not runtime_matches:
+            profile, unsupported_runtime_dimensions = min(
+                runtime_mismatches, key=lambda item: len(item[1])
+            )
+            return PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                profile=profile,
+                unsupported_runtime_dimensions=unsupported_runtime_dimensions,
+            )
+
+        profile = runtime_matches[0]
         unsupported_features = frozenset(enabled_features) - profile.supported_features
         if unsupported_features:
             return PostTransformQualificationDecision(

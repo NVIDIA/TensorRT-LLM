@@ -1,0 +1,21 @@
+{
+    "model_mode": "image2video",
+    "prompt": {
+        "cinematography": {
+            "framing": "This video contains concatenated views from multiple camera perspectives. The top row is from the wrist-mounted camera. The bottom row contains two horizontally concatenated third-person perspective views of the scene from opposite sides, with the robot visible."
+        },
+        "actions": [
+            {
+                "time": "0:00-0:02",
+                "description": "Pick up the object and place it at the requested location."
+            }
+        ],
+        "duration": "2s",
+        "fps": 15.0,
+        "resolution": {
+            "H": 544,
+            "W": 736
+        },
+        "aspect_ratio": "4,3"
+    }
+}

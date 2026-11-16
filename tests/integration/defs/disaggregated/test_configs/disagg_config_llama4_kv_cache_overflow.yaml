@@ -19,9 +19,7 @@ context_servers:
   disable_overlap_scheduler: true
   cuda_graph_config: null
   cache_transceiver_config:
-    backend: UCX
-    # Intentionally small to reproduce buffer overflow bug
-    max_tokens_in_buffer: 2048
+    backend: NIXL
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -40,6 +38,4 @@ generation_servers:
   disable_overlap_scheduler: true
   cuda_graph_config: null
   cache_transceiver_config:
-    backend: UCX
-    # Intentionally small to reproduce buffer overflow bug
-    max_tokens_in_buffer: 2048
+    backend: NIXL

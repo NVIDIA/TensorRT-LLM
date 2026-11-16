@@ -14,7 +14,8 @@ generation_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: True
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
   urls:
       - "localhost:8002"
       - "localhost:8003"

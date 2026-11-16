@@ -16,7 +16,6 @@ context_servers:
     free_gpu_memory_fraction: 0.3
   cache_transceiver_config:
     backend: DEFAULT
-    max_tokens_in_buffer: 32768
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1
@@ -33,7 +32,6 @@ generation_servers:
     free_gpu_memory_fraction: 0.85
   cache_transceiver_config:
     backend: DEFAULT
-    max_tokens_in_buffer: 32768
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 64

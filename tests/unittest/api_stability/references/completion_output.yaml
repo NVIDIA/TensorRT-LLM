@@ -32,3 +32,6 @@ properties:
   token_ids_diff:
     annotation: List[int]
     default: inspect._empty
+  routed_experts:
+    annotation: Optional[torch.Tensor]
+    default: inspect._empty

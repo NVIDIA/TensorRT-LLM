@@ -74,6 +74,160 @@ _STRESS_CONFIG_COERCERS: dict[str, Callable[[Any], Any]] = {
 }
 
 
+# `${VAR}` references in external_cluster string fields. Expanded at
+# setup() time, not YAML-parse time, so configs with unset placeholders
+# still pass the parse/validate gate (and CI collection).
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_refs(value: str, *, label: str) -> str:
+    """Expand `${VAR}` references in `value` from the environment.
+
+    Args:
+        value: String possibly containing `${VAR}` references.
+        label: Config-field name embedded in the error message.
+
+    Returns:
+        `value` with every reference replaced by the variable's value.
+
+    Raises:
+        ValueError: If any referenced variable is unset. Unset
+            references never pass through silently — a literal
+            `${...}` in a URL or log path would only fail later and
+            further from the root cause.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        env_value = os.environ.get(name)
+        if env_value is None:
+            raise ValueError(f"{label} references unset environment variable {name!r}")
+        return env_value
+
+    return _ENV_REF_RE.sub(replace, value)
+
+
+def _require_readable_log(path: str, label: str) -> None:
+    """Raise `RuntimeError` unless `path` is a file this process can read.
+
+    Args:
+        path: Expanded log path from the `external_cluster` block.
+        label: Config-field name embedded in the error message.
+    """
+    if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+        raise RuntimeError(f"{label} {path!r} is not a readable file")
+
+
+def _unset_env_refs(value: str) -> list[str]:
+    """Return the `${VAR}` names in `value` that are unset in the environment."""
+    return [name for name in _ENV_REF_RE.findall(value) if os.environ.get(name) is None]
+
+
+@dataclass(frozen=True)
+class ExternalClusterConfig:
+    """Parsed `stress_config.external_cluster:` block (attach mode).
+
+    When present, the harness attaches to an already-running
+    disaggregated cluster instead of launching one via
+    `setup_disagg_cluster`: the orchestrator URL becomes the probe
+    endpoint and the worker log paths feed the log-scanner thread.
+    This is how models whose per-instance GPU footprint exceeds one
+    node run the marathon — the cluster is booted externally (e.g.
+    one tray per instance via `srun`) and the test only needs
+    HTTP + filesystem access to it.
+
+    String fields may contain `${VAR}` environment references,
+    resolved at `setup()` time (see `_expand_env_refs`); structural
+    validation here is env-independent so checked-in YAMLs with
+    placeholders still parse.
+    """
+
+    server_url: str
+    # (role, log_path) pairs in YAML order; per-role indices are
+    # assigned in that order at setup() time.
+    worker_logs: tuple[tuple[str, str], ...]
+    server_log: Optional[str] = None
+    worker_health_urls: tuple[str, ...] = ()
+    # Model name for the OpenAI request envelope; falls back to the
+    # YAML's top-level `model`. Attach mode never loads weights, so
+    # this should be the externally-launched cluster's served model
+    # name rather than a checkpoint path.
+    model_name: Optional[str] = None
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "ExternalClusterConfig":
+        """Structurally validate the YAML subtree; no env expansion.
+
+        Raises:
+            ValueError: If the subtree is not a mapping, `server_url`
+                is missing/empty, `worker_logs` is missing/empty, or
+                any entry lacks a valid `role` / `path`.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError(f"external_cluster must be a mapping, got {raw!r}")
+        server_url = raw.get("server_url")
+        if not isinstance(server_url, str) or not server_url:
+            raise ValueError("external_cluster.server_url must be a non-empty string")
+        raw_logs = raw.get("worker_logs")
+        if not isinstance(raw_logs, list) or not raw_logs:
+            raise ValueError(
+                "external_cluster.worker_logs must be a non-empty list of {role, path} mappings"
+            )
+        worker_logs: list[tuple[str, str]] = []
+        for i, entry in enumerate(raw_logs):
+            if not isinstance(entry, dict):
+                raise ValueError(f"external_cluster.worker_logs[{i}] must be a mapping")
+            role = entry.get("role")
+            path = entry.get("path")
+            if role not in ("ctx", "gen"):
+                raise ValueError(
+                    f"external_cluster.worker_logs[{i}].role must be 'ctx' or 'gen', got {role!r}"
+                )
+            if not isinstance(path, str) or not path:
+                raise ValueError(
+                    f"external_cluster.worker_logs[{i}].path must be a non-empty string"
+                )
+            worker_logs.append((role, path))
+        server_log = raw.get("server_log")
+        if server_log is not None and (not isinstance(server_log, str) or not server_log):
+            raise ValueError("external_cluster.server_log must be a non-empty string when set")
+        raw_health = raw.get("worker_health_urls", [])
+        if not isinstance(raw_health, list) or not all(
+            isinstance(u, str) and u for u in raw_health
+        ):
+            raise ValueError(
+                "external_cluster.worker_health_urls must be a list of non-empty strings"
+            )
+        model_name = raw.get("model_name")
+        if model_name is not None and (not isinstance(model_name, str) or not model_name):
+            raise ValueError("external_cluster.model_name must be a non-empty string when set")
+        return cls(
+            server_url=server_url,
+            worker_logs=tuple(worker_logs),
+            server_log=server_log,
+            worker_health_urls=tuple(raw_health),
+            model_name=model_name,
+        )
+
+    def missing_env_vars(self) -> list[str]:
+        """Names of `${VAR}` references that are currently unset.
+
+        Lets the pytest entry point `skip` (rather than fail) an
+        attach-mode marathon when no external cluster is provided —
+        e.g. when the YAML is parametrized but the run environment
+        did not export the endpoint variables.
+        """
+        missing: list[str] = []
+        fields = [self.server_url, self.server_log or "", self.model_name or ""]
+        fields.extend(path for _, path in self.worker_logs)
+        fields.extend(self.worker_health_urls)
+        for value in fields:
+            for name in _unset_env_refs(value):
+                if name not in missing:
+                    missing.append(name)
+        return missing
+
+
 @dataclass
 class StressConfig:
     """Parsed contents of a marathon YAML's ``stress_config:`` block.
@@ -85,11 +239,14 @@ class StressConfig:
 
     mode: str = _STRESS_MODE_LOG_ONLY
     duration_min: float = 120.0
-    kv_cache_manager: str = "v1"  # v1 | v2  (v2 + CPP is invalid)
-    transceiver: str = "cpp"  # cpp | python
+    kv_cache_manager: str = "v2"
+    transceiver: str = "python"
     base_concurrency: int = 64
     client_cancel_rate: float = 0.10
     output_length: int = 512
+    # Attach mode: bind to an externally-launched cluster instead of
+    # calling setup_disagg_cluster. None = launch locally (default).
+    external_cluster: Optional[ExternalClusterConfig] = None
     # Full YAML subtree, for fields the harness consumes lazily
     # (bursts, injections, canary, log_scan, kv_cache_growth_max).
     raw: dict[str, Any] = field(default_factory=dict)
@@ -131,6 +288,8 @@ class StressConfig:
         for name, coerce in _STRESS_CONFIG_COERCERS.items():
             if name in sc:
                 kwargs[name] = coerce(sc[name])
+        if "external_cluster" in sc:
+            kwargs["external_cluster"] = ExternalClusterConfig.from_raw(sc["external_cluster"])
         cfg = cls(**kwargs)
         cfg.validate()
         return cfg
@@ -139,28 +298,25 @@ class StressConfig:
         """Reject backend-knob combinations that are not supported.
 
         Raises:
-            ValueError: If ``kv_cache_manager`` is not ``"v1"`` or
-                ``"v2"``, if ``transceiver`` is not ``"cpp"`` or
-                ``"python"``, or if the pair ``(v2, cpp)`` is
-                supplied (the C++ transceiver only supports the V1
-                KV cache manager).
+            ValueError: If ``kv_cache_manager`` is not ``"v2"``, or
+                ``transceiver`` is not ``"python"``.
         """
         if self.mode not in _STRESS_MODES:
             raise ValueError(f"mode must be one of {_STRESS_MODES}, got {self.mode!r}")
-        if self.kv_cache_manager == "v2" and self.transceiver == "cpp":
-            # The C++ transceiver (BindKvCacheTransceiver) only supports
-            # the V1 KV cache manager. V2 must be paired with the Python
-            # transceiver (KvCacheTransceiverV2).
+        if self.kv_cache_manager != "v2":
+            raise ValueError(f"kv_cache_manager must be 'v2', got {self.kv_cache_manager!r}")
+        if self.transceiver != "python":
+            raise ValueError(f"transceiver must be 'python', got {self.transceiver!r}")
+        if self.external_cluster is not None and self.is_full_cancel_poison:
+            # Fault injection signals local worker subprocesses by PID
+            # and respawns them via the shared launcher; an externally
+            # launched cluster offers neither, so the combination is a
+            # config error rather than a silently-degraded marathon.
             raise ValueError(
-                "(kv_cache_manager=v2, transceiver=cpp) is an unsupported "
-                "combination; pair V2 with the Python transceiver."
+                "mode=full_cancel_poison is unsupported with external_cluster: "
+                "injection and respawn require locally-launched worker processes. "
+                "Use mode=log_only for attach-mode marathons."
             )
-        if self.kv_cache_manager not in ("v1", "v2"):
-            raise ValueError(
-                f"kv_cache_manager must be 'v1' or 'v2', got {self.kv_cache_manager!r}"
-            )
-        if self.transceiver not in ("cpp", "python"):
-            raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
 
     @property
     def is_log_only(self) -> bool:
@@ -420,6 +576,30 @@ def _parse_injection_schedule(raw_injections: list[Any]) -> list[_InjectionSpec]
         )
     specs.sort(key=lambda s: s.at_min)
     return specs
+
+
+def _worker_id_pid(worker_id: str) -> Optional[int]:
+    """Extract the pid a cluster worker embedded in its worker id.
+
+    DisaggClusterWorker builds the id as
+    ``{role}-{host}:{port}-{time_ms}-{pid}-{rand}``. Only the last two fields
+    are fixed-width in structure, so the pid is read from the tail: a substring
+    search for ``-{pid}-`` would also match inside a host name that contains a
+    dash-delimited digit run, such as ``node-1234-a``.
+
+    Args:
+        worker_id: The ``worker_id`` reported by ``/cluster_info``.
+
+    Returns:
+        The pid, or None if the id does not have the expected shape.
+    """
+    fields = worker_id.rsplit("-", 2)
+    if len(fields) != 3:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
 
 
 def _resolve_injection_target(target: str, tracked: list[_TrackedWorker]) -> _TrackedWorker:
@@ -975,7 +1155,14 @@ class DisaggCancellationStressHarness:
         ``stress_config`` block is stripped from the temporary YAML
         passed to the shared launcher so worker config validation only
         sees normal ``trtllm-serve`` settings.
+
+        When `stress_config.external_cluster` is present, no cluster
+        is launched at all; see `_setup_external_cluster`.
         """
+        if self.config.external_cluster is not None:
+            self._setup_external_cluster()
+            return
+
         from test_disaggregated import (
             build_worker_config,
             get_default_disagg_cluster_config,
@@ -1044,6 +1231,112 @@ class DisaggCancellationStressHarness:
             len(gen_workers),
             server_url,
         )
+
+    def _setup_external_cluster(self) -> None:
+        """Attach to an externally-launched disagg cluster (no local Popen).
+
+        Expands `${VAR}` references in the `external_cluster`
+        block, binds the orchestrator endpoint for the probe thread,
+        and registers worker/server log paths as `WorkerLaunchSpec`
+        shadows so the log-scanner thread tails them exactly as it
+        would for a locally-launched cluster. The cluster is already up,
+        so every listed log must already be a readable file: the scanner
+        waits silently for a missing one, which would leave that worker
+        unchecked. No workers are tracked
+        (`_tracked_workers` stays empty): fault injection is
+        unavailable in attach mode, which `StressConfig.validate`
+        already enforces by rejecting `full_cancel_poison`.
+
+        Raises:
+            ValueError: If an `${VAR}` reference is unset, or the
+                YAML lacks both `external_cluster.model_name` and a
+                top-level `model`.
+            RuntimeError: If a listed log is not a readable file, or a
+                configured `worker_health_urls` probe does not return
+                HTTP 200.
+        """
+        ext = self.config.external_cluster
+        assert ext is not None  # guarded by setup()
+
+        server_url = _expand_env_refs(ext.server_url, label="external_cluster.server_url")
+
+        if ext.model_name is not None:
+            model_name = _expand_env_refs(ext.model_name, label="external_cluster.model_name")
+        else:
+            with self.yaml_path.open("r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+            model_name = str((doc or {}).get("model") or "")
+            if not model_name:
+                raise ValueError(
+                    f"YAML at {self.yaml_path} needs external_cluster.model_name "
+                    "or a top-level model for the request envelope"
+                )
+
+        specs: list[WorkerLaunchSpec] = []
+        role_counts = {"ctx": 0, "gen": 0}
+        for role, raw_path in ext.worker_logs:
+            index = role_counts[role]
+            role_counts[role] += 1
+            specs.append(
+                WorkerLaunchSpec(
+                    role=role,
+                    index=index,
+                    model_name=model_name,
+                    worker_config={},
+                    work_dir="",
+                    port=0,
+                    device="",
+                    env={},
+                    log_path=_expand_env_refs(
+                        raw_path, label=f"external_cluster.worker_logs[{role}_{index}].path"
+                    ),
+                )
+            )
+        for spec in specs:
+            _require_readable_log(
+                spec.log_path, f"external_cluster.worker_logs[{spec.role}_{spec.index}].path"
+            )
+        self._worker_specs = specs
+        self._tracked_workers = []
+        if ext.server_log is not None:
+            self._server_log_path = _expand_env_refs(
+                ext.server_log, label="external_cluster.server_log"
+            )
+            _require_readable_log(self._server_log_path, "external_cluster.server_log")
+
+        for i, raw_url in enumerate(ext.worker_health_urls):
+            url = _expand_env_refs(raw_url, label=f"external_cluster.worker_health_urls[{i}]")
+            self._check_external_endpoint(url)
+        # The orchestrator must already be healthy — attach mode never
+        # waits for a boot, it verifies one that external tooling
+        # reported up.
+        self._check_external_endpoint(f"{server_url.rstrip('/')}/health")
+
+        self.bind_server_endpoint(server_url, model_name)
+        logger.info(
+            "[harness] setup() attached to external cluster %s with %d ctx / %d gen log(s)",
+            server_url,
+            role_counts["ctx"],
+            role_counts["gen"],
+        )
+
+    def _check_external_endpoint(self, url: str, *, timeout_s: float = 15.0) -> None:
+        """GET `url` once; raise if it is not reachable with HTTP 200.
+
+        Kept as a method so unit tests can monkeypatch it without a
+        live HTTP server.
+
+        Raises:
+            RuntimeError: On any connection error, timeout, or
+                non-200 status.
+        """
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as response:
+                status = response.status
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"external cluster endpoint {url} unreachable: {exc}") from exc
+        if status != 200:
+            raise RuntimeError(f"external cluster endpoint {url} returned HTTP {status}")
 
     def _load_sanitized_cluster_config(self) -> dict[str, Any]:
         """Load YAML and remove harness-only fields before cluster launch."""
@@ -1865,13 +2158,15 @@ class DisaggCancellationStressHarness:
 
         Args:
             tracked: Worker to relaunch.
-            timeout_s: Maximum seconds to wait for HTTP 200 on ``/health``.
+            timeout_s: Total budget for the respawn, covering both the
+                cluster registration that reveals the worker's port and
+                the subsequent wait for HTTP 200 on ``/health``.
 
         Returns:
             True if the respawned worker reports healthy within the
             deadline; False otherwise.
         """
-        from disagg_test_utils import _run_worker, get_free_port
+        from disagg_test_utils import _run_worker
 
         spec = tracked.spec
         old = tracked.wrapper
@@ -1884,40 +2179,132 @@ class DisaggCancellationStressHarness:
 
         role_key = "ctx" if spec.role == "ctx" else "gen"
         save_log = spec.log_path is not None
-        new_port = get_free_port()
+        deadline = time.monotonic() + timeout_s
+        # port=0 lets the respawned worker bind an OS-assigned port inside its
+        # own process and register it with the cluster. Pre-picking a port here
+        # would race whoever grabs it between the probe and the child's rebind.
         try:
             new_wrapper = _run_worker(
                 spec.model_name,
                 spec.worker_config,
                 role_key,
-                port=new_port,
+                port=0,
                 work_dir=spec.work_dir,
                 device=spec.device,
                 save_log=save_log,
                 env=spec.env,
+                # Without this the respawn writes ctx_0/gen_0 filenames, so
+                # respawning worker N truncates worker 0's log out from under
+                # the log scanner. setup_disagg_cluster already passes it.
+                worker_index=spec.index,
             )
         except Exception:
-            logger.exception(
-                "[injector] failed to respawn %s_%d on port %d",
-                spec.role,
-                spec.index,
-                new_port,
-            )
+            logger.exception("[injector] failed to respawn %s_%d", spec.role, spec.index)
             return False
         tracked.wrapper = new_wrapper
-        spec.port = new_wrapper.port
+        # _teardown_cluster terminates the wrapper lists held in self._cluster,
+        # not self._tracked_workers, so the respawn has to replace its slot
+        # there or it survives teardown and keeps holding its GPUs. Done before
+        # the port wait below, so a respawn that never registers is cleaned up
+        # too. spec.index is per-role (see _make_worker_launch_spec callers).
+        if self._cluster is not None:
+            _, ctx_workers, gen_workers, *_ = self._cluster
+            workers = ctx_workers if spec.role == "ctx" else gen_workers
+            workers[spec.index] = new_wrapper
         if new_wrapper.log_path is not None:
             spec.log_path = new_wrapper.log_path
+
+        new_port = self._await_registered_worker_port(
+            role_key,
+            new_wrapper.process.pid,
+            deadline=deadline,
+        )
+        if new_port is None:
+            logger.error(
+                "[injector] respawned %s_%d (pid %d) never registered a port with the cluster",
+                spec.role,
+                spec.index,
+                new_wrapper.process.pid,
+            )
+            return False
+        spec.port = new_port
+        new_wrapper.port = new_port
 
         logger.info(
             "[injector] respawned %s_%d on port %s; waiting up to %.0fs for /health",
             spec.role,
             spec.index,
-            new_wrapper.port,
-            timeout_s,
+            new_port,
+            max(0.0, deadline - time.monotonic()),
         )
 
-        return self._wait_for_worker_health(new_wrapper.port, timeout_s=timeout_s)
+        return self._wait_for_worker_health(
+            new_port, timeout_s=max(0.0, deadline - time.monotonic())
+        )
+
+    def _await_registered_worker_port(
+        self, role_key: str, pid: int, *, deadline: float
+    ) -> Optional[int]:
+        """Poll ``/cluster_info`` for the port a respawned worker registered.
+
+        A worker launched with ``port=0`` only knows its port after it binds,
+        so the cluster registry is the sole authoritative source. Entries are
+        matched on the worker's pid, which ``WorkerInfo.worker_id`` embeds --
+        matching on "a port we have not seen before" would be ambiguous while
+        the SIGKILLed worker's stale registration is still being reaped. See
+        ``_worker_id_pid`` for why the pid is parsed rather than substring-matched.
+
+        Args:
+            role_key: ``"ctx"`` or ``"gen"``.
+            pid: Pid of the respawned ``trtllm-serve`` process.
+            deadline: ``time.monotonic()`` value to give up at.
+
+        Returns:
+            The registered port, or None if it did not appear in time.
+        """
+        if not self._server_url:
+            logger.error("[injector] no server URL bound; cannot resolve respawned worker port")
+            return None
+
+        info_key = "context_servers" if role_key == "ctx" else "generation_servers"
+        seen_worker_ids: list[str] = []
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set() or self.failed_event.is_set():
+                return None
+            try:
+                request_timeout = min(5.0, max(0.1, deadline - time.monotonic()))
+                with urllib.request.urlopen(
+                    f"{self._server_url}/cluster_info", timeout=request_timeout
+                ) as response:
+                    info = json.loads(response.read().decode("utf-8", errors="replace"))
+                seen_worker_ids = []
+                for worker_info in (info.get("current_workers") or {}).get(info_key) or []:
+                    if not isinstance(worker_info, dict):
+                        continue
+                    worker_id = str(worker_info.get("worker_id", ""))
+                    seen_worker_ids.append(worker_id)
+                    if _worker_id_pid(worker_id) != pid:
+                        continue
+                    try:
+                        return int(worker_info["port"])
+                    except (KeyError, TypeError, ValueError):
+                        logger.warning(
+                            "[injector] cluster_info %s entry for pid %d has invalid port %r",
+                            info_key,
+                            pid,
+                            worker_info.get("port"),
+                        )
+            except (json.JSONDecodeError, TimeoutError, OSError, urllib.error.URLError) as exc:
+                logger.debug("[injector] cluster_info poll failed: %s", exc)
+            self.stop_event.wait(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+
+        logger.warning(
+            "[injector] no %s worker matching pid %d in cluster_info; last saw %s",
+            info_key,
+            pid,
+            seen_worker_ids,
+        )
+        return None
 
     def _wait_for_worker_health(self, port: int, *, timeout_s: float) -> bool:
         """Poll a worker's ``/health`` endpoint until healthy or timed out."""

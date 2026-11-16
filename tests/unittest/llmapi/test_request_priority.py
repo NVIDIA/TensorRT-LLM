@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +30,9 @@ import pytest
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY, GenerationRequest
 from tensorrt_llm.sampling_params import SamplingParams
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # GenerationRequest
@@ -172,8 +177,6 @@ class TestBaseWorkerPriorityDefault:
         worker.llm_args = MagicMock()
         worker.llm_args.max_beam_width = 1
         worker.llm_args.return_perf_metrics = False
-        worker._executor_config = None
-        worker._is_pytorch_backend = False
         worker.max_seq_len = None
         worker.engine = MagicMock()
         worker.engine.enqueue_request = MagicMock(return_value=42)

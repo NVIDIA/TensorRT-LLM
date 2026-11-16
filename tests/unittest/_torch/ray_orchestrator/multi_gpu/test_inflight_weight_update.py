@@ -45,7 +45,7 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm import AsyncLLM
-from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
@@ -98,7 +98,7 @@ async def _run_generate_async(
 @pytest.mark.asyncio
 @skip_pre_hopper
 async def test_inflight_weight_update():
-    model_dir = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_dir = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     num_hidden_layers = 1
 
     # Reference HF model providing the "new" weights via CUDA IPC handles.

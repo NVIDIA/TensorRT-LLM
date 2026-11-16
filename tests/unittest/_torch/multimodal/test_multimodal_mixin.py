@@ -14,15 +14,25 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalModelMixin,
+    _assemble_multimodal_encoder_embeddings,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 
 
@@ -76,6 +86,8 @@ class TensorEncoderMultimodalModel(DummyMultimodalModel):
 
 
 class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     @property
     def embedding_dim(self) -> int:
         raise NotImplementedError
@@ -86,6 +98,8 @@ class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
 
 
 class CountingEncoderMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     def __init__(
         self,
         embedding: Embedding,
@@ -98,12 +112,18 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
             multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
         )
         self.encode_calls = 0
+        self._initialize_multimodal_encoder_cache(encoder_cache_max_bytes)
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         self.encode_calls += 1
-        total_rows = sum(
-            param.multimodal_runtime.total_embeds_in_request for param in multimodal_params
-        )
+        total_rows = 0
+        for param in multimodal_params:
+            # Residuals built by the partial-cache path carry `multimodal_embedding_lengths`
+            # but no `multimodal_runtime`; fall through to the metadata in that case.
+            if param.multimodal_runtime is not None:
+                total_rows += param.multimodal_runtime.total_embeds_in_request
+            else:
+                total_rows += sum(param.get_item_layout()[1])
         return torch.full(
             (total_rows, self.embedding.embedding_dim),
             float(self.encode_calls),
@@ -138,10 +158,22 @@ def make_keyed_multimodal_param(
         item_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
     if embedding_lengths is None:
         embedding_lengths = [2]
+    n_items = len(embedding_lengths)
 
+    # Pattern-A image data so the mixin's default `build_multimodal_encoder_input` can
+    # slice this param (dim-0 `pixel_values [B, C, H, W]` parallel to a per-item
+    # `image_sizes` list).
     mm_data = {
-        "image": {"pixel_values": torch.empty(1)},
-        "multimodal_embedding_lengths": embedding_lengths,
+        "image": {
+            "pixel_values": torch.arange(n_items * 3 * 2 * 2, dtype=torch.float32).reshape(
+                n_items, 3, 2, 2
+            ),
+            "image_sizes": [[2, 2]] * n_items,
+        },
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", i) for i in range(len(embedding_lengths))],
+            output_embedding_lengths=embedding_lengths,
+        ),
         "mm_processor_kwargs_hash": kwargs_hash,
     }
     if local_embedding is not None:
@@ -158,6 +190,7 @@ def make_keyed_multimodal_param(
     )
 
 
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 
@@ -203,8 +236,7 @@ def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
-def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
+def _test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     hidden = 8
     mm_token_id = 7
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -237,6 +269,49 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
+@pytest.mark.cpu_only
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
+
+
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+    )
+
+    class QwenModel(DummyMultimodalModel):
+        get_multimodal_item_partitions = Qwen3VLModelBase.get_multimodal_item_partitions
+
+    pixels = torch.arange(10, device="cuda").reshape(5, 2)
+    grids = torch.tensor([[1, 1, 2], [1, 1, 3]], device="cuda")
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": pixels, "image_grid_thw": grids},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 1), ("image", 0)], [3, 2], [3, 2]
+            ),
+        }
+    )
+    model = QwenModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    with patch.object(
+        torch.Tensor, "tolist", side_effect=AssertionError("Device grids must not be read back")
+    ):
+        selected = model.build_multimodal_encoder_input(param, [1, 0])
+
+    torch.testing.assert_close(
+        selected.multimodal_data["image"]["pixel_values"], torch.cat([pixels[2:], pixels[:2]])
+    )
+    torch.testing.assert_close(selected.multimodal_data["image"]["image_grid_thw"], grids[[1, 0]])
+
+
 def test_encoder_cache_first_request_writes_per_item_entries():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -255,15 +330,64 @@ def test_encoder_cache_first_request_writes_per_item_entries():
     assert len(model._multimodal_encoder_cache) == 2
 
 
-def test_encoder_cache_creation_logs_embedding_row_capacity():
+def test_encoder_cache_requires_model_opt_in():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    assert not model.encoder_cache_active
+
+
+def test_explicit_cache_initialization_creates_cache_without_persistent_reuse():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    cache = model._initialize_multimodal_encoder_cache(1024)
+
+    assert cache is not None
+    assert cache.max_bytes == 1024
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_explicit_cache_capacity_can_exceed_persistent_reuse_capacity():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
         torch.tensor([7]),
-        encoder_cache_max_bytes=4096,
+    )
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=1024)
     )
 
+    cache = model._initialize_multimodal_encoder_cache(2048)
+
+    assert cache is not None
+    assert cache.max_bytes == 2048
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_cache_reinitialization_requires_same_capacity():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+    cache = model._initialize_multimodal_encoder_cache(1024)
+
+    assert model._initialize_multimodal_encoder_cache(1024) is cache
+    with pytest.raises(ValueError, match="cannot reinitialize"):
+        model._initialize_multimodal_encoder_cache(2048)
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_encoder_cache_creation_logs_embedding_row_capacity():
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        CountingEncoderMultimodalModel(
+            make_embedding(hidden_size=4),
+            torch.tensor([7]),
+            encoder_cache_max_bytes=4096,
+        )
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
@@ -280,7 +404,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        model._initialize_multimodal_encoder_cache(4096)
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
@@ -346,6 +470,115 @@ def test_encoder_cache_repeated_chunk_does_not_rewrite_entries():
     assert cache.stats().replacements == 0
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_layout", ["tensor", "pieces", "raw"])
+def test_chunk_embeddings_mix_with_full_request_embeddings(peer_layout):
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4), torch.tensor([7]), encoder_cache_max_bytes=4096
+    )
+    full_output = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    chunk = make_cached_multimodal_param(full_output[2:4])
+    chunk.multimodal_data["multimodal_embedding_is_chunk"] = True
+    chunk.multimodal_runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.tensor([0, 1, 2, 2, 3, 4, 5]),
+        past_seen_token_num=4,
+        chunk_end_pos=6,
+    )
+    peer_output = full_output + 100
+    peer = make_keyed_multimodal_param(
+        embedding_lengths=[5],
+        local_embedding=peer_output if peer_layout != "raw" else None,
+    )
+    if peer_layout == "pieces":
+        peer.multimodal_data["multimodal_embedding"] = list(peer_output.split([2, 3]))
+    peer.multimodal_runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.arange(1, 6), past_seen_token_num=1, chunk_end_pos=3
+    )
+
+    input_ids = torch.tensor([7, 7, 0, 7, 7])
+    with patch("torch.cat", wraps=torch.cat) as join:
+        prepared = model.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=None,
+            multimodal_params=[chunk, peer],
+            num_context_requests=2,
+            text_token_indices=torch.tensor([2]),
+            mm_token_indices=torch.tensor([0, 1, 3, 4]),
+        )
+
+    expected_peer = torch.ones(2, 4) if peer_layout == "raw" else peer_output[1:3]
+    torch.testing.assert_close(prepared.inputs_embeds[:2], full_output[2:4])
+    torch.testing.assert_close(prepared.inputs_embeds[3:], expected_peer)
+    torch.testing.assert_close(prepared.inputs_embeds[2:3], model.embedding(input_ids[2:3]))
+    # Neither a legacy list of pieces nor the batch join may copy full future
+    # chunks. The chunk payload's nonzero cached prefix is not applied twice.
+    assert all(sum(tensor.shape[0] for tensor in call.args[0]) <= 4 for call in join.call_args_list)
+    assert model.encode_calls == int(peer_layout == "raw")
+    attached_peer = peer.multimodal_data["multimodal_embedding"]
+    peer_rows = (
+        sum(tensor.shape[0] for tensor in attached_peer)
+        if isinstance(attached_peer, list)
+        else attached_peer.shape[0]
+    )
+    assert peer_rows == 5  # Retained for subsequent chunks, not replaced by a slice.
+    if peer_layout == "raw":
+        assert model._multimodal_encoder_cache.current_bytes == 5 * 4 * 4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_only_chunk", [False, True])
+def test_chunk_embeddings_preserve_qwen3_deepstack_layout(text_only_chunk):
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+
+    # Exercise the real shared prepare flow and Qwen3 split/scatter hooks,
+    # without constructing a vision encoder or loading model weights.
+    model = Qwen3VLModelBase.__new__(Qwen3VLModelBase)
+    torch.nn.Module.__init__(model)
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=make_embedding(hidden_size=4)))
+    model.mm_encoder = torch.nn.Identity()
+    model._mm_token_ids = torch.tensor([7])
+    model.use_deepstack = True
+    model.deepstack_num_level = 2
+    model.deepstack_input_embeds = torch.empty(2, 5, 4)
+    full_output = torch.arange(60, dtype=torch.float32).reshape(5, 12)
+    runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.tensor([1, 2, 3, 3, 4, 5]),
+        past_seen_token_num=3 if text_only_chunk else 1,
+        chunk_end_pos=4 if text_only_chunk else 3,
+    )
+    start = runtime.num_cached_mm_tokens
+    end = start + runtime.num_mm_tokens_in_chunk
+    chunk = make_cached_multimodal_param(full_output[start:end])
+    chunk.multimodal_data["multimodal_embedding_is_chunk"] = True
+    peer = make_cached_multimodal_param(full_output + 100)
+    chunk.multimodal_runtime = peer.multimodal_runtime = runtime
+    input_ids = torch.tensor([0, 1] if text_only_chunk else [7, 0, 7, 7, 7])
+    mm_indices = torch.tensor([] if text_only_chunk else [0, 2, 3, 4], dtype=torch.long)
+    text_indices = torch.tensor([0, 1] if text_only_chunk else [1])
+
+    prepared = model.prepare_multimodal_inputs(
+        input_ids=input_ids,
+        positions=None,
+        multimodal_params=[chunk, peer],
+        num_context_requests=2,
+        text_token_indices=text_indices,
+        mm_token_indices=mm_indices,
+    )
+
+    if text_only_chunk:
+        assert prepared.input_ids is input_ids
+        assert prepared.inputs_embeds is None
+        assert not prepared.extra_embeds
+    else:
+        expected = torch.cat([full_output[start:end], (full_output + 100)[start:end]])
+        primary, *extra = expected.split(4, dim=1)
+        torch.testing.assert_close(prepared.inputs_embeds[mm_indices], primary)
+        assert len(prepared.extra_embeds) == 2
+        for actual, expected_level in zip(prepared.extra_embeds, extra, strict=True):
+            torch.testing.assert_close(actual[mm_indices], expected_level)
+            assert torch.count_nonzero(actual[text_indices]) == 0
+
+
 def test_encoder_cache_mixed_attached_and_uncached_requests():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -372,7 +605,7 @@ def test_encoder_cache_mixed_attached_and_uncached_requests():
     assert len(cache) == 1
 
 
-def test_encoder_cache_partial_hit_logs_and_uses_encoder():
+def test_encoder_cache_partial_hit_encodes_miss_and_interleaves():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
         torch.tensor([7]),
@@ -391,12 +624,44 @@ def test_encoder_cache_partial_hit_logs_and_uses_encoder():
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.debug") as debug:
         embeddings = model._get_or_encode_multimodal_embeddings([partial])
 
-    messages = [" ".join(map(str, call.args)) for call in debug.call_args_list]
+    # Encoder ran twice: once for the initial miss item, once for the residual containing
+    # only the second request's novel item. Assembled tensor puts the cached hit before
+    # the freshly encoded miss in item-index order.
     assert model.encode_calls == 2
-    assert embeddings.shape == (4, 4)
+    torch.testing.assert_close(embeddings[:2], torch.full((2, 4), 1.0))
+    torch.testing.assert_close(embeddings[2:], torch.full((2, 4), 2.0))
+    assert len(model._multimodal_encoder_cache) == 2
+    messages = [" ".join(map(str, call.args)) for call in debug.call_args_list]
     assert any(
-        "mm_encoder_cache: cache miss; hit_items=1, total_items=2" in msg for msg in messages
+        "mm_encoder_cache: partial-hit encode total_items=2 hit_items=1 encoded_items=1" in msg
+        for msg in messages
     )
+
+
+def test_encoder_cache_partial_hit_batches_encoder_across_partial_params():
+    # Two partial-hit params in the same batch must share a single encoder call so
+    # launch overhead scales with iterations, not with partial-hit count.
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    shared = [1, 1, 1, 1, 1, 1, 1, 1]
+    seed = make_keyed_multimodal_param(item_hashes=[shared, [2] * 8], embedding_lengths=[2, 2])
+    partial_a = make_keyed_multimodal_param(item_hashes=[shared, [3] * 8], embedding_lengths=[2, 2])
+    partial_b = make_keyed_multimodal_param(
+        item_hashes=[[2] * 8, [4] * 8], embedding_lengths=[2, 2]
+    )
+
+    model._get_or_encode_multimodal_embeddings([seed])
+    encode_calls_before = model.encode_calls
+    model._get_or_encode_multimodal_embeddings([partial_a, partial_b])
+
+    # Single batched encoder call for both partial residuals.
+    assert model.encode_calls == encode_calls_before + 1
+    # Both new miss items (`[3]*8` and `[4]*8`) written to cache alongside the two
+    # already-cached seed items.
+    assert len(model._multimodal_encoder_cache) == 4
 
 
 def test_encoder_cache_logs_rejected_oversized_write():
@@ -454,7 +719,9 @@ def test_disabled_encoder_cache_preserves_current_behavior():
         MultimodalParams(
             multimodal_data={
                 "image": {"pixel_values": torch.empty(1)},
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
                 "mm_processor_kwargs_hash": "kwargs-a",
             },
             multimodal_runtime=make_runtime(2),
@@ -495,3 +762,189 @@ def test_request_local_multimodal_embedding_wins_over_encoder_cache():
     torch.testing.assert_close(embeddings, local_embedding)
     put.assert_not_called()
     assert cache.stats().replacements == 0
+
+
+def test_partition_encoder_cache_dispatches_by_hit_outcome():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    seeded = make_keyed_multimodal_param(item_hashes=[[1] * 8, [2] * 8], embedding_lengths=[2, 2])
+    model._get_or_encode_multimodal_embeddings([seeded])
+    cache = model._multimodal_encoder_cache
+
+    full_hit = make_keyed_multimodal_param(item_hashes=[[1] * 8, [2] * 8], embedding_lengths=[2, 2])
+    part = model.partition_encoder_cache(full_hit, cache)
+    assert part.is_full_hit and not part.is_full_miss and part.miss_indices == []
+
+    full_miss = make_keyed_multimodal_param(
+        item_hashes=[[8] * 8, [9] * 8], embedding_lengths=[2, 2]
+    )
+    part = model.partition_encoder_cache(full_miss, cache)
+    assert part.is_full_miss and not part.is_full_hit and part.hits == {}
+
+    partial = make_keyed_multimodal_param(item_hashes=[[1] * 8, [3] * 8], embedding_lengths=[2, 2])
+    part = model.partition_encoder_cache(partial, cache)
+    assert not part.is_full_hit and not part.is_full_miss
+    assert list(part.hits) == [0] and part.miss_indices == [1]
+
+
+def test_assemble_full_embedding_preserves_item_order():
+    per_item = {
+        0: torch.tensor([[0.0]]),
+        1: torch.tensor([[1.0], [1.5]]),
+        2: torch.tensor([[2.0]]),
+    }
+    torch.testing.assert_close(
+        _assemble_multimodal_encoder_embeddings(per_item, 3),
+        torch.tensor([[0.0], [1.0], [1.5], [2.0]]),
+    )
+    # Even a single item is copied into request-owned storage. The sources here
+    # are cache entries, which `TensorLRUCache.get` returns as aliases of
+    # cache-owned tensors; handing one straight to a request would leave the two
+    # sharing storage and the cache's byte accounting short by an entry it can
+    # no longer actually free. A detached view would be a new tensor over the
+    # same storage, so compare storage rather than tensor identity.
+    single = per_item[1]
+    assembled = _assemble_multimodal_encoder_embeddings({0: single}, 1)
+    assert assembled.untyped_storage().data_ptr() != single.untyped_storage().data_ptr()
+    torch.testing.assert_close(assembled, single)
+
+
+def test_assemble_full_embedding_rejects_incompatible_items():
+    with pytest.raises(ValueError, match="matching output shape, dtype, and device"):
+        _assemble_multimodal_encoder_embeddings({0: torch.ones(1, 2), 1: torch.ones(1, 3)}, 2)
+
+
+def test_build_multimodal_encoder_input_slices_packed_grid_thw():
+    # Qwen3-VL-style layout: `pixel_values` is a single packed tensor sized by the
+    # cumulative patch counts declared in `image_grid_thw`. `second_per_grid_ts`
+    # stands in for any per-item sibling field that must stay in sync with the
+    # sliced items; `per_request_scalar` stands in for non-per-item siblings that
+    # must pass through unchanged.
+    grids = torch.tensor([[1, 1, 2], [1, 1, 3], [1, 1, 1]])  # 2 + 3 + 1 patches
+    pixels = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    per_item_meta = torch.tensor([0.1, 0.2, 0.3])
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(3)],
+            multimodal_positions=[0, 0, 0],
+            multimodal_lengths=[2, 3, 1],
+        ),
+        multimodal_data={
+            "image": {
+                "pixel_values": pixels,
+                "image_grid_thw": grids,
+                "second_per_grid_ts": per_item_meta,
+                "per_item_list": ["a", "b", "c"],
+                "per_request_scalar": torch.tensor(42.0),
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1), ("image", 2)], output_embedding_lengths=[2, 3, 1]
+            ),
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [2, 0])
+
+    # Item 2 spans rows [5], item 0 spans rows [0, 1]; residual concatenates them in
+    # the requested item order and slices every parallel sibling the same way.
+    residual_image = residual.multimodal_data["image"]
+    torch.testing.assert_close(
+        residual_image["pixel_values"], torch.cat([pixels[5:6], pixels[0:2]], dim=0)
+    )
+    torch.testing.assert_close(residual_image["image_grid_thw"], grids[[2, 0]])
+    torch.testing.assert_close(residual_image["second_per_grid_ts"], per_item_meta[[2, 0]])
+    assert residual_image["per_item_list"] == ["c", "a"]
+    torch.testing.assert_close(residual_image["per_request_scalar"], torch.tensor(42.0))
+
+
+def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size():
+    # `pixel_values` is padded to request-wide 5x5 but item 0's true size is (3, 4)
+    # and item 1's is (5, 5). Slicing to just item 0 must crop `pixel_values` down to
+    # (3, 4) so Mistral 3's `batch_pixel_values` (which re-pads to
+    # `max(image_sizes)`) doesn't apply a negative pad amount.
+    pixels = torch.arange(2 * 3 * 5 * 5, dtype=torch.float32).reshape(2, 3, 5, 5)
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(2)],
+            multimodal_positions=[0, 0],
+            multimodal_lengths=[1, 1],
+        ),
+        multimodal_data={
+            "image": {
+                "pixel_values": pixels,
+                "image_sizes": [[3, 4], [5, 5]],
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1)], output_embedding_lengths=[1, 1]
+            ),
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [0])
+
+    residual_image = residual.multimodal_data["image"]
+    assert residual_image["image_sizes"] == [[3, 4]]
+    assert residual_image["pixel_values"].shape == (1, 3, 3, 4)
+    # Cropped tensor preserves item 0's top-left (H=0..3, W=0..4) window.
+    torch.testing.assert_close(residual_image["pixel_values"], pixels[0:1, :, :3, :4])
+
+
+def test_build_multimodal_encoder_input_slices_audio_input_features():
+    # Whisper / Gemma4-audio layout: `input_features [B, mel, T]` stacked on
+    # dim 0, with an optional per-item mask that sibling-slices automatically.
+    # Two clips: item 0 and item 1 -- slice to [1, 0] to also confirm item order
+    # is preserved.
+    features = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(2)],
+            multimodal_positions=[0, 0],
+            multimodal_lengths=[1, 1],
+        ),
+        multimodal_data={
+            "audio": {
+                "input_features": features,
+                "input_features_mask": mask,
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", 0), ("audio", 1)], output_embedding_lengths=[1, 1]
+            ),
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [1, 0])
+
+    residual_audio = residual.multimodal_data["audio"]
+    torch.testing.assert_close(residual_audio["input_features"], features[[1, 0]])
+    # Per-item mask is caught by the generic sibling-slice pass.
+    torch.testing.assert_close(residual_audio["input_features_mask"], mask[[1, 0]])
+
+
+@pytest.mark.parametrize(
+    "mm_data, expected_match",
+    [
+        # `_encoder_cache_modality` returns None -> single-modality guard fires.
+        ({}, "cannot infer the modality"),
+        # Modality present but layout is neither pattern A (image_sizes) nor pattern B
+        # (grid_thw); default has nothing to dispatch on.
+        ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),
+        # Audio modality but no `input_features`; default falls through.
+        ({"audio": {"nonsense": torch.zeros(2)}}, "cannot slice audio layout"),
+    ],
+    ids=["no_modality", "unhandled_image_layout", "unhandled_audio_layout"],
+)
+def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expected_match):
+    param = MultimodalParams(multimodal_data=mm_data)
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+    with pytest.raises(NotImplementedError, match=expected_match):
+        model.build_multimodal_encoder_input(param, [0])

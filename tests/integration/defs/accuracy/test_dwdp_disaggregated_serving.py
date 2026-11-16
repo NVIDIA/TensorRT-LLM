@@ -1,7 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """DWDP disaggregated serving accuracy tests.
 
 Separated from test_disaggregated_serving.py to isolate MPI-dependent test
 infrastructure for easier maintenance.
+
+The worker launcher selects UCX transports for the GPU architecture instead of
+inheriting transport restrictions from SLURM/enroot/pyxis. In particular,
+``UCX_TLS=tcp`` inherited from the host MPI stack caused KV transfer failures
+and hangs in these tests (nvbugs/6276923).
 """
 
 import contextlib
@@ -17,6 +25,7 @@ import requests
 import yaml
 
 from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import get_ucx_tls
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -64,6 +73,8 @@ def launch_dwdp_disaggregated_llm(
     child_env = {
         k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
     }
+    # Override host MPI transport restrictions without changing the parent environment.
+    child_env["UCX_TLS"] = get_ucx_tls()
 
     mpi_cmd = [
         "mpirun",
@@ -211,8 +222,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -243,8 +253,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -326,8 +335,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -359,8 +367,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -401,7 +408,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @skip_post_blackwell_ultra
-    def test_dwdp_accuracy_mode_b_overlap(self):
+    def test_dwdp_accuracy_mode_b_overlap(self) -> None:
         """End-to-end accuracy test for Phase 2's redundancy (overlap) path.
 
         DSv3-Lite has 72 experts.  The companion ``test_dwdp_accuracy``
@@ -416,10 +423,10 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
           * peer ranges ``[(0, 40), (32, 72)]`` have a non-empty
             8-expert overlap, exercising ``lookup_owner``'s first-match
             policy in fill_edge_bytes / weight_manager / scatter;
-          * ``_scatter_shards_to_full`` writes overlapping experts
-            (32..39) twice — once from rank 0 (lowest, wins) and once
-            from rank 1 — and values must agree because every rank that
-            owns expert ``e`` loaded ``e`` from the same checkpoint.
+          * ``_exchange_expert_scalars`` puts the overlapping experts
+            (32..39) together from both ranks' shards and requires the two
+            copies to be equal, which holds because every rank that owns
+            expert ``e`` loaded ``e`` from the same checkpoint.
 
         Passing GSM8K at the standard threshold is sufficient evidence
         that the runtime fetches every remote expert from the right
@@ -461,8 +468,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -471,9 +477,9 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "dwdp_size": 2,
                 "num_groups": 1,
                 # Mode B redundancy: stride=32 < size=40.  Strict
-                # equality 1*32 + 40 == 72 is enforced by
-                # _validate_partition_config; 8-expert overlap between
-                # rank 0's range [0, 40) and rank 1's range [32, 72).
+                # equality 1*32 + 40 == 72 is required by
+                # ExpertPartition.strided (redundant); 8-expert overlap
+                # between rank 0's range [0, 40) and rank 1's range [32, 72).
                 "num_experts_per_worker": 40,
                 "num_prefetch_experts": 32,
             },
@@ -497,8 +503,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
             },
             "moe_config": {
                 "backend": "CUTEDSL",

@@ -1,13 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import base64
 import gc
+import os
 from typing import Optional
 
 import torch
 
-from tensorrt_llm import serialization
-from tensorrt_llm._ray_utils import control_action_decorator
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.llmapi import serialization
 from tensorrt_llm.logger import logger
 
 
@@ -33,6 +37,81 @@ class WorkerExtension:
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
 
+    @staticmethod
+    def _refit_modules(model: torch.nn.Module):
+        """Yield each module once, skipping torch.compile wrappers.
+
+        ``torch.compile`` leaves an ``OptimizedModule`` in the tree, and that
+        wrapper forwards unknown attributes to ``_orig_mod``. A plain
+        ``model.modules()`` walk therefore reaches every compiled submodule
+        TWICE -- once through the wrapper, once as itself -- and fires each
+        refit hook twice. Any non-idempotent weight transform is then applied
+        twice and the weights are scrambled in place.
+
+        This is defence in depth, not the fix for the Qwen3.5 397B refit
+        corruption -- that one was the compile wrapper renaming parameter paths
+        so ``load_weights`` matched nothing, handled by
+        ``unwrap_compiled_model_for_refit``. Double invocation was never
+        observed on that model (the wrapped scope owns none of these hooks), but
+        it does occur for any model whose wrapped scope does own one.
+
+        Deduplicating here makes refit correct regardless of whether a compile
+        wrapper happens to be installed, so it does not depend on the caller
+        unwrapping first.
+        """
+        # Opt-out so the dedup can be isolated from the other refit fixes when
+        # bisecting; the dedup is correct regardless, so it defaults on.
+        if os.environ.get("TLLM_REFIT_DEDUP_MODULES", "1") == "0":
+            yield from model.modules()
+            return
+        seen = set()
+        for module in model.modules():
+            # ``_orig_mod`` is the marker for a torch.compile wrapper and is a
+            # real attribute on it, so this does not go through the forwarding
+            # __getattr__ that causes the problem. Keyed on the attribute rather
+            # than on the class name so it survives renames and subclasses.
+            # The wrapped module is visited on its own in this same walk.
+            if getattr(module, "_orig_mod", None) is not None:
+                continue
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield module
+
+    def begin_weight_update(self) -> None:
+        """Prepare modules and captures for refit."""
+        model_engine = self.engine.model_engine
+        model_engine.unwrap_compiled_model_for_refit()
+        model_engine.model_loader.begin_update_weights()
+        for module in self._refit_modules(model_engine.model):
+            if hasattr(module, "pre_reload_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.pre_reload_weights()
+
+    def finish_weight_update(self) -> None:
+        """Finalize runtime caches and captures after refit."""
+        self.engine.reset_prefix_cache()
+        torch.cuda.synchronize()
+        self.engine.model_engine.restore_compiled_model_after_refit(self.engine.resource_manager)
+
+    def finalize_weight_update(self) -> None:
+        """Finalize a refit and refresh post-load state safely for CUDA Graph replay."""
+        model_engine = self.engine.model_engine
+        model = model_engine.model
+        model_engine.model_loader.finalize_update_weights()
+        # _refit_modules, not model.modules(): a torch.compile wrapper in the
+        # tree would otherwise make every hook below fire twice per module.
+        for module in self._refit_modules(model):
+            if hasattr(module, "process_weights_after_loading") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.process_weights_after_loading()
+            if hasattr(module, "post_load_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.post_load_weights()
+
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
         """Update model weights from IPC (Inter-Process Communication) handles.
@@ -52,11 +131,7 @@ class WorkerExtension:
         """
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
-                for module in self.engine.model_engine.model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.pre_reload_weights()
+                self.begin_weight_update()
                 setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
@@ -70,7 +145,7 @@ class WorkerExtension:
                 serialized_handles = ipc_handles[device_uuid]
                 if isinstance(serialized_handles, str):
                     # Data is base64-encoded pickled bytes - deserialize it
-                    # using restricted unpickler from tensorrt_llm.serialization
+                    # using restricted unpickler from tensorrt_llm.llmapi.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
                     disallowed_imports = {
@@ -120,6 +195,13 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
+                # Encoder outputs are weight-derived. The control action is
+                # draining by default, so any live reference or reservation
+                # here is a lifecycle error rather than state that may be
+                # force-dropped. Invalidate before every partial reload; a
+                # multi-call update session must not expose outputs from an
+                # earlier weight bucket through the persistent cache.
+                self.engine.invalidate_multimodal_encoder_cache()
                 self.engine.model_engine.model_loader.reload(
                     self.engine.model_engine.model, weights, allow_partial_loading=True
                 )
@@ -127,36 +209,39 @@ class WorkerExtension:
                 torch.cuda.ipc_collect()
             else:
                 logger.info("Finalize update weights")
-                for module in self.engine.model_engine.model.modules():
-                    if hasattr(module, "process_weights_after_loading") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.process_weights_after_loading()
-                    if hasattr(module, "post_load_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.post_load_weights()
+                self.finalize_weight_update()
                 moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
-                self.engine.reset_prefix_cache()
+                # Finalization can post-process weights; drop outputs encoded
+                # since the last bucket reload.
+                self.engine.invalidate_multimodal_encoder_cache()
                 delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
-                torch.cuda.synchronize()
                 # Done once after all buckets to avoid per-bucket cleanup overhead.
                 gc.collect()
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
+                self.finish_weight_update()
 
         except Exception as e:
+            self.engine.model_engine.model_loader.abort_update_weights()
+            if hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
+                delattr(self.engine.model_engine.model, "first_pre_reload_weights")
             logger.error("Encountered an error in update_weights")
             raise e
 
+    @control_action_decorator
     def reset_prefix_cache(self) -> None:
-        """Invalidate the KV cache prefix reuse state after weight updates."""
+        """Invalidate the KV cache prefix reuse state after weight updates.
+
+        Drains in-flight requests first, like update_weights(): clearing the reuse state
+        detaches the whole radix tree, and a request that is still holding blocks from it
+        would go on committing into the detached subtree.
+        """
         self.engine.reset_prefix_cache()
 
     @control_action_decorator

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -209,6 +209,8 @@ struct QKVPreprocessingParams
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     bool generation_phase{false};
+    // The input contains Q only and the existing KV cache must not be updated.
+    bool q_only_input{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -308,6 +310,7 @@ struct QKVPreprocessingParams
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
+        ss << "q_only_input: " << q_only_input << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();
@@ -418,6 +421,16 @@ template <typename T, typename KVCacheBuffer>
 void invokeDebugSparseKvCacheParams(
     QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
 
+//! Compact a uniform group of KVCacheManagerV2 layer pools in one batched launch
+//! (per request and head, moves are ascending and never overtake their sources:
+//! the copy runs in place).
+template <typename T>
+void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+    int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
+
 template <typename T, typename KVCacheBuffer>
 void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
@@ -459,24 +472,6 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
 // compute src[x] * scale[0] and write into dst[x]
 template <typename Dst, typename Src>
 void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream);
-
-template <typename T>
-void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialLength, int64_t cpSize, int64_t partialQHeads,
-    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank, cudaStream_t stream);
-
-template <typename T>
-void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
-    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
-
-template <typename T>
-void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
-    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
-    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
-
-template <typename T>
-void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
-    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
-    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
 
 } // namespace kernels
 

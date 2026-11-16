@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// LoRA adapter lifecycle messages.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+message LoraAdapter {
+  int64 lora_id = 1;
+  string lora_name = 2;
+  string source_path = 3;
+}
+
+message LoadLoraRequest {
+  LoraAdapter adapter = 1;
+}
+
+message LoadLoraResponse {
+  LoraAdapter adapter = 1;
+  bool already_loaded = 2;
+}
+
+message UnloadLoraRequest {
+  string lora_name = 1;
+}
+
+message UnloadLoraResponse {
+  LoraAdapter adapter = 1;
+}
+
+message ListLorasRequest {}
+
+message ListLorasResponse {
+  repeated LoraAdapter adapters = 1;
+}

@@ -7,22 +7,36 @@ import gc
 import json
 import os
 import time
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from diffusers.utils.torch_utils import randn_tensor
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
-from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+    CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
+    resolved_extra_keys_scope,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -410,8 +424,9 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         if isinstance(v, torch.Tensor):
             return v.clone()
         if isinstance(v, Modality):
-            # NOTE: must be kept in sync with Modality dataclass fields.
-            return Modality(
+            # Preserve modality subclasses when cloning the shared tensor fields.
+            return replace(
+                v,
                 latent=v.latent.clone(),
                 timesteps=v.timesteps.clone(),
                 positions=v.positions.clone(),
@@ -486,19 +501,26 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         static_kwargs = {k: self._clone_value(v) for k, v in kwargs.items()}
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Same contract as CUDAGraphRunner.capture: warmup and capture read the
+        # host-resolved extra keys (skip-softmax / Sol-Attn dense-prefix phase)
+        # from this scope instead of syncing the CUDA timestep, which capture
+        # would reject.
+        with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
+            for _ in range(self.WARMUP_STEPS):
+                with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                    fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self.graph_outputs[key] = self._make_output_ref(output)
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
 
         if self._shared_pool is not None and self._shared_pool.handle is None:
             self._shared_pool.handle = self.memory_pool
@@ -619,6 +641,10 @@ class LTX2Pipeline(BasePipeline):
     Only the text encoder (Gemma3) and tokenizer come from the
     ``transformers`` library.
     """
+
+    _transformer_class = LTXModel
+    _cuda_graph_runner_class = _LTX2CUDAGraphRunner
+    _supports_quantized_attention = False
 
     def __init__(self, model_config):
         _sa_cfg = model_config.attention.sparse_attention_config
@@ -745,7 +771,11 @@ class LTX2Pipeline(BasePipeline):
         fall back to the same defaults the reference uses.
         """
         attn_cfg = getattr(self.pipeline_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+        if (
+            attn_cfg is not None
+            and getattr(attn_cfg, "quant_attention_config", None) is not None
+            and not self._supports_quantized_attention
+        ):
             raise NotImplementedError(
                 "Quantized attention is not yet supported for the LTX-2 pipeline."
             )
@@ -764,7 +794,7 @@ class LTX2Pipeline(BasePipeline):
             f"apply_gated_attention={apply_gated_attention}"
         )
 
-        self.transformer = LTXModel(
+        self.transformer = self._transformer_class(
             model_type=LTXModelType.AudioVideo,
             num_attention_heads=getattr(cfg, "num_attention_heads", 32),
             attention_head_dim=getattr(cfg, "attention_head_dim", 128),
@@ -793,8 +823,14 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
+            **self._extra_transformer_kwargs(),
         )
         self.transformer._transformer_config = vars(cfg)
+
+    def _extra_transformer_kwargs(self) -> dict:
+        """Extra LTXModel constructor kwargs; empty for the base one-stage
+        pipeline. Subclasses override to add topology-specific kwargs."""
+        return {}
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -821,8 +857,9 @@ class LTX2Pipeline(BasePipeline):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
-        runner = _LTX2CUDAGraphRunner(
+        runner = self._cuda_graph_runner_class(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
+            self._get_or_create_cuda_graph_shared_pool(),
         )
         self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
@@ -1222,10 +1259,10 @@ class LTX2Pipeline(BasePipeline):
         Returns:
             Tensor of shape ``(1, 3, 1, H, W)`` in ``[-1, 1]``.
         """
-        if isinstance(image, str):
+        if isinstance(image, bytes):
             from PIL import Image
 
-            pil_img = Image.open(image).convert("RGB")
+            pil_img = Image.open(BytesIO(image)).convert("RGB")
             pil_img = pil_img.resize((width, height), Image.LANCZOS)
             import numpy as np
 
@@ -1368,9 +1405,19 @@ class LTX2Pipeline(BasePipeline):
             ),
         }
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -1384,7 +1431,7 @@ class LTX2Pipeline(BasePipeline):
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
-            image=req.params.image,
+            image=refs[0].content if refs else None,
             image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
@@ -1475,7 +1522,7 @@ class LTX2Pipeline(BasePipeline):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Build guider params
         video_guider_params = MultiModalGuiderParams(
@@ -1601,7 +1648,7 @@ class LTX2Pipeline(BasePipeline):
         self.transformer.configure_audio_ulysses(audio_shape.frames)
 
         # ---- 4. Generate initial noise / image conditioning ---------------
-        latents = torch.randn(
+        latents = randn_tensor(
             video_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1631,7 +1678,9 @@ class LTX2Pipeline(BasePipeline):
             )
             mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
 
-            noise = torch.randn_like(latents)
+            noise = randn_tensor(
+                latents.shape, generator=generator, device=latents.device, dtype=latents.dtype
+            )
             latents = noise * mask_5d + latents * (1.0 - mask_5d)
 
             # Token-space mask for per-token timesteps (after patchification)
@@ -1654,7 +1703,7 @@ class LTX2Pipeline(BasePipeline):
 
         latents = self.video_patchifier.patchify(latents)
 
-        audio_latents = torch.randn(
+        audio_latents = randn_tensor(
             audio_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1680,15 +1729,15 @@ class LTX2Pipeline(BasePipeline):
         )
 
         # ---- 6. Prepare scheduler / timesteps ---------------------------
-        latents_5d = torch.randn(
+        latents_5d = randn_tensor(
             video_shape.to_torch_shape(),
+            generator=generator,
             device=self.device,
         )
         self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         audio_scheduler = copy.deepcopy(self.scheduler)
         audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
-        num_steps = len(timesteps)
 
         # ---- 7. Build perturbation config for STG -----------------------
         stg_perturbation: PerturbationConfig | None = None
@@ -1816,7 +1865,11 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
-                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+                # The scheduler sigma is already normalized to [0, 1] with the
+                # contract's sense (larger = noisier). The previous
+                # step_index / num_steps was ascending, which inverted the
+                # sparse-attention dense prefix on this model.
+                timestep=timestep_val,
                 step_index=step_index,
             )
 
@@ -2023,10 +2076,6 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_video_fn(vid_latents):
             vid_latents = self.video_patchifier.unpatchify(vid_latents, video_shape)
-
-            if output_type == "latent":
-                return vid_latents
-
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
             if self._parallel_vae_enabled:
@@ -2056,18 +2105,27 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_audio_fn(aud_latents):
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
-
-            if output_type == "latent":
-                return aud_latents
-
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        video, audio = self.decode_latents(
-            latents=latents,
-            decode_fn=decode_video_fn,
-            extra_latents={"audio": (audio_latents, decode_audio_fn)},
-        )
+        if output_type == "latent":
+            # Latent output is a local unpatchify with no VAE work, and every
+            # rank already holds the full latents after the denoise loop —
+            # return them on every rank. decode_latents' vae_ranks/rank-0 gate
+            # exists to skip real VAE decode only; the two-stage handoff
+            # consumes these latents in place with zero collectives.
+            video = self.video_patchifier.unpatchify(latents, video_shape)
+            audio = (
+                self.audio_patchifier.unpatchify(audio_latents, audio_shape)
+                if audio_latents is not None
+                else None
+            )
+        else:
+            video, audio = self.decode_latents(
+                latents=latents,
+                decode_fn=decode_video_fn,
+                extra_latents={"audio": (audio_latents, decode_audio_fn)},
+            )
 
         if self.rank == 0:
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")

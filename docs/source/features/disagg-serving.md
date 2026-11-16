@@ -1,18 +1,24 @@
 # Disaggregated Serving
 
-- [Motivation](#Motivation)
-- [KV Cache Exchange](#KV-Cache-Exchange)
-  - [Multi-backend Support](#Multi-backend-Support)
-  - [NIXL Backend Configuration](#nixl-backend-configuration)
-  - [Overlap Optimization](#Overlap-Optimization)
-  - [Cache Layout Transformation](#Cache-Layout-Transformation)
-  - [Unique Global Request ID](#Unique-Global-Request-ID)
-- [Usage](#Usage)
-  - [Dynamo](#Dynamo)
+- [Motivation](#motivation)
+- [KV Cache Exchange](#kv-cache-exchange)
+  - [Multi-backend Support](#multi-backend-support)
+  - [Overlap Optimization](#overlap-optimization)
+  - [Cache Layout Transformation](#cache-layout-transformation)
+  - [Unique Global Request ID](#unique-global-request-id)
+- [Usage](#usage)
+  - [Dynamo](#dynamo)
   - [trtllm-serve](#trtllm-serve)
   - [Multiple Instances](#multiple-instances)
-- [Environment Variables](#Environment-Variables)
-- [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
+  - [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)
+- [Environment Variables](#environment-variables)
+- [Troubleshooting and FAQ](#troubleshooting-and-faq)
+
+For the internals of the component that actually moves the KV blocks, see
+[Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
+
+For placing sub-agents with their parent while retaining independent conversation
+histories, see [Sub-agent Routing](subagent-routing.md).
 
 ## Motivation
 
@@ -47,7 +53,7 @@ You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more de
 
 ### Multi-backend Support
 
-In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 3. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Currently, mainstream communication protocols—MPI, UCX, and NIXL—are all supported by TensorRT-LLM, and the underlying communication protocols utilize RDMA / NVLink. Currently, we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them—specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
+In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 3. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Use `backend: NIXL`. It transfers over RDMA / NVLink, and a dynamic scaling mechanism—specifically, dynamic node joining and leaving—is being built on top of it. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
 
 <div align="center">
 <figure>
@@ -55,18 +61,6 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
-
-### NIXL Backend Configuration
-
-NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
-
-**Supported NIXL backends:**
-- **UCX** (default)
-- **LIBFABRIC** (available from v0.16.0)
-
-If an unsupported backend is specified, NIXL will automatically fall back to UCX.
-
-For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
 
 ### Overlap Optimization
 
@@ -90,7 +84,7 @@ To minimize KV cache transmission latency, TensorRT LLM currently uses direct tr
 </div>
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
+The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#environment-variables).
 
 ### Unique Global Request ID
 
@@ -151,36 +145,80 @@ We use the `cache_transceiver_config` configuration to set up disaggregated serv
 
 ```yaml
 cache_transceiver_config:
-  backend: <str>
+  backend: NIXL
   max_tokens_in_buffer: <int>
+  kv_transfer_timeout_ms: <int>
+  kv_cache_bounce_size_mb: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`. The default backend is NIXL.
+`backend` selects the communication library used to transfer the KV cache. Set it to `NIXL`, which transfers over RDMA / NVLink. The field has no default — if it is left unset, the worker still starts, but it brings up no cache transceiver and rejects the disaggregated requests it is then routed. Set the same value on the context and the generation worker.
 
-Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable:
-- `UCX` (default)
-- `LIBFABRIC` (available from v0.16.0)
+`max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
 
-`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+`kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
-For example, you could launch two context servers and one generation server as follows:
+```{warning}
+The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
 
+Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep that configuration while the feature is required, or disable the flag when migrating to Python. The existing startup validation remains in effect.
 ```
+
+The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
+
+`kv_cache_bounce_size_mb` (default `0`) sets the size, in MiB, of the KV-cache bounce buffer; `0` turns it off. Without the buffer, each KV fragment is a separate descriptor in the NIXL write. With it, the sender gathers an eligible write's fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. This helps when a write consists of many small fragments, which is typical when context and generation split attention heads differently (for example, context TP != generation TP, or attention DP).
+
+- The buffer lives in the C++ NIXL agent: one buffer per rank, shared by send and receive. It uses fabric (MNNVL) memory where available and `cudaMalloc` otherwise. Use a power of two such as `256`, `512` or `1024`; for other values only the largest power of two that fits is used.
+- It requires the Python transceiver with the C++ NIXL agent. On a build without bounce support (libzmq), a positive value fails at worker startup. The C++ transceiver and the pure-Python NIXL agent ignore it with a warning.
+- Set it on both the context and the generation workers. If either side has `0`, the pair uses standard NIXL.
+
+By default, only writes with at least 1024 descriptors averaging at most 16 KiB use the bounce buffer, so head-matched layouts (MLA, symmetric TP) stay on standard NIXL. To change this, set `agent_bounce_params`: lower `min_descriptor_count` (`0` means no minimum) or raise `max_average_descriptor_size` (for example `4MB`). Setting `max_average_descriptor_size: 0` stops this worker from sending through the bounce buffer; it still allocates the buffer and still receives bounced writes from peers. To turn the feature off entirely, set `kv_cache_bounce_size_mb: 0`.
+
+The two sides must also agree on `request_timeout_ms` (an `agent_bounce_params` key) and on the effective chunk size, `min(max_chunk_size, buffer size rounded down to a power of two)`. With the default `max_chunk_size` (32 MiB), the chunk sizes can only differ when a buffer is smaller than 32 MiB. If either value differs, the worker logs a WARNING when it first loads the peer's metadata, and then uses standard NIXL for that peer without further messages.
+
+`agent_bounce_buffer_enable` is deprecated and ignored. Remove it from existing configs.
+
+#### KV transfer lifecycle enforcement (PACT)
+
+Set `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT=1` on every CTX and GEN executor rank to request PACT protection. It is off by default; `TRTLLM_DISAGG_NO_RETRY=1` alone does not enable it. Explicit enablement rejects unsupported local configurations during startup rather than silently running without protection.
+
+For context-first, protection applies to requests with an explicit context-first scheduling style and a non-negative integer `disagg_request_id` when **all** of these conditions hold on both endpoints:
+
+- Full-context BF16 MHA/GQA K/V in KV cache manager V2, ordinary HND page views, symmetric TP1 or TP2, attention-DP disabled, PP1 and CP1.
+- `transceiver_runtime: PYTHON`, `backend: NIXL`, the C++ agent binding (`TRTLLM_USE_PY_NIXL_KVCACHE=0`), and `TRTLLM_NIXL_KVCACHE_BACKEND=UCX`.
+- Direct asynchronous transfer with a finite timeout: no Python/agent bounce buffer, pipelined or layerwise transfer, or disabled transfer overlap.
+- `TRTLLM_DISAGG_NO_RETRY=1` on the coordinator and every worker; no rerouting/replay of a published pairing ID.
+- MPI executor workers with a matching rank/world mapping and `MPI_THREAD_MULTIPLE`, so the existing fatal policy can stop the executor.
+
+Use identical images and effective BF16 configuration on all participants. Before any rank publishes transfer metadata, every executor rank must agree on the selected protection profile. Rank zero then logs an initialization WARNING that enforcement is enabled and fail-stop can affect the entire MPI launcher job. Each rank also logs `Context-first BF16 KV ownership ENABLED` on its first protected request.
+
+Protected context-first transfers require both endpoints to advertise activation and compatible geometry before destination publication or source submission. Incompatible peers fail the request without publishing its destination; the generation worker caches this rejection until restart. This is not dtype or version negotiation. Mixed-version protected transfers remain unsupported, and an explicitly protected transfer never falls back to unprotected operation. Without opt-in, legacy behavior is unchanged; omitted scheduling style and unsupported request paths do not gain protection from this flag.
+
+The same flag can select the existing no-retry FP4 MLA generation-first bridge within its existing supported profile. `TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE=1` remains a compatibility opt-in when the new flag is unset or `1`; combining it with the new flag set to `0` is a startup error. The FP4 bridge still requires matching configuration and enablement on all CTX/GEN participants as a deployment invariant; the new context-first peer check does not add FP4 peer negotiation.
+
+The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
+
+#### Basic serving example
+
+The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:
+
+```bash
 
 # Generate context_config.yml
-# Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: NIXL" > context_config.yml
 
 # Start Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
 # Generate gen_config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
+echo -e "cache_transceiver_config:\n  backend: NIXL" > gen_config.yml
 
 # Start Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
+
+Both workers must carry the same `cache_transceiver_config`; confirm each one brought the transceiver up with `grep "Using KvCacheTransceiverV2" log_ctx_0 log_gen_0`.
+
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
 and generation servers. The disaggregated server can be launched with:
@@ -208,6 +246,10 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
+The config also accepts an optional field that tunes the HTTP listeners:
+
+- `server_keep_alive_timeout` (int, default `10`) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator's listener when it runs in-process (see [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)). Raise it (for example, `3600`) when clients hold large idle connection pools and hit `Connection reset by peer` on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
 ```
 curl http://localhost:8000/v1/completions \
@@ -220,9 +262,20 @@ curl http://localhost:8000/v1/completions \
     }' -w "\n"
 ```
 
+#### Responses API
+
+The disaggregated server also serves `/v1/responses`, with both `context_first` and `generation_first` scheduling, and `/v1/models`, which it answers from a context worker. A streamed response carries the generation worker's events unchanged. Unlike a single `trtllm-serve` instance, the disaggregated server keeps no response history:
+
+- A request with `previous_response_id` is rejected with a 400, because a stored response lives in one worker's memory and a later request may reach another worker. Send the earlier turns in `input` instead.
+- `store` is ignored: nothing is persisted, and the server logs a warning once when a client asks for it.
+
+One limitation applies to `/v1/responses` on every server, disaggregated or not:
+
+- `parallel_tool_calls: false`, and a `tool_choice` other than `auto` or `none` on non-Harmony models, are accepted but not enforced. The server logs a warning once.
+
 #### Launching disaggregated servers on SLURM clusters
 
-Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
+Please refer to [Disaggregated Inference Benchmark Scripts](source:examples/disaggregated/slurm).
 
 ### Multiple Instances
 
@@ -247,7 +300,7 @@ A single disaggregated server process is itself a single-threaded orchestrator a
 
 The two roles split as follows:
 
-- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/renew`, `/cluster_info`, `/health`, `/version`, and `/output_length` for [output-length prediction](#generation-admission-by-predicted-output-length)). The API has no authentication: any client that reaches the coordinator's port can reserve and release servers, and through `/output_length` record arbitrary in-range reply lengths, with or without a conversation ID. Such records change the named conversation's later predictions and also train the global models (median, ridge, trees) that predict every request, so they change the generation priority of all clients' requests, and the effect outlasts them (the ridge statistics cover all history). Keep the port reachable only from the fleet workers.
 - **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
 
 This is controlled by two fields in the disaggregated config:
@@ -264,8 +317,18 @@ The three resulting topologies:
 | any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
 
 ```{note}
-The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+The fleet delegates `load_balancing`, `kv_cache_aware`, and `conversation` routing to the coordinator, so their placement and in-flight load state are globally consistent across workers. `round_robin` remains local to each worker and does not make a coordinator round-trip.
 ```
+
+#### Generation admission by predicted output length
+
+With `output_length_prediction: {}` (predictor `ridge`, the default) or `{predictor: ridge_gbm}` at the top level of the disaggregated config, the coordinator learns reply lengths online and the orchestrator sets the `priority` of every completion and chat completion generation request from the predicted length (shorter first; `max_tokens` is never read). `/v1/responses` requests have no `priority` field and are not predicted: with pooled dispatch (below) they wait for a seat at the prior's priority, any `priority` the client sends with them is ignored, and generation servers give them the default priority. A reply with `n` sequences is learned as the length of one sequence. Replies without a conversation ID train the global models (median, ridge, trees) but have no per-conversation history (see the conversation-ID note below). A streamed request's generation leg always asks for usage, which is how its length is learned; if the client did not ask for it, the final usage chunk is dropped from its stream, and a stream that ends without that chunk is not learned. In a fleet, a generation router placed by the coordinator gets the prediction inside `/select`, without an extra round trip; other fleets ask the coordinator's `/output_length`, which also takes the finished replies' lengths in batches and rejects lengths that are not numbers of tokens in [0, 2^24]. A request the coordinator fails to predict gets the prior's priority, and so does a request that conditional disaggregation serves without a context phase. Prediction needs `schedule_style: context_first` (the prompt length comes from the context phase); the server refuses to start with `generation_first`. `ridge_gbm` adds a gradient-boosted tree ensemble, fitted in a separate process with scikit-learn, which is not a TensorRT-LLM dependency: the server checks at startup that it can fit and export the trees, and refuses to start otherwise. Generation servers order their waiting queue by the priority with `scheduler_config: {waiting_queue_policy: priority, waiting_queue_max_wait_s: 60}`; the cap lets a request that waited that long go first.
+
+This priority queue and main's GEN admission by original arrival (`TLLM_GEN_ADMISSION_TTFT_PERCENTILE` > 0, see [generation slot preemption](#generation-slot-preemption-prototype)) are alternatives. With `waiting_queue_max_wait_s` set, a generation server that also has `TLLM_GEN_ADMISSION_TTFT_PERCENTILE` > 0 refuses to start; without the cap, the admission by arrival replaces the priority queue and the predicted priorities are ignored (a warning says so). GEN slot preemption needs the admission by arrival in its auto mode (`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`), so it is not available with the priority queue. Use the priority queue with output-length prediction to run short predicted replies first; use the admission by arrival, optionally with preemption, to order by arrival at the orchestrator toward a TTFT percentile.
+
+`generation_servers.router: {type: load_balancing, max_requests_per_server: 64, max_queue_wait_s: 60}` additionally holds generation requests in the orchestrator until a server has a free seat (fewer than `max_requests_per_server` active requests), in the same order, with the cap also counted from the arrival at the orchestrator. Set `max_requests_per_server` to the number of requests a generation server runs at once: its `max_batch_size` × `pipeline_parallel_size`, times `tensor_parallel_size` with `enable_attention_dp` (a seat counts requests per server URL, and an attention-DP server spreads them over its ranks). A smaller value leaves decode batch slots unused; with attention DP, `max_batch_size` alone caps the server at one rank's share. `max_queue_wait_s` requires `max_requests_per_server`. A request held there longer than the context servers' `cache_transceiver_config.kv_transfer_timeout_ms`, less a 5% margin, fails with HTTP 503. A context server with the C++ transceiver (`transceiver_runtime: CPP`) counts that timeout from its KV send, a little before the request joins the queue, and has dropped the transfer by then (the margin covers that gap); the Python transceiver (the default) holds a send that its generation peer has not asked for up to three timeouts from the send, so there the bound is conservative (with `schedule_style: generation_first` the context server waits as long for the generation side); keep `max_queue_wait_s` at or below it. The orchestrator takes the smallest value the context servers report in `/server_info` (their own `--config`), and waits without a bound when they report `null` (no timeout); until a context server reports the key, it uses `context_servers.cache_transceiver_config.kv_transfer_timeout_ms` from the disaggregated config (`null` included), default 60000, and logs a warning. A seat is released when its request finishes. In a fleet, the worker sends that release to the coordinator in the background and retries it, with backoff of up to 5 s, until the coordinator accepts it: a full release queue or an unreachable coordinator delays it but does not drop it. The coordinator reclaims a seat by itself only after 6 hours (or `TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT`, if longer; that variable cannot shorten it, since a shorter expiry would hand on the seat of a generation still streaming). A seat waits for that expiry only when its release never arrives: the orchestrator worker died or was stopped before sending it (on shutdown a worker waits 5 s for pending releases), or the coordinator rejected it as malformed. A worker that gets no reply to a `/select` sends that release too, and a `/select` still waiting for a seat when its worker's connection closes leaves the queue. The Slurm benchmark launcher (`examples/disaggregated/slurm/benchmark/submit.py`) copies its `router_config` to both roles without the generation-only keys for the context servers, and copies the context workers' `kv_transfer_timeout_ms` (`null` included) into `context_servers`.
+
+With prediction on, the client's conversation ID sets the generation priority. The orchestrator replaces any `priority` the client sent with the predicted one. The prediction comes from the earlier replies of the conversation named by the request's `conversation_params.conversation_id`, either sent in the body or taken from the session header (see [request headers](subagent-routing.md#request-headers)). A request without a conversation ID, or the first request of a conversation, is predicted from its prompt length and the replies of all conversations. A client that reuses another conversation's ID therefore takes that conversation's predicted priority, and its replies change that conversation's later predictions. Treat the conversation ID as untrusted input: when untrusted clients reach the server, a gateway in front of it should set or validate the ID.
 
 #### Example: implicit coordinator + 4-worker fleet
 
@@ -330,28 +393,152 @@ generation_servers:
 A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
 ```
 
+### DeepSeek-V4.1 context decoder weights
+
+Set `bounded_replay_on_generation: true` at the top level of the
+disaggregated serving YAML. The orchestrator passes it to both workers;
+`trtllm-serve serve ... --server_role context` then omits decoder weights on the
+context worker. The flag defaults to `false` and does not require conditional
+disaggregation. Python API deployments must set `TRTLLM_DISAGG_ROLE=context`
+before creating the model. Generation workers retain the complete model.
+
+The context worker keeps the encoder prefix and the boundary layer's GLOBAL
+KV/index projections. It skips the boundary query/output/MoE weights, subsequent
+decoder layers, final normalization and language-model head. Pruning happens
+before GPU weight materialization; the standard HF loader reads only retained
+checkpoint tensors. Logical layer numbering remains unchanged. The context
+cache allocator also omits the decoder's unused SWA buffers, while retaining
+encoder SWA and all GLOBAL KV, index and compressor-state buffers. The
+generation worker retains its complete cache layout; transfer matches the
+retained buffers by their model-layer identities.
+For prompts shorter than the replay window, generation replays the entire prompt.
+
+Both runtime capacity accounting and the static cache estimator use the same
+validated boundary as the model. Weight savings already enter the KV budget
+through measured post-load memory usage and are not added a second time.
+
+This experimental path uses the same approximate bounded-replay semantics as
+remote-tail replay. It requires text-only context requests, a KV transceiver,
+beam width one, block reuse disabled, and non-pipelined transfer. Context logits
+and speculative decoding on the context worker are unsupported. Saved weight
+memory is available to KV cache or larger batches/token budgets, subject to the
+remaining runtime memory requirements.
+
+Remote-tail handoffs disable HTTP retries on the generation hop in context-first
+serving, and on both hops in generation-first serving. Retrying one side cannot
+safely replay or cancel the paired transfer. Context-first context requests and
+requests that bypass the handoff retain the configured retry policy. With
+remote-tail replay disabled, ordinary disaggregated requests retain their
+configured retry policy, including the transient TCP retry budget.
+
+### Generation slot preemption (prototype)
+
+GEN slot preemption pauses a resident decode request when all batch slots are
+occupied and a waiter risks missing its TTFT target. Configure exactly one bound
+(neither: disabled):
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.10          # up to +10% mean TPOT from pauses
+    # target_output_tps: 35.0  # alternative: output-rate floor for ~80% of requests
+```
+
+Preemption requires the auto GEN admission policy
+(`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`) and the V2 KV scheduler.
+Pipeline parallelism and attention DP are rejected. Startup checks these
+prerequisites before reserving paused-request headroom.
+
+Pauses free batch slots while retaining KV, recurrent, and drafter state. Cache
+sizing must cover active plus paused requests: SWA and NVFP4-MLA HP-ring
+reservations include the paused cap; full-attention demand depends on sequence
+lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
+recompute context locally, and Helix CP raises on decode allocation failure.
+Reduce concurrency or increase the KV budget when both slots and pages are full.
+
+Pool headroom belongs to each executor. Configuring preemption on a context
+worker also reserves headroom. `target_output_tps` has simulation coverage only;
+GPU validation is limited to `tpot_budget`.
+
+### Deferred KV cache release on generation servers (prototype)
+
+On a generation server, releasing a finished request's KV cache is host work on
+the executor's critical path. With
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  defer_generation_only_release: true
+```
+
+the overlap executor releases the KV cache of finished generation-only requests
+after the next forward is enqueued, so that the release overlaps GPU work. The
+request itself finishes as before; its pages return one iteration later:
+
+- When the next iteration's scheduler runs out of KV cache pages, it releases
+  the pending caches before it suspends or recompute-pauses a running request.
+  Until then, new requests are admitted as if those pages were still in use.
+- KV cache events for the released pages are published one iteration later, or
+  in the same iteration when the server goes idle.
+- An idle server, an iteration that skips its forward, and a KV pool rebalance
+  release the pending caches before they continue.
+
+The option requires KV cache manager V2 and the overlap scheduler
+(`disable_overlap_scheduler: false`) without pipeline parallelism; other
+configurations are rejected at startup. It affects only generation-only
+requests, so it has no effect on context servers or aggregated serving (startup
+logs a warning when the server has no cache transceiver).
+
+### Bounding the graceful stop of a server
+
+A server can still have request handlers running when it is told to stop, for
+example when a benchmark client leaves while its last requests are in flight. By
+default the OpenAI HTTP server waits for every one of them. The prototype setting
+`serve_graceful_shutdown_timeout_s: N` bounds that wait: after a shutdown signal,
+the server waits at most `N` seconds for running request handlers (uvicorn's
+`timeout_graceful_shutdown`), then cancels them and shuts down as usual. It
+applies to the LLM, embedding and multimodal-encoder servers of `trtllm-serve`,
+in every frontend process; the disaggregated router keeps its own
+`--request_timeout` for the requests it forwards. It is off by default.
+[Bounding the Graceful Stop](../commands/trtllm-serve/trtllm-serve.rst#bounding-the-graceful-stop)
+in the `trtllm-serve` reference describes it for every server.
+
+```yaml
+serve_graceful_shutdown_timeout_s: 30
+```
+
+### Generation server options
+
+Two prototype options of a generation server's configuration:
+
+* `scheduler_config.max_gen_init_admissions_per_pass` bounds how many
+  disaggregated generation requests a rank admits, allocating their KV cache, per
+  scheduling pass of the KV cache manager V2 scheduler; the others are admitted
+  in later passes, in order. A bound trades the start latency of a burst of
+  requests for shorter passes, which every attention-DP rank waits for. Unset,
+  the default, admits all that fit; KV cache manager V1 ignores it with a warning.
+* `gen_prompt_tail_tokens: N` (at least 256) sends a context-first
+  generation-only request to the generation workers with only its last `N`
+  prompt ids and the number of ids left out, since its KV cache comes from the
+  context server. Remote-tail, generation-first and multimodal requests keep
+  their full prompt, as do requests that read it (penalties, prompt logprobs,
+  logits processors, beams or several sequences, among others). The option is
+  rejected together with KV cache block reuse, KV cache events, a KV cache
+  connector, routed-expert capture, context parallelism, the SA, NGram or AUTO
+  drafters, KV cache manager V1, or a cache transceiver runtime other than
+  `PYTHON`.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-* `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
-  - `UCX` (default)
-  - `LIBFABRIC` (available from v0.16.0)
-  - If an unsupported value is specified, NIXL will automatically fall back to UCX
+* `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT`: Set to `1` to request [PACT protection](#kv-transfer-lifecycle-enforcement-pact) for a supported Python/NIXL profile. Unset or `0` leaves context-first protection off; the existing FP4 bridge opt-in remains supported as described above. This setting is fixed at executor startup and does not release outstanding ownership claims.
 
-* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
+* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
-* `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL`:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to `1`, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is `0`.
+* `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
-* `TRTLLM_REQUEST_KV_CACHE_CONCURRENT`: If set to `1`, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to `0`, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is `0`.
-
-* `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER`: TRT-LLM typically copies non-contiguous data into a temporary buffer before sending KV cache. If set to `1`, TRT-LLM will attempt to directly transmit each KV cache block, eliminating extra copies. The default value is `0`.
-
-* `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE`: By default, TRT-LLM uses a `stream-ordered memory allocator` to allocate temporary buffers. If this environment variable is set to #Size, TRT-LLM will use `cudaMalloc` to allocate buffer of size #Size for KV cache transmission. The default value is `512MB`. Users can set `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB` to allocate a 1 GB buffer with `cudaMalloc` for KV cache transmission.
-
-* `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
-
-* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+* `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
@@ -364,21 +551,59 @@ There are some other useful environment variables that may help when encounterin
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
+### Opt-in transfer lifecycle diagnostics
+
+For a targeted native Python-transceiver/Scheduler V2 debugging run, set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS=1` before starting the workers. Diagnostics
+are disabled by default; leave them disabled for throughput comparisons.
+Existing `RequestPerfMetrics` and native `perf_logger` remain the sources for
+aggregate request latency, transfer bytes, and bandwidth.
+
+Generate one fresh UUID for the launch and set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID` to that same value on all CTX and
+GEN workers. Preserve each worker's stdout, which contains JSON records prefixed
+with `[DISAGG_TRANSFER_DIAG]`. From a source checkout, produce a timing report:
+
+```bash
+python scripts/disagg_transfer_diagnostics.py ctx-worker.log gen-worker.log -o timing.json
+```
+
+The events record actual admission, receiver readiness, queue/submission,
+completion, cancellation, and resource-release boundaries, including unfinished
+requests. Explicit disaggregated request IDs support cross-worker correlation;
+fallback IDs stay process-local. Durations never subtract clocks from different
+processes. Submission-to-completion measures backend residence, not necessarily
+on-wire service. CTX handoff-to-release starts at the final chunk's handoff and
+excludes earlier prefill KV retention. Executor timeouts and native blocking-wait
+deadlines are separate observations; neither proves that memory is reusable.
+Transceiver settlement records confirm session retirement, not physical resource
+drain; diagnostics do not add lifecycle polling to establish that stronger claim.
+KV-capacity deferral is recorded only on the first failed preparation per local
+request. `kv_deferral_count` counts failed KV preparation attempts, not every
+scheduler pass. Successful KV preparation is tentative: `outcome=admitted` is
+recorded only after transfer-window selection, PP/CP reconciliation, and executor
+resource preparation succeed. This admission boundary precedes receive
+publication, which can still wait for destination readiness.
+Rollback records are emitted once per request and reason. Final admission carries
+the cumulative `transfer_window_rollback_count`, `pp_reconciliation_rollback_count`,
+and `cp_reconciliation_rollback_count`,
+along with `kv_deferral_count`; tentative successes do not reset these counts.
+Requests cancelled before admission have no completed admission-wait interval.
+
+Buffering is bounded; output is asynchronous and best-effort. Overflow, broken stdout, or
+process exit can lose records. The report exposes malformed, unmatched, and
+ambiguous evidence; it is not an end-to-end health or completeness verdict.
+Unsupported profiles are unassessed. Enabled collection can perturb timings;
+disabled mode avoids diagnostic recording and I/O, but is not a claim of
+measured zero overhead. Diagnostics do not change admission or timeout policy.
+
 ## Troubleshooting and FAQ
 
 ### General FAQs
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
-
-*Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
-
-A. No. There are no special requirements for the arguments to build engine.
-
-*Q. When using the TRT backend, do the engines used by the context and generation instances need to be the same?*
-
-A. No. The engines used by context and generation instances can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of KV cache.
+A. Currently, only decoder-only models are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads. The context and generation instances may use different parallelism, that is, TP and PP can differ, and TRT-LLM will handle the heterogeneity of KV cache.
 
 *Q. Can a TRT-LLM server instance handle both context-only requests and generation-only requests?*
 
@@ -390,23 +615,25 @@ A. Yes, it's recommended that different server instances use different GPUs. We 
 
 ### Debugging FAQs
 
-*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
-
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
-
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
-
-Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
-
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. please set `backendType` of `CacheTransceiverConfig`.
-```cpp
-ExecutorConfig executorConfig{...};
+A. `cache_transceiver_config.backend` has no default, so leaving it unset disables the transceiver on that worker. Set it in the worker's `--config` file, on both the context and the generation worker:
 
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
+```yaml
+cache_transceiver_config:
+  backend: NIXL
 ```
+
+*Q. How do I confirm that a worker actually brought up the cache transceiver?*
+
+A. Each worker logs the outcome at INFO level, which `trtllm-serve` enables by default:
+
+```bash
+grep -E "Using KvCacheTransceiverV2|cache_transceiver is disabled" log_ctx_0 log_gen_0
+```
+
+Check the context and the generation worker separately, and configure the two together. There is no general negotiation of transfer settings across workers; the opt-in PACT path adds the specific activation and geometry checks described above.
+
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.

@@ -4,6 +4,7 @@
 import copy
 import os
 
+import numpy as np
 import pytest
 import test_modeling_qwen3vl as _qwen3vl
 import torch
@@ -15,7 +16,8 @@ from tensorrt_llm._torch.configs import Cosmos3Config
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
-from tensorrt_llm._torch.models.modeling_cosmos3 import Cosmos3Model
+from tensorrt_llm._torch.models.modeling_cosmos3 import Cosmos3InputProcessor, Cosmos3Model
+from tensorrt_llm.inputs import media_io
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -29,6 +31,95 @@ COSMOS3_TEST_CONFIG.update(
         "_name_or_path": COSMOS3_NANO_PATH,
     }
 )
+
+
+class _FakeVideoCapture:
+    def __init__(self, frame_count: int, fps: float) -> None:
+        self._frames = [
+            np.full((2, 2, 3), frame_idx % 256, dtype=np.uint8) for frame_idx in range(frame_count)
+        ]
+        self._fps = fps
+        self._next_frame_idx = 0
+        self._grabbed_frame_idx = -1
+
+    def isOpened(self) -> bool:  # noqa: N802
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == _FakeCv2.CAP_PROP_FRAME_COUNT:
+            return float(len(self._frames))
+        if prop == _FakeCv2.CAP_PROP_FPS:
+            return self._fps
+        raise AssertionError(f"Unexpected capture property: {prop}")
+
+    def grab(self) -> bool:
+        if self._next_frame_idx >= len(self._frames):
+            return False
+        self._grabbed_frame_idx = self._next_frame_idx
+        self._next_frame_idx += 1
+        return True
+
+    def retrieve(self, _scratch: np.ndarray | None) -> tuple[bool, np.ndarray]:
+        return True, self._frames[self._grabbed_frame_idx]
+
+    def release(self) -> None:
+        pass
+
+
+class _FakeCv2:
+    CAP_PROP_FRAME_COUNT = 1
+    CAP_PROP_FPS = 2
+    COLOR_BGR2RGB = 3
+
+    def __init__(self, frame_count: int, fps: float = 30.0) -> None:
+        self._frame_count = frame_count
+        self._fps = fps
+
+    def VideoCapture(self, _video: str) -> _FakeVideoCapture:  # noqa: N802
+        return _FakeVideoCapture(self._frame_count, self._fps)
+
+    def cvtColor(  # noqa: N802
+        self,
+        source: np.ndarray,
+        conversion: int,
+        *,
+        dst: np.ndarray,
+    ) -> np.ndarray:
+        assert conversion == self.COLOR_BGR2RGB
+        dst[...] = source[..., ::-1]
+        return dst
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prepared_frame_count",
+    [
+        pytest.param(8, id="below-shared-ten-frame-default"),
+        pytest.param(64, id="above-shared-ten-frame-default"),
+    ],
+)
+def test_cosmos3_preserves_prepared_video_frame_count(
+    monkeypatch: pytest.MonkeyPatch, prepared_frame_count: int
+) -> None:
+    media_io_kwargs = Cosmos3InputProcessor.__new__(
+        Cosmos3InputProcessor
+    ).get_preferred_media_io_kwargs()
+    assert media_io_kwargs == {
+        "image": {"format": "np"},
+        "video": {"format": "np", "num_frames": -1, "fps": -1},
+    }
+
+    monkeypatch.setattr(media_io, "_get_cv2", lambda: _FakeCv2(prepared_frame_count))
+    video_kwargs = media_io_kwargs["video"]
+    decoded_video = media_io._load_video_by_cv2(
+        "prepared-video.mp4",
+        num_frames=video_kwargs["num_frames"],
+        fps=video_kwargs["fps"],
+        format=video_kwargs["format"],
+    )
+
+    assert decoded_video.frames.shape[0] == prepared_frame_count
+    assert decoded_video.metadata["frames_indices"] == list(range(prepared_frame_count))
 
 
 # TestQwen3VL is a unittest.TestCase subclass, which pytest collects

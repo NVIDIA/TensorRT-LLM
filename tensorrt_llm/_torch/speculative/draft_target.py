@@ -29,10 +29,8 @@ from torch import nn
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import TorchSampler
+from ..attention.backends import AttentionMetadata
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
@@ -61,6 +59,9 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             device="cuda",
         )
 
+    def dp_num_tokens(self) -> int:
+        return self.num_tokens - self.num_generations * self.runtime_draft_len
+
     def prepare(self):
         """Prepare the metadata before model forward."""
         assert self.request_ids is not None
@@ -70,20 +71,9 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
-        self.num_tokens -= self.num_generations * self.runtime_draft_len
+        self.num_tokens = self.dp_num_tokens()
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
-
-
-class DraftTargetOneModelSampler(MTPSampler):
-    """
-    Sampler for DraftTarget one-model speculative decoding.
-
-    Inherits from MTPSampler to reuse the speculative decoding sampling logic.
-    """
-
-    def __init__(self, args: TorchSampler.Args):
-        super().__init__(args, nextn=args.max_draft_len)
 
 
 class DraftTargetOneModelWorker(SpecWorkerBase):

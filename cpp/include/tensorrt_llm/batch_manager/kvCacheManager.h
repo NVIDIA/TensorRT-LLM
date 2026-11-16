@@ -353,6 +353,9 @@ struct KvCacheIterationStats
     SizeType32 secondaryPeakFreeNumBlocks{0};
     SizeType32 secondaryPeakUsedNumBlocks{0};
     SizeType32 secondaryPeakEvictableNumBlocks{0};
+    // Disk copies retained while their block also lives in a hotter tier (KV cache manager V2 disk options). Not
+    // counted in secondaryEvictableNumBlocks; reclaimable, so counted in secondaryFreeNumBlocks.
+    SizeType32 secondaryRetainedCopyNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
@@ -620,7 +623,7 @@ public:
                 = runtime::BufferManager::cpu(runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
                     runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value);
             auto cacheBlockIdsRange
-                = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices.at(windowSize));
+                = mCacheBlockIndices.at(windowSize)->getBufferRange<tensorrt_llm::kernels::KVCacheIndex>();
             std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
                 tensorrt_llm::kernels::KVCacheIndex{
                     std::numeric_limits<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>::max()});
@@ -882,6 +885,7 @@ public:
         radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         SizeType32 numPlaceholderBlocks = 0);
 
@@ -911,7 +915,19 @@ public:
 
     void releasePools();
 
-    void createIndexerKCachePools();
+    //! \brief Create the indexer K cache pools mirroring each KV pool.
+    //! \details When an indexer layer mask is set, only masked-in layers get a row in the
+    //! indexer pool (masked layout); rows follow the order of `managedLayers` restricted to
+    //! the KV pool's layers, matching the KV pool's own layer-row order.
+    void createIndexerKCachePools(std::vector<SizeType32> const& managedLayers);
+
+    //! \brief Row of `layerIdx` within the masked indexer K cache pool, or -1 when the layer
+    //! is masked out (owns no indexer K cache).
+    [[nodiscard]] SizeType32 getIndexerKCachePoolLayerIdx(SizeType32 layerIdx) const
+    {
+        auto const it = mLayerToIndexerPoolRow.find(layerIdx);
+        return it != mLayerToIndexerPoolRow.end() ? it->second : -1;
+    }
 
     void startScheduling();
 
@@ -991,8 +1007,6 @@ public:
     //! \return true iff at least one async block transfer was actually issued. Callers can use this to decide
     //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
@@ -1476,6 +1490,14 @@ private:
     // Whether the indexer K cache stores FP4-packed data (half the byte count
     // per token vs. FP8). Drives the createIndexerKCachePools() formula.
     bool mIndexerKCacheUseFp4{false};
+    // Optional per-layer indexer K cache mask, indexed like numKvHeadsPerLayer.
+    // nullopt = every layer owns an indexer K cache row (dense, legacy behavior).
+    // When set, only masked-in layers get a row in the (masked) indexer pool —
+    // e.g. GLM 5.2 cross-layer indexer sharing where "shared" layers reuse the
+    // previous full layer's top-k and never touch the indexer K cache.
+    std::optional<std::vector<bool>> mIndexerKCacheLayerMask;
+    // layerIdx -> row within the masked indexer K cache pool (only masked-in layers).
+    std::unordered_map<SizeType32, SizeType32> mLayerToIndexerPoolRow;
 
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
@@ -1508,7 +1530,8 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
-        bool indexerKCacheUseFp4 = false, std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        bool indexerKCacheUseFp4 = false, std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
     [[nodiscard]] bool isEnableIndexerKCache() const
@@ -1539,15 +1562,6 @@ public:
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
 
-    //! \brief Calculate the proportional share each window size receives of the total memory pool
-    //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
-    //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
-    //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare).
-    //! \return Map<windowSize, share> where share is a float between 0 and 1. Shares sum to 1.0.
-    static std::map<SizeType32, float> calculateWindowSizeToShare(
-        std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
-        std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize);
-
     void allocatePools(bool useUvm);
 
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
@@ -1557,14 +1571,10 @@ public:
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
         bool isEnableBlockReuse);
 
-    void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
     //! \return true iff at least one async block transfer was actually issued.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
@@ -1581,9 +1591,6 @@ public:
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
-        SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
     //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
@@ -1742,6 +1749,13 @@ public:
     [[nodiscard]] SizeType32 getPoolLayerIdx(SizeType32 layerIdx) const
     {
         return windowManagerByLayer(layerIdx).getPoolLayerIdx(layerIdx);
+    }
+
+    //! \brief Row of `layerIdx` within the masked indexer K cache pool, or -1 when the layer
+    //! owns no indexer K cache (masked out by the per-layer indexer mask).
+    [[nodiscard]] SizeType32 getIndexerKCachePoolLayerIdx(SizeType32 layerIdx) const
+    {
+        return windowManagerByLayer(layerIdx).getIndexerKCachePoolLayerIdx(layerIdx);
     }
 
     [[nodiscard]] bool isPoolLayerFirst(SizeType32 layerIdx) const
@@ -1913,9 +1927,6 @@ public:
 
     //! \brief Update cache offsets for blocks initiated from sequence
     void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-
-    //! \brief Update cache offsets for block at index
-    void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window
@@ -2183,13 +2194,6 @@ public:
     [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> groupLayersByWindowSize(
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers);
 
-    /// @brief Calculate the free memory available for KV cache allocation.
-    /// @param bufferManager Buffer manager for memory operations
-    /// @param config KV cache configuration parameters
-    /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
-    [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
-        runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config);
-
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
     /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
     /// share
@@ -2315,6 +2319,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2329,6 +2334,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2343,6 +2349,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2353,6 +2360,7 @@ public:
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 

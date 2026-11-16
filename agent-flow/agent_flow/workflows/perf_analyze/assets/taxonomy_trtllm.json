@@ -1,0 +1,21 @@
+{
+  "Overall": {
+    "nccl": "^nccl|ncclDevKernel|ncclKernel|[Aa]ll[Rr]educe|allreduce|[Aa]ll[Gg]ather|[Rr]educe[Ss]catter|[Aa]ll[Tt]o[Aa]ll|moeA2A|oneShotAllReduce|twoshotAllreduce|lamport|ar_fusion|lowPrecision(?:Two|Hier)|localFifoSendRecv",
+    "mha": "fmha|^xqa|_xqa|xqa_|flash_fwd|[Bb]atch(?:Decode|Prefill)WithPaged|[Mm]ulti[Hh]ead[Aa]ttention|multihead_attention|mmha|mergeAttnWithSoftmax|cascade_(?:prefix|suffix)|sageAttention|sparseAttention|paged_attention|singleQueryAttention",
+    "gemm": "^nvjet|nvjet_|cutlass|^ampere_|^volta_|^turing_|sm[0-9]+_xmma|xmma_gemm|cublas|[Gg]emm|GEMM|[Mm]arlin|qserve|deep_gemm|fp8_swap_ab|int8_sq",
+    "moe": "[Mm]oe|MoE|[Ee]xpert|routing[A-Z]|finalizeMoeRouting|finalize(?:DeepSeek)?Kernel(?:VecLoad)?|doGatedActivationKernel|doActivationKernel|expandInputRows|permuteKernel|[Uu]npermute|deepseek_v3_topk|moe_align_block_size|count_and_sort_expert|[Rr]outer",
+    "norm": "[Rr][Mm][Ss]_?[Nn]orm|generalRmsNorm|generalLayerNorm|[Ll]ayer_?[Nn]orm|LayerNorm|GroupRMSNorm|[Nn]orm[A-Z]|rms_pre_post_norm|AddBiasResidual|adaptiveLayerNorm|[Aa]da[Ll][Nn]",
+    "rope": "[Rr]o[Pp][Ee]|rotary|applyBiasRope|add_fusedQKV_bias_rope|applyMLARope|inverseRope",
+    "kv_cache": "[Kk][Vv][Cc]ache|kv_cache|[Pp]aged[Kk][Vv]|shiftKCache|onboardTiled|offloadFrom|gatherKvPageOffsets|transpose4dBatchMajor|BlockPartialCopy|indexerKCache|loadPagedKVCache|loadChunkedKVCache|shiftWindow|[Bb]lock[Tt]able",
+    "quant": "[Qq]uantiz|[Dd]equant|scale_1x128|scale_128x128|block_scale_interleave|perTokenQuantization|apply_per_channel_scale|[Ff][Pp]4|[Ff][Pp]8|[Mm][Xx][Ff][Pp]|[Ii]nt8|[Ii]nt4|sage_quant|tokenPerChannelScale|scaleMatrix|convertFP",
+    "attn_prep": "buildCuMaskRows|buildCuQSeqLens|computeSeqAndPaddingOffsets|[Aa]ttention[Mm]ask|packFlashAttentionMask|computeStridesTmaWarpSpecialized|buildRelativeAttentionBias|get_mla_metadata|[Cc]ustom[Mm]ask|adjustFirstSparseMaskOffsets|topKPerRow|SelectBlocks",
+    "linear_attn": "causal_conv1d|selective_scan|rg_lru|kda_|chunk_(?:gated|delta|scaled|fused)|fused_recurrent|fused_chunk|gdn_|deltanet|mamba",
+    "sampling": "[Tt]op[KkPp]|[Ss]ampling|mtp[A-Z]|[Dd]raft[Tt]oken|[Bb]eam|softmax_kernel|penalt|stopCriteria|banBadWords|banRepeatNgram|[Ll]ogits|curand|DynamicTree|suffixAutomaton",
+    "lora": "[Ll]o[Rr][Aa]|[Dd]o[Rr][Aa]",
+    "activation": "^activation|activationKernel|[Ss]wi[Gg][Ll][Uu]|silu|[Gg]e[Gg][Ll][Uu]|gelu|[Ss]igmoid|relu|Relu2",
+    "triton": "^triton_",
+    "elementwise": "vectorized_elementwise_kernel|unrolled_elementwise_kernel|elementwise_kernel|CatArrayBatchedCopy|at::native|direct_copy_kernel|fill_kernel|index_(?:select|add|put|copy)|reduce_kernel|copy_kernel|[Cc]umsum|[Aa]dd[Bb]ias|lookup|[Ee]mbedding",
+    "memory": "[Mm]emcpy|[Mm]emset|[Tt]ranspose|[Uu]npadding|rebuild_padding|remove_padding|convertData|convert_kernel|permute"
+  },
+  "ExactNames": {}
+}

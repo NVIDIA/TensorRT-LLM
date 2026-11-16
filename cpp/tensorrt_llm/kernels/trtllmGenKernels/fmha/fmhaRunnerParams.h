@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include <climits>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -40,7 +41,9 @@ enum class TrtllmGenAttentionMaskType
     // Custom mask.
     Custom,
     // Sliding window mask combined with custom packed mask.
-    SlidingWindowCustom
+    SlidingWindowCustom,
+    // Per-token contiguous window bounds.
+    VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -57,6 +60,7 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -69,7 +73,8 @@ inline bool isCustomMask(TrtllmGenAttentionMaskType maskType)
 inline bool usesSlidingWindowMask(TrtllmGenAttentionMaskType maskType)
 {
     return maskType == TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
-        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
+        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom
+        || maskType == TrtllmGenAttentionMaskType::VariableWindow;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -244,6 +249,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Optional caller limit; the default preserves autotuner selection.
+    int32_t mMaxNumCtasPerSeqKv{INT_MAX};
     // Use block sparse attention.
     bool mUseBlockSparseAttention;
 
@@ -251,6 +258,8 @@ struct TllmGenFmhaRunnerParams
     void const* qPtr;
     void const* kPtr;
     void const* vPtr;
+    // Zero derives the separate V token stride from the layout.
+    int64_t mVTokenStrideInBytes = 0;
     // Packed KV buffer
     void const* kvPtr;
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
@@ -265,12 +274,17 @@ struct TllmGenFmhaRunnerParams
     int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
     uint32_t* customMaskPtr;
+    // The number of uint32 elements behind customMaskPtr.
+    int64_t customMaskCapacity = 0;
     // The packed custom mask's offsets of each sequence.
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t* firstSparseMaskOffsetsKvPtr;
     // The variable sparse MLA topK lengths with shape [numTokensQ].
     int32_t const* ptrSparseMlaTopKLens = nullptr;
+    // Inclusive VariableWindow bounds with one pair per packed Q token.
+    int32_t const* variableWindowTokenStartsPtr = nullptr;
+    int32_t const* variableWindowTokenEndsPtr = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -331,9 +345,9 @@ struct TllmGenFmhaRunnerParams
     int mJITWarmupMaxSeqLenKv = 0;
     // True when a prefill/context path intentionally uses a generation kernel.
     bool mUseGenKernelForPrefill = false;
-    // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
-    // mAttentionWindowSize).
-    int mAttentionWindowSize;
+    // Sliding-window reaches excluding the current token. A negative value means unbounded on that side.
+    int mLeftSlidingWindow;
+    int mRightSlidingWindow;
     // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
     int mChunkedAttentionSize;
     // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
@@ -354,6 +368,8 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float mSkipCorrThreshold{0.0F};
     // Sparse attention type.
     SparseType mSparseAttention;
     // The top k value for sparse attention.
@@ -370,6 +386,13 @@ struct TllmGenFmhaRunnerParams
     int32_t mPackedMaskMaxSeqLenQ = 0;
     int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mForcePrepareSpecDecTreeMask = false;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax{false};
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress{false};
+    // Head dimension per K/V shared-memory stage; 0 lets the autotuner choose. A caller-chosen value is kept; its
+    // kernel comes from the stage-KV cubin table (kernelMetaInfoStageKv.h) when one matches, else from NVRTC.
+    int mHeadDimPerStageKv{0};
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
@@ -429,6 +452,10 @@ struct TllmGenSelectKernelParams
     bool mUses2CtaMma;
     // Skips softmax or not.
     bool mSkipsSoftmaxWhenPossible;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax;
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -445,7 +472,9 @@ struct TllmGenSelectKernelParams
         , mTileSizeQ(128)
         , mTileSizeKv(128)
         , mUses2CtaMma(false)
-        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f)
+        , mFp16Softmax(params.mFp16Softmax)
+        , mUsesSpcompress(params.mUsesSpcompress){};
 };
 
 } // namespace kernels

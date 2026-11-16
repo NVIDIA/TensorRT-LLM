@@ -5,6 +5,22 @@ set -e
 set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
+# Container runtimes (pyxis/enroot) reset image-defined variables like PATH
+# at container start, so values passed via srun --export are lost for them.
+# Allow the launcher config to prepend entries from inside the container.
+# The client_cmds srun passes these via --export with single-quoted values
+# (submit.py convert_envs_to_str), and srun keeps the quotes literal — strip them.
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND:-}"
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND#\'}"; TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND%\'}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
+if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
+    export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
+fi
+if [ -n "${TRTLLM_PYTHONPATH_PREPEND:-}" ]; then
+    export PYTHONPATH="${TRTLLM_PYTHONPATH_PREPEND}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 # Add parameter validation
 if [ "$#" -lt 10 ]; then
     echo "Error: Missing required arguments, got $# arguments, args: $@"

@@ -347,8 +347,7 @@ def test_attn_ctx_fmha_time():
 # only on the HEAD SHAPE (num_heads, num_kv_heads, head_dim) + dtype + seq_len +
 # batch — so models that share a shape share a case:
 #   q8b  = Qwen3-8B                         -> 32 / 8 / 128
-#   l70b = Qwen3-32B / Llama-3.3-70B /
-#          Llama-3.3-Nemotron-Super-49B     -> 64 / 8 / 128
+#   l70b = Qwen3-32B                        -> 64 / 8 / 128
 # seq points map from perf ISL/OSL: prefill seq_len=2048 (long prompt), decode =
 # 1 new token over num_cached_tokens=1024 at batch 256 (throughput concurrency).
 # MLA (DeepSeek) and SWA+sink (gpt_oss) are separate attention families needing

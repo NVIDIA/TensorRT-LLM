@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -15,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -32,6 +46,20 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
+# Every rank needs the test sources importable, not just rank 0. Rank 0 runs
+# pytest, whose pythonpath ini setting (tests/integration/defs/pytest.ini sets
+# `pythonpath = ../../`, i.e. the tests/ root) plus rootdir handling puts both
+# tests/ and tests/integration on sys.path; ranks 1..N run the mgmn_worker_node
+# started by trtllm-llmapi-launch, a bare MPI worker that unpickles
+# request-attached objects the tests define (for example the logits processors
+# in `defs.accuracy.accuracy_core`) and otherwise dies with
+# "ModuleNotFoundError: No module named 'defs'". tests/ is needed too:
+# importing `defs.accuracy.accuracy_core` pulls in `defs.conftest`, which
+# imports the `test_common` package that lives at tests/test_common.
+# Single-node stages never see any of this because MpiPoolSession spawns its
+# workers with rank 0's sys.path.
+export PYTHONPATH="$llmSrcNode/tests/integration:$llmSrcNode/tests${PYTHONPATH:+:$PYTHONPATH}"
+
 # Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
@@ -45,35 +73,15 @@ else
     sleep 30
 fi
 
-containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
-containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
-containerLDLibPath=$LD_LIBRARY_PATH
-containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
-if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
-fi
-export LD_LIBRARY_PATH=$containerLDLibPath
-
-# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
-# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
-# registration. Unset it so UCX can auto-select.
-if [ "${UCX_TLS:-}" = "tcp" ]; then
-    unset UCX_TLS
-    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
-fi
-
-# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
-# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
-# GDS modes can fail to publish UCX worker addresses across nodes, producing:
-#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
-#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
-# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
-# when PMIx isn't used.
-export PMIX_MCA_gds=hash
+# Library path + UCX/PMIx fixups shared with the disagg cache-transceiver
+# precheck (slurm_precheck_run.sh) -- keeping them in one place guarantees the
+# precheck observes the same network environment as the real test steps.
+source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
+slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 
@@ -93,66 +101,72 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# The install lock in slurm_install.sh lives under $resourcePathNode (/tmp), so it
+# is node-local: its wait loop only fences $SLURM_LOCALID peers on the same node,
+# and a node can never observe another node's lock. Nothing else stops one node
+# from reaching `eval $pytestCommand` below while another is still installing, and
+# the per-rank work above skews the ranks further (non-zero ranks cover the
+# coverage-config write with a blind `sleep 30`, and slurm_setup_runtime_env shells
+# out to pip3). Pytest's first action is `import tensorrt_llm`, whose module-scope
+# MPI collective must be entered by every rank; under --mpi=pmix -- added exactly
+# when nodeCount > 1 -- that collective has a 300s fence timeout, so the skew
+# aborts every rank instead of merely running late. Fence every rank on the shared
+# $jobWorkspace so they enter pytest together.
+slurm_wait_all_ranks() {
+    local numRanks="${SLURM_NTASKS:-1}"
+    if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
+        return 0
+    fi
+
+    # Keyed per job *and* per step: $jobWorkspace outlives a single step, so
+    # markers from another job, or from an earlier step of this job, must not
+    # satisfy the count. Slurm assigns one step id per step across all of its
+    # nodes, so every rank of a step agrees on this path.
+    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    mkdir -p "$readyDir"
+    touch "$readyDir/rank_${SLURM_PROCID}.ready"
+
+    # Bounded so a dead rank fails the stage loudly instead of hanging until the
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
+    # in slurm_install.sh so a merely slow rank still releases the barrier.
+    local timeoutSecs=3600
+    local deadline=$((SECONDS + timeoutSecs))
+    local markers ready
+    while true; do
+        # Counted with a glob rather than `ls | wc -l`: under `set -Eeuo pipefail` a
+        # failing `ls` propagates into the assignment and fires the ERR trap. The
+        # touch above guarantees at least one match, so no nullglob is needed.
+        markers=("$readyDir"/*.ready)
+        ready=${#markers[@]}
+        if [ "$ready" -ge "$numRanks" ]; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: rank ${SLURM_PROCID} timed out after ${timeoutSecs}s waiting for" \
+                 "all $numRanks ranks to be ready; ready: $ready/$numRanks"
+            return 1
+        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
+        sleep 10
+    done
+}
+
+slurm_wait_all_ranks
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
 pytest_exit_code=0
-perf_check_exit_code=0
-perf_report_exit_code=0
 
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-
-# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
-# Remove this after the issue is resolved
-if [ $pytest_exit_code -eq 4 ]; then
-    echo "DEBUG: Pytest failed with usage error (exit code 4)"
-    echo "DEBUG: Directory state at $(pwd):"
-    ls -l
-    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
-    ls -l $llmSrcNode/tests/integration/defs
-
-    echo "DEBUG: conftest.py content:"
-    md5sum $llmSrcNode/tests/integration/defs/conftest.py
-
-    echo "DEBUG: pytest.ini content:"
-    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
-
-    echo "DEBUG: Check importability of conftest.py"
-    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
 fi
 
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-    basePerfFilename="base_perf_pytorch.csv"
-    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
-        $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_check_exit_code=$?
-
-    echo "Create Perf Report"
-    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
-        --output_path $stageName/report.pdf \
-        --files $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_report_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
-
-    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
-        perf_check_exit_code=$perf_report_exit_code
-    fi
-    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
-fi
-
-if [ "$pytest_exit_code" -ne 0 ]; then
-    final_exit_code=$pytest_exit_code
-elif [ "$perf_check_exit_code" -ne 0 ]; then
-    final_exit_code=$perf_check_exit_code
-else
-    final_exit_code=0
-fi
-echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
-exit $final_exit_code
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
+exit $pytest_exit_code

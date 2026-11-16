@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Disaggregated Serving with Ray orchestrator
 TensorRT-LLM supports a prototype [Ray orchestrator](../README.md) as an alternative to MPI.
 
@@ -11,6 +16,12 @@ This script is a shorthand to launch a single-GPU context and generation server,
 # requires a total of two GPUs
 bash -e disagg_serving_local.sh
 ```
+
+The script defaults to the NIXL backend and Python transceiver runtime.
+Use `--transceiver_backend DEFAULT --transceiver_runtime auto` to follow the
+standard model-loading defaults instead.
+
+Run `bash disagg_serving_local.sh --help` for the full list of options (executor backend, model, tensor-parallel size, etc.).
 
 Once the disaggregated server is ready, you can send requests to the disaggregated server using curl:
 ```bash

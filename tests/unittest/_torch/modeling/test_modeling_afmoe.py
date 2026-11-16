@@ -19,11 +19,12 @@ import unittest
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_afmoe import (
@@ -37,10 +38,9 @@ from tensorrt_llm._torch.models.modeling_utils import (
     MODEL_CLASS_MAPPING,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi import MoeConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -106,12 +106,13 @@ def _force_mpi_collectives():
     return patch("tensorrt_llm._torch.distributed.ops.mpi_disabled", return_value=False)
 
 
-def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManager) -> None:
+def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManagerV2) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     kv_cache_manager.shutdown()
 
 
+@pytest.mark.cpu_only
 class TestAfmoeRegistry(unittest.TestCase):
     """Verify AfmoeForCausalLM resolves through _torch auto-model registration."""
 
@@ -128,6 +129,7 @@ class TestAfmoeRegistry(unittest.TestCase):
         self.assertNotIn("AfmoeForCausalLM", MODEL_MAP)
 
 
+@pytest.mark.cpu_only
 class TestAfmoeRoutingValidation(unittest.TestCase):
     """Verify routing assumption guards."""
 
@@ -158,6 +160,7 @@ class TestAfmoeRoutingValidation(unittest.TestCase):
             AfmoeForCausalLM(model_config)
 
 
+@pytest.mark.cpu_only
 class TestAfmoeWeightMapper(unittest.TestCase):
     """Verify AfmoeHfWeightMapper key transformations."""
 
@@ -254,7 +257,7 @@ class TestAfmoeWeightMapper(unittest.TestCase):
     def test_is_special_instance_module_for_moe(self):
         from unittest.mock import MagicMock
 
-        from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+        from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 
         mock_moe = MagicMock(spec=MoE)
         mock_moe.__class__ = MoE
@@ -264,6 +267,7 @@ class TestAfmoeWeightMapper(unittest.TestCase):
         self.assertFalse(self.mapper.is_special_instance_module(mock_linear))
 
 
+@pytest.mark.cpu_only
 class TestAfmoeWeightLoading(unittest.TestCase):
     """Verify AfmoeForCausalLM applies mapper preprocessing in the real load hook."""
 
@@ -340,7 +344,7 @@ class TestAfmoeSanity(unittest.TestCase):
             copy_on_partial_reuse=False,
             max_tokens=num_blocks * tokens_per_block,
         )
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
@@ -444,7 +448,7 @@ class TestAfmoeEndToEnd(unittest.TestCase):
                 moe_expert_parallel_size=-1,
                 moe_tensor_parallel_size=-1,
                 enable_attention_dp=False,
-                kv_cache_config=LlmKvCacheConfig(enable_block_reuse=False),
+                kv_cache_config=KvCacheConfig(enable_block_reuse=False),
             ) as llm:
                 outputs = llm.generate(prompts, sampling_params=sampling_params)
 
@@ -677,7 +681,7 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
 
         num_blocks, tokens_per_block = 4, 128
         max_seq_len = num_blocks * tokens_per_block
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(
                 enable_block_reuse=False,
                 enable_partial_reuse=False,

@@ -1,4 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
+import dataclasses
 import functools
 import json
 import os
@@ -8,6 +23,7 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Generator
 
+import numpy as np
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -15,7 +31,9 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
@@ -28,11 +46,10 @@ example_images = [
     str(test_data_root / "61.jpg"),
 ]
 
-_LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
-_QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+_QWEN_2_5_VL_3B_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
@@ -66,7 +83,7 @@ def _create_llm(
     disable_overlap_scheduler: bool = False,
 ) -> LLM:
     cache_transceiver_cfg = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
+        backend="DEFAULT") if pd_disagg else None
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,  # Disable for output 1:1 matching check
         free_gpu_memory_fraction=0.2,
@@ -101,6 +118,7 @@ def _create_mm_disagg_llm(
     model_dir: Path,
     enable_block_reuse: bool,
     disable_overlap_scheduler: bool = False,
+    force_kv_cache_manager_v2: bool = False,
 ) -> LLM:
     kv_cache_kwargs = {
         "enable_block_reuse": enable_block_reuse,
@@ -108,10 +126,17 @@ def _create_mm_disagg_llm(
     }
     if enable_block_reuse:
         kv_cache_kwargs["event_buffer_max_size"] = 1024
+    if force_kv_cache_manager_v2:
+        kv_cache_kwargs["use_kv_cache_manager_v2"] = True
 
     kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
+    if force_kv_cache_manager_v2:
+        cache_transceiver_cfg = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+        )
+    else:
+        cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT")
     return LLM(model=model_dir,
                kv_cache_config=kv_cache_config,
                trust_remote_code=True,
@@ -121,10 +146,9 @@ def _create_mm_disagg_llm(
 
 
 def _get_encoder_max_batch_size(model_dir: Path) -> int:
-    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
+    # Qwen3-VL vision encoders output different embeddings based on this value.
     # The test only passes with this set to 1.
-    if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
-            or _is_fake_checkpoint(model_dir)):
+    if (model_dir in [_QWEN_3_VL_DIR] or _is_fake_checkpoint(model_dir)):
         return 1
     return 3
 
@@ -210,7 +234,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
        - Same media + same prompts: full reuse (0 duplicate offsets)
        - Same media + different prompts: partial reuse (prefix blocks reused)
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -223,6 +247,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,  # Enable KV cache events
+        use_kv_cache_manager_v2=True,
     )
     moe_config = _get_moe_config_for_blackwell()
 
@@ -262,9 +287,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
 @pytest.fixture(
     scope="module",
     params=[
-        pytest.param(_LLAVA_DIR, id="llava_7b"),
-        pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
-        pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
+        pytest.param(_QWEN_3_VL_DIR, id="qwen3_vl_2b"),
         pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
                      id="qwen3_30b_a3b_fp8"),
     ],
@@ -276,25 +299,26 @@ def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
     return request.param
 
 
-@pytest.mark.parametrize(
-    "use_uuids,expected_hash_type",
-    [
-        # Without UUIDs: mm_key hash should be a 64-char hex string
-        (False, "hex"),
-        # With UUIDs: mm_key hash should be the original UUID string
-        (True, "uuid"),
-    ])
-def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
-    """Test mm_keys in KV cache events return UUID when provided.
+def _expected_mm_event_hashes(inp: TextPrompt,
+                              use_kv_cache_manager_v2: bool) -> set[str]:
+    """Return item digests for V2 events and optional UUID labels for V1."""
+    result = apply_mm_hashes(inp["multi_modal_data"],
+                             inp.get("multi_modal_uuids"))
+    expected = set()
+    for modality, hashes in result.hashes.items():
+        uuids = result.uuids[modality] if result.uuids is not None else None
+        for index, digest in enumerate(hashes):
+            uuid = uuids[index] if uuids is not None else None
+            expected.add(
+                digest if use_kv_cache_manager_v2 or uuid is None else uuid)
+    return expected
 
-    This test verifies that when multi_modal_uuids is provided:
-    1. The KV cache event mm_keys 'hash' field contains the original UUID string
-    2. Without UUIDs, the hash field contains a 64-char hex string
 
-    The UUID feature allows users to provide stable identifiers for multimodal
-    items, which are returned in KV cache events for external cache management.
-    """
-    encoder_model_dir = _LLAVA_DIR
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+@pytest.mark.parametrize("use_uuids", [False, True])
+def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
+    """V2 emits digest plus UUID; V1 preserves the UUID as its hash label."""
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -311,6 +335,7 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -324,6 +349,11 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         inputs = _load_inputs_with_uuids(llm, prompts, media, [test_uuid])
     else:
         inputs = _load_inputs(llm, prompts, media)
+
+    expected_hashes = set().union(*[
+        _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
+        for inp in inputs
+    ])
 
     with llm:
         for inp in inputs:
@@ -343,19 +373,11 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
     # Verify mm_keys were found (multimodal model should have them)
     assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
 
-    # Verify the hash field matches expected type
-    for mm_key in mm_keys_found:
-        hash_value = mm_key["hash"]
-        if expected_hash_type == "uuid":
-            # Should be the original UUID string
-            assert hash_value == test_uuid, (
-                f"Expected UUID '{test_uuid}', got '{hash_value}'")
-        else:
-            # Should be a 64-char hex string
-            assert len(hash_value) == 64, (
-                f"Expected 64-char hex hash, got {len(hash_value)} chars")
-            # Verify it's valid hex (fromhex will raise ValueError if invalid)
-            bytes.fromhex(hash_value)
+    assert {mm_key["hash"] for mm_key in mm_keys_found} == expected_hashes
+    expected_uuids = {test_uuid
+                      } if use_uuids and use_kv_cache_manager_v2 else set()
+    assert {mm_key["uuid"]
+            for mm_key in mm_keys_found if "uuid" in mm_key} == expected_uuids
 
 
 def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
@@ -374,25 +396,15 @@ def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
     return inputs
 
 
-@pytest.mark.parametrize(
-    "uuids,expected_patterns",
-    [
-        # First image has UUID, second uses content hash
-        (["custom-uuid-first", None], ["custom-uuid-first", "hex"]),
-        # Both have UUIDs
-        (["uuid-img-a", "uuid-img-b"], ["uuid-img-a", "uuid-img-b"]),
-        # Both use content hash (None)
-        ([None, None], ["hex", "hex"]),
-    ])
-def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
-    """Test mm_keys with partial UUIDs (some items with UUID, some without).
-
-    This test verifies the mixed UUID scenario where:
-    1. Some multimodal items have user-provided UUIDs
-    2. Other items fall back to content-based hashing
-    3. KV cache events correctly return UUID or hex hash based on input
-    """
-    encoder_model_dir = _LLAVA_DIR
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+@pytest.mark.parametrize("uuids", [
+    ["custom-uuid-first", None],
+    ["uuid-img-a", "uuid-img-b"],
+    [None, None],
+])
+def test_kv_event_mm_keys_with_partial_uuids(uuids, use_kv_cache_manager_v2):
+    """Check each item's event identity when only some items have UUIDs."""
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -406,6 +418,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -430,6 +443,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
     # Add multi_modal_uuids to the processed input
     inputs[0]["multi_modal_uuids"] = {"image": uuids}
     inp = inputs[0]
+    expected_hashes = _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
 
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
@@ -440,40 +454,29 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify each expected pattern appears in the results
-    for pattern in expected_patterns:
-        if pattern == "hex":
-            # Should find at least one 64-char hex string
-            hex_found = any(
-                len(h) == 64 and all(c in '0123456789abcdef' for c in h)
-                for h in mm_key_hashes)
-            assert hex_found, f"Expected hex hash pattern but got: {mm_key_hashes}"
-        else:
-            # Should find the exact UUID string
-            assert pattern in mm_key_hashes, (
-                f"Expected UUID '{pattern}' in mm_keys, got: {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == ({uuid
+                             for uuid in uuids if uuid is not None}
+                            if use_kv_cache_manager_v2 else set())
 
 
-def test_kv_event_mm_keys_with_uuid_multiple_prompts():
-    """Test mm_keys with UUIDs across multiple prompts, each with its own image.
-
-    This test verifies that when multiple prompts are processed, each with its own
-    multimodal data and UUID:
-    1. Each prompt's mm_keys correctly return the associated UUID
-    2. Different UUIDs are preserved for different prompts
-    3. KV cache events correctly associate UUIDs with their respective blocks
-    """
-    encoder_model_dir = _LLAVA_DIR
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_kv_event_mm_keys_with_uuid_multiple_prompts(use_kv_cache_manager_v2):
+    """Check MM event identities across multiple requests with distinct UUIDs."""
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -492,6 +495,7 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=2048,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -506,6 +510,11 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
     for inp, uuid in zip(inputs, uuids):
         inp["multi_modal_uuids"] = {"image": [uuid]}
 
+    expected_hashes = set().union(*[
+        _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
+        for inp in inputs
+    ])
+
     with llm:
         # Generate for each input separately
         for inp in inputs:
@@ -517,32 +526,27 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify each UUID appears in the results
-    for uuid in uuids:
-        assert uuid in mm_key_hashes, (
-            f"Expected UUID '{uuid}' in mm_keys, got: {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
-def test_kv_event_mm_keys_with_very_long_uuid():
-    """Test mm_keys with UUIDs that exceed 64 bytes.
-
-    This test verifies that the system correctly handles UUIDs that are longer
-    than the typical 64-character hex hash representation:
-    1. Very long UUIDs (>64 bytes) are preserved and returned correctly
-    2. No truncation or corruption occurs for long UUID strings
-    3. The full UUID is returned in KV cache events
-    """
-    encoder_model_dir = _LLAVA_DIR
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
+    """Long UUIDs remain intact in V1 labels and V2 UUID fields."""
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -569,6 +573,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -593,6 +598,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
     # Add very long UUIDs
     inputs[0]["multi_modal_uuids"] = {"image": uuids}
     inp = inputs[0]
+    expected_hashes = _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
 
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
@@ -603,32 +609,21 @@ def test_kv_event_mm_keys_with_very_long_uuid():
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify the 80-char UUID is present and not truncated
-    assert long_uuid_80 in mm_key_hashes, (
-        f"Expected 80-char UUID '{long_uuid_80}' in mm_keys, got: {mm_key_hashes}"
-    )
-
-    # Verify the 200-char UUID is present and not truncated
-    assert very_long_uuid_200 in mm_key_hashes, (
-        f"Expected 200-char UUID '{very_long_uuid_200}' in mm_keys, got: {mm_key_hashes}"
-    )
-
-    # Verify the UUIDs are exactly as provided (no truncation)
-    for uuid in uuids:
-        matching = [h for h in mm_key_hashes if h == uuid]
-        assert len(matching) == 1, (
-            f"UUID '{uuid}' (len={len(uuid)}) should appear exactly once, "
-            f"found {len(matching)} times in {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
 @pytest.fixture(scope="module",
@@ -892,6 +887,78 @@ def test_single_request_chat_multiple_images(
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
                          indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize("frame_counts", [(8, ), (40, ), (8, 8)])
+@pytest.mark.threadleak(enabled=False)
+def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
+                                                    frame_counts):
+    """E/PD must consume the same timestamped prompt as aggregated inference."""
+    (llm, _), encoder = llms_and_encoder
+    videos = []
+    for count in frame_counts:
+        indices = np.linspace(0, 239, count).astype(int).tolist()
+        frames = []
+        for index in indices:
+            frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            frame[:, :, 0 if index < 120 else 2] = 255
+            frames.append(frame)
+        videos.append(
+            VideoData(frames=frames,
+                      metadata={
+                          "fps": 24.0,
+                          "total_num_frames": 240,
+                          "duration": 10.0,
+                          "frames_indices": indices,
+                      }))
+    prompt = llm.tokenizer.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [
+                *({
+                    "type": "video"
+                } for _ in videos),
+                {
+                    "type": "text",
+                    "text": "Describe the events and their times in seconds."
+                },
+            ]
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = {
+        "prompt": prompt,
+        "multi_modal_data": {
+            "video": videos
+        },
+        "mm_processor_kwargs": {
+            "do_sample_frames": False
+        }
+    }
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=64)
+    reference = llm.generate_async(copy.deepcopy(inputs),
+                                   sampling_params=sampling).result()
+    encoded = encoder.generate_async(copy.deepcopy(inputs)).result()
+    handoff = encoded.disaggregated_params
+    assert handoff.multimodal_input_layout.prompt_token_ids == reference.prompt_token_ids
+    assert handoff.mrope_position_ids_handle["tensor_size"][-1] == len(
+        reference.prompt_token_ids)
+    # Exercise a wire round trip without resending the raw video to prefill.
+    handoff = DisaggregatedParams(
+        **json.loads(json.dumps(dataclasses.asdict(handoff))))
+    handoff.request_type = "context_and_generation"
+    output = llm.generate_async({
+        "prompt": prompt
+    },
+                                sampling_params=sampling,
+                                disaggregated_params=handoff).result()
+    assert output.prompt_token_ids == reference.prompt_token_ids
+    assert output.outputs[0].token_ids == reference.outputs[0].token_ids
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
 @pytest.mark.parametrize("pd_disagg", [True], indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_pd_disagg_with_image_input(
@@ -947,17 +1014,9 @@ def test_pd_disagg_with_image_input(
 @pytest.mark.parametrize(
     "model_dir,use_mm_embeddings,pass_embeddings_through_loader",
     [
-        # Reference path: raw multimodal inputs go through the standard pipeline.
-        pytest.param(_LLAVA_DIR, False, False, id="llava_7b-raw_inputs"),
-        # Encoder produces embeddings; LLM consumes them via multi_modal_embeddings.
-        pytest.param(_LLAVA_DIR, True, False, id="llava_7b-encoder_embeddings"),
-        # Encoder embeddings routed back through default_multimodal_input_loader.
-        pytest.param(_LLAVA_DIR, True, True, id="llava_7b-loader_embeddings"),
         # Keep Qwen rows on the raw path here; Qwen image-embedding attach is
         # covered by dedicated input-processor and OpenAI image_embeds tests.
-        pytest.param(_QWEN_2_5_VL_DIR, False, False,
-                     id="qwen2.5_3b-raw_inputs"),
-        pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_2b-raw_inputs"),
+        pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_vl_2b-raw_inputs"),
         pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
                      False,
                      False,
@@ -1191,7 +1250,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
 
     create_llm = functools.partial(_create_mm_disagg_llm,
                                    encoder_model_dir,
-                                   enable_block_reuse=True)
+                                   enable_block_reuse=True,
+                                   force_kv_cache_manager_v2=True)
 
     llm_prefill, encoder, llm_decode = _instantiate_models(
         functools.partial(create_llm, disable_overlap_scheduler=True),
@@ -1330,7 +1390,8 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
 
     create_llm = functools.partial(_create_mm_disagg_llm,
                                    model_dir,
-                                   enable_block_reuse=False)
+                                   enable_block_reuse=False,
+                                   force_kv_cache_manager_v2=True)
 
     llm_prefill, llm_decode = _instantiate_models(
         functools.partial(create_llm, disable_overlap_scheduler=True),
@@ -1363,3 +1424,46 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
             assert len(decode_outputs[0].outputs) > 0
             text = decode_outputs[0].outputs[0].text
             assert len(text) > 0, f"[req {req_num}] empty output"
+
+
+def _encode_images(model_dir: Path, attn_backend: str,
+                   media: list[list[str]]) -> list[torch.Tensor]:
+    encoder = MultimodalEncoder(model=model_dir,
+                                attn_backend=attn_backend,
+                                max_batch_size=len(media))
+    with encoder:
+        inputs = _load_inputs(encoder, ["Describe the image."] * len(media),
+                              media)
+        outputs = encoder.generate(inputs)
+        embeddings = []
+        for output in outputs:
+            handles = output.disaggregated_params.multimodal_embedding_handles
+            assert handles is not None
+            embeddings.append(
+                torch.cat([
+                    SharedTensorContainer.from_dict(
+                        handle).get_local_view().float().cpu()
+                    for handle in handles
+                ]))
+    return embeddings
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_encoder_flashinfer_attention_matches_trtllm():
+    """The encoder-only engine runs with FLASHINFER attention and matches TRTLLM."""
+    # get_attention_backend() falls back to TRTLLM when FlashInfer cannot be
+    # imported, which would turn this test into a TRTLLM self-comparison.
+    pytest.importorskip("flashinfer")
+    if not _QWEN_2_5_VL_3B_DIR.is_dir():
+        pytest.skip(f"Checkpoint not found: {_QWEN_2_5_VL_3B_DIR}")
+    media = [[image] for image in example_images]
+    reference = _encode_images(_QWEN_2_5_VL_3B_DIR, "TRTLLM", media)
+    flashinfer = _encode_images(_QWEN_2_5_VL_3B_DIR, "FLASHINFER", media)
+
+    assert len(flashinfer) == len(reference) == len(media)
+    for ref, test in zip(reference, flashinfer):
+        assert test.shape == ref.shape
+        cos = torch.nn.functional.cosine_similarity(ref.flatten(),
+                                                    test.flatten(),
+                                                    dim=0)
+        assert cos.item() > 0.99, f"cosine similarity {cos.item():.6f}"

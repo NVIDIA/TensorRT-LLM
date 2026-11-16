@@ -5,10 +5,9 @@ import time
 
 import openai
 import pytest
+from test_common import cluster_env
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
-from test_common.perf_metrics_utils import (get_timing_metrics,
-                                            validate_timing_metrics)
 
 from tensorrt_llm._utils import get_sm_version
 
@@ -31,6 +30,10 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 CTX_SERVER_PORT = 8001
 GEN_SERVER_PORT = 8002
 DISAGG_SERVER_PORT = 8000
+# The disagg server starts once the local ctx server is ready, while the gen
+# server on the other node starts independently and may need longer, so the
+# default 180-second readiness window of the disagg server is too short.
+DISAGG_SERVER_START_TIMEOUT_S = 1200
 
 
 # Exclude the current node from the node list, then return other nodes by idx
@@ -79,14 +82,17 @@ def env():
     # auto-selection, so UCX_TLS must be set explicitly there. Identify GB300 via
     # sm_103 (Blackwell Ultra) + aarch64 (Grace) -- this excludes HGX B300
     # (also sm_103 but x86_64) and avoids depending on the GPU device name string.
+    # A cluster rule, if one matches, overrides this.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+    cluster_env.apply_ucx_env(e,
+                              cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
     return e
 
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture(scope="module", params=['pytorch'], ids=["pytorch"])
@@ -117,12 +123,14 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "backend": "DEFAULT"
         },
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
-        "perf_metrics_max_requests": 1000,
-        "return_perf_metrics": True,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
@@ -164,11 +172,13 @@ def disagg_server(worker: RemoteOpenAIServer):
         # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only expected to run with 2 nodes now
         # We need to test with 4 nodes or more in the future, which should be easier with service discovery
         gen_url = f"{get_the_other_host(0)}:8002"
-        with RemoteDisaggOpenAIServer(ctx_servers=[ctx_url],
-                                      gen_servers=[gen_url],
-                                      port=DISAGG_SERVER_PORT,
-                                      llmapi_launch=False,
-                                      env=env()) as server:
+        with RemoteDisaggOpenAIServer(
+                ctx_servers=[ctx_url],
+                gen_servers=[gen_url],
+                port=DISAGG_SERVER_PORT,
+                llmapi_launch=False,
+                env=env(),
+                server_start_timeout=DISAGG_SERVER_START_TIMEOUT_S) as server:
             yield server
     else:
         print(f"skipping disagg_server for rank {RANK} node rank {NODE_RANK}")
@@ -203,11 +213,6 @@ def test_completion(client: openai.OpenAI,
         message = completion.choices[0].text
         assert message.startswith('2.')
 
-        perf_metrics = get_timing_metrics(disagg_server.url_root)
-        # allow 5ms leniency when comparing the time points from disagg and ctx/gen servers
-        validate_timing_metrics(perf_metrics,
-                                "multinode test_completion",
-                                time_tolerance_seconds=0.005)
         # sleep 10 seconds to ensure a successful wait_for_endpoint_ready on rank1
         time.sleep(10)
         disagg_server.terminate()

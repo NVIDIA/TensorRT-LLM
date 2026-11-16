@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,6 +15,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
     get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
 # isort: on
+
+pytestmark = pytest.mark.cpu_only
 
 
 def get_yaml_config():
@@ -127,10 +133,160 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
+def test_bounded_replay_on_generation_reaches_both_workers():
+    config = extract_disagg_cfg(**get_yaml_config(),
+                                bounded_replay_on_generation=True)
+
+    assert config.bounded_replay_on_generation is True
+    assert {
+        server.other_args["bounded_replay_on_generation"]
+        for server in config.server_configs
+    } == {True}
+    assert config.conditional_disagg_config is None
+
+
+@pytest.mark.parametrize("ctx_frontends, expected", [
+    ({
+        "num_serve_frontends": 8,
+        "serve_frontend_affinity_port_stride": 10
+    }, (8, 10)),
+    ({
+        "num_serve_frontends": 8
+    }, None),
+    ({
+        "num_serve_frontends": 1,
+        "serve_frontend_affinity_port_stride": 10
+    }, None),
+])
+def test_extract_disagg_cfg_ctx_frontend_affinity(ctx_frontends, expected):
+    config = get_yaml_config()
+    config["context_servers"].update(ctx_frontends)
+    assert extract_disagg_cfg(**config).ctx_frontend_affinity == expected
+
+
+def test_disaggregated_mpi_worker_rejects_ctx_frontend_affinity(tmp_path):
+    from click.testing import CliRunner
+
+    from tensorrt_llm.commands import serve
+
+    config = get_yaml_config()
+    config["context_servers"].update({
+        "num_serve_frontends": 8,
+        "serve_frontend_affinity_port_stride": 10
+    })
+    config_file = tmp_path / "disagg.yaml"
+    config_file.write_text(yaml.safe_dump(config))
+
+    result = CliRunner().invoke(serve.disaggregated_mpi_worker,
+                                ["-c", str(config_file), "--no-telemetry"])
+
+    assert isinstance(result.exception, ValueError)
+    assert "one serving frontend per server" in str(result.exception)
+
+
+def test_extract_disagg_metrics_controls():
+    yaml_config = get_yaml_config()
+    yaml_config["context_servers"]["return_perf_metrics"] = False
+    yaml_config["generation_servers"]["return_perf_metrics"] = False
+    config = extract_disagg_cfg(
+        **yaml_config,
+        return_perf_metrics=True,
+        perf_metrics_output_dir="/tmp/perf",
+    )
+
+    assert config.return_perf_metrics is True
+    assert config.perf_metrics_output_dir == "/tmp/perf"
+    assert all("perf_metrics_output_dir" not in server.other_args
+               for server in config.server_configs)
+
+
 @pytest.mark.parametrize("node_id", [-1, 256])
 def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
     with pytest.raises(ValueError, match="node_id must be in range"):
         extract_disagg_cfg(node_id=node_id)
+
+
+def test_server_keep_alive_timeout(tmp_path):
+    # Absent key keeps the historical 10s default.
+    assert extract_disagg_cfg(
+        **get_yaml_config()).server_keep_alive_timeout == 10
+
+    # A top-level override reaches the config...
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = 3600
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 3600
+
+    # ...and survives the YAML file parser.
+    yaml_file = tmp_path / "keep_alive_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(cfg, f)
+    assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
+
+    # Zero is valid.
+    cfg["server_keep_alive_timeout"] = 0
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 0
+
+
+@pytest.mark.parametrize("value", [None, "10", 10.0, True, False, -1])
+def test_server_keep_alive_timeout_rejects_invalid_values(value):
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = value
+    with pytest.raises(
+            ValueError,
+            match="server_keep_alive_timeout must be a non-negative integer"):
+        extract_disagg_cfg(**cfg)
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
+    sample_yaml_config["internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_accepts_matching_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "test-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_rejects_mismatched_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "ctx-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "gen-secret"
+
+    with pytest.raises(ValueError, match="must match"):
+        extract_disagg_cfg(**sample_yaml_config)
+
+
+def test_extract_disagg_cfg_rejects_invalid_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key="")
+
+
+def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key=123)
 
 
 def test_extract_ctx_gen_cfgs():
@@ -294,3 +450,202 @@ def test_get_local_request_id():
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
     assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1
+
+
+def _yaml_config_with_conversation_routers():
+    """Configure conversation routing on both fleets for sub-agent affinity."""
+    config = get_yaml_config()
+    config["context_servers"]["router"] = {"type": "conversation"}
+    config["generation_servers"]["router"] = {"type": "conversation"}
+    return config
+
+
+def test_subagent_affinity_scope_defaults_to_context():
+    config = extract_disagg_cfg(**get_yaml_config())
+    assert config.subagent_affinity_scope == "context"
+    assert config.conversation_affinity_header_for_subagents is None
+
+
+def test_subagent_affinity_scope_rejects_invalid_value():
+    with pytest.raises(ValueError, match="subagent_affinity_scope"):
+        extract_disagg_cfg(**get_yaml_config(),
+                           subagent_affinity_scope="everything")
+
+
+def test_subagent_affinity_requires_key_at_config_load() -> None:
+    with pytest.raises(ValueError, match="requires internal_request_auth_key"):
+        extract_disagg_cfg(
+            **get_yaml_config(),
+            conversation_affinity_header_for_subagents="x-parent-id")
+
+
+@pytest.mark.parametrize("key_location",
+                         ["top_level", "context_servers", "generation_servers"])
+def test_subagent_affinity_accepts_resolved_key(key_location: str) -> None:
+    config = get_yaml_config()
+    config["conversation_affinity_header_for_subagents"] = "x-parent-id"
+    key_config = config if key_location == "top_level" else config[key_location]
+    key_config["internal_request_auth_key"] = "secret"
+
+    assert extract_disagg_cfg(**config).internal_request_auth_key == "secret"
+
+
+def test_subagent_affinity_warns_when_ctx_router_not_conversation(caplog):
+    # Default ctx router is round_robin, not conversation -> instance affinity
+    # for "context" scope is inactive; expect a startup warning.
+    with caplog.at_level(logging.WARNING):
+        config = extract_disagg_cfg(
+            **get_yaml_config(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
+        )
+    assert config.conversation_affinity_header_for_subagents == "X-Dynamo-Parent-Session-ID"
+    assert "conversation" in caplog.text
+    assert "context" in caplog.text
+
+
+def test_subagent_affinity_no_warning_when_router_prerequisite_met(caplog):
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **_yaml_config_with_conversation_routers(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
+        )
+    assert "router type" not in caplog.text
+
+
+def test_subagent_affinity_both_scope_warns_with_conditional_disagg(caplog):
+    # "both" scope + conditional disaggregation is unsupported (router-type
+    # conflict); expect a warning rather than a hard rejection.
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **_yaml_config_with_conversation_routers(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
+            subagent_affinity_scope="both",
+            conditional_disagg_config={"max_local_prefill_length": 32},
+        )
+    assert "unsupported with conditional" in caplog.text
+
+
+def test_subagent_affinity_inert_when_header_unset(caplog):
+    # No configured header -> feature off -> no warnings even with a non-conversation
+    # router or conditional disagg present.
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **get_yaml_config(),
+            subagent_affinity_scope="both",
+            conditional_disagg_config={"max_local_prefill_length": 32},
+        )
+    assert "sub-agent" not in caplog.text.lower()
+    assert "subagent_affinity_scope" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "decoding_type, backend, blocked",
+    [("DSpark", "CUTEDSL", False), ("DSpark", "TRTLLM", True),
+     ("DFlash", "CUTEDSL", True)],
+)
+def test_shared_draft_kv_under_helix_needs_the_cutedsl_dspark_drafter(
+        decoding_type, backend, blocked):
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": decoding_type, "attention_backend": backend}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": spec,
+                "tensor_parallel_size": 1,
+                "context_parallel_size": 2,
+            },
+        ) for role in ("ctx", "gen")
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "backend, tokens_per_block, blocked",
+    [("CUTEDSL", 128, False), ("CUTEDSL", 64, False), ("CUTEDSL", 96, True),
+     ("TRTLLM", 128, True), ("TRTLLM", 64, False)],
+)
+def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
+        backend, tokens_per_block, blocked):
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DSpark", "attention_backend": backend}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": spec,
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {
+                    "tokens_per_block": tokens_per_block
+                },
+            },
+        ) for role in ("ctx", "gen")
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles_with_spec, blocked",
+    [((("ctx", True), ), False), ((("ctx", True), ("ctx", True)), False),
+     ((("ctx", True), ("ctx", False)), True),
+     ((("ctx", True), ("gen", False)), True), ((("gen", True), ), False),
+     ((), True)],
+)
+def test_shared_draft_kv_checks_a_one_sided_config_for_its_own_side(
+        roles_with_spec, blocked):
+    """A DWDP context MPI world's config lists only its context servers."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {
+                    "tokens_per_block": 64
+                },
+                **({
+                    "speculative_config": spec
+                } if has_spec else {}),
+            },
+        ) for role, has_spec in roles_with_spec
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles, blocker, expected",
+    [(("ctx", "gen"), None, "auto"), (("ctx", "ctx"), None, "0"),
+     (("gen", ), None, "0"), (("ctx", "gen"), "a reason", "0")],
+)
+def test_launcher_shares_draft_kv_by_default_only_when_both_sides_are_listed(
+        roles, blocker, expected):
+    """A one-sided config leaves sharing off unless it is asked for.
+
+    A DWDP context MPI world lists only its context servers and cannot see
+    how the generation side is launched.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_default
+
+    configs = [SimpleNamespace(type=role, other_args={}) for role in roles]
+    assert _shared_draft_kv_default(configs, blocker) == expected

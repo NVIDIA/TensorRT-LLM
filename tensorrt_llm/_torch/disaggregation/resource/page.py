@@ -17,14 +17,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, FrozenSet, List, Optional
+from typing import FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
+
+from tensorrt_llm._torch.disaggregation.base import CacheKind
 
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
-        ("offset", np.uint32),
+        # Byte offsets within coalesced pools use 64 bits.
+        ("offset", np.uint64),
         ("size", np.uint32),
     ]
 )
@@ -40,8 +43,8 @@ class MapperKind(IntEnum):
     when a role class exists only on some layers). The kind selects how
     bytes move between heterogeneous topologies:
 
-    INDEXED: Head-major (HND) K/V — the layout written by the TRTLLM
-        attention kernels and the default for V1 and standard V2 managers.
+    INDEXED/HND: Head-major (HND) K/V — the layout written by the TRTLLM
+        attention kernels and the default for standard V2 managers.
         Heterogeneous-head transfer selects one contiguous head-major range
         per K/V buffer.
     REPLICATED: The pool holds bytes that are identical on every TP rank
@@ -64,27 +67,71 @@ class MapperKind(IntEnum):
     in ``bytes_per_layer``). View count per layer group is bounded by the
     number of role classes, never by layer count.
 
-    Mamba state pools do not use this enum: Mamba's transfer is dispatched
-    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
-    bypasses the attention pool-matching path entirely.
+    Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
+    state, and REPLICATED for auxiliary recurrent state. The policy is chosen
+    by the layer group's :class:`CacheKind` (PAGED -> ``AttentionPolicy``,
+    STATE -> ``MambaPolicy``); each policy then picks the mapper for a view
+    from its mapper kind, copying REPLICATED views whole per layer.
     """
 
     INDEXED = 0
+    HND = INDEXED
     REPLICATED = 1
     NHD = 2
+    SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded
+
+
+@dataclass(frozen=True)
+class RoleLayout:
+    """Resharding geometry a cache manager declares for one role.
+
+    Carried onto the role's :class:`PoolView` by the page-table builder.
+    ``section_bytes`` describes a SECTIONED role (one entry per section, in
+    slot order); ``bytes_per_head`` describes an INDEXED role whose head
+    count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
+    ``ring_slot_bytes`` describes a REPLICATED role whose per-layer region is
+    a ring of token slots addressed by global token position modulo the slot
+    count (see :attr:`PoolView.ring_slot_bytes`). Roles with none of these need
+    no geometry (plain REPLICATED, attention K/V).
+    """
+
+    section_bytes: Optional[Tuple[int, ...]] = None
+    bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
 
 @dataclass
 class PhysicalPool:
+    """Physical storage for a V2 pool's slots.
+
+    ``slot_bytes`` spans all layers and roles coalesced into one slot.
+    The slot address is ``base_address + slot * slot_stride_bytes``;
+    per-layer and per-role offsets are carried by each PoolView.
+    ``memory_type`` describes the backing allocation, including the host hot
+    tier for sparse buffers, independently of the logical layer layout.
+    """
+
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
+    slot_stride_bytes: Optional[int] = None
+    memory_type: Literal["VRAM", "DRAM"] = "VRAM"
+
+    def __post_init__(self) -> None:
+        if self.memory_type not in ("VRAM", "DRAM"):
+            raise ValueError(f"Unsupported KV pool memory type: {self.memory_type!r}")
+        if self.slot_stride_bytes is None:
+            self.slot_stride_bytes = self.slot_bytes
+        if self.slot_stride_bytes < self.slot_bytes:
+            raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
         return {
             "base_address": int(self.base_address),
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
+            "slot_stride_bytes": int(self.slot_stride_bytes),
+            "memory_type": self.memory_type,
         }
 
     @staticmethod
@@ -93,6 +140,12 @@ class PhysicalPool:
             base_address=int(data["base_address"]),
             slot_bytes=int(data["slot_bytes"]),
             num_slots=int(data["num_slots"]),
+            slot_stride_bytes=(
+                int(data["slot_stride_bytes"])
+                if data.get("slot_stride_bytes") is not None
+                else None
+            ),
+            memory_type=data.get("memory_type", "VRAM"),
         )
 
 
@@ -152,6 +205,26 @@ class PoolView:
             classes between layers, making the layer stride non-uniform.
             Set for every kind; ``None`` only in tables serialized by older
             builders, where consumers re-derive it from the entries.
+        section_bytes: SECTIONED views only. Byte size of each section of one
+            layer's region, in slot order (``sum == bytes_per_layer``). Each
+            section is TP-sharded independently, so a TP mismatch is resolved
+            per section.
+        bytes_per_head: INDEXED views whose head count is not derivable from
+            ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
+            bytes_per_head`` is the per-rank head count. Attention K/V leaves
+            it ``None``; its head count is ``num_kv_heads``.
+        num_kv_heads: Attention K/V views only. Per-rank KV-head count shared
+            by every layer of the view, so views of one rank (e.g. target and
+            draft layers) may shard or replicate heads differently. Required
+            for head-sharded attention views; ``None`` for replicated and
+            recurrent-state views, which do not use attention head counts.
+        ring_slot_bytes: REPLICATED views only. When set, each layer's region
+            is a ring of ``bytes_per_layer // ring_slot_bytes`` token slots,
+            and the token at global position ``p`` lives in slot
+            ``p % num_slots`` of the ring in the page that holds ``p``. The two
+            sides may size their rings differently, so the transfer moves the
+            positions both rings retain slot by slot instead of copying the
+            region verbatim.
     """
 
     pool_idx: int
@@ -159,6 +232,10 @@ class PoolView:
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
     mapper_kind: MapperKind = MapperKind.INDEXED
     bytes_per_layer: Optional[int] = None
+    section_bytes: Optional[List[int]] = None
+    bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
+    num_kv_heads: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -168,6 +245,16 @@ class PoolView:
             "mapper_kind": int(self.mapper_kind),
             "bytes_per_layer": (
                 int(self.bytes_per_layer) if self.bytes_per_layer is not None else None
+            ),
+            "section_bytes": (
+                [int(x) for x in self.section_bytes] if self.section_bytes is not None else None
+            ),
+            "bytes_per_head": (
+                int(self.bytes_per_head) if self.bytes_per_head is not None else None
+            ),
+            "num_kv_heads": int(self.num_kv_heads) if self.num_kv_heads is not None else None,
+            "ring_slot_bytes": (
+                int(self.ring_slot_bytes) if self.ring_slot_bytes is not None else None
             ),
         }
 
@@ -187,27 +274,52 @@ class PoolView:
             bytes_per_layer=(
                 int(data["bytes_per_layer"]) if data.get("bytes_per_layer") is not None else None
             ),
+            section_bytes=(
+                [int(x) for x in data["section_bytes"]]
+                if data.get("section_bytes") is not None
+                else None
+            ),
+            bytes_per_head=(
+                int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
+            ),
+            num_kv_heads=(
+                int(data["num_kv_heads"]) if data.get("num_kv_heads") is not None else None
+            ),
+            ring_slot_bytes=(
+                int(data["ring_slot_bytes"]) if data.get("ring_slot_bytes") is not None else None
+            ),
         )
 
 
 @dataclass
 class LayerGroup:
-    """
-    Base class for one life cycle / layer-group.
+    """Base class for one life cycle / layer-group.
+
+    Shared structure:
+      - kind: how this group's region IDs are interpreted. PAGED extracts per-block base pointers
+        and aligns on window/beam/SWA; STATE extracts per-layer pointers within one slot and has no
+        block alignment.
+      - pool_group_idx: index into KVCachePageTable.pool_groups
+      - local_layers: local ↔ global layer ID mapping
+      - pool_views: logical views into pool_groups[pool_group_idx].pools
     """
 
     pool_group_idx: int
+    kind: CacheKind = CacheKind.PAGED
+    local_layers: List[LocalLayer] = field(default_factory=list)
+    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         raise NotImplementedError
 
     @classmethod
     def from_dict(cls, data: dict) -> "LayerGroup":
-        if data.get("kv_head_num_per_rank") is not None:
+        kind = int(data["kind"])
+        if kind == CacheKind.PAGED:
             return AttentionLayerGroup.from_dict(data)
-        elif data.get("mamba_layer_offsets") is not None:
+        elif kind == CacheKind.STATE:
             return MambaLayerGroup.from_dict(data)
-        raise ValueError("Invalid layer group")
+        raise ValueError(f"Unknown layer group kind: {kind}")
 
 
 @dataclass
@@ -216,11 +328,10 @@ class AttentionLayerGroup(LayerGroup):
 
     kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
-    local_layers: List[LocalLayer] = field(default_factory=list)
-    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
@@ -232,46 +343,60 @@ class AttentionLayerGroup(LayerGroup):
     def from_dict(cls, data: dict) -> "AttentionLayerGroup":
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
-            sliding_window_size=data.get("sliding_window_size"),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
+            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
+            sliding_window_size=data.get("sliding_window_size"),
         )
+
+
+# Native role names of the hybrid Mamba managers (``MambaRole.CONV_STATE`` /
+# ``MambaRole.SSM_STATE``), spelled out here because page.py must not import
+# the manager.
+MAMBA_CONV_ROLE = frozenset({"conv_state"})
+MAMBA_SSM_ROLE = frozenset({"ssm_state"})
 
 
 @dataclass
 class MambaLayerGroup(LayerGroup):
-    """Layer group for Mamba SSM states."""
+    """Layer group for recurrent (STATE life cycle) states.
 
-    mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
-    conv_states: Optional[PhysicalPool] = None
-    ssm_states: Optional[PhysicalPool] = None
-    conv_section_bytes: Optional[List[int]] = None
-    ssm_bytes_per_head: Optional[int] = None
+    One slot per request; every view of the group is addressed by the same
+    slot id. Pools are accessed the same way as attention:
+        pool_groups[pool_group_idx].pools[pool_view.pool_idx]
+
+    Views are matched to a peer by ``pool_role``; how each view reshards
+    under a TP mismatch is described on the view itself (``mapper_kind``
+    plus ``section_bytes`` / ``bytes_per_head``), so a group may carry any
+    mix of recurrent roles (Mamba2 / GDN conv and SSM state, KDA state, PLE
+    side state) without the group knowing which is which.
+
+    Each physical slot packs its coalesced layers and roles together.
+    """
+
+    def __post_init__(self) -> None:
+        self.kind = CacheKind.STATE
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
-            "mamba_layer_offsets": {int(k): int(v) for k, v in self.mamba_layer_offsets.items()},
-            "conv_states": self.conv_states.to_dict(),
-            "ssm_states": self.ssm_states.to_dict(),
-            "conv_section_bytes": self.conv_section_bytes,
-            "ssm_bytes_per_head": self.ssm_bytes_per_head,
+            "local_layers": [ll.to_dict() for ll in self.local_layers],
+            "pool_views": [pv.to_dict() for pv in self.pool_views],
+            "slot_major_layout": True,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
-        conv_section_bytes = data.get("conv_section_bytes")
-        ssm_bytes_per_head = data.get("ssm_bytes_per_head")
+        if data.get("slot_major_layout", True) is not True:
+            raise ValueError(
+                "Python transceiver does not support the layer-major recurrent-state "
+                "layout of KV cache manager V1; use a V2 slot-major peer."
+            )
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            mamba_layer_offsets={int(k): int(v) for k, v in data["mamba_layer_offsets"].items()},
-            conv_states=PhysicalPool.from_dict(data["conv_states"]),
-            ssm_states=PhysicalPool.from_dict(data["ssm_states"]),
-            conv_section_bytes=[int(x) for x in conv_section_bytes]
-            if conv_section_bytes is not None
-            else None,
-            ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
+            local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
+            pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
         )
 
 
@@ -280,6 +405,11 @@ class KVCachePageTable:
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+
+    @property
+    def has_host_pools(self) -> bool:
+        """Whether any transferable allocation is backed by host memory."""
+        return any(pool.memory_type == "DRAM" for group in self.pool_groups for pool in group.pools)
 
     def to_dict(self) -> dict:
         return {

@@ -1,4 +1,4 @@
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: Qwen3/Qwen3-0.6B
 hostname: localhost
 backend: pytorch
 cuda_graph_config: null
@@ -16,6 +16,7 @@ context_servers:
   disable_overlap_scheduler: true
   cache_transceiver_config:
     backend: DEFAULT
+    kv_transfer_timeout_ms: 100000
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -29,3 +30,4 @@ generation_servers:
   disable_overlap_scheduler: true
   cache_transceiver_config:
     backend: DEFAULT
+    kv_transfer_timeout_ms: 100000

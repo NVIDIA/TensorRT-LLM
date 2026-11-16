@@ -22,6 +22,8 @@ from tensorrt_llm.media.tensor_payload import (
 )
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _safetensors_load(data: bytes) -> dict:
     from safetensors.torch import load as load_safetensors
@@ -50,6 +52,12 @@ def _make_video_output(batch: int = 1, t: int = 2, h: int = 4, w: int = 4) -> Vi
         frame_rate=24.0,
         audio_sample_rate=16000,
     )
+
+
+def _make_action_output(batch: int = 1, t: int = 4, action_dim: int = 7) -> VisualGenOutput:
+    """Action uses ``(B, T, action_dim)``: batched at rank 3, unbatched at rank 2."""
+    action = torch.arange(batch * t * action_dim, dtype=torch.float32).reshape(batch, t, action_dim)
+    return VisualGenOutput(request_id=3, action=action)
 
 
 class TestIsTensorFormat:
@@ -93,9 +101,63 @@ class TestInferBatchSize:
         with pytest.raises(ValueError, match="Inconsistent batch sizes"):
             infer_batch_size(output)
 
+    def test_action_rank_3_is_batched(self):
+        output = _make_action_output(batch=2)
+        assert infer_batch_size(output) == 2
+
+    def test_action_rank_2_is_unbatched(self):
+        """An unbatched action tensor has shape ``(T, action_dim)``; the
+        timestep axis must not be confused with a batch dimension."""
+        output = VisualGenOutput(request_id=1, action=torch.zeros(4, 7))
+        assert infer_batch_size(output) == 1
+
+    def test_action_only_output_infers_batch(self):
+        """Action counts as a media tensor, so an action-only output
+        (no image/video/audio) reports a batch size instead of raising."""
+        assert infer_batch_size(_make_action_output(batch=3)) == 3
+
     def test_no_media_raises(self):
         with pytest.raises(ValueError, match="carries no media"):
             infer_batch_size(VisualGenOutput(request_id=1))
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "pt"])
+class TestActionRoundTrip:
+    """The ``action`` tensor must round-trip through both payload formats
+    alongside the other media modalities (regression: it was silently
+    dropped by :func:`serialize_visual_gen_output`)."""
+
+    def _load(self, data: bytes, fmt: str) -> dict:
+        return _safetensors_load(data) if fmt == "safetensors" else _pt_load(data)
+
+    def test_action_serialized_full(self, fmt):
+        output = _make_action_output(batch=2)
+        loaded = self._load(serialize_visual_gen_output(output, fmt), fmt)
+        assert "action" in loaded
+        assert torch.equal(loaded["action"], output.action)
+
+    def test_action_sliced_drops_batch_axis(self, fmt):
+        output = _make_action_output(batch=3)
+        data = serialize_visual_gen_output(output, fmt, batch_index=1)
+        loaded = self._load(data, fmt)
+        assert loaded["action"].shape == (4, 7)
+        assert torch.equal(loaded["action"], output.action[1])
+
+    def test_unbatched_action_passthrough(self, fmt):
+        output = VisualGenOutput(request_id=1, action=torch.randn(4, 7))
+        # batch_index set, but rank-2 action has no batch axis to slice.
+        loaded = self._load(serialize_visual_gen_output(output, fmt, batch_index=0), fmt)
+        assert loaded["action"].shape == (4, 7)
+        assert torch.equal(loaded["action"], output.action)
+
+    def test_action_carries_no_request_metadata(self, fmt):
+        """The trajectory's own shape states its DOF, and the mode and
+        embodiment are the caller's request. The payload stays model-agnostic:
+        media tensors plus rates, nothing Cosmos3-shaped."""
+        output = _make_action_output(batch=1, t=4, action_dim=7)
+        loaded = self._load(serialize_visual_gen_output(output, fmt, batch_index=0), fmt)
+        assert loaded["action"].shape == (4, 7)
+        assert set(loaded) == {"action"}
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "pt"])

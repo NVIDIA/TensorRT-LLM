@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Performance metrics manager for PyExecutor.
 
 Encapsulates GPU/CPU timing instrumentation: event creation, recording,
@@ -11,8 +14,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 from .llm_request import PerfTimingInfo
 
@@ -23,10 +26,19 @@ class PerfMetricsManager:
     Args:
         enabled: Whether performance metrics collection is turned on
             (mirrors ``LlmArgs.return_perf_metrics``).
+        timing_side_stream: Record the timing events on a side stream that waits
+            for the current stream (``RuntimeHooks.perf_metrics_timing_side_stream``).
     """
 
-    def __init__(self, enabled: bool):
+    _timing_stream: Optional[torch.cuda.Stream] = None
+    # Marks the current stream's position for the side stream to wait on; reused every record.
+    _fork_event: Optional[torch.cuda.Event] = None
+
+    def __init__(self, enabled: bool, timing_side_stream: bool = False):
         self.enabled = enabled
+        if enabled and timing_side_stream:
+            self._timing_stream = torch.cuda.Stream()
+            self._fork_event = torch.cuda.Event()
         self._perf_events = None
         self._perf_event_idx = 0
         self._forward_event_pool = []
@@ -96,7 +108,7 @@ class PerfMetricsManager:
 
         # --- Pre-execution: record start ---
         if start_event is not None:
-            start_event.record()
+            self._record(start_event)
         if self.enabled:
             timing.start_time = get_steady_clock_now_in_seconds()
 
@@ -104,9 +116,18 @@ class PerfMetricsManager:
 
         # --- Post-execution: record end ---
         if end_event is not None:
-            end_event.record()
+            self._record(end_event)
         if self.enabled:
             timing.end_time = get_steady_clock_now_in_seconds()
+
+    def _record(self, event: torch.cuda.Event) -> None:
+        """Record ``event`` after the current stream's work, on the side stream when there is one."""
+        if self._timing_stream is None or torch.cuda.is_current_stream_capturing():
+            event.record()
+            return
+        self._fork_event.record()
+        self._timing_stream.wait_event(self._fork_event)
+        event.record(self._timing_stream)
 
     # ------------------------------------------------------------------
     # Saving / computing timing data
@@ -116,16 +137,22 @@ class PerfMetricsManager:
         """Return a CPU timestamp if metrics are enabled, else ``None``."""
         return get_steady_clock_now_in_seconds() if self.enabled else None
 
-    @staticmethod
     def try_compute_gpu_elapsed_time_ms(
+        self,
         start_event: Optional[torch.cuda.Event],
         end_event: Optional[torch.cuda.Event],
     ) -> Optional[float]:
-        """Return CUDA-event elapsed time if ready, without synchronizing."""
+        """Return CUDA-event elapsed time if ready.
+
+        Events on the current stream are not waited for. An event on the timing side stream is
+        ordered after nothing the caller synchronized with, so it is waited for.
+        """
         if start_event is None or end_event is None:
             return None
         try:
-            if not end_event.query():
+            if self._timing_stream is not None:
+                end_event.synchronize()
+            elif not end_event.query():
                 return None
             return float(start_event.elapsed_time(end_event))
         except RuntimeError as e:
@@ -156,7 +183,7 @@ class PerfMetricsManager:
             req.py_perf_timing.sample_start_time = sample_start_time
             req.py_perf_timing.sample_end_time = sample_end_time
 
-    def compute_batch_gpu_times(self, requests):
+    def compute_batch_gpu_times(self, requests, gpu_times_cache=None):
         """Compute GPU times once per batch for the last ctx chunk or gen step.
 
         Reads events from perf fields, computes elapsed_time once per batch,
@@ -164,11 +191,17 @@ class PerfMetricsManager:
         either ``ctx_chunk_metrics`` or ``step_metrics``.
         For ctx chunks, also accumulates ``ctx_gpu_forward_time`` across all
         chunks.
+
+        Args:
+            requests: Requests whose latest timing entry should be updated.
+            gpu_times_cache: Optional cache shared by multiple calls within one
+                response-processing pass. Its lifetime must not span executor
+                iterations because the timing events are reused.
         """
         if not self.enabled:
             return
-        batch_gpu_forward_time = None
-        batch_gpu_sample_time = None
+        if gpu_times_cache is None:
+            gpu_times_cache = {}
         for req in requests:
             perf = req.py_perf_timing
             if perf is None or perf.gpu_forward_start_event is None:
@@ -189,8 +222,15 @@ class PerfMetricsManager:
             if target is None:
                 continue
 
-            # Compute once per batch, reuse for all requests
-            if batch_gpu_forward_time is None:
+            # Ping-pong events are reused across iterations, so the CPU start
+            # timestamp is part of the batch identity.
+            cache_key = (
+                id(perf.gpu_forward_start_event),
+                id(perf.gpu_forward_end_event),
+                id(perf.gpu_sample_end_event),
+                perf.forward_start_time,
+            )
+            if cache_key not in gpu_times_cache:
                 if not perf.gpu_forward_end_event.query():
                     perf.gpu_forward_end_event.synchronize()
                 if perf.gpu_sample_end_event and not perf.gpu_sample_end_event.query():
@@ -216,6 +256,12 @@ class PerfMetricsManager:
                     )
                     batch_gpu_forward_time = 0.0
                     batch_gpu_sample_time = 0.0
+                gpu_times_cache[cache_key] = (
+                    batch_gpu_forward_time,
+                    batch_gpu_sample_time,
+                )
+
+            batch_gpu_forward_time, batch_gpu_sample_time = gpu_times_cache[cache_key]
 
             target["gpu_forward_time"] = batch_gpu_forward_time
             target["gpu_sample_time"] = batch_gpu_sample_time
@@ -250,7 +296,7 @@ class PerfMetricsManager:
         # - py_decoding_iter == 1 and not yet marked complete: last/only chunk
         # - Gen-only requests (disagg gen server) are never ctx
         is_ctx = (
-            not request.is_generation_only_request()
+            not request.is_generation_only_request
             and not perf.ctx_chunks_complete
             and request.py_decoding_iter <= 1
         )

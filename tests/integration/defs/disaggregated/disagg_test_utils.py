@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 import asyncio
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -132,6 +133,13 @@ def _run_worker(
             env = os.environ.copy()
         else:
             env = env.copy()
+        # Every KVCacheManagerV2 worker prefaults a pinned host tier at startup.
+        # With transparent huge pages, a fragmented page cache on CI nodes turns
+        # each 2 MiB fault into direct compaction, and populating the tiers of
+        # several co-located workers can outlast the readiness budget
+        # (nvbugs/6888251). Tests only need the tier to exist, so use 4 KiB
+        # pages unless the caller asks for THP.
+        env.setdefault("TLLM_KV_CACHE_MANAGER_V2_THP", "0")
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack
@@ -208,7 +216,9 @@ def run_gen_worker(
     )
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
+def run_disagg_server(
+    disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None, report_addr=None
+):
     """Launch the disaggregated server.
 
     Args:
@@ -217,6 +227,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
         port: Port number
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
+        report_addr: If set, passed as --report_addr: the server writes the
+            host:port it bound to this file (read it with wait_for_reported_addr)
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -226,6 +238,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
+    if report_addr:
+        cmds += ["--report_addr", report_addr]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).
@@ -320,6 +334,32 @@ async def wait_for_port_released(port):
             return True
     except OSError:
         return False
+
+
+def get_registered_worker_urls(port: int) -> tuple[list[str], list[str]]:
+    """Return ``(ctx_urls, gen_urls)`` as registered with the disagg server.
+
+    Workers launched with ``port=0`` pick their listening port inside the child
+    process, so the cluster registry is the only authoritative source for their
+    addresses. Call this once the server reports ready, i.e. once every worker
+    the test expects has registered.
+
+    Args:
+        port: Disagg server port
+
+    Returns:
+        tuple[list[str], list[str]]: Context and generation worker URLs, each
+        sorted so the ordering is stable across calls.
+    """
+    assert port > 0, "port must be positive"
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info", timeout=5)
+    assert info_resp.status_code == 200, f"cluster_info returned {info_resp.status_code}"
+    workers = info_resp.json().get("current_workers", {})
+
+    def _urls(role_key: str) -> list[str]:
+        return sorted(f"http://{w['host']}:{w['port']}" for w in workers.get(role_key, []))
+
+    return _urls("context_servers"), _urls("generation_servers")
 
 
 def verify_cluster_info(ready, ctx_workers=-1, gen_workers=-1, port=0, expected_code=200):
@@ -477,7 +517,13 @@ def disagg_cluster_config(service_discovery):
 
 
 @pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port):
+def internal_request_auth_key():
+    """Create one internal auth key shared by proxy and workers."""
+    return secrets.token_hex(32)
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_request_auth_key):
     """Create disaggregated server configuration."""
     return {
         "hostname": "localhost",
@@ -485,14 +531,16 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port):
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
+        "internal_request_auth_key": internal_request_auth_key,
     }
 
 
 @pytest.fixture
-def worker_config(disagg_cluster_config):
+def worker_config(disagg_cluster_config, internal_request_auth_key):
     """Create worker configuration."""
     return {
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {

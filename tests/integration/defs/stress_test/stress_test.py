@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
+Stress test script for model inference using the TensorRT LLM PyTorch backend.
 This script is used for stress testing inference performance using trtllm-serve and aiperf.
 
 The script supports three test modes:
@@ -115,12 +115,10 @@ class ModelConfig:
     model_dir: str
     tp_size: int
     memory_requirement: int
-    backend: Optional[str] = None
 
     def __str__(self) -> str:
         model_name = os.path.basename(self.model_dir)
-        backend_str = f"_{self.backend}" if self.backend else ""
-        return f"{model_name}_tp{self.tp_size}{backend_str}"
+        return f"{model_name}_tp{self.tp_size}"
 
     @property
     def model_name(self) -> str:
@@ -173,14 +171,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
+    input_len_mean: int = 64  # Customized for TinyLlama and Qwen3.5-4B.
     input_len_std: int = 16
-    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
+    output_len_mean: int = 128  # Customized for TinyLlama and Qwen3.5-4B.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
+    test_timeout: int = 3600  # One hour for TinyLlama and Qwen3.5-4B.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -419,7 +417,6 @@ def is_port_available(port: int,
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
     ids=lambda x: x)
-@pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
@@ -431,13 +428,11 @@ def is_port_available(port: int,
     [
         # Configuration for TinyLlama model
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-                    tp_size=1,
-                    memory_requirement=12288),
-        # Configuration for Llama-v3 model
+        ModelConfig(
+            model_dir="Qwen3/Qwen3-0.6B", tp_size=1, memory_requirement=12288),
+        # Configuration for Qwen3.5-4B
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
-                    tp_size=1,
+        ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
         # memory_requirement is in MiB (96 GB = 98304 MiB)
@@ -463,11 +458,16 @@ def is_port_available(port: int,
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=4,
                     memory_requirement=172032),
+        # Configuration for Muse Spark Open with NVFP4 checkpoints (4 GPU setup, requires GB300 288GB)
+        # memory_requirement is in MiB (192 GB = 196608 MiB)
+        ModelConfig(model_dir="Muse-Spark-Open-816B-A42B-NVFP4",
+                    tp_size=4,
+                    memory_requirement=196608),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
-def test_run_stress_test(config, stress_time_timeout, backend,
-                         capacity_scheduler_policy, test_mode):
-    """Run the stress test with the provided configuration, backend, and test mode.
+def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
+                         test_mode):
+    """Run the stress test with the provided configuration and test mode.
 
     This test function calls the stress_test function with the given parameters.
     The function should start with test_ prefix to be recognized as a test function by pytest.
@@ -475,18 +475,9 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
-        backend: Backend to use ("trt" or "pytorch")
         capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
-    # Create a new ModelConfig with the backend parameter
-    # Convert 'trt' to None as expected by the ModelConfig
-
-    new_config = ModelConfig(model_dir=config.model_dir,
-                             tp_size=config.tp_size,
-                             memory_requirement=config.memory_requirement,
-                             backend=backend)
-
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
 
@@ -494,9 +485,8 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     server_config = ServerConfig(
         capacity_scheduler_policy=capacity_scheduler_policy)
 
-    # Call the existing stress_test function with the new config and test mode
-    stress_test(new_config, test_mode, server_config, stress_time,
-                stress_timeout)
+    # Call the existing stress_test function with the config and test mode
+    stress_test(config, test_mode, server_config, stress_time, stress_timeout)
 
 
 def stress_test(config,
@@ -568,11 +558,13 @@ def stress_test(config,
     if run_performance:
         performance_config = PerformanceParams()
 
-        # For DeepSeek-V3 or DeepSeek-R1 specific parameters
-        if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # For DeepSeek-V3, DeepSeek-R1 or Muse Spark Open specific parameters
+        if ("DeepSeek-V3" in config.model_dir
+                or "DeepSeek-R1" in config.model_dir
+                or "Muse-Spark-Open" in config.model_dir):
             performance_config = PerformanceParams(
                 test_timeout=
-                36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
+                36000  # 10 hours for large MoE models, change this value if needed
             )
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
@@ -597,6 +589,24 @@ def stress_test(config,
             wait_interval=test_server_config.wait_interval,
             max_wait_seconds=
             28800,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (8 hours)
+            health_check_timeout=test_server_config.health_check_timeout)
+
+    # Muse Spark Open server parameters: its single-node GB300 serving recipe
+    # (TP4/EP4), with a 0.4 KV cache fraction for the stress load
+    if "Muse-Spark-Open" in config.model_dir:
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        test_server_config = ServerConfig(
+            port=test_server_config.port,
+            host=test_server_config.host,
+            pp_size=test_server_config.pp_size,
+            ep_size=config.tp_size,  # TP4/EP4 on one GB300 node
+            max_batch_size=256,
+            max_num_tokens=8192,
+            kv_cache_free_gpu_memory_fraction=0.4,
+            capacity_scheduler_policy=test_server_config.
+            capacity_scheduler_policy,
+            wait_interval=test_server_config.wait_interval,
+            max_wait_seconds=7200,  # loading the checkpoint can take ~30 min
             health_check_timeout=test_server_config.health_check_timeout)
 
     # Create a StressTestConfig with customized time parameters if provided
@@ -685,14 +695,43 @@ def stress_test(config,
             print_warning(f"Failed to detect GPU architecture: {e}. "
                           "Using default MOE backend (CUTLASS).")
 
-        if config.backend == "pytorch":
-            extra_llm_options.update({
-                "cuda_graph_config": {
-                    "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                },
-                "print_iter_log": True,
-            })
+        extra_llm_options.update({
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
+
+    # Muse Spark Open LLM-API options for the same recipe (tp/ep/batch/token/
+    # kv-fraction values are passed on the CLI instead)
+    if "Muse-Spark-Open" in config.model_dir:
+        extra_llm_options.update({
+            "max_seq_len": 49152,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "disable_overlap_scheduler": False,
+            "attn_backend": "TRTLLM",
+            "allreduce_strategy": "NCCL",
+            "guided_decoding_backend": "xgrammar",
+            "cuda_graph_config": {
+                "max_batch_size": 256,
+                "enable_padding": True,
+            },
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                # FP8 KV cache is required on SM103 when chunked prefill or
+                # block reuse is enabled (head-dimension-64 paged-context
+                # FMHA constraint).
+                "dtype": "fp8",
+                "enable_block_reuse": True,
+                "enable_partial_reuse": True,
+                "free_gpu_memory_fraction": 0.4,
+            },
+            "print_iter_log": True,
+        })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -712,7 +751,7 @@ def stress_test(config,
         "--pp_size",
         str(test_server_config.pp_size),
         "--backend",
-        config.backend,
+        "pytorch",
     ]
 
     # Only add ep_size parameter if it's not None
@@ -812,6 +851,7 @@ def stress_test(config,
 
             # Run baseline accuracy test first if enabled
             baseline_accuracy_success = True
+            baseline_accuracy_value = None
             if stress_config and stress_config.enable_accuracy_test:
                 baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
                     model_path, test_server_config, stress_config, "baseline")
@@ -1214,16 +1254,21 @@ def stress_stage(model_name,
         request_count = int(stress_request_rate * stress_time)
         test_timeout = stress_config.stress_timeout
 
-    # Cap request count for large MoE models (DeepSeek-V3/R1) to prevent timeout
-    if "DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path:
-        max_sustainable_rate = 3.0  # req/s - conservative estimate
+    # Cap request count for large MoE models to prevent timeout
+    if ("DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path
+            or "Muse-Spark-Open" in model_path):
+        if "Muse-Spark-Open" in model_path:
+            # The rate cap keeps the stress stage near its nominal duration
+            # without risking the timeout.
+            max_sustainable_rate = 30.0  # req/s
+        else:
+            max_sustainable_rate = 3.0  # req/s - conservative estimate
         max_request_count = int(max_sustainable_rate *
                                 stress_config.stress_time)
         if request_count > max_request_count:
             print_info(
                 f"Capping request_count from {request_count} to {max_request_count} "
-                f"for DeepSeek V3/R1 model (sustainable rate: {max_sustainable_rate} req/s)"
-            )
+                f"(sustainable rate: {max_sustainable_rate} req/s)")
             request_count = max_request_count
 
     print_info(

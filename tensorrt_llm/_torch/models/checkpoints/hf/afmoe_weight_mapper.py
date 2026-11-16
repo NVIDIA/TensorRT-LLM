@@ -18,10 +18,11 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "AfmoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "AfmoeForCausalLM")
 class AfmoeHfWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()
@@ -89,7 +90,7 @@ class AfmoeHfWeightMapper(HfWeightMapper):
         return fused.reshape(num_heads * 2 * per_head, *tail).contiguous()
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoE)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -98,7 +99,7 @@ class AfmoeHfWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoE):
+        if is_moe_weight_owner(module):
             module.load_weights(
                 weights=[module_weights],
                 allow_partial_loading=allow_partial_loading,

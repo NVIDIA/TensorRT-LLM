@@ -6,7 +6,8 @@ from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .evs import (compute_retained_tokens_count,
                   compute_retained_tokens_from_tubelet_budget,
                   compute_retention_mask)
-from .multimodal import MultimodalInput
+from .multimodal import (MultimodalInput, MultimodalItemMetadata,
+                         MultimodalItemPartition)
 from .multimodal_data import AudioData, BaseModalityData, VideoData
 # yapf and isort conflict on the following import blocks
 # yapf: disable
@@ -21,6 +22,7 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
                     ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, apply_chat_template,
+                    apply_mm_placeholders, async_build_multimodal_prompt,
                     async_load_audio, async_load_image, async_load_video,
                     convert_image_mode, default_multimodal_input_loader,
                     encode_base64_content_from_url, encode_base64_image,
@@ -51,6 +53,8 @@ __all__ = [
     "ExtraProcessedInputs",
     "BaseMultimodalDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
+    "MultimodalItemMetadata",
+    "MultimodalItemPartition",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
     "ConversationMessage",
@@ -61,6 +65,8 @@ __all__ = [
     "async_load_image",
     "async_load_video",
     "add_multimodal_placeholders",
+    "apply_mm_placeholders",
+    "async_build_multimodal_prompt",
     "apply_chat_template",
     "convert_image_mode",
     "default_multimodal_input_loader",

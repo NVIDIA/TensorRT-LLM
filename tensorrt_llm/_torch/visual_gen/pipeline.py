@@ -1,23 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
 import itertools
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
+from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    install_module_nccl_window_tensor_scopes,
+    nccl_window_tensor_scope,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.params import MediaRole
 
-from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
+from .profiler import VisualGenProfiler
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -33,78 +62,59 @@ class ExtraParamSchema(StrictBaseModel):
     range: Optional[tuple] = Field(
         default=None, description="Optional (min, max) range for numeric params."
     )
+    validator: Optional[Callable[[Any], Any]] = Field(
+        default=None,
+        description="Optional value validator; raises ValueError on invalid "
+        "values. Must be a module-level function (specs are pickled to the "
+        "coordinator in the READY handshake).",
+    )
+    requires_tensor_output: bool = Field(
+        default=False,
+        description="Setting this parameter makes the request produce a result "
+        "the media encoders cannot represent (a non-image/video modality), so "
+        "the response must be a tensor payload. Serve resolves 'auto' to a "
+        "tensor format and rejects an explicit encoder format. Declared here "
+        "rather than hard-coded in the routes so the serving layer needs no "
+        "per-model knowledge.",
+    )
 
 
-def _parse_profile_range():
-    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
+class RoleSpec(StrictBaseModel):
+    """One accepted role for a reference modality, with its count bounds."""
 
-    Visual-gen-specific env var (separate from the LLM path's
-    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
+    role: MediaRole = Field(description="Role of the reference input.")
+    min: int = Field(default=1, description="Minimum count for this role.")
+    max: Optional[int] = Field(
+        default=1, description="Maximum count for this role (None = unbounded)."
+    )
 
-    Supported formats:
 
-    * ``A-B``            – profile denoise steps A through B
-    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
-    * ``A,B,...``        – individual steps treated as single-step ranges
-    * ``predenoise``     – profile the per-request pre-loop work inside
-                           ``denoise()`` (CFG config setup, scheduler refresh,
-                           TeaCache reset) up to the first denoise step.
-                           Single-shot.
-    * ``postdenoise``    – profile from the end of the last denoise step to
-                           pipeline cleanup, covering VAE decode. Single-shot.
-    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
-    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+class RefSlotSpec(StrictBaseModel):
+    """Reference slot a pipeline accepts for one modality.
 
-    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
-    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
-    for numeric ranges.
-
-    .. note::
-       Step indices are **per-request**: each ``denoise()`` call resets the
-       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
-       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
-       which indexes a global executor iteration counter (one forward pass
-       services all in-flight requests, so there is no "per request" index).
-
-       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
-       they fire once around the first user request after warmup and do not
-       re-arm on subsequent requests. Pair ``predenoise`` with
-       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
-       collection ends). ``postdenoise`` ends collection at process exit, so
-       either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
-       use a numeric range with ``--capture-range-end=repeat:N``.
+    A request item's ``role`` is required only when ``roles`` has more than one
+    entry (same modality carries multiple roles, e.g. first + last frame);
+    otherwise the single declared role is inferred. Exposed via
+    ``VisualGen.ref_slot_specs`` and enforced by ``validate_visual_gen_params``.
+    Pickled to the coordinator in the READY handshake, so keep it plain data.
     """
-    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
-    if not val:
-        return None
-    val = val.strip()
-    if val.lower() in ("all", "predenoise", "postdenoise"):
-        return val.lower()
-    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
-    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
-    starts, stops = [], []
-    for span in val.split(","):
-        span = span.strip()
-        if "-" in span:
-            start, stop = span.split("-", 1)
-            starts.append(int(start))
-            stops.append(int(stop))
-        else:
-            v = int(span)
-            starts.append(v)
-            stops.append(v)
-    return frozenset(starts), frozenset(stops)
+
+    modality: MediaModality = Field(description="Reference modality.")
+    roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
+    from .sleep import SleepRestoreMode
 
 
 class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
     """
+
+    supports_image_edit: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -122,11 +132,17 @@ class BasePipeline(nn.Module):
         self.pipeline_config = pipeline_config
         self.config = pipeline_config.primary_pretrained_config
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
+        self._device = torch.device(getattr(pipeline_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._cuda_graph_shared_pool: Optional[SharedGraphPool] = None
+        self._nccl_window_tensor_scope_hooks: List[torch.utils.hooks.RemovableHandle] = []
+        self._nccl_window_tensor_scope_device_anchor: Optional[torch.Tensor] = None
+        self.offloader = PipelineOffloader(self)
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._runtime_lora_applications: List[Any] = []
 
-        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        # Unified cache acceleration (TeaCache, Cache-DiT, SeaCache); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
 
         # Components
@@ -137,37 +153,75 @@ class BasePipeline(nn.Module):
         self.scheduler: Optional[Any] = None
         self._is_warmup: bool = False
 
-        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
-        self._profile_range = _parse_profile_range()
-        self._profiling_active: bool = False
-        # Single-shot guards for predenoise/postdenoise modes — fire once
-        # around the first non-warmup denoise() invocation, then disarm.
-        self._predenoise_pending: bool = self._profile_range == "predenoise"
-        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
+        # Profiler window scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profiler = VisualGenProfiler(rank=self.rank)
 
         # Initialize transformer
         self._init_transformer()
+
+        self._install_nccl_window_tensor_scope_hooks()
 
         # CUDA graph runner - wrap transformer.forward
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
 
-    def _cuda_profiler_start(self):
-        """Start CUDA profiler if configured and not already active."""
-        if self._profile_range is not None and not self._profiling_active:
-            torch.cuda.cudart().cudaProfilerStart()
-            self._profiling_active = True
-            if self.rank == 0:
-                logger.info("CUDA profiler started")
+    def run_inference(self, req: Any) -> Any:
+        """Run model-specific inference within shared request profiler boundaries."""
+        profiler_scope = (
+            contextlib.nullcontext() if self._is_warmup else self._profiler.request_scope()
+        )
+        with profiler_scope:
+            anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
+            anchor = anchor_fn() if anchor_fn is not None else None
+            if anchor is None:
+                return self.infer(req)
+            with nccl_window_tensor_scope(anchor) as scope:
+                return scope.escape(self.infer(req))
 
-    def _cuda_profiler_stop(self):
-        """Stop CUDA profiler if currently active."""
-        if self._profiling_active:
-            torch.cuda.cudart().cudaProfilerStop()
-            self._profiling_active = False
-            if self.rank == 0:
-                logger.info("CUDA profiler stopped")
+    def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
+        """Enumerate a denoise loop's steps within its profiling windows.
+
+        ``BasePipeline.denoise()`` uses this, and so must any pipeline that
+        writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
+        that loop is silently absent from every trace. Substitute it for the
+        loop's ``enumerate()``; it owns every window boundary the loop has::
+
+            for i, t in self._profile_denoise_steps(timesteps):
+                ...
+
+        It also publishes each step as ``(step, num_steps)`` under
+        ``denoise_step`` in every transformer component's attention metadata
+        state, for the attention recipes that follow the step schedule, and
+        clears it when the loop ends.
+        """
+        steps = enumerate(timesteps) if self._is_warmup else self._profiler.steps(timesteps)
+        num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
+        try:
+            for i, t in steps:
+                self._publish_denoise_step(None if num_steps is None else (i, num_steps))
+                yield i, t
+        finally:
+            self._publish_denoise_step(None)
+
+    def _publish_denoise_step(self, denoise_step: Optional[Tuple[int, int]]) -> None:
+        """Record the current denoising step in each transformer component's attention state."""
+        # Partially built pipelines, as the unit tests construct them, may not resolve
+        # their component list yet; they have no attention state to publish into.
+        for name in getattr(self, "transformer_components", None) or ():
+            model = getattr(self, name, None)
+            model_config = getattr(model, "model_config", None)
+            state = getattr(model_config, "attention_metadata_state", None)
+            if state is not None:
+                state["denoise_step"] = denoise_step
+
+    def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
+        """Return the pipeline-owned pool shared by non-concurrent graph runners."""
+        shared_pool = getattr(self, "_cuda_graph_shared_pool", None)
+        if shared_pool is None:
+            shared_pool = SharedGraphPool()
+            self._cuda_graph_shared_pool = shared_pool
+        return shared_pool
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -183,11 +237,17 @@ class BasePipeline(nn.Module):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+
         if len(self.transformer_components) > 1:
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
             )
-            shared_pool = SharedGraphPool()
+            shared_pool = self._get_or_create_cuda_graph_shared_pool()
         else:
             shared_pool = None
 
@@ -206,6 +266,18 @@ class BasePipeline(nn.Module):
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
 
+    @contextlib.contextmanager
+    def disallow_cuda_graph_capture(self):
+        """Run wrapped forwards eagerly instead of capturing new CUDA graphs."""
+        prev = {name: r.allow_capture for name, r in self._cuda_graph_runners.items()}
+        for r in self._cuda_graph_runners.values():
+            r.allow_capture = False
+        try:
+            yield
+        finally:
+            for name, r in self._cuda_graph_runners.items():
+                r.allow_capture = prev[name]
+
     @property
     def rank(self):
         return dist.get_rank() if dist.is_initialized() else 0
@@ -220,12 +292,12 @@ class BasePipeline(nn.Module):
 
     @property
     def device(self):
-        return self.transformer.device
+        return self._device
 
     @property
-    def transformer_components(self) -> list:
-        """Return list of transformer components this pipeline needs."""
-        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+    def transformer_components(self) -> list[str]:
+        """Return names of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER.value] if self.transformer is not None else []
 
     def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
         """Return the cache key for a given warmup shape.
@@ -235,6 +307,14 @@ class BasePipeline(nn.Module):
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        """Return the warmup cache key for a prepared inference request."""
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            num_frames=req.params.num_frames,
+        )
 
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
@@ -345,6 +425,17 @@ class BasePipeline(nn.Module):
         return {}
 
     @property
+    def ref_slot_specs(self) -> Dict[str, RefSlotSpec]:
+        """Reference slots this pipeline accepts.
+
+        Maps a ``VisualGenParams`` reference field name
+        (``image_reference`` / ``video_reference`` / ``audio_reference``) to a
+        :class:`RefSlotSpec` declaring the accepted roles and per-role counts.
+        Empty by default (pipeline takes no reference inputs).
+        """
+        return {}
+
+    @property
     def default_generation_params(self) -> dict:
         """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
 
@@ -352,6 +443,26 @@ class BasePipeline(nn.Module):
         merges these into ``request.params`` before calling ``infer()``.
         """
         return {}
+
+    def prepare_request(self, req: Any) -> None:
+        """Prepare model-specific inputs before warmup bookkeeping.
+
+        Subclasses may mutate internal request state and resolve request
+        parameters needed by :meth:`request_warmup_cache_key`. The default
+        implementation is a no-op.
+        """
+
+    def classify_request_failure(self, exc: BaseException) -> Optional[str]:
+        """Failure class for the response channel, or ``None`` if unknown.
+
+        Opt-in per pipeline: a pipeline that knows which of its failures are
+        caused by the request's own content returns ``"client"`` or
+        ``"capacity"`` for those. The default leaves every failure
+        unclassified, because the exception's built-in type alone does not say
+        whose fault it was -- a ``ValueError`` is just as likely to be an
+        internal invariant as a rejected input.
+        """
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -361,6 +472,20 @@ class BasePipeline(nn.Module):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def _sleep_loading_context(
+        self,
+        restore_mode: "SleepRestoreMode",
+        *,
+        device: torch.device,
+        release_host_backup: bool = False,
+    ) -> contextlib.AbstractContextManager[None]:
+        """Capture persistent allocations for pipelines that explicitly support sleep.
+
+        The loader calls this hook only when sleep is requested, before tensor
+        materialization, and exits the context before inference warmup.
+        """
+        raise ValueError("Pipeline sleep is currently not supported for this model")
 
     def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         """Load transformer weights from checkpoint.
@@ -401,6 +526,149 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+
+    def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        """Return model-specific offload stages requested by shorthand config.
+
+        Each stage is a tuple of component names from ``offload_pipeline_components``.
+        Components in the same stage are brought onto the GPU together.
+        """
+        return ()
+
+    def extra_offload_component_names(self) -> set[str]:
+        """Return component names that are valid in configured stages but may be absent.
+
+        These are accepted during stage validation even when missing from
+        ``offload_pipeline_components`` (e.g. rank-0-only components that other ranks
+        drop later). Defaults to an empty set; models override as needed.
+        """
+        return set()
+
+    def offload_pipeline_components(self) -> dict[str, nn.Module]:
+        """Expose standard component subtrees for offloading.
+
+        This default assumes the common diffusers-style layout: a ``text_encoder``,
+        a ``vae``, and one or more transformers each exposing their decoder layers
+        as ``.blocks``. Models that deviate from this naming/structure (e.g. Cosmos3,
+        whose towers live inside a single ``transformer`` module) must override this
+        to expose their own offloadable components.
+
+        NOTE: this attribute-name based detection is convenient but brittle; if we
+        extend offloading to more model families it may be worth replacing with an
+        explicit per-model declaration instead of relying on these conventions.
+        """
+        components: dict[str, nn.Module] = {}
+        text_encoder = getattr(self, PipelineComponent.TEXT_ENCODER.value, None)
+        if text_encoder is not None:
+            components[PipelineComponent.TEXT_ENCODER.value] = text_encoder
+
+        vae = getattr(self, PipelineComponent.VAE.value, None)
+        if vae is not None:
+            components[PipelineComponent.VAE.value] = vae
+
+        for component_name in self.transformer_components:
+            transformer = getattr(self, component_name, None)
+            blocks = getattr(transformer, "blocks", None) if transformer is not None else None
+            if blocks is not None:
+                public_name = transformer_component_offload_name(
+                    component_name, PipelineComponent.TRANSFORMER.value
+                )
+                components[public_name] = blocks
+        return components
+
+    def initialize_offload_pipeline(self) -> None:
+        """Create and initialize the offload pipeline after weights are loaded."""
+        self.offloader.initialize()
+
+    def _setup_runtime_lora(self) -> None:
+        runtime_lora = getattr(self.pipeline_config, "runtime_lora", None)
+        if runtime_lora is None or self._runtime_lora_applications:
+            return
+
+        from .runtime_lora import (
+            _commit_runtime_lora_plan,
+            _log_runtime_lora_application,
+            _prepare_runtime_lora,
+        )
+
+        transformer_component_names = list(self.transformer_components)
+        transformer_components = set(transformer_component_names)
+        if not runtime_lora.target_components and len(transformer_component_names) > 1:
+            raise ValueError(
+                "runtime_lora_config.target_components must be set when a pipeline "
+                f"has multiple transformer components: {transformer_component_names}. "
+                "A single runtime_lora_config.path cannot be safely applied by default "
+                "to every component."
+            )
+        component_names = runtime_lora.target_components or transformer_component_names
+        if len(component_names) != len(set(component_names)):
+            raise ValueError(
+                f"runtime_lora_config.target_components contains duplicates: {component_names}"
+            )
+        total_applied = 0
+        plans = []
+        require_each_component_match = runtime_lora.strict and bool(runtime_lora.target_components)
+        for component_name in component_names:
+            if component_name not in transformer_components:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        "runtime_lora_config target component "
+                        f"'{component_name}' is not in transformer_components "
+                        f"{sorted(transformer_components)}"
+                    )
+                logger.warning(
+                    f"Runtime LoRA skipping non-transformer component '{component_name}'"
+                )
+                continue
+            component = getattr(self, component_name, None)
+            if component is None:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested missing component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping missing component '{component_name}'")
+                continue
+            if not isinstance(component, nn.Module):
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested non-module component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping non-module component '{component_name}'")
+                continue
+
+            component_prefixes = [f"{component_name}.", f"model.{component_name}."]
+            plan = _prepare_runtime_lora(
+                component,
+                runtime_lora,
+                default_strip_prefixes=component_prefixes,
+                raise_on_no_matches=False,
+            )
+            application = plan.application
+            if require_each_component_match and not application.applied_modules:
+                raise ValueError(
+                    f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                    f"selected component '{component_name}'."
+                )
+            plans.append((component_name, plan))
+            total_applied += len(application.applied_modules)
+
+        if total_applied == 0 and runtime_lora.strict:
+            raise ValueError(
+                f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                f"components {component_names}."
+            )
+
+        applications = []
+        for component_name, plan in plans:
+            application = _commit_runtime_lora_plan(plan)
+            applications.append(application)
+            _log_runtime_lora_application(application)
+            if application.applied_modules:
+                logger.info(
+                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
+                )
+
+        self._runtime_lora_applications = applications
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
         """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
@@ -488,7 +756,7 @@ class BasePipeline(nn.Module):
             )
 
     def _setup_cache_acceleration(self) -> None:
-        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+        """Enable TeaCache, Cache-DiT or SeaCache from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
             self.cache_accelerator.unwrap()
@@ -498,6 +766,12 @@ class BasePipeline(nn.Module):
 
         if cfg.cache_backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
+            self.cache_accelerator = acc
+            return
+
+        if cfg.cache_backend == "seacache":
+            acc = SeaCacheAccelerator(self, cfg.seacache)
             acc.wrap()
             self.cache_accelerator = acc
             return
@@ -571,6 +845,7 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
+        self._remove_nccl_window_tensor_scope_hooks()
         tc_config = self.pipeline_config.torch_compile
 
         # Using default as max-autotune mode takes more initialization time and
@@ -614,6 +889,9 @@ class BasePipeline(nn.Module):
                     fullgraph=tc_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)
+        # Hooks stay outside the lazy-compiled blocks, so their opaque operations
+        # execute on every invocation rather than only while Dynamo traces.
+        self._install_nccl_window_tensor_scope_hooks()
 
     @staticmethod
     def _find_transformer_blocks(model: nn.Module) -> list:
@@ -627,15 +905,59 @@ class BasePipeline(nn.Module):
                 block_names.append(name)
         return block_names
 
+    def _uses_nccl_window_tensors(self) -> bool:
+        strategy = getattr(self.pipeline_config, "allreduce_strategy", None)
+        mapping = getattr(self, "mapping", None)
+        tp_size = getattr(mapping, "tp_size", 1)
+        return (
+            os.environ.get("TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1"
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and strategy
+            in (
+                AllReduceStrategy.NCCL,
+                AllReduceStrategy.NCCL_SYMMETRIC,
+                AllReduceStrategy.AUTO,
+            )
+        )
+
+    def _nccl_window_tensor_scope_anchor(self) -> Optional[torch.Tensor]:
+        if not self._uses_nccl_window_tensors():
+            return None
+        if self._nccl_window_tensor_scope_device_anchor is None:
+            self._nccl_window_tensor_scope_device_anchor = torch.empty(0, device=self.device)
+        return self._nccl_window_tensor_scope_device_anchor
+
+    def _remove_nccl_window_tensor_scope_hooks(self) -> None:
+        handles = getattr(self, "_nccl_window_tensor_scope_hooks", [])
+        for handle in handles:
+            handle.remove()
+        handles.clear()
+
+    def _install_nccl_window_tensor_scope_hooks(self) -> None:
+        self._remove_nccl_window_tensor_scope_hooks()
+        if not self._uses_nccl_window_tensors():
+            return
+        blocks = []
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+            for block_name in self._find_transformer_blocks(model):
+                blocks.extend(getattr(model, block_name))
+        self._nccl_window_tensor_scope_hooks = install_module_nccl_window_tensor_scopes(blocks)
+
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
 
-        Resolves warmup shapes from user config or model defaults, then runs
-        a short denoising loop with dummy inputs for each shape. This:
-        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
-        2. Pre-captures CUDA graphs (if enabled)
-        3. Warms up CUDA kernels and allocators
-        4. Populates any lazy caches (e.g., RoPE frequencies)
+        Resolves warmup shapes from user config or model defaults, then runs a
+        short denoising loop with dummy inputs for each shape, triggering
+        torch.compile, CUDA graph capture (if enabled), and autotuner tuning.
+
+        With autotuning enabled, a single rank tunes and captures in one pass.
+        On multiple ranks, tactics are tuned with capture off, merged across
+        ranks at ``autotune()`` exit, then recaptured — so every rank bakes the
+        same tactic into its graphs.
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
@@ -645,24 +967,66 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (no warmup shapes)")
             return
 
+        shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
         logger.info(
-            f"Running warmup for {self.__class__.__name__} "
-            f"with {len(shapes)} shapes and {steps} steps..."
+            f"Running warmup for {self.__class__.__name__}: "
+            f"{len(shapes)} shape(s) [{shape_list}], {steps} steps..."
         )
         warmup_start = time.time()
 
+        # Autotuner tuning knobs: cache path from env, plus (multi-rank only) a
+        # world-group communicator that drives the post-tune cross-rank merge.
+        enable_autotune = self.pipeline_config.torch_compile.enable_autotune
+        cache_path = None
+        post_tune_merge_dist = None
+        if enable_autotune:
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                amap = self.pipeline_config.visual_gen_mapping.to_autotuner_mapping()
+                post_tune_merge_dist = _VisualGenAutotuneDist(amap)
+
         self._is_warmup = True
-        for height, width, num_frames in shapes:
-            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
-            self._run_warmup(height, width, num_frames, steps)
-            torch.cuda.synchronize()
-        self._is_warmup = False
+        try:
+            if not enable_autotune:
+                self._run_warmup_pass(shapes, steps)
+            elif post_tune_merge_dist is None:
+                # Single rank: nothing to merge; tune and capture in one pass.
+                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                    self._run_warmup_pass(shapes, steps)
+            else:
+                # Multi rank: tune with capture off, merge tactics across ranks
+                # at autotune() exit, then recapture from the merged tactics
+                # (only needed when CUDA graphs are enabled).
+                with (
+                    self.disallow_cuda_graph_capture(),
+                    autotune(
+                        cache_path=cache_path,
+                        skip_dynamic_tuning_buckets=True,
+                        post_tune_merge_dist=post_tune_merge_dist,
+                    ),
+                ):
+                    self._run_warmup_pass(shapes, steps)
+                if self.pipeline_config.cuda_graph.enable:
+                    self._run_warmup_pass(shapes, steps)
+        finally:
+            self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup_pass(self, shapes, steps) -> None:
+        """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
+        for height, width, num_frames in shapes:
+            anchor = self._nccl_window_tensor_scope_anchor()
+            if anchor is None:
+                self._run_warmup(height, width, num_frames, steps)
+            else:
+                with discard_nccl_window_tensor_outputs(anchor):
+                    self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         """Run warmup for a single shape. Subclasses must override.
@@ -978,16 +1342,23 @@ class BasePipeline(nn.Module):
         timestep,
         scheduler,
         extra_stream_schedulers,
+        scheduler_step_kwargs=None,
+        extra_stream_timesteps=None,
     ):
         """Execute scheduler step for all streams."""
+        step_kwargs = scheduler_step_kwargs or {}
         t_start = time.time()
-        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False, **step_kwargs)[0]
 
         # Step schedulers for extra streams
         for name, noise_extra in extra_noise_preds.items():
             if name in extra_stream_schedulers:
                 extra_stream_latents[name] = extra_stream_schedulers[name].step(
-                    noise_extra, timestep, extra_stream_latents[name], return_dict=False
+                    noise_extra,
+                    (extra_stream_timesteps or {}).get(name, timestep),
+                    extra_stream_latents[name],
+                    return_dict=False,
+                    **step_kwargs,
                 )[0]
 
         t_sched = time.time() - t_start
@@ -1010,8 +1381,10 @@ class BasePipeline(nn.Module):
         boundary_timestep: Optional[float] = None,
         guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
+        scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
+        extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
     ):
-        """Execute denoising loop with optional CFG parallel and TeaCache support.
+        """Execute denoising loop with optional CFG parallel and step-caching support.
 
         Args:
             latents: Initial noise latents (primary stream, e.g., video)
@@ -1042,29 +1415,34 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied to latents after each scheduler step.
-                         Signature: post_step_fn(latents) -> latents
+            post_step_fn: Optional callable applied after each scheduler step.
+                         It is invoked as ``post_step_fn(latents,
+                         extra_stream_latents) -> (latents, extra_stream_latents)``,
+                         where ``extra_stream_latents`` is the dict of parallel streams
+                         from ``extra_streams`` (e.g. ``{"action": ...}``).
                          Use for constraints that must hold throughout denoising.
+            scheduler_step_kwargs: Extra keyword arguments forwarded to every
+                         scheduler's ``step()`` call.
+            extra_stream_timesteps: Optional native timestep schedules keyed by extra
+                         stream name. Each must match the primary schedule length.
+                         Omitted streams use the primary timestep, as before.
 
         Returns:
             Single latents if no extra_streams
             Tuple (primary_latents, extra_streams_dict) if extra_streams provided
         """
-        # ``predenoise`` mode: arm the profiler at the very start of denoise()
-        # so the per-request pre-loop work (CFG config, scheduler refresh,
-        # TeaCache reset) is captured. The window closes at the first step.
-        # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
-        # on across the worker's IPC idle, which can interact badly with CUPTI.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-
         if timesteps is None:
             timesteps = scheduler.timesteps
 
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
+        for name, stream_timesteps in (extra_stream_timesteps or {}).items():
+            if name not in (extra_streams or {}):
+                raise ValueError(f"Timestep schedule provided for unknown stream: {name}")
+            if stream_timesteps.ndim != 1 or len(stream_timesteps) != total_steps:
+                raise ValueError(f"Timestep schedule for {name} must have {total_steps} entries.")
 
-        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT / SeaCache)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
 
@@ -1095,23 +1473,7 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
-        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
-        # step ranges start/stop at specific indices. See _parse_profile_range().
-        prof = self._profile_range
-        if prof == "all" and not self._is_warmup:
-            self._cuda_profiler_start()
-        # ``predenoise`` was started in warmup() exit; close the window now,
-        # before the first denoise step kernels run. Single-shot: disarm.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_stop()
-            self._predenoise_pending = False
-        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
-        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
-
-        for i, t in enumerate(timesteps):
-            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
-                self._cuda_profiler_start()
-
+        for i, t in self._profile_denoise_steps(timesteps):
             step_start = time.time()
 
             current_guidance_scale = self._resolve_step_guidance_scale(
@@ -1171,10 +1533,14 @@ class BasePipeline(nn.Module):
                 t,
                 scheduler,
                 extra_stream_schedulers,
+                scheduler_step_kwargs=scheduler_step_kwargs,
+                extra_stream_timesteps={
+                    name: schedule[i] for name, schedule in (extra_stream_timesteps or {}).items()
+                },
             )
 
             if post_step_fn is not None:
-                latents = post_step_fn(latents)
+                latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
 
             # Logging
             if self.rank == 0:
@@ -1187,27 +1553,17 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
-            # Step-level profiler stop
-            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
-                self._cuda_profiler_stop()
-
-        # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
-        # any post-denoise host work) is captured up to cleanup(). Single-shot.
-        if self._postdenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-            self._postdenoise_pending = False
-
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Single logging site for TeaCache and Cache-DiT.
+            # Single logging site for TeaCache, Cache-DiT and SeaCache.
             if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         first_val = next(iter(stats.values()), None)
                         if isinstance(first_val, dict):
@@ -1222,6 +1578,12 @@ class BasePipeline(nn.Module):
                                 f"TeaCache: {stats['hit_rate']:.1%} hit rate "
                                 f"({stats['cached']}/{stats['total']} steps)"
                             )
+                    elif self.pipeline_config.cache_backend == "seacache":
+                        logger.info(
+                            f"SeaCache: {stats['hit_rate']:.1%} hit rate "
+                            f"({stats['cached']}/{stats['total']} steps, "
+                            f"cached steps {stats['cached_step_indices']})"
+                        )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 
@@ -1229,8 +1591,17 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
-        self._cuda_profiler_stop()
+        self._profiler.close_window()
 
+        self.offloader.cleanup()
+        self._remove_nccl_window_tensor_scope_hooks()
+        graph_pools = {
+            runner._get_pool()
+            for runner in self._cuda_graph_runners.values()
+            if runner._get_pool() is not None
+        }
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
+        for graph_pool in graph_pools:
+            release_nccl_window_graph_owner(graph_pool)

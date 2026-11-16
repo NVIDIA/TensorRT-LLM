@@ -14,36 +14,43 @@
 # limitations under the License.
 
 import asyncio
+import csv
 import json
 import os
-import platform
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import aiohttp
 import numpy as np
 import pytest
+import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
+from defs.common import (get_ucx_tls, parse_gsm8k_output,
+                         resolve_llm_model_path, wait_for_reported_addr,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
-                                            validate_timing_metrics)
+                                            validate_timing_metrics,
+                                            wait_for_perf_metrics_jsonl)
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
+
+MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
 
 
 @dataclass
@@ -63,29 +70,31 @@ class TestConfig:
         return self.test_desc
 
 
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
+def get_ucx_net_devices():
+    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
 
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    Every worker runs on this host, so loopback is the only TCP device UCX
+    needs. With every netdev enabled, UCX protocol selection re-queries each
+    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
+    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
+    nodes (https://nvbugs/6836097).
     """
-    sm = get_sm_version()
-    """
-    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
-    """
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
+    return "lo"
 
 
-def cleanup_output_files():
-    """Clean up output files from previous runs."""
-    for file in ['output.json', 'output_streaming.json']:
-        try:
-            os.remove(file)
-        except FileNotFoundError:
-            pass
+def apply_pre_hopper_nccl_workaround(env: dict) -> None:
+    """Keep NCCL off PCIe peer-to-peer on pre-Hopper CI nodes.
+
+    The 8xL40S CI nodes run with the AMD IOMMU in DMA translation mode, so
+    PCIe P2P writes across the host bridge fault (``AMD-Vi IO_PAGE_FAULT``)
+    and never land. NCCL still picks its P2P/CUMEM transport there, and the
+    first PP send/recv or TP collective in the warmup forward hangs the
+    worker before it can register with the disagg server
+    (https://nvbugs/6728119). Restricting P2P to PCIe-switch peers makes NCCL
+    fall back to SHM on those nodes; NVLink platforms are unaffected.
+    """
+    if get_sm_version() < 90:
+        env.setdefault("NCCL_P2P_LEVEL", "PXB")
 
 
 # Fatal patterns whose presence in worker/server logs after a stress run
@@ -99,6 +108,38 @@ _FATAL_LOG_PATTERNS = (
     "Hang detected on rank",
     "out of memory",
 )
+
+
+def archive_process_logs(work_dir, log_output_dir):
+    """Copy the cluster's saved log files into log_output_dir for CI upload.
+
+    In CI, log_output_dir is pytest's --output-dir (the stage directory), which
+    is tarred and uploaded to Artifactory as results-<stage>.tar.gz, so logs
+    copied here survive the test and are downloadable from the CI job. Each
+    test gets its own subdirectory, named after PYTEST_CURRENT_TEST.
+
+    Returns the destination directory, or None if nothing was copied.
+    """
+    if not log_output_dir or not os.path.isdir(work_dir):
+        return None
+    test_name = os.environ.get("PYTEST_CURRENT_TEST", "disagg")
+    test_name = test_name.split("::")[-1].split(" ")[0]
+    test_name = re.sub(r"[^A-Za-z0-9._-]+", "_", test_name)[:200]
+    dest = os.path.join(log_output_dir, "disagg-logs", test_name)
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for name in sorted(os.listdir(work_dir)):
+        if not name.endswith(".log"):
+            continue
+        try:
+            shutil.copy2(os.path.join(work_dir, name), dest)
+            copied += 1
+        except OSError as e:
+            print(f"Could not archive {name}: {e}")
+    if copied == 0:
+        return None
+    print(f"Archived {copied} disagg log file(s) to {dest}", flush=True)
+    return dest
 
 
 def scan_logs_for_fatal_errors(processes):
@@ -125,6 +166,51 @@ def scan_logs_for_fatal_errors(processes):
         if hits:
             findings[log_path] = hits
     return findings
+
+
+def print_first_fatal_log_context(processes,
+                                  context_lines=20,
+                                  *,
+                                  patterns=_FATAL_LOG_PATTERNS):
+    """Print the lines around the FIRST fatal-pattern match in each log.
+
+    The last-N-lines tail printed on failure usually shows only post-crash
+    shutdown spam ("LLM is shutting down" storms); the root cause — e.g. the
+    OOM traceback with the allocation site — is at the first match, often
+    thousands of lines earlier. Streams each log to avoid loading multi-GB
+    worker logs into memory.
+    """
+    for proc in processes:
+        log_path = getattr(proc, "log_path", None)
+        if not log_path or not os.path.exists(log_path):
+            continue
+        before = deque(maxlen=context_lines)
+        after = []
+        matched = None
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if matched is None:
+                        pat = next((p for p in patterns if p in line), None)
+                        if pat is None:
+                            before.append(line)
+                            continue
+                        matched = (lineno, pat)
+                        after.append(line)
+                    else:
+                        after.append(line)
+                        if len(after) > context_lines:
+                            break
+        except OSError:
+            continue
+        if matched is None:
+            continue
+        lineno, pat = matched
+        logger.error(f"-------- {log_path}: first fatal pattern '{pat}' at "
+                     f"line {lineno} (+/-{context_lines} lines) --------")
+        for line in [*before, *after]:
+            if line.strip():
+                logger.error(line.rstrip())
 
 
 def _crashed_workers(workers):
@@ -161,6 +247,20 @@ def get_default_disagg_cluster_config():
         "heartbeat_interval_sec": 1,
         "inactive_timeout_sec": 2
     }
+
+
+# Production service-discovery timings, matching the DisaggClusterConfig
+# defaults in tensorrt_llm/llmapi/disagg_utils.py. The tight 1s/2s defaults
+# above keep short functional tests snappy, but at stress-level concurrency
+# they leave <1s of heartbeat slack while the worker heartbeat task, the
+# cluster-storage /expire handler, and the expiry sweep all share event loops
+# saturated by request traffic — so workers get spuriously expired and the
+# router flaps "Cluster is not ready" (nvbugs/6472256). Stress runners must
+# use these production values instead.
+PRODUCTION_CLUSTER_TIMINGS = {
+    "heartbeat_interval_sec": 5,
+    "inactive_timeout_sec": 10,
+}
 
 
 def build_worker_config(base_config: dict[str, Any],
@@ -257,8 +357,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "overlap_transceiver_runtime_python_bounce":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
-        "python_transceiver_host_offload":
-        f"{test_configs_root}/disagg_config_python_transceiver_host_offload.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -271,6 +369,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conditional.yaml",
         "ngram":
         f"{test_configs_root}/disagg_config_ngram.yaml",
+        "sa":
+        f"{test_configs_root}/disagg_config_sa.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -283,14 +383,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml",
         "ctxpp4_gentp4":
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
-        "deepseek_v3_lite_fp8_mpi":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
-        "deepseek_v3_lite_fp8_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
-        "deepseek_v3_lite_fp8_transceiver_runtime_python":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_transceiver_runtime_python.yaml",
         "deepseek_v3_lite_fp8_tp1":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml",
         "deepseek_v3_lite_fp8_tp1_mtp":
@@ -355,14 +449,16 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_20b_kv_cache_aware":
+        f"{test_configs_root}/disagg_config_cache_reuse.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "cancel_stress_test_large":
-        f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "qwen3_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_qwen3_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
+        "mamba_bs1_concurrency2":
+        f"{test_configs_root}/disagg_config_mamba_bs1_concurrency2.yaml",
     }
 
     if test_desc not in config_map:
@@ -396,6 +492,15 @@ ClientTestSet = namedtuple('ClientTestSet', [
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
     if test_desc == "tool_calls":
+        return ClientTestSet(completion=False,
+                             completion_streaming=False,
+                             chat=True,
+                             chat_streaming=False,
+                             verify_completion=False,
+                             verify_streaming_completion=False,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
+    if test_desc == "gpt_oss_20b_kv_cache_aware":
         return ClientTestSet(completion=False,
                              completion_streaming=False,
                              chat=True,
@@ -443,11 +548,19 @@ def run_client_tests(example_dir,
                      server_url,
                      workers_proc,
                      server_proc,
+                     client_output_dir,
                      use_ray=False,
                      client_test_set=None):
-    """Run client tests against the disaggregated server."""
+    """Run client tests against the disaggregated server.
+
+    Client outputs go to client_output_dir, not to the cwd: concurrent QA jobs
+    run from one shared checkout and can overwrite each other's files there.
+    """
     if client_test_set is None:
         client_test_set = get_client_test_set(test_desc)
+
+    def output_path(file_name):
+        return os.path.join(client_output_dir, file_name)
 
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
@@ -477,25 +590,30 @@ def run_client_tests(example_dir,
 
         # Run completion test (non-streaming)
         if client_test_set.completion:
-            check_call(client_cmd, env=env, poll_procs=poll_procs)
+            completion_output = output_path('output.json')
+            completion_client_cmd = client_cmd + ['-o', completion_output]
+            check_call(completion_client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
         if client_test_set.completion_streaming:
+            streaming_output = output_path('output_streaming.json')
             streaming_client_cmd = client_cmd + [
-                '--streaming', '-o', 'output_streaming.json'
+                '--streaming', '-o', streaming_output
             ]
             check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
-            chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_file_name = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_output = output_path(chat_file_name)
             chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run streaming chat completion test
         if client_test_set.chat_streaming:
+            streaming_chat_output = output_path('output_streaming_chat.json')
             streaming_chat_client_cmd = client_cmd + [
-                '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
+                '-e', 'chat', '--streaming', '-o', streaming_chat_output
             ]
             check_call(streaming_chat_client_cmd,
                        env=env,
@@ -527,26 +645,46 @@ def run_client_tests(example_dir,
             continue
 
         for output_file in output_files:
-            with open(output_file, 'r') as f:
+            with open(output_path(output_file), 'r') as f:
                 content = f.read()
-                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                    expected_strings = [
-                        "Berlin", ["Asyncio is a", "Asyncio module in"]
-                    ]
+                if ("deepseek_v3_lite" in test_desc
+                        or "qwen3_32b_fp8" in test_desc
+                        or output_file == "output_chat.json"):
+                    # Different models (and endpoints) phrase the continuation
+                    # of the raw asyncio prompt differently, and repeated
+                    # attempts to pin down the exact wording have proven
+                    # fragile across CI runs: e.g. qwen3_32b_fp8's near-tied
+                    # greedy tokens flip with the GPU type and with the ctx/gen
+                    # TP sizes (https://nvbugs/6770977). Match
+                    # case-insensitively on the prompt's own keywords instead
+                    # of an exact phrase.
+                    lowered_content = content.lower()
+                    assert "berlin" in lowered_content, (
+                        f"Expected 'Berlin' not found in {output_file}")
+                    assert "asyncio" in lowered_content, (
+                        f"Expected 'asyncio' not found in {output_file}")
+                    for not_expected_string in not_expected_strings:
+                        assert not_expected_string not in content, (
+                            f"Unexpected string '{not_expected_string}' found in {output_file}"
+                        )
+                    continue
                 elif "gpt_oss_120b" in test_desc:
                     expected_strings = [
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
                     ]
-                elif "qwen3_32b_fp8" in test_desc:
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        "Asyncio in Python is a library"
-                    ]
                 else:
+                    # Qwen3-0.6B (migrated from TinyLlama onto this default
+                    # path) answers the raw asyncio prompt with a
+                    # reasoning-style continuation instead of repeating it
+                    # verbatim; accept its actual phrasing alongside the
+                    # original expectation.
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio is a Python library"
+                        [
+                            "Asyncio is a Python library",
+                            "advantages of using asyncio",
+                        ],
                     ]
                 for expected_string in expected_strings:
                     if isinstance(expected_string, list):
@@ -654,9 +792,17 @@ def setup_disagg_cluster(
     save_log: bool = False,
     startup_callback=None,
     startup_tick: int = 30,
+    perf_metrics_output_dir: str | None = None,
+    disagg_cluster_overrides: dict[str, Any] | None = None,
+    ctx_env: dict[str, str] | None = None,
+    gen_env: dict[str, str] | None = None,
+    share_gpu: bool = False,
+    config_overrides: dict[str, Any] | None = None,
+    log_output_dir: str | None = None,
+    prepare_fmha_metadata: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
-    """Load config, launch workers + disagg server, wait for ready.
+    """Load config, launch the workers and the disagg server, wait for ready.
 
     Args:
         config_file: Path to disaggregated server config YAML
@@ -664,12 +810,36 @@ def setup_disagg_cluster(
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
+        disagg_cluster_overrides: Entries merged over
+            get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
+            for stress runs (cluster_uri/minimal_instances are still derived below)
+        config_overrides: Entries merged into the config (a dict value is merged into the
+            section), e.g. {"model": "m", "context_servers": {"router": {"type": "kv_cache_aware"}}}
+        save_log: Redirect each worker's and the server's output to a file in
+            work_dir instead of the inherited stdout
+        log_output_dir: With save_log, directory the logs are copied to if
+            startup fails (CI's --output-dir, so they get uploaded)
+        prepare_fmha_metadata: Prepare shared FMHA artifacts before single-rank
+            Blackwell Python transceiver workers start.
 
     Returns:
-        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
+        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
+        where server_port is the port the disagg server bound
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+    for key, value in (config_overrides or {}).items():
+        if isinstance(value, dict):
+            config.setdefault(key, {}).update(value)
+        else:
+            config[key] = value
+
+    if perf_metrics_output_dir is not None:
+        config["perf_metrics_output_dir"] = perf_metrics_output_dir
+        for servers in ("context_servers", "generation_servers"):
+            config.setdefault(
+                servers,
+                {})["perf_metrics_output_dir"] = perf_metrics_output_dir
 
     speculative_config = config.get("speculative_config")
     if isinstance(speculative_config, dict):
@@ -679,8 +849,9 @@ def setup_disagg_cluster(
                 speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
+    if disagg_cluster_overrides:
+        disagg_cluster.update(disagg_cluster_overrides)
     server_host = config.get("hostname", "localhost")
-    server_port = get_free_port()
     if save_log:
         log_base = os.path.join(cwd or ".", "disagg-logs")
         os.makedirs(log_base, exist_ok=True)
@@ -689,15 +860,27 @@ def setup_disagg_cluster(
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
     server_env = env
-    coordinator_url = f"http://{server_host}:{server_port}"
+    report_addr = None
     if config.get("num_workers", 1) > 1:
+        # trtllm-serve rejects port 0 for a fleet, whose frontends share one
+        # public port, so that port and the coordinator's are picked here.
+        server_port = get_free_port()
         coordinator_port = get_free_port()
         while coordinator_port == server_port:
             coordinator_port = get_free_port()
-        coordinator_url = f"http://{server_host}:{coordinator_port}"
+        disagg_cluster[
+            "cluster_uri"] = f"http://{server_host}:{coordinator_port}"
         server_env = (env or os.environ).copy()
         server_env["TRTLLM_DISAGG_COORDINATOR_PORT"] = str(coordinator_port)
-    disagg_cluster["cluster_uri"] = coordinator_url
+    else:
+        # The server binds a kernel-assigned port and writes it to report_addr,
+        # so no other process can take the port between choosing and binding
+        # it. The server hosts the cluster storage on its own port and never
+        # reads the port in its copy of cluster_uri; the workers get the
+        # reported address.
+        server_port = 0
+        report_addr = os.path.join(work_dir, "disagg_server.addr")
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:0"
 
     # Auto-deduce minimal_instances from num_instances
     ctx_servers = config.get("context_servers", {})
@@ -717,11 +900,12 @@ def setup_disagg_cluster(
                     gen_servers.get("pipeline_parallel_size", 1) *
                     gen_servers.get("context_parallel_size", 1))
 
-    # Build worker configs
-    ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
-    gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
+    internal_request_auth_key = config.get(
+        "internal_request_auth_key") or secrets.token_hex(32)
 
-    # Launch workers
+    cluster_start = time.perf_counter()
+    print("[startup] cluster_launch_to_ready: start", flush=True)
+
     model = model_name or config.get("model")
     if model:
         model = resolve_llm_model_path(model)
@@ -734,45 +918,47 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
-        for i in range(num_ctx_instances):
-            device_ids = ",".join(
-                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
-                                              for j in range(gpus_per_ctx)))
-            w = run_ctx_worker(model,
-                               ctx_worker_config,
-                               work_dir,
-                               port=0,
-                               device=device_ids,
-                               env=env,
-                               save_log=save_log,
-                               worker_index=i)
-            ctx_workers.append(w)
-            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
-            print(
-                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}{log_suffix}"
-            )
-            next_device += gpus_per_ctx
+        ctx_worker_config = build_worker_config(config, ctx_servers,
+                                                disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers,
+                                                disagg_cluster)
+        if prepare_fmha_metadata and get_sm_version() in (100, 103):
+            prepared_caches = set()
+            for worker_config, ranks, worker_env in (
+                (ctx_worker_config, gpus_per_ctx, ctx_env or env),
+                (gen_worker_config, gpus_per_gen, gen_env or env),
+            ):
+                worker_env = worker_env or os.environ
+                if (ranks != 1 or worker_config.get(
+                        "cache_transceiver_config",
+                    {}).get("transceiver_runtime") != "PYTHON"):
+                    continue
+                # Managed MPI workspaces select their cache after spawning.
+                if (not worker_env.get("FLASHINFER_CUBIN_DIR") and
+                    (worker_env.get("TRTLLM_CACHE_DIR")
+                     or worker_env.get("TRTLLM_FLASHINFER_WORKSPACE_MANAGED")
+                     == "1")):
+                    continue
+                cache_key = tuple(
+                    (key, value) for key, value in sorted(worker_env.items())
+                    if key.startswith("FLASHINFER_") or key in (
+                        "HOME", "PATH", "PYTHONPATH", "TRTLLM_CACHE_DIR"))
+                if cache_key in prepared_caches:
+                    continue
+                # Both single-rank workers must see verified metadata before
+                # either starts warming up against their shared cold cache.
+                check_call([
+                    "python3", "-c",
+                    "from flashinfer.jit.attention import gen_trtllm_gen_fmha_module; "
+                    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
+                    "print(f'Preparing FMHA metadata in {FLASHINFER_CUBIN_DIR}', flush=True); "
+                    "gen_trtllm_gen_fmha_module()"
+                ],
+                           env=worker_env,
+                           cwd=cwd,
+                           timeout=server_start_timeout)
+                prepared_caches.add(cache_key)
 
-        for i in range(num_gen_instances):
-            device_ids = ",".join(
-                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
-                                              for j in range(gpus_per_gen)))
-            w = run_gen_worker(model,
-                               gen_worker_config,
-                               work_dir,
-                               port=0,
-                               device=device_ids,
-                               env=env,
-                               save_log=save_log,
-                               worker_index=i)
-            gen_workers.append(w)
-            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
-            print(
-                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}{log_suffix}"
-            )
-            next_device += gpus_per_gen
-
-        # Build minimal server config and launch
         server_config = {
             "hostname":
             server_host,
@@ -792,15 +978,88 @@ def setup_disagg_cluster(
             config.get("conditional_disagg_config", None),
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
+            "perf_metrics_output_dir":
+            config.get("perf_metrics_output_dir", None),
+            "return_perf_metrics":
+            config.get("return_perf_metrics", False),
+            "internal_request_auth_key":
+            internal_request_auth_key,
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style
-        disagg_server = run_disagg_server(server_config,
-                                          work_dir,
-                                          server_port,
-                                          save_log=save_log,
-                                          env=server_env,
-                                          cwd=cwd)
+        server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
+        if report_addr is not None:
+            # The workers register with the server, so a server on a
+            # kernel-assigned port starts first and they get the port it
+            # reports.
+            disagg_server = run_disagg_server(server_config,
+                                              work_dir,
+                                              server_port,
+                                              report_addr=report_addr,
+                                              **server_launch_kwargs)
+            _, server_port = wait_for_reported_addr(report_addr,
+                                                    server_start_timeout,
+                                                    disagg_server.process)
+            disagg_server.port = server_port
+            disagg_cluster = dict(
+                disagg_cluster,
+                cluster_uri=f"http://{server_host}:{server_port}")
+
+        # Build worker configs and launch workers
+        # The server may have selected a port after metadata preparation.
+        ctx_worker_config["disagg_cluster"] = disagg_cluster
+        gen_worker_config["disagg_cluster"] = disagg_cluster
+        ctx_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+        gen_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+
+        for i in range(num_ctx_instances):
+            device_ids = ",".join(
+                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
+                                              for j in range(gpus_per_ctx)))
+            w = run_ctx_worker(model,
+                               ctx_worker_config,
+                               work_dir,
+                               port=0,
+                               device=device_ids,
+                               env=ctx_env or env,
+                               save_log=save_log,
+                               worker_index=i)
+            ctx_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
+            )
+            next_device += gpus_per_ctx
+
+        if share_gpu:
+            next_device = 0
+        for i in range(num_gen_instances):
+            device_ids = ",".join(
+                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
+                                              for j in range(gpus_per_gen)))
+            w = run_gen_worker(model,
+                               gen_worker_config,
+                               work_dir,
+                               port=0,
+                               device=device_ids,
+                               env=gen_env or env,
+                               save_log=save_log,
+                               worker_index=i)
+            gen_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
+            )
+            next_device += gpus_per_gen
+
+        if disagg_server is None:
+            # A fleet's public and coordinator ports are picked above, so its
+            # server starts after the workers.
+            disagg_server = run_disagg_server(server_config, work_dir,
+                                              server_port,
+                                              **server_launch_kwargs)
 
         all_workers = ctx_workers + gen_workers
 
@@ -896,9 +1155,17 @@ def setup_disagg_cluster(
                     raise t.exception()
 
         asyncio.run(_wait_with_ticker())
-    except Exception:
+        print(
+            f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
+    except BaseException:
+        print(
+            f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        if not save_log:
+        if save_log:
+            archive_process_logs(work_dir, log_output_dir)
+        else:
             shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
@@ -915,12 +1182,20 @@ def run_disaggregated_test(example_dir,
                            cwd=None,
                            disagg_schedule_style=None,
                            post_client_test=None,
-                           assert_gen_log_contains=None):
+                           assert_gen_log_contains=None,
+                           perf_metrics_output_dir=None,
+                           ctx_env=None,
+                           gen_env=None,
+                           share_gpu=False,
+                           server_start_timeout=300,
+                           assert_ctx_log_contains=None,
+                           config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove the KV-cache
-    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
+    worker logs are captured and, after the client tests, at least one worker of each specified
+    role must log each substring (used to prove an intended code path actually engaged instead of
+    silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -929,16 +1204,35 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    apply_pre_hopper_nccl_workaround(run_env)
+    ctx_run_env = run_env.copy()
+    if ctx_env:
+        ctx_run_env.update(ctx_env)
+    gen_run_env = run_env.copy()
+    if gen_env:
+        gen_run_env.update(gen_env)
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
+    assert_worker_logs = (assert_ctx_log_contains is not None
+                          or assert_gen_log_contains is not None)
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=server_start_timeout,
                              schedule_style=disagg_schedule_style,
-                             save_log=assert_gen_log_contains is not None)
+                             save_log=assert_worker_logs,
+                             perf_metrics_output_dir=perf_metrics_output_dir,
+                             ctx_env=ctx_run_env, gen_env=gen_run_env,
+                             share_gpu=share_gpu,
+                             config_overrides=config_overrides,
+                             prepare_fmha_metadata=test_desc in (
+                                 "overlap_transceiver_runtime_python",
+                                 "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
 
+    success = False
     try:
         server_url = f"http://{server_host}:{server_port}"
 
@@ -962,72 +1256,146 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            300,  # timeout
+            server_start_timeout,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
             all_worker_procs,
             disagg_server.process,
+            client_output_dir=work_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        if assert_gen_log_contains is not None:
-            # Fail loudly if the marker is absent: the transfer silently fell back to the
-            # per-fragment path, so the bounce path we meant to exercise never ran.
+        for role, workers, markers in (
+            ("context", ctx_workers, assert_ctx_log_contains),
+            ("generation", gen_workers, assert_gen_log_contains),
+        ):
+            if markers is None:
+                continue
+            # Fail loudly if the marker is absent: the code path the test means to
+            # exercise never ran and something else silently took its place.
             logs = []
-            for w in gen_workers:
+            for w in workers:
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(assert_gen_log_contains in log for log in logs), (
-                f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
-                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
-            )
+            for marker in ((markers, )
+                           if isinstance(markers, str) else markers):
+                assert any(marker in log for log in logs), (
+                    f"expected marker {marker!r} in a {role}-worker log, "
+                    f"but none of {len(logs)} log(s) contained it "
+                    f"(the intended code path did not engage)")
+        success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # When the marker assertion is active the worker logs are file-based
+        # (save_log=True). Preserve work_dir on the failure path so the first
+        # failures on the newly enabled stages arrive with logs to read.
+        if success or not assert_worker_logs:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
-                                       disaggregated_example_root, llm_venv,
-                                       llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                       disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_single_gpu(disaggregated_test_root,
-                                  disaggregated_example_root, llm_venv,
-                                  llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                  disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
-                                                    disaggregated_example_root,
-                                                    llm_venv, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+def _verify_mamba_bs1_concurrency2(server_url: str) -> None:
+
+    async def run() -> None:
+        timeout = aiohttp.ClientTimeout(total=120)
+        prompts = (
+            "Write one sentence about disaggregated inference.",
+            "Write one sentence about recurrent-state transfer.",
+        )
+
+        async def send(session: aiohttp.ClientSession, prompt: str) -> None:
+            payload = {
+                "model": MAMBA_BS1_CONCURRENCY2_MODEL,
+                "prompt": prompt,
+                "max_tokens": 16,
+                "temperature": 0,
+                "ignore_eos": True,
+            }
+            async with session.post(f"{server_url}/v1/completions",
+                                    json=payload,
+                                    timeout=timeout) as response:
+                body = await response.json()
+                assert response.status == 200, body
+                assert body.get("choices"), body
+
+        async with aiohttp.ClientSession() as session:
+            await asyncio.gather(*(send(session, prompt) for prompt in prompts))
+
+    asyncio.run(run())
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(900)
+def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
+                                              llm_venv):
+    model_path = f"{llm_models_root()}/{MAMBA_BS1_CONCURRENCY2_MODEL}"
+    env = llm_venv._new_env.copy()
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../.."))
+    env["LLM_ROOT"] = repo_root
+    env["PYTHONPATH"] = os.pathsep.join(path for path in (repo_root,
+                                                          env.get("PYTHONPATH"))
+                                        if path)
+    env.pop("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", None)
+    env["TRTLLM_NIXL_NUM_THREADS"] = "1"
+    worker_env = {"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": "1"}
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "mamba_bs1_concurrency2",
+        num_iters=0,
+        env=env,
+        model_path=model_path,
+        cwd=llm_venv.get_working_directory(),
+        post_client_test=_verify_mamba_bs1_concurrency2,
+        ctx_env=worker_env,
+        gen_env=worker_env,
+        share_gpu=True,
+        server_start_timeout=600,
+    )
+
+
+def test_disaggregated_qwen3_multi_orchestrator(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
@@ -1035,81 +1403,68 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
                            "multi_orchestrator",
                            num_iters=1,
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("router_type",
                          ["load_balancing", "kv_cache_aware", "conversation"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_router(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
-                              llama_model_root, router_type, tmp_path):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    metrics_file = tmp_path / f"perf_metrics_{router_type}.json"
-
-    def fetch_perf_metrics(server_url: str):
-        import json
-
-        import requests as http_requests
-        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
-        assert resp.status_code == 200, \
-            f"Failed to fetch perf_metrics: {resp.status_code}"
-        metrics = resp.json()
-        metrics_file.write_text(json.dumps(metrics, indent=2))
-        logger.info(f"Router={router_type}: saved {len(metrics)} perf metrics "
-                    f"to {metrics_file}")
+                              router_type):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            router_type,
                            env=llm_venv._new_env,
-                           extra_endpoints_test=fetch_perf_metrics,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_benchmark_gen_only_insufficient_kv(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
+        disaggregated_test_root, disaggregated_example_root, llm_venv):
     """Test that gen-only benchmark mode raises an error when KV cache is too small to hold all benchmark requests, instead of hanging forever."""
     import openai
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file,
-                             model_name=llama_model_root,
+                             model_name=qwen_model_root,
                              env=env,
                              cwd=llm_venv.get_working_directory())
 
@@ -1124,7 +1479,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
         def send_request():
             try:
                 stream = client.completions.create(
-                    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    model="Qwen3/Qwen3-0.6B",
                     prompt="What is the capital of Germany?",
                     max_tokens=10,
                     temperature=0.0,
@@ -1142,105 +1497,114 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
             results = [f.result(timeout=120) for f in futures]
 
         errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) > 0, \
-            "Expected at least one error due to insufficient KV cache"
+        # The executor's fail-fast message must reach a client; any other
+        # exception (connection refused, worker crash) is a different failure.
+        fail_fast_errors = [
+            e for e in errors
+            if "Insufficient KV cache for gen-only benchmark mode" in str(e)
+        ]
+        assert fail_fast_errors, \
+            f"Expected the insufficient-KV fail-fast error, got: {errors!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_genbs1(disaggregated_test_root,
-                              disaggregated_example_root, llm_venv,
-                              llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                              disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_multi_gpu(disaggregated_test_root,
-                                 disaggregated_example_root, llm_venv,
-                                 llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                 disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
-                                  disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
-                               disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                               disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     def post_client_test(server_url: str):
-        verify_usage_with_cache_reuse(server_url,
-                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        verify_usage_with_cache_reuse(server_url, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
                            post_client_test=post_client_test,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
 def test_disaggregated_overlap_gen_first(disaggregated_test_root,
                                          disaggregated_example_root, llm_venv,
-                                         llama_model_root, ctx_pp):
+                                         ctx_pp):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
@@ -1248,34 +1612,95 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
 
     def post_client_test(server_url: str):
-        verify_usage_with_cache_reuse(server_url,
-                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        verify_usage_with_cache_reuse(server_url, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
-        model_path=llama_model_root,
+        model_path=qwen_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first",
         post_client_test=post_client_test)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+def test_disaggregated_context_first_bf16_ownership(
+        disaggregated_test_root: str, llm_venv: Any,
+        disaggregated_example_root: str) -> None:
+    """Exercise serving activation and output through two real TP2 executors.
+
+    Args:
+        disaggregated_test_root: Fixture preparing the integration test assets.
+        llm_venv: Runtime environment with the tested TRT-LLM installation.
+        disaggregated_example_root: Existing disaggregated serving/client harness.
+
+    This verifies activation and successful serving, not outstanding-DMA fencing
+    or replacement after a fatal transfer. Native module tests cover retirement.
+    """
+    model_root = resolve_llm_model_path("Qwen3/Qwen3-0.6B")
+    setup_model_symlink(llm_venv, model_root, "Qwen3/Qwen3-0.6B")
+    env = llm_venv._new_env.copy()
+    env.update({
+        "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT": "1",
+        "TRTLLM_DISAGG_NO_RETRY": "1",
+        "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "0",
+        "TRTLLM_DISAGG_LAYERWISE": "0",
+        "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE": "0",
+    })
+    worker_config = {
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "enable_attention_dp": False,
+        "kv_cache_config": {
+            "use_kv_cache_manager_v2": True,
+            "free_gpu_memory_fraction": 0.2,
+            "enable_partial_reuse": False,
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 60000,
+            "kv_cache_bounce_size_mb": 0,
+            "agent_bounce_buffer_enable": False,
+            "enable_pipelined_transfer": False,
+        },
+    }
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python",
+        env=env,
+        model_path=model_root,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="context_first",
+        config_overrides={
+            "context_servers": worker_config,
+            "generation_servers": worker_config,
+        },
+        assert_ctx_log_contains="Context-first BF16 KV ownership ENABLED",
+        assert_gen_log_contains="Context-first BF16 KV ownership ENABLED")
 
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
@@ -1284,479 +1709,340 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 # platforms with MNNVL fabric-memory support; on other devices the env var would silently fall
 # back to a non-fabric allocation, which would defeat the purpose of this test.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver AND the
-# KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
-# per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
-# Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
-#
-# The bounce transport coalesces a transfer only when it clears the receiver's min_blocks gate.
-# The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env so the ordinary short
-# prompts still take the coalesced-bounce WRITE path -- no special long prompt is needed. The test
-# runs the normal disagg output verification (the coalesced KV must still decode to the right
-# answer, e.g. "Berlin"; a corrupt transfer would garble it) AND asserts the generation worker
-# logged the coalesced-bounce marker, so a silent fall-back to the per-fragment path fails the
-# test instead of passing quietly.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python_bounce(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    """Verify output correctness and C++ agent bounce engagement on fabric-capable GPUs."""
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
-    # min_blocks=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
-    # env). No fabric-pool env is needed: the bounce arena is its own fabric memory.
-    env["TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "overlap_transceiver_runtime_python_bounce",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           assert_gen_log_contains="[kv-bounce] coalesced")
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python_bounce",
+        env=env,
+        model_path=qwen_model_root,
+        cwd=llm_venv.get_working_directory(),
+        ctx_env={"TLLM_LOG_LEVEL_BY_MODULE": "debug:executor"},
+        assert_ctx_log_contains="bounce path engaged for write")
 
 
-def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
-    """End-to-end check: Python transceiver + ctx-side host offload.
-
-    The fix translates logical block IDs to primary-pool slot indices in
-    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
-    sender. Without that translation, once host offload moves blocks
-    around, the sender computes pool pointers from stale block IDs and
-    either reads garbage memory or aborts. This test stresses that path
-    end-to-end:
-
-      1. Send several distinct prompts to fill the (deliberately small)
-         ctx primary pool, committing each to the reuse radix tree.
-      2. Send more prompts, evicting earlier blocks to the host pool.
-      3. Re-issue the earlier prompts. Reuse hits force onboard from host
-         back to primary, and the disagg transfer must read primary slots
-         that no longer match the original block IDs. With the fix, this
-         succeeds; without it, the sender either crashes on a primary
-         assertion or returns nonsense tokens.
-
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
-    run-to-run): we check that responses are non-empty, the server stays
-    up across the eviction/onboard cycle, and `cached_tokens > 0` on
-    repeats so we know reuse actually fired.
-    """
-    timeout = aiohttp.ClientTimeout(total=180)
-    max_tokens = 16
-    # Workload sizing: ctx-side primary pool = max_tokens(1024) /
-    # tokens_per_block(64) = 16 blocks. Each prompt below tokenizes to
-    # ~200 tokens ≈ 4 KV blocks. We send 6 distinct prompts → ~24 blocks
-    # of primary demand > 16-block primary pool, forcing eviction of an
-    # earlier prefix to host. Replaying earlier prompts (Pass 2) then
-    # forces onboard from host back to primary, and onboard typically
-    # places the block in a *different* primary slot than its block_id.
-    # That divergence is exactly what the disagg pointer-arithmetic fix
-    # has to handle — without the fix, the sender computes
-    # `base + block_id * slot_bytes` and reads the wrong primary slot.
-    _filler = (
-        "This is filler context describing computer systems, distributed "
-        "inference, KV cache management, host memory offload policies, "
-        "block reuse via radix prefix trees, and the disaggregated serving "
-        "architecture used by modern large language model deployments. ")
-    _topics = [
-        "transformer KV cache management",
-        "the disaggregated prefill/decode split",
-        "host (CPU) memory offload trade-offs",
-        "block eviction and onboard cycles",
-        "primary versus secondary KV pools",
-        "radix prefix tree block reuse",
-    ]
-    distinct_prompts = [
-        f"Topic: {topic}. {_filler * 4} Now answer briefly:"
-        for topic in _topics
-    ]
-
-    async def send(session, prompt):
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "ignore_eos": True,
-        }
-        async with session.post(f"{server_url}/v1/completions",
-                                json=payload,
-                                timeout=timeout) as resp:
-            assert resp.status == 200, (
-                f"completions request failed with {resp.status}: "
-                f"{await resp.text()}")
-            return await resp.json()
-
-    def assert_sane(resp, label):
-        choices = resp.get("choices") or []
-        assert choices, f"{label}: response missing 'choices': {resp}"
-        text = choices[0].get("text") or ""
-        assert text.strip(), f"{label}: empty/whitespace text: {resp}"
-        usage = resp.get("usage") or {}
-        assert usage.get("completion_tokens") == max_tokens, (
-            f"{label}: completion_tokens != {max_tokens}; "
-            f"got {usage.get('completion_tokens')}")
-        return text
-
-    async def drive():
-        async with aiohttp.ClientSession() as session:
-            # Pass 1: prime the radix tree with each distinct prompt and
-            # capture the deterministic output (temperature=0).
-            first_texts = []
-            for idx, p in enumerate(distinct_prompts):
-                resp = await send(session, p)
-                first_texts.append(assert_sane(resp, f"pass1[{idx}]"))
-
-            # Pass 2: send all prompts CONCURRENTLY each replay. Concurrent
-            # in-flight prefills hold their KV blocks simultaneously; with
-            # primary capacity smaller than the union of in-flight prompts,
-            # this is the scenario that produces non-trivial alloc/free
-            # interleaving and onboard-to-different-slot for replayed
-            # prompts. Strict serial sends (Pass 1 above) typically alloc
-            # back to original slots and miss the bug.
-            for replay in range(5):
-                results = await asyncio.gather(
-                    *[send(session, p) for p in distinct_prompts])
-                for idx, resp in enumerate(results):
-                    text = assert_sane(resp,
-                                       f"pass2.replay{replay}.prompt{idx}")
-                    usage = resp["usage"]
-                    cached = (usage.get("prompt_tokens_details")
-                              or {}).get("cached_tokens", 0)
-                    print(f"[host_offload_e2e] replay={replay} prompt={idx} "
-                          f"prompt_tokens={usage.get('prompt_tokens')} "
-                          f"cached_tokens={cached}")
-                    # Reuse must hit — otherwise we never exercise onboard
-                    # back from host, which is the path the fix protects.
-                    assert cached > 0, (
-                        f"replay={replay} prompt={idx}: expected reuse "
-                        f"hit (cached_tokens > 0), got usage={usage}")
-                    # Primary regression check: deterministic decoding +
-                    # correct KV must reproduce Pass 1's output bit-for-bit.
-                    assert text == first_texts[idx], (
-                        f"replay={replay} prompt={idx}: output diverged "
-                        f"from Pass 1, indicating wrong KV was read after "
-                        f"offload/onboard.\n"
-                        f"  pass1: {first_texts[idx]!r}\n"
-                        f"  replay: {text!r}")
-
-    asyncio.run(drive())
-
-
-# Plain parametrize (not the `llama_model_root` indirect fixture) so the
-# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
-# trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
-def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
-    """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
-
-    See `_verify_python_transceiver_under_host_offload` for what this
-    test proves. The setup pairs the Python transceiver runtime with a
-    ctx-side `host_cache_size` and a deliberately tight primary pool so
-    that prefix reuse is forced through an offload+onboard cycle before
-    each KV transfer.
-
-    Model resolution: trtllm-serve loads the HuggingFace id from the
-    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
-    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
-    """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-
-    def post_client_test(server_url: str):
-        _verify_python_transceiver_under_host_offload(
-            server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "python_transceiver_host_offload",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           post_client_test=post_client_test)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                    disaggregated_example_root, tmp_path):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
-    def extra_endpoints_test(server_url: str):
-        item = get_timing_metrics(server_url)
-        # Use helper function to validate all timing metrics comprehensively
-        validate_timing_metrics(item, "perf_metrics test")
+    perf_metrics_output_dir = str(tmp_path / "perf_metrics")
 
+    def extra_endpoints_test(_server_url: str):
+        item = get_timing_metrics(perf_metrics_output_dir)
+        gen_timing = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+        # JSONL omits kv_cache_size for zero-byte transfers (e.g. block reuse).
+        assert {"kv_cache_transfer_start",
+                "kv_cache_transfer_end"} <= gen_timing.keys()
+        validate_timing_metrics(item, "Python transceiver perf_metrics test")
+
+    env = llm_venv._new_env | {
+        "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
+    }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env,
+                           env=env,
                            extra_endpoints_test=extra_endpoints_test,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           model_path=qwen_model_root,
+                           cwd=llm_venv.get_working_directory(),
+                           perf_metrics_output_dir=perf_metrics_output_dir)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
-                                                  disaggregated_example_root,
-                                                  llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "tool_calls",
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
-                                            llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                            tmp_path):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
-    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    output_path = str(tmp_path / "cache_time")
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env
-                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
-                           model_path=llama_model_root,
+                           env=env,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
-    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
-    # (instanceId is a runtime UUID that disambiguates instances sharing an
-    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
-    # "rank_0" prefix.
-    send_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_send.csv"))
-    recv_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_recv.csv"))
-    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
-    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
-    send_file = os.path.join(output_path, send_files[0])
-    recv_file = os.path.join(output_path, recv_files[0])
-    with open(send_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        assert lines[0].startswith(
-            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
-        )
-        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
-        # get a send sample and match the recv
-        sample = lines[1].split(',')
-        assert len(sample) >= 9
-    with open(recv_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        matched = False
-        for line in lines:
-            sample_recv = line.split(',')
-            if sample_recv[0] == sample[0]:
-                matched = True
-                assert float(sample_recv[1]) <= float(sample[1])
-                break
-        assert matched
+    # Python writes task rows per instance/rank and a separate generation
+    # summary. Match requests across both workers instead of relying on UUIDs.
+    task_rows = []
+    summary_rows = []
+    for filename in sorted(os.listdir(output_path)):
+        if not filename.endswith(".csv"):
+            continue
+        with open(os.path.join(output_path, filename), newline="") as f:
+            reader = csv.DictReader(f)
+            if filename.endswith("_gen_transfer_summary.csv"):
+                assert reader.fieldnames == [
+                    "timestamp", "RequestID", "gen_side_transfer_time(ms)",
+                    "kv_cache_size"
+                ]
+                summary_rows.extend(reader)
+            else:
+                assert reader.fieldnames == [
+                    "timestamp", "task_type", "unique_rid", "peer_rank",
+                    "transfer_size_bytes", "avg_segment_size_bytes",
+                    "transfer_entry_count", "prepare_args_latency_ms",
+                    "queue_latency_ms", "transfer_latency_ms",
+                    "task_latency_ms", "throughput_mbs"
+                ]
+                task_rows.extend(reader)
+
+    send_rows = [row for row in task_rows if row["task_type"] == "KVSendTask"]
+    recv_rows = [row for row in task_rows if row["task_type"] == "KVRecvTask"]
+    assert send_rows, f"No Python send task metrics in {output_path}"
+    assert recv_rows, f"No Python receive task metrics in {output_path}"
+    assert summary_rows, f"No generation transfer summaries in {output_path}"
+    recv_ids = {row["unique_rid"] for row in recv_rows}
+    # Repeated prompts may reuse all blocks. Require an actual transfer among
+    # the matched requests, while permitting zero-byte rows for cache hits.
+    sent_ids = {
+        row["unique_rid"]
+        for row in send_rows if int(row["transfer_size_bytes"]) > 0
+    }
+    summary_ids = {
+        row["RequestID"]
+        for row in summary_rows if int(row["kv_cache_size"]) > 0
+    }
+    assert sent_ids & recv_ids & summary_ids
+    for row in send_rows:
+        assert int(row["transfer_size_bytes"]) >= 0
+        assert int(row["transfer_entry_count"]) >= 0
+        assert float(row["avg_segment_size_bytes"]) >= 0
+        for field in ("prepare_args_latency_ms", "queue_latency_ms",
+                      "transfer_latency_ms", "task_latency_ms",
+                      "throughput_mbs"):
+            assert float(row[field]) >= 0, row
+        assert float(row["task_latency_ms"]) >= float(
+            row["transfer_latency_ms"])
+    for row in recv_rows:
+        assert float(row["task_latency_ms"]) >= 0, row
+    for row in summary_rows:
+        assert float(row["gen_side_transfer_time(ms)"]) >= 0, row
+        assert int(row["kv_cache_size"]) >= 0, row
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                    disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
-                                   disaggregated_example_root,
-                                   llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                   disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+def test_disaggregated_sa(disaggregated_test_root, llm_venv,
+                          disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa",
+                           env=llm_venv._new_env,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
+    # Cold model initialization and JIT across eight Blackwell ranks took
+    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           model_path=qwen_model_root,
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
-#tiny llama pp4 will have uneven layer per pp. pp4
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip(
-    reason="MPI cache transceiver requires shared MPI process group, "
-    "incompatible with service discovery which launches separate subprocesses")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_mpi",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1850,30 +2136,9 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
         cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @skip_arm
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_ucx",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
@@ -1886,50 +2151,47 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["UCX_MM_ERROR_HANDLING"] = "y"
+
+    # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
+    # controlled by the test lists (l0_dgx_h100, l0_dgx_b200 pre_merge,
+    # l0_dgx_b300), which cover Hopper and Blackwell. The old Hopper-only
+    # @skip_no_hopper silently skipped this test on its B200/B300 registrations;
+    # skip_pre_hopper keeps those live while still gating out pre-Hopper.
+    #
+    # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
+    # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
+    # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
+    # essentially every gen forward. Require its kernel-compile marker (logged
+    # at INFO) in a generation-worker log: correct client output alone would
+    # not distinguish the CuTe DSL path from a silent fallback to another FMHA
+    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    # documented off switch.
+    gen_env = None
+    assert_gen_log_contains = None
+    # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
+    # JIT and autotuner warmup deterministically push cold-start readiness to
+    # ~370s: every observed B200/B300 run overran the 300s default, so raise it
+    # to the 1200s budget other disagg tests already use (a real hang still
+    # fails at 1200s). H100 registers in ~138s and its 300s-mark failures are
+    # dominated by a separate UCX/NIXL issue, not slow warmup, so keep 300s
+    # there rather than delaying those failures.
+    server_start_timeout = 300
+    if get_sm_version() in (100, 103):
+        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+        server_start_timeout = 1200
+
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
+                           gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_transceiver_runtime_python",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           assert_gen_log_contains=assert_gen_log_contains,
+                           server_start_timeout=server_start_timeout)
 
 
 @skip_no_hopper
@@ -1968,21 +2230,55 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
+    """Attention DP with the overlap scheduler and the servers' scheduling fields.
+
+    A long prompt reaches the generation workers trimmed to its tail and must still be answered.
+    """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           env=llm_venv._new_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+    def trimmed_prompt_answer(server_url):
+        import requests
+
+        with open(
+                f"{disaggregated_example_root}/clients/long_prompts.json") as f:
+            prompt = json.load(f)[0]
+        # Longer than gen_prompt_tail_tokens: the generation workers get only its tail.
+        prompt += ("\n\nQuestion: What is the capital of Germany?\n"
+                   "Answer: The capital of Germany is")
+        response = requests.post(f"{server_url}/v1/completions",
+                                 json={
+                                     "model": "DeepSeek-V3-Lite/fp8",
+                                     "prompt": prompt,
+                                     "max_tokens": 8,
+                                     "temperature": 0
+                                 },
+                                 timeout=600)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["usage"]["prompt_tokens"] > 256, result["usage"]
+        text = result["choices"][0]["text"]
+        assert "berlin" in text.lower(), text
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp_8_attention_dp_overlap",
+        num_iters=1,
+        env=llm_venv._new_env,
+        gen_env={"TLLM_LOG_LEVEL": "INFO"},
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200,
+        post_client_test=trimmed_prompt_answer,
+        assert_gen_log_contains=(
+            "max_gen_init_admissions_per_pass=1",
+            "prompt tail trimming: first trimmed request sends 256"))
 
 
 @skip_no_hopper
@@ -2073,6 +2369,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2089,6 +2386,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2106,50 +2404,34 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
 
 # V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, tmp_path):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
-    # Conditional disagg handles short-prefill requests locally on the gen
-    # server (bypassing the ctx handoff + add_per_request_metrics), while routed
-    # requests are recorded in the disagg /perf_metrics. Verify ONCE after all
-    # client iterations via post_client_test (not per-iteration): routed-request
-    # metrics are recorded asynchronously (add_per_request_metrics via
-    # create_task on response completion) and surface only after the client
-    # traffic settles, so a per-iteration read races that lag; /perf_metrics is
-    # also consume-on-read, so query it exactly once at the end.
-    def _check_routed_recorded(server_url: str):
-        import requests as http_requests
-        metrics = []
-        deadline = time.time() + 60
-        while True:
-            resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
-            assert resp.status_code == 200, \
-                f"perf_metrics fetch failed: {resp.status_code}"
-            metrics = resp.json()
-            if metrics or time.time() >= deadline:
-                break
-            time.sleep(2)
-        logger.info(f"conditional_v2 perf_metrics len={len(metrics)} "
-                    f"(routed requests recorded; bypassed ones absent)")
-        # With short prompts every prompt's first occurrence routes through the
-        # context server (match=0 -> need_ctx), so at least one routed request
-        # must be recorded; an empty result means conditional routing never
-        # engaged.
-        assert metrics, \
-            "no per-request metrics recorded after client runs; conditional routing may be misconfigured"
+    perf_metrics_output_dir = str(tmp_path / "perf_metrics")
+
+    def _check_routed_recorded(_server_url: str):
+        records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                              expected_count=3,
+                                              timeout=60)
+        assert any(
+            {"ctx_perf_metrics", "gen_perf_metrics"} <= record.keys()
+            for record in records
+        ), "new prompt did not produce routed context and generation metrics"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional_v2",
                            env=llm_venv._new_env,
                            post_client_test=_check_routed_recorded,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           perf_metrics_output_dir=perf_metrics_output_dir)
 
 
 @skip_no_hopper
@@ -2189,11 +2471,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-v3-8b-hf":
-        model_path = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        model_path = os.path.join(models_root, "llama-3.1-model",
-                                  "Llama-3.1-8B-Instruct-FP8")
     else:
         raise ValueError(f"Failed to find the model: {request.param}")
     return model_path
@@ -2215,6 +2492,7 @@ def run_disaggregated_benchmark(example_dir,
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2294,7 +2572,6 @@ def get_config_for_benchmark(model_root, backend):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         },
@@ -2307,12 +2584,136 @@ def get_config_for_benchmark(model_root, backend):
             "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         }
     }
     return serve_config
+
+
+def enforce_aiperf_error_rate(artifact_dir,
+                              max_error_rate,
+                              expected_records=None):
+    """Fail if the fraction of non-cancellation request errors exceeds max_error_rate.
+
+    aiperf exits 0 and counts HTTP 500s as completed requests, so without this
+    gate a mid-run server error storm (e.g. "Cluster is not ready" readiness
+    flapping, nvbugs/6472256) passes silently. Reads aiperf's per-record export
+    (profile_export.jsonl in artifact_dir), where each line carries an optional
+    "error" object with code/type/message. Intentional client-side cancellations
+    (HTTP 499 / RequestCancellationError) are excluded from both the numerator
+    and the denominator — stress tests cancel a fraction of requests on purpose.
+
+    Record schema validated against aiperf==0.8.0 (the pin in
+    requirements-dev.txt): each JSONL line is a MetricRecordInfo object
+    ({"metadata", "metrics", "error"}), and both cancellation construction
+    sites in aiperf's aiohttp client emit exactly error.code == 499 with
+    error.type == "RequestCancellationError". Reference gate output from the
+    35000-request DeepSeek R1 FP4 validation run (cancellation_rate=10):
+    [aiperf-gate] non-cancellation errors: 0/31561 (0.00%), cancelled: 3439.
+
+    The export must be substantive for the gate to pass: an empty or
+    unparsable export, an all-cancelled record set, or a record count far
+    below expected_records fails loudly instead of degrading into a silent
+    pass (a broken export is itself evidence of a broken run).
+    """
+    export_path = os.path.join(artifact_dir, "profile_export.jsonl")
+    # Explicit raise (not assert): asserts are stripped under python -O, which
+    # would defer the failure to open() without this diagnostic.
+    if not os.path.exists(export_path):
+        raise FileNotFoundError(
+            f"aiperf per-record export not found at {export_path}; cannot "
+            "enforce the request error-rate gate. If this aiperf "
+            "version/export level does not produce it, pass "
+            "max_error_rate=None explicitly.")
+    total = 0
+    cancelled = 0
+    decode_failures = 0
+    non_request = 0
+    # (code, type) -> [count, example message]
+    error_counts: dict[tuple, list] = {}
+    with open(export_path, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                decode_failures += 1
+                continue
+            if not isinstance(record, dict) or ("metrics" not in record
+                                                and "error" not in record):
+                # Non-request records would inflate the denominator and
+                # under-report the rate. The aiperf==0.8.0 record export is
+                # request-only, but stay robust to future metadata additions.
+                non_request += 1
+                continue
+            total += 1
+            error = record.get("error")
+            # Schema-drift fallback: per-record metadata carries was_cancelled
+            # independently of the error object's code/type, so a cancelled
+            # request is excluded even if a future aiperf changes the error
+            # shape (or omits the error object for cancellations entirely).
+            metadata = record.get("metadata") or {}
+            was_cancelled = bool(metadata.get("was_cancelled"))
+            if not error:
+                if was_cancelled:
+                    cancelled += 1
+                continue
+            code = error.get("code")
+            err_type = error.get("type")
+            if (code == 499 or err_type == "RequestCancellationError"
+                    or was_cancelled):
+                cancelled += 1
+                continue
+            entry = error_counts.setdefault((code, err_type),
+                                            [0, error.get("message", "")])
+            entry[0] += 1
+    # Substantiveness checks: never let a broken export read as a clean run.
+    # A single truncated trailing line is tolerated; wholesale parse failure
+    # means the record format changed and the gate can no longer be trusted.
+    if decode_failures > max(1, (total + decode_failures) // 100):
+        raise AssertionError(
+            f"{export_path}: {decode_failures} of {total + decode_failures} "
+            "lines failed to parse as JSON — the export is corrupt or the "
+            "aiperf record format changed; refusing to compute an error rate "
+            "from it.")
+    if total == 0:
+        raise AssertionError(
+            f"{export_path} contained no parseable request records — the "
+            "benchmark produced no per-request accounting, which itself "
+            "indicates a broken run.")
+    if expected_records is not None and total < expected_records * 0.9:
+        raise AssertionError(
+            f"{export_path} contained only {total} records but "
+            f"~{expected_records} were expected — per-request accounting is "
+            "incomplete; refusing to compute an error rate from it.")
+    considered = total - cancelled
+    if considered <= 0:
+        raise AssertionError(
+            f"all {total} records in {export_path} were classified as "
+            "cancelled — implausible at the configured cancellation rate and "
+            "indicates a broken run or cancellation-classification drift.")
+    errors = sum(count for count, _ in error_counts.values())
+    error_rate = errors / considered
+    print(
+        f"[aiperf-gate] non-cancellation errors: {errors}/{considered} "
+        f"({error_rate:.2%}), cancelled: {cancelled}, "
+        f"decode failures: {decode_failures}, "
+        f"non-request records: {non_request}, "
+        f"threshold: {max_error_rate:.2%}",
+        flush=True)
+    if error_rate > max_error_rate:
+        breakdown = "\n".join(
+            f"  code={code} type={err_type}: {count} (e.g. {message[:200]})"
+            for (code, err_type), (count, message) in sorted(
+                error_counts.items(), key=lambda kv: -kv[1][0]))
+        raise AssertionError(
+            f"aiperf request error rate {error_rate:.2%} exceeds threshold "
+            f"{max_error_rate:.2%} ({errors} non-cancellation errors out of "
+            f"{considered} requests; {cancelled} intentional cancellations "
+            f"excluded). Error breakdown:\n{breakdown}")
 
 
 def run_disaggregated_aiperf(config_file,
@@ -2332,8 +2733,10 @@ def run_disaggregated_aiperf(config_file,
                              threshold=0.8,
                              cancellation_rate=None,
                              cancellation_delay=None,
+                             max_error_rate=0.05,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             log_output_dir=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2350,22 +2753,29 @@ def run_disaggregated_aiperf(config_file,
         random_seed: Random seed for reproducibility
         accuracy_test: Whether to run accuracy test
         threshold: Threshold for accuracy test
+        max_error_rate: Fail if the fraction of non-cancellation request
+            errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
+        log_output_dir: If set, the full worker/server logs are copied there
+            when the run fails (pass the output_dir fixture so CI uploads them)
     """
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
-                             save_log=True)
+                             save_log=True,
+                             log_output_dir=log_output_dir,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
+    failed = False
     try:
         # Wait for server to be ready
         if not wait_for_server(
@@ -2460,6 +2870,22 @@ def run_disaggregated_aiperf(config_file,
                 "Fatal error patterns detected in disaggregated worker/server "
                 f"logs:\n{summary}")
 
+        # Gate on the per-request error rate from aiperf's record export:
+        # aiperf exits 0 even when the server returns 500s for a large share
+        # of requests, so this is the only check that catches a mid-run error
+        # storm on this path (the fatal-pattern scan above is hang/OOM only).
+        if max_error_rate is not None:
+            # aiperf 0.8.0 derives the request count from concurrency when
+            # --request-count is not passed (max(10, concurrency * 2) for
+            # synthetic datasets; --num-dataset-entries only sizes the prompt
+            # pool). Mirror that so the completeness check also covers the
+            # default request mode instead of silently disabling.
+            expected_records = (request_count if request_count is not None else
+                                max(10, concurrency * 2))
+            enforce_aiperf_error_rate(artifact_dir,
+                                      max_error_rate,
+                                      expected_records=expected_records)
+
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
@@ -2495,24 +2921,32 @@ def run_disaggregated_aiperf(config_file,
                     "Fatal error patterns detected in disaggregated "
                     f"worker/server logs after accuracy run:\n{summary}")
 
-    except Exception:
-        # Print tail of each captured worker/server log to aid triage.
+    except BaseException:
+        # Print the context around the first fatal-pattern match (the root
+        # cause, e.g. an OOM traceback) and the tail of each captured
+        # worker/server log to aid triage.
+        print_first_fatal_log_context(
+            [*ctx_workers, *gen_workers, disagg_server])
         for proc in [*ctx_workers, *gen_workers, disagg_server]:
             log_path = getattr(proc, "log_path", None)
             if not log_path or not os.path.exists(log_path):
                 continue
             logger.error(f"-------- {log_path} (last 30 lines) --------")
             try:
-                from collections import deque
                 with open(log_path, "r", errors="replace") as f:
                     for line in deque(f, maxlen=30):
                         if line.strip():
                             logger.error(line.rstrip())
             except OSError:
                 pass
+        failed = True
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
+        if failed:
+            # The log writers are closed now, so the files are complete. Copy
+            # them into the CI output directory before work_dir is removed.
+            archive_process_logs(work_dir, log_output_dir)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -2628,6 +3062,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@pytest.mark.skip_less_device(3)
 @skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2669,9 +3104,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5555681
-    Test to reproduce KV cache buffer overflow bug with long context.
+    """Verify long-context KV cache transfer with the Python transceiver.
+
+    Retains long-context coverage from https://nvbugspro.nvidia.com/bug/5555681.
     """
     models_root = llm_models_root()
     llama4_model_root = os.path.join(models_root, model_path)
@@ -2731,7 +3166,65 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-20b'])
+def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
+                                                  disaggregated_example_root,
+                                                  llm_venv, model_path):
+    """gpt-oss (Harmony) behind kv_cache_aware routers serves a chat request."""
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
+    def chat_and_fingerprints(server_url: str) -> None:
+        reply = requests.post(f"{server_url}/v1/chat/completions",
+                              json={
+                                  "model":
+                                  model_path,
+                                  "messages": [{
+                                      "role":
+                                      "user",
+                                      "content":
+                                      "Say hi in three words."
+                                  }],
+                                  "max_tokens":
+                                  32,
+                                  "temperature":
+                                  0
+                              },
+                              timeout=120)
+        assert reply.status_code == 200, reply.text
+        message = reply.json()["choices"][0]["message"]
+        assert message.get("content") or message.get("reasoning_content")
+        info = requests.get(f"{server_url}/cluster_info", timeout=30).json()
+        for role in ("context", "generation"):
+            assert info["render_fingerprints"][role], role
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_20b_kv_cache_aware",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory(),
+                           post_client_test=chat_and_fingerprints,
+                           config_overrides={
+                               "model": model_path,
+                               "context_servers": {
+                                   "router": {
+                                       "type": "kv_cache_aware"
+                                   }
+                               }
+                           },
+                           server_start_timeout=600)
 
 
 @skip_pre_hopper
@@ -2743,11 +3236,255 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
+    # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
+
+
+def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
+                             streaming: bool) -> tuple[str, dict[str, int]]:
+    import requests
+    from defs.deepseek_v41_serving import MAX_OUTPUT_TOKENS
+
+    body = dict(model=model,
+                prompt=prompt,
+                temperature=0,
+                top_p=1,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                stream=streaming)
+    if streaming:
+        body["stream_options"] = {"include_usage": True}
+    with requests.post(f"{server_url}/v1/completions",
+                       json=body,
+                       stream=streaming,
+                       timeout=600) as response:
+        response.raise_for_status()
+        if not streaming:
+            payload = response.json()
+            assert payload["choices"][0]["finish_reason"] == "stop", payload
+            return payload["choices"][0]["text"], payload["usage"]
+        text, usage, finished, done = "", {}, False, False
+        # Consume metrics events after [DONE] so the response closes cleanly.
+        for line in response.iter_lines():
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                done = True
+                continue
+            payload = json.loads(data)
+            assert "error" not in payload, payload
+            if payload.get("usage"):
+                usage = payload["usage"]
+            for choice in payload.get("choices", []):
+                text += choice.get("text", "")
+                if choice.get("finish_reason") is not None:
+                    assert choice["finish_reason"] == "stop", choice
+                    finished = True
+        assert done and finished, "Streaming response did not finish cleanly"
+        return text, usage
+
+
+def _deepseek_v41_handoff(metrics_dir: str, transfer_dir: str,
+                          seen_ids: set[str], *, attention_dp: bool) -> str:
+    import csv
+    from pathlib import Path
+
+    # Requests are sequential, with one context, generation and proxy record each.
+    records = wait_for_perf_metrics_jsonl(metrics_dir,
+                                          3 * (len(seen_ids) + 1),
+                                          timeout=60)
+    proxies = [
+        r for r in records if "ctx_server" in r
+        and str(r.get("disagg_request_id", "")) not in seen_ids
+    ]
+    assert len(proxies) == 1, proxies
+    proxy = proxies[0]
+    request_id = str(proxy["disagg_request_id"])
+    assert request_id and proxy["status"] == "complete", proxy
+    workers = [
+        r for r in records if "request_id" in r
+        and str(r.get("disagg_request_id", "")) == request_id
+    ]
+    assert len(workers) == 2, workers
+    # Local request IDs can collide across the two worker executors.
+    generation = []
+    for path in Path(metrics_dir).glob("perf_metrics-generation-*.jsonl"):
+        for line in path.read_text().splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if str(record.get("disagg_request_id", "")) == request_id:
+                    generation.append(record)
+    assert len(generation) == 1, generation
+    assert all(r["status"] == "complete" for r in workers), workers
+    # Header-derived proxy metrics do not carry worker-local or context IDs.
+    ctx_request_id = generation[0]["ctx_request_id"]
+    assert all(r["ctx_request_id"] == ctx_request_id for r in workers), workers
+    timing = generation[0]["perf_metrics"]["timing_metrics"]
+    assert timing["kv_cache_size"] > 0, timing
+    assert 0 < timing["kv_cache_transfer_start"] <= timing[
+        "kv_cache_transfer_end"], timing
+    deadline = time.monotonic() + 10
+    while True:
+        ranks = []
+        for path in Path(transfer_dir).glob("*_gen_transfer_summary.csv"):
+            rank = int(
+                path.name.removesuffix("_gen_transfer_summary.csv").rsplit(
+                    "_", 1)[-1])
+            with path.open() as stream:
+                for row in csv.DictReader(stream):
+                    if row["RequestID"] == request_id:
+                        # TP records a consensus total; DP records the receiving rank's bytes.
+                        assert int(row["kv_cache_size"]) > 0, row
+                        ranks.append(rank)
+        if attention_dp and len(ranks) == 1 and ranks[0] in range(4):
+            return request_id
+        if not attention_dp and sorted(ranks) == [0, 1, 2, 3]:
+            return request_id
+        assert time.monotonic() < deadline, (request_id, ranks)
+        time.sleep(0.1)
+
+
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+def test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4(llm_venv, model_path,
+                                                        tmp_path) -> None:
+    """Check GSM8K accuracy, DSpark AL, and NIXL handoff on TP4/EP4 workers."""
+    _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, attention_dp=False)
+
+
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+def test_disaggregated_deepseek_v41_gsm8k_ctxdp4_gendp4(llm_venv, model_path,
+                                                        tmp_path) -> None:
+    """Check GSM8K accuracy, DSpark AL, and NIXL handoff on attention DP4/EP4 workers."""
+    _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, attention_dp=True)
+
+
+def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
+                            attention_dp: bool) -> None:
+    from defs.deepseek_v41_serving import baseline_env, model_kwargs
+
+    from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+    model_dir = resolve_llm_model_path(model_path)
+    tokenizer = DeepseekV41Tokenizer.from_pretrained(model_dir,
+                                                     trust_remote_code=True,
+                                                     local_files_only=True)
+    config = {
+        "model": model_dir,
+        "hostname": "localhost",
+        "backend": "pytorch",
+        "return_perf_metrics": True
+    }
+    for role in ("context_servers", "generation_servers"):
+        config[role] = model_kwargs(attention_dp=attention_dp) | {
+            "num_instances": 1,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+        }
+        # Both workers share one node. The KV cache manager V2 auto host tier
+        # only counts its own TP ranks, so each worker would pin half of the
+        # free host memory and the two together would pin all of it; that
+        # page-population stalls for over an hour. A fixed small host tier
+        # keeps the V2 suspend/resume path available without oversubscribing.
+        config[role]["kv_cache_config"]["host_cache_size"] = 2 * (1 << 30)
+    config["context_servers"].update(cuda_graph_config=None,
+                                     disable_overlap_scheduler=True,
+                                     speculative_config=None)
+    config["generation_servers"]["speculative_config"] = {
+        "decoding_type": "DSpark",
+        "max_draft_len": 5,
+    }
+    config_path = tmp_path / "disagg.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    metrics_dir, transfer_dir = str(tmp_path / "metrics"), str(tmp_path /
+                                                               "transfers")
+    env = baseline_env(llm_venv._new_env) | {
+        "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_NIXL_NUM_THREADS": "1",
+        "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": transfer_dir,
+        "TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1",
+    }
+    _, ctx_workers, gen_workers, server, port, _ = setup_disagg_cluster(
+        str(config_path),
+        model_name=model_dir,
+        env=env,
+        cwd=str(tmp_path),
+        server_start_timeout=5400,
+        save_log=True,
+        perf_metrics_output_dir=metrics_dir)
+    try:
+        _check_deepseek_v41_gsm8k(f"http://localhost:{port}",
+                                  model_dir,
+                                  tokenizer,
+                                  tmp_path,
+                                  metrics_dir=metrics_dir,
+                                  transfer_dir=transfer_dir,
+                                  attention_dp=attention_dp)
+        assert not build_worker_diag(ctx_workers + gen_workers, server)
+        for worker in ctx_workers + gen_workers:
+            with open(worker.log_path) as log:
+                assert "Using KvCacheTransceiverV2" in log.read(
+                ), worker.log_path
+    except Exception:
+        print_first_fatal_log_context(
+            [*ctx_workers, *gen_workers, server],
+            patterns=_FATAL_LOG_PATTERNS +
+            ("Assertion `", "Assertion failed:", "CUDA error:"))
+        raise
+    finally:
+        terminate(*ctx_workers, *gen_workers, server)
+
+
+def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
+                              tmp_path, *, metrics_dir: str, transfer_dir: str,
+                              attention_dp: bool) -> set[str]:
+    """Apply the same accuracy and handoff gates to local or multinode workers."""
+    from defs.deepseek_v41_gsm8k import evaluate_gsm8k_server
+    from defs.deepseek_v41_serving import MAX_NUM_TOKENS, build_smoke_cases
+
+    seen_ids = set()
+    with (tmp_path / "requests.jsonl").open("w") as evidence:
+        for case in build_smoke_cases(tokenizer):
+            outputs = []
+            for streaming in (False, True):
+                text, usage = _deepseek_v41_completion(server_url, model_dir,
+                                                       case.prompt, streaming)
+                request_id = _deepseek_v41_handoff(metrics_dir,
+                                                   transfer_dir,
+                                                   seen_ids,
+                                                   attention_dp=attention_dp)
+                seen_ids.add(request_id)
+                evidence.write(
+                    json.dumps(
+                        dict(name=case.name,
+                             stream=streaming,
+                             text=text,
+                             usage=usage,
+                             disagg_request_id=request_id)) + "\n")
+                evidence.flush()
+                assert text.strip() == case.expected, (case.name, text)
+                assert usage["completion_tokens"] > 1, (case.name, usage)
+                if case.name == "long_recall":
+                    assert usage["prompt_tokens"] > 4096 > MAX_NUM_TOKENS, usage
+                outputs.append(text)
+            assert outputs[0] == outputs[1], (case.name, outputs)
+    evaluate_gsm8k_server(server_url, model_dir, tokenizer, tmp_path / "gsm8k")
+    return seen_ids
 
 
 @pytest.mark.timeout(12600)
@@ -2837,7 +3574,7 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
 def test_disaggregated_stress_test(disaggregated_test_root,
                                    disaggregated_example_root, llm_venv,
                                    test_config, input_tokens, output_tokens,
-                                   concurrency):
+                                   concurrency, output_dir):
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
@@ -2894,7 +3631,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              cancellation_rate=test_config.cancellation_rate,
                              cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+                             cwd=llm_venv.get_working_directory(),
+                             log_output_dir=output_dir)
 
 
 def run_cancel_stress_test(server_url: str,
@@ -3453,9 +4191,10 @@ async def _warmup_requests(server_url: str, profiles: list, count: int,
     The first request of each shape pays a one-time autotuner/compile cost
     (~20s host-steps observed on B200). Running those here, before the measured
     run, keeps them out of the accuracy/incomplete accounting and out of the
-    heartbeat-eviction path (a worker stuck in a 20s step misses the 2s cluster
-    heartbeat and gets evicted under a high-concurrency flood). Failures are
-    ignored — the only goal is to trigger the autotuner across the profile mix.
+    heartbeat-eviction path (a worker stuck in a 20s step exceeds even the 10s
+    PRODUCTION_CLUSTER_TIMINGS inactive timeout and gets evicted under a
+    high-concurrency flood). Failures are ignored — the only goal is to
+    trigger the autotuner across the profile mix.
     """
     import random
 
@@ -3521,16 +4260,17 @@ def run_disaggregated_mixed_stress(example_dir: str,
     if profiles is None:
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
-    cleanup_output_files()
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     setup_start = time.monotonic()
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
-                             save_log=True, startup_callback=startup_callback)
+                             save_log=True, startup_callback=startup_callback,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
     print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
           flush=True)
 
@@ -3547,9 +4287,10 @@ def run_disaggregated_mixed_stress(example_dir: str,
         # Pay the one-time autotuner cost before the measured run. The first
         # request of each shape triggers a ~20s autotuner host-step; left in
         # the measured run at high concurrency, a worker stuck in that step
-        # misses the 2s cluster heartbeat and is evicted mid-run, causing
-        # "Cluster is not ready" 500s. Default count = ~20s at the ~6 req/s
-        # observed in the 5k B200 run; results are discarded.
+        # exceeds even the 10s PRODUCTION_CLUSTER_TIMINGS inactive timeout
+        # and is evicted mid-run, causing "Cluster is not ready" 500s.
+        # Default count = ~20s at the ~6 req/s observed in the 5k B200 run;
+        # results are discarded.
         if warmup_request_count is None:
             warmup_request_count = 120
         print(
@@ -3675,9 +4416,9 @@ def run_disaggregated_cancel_test(example_dir,
                                   model_path=None,
                                   cwd=None):
     """Run disaggregated test with request cancellation stress test."""
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -3731,6 +4472,7 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
@@ -3756,11 +4498,8 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
-                         indirect=True)
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
-                                        disaggregated_example_root, llm_venv,
-                                        llama_model_root):
+                                        disaggregated_example_root, llm_venv):
     """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
 
     Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
@@ -3822,25 +4561,26 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         logprobs = [item.get("logprob") for item in content]
         return tokens, logprobs
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+    model_path = "Qwen3/Qwen3-8B"
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
-    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
+    config_file = get_test_config("qwen3_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
-                             model_name=llama_model_root,
+                             model_name=model_dir,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
-    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    model_name = model_path
     max_tokens = 20
     timeout = aiohttp.ClientTimeout(total=120)
     # Use emoji prompt to also stress-test multi-byte tokenizer handling
@@ -3871,14 +4611,19 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                         **base
                     }
 
-                # 1) Streaming vs non-streaming consistency check
-                async with session.post(url,
-                                        json=make_payload(prompt, False),
-                                        timeout=timeout) as resp:
-                    assert resp.status == 200, \
-                        f"[{api_type}] non-streaming: {await resp.text()}"
-                    ns_tokens, ns_logprobs = extract_logprobs(
-                        await resp.json(), api_type)
+                # 1) Streaming vs non-streaming consistency check.
+                # Block reuse is on, and a cold prefill is not bit-identical
+                # to a reused prefix. Issue the non-streaming request twice
+                # and keep the second result so both sides of the comparison
+                # hit the reuse path.
+                for _ in range(2):
+                    async with session.post(url,
+                                            json=make_payload(prompt, False),
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, \
+                            f"[{api_type}] non-streaming: {await resp.text()}"
+                        ns_tokens, ns_logprobs = extract_logprobs(
+                            await resp.json(), api_type)
 
                 async with session.post(url,
                                         json=make_payload(prompt, True),
@@ -3893,13 +4638,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 assert len(ns_logprobs) == len(st_logprobs), (
                     f"[{api_type}] logprobs length: "
                     f"{len(ns_logprobs)} vs {len(st_logprobs)}")
-                # Skip position 0: the first token logprob can diverge
-                # between streaming and non-streaming in disaggregated mode
-                # due to the context/generation handoff boundary.
                 comparable = 0
                 for i, (n, s) in enumerate(
                         zip(ns_logprobs, st_logprobs, strict=True)):
-                    if i == 0 or n is None or s is None:
+                    if n is None or s is None:
                         continue
                     comparable += 1
                     rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
@@ -3907,7 +4649,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
                 assert comparable > 0, (
-                    f"[{api_type}] no comparable post-handoff logprobs found")
+                    f"[{api_type}] no comparable logprobs found")
 
                 # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":
@@ -3957,29 +4699,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
 @pytest.mark.skip_less_device(8)
 @skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
 @pytest.mark.parametrize("model_path",
                          ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
 def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
@@ -3995,6 +4714,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,

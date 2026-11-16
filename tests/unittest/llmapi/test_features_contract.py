@@ -21,9 +21,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tensorrt_llm import lora_helper
+from tensorrt_llm._torch.peft.lora import config as lora_helper
 from tensorrt_llm.llmapi import llm_args
 from tensorrt_llm.usage import usage_lib
+
+pytestmark = pytest.mark.cpu_only
+
 
 _STABILITY_DIR = Path(__file__).resolve().parents[1] / "api_stability"
 _COMMITTED_YAML = _STABILITY_DIR / "references_committed" / "llm.yaml"
@@ -56,7 +59,6 @@ def _args(**kwargs):
         "speculative_config": None,
         "kv_cache_config": _KV_DEFAULT,
         "cuda_graph_config": None,
-        "extended_runtime_perf_knob_config": None,
         "enable_chunked_prefill": False,
         "parallel_config": llm_args._ParallelConfig(),
     }

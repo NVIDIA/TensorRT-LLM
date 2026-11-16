@@ -11,17 +11,15 @@ TensorRT engine. The LLM API treats the supplied prompt as the encoder input and
 automatically starts the decoder with the checkpoint's
 `decoder_start_token_id` or `bos_token_id`.
 
-This guide covers text-to-text generation with the following Hugging Face
-architectures:
+This guide covers text-to-text generation and speech-to-text transcription with
+the following Hugging Face architectures:
 
 | Hugging Face architecture | Model families and examples |
 | --- | --- |
 | `T5ForConditionalGeneration` | T5, Flan-T5, and ByT5, for example `google/flan-t5-small` |
 | `BartForConditionalGeneration` | BART checkpoints |
 | `MBartForConditionalGeneration` | mBART checkpoints |
-
-Whisper is not currently supported by the PyTorch encoder-decoder path. Support
-is in progress.
+| `WhisperForConditionalGeneration` | Whisper automatic speech recognition (ASR), for example `openai/whisper-large-v3` |
 
 mBART architecture loading is available. When a BART or mBART checkpoint
 defines `forced_bos_token_id`, the PyTorch backend seeds that token in the
@@ -29,6 +27,11 @@ decoder prefix. Source- and target-language selection remains
 checkpoint-specific, so validate the configured language tokens before
 deployment. Refer to [Understand BART and mBART decoder tokens](#understand-bart-and-mbart-decoder-tokens)
 for BOS, EOS, and output-limit behavior.
+
+Whisper consumes audio rather than a text prompt. The sections up to
+[Transcribe audio with Whisper](#transcribe-audio-with-whisper) describe the
+text-to-text models; the runtime configuration, KV cache manager, beam search,
+CUDA graph, and parallelism guidance in this guide applies to all architectures.
 
 ## Feature support
 
@@ -41,8 +44,8 @@ The following table describes the supported and recommended configurations.
 | Greedy decoding | Yes | Set `temperature=0.0`. |
 | Beam search | Yes with V1 | Configure `max_beam_width` when constructing `LLM`, then set `use_beam_search=True` in `SamplingParams`. |
 | Attention backend | `TRTLLM` | Use this backend for encoder-decoder models. It is required when `tensor_parallel_size > 1`. |
-| Decoder CUDA graphs | Yes | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. |
-| Encoder CUDA graphs | No | `EncodeCudaGraphConfig` is disabled for encoder-decoder models. The encoder runs eagerly. |
+| Decoder CUDA graphs | Yes, except in FP32 | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. FP32 encoder-decoder models decline capture at engine init and log a warning instead of failing. |
+| Encoder CUDA graphs | Yes | Set `encoder_cuda_graph_config=EncodeCudaGraphConfig(...)` and `encoder_max_batch_size`. Usually set `encoder_max_batch_size` lower than `max_batch_size`. The `TRTLLM` attention backend is required. Text encoders also require `num_tokens` and `seq_lens`; a fixed-shape feature encoder such as Whisper derives both from the model and needs only `batch_sizes`. |
 | Overlap scheduler | Yes | Enabled by default. V1 supports greedy decoding and beam search; V2 remains limited to `max_beam_width=1`. |
 | Tensor parallelism | Yes | Use `tensor_parallel_size > 1` with `attn_backend="TRTLLM"`. Attention head counts must be divisible by the TP size. |
 | Pipeline parallelism | No | Keep `pipeline_parallel_size=1`. |
@@ -201,6 +204,87 @@ The runtime does not inject `forced_eos_token_id` when a sequence reaches
 `max_tokens`. It preserves the model-selected final token and reports
 `finish_reason="length"`.
 
+## Transcribe audio with Whisper
+
+Whisper is an audio encoder-decoder model for speech transcription and
+translation. It differs from the text-to-text models in this guide in two ways:
+the encoder consumes audio instead of a text prompt, and the text prompt, when
+supplied, sets the decoder task prefix rather than the encoder input.
+
+Pass one audio clip per request through `multi_modal_data["audio"]`:
+
+```python
+import soundfile
+
+from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams, SchedulerConfig
+
+
+model = "openai/whisper-large-v3"
+wave, sample_rate = soundfile.read("utterance.wav")
+
+with LLM(
+    model=model,
+    backend="pytorch",
+    attn_backend="TRTLLM",
+    max_batch_size=4,
+    max_num_tokens=3000,
+    enable_chunked_prefill=False,
+    kv_cache_config=KvCacheConfig(
+        enable_block_reuse=False,
+        free_gpu_memory_fraction=0.8,
+        cross_kv_cache_fraction=0.5,
+    ),
+    scheduler_config=SchedulerConfig(use_python_scheduler=True),
+) as llm:
+    result = llm.generate(
+        {"prompt": "", "multi_modal_data": {"audio": [(wave, sample_rate)]}},
+        sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+        use_tqdm=False,
+    )
+    print(result.outputs[0].text)
+```
+
+Every Whisper request produces 1500 encoder positions (the checkpoint's
+`max_source_positions`) regardless of clip length, and the cross-KV pool is sized
+to hold them; `max_input_len` does not affect it. Leave `max_seq_len` unset, or
+set it to at least 1500, because the engine-level limit also covers the encoder
+pass; a smaller value is rejected at startup.
+
+Whisper automatically disables block reuse for both the decoder self-attention
+and cross-attention KV caches, even when `KvCacheConfig.enable_block_reuse=True`.
+Both caches depend on the audio features, which cannot be safely identified by
+decoder token IDs alone. The runtime logs this adjustment and updates
+`KvCacheConfig.enable_block_reuse` to reflect the effective setting.
+
+The audio item accepts a file path or URL, an `(array, sample_rate)` tuple, or a
+`{"array": ..., "sampling_rate": ...}` mapping. Supply exactly one clip per
+request, at the checkpoint's sampling rate, which is 16 kHz for the published
+Whisper checkpoints. Clips shorter than the 30-second window are zero-padded;
+longer clips and other sampling rates are rejected rather than silently
+truncated or resampled. Long-form chunked transcription is not part of this
+path.
+
+### Select the language and task
+
+An empty text prompt selects the checkpoint default, which is English
+transcription (`<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>`).
+A non-empty text prompt replaces that decoder prefix verbatim and is how you
+override the language or switch to translation. It must begin with
+`<|startoftranscript|>`:
+
+```python
+prompt = "<|startoftranscript|><|de|><|transcribe|><|notimestamps|>"
+result = llm.generate(
+    {"prompt": prompt, "multi_modal_data": {"audio": [(wave, sample_rate)]}},
+    sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+)
+```
+
+The prefix counts against the decoder position table, so `SamplingParams.max_tokens`
+is capped to the space remaining in it. A request asking for more logs a warning
+and proceeds with the capped budget. Pre-tokenized `prompt_token_ids` are not
+consumed on this path.
+
 ## Run a batch
 
 Pass a list of strings to batch inputs. The strings can have different tokenized
@@ -319,12 +403,12 @@ to return only the best hypothesis.
 Beam search expands decoder-side cache and compute requirements. Include this
 expansion when sizing the self-attention KV pool and CUDA graph batch sizes.
 
-## Enable decoder CUDA graphs
+## Enable encoder and decoder CUDA graphs
 
-Pass `CudaGraphConfig` to capture and replay decoder iterations:
+Configure the decoder and encoder graph grids separately:
 
 ```python
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, EncodeCudaGraphConfig
 
 
 llm = LLM(
@@ -332,10 +416,19 @@ llm = LLM(
     backend="pytorch",
     attn_backend="TRTLLM",
     max_batch_size=8,
+    encoder_max_batch_size=2,
+    encoder_max_num_tokens=2048,
     cuda_graph_config=CudaGraphConfig(
         max_batch_size=8,
         enable_padding=True,
     ),
+    encoder_cuda_graph_config=EncodeCudaGraphConfig(
+        batch_sizes=[1, 2],
+        num_tokens=[128, 256, 512, 1024, 2048],
+        seq_lens=[128, 256, 512, 1024],
+        enable_padding=True,
+    ),
+    enable_encoder_decoder_mixed_cuda_graph=True,
     kv_cache_config=KvCacheConfig(
         free_gpu_memory_fraction=0.8,
         cross_kv_cache_fraction=0.5,
@@ -343,14 +436,77 @@ llm = LLM(
 )
 ```
 
-This configuration captures decoder work only; the encoder continues to run
-eagerly. With beam search, graph batch sizes must cover the active decoder
-sequences after beam expansion. Padding lets nearby runtime batch sizes reuse a
-captured graph.
+`cuda_graph_config` controls decoder and mixed decoder graphs.
+`encoder_cuda_graph_config` controls encoder-forward graph buckets for batch
+size, total packed tokens, and maximum sequence length. The
+`encoder_max_batch_size` value is the hard encoder capacity and admission
+limit. With beam search, decoder graph batch sizes must cover the active
+decoder sequences after beam expansion.
 
-Do not use `EncodeCudaGraphConfig` for an encoder-decoder model. The runtime
-warns and disables it. Piecewise CUDA graphs through `TorchCompileConfig` are
-also unsupported for this model type.
+Which encoder buckets you must supply depends on the model. A text encoder,
+such as BART or T5, packs a variable number of tokens per request, so
+`num_tokens` and `seq_lens` are part of its key space and are required; leaving
+either unset is rejected at `LLM(...)` for any architecture TensorRT-LLM
+recognizes, and at model engine initialization otherwise, since only the loaded
+model states with certainty which kind of encoder it has. An encoder whose input is a
+fixed-shape per-request feature tensor, such as Whisper's fixed 30-second
+zero-padded audio waveform (the mel transform runs inside the encoder, so the
+per-request input is the waveform itself, not a spectrogram), produces the same
+number of encoder positions for every request, so both lists follow from the
+model and are derived rather than configured. For those models
+`batch_sizes` alone enables capture, and any `num_tokens` or `seq_lens` you set
+is ignored.
+
+Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
+encoder output length are dropped, and the encoder stays eager when none fit.
+Size the encoder token budget for the largest bucket before setting the
+buckets: Whisper emits 1500 encoder positions per request, so `batch_sizes` up
+to 8 needs `encoder_max_num_tokens` of at least 12000. `encoder_max_num_tokens`
+falls back to `max_num_tokens` when unset, which is a decoder-sized number and
+usually too small.
+
+```python
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+
+
+llm = LLM(
+    model="openai/whisper-large-v3",
+    backend="pytorch",
+    attn_backend="TRTLLM",
+    max_batch_size=8,
+    encoder_max_batch_size=8,
+    # 8 buckets * 1500 encoder positions. Leave this at the default and the
+    # 4 and 8 buckets are silently dropped.
+    encoder_max_num_tokens=12000,
+    encoder_cuda_graph_config=EncodeCudaGraphConfig(batch_sizes=[1, 2, 4, 8]),
+    # ... the remaining Whisper settings from "Transcribe audio with Whisper",
+    # whose `max_batch_size=4` this example raises to 8
+)
+```
+
+`max_batch_size` controls the total decoder concurrency, while
+`encoder_max_batch_size` controls encoder microbatch admission. One encoder
+step runs at most `encoder_max_batch_size` requests and `encoder_max_num_tokens`
+encoder tokens; admitted encoder requests beyond either limit wait for later
+encoder steps, oldest first, so limits set too low reduce encoder throughput. A
+request whose encoder tokens alone exceed `encoder_max_num_tokens` is rejected
+at admission instead. For better
+performance, tune `encoder_max_batch_size`, `encoder_max_num_tokens`, and the
+encoder CUDA graph buckets together for the production workload. Start with
+`encoder_max_batch_size` smaller than `max_batch_size`, such as 2 versus 8,
+then adjust the limits and capture buckets based on benchmark results.
+
+`enable_encoder_decoder_mixed_cuda_graph` is primarily a performance option. It
+reduces CPU launch overhead for decoder iterations that mix newly admitted
+context requests with ongoing generation requests. The option defaults to
+`True`, but becomes effective only when the encoder and decoder graph
+configurations produce usable capture shapes. Set it to `False` to disable
+mixed graphs while retaining the separate encoder and decoder CUDA graphs.
+
+Passing `EncodeCudaGraphConfig` through `cuda_graph_config` remains unsupported
+for encoder-decoder models; pass it through `encoder_cuda_graph_config`
+instead. Piecewise CUDA graphs through `TorchCompileConfig` are also
+unsupported for this model type.
 
 ## Control the overlap scheduler
 
@@ -413,10 +569,22 @@ attn_backend: TRTLLM
 dtype: bfloat16
 disable_overlap_scheduler: false
 enable_chunked_prefill: false
+max_batch_size: 8
+encoder_max_batch_size: 2
+encoder_max_num_tokens: 1024
 max_beam_width: 1
 max_input_len: 512
 max_num_tokens: 2048
 max_seq_len: 512
+cuda_graph_config:
+  max_batch_size: 8
+  enable_padding: true
+encoder_cuda_graph_config:
+  batch_sizes: [1, 2]
+  num_tokens: [128, 256, 512, 1024]
+  seq_lens: [128, 256, 512]
+  enable_padding: true
+enable_encoder_decoder_mixed_cuda_graph: true
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
@@ -431,7 +599,6 @@ Start the server:
 ```bash
 trtllm-serve google/flan-t5-small \
     --backend pytorch \
-    --max_batch_size 4 \
     --config enc-dec-config.yaml
 ```
 
@@ -471,68 +638,36 @@ Use these guidelines as a starting point:
 - Set `max_seq_len` to at least the larger of the maximum encoder input length
   and maximum decoded sequence length. The current encoder-decoder runtime uses
   this value while sizing both phases.
-- Set `max_num_tokens` high enough for all encoder tokens admitted together and
-  for the active decoder tokens. This is especially important for mixed-length
-  batches.
-- Increase `max_batch_size` for more concurrent requests. Beam width multiplies
-  the number of active decoder sequences but not the number of source requests.
+- Set `max_num_tokens` high enough for the active decoder tokens.
+- Set `encoder_max_num_tokens` high enough for all encoder tokens in one
+  encoder microbatch. This is especially important for mixed-length batches.
+- Increase `max_batch_size` for more concurrent requests. Start with a smaller
+  `encoder_max_batch_size`, such as 2 when `max_batch_size=8`, to bound encoder
+  memory and admission cost without reducing decoder concurrency. Beam width
+  multiplies the number of active decoder sequences but not the number of
+  source requests.
 - Tune `free_gpu_memory_fraction` first, then tune
   `cross_kv_cache_fraction` based on whether the cross-attention or
   self-attention pool is exhausted.
 
 ## Performance
 
-The following benchmarks compare the PyTorch backend with the legacy TensorRT
-encoder-decoder path for large-batch inference. The measurements use BF16 on
-one H100 80 GB GPU with greedy decoding, an output limit of 128 tokens, and
-mixed encoder input lengths from 260 to 440 tokens. The Flan-T5-XL results are
-the average of ten timed runs after three warmup runs. The BART results are the
-average of 20 timed runs after five warmup runs. Executed-token throughput
-includes the terminal EOS token when a sequence emits it.
+Configure encoder, decoder, and mixed decoder CUDA graphs for the expected
+serving workload. With representative capture buckets, the PyTorch backend can
+outperform the legacy TensorRT encoder-decoder path while avoiding the engine
+build and checkpoint conversion steps.
 
-The PyTorch configuration uses the `TRTLLM` attention backend, the overlap
-scheduler, the Python scheduler, decoder CUDA graphs with padding, KV cache
-manager V1, `max_input_len=512`, `max_seq_len=1024`, and
-`max_num_tokens=65536`. Block reuse and chunked prefill are disabled. The KV
-cache uses `free_gpu_memory_fraction=0.3` and
-`cross_kv_cache_fraction=0.5`.
+For example, a BF16 FLAN-T5 Large serving benchmark on one H100 80 GB GPU used
+encoder CUDA graphs, padded decoder CUDA graphs, and mixed encoder-decoder CUDA
+graphs. Compared with the legacy TensorRT path, the PyTorch backend delivered
+65.8%, 12.6%, and 11.8% higher request throughput at concurrencies 8, 32, and
+64, respectively. P99 latency was 51.6%, 31.0%, and 33.5% lower.
 
-The legacy TensorRT configuration uses separate BF16 encoder and decoder
-engines built for batch size 128 and beam width 1. The encoder supports 512
-input tokens and 65,536 tokens per iteration; the decoder supports a sequence
-length of 129. The benchmark runs these engines through `ModelRunnerCpp` with
-greedy `top_k=1` decoding and the same KV cache fractions. For BART, the legacy
-TensorRT benchmark starts the decoder with token IDs `[2, 0]` and generates at
-most 127 more tokens. The PyTorch LLM API applies the same decoder prefix
-internally and counts token ID 0 as the first output token; customers do not
-need to provide the decoder prefix. Both paths use token ID 2 as EOS and stop
-when the model generates it naturally. If a sequence reaches the output limit,
-it retains the model-selected final token and reports a length stop instead of
-forcing EOS. This setup also lets beam search begin after the shared decoder
-prefix without a per-step Python logits processor.
-
-### Flan-T5-XL
-
-For Flan-T5-XL, the PyTorch backend performs on par with the legacy TensorRT
-path, with slightly lower latency and higher executed-token throughput across
-the tested batch sizes.
-
-| Batch size | Legacy TensorRT latency | PyTorch latency | PyTorch latency improvement over legacy TensorRT | Legacy TensorRT executed tokens/s | PyTorch executed tokens/s |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 727.6 ms | 706.1 ms | 3.0% | 3,153 | 3,312 |
-| 64 | 1,225.0 ms | 1,136.7 ms | 7.2% | 3,863 | 4,184 |
-| 128 | 2,056.8 ms | 1,999.3 ms | 2.8% | 4,601 | 4,768 |
-
-### BART-large-CNN
-
-For BART-large-CNN, the PyTorch backend has 21.9% to 36.0% higher latency than
-the legacy TensorRT path across the tested batch sizes.
-
-| Batch size | Legacy TensorRT latency | PyTorch latency | PyTorch latency difference | Legacy TensorRT executed tokens/s | PyTorch executed tokens/s |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 229.9 ms | 280.2 ms | 21.9% slower | 12,611 | 10,662 |
-| 64 | 252.2 ms | 343.0 ms | 36.0% slower | 22,007 | 16,209 |
-| 128 | 352.3 ms | 472.7 ms | 34.2% slower | 31,544 | 23,518 |
+Follow [Enable encoder and decoder CUDA graphs](#enable-encoder-and-decoder-cuda-graphs)
+and choose capture buckets that cover the batch sizes, packed encoder token
+counts, and sequence lengths expected in production. Capture grids that omit
+common runtime shapes fall back to eager execution and can lose these
+performance benefits.
 
 Performance depends on the model, request distribution, decoding settings, and
 GPU configuration. Benchmark with a representative workload before deployment.
@@ -566,11 +701,19 @@ Check all of the following:
 - `pipeline_parallel_size=1` and `context_parallel_size=1`.
 - `enable_attention_dp=False`.
 
-### CUDA graphs do not capture the encoder
+### Encoder CUDA graphs fall back to eager execution
 
-This is expected. `CudaGraphConfig` accelerates decoder iterations only. The
-encoder path runs eagerly, and `EncodeCudaGraphConfig` is disabled for
-encoder-decoder models.
+Check that `encoder_cuda_graph_config` and `encoder_max_batch_size` are set,
+that the encoder graph buckets cover the request shape, and that
+`attn_backend="TRTLLM"`. Unsupported shapes and attention backends fall back to
+eager encoder execution.
+
+### `num_tokens` or `seq_lens` unset is rejected at engine construction
+
+A text encoder needs both bucket lists, so the engine raises rather than
+silently running eager. Supply them, or drop `encoder_cuda_graph_config` if you
+do not want encoder graphs. A fixed-shape feature encoder such as Whisper does
+not hit this: it derives both from the model and needs only `batch_sizes`.
 
 ### Output quality differs from the Hugging Face example
 

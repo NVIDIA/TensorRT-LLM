@@ -1,42 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+import contextlib
 import inspect
+import os
 from dataclasses import replace
-from typing import Dict, Generic, List, Optional, Tuple
+from typing import ClassVar, Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import (MoeLoadBalancerConfigType,
+                                          auto_moe_backend_for_load_balancer)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ...functional import PositionEmbeddingType, RotaryScalingType
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
+from ...functional import PositionEmbeddingType
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
+from ..model_config import ModelConfig, MoESelection, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
-from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
-from ..modules.mla import MLA
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
-
-try:
-    from ..custom_ops import \
-        flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
-except ImportError:
-    _flashinfer_rope = None
+from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
-from ..utils import AuxStreamType
+from ..speculative.interface import SpeculativeDecodingMode
+from ..utils import AuxStreamType, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
-                             get_model_architecture, register_auto_model)
+                             apply_layerwise_quant_config,
+                             apply_quant_config_exclude_modules,
+                             get_model_architecture,
+                             get_registered_draft_model_builder,
+                             register_auto_model, register_draft_model)
+
+_SPECULATIVE_POSITION_HEADROOM = "_speculative_position_headroom"
 
 
 def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
@@ -51,12 +63,536 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     config.draft_vocab_size = config.vocab_size
 
 
+def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
+                                   target_config: ModelConfig) -> None:
+    """Inherit the target KV dtype unless the model requests a draft override."""
+    algo = target_config.quant_config.kv_cache_quant_algo
+    override = target_config.extra_attrs.get(
+        "draft_kv_cache_quant_algo_override")
+    if override is not None:
+        algo = QuantAlgo(override)
+    draft_config.quant_config.kv_cache_quant_algo = algo
+    if override is not None and draft_config.quant_config_dict is not None:
+        for layer_quant_config in draft_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = algo
+
+
+def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
+    """Build an independent quantization scope for replacement MTP weights."""
+    from .checkpoints.auto_mapper import AutoCheckpointMapper
+
+    checkpoint_dir = str(model_config.spec_config.speculative_model)
+    architecture = model_config.pretrained_config.architectures[0]
+    quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+    quant_config, layer_configs = QuantConfig(), None
+    if os.path.isfile(quant_path):
+        # Parsed for the selection the heads' MTP layers make, with AUTO
+        # hinted by architecture as ModelConfig.from_pretrained hints it.
+        moe_kwargs = _draft_loader_moe_kwargs(
+            model_config,
+            _draft_moe_selection(model_config,
+                                 model_config.spec_config,
+                                 load_balancer=model_config.moe_load_balancer))
+        moe_kwargs["moe_backend"] = ModelConfig.resolve_moe_backend(
+            moe_kwargs["moe_backend"], architecture)
+        quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
+            quant_path, checkpoint_dir, architecture=architecture, **moe_kwargs)
+
+    mapper = AutoCheckpointMapper.get(CheckpointFormat.HF, architecture)
+    start_layer_idx = model_config.pretrained_config.num_hidden_layers
+    if layer_configs is not None:
+        normalized = {}
+        for name, config in layer_configs.items():
+            if name != "lm_head" and not name.startswith("mtp."):
+                continue
+            candidates = [name]
+            if name.endswith((".q_proj", ".k_proj", ".v_proj")):
+                candidates.append(name.rsplit(".", 1)[0] + ".qkv_proj")
+            if any(
+                    quant_config.is_module_excluded_from_quantization(candidate)
+                    for candidate in candidates):
+                raise ValueError(
+                    f"Replacement quantization exclusion conflicts with {name}")
+            mapped_name = mapper.map_mtp_module_name(name, start_layer_idx)
+            if mapped_name.startswith("mtp."):
+                raise ValueError(
+                    f"{type(mapper).__name__} does not map replacement MTP "
+                    f"quantization for {name}")
+            normalized[mapped_name] = config
+        layer_configs = normalized
+    if quant_config.exclude_modules is not None:
+        quant_config.exclude_modules = [
+            mapper.map_mtp_module_name(name, start_layer_idx)
+            for name in quant_config.exclude_modules
+        ]
+
+    draft_config = replace(model_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_configs,
+                           skip_create_weights_in_init=True)
+    draft_config.extra_attrs = model_config.extra_attrs
+    _set_draft_kv_cache_quant_algo(draft_config, model_config)
+    for config in (draft_config.quant_config_dict or {}).values():
+        config.kv_cache_quant_algo = draft_config.quant_config.kv_cache_quant_algo
+    return draft_config
+
+
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
                              num_tokens: int) -> Optional[torch.Tensor]:
     """Slice speculative position IDs along the token dimension."""
     if position_ids is None:
         return None
     return position_ids[..., :num_tokens]
+
+
+# ---------------------------------------------------------------------------
+# DSpark draft-network heads, shared by both drafters that implement DSpark:
+# the DFlash path (modeling_dflash.py, standalone Kimi K3 style drafters) and
+# the DeepSeek-V4-Pro path (modeling_dspark.py, mtp.* stages inside the target
+# checkpoint). DFlash is the degenerate case -- DSpark with the Markov and
+# confidence heads switched off -- so the math below is the *only* copy; the
+# two drafters differ solely in how they store the weights and whether their
+# draft lm_head is TP vocab-sharded.
+#
+# Ported from DeepSeek's DeepSpec reference implementation
+# (https://github.com/deepseek-ai/DeepSpec, MIT License).
+# ---------------------------------------------------------------------------
+
+
+def greedy_or_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Argmax for temperature<=0, else temperature-scaled multinomial.
+
+    Args:
+        logits: ``[..., vocab]``.
+    Returns:
+        token ids with the trailing vocab dim reduced.
+    """
+    if temperature <= 0.0:
+        return logits.argmax(dim=-1)
+    probs = torch.softmax(logits.float() / temperature, dim=-1)
+    flat = probs.reshape(-1, probs.shape[-1])
+    sampled = torch.multinomial(flat, num_samples=1).squeeze(-1)
+    return sampled.view(probs.shape[:-1])
+
+
+def markov_prev_embeddings(prev_tokens: torch.Tensor,
+                           markov_w1: torch.Tensor) -> torch.Tensor:
+    """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
+
+    The anchor is the last accepted token, which on the one-model rejection path
+    comes from ``trtllm::chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1``. Mask like modules/embedding.py does, so such a
+    position contributes no bias instead of tripping a device assert.
+
+    Args:
+        prev_tokens: previous token ids (draft vocab), any shape.
+        markov_w1: [vocab, rank].
+    Returns:
+        ``prev_tokens.shape + (rank,)`` in ``markov_w1``'s dtype.
+    """
+    prev_tokens, invalid = get_masked_input_and_mask(prev_tokens.long(), 0,
+                                                     markov_w1.shape[0])
+    return F.embedding(prev_tokens, markov_w1).masked_fill(invalid, 0)
+
+
+def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
+                            markov_w2: torch.Tensor) -> torch.Tensor:
+    """Vanilla Markov head logit bias for one intra-block draft step.
+
+    Reference: DeepSpec ``VanillaMarkov`` (deepspec/modeling/dspark/
+    markov_head.py): ``bias = markov_w2(markov_w1(prev_token))`` where
+    markov_w1 is nn.Embedding(vocab, rank) and markov_w2 is
+    nn.Linear(rank, vocab, bias=False). With both weights stored
+    [vocab, rank] this is ``markov_w1[prev] @ markov_w2.T``.
+
+    Args:
+        prev_tokens: [B] long, previous token per request (draft vocab).
+        markov_w1: [vocab, rank].
+        markov_w2: [vocab_or_shard, rank] (rows may be a TP vocab shard).
+    Returns:
+        [B, vocab_or_shard] bias in the markov weights' dtype.
+    """
+    return F.linear(markov_prev_embeddings(prev_tokens, markov_w1), markov_w2)
+
+
+def dspark_markov_chain(
+    base_logits: torch.Tensor,
+    first_prev_tokens: torch.Tensor,
+    step_bias_fn,
+    *,
+    hidden_states: Optional[torch.Tensor] = None,
+    next_token_fn=None,
+    cast_bias_to_logits: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The intra-block Markov refinement loop, shared by every DSpark head.
+
+    Reference: DeepSpec ``VanillaMarkov.sample_block_tokens``. For step i,
+    ``logits_i += bias(prev_i)`` with ``prev_0`` = the anchor token (the last
+    accepted token, block slot 0) and ``prev_{i>0}`` = the token drawn from
+    step i-1's *biased* logits. llama.cpp PR #25173 implements the same chain.
+
+    The chain being sequential is load-bearing and is NOT derivable from a
+    checkpoint: published DSpark drafters ship only the training-time
+    ``apply_block_logits``, which biases the whole block in one teacher-forced
+    pass. SGLang ``srt/models/dspark.py:34-64 run_markov_block`` settles it --
+    it steps the same way, feeding back the token drawn from the biased logits.
+
+    Two callers drive this, and a change here has to satisfy both: the embedded
+    flavour chains it inside the model, which owns its sampler, while the
+    standalone flavour is driven from the worker through ``next_token_fn`` so
+    the chain can advance on a TP-gathered global argmax the model cannot
+    compute on its own.
+
+    Args:
+        base_logits: [B, K, vocab_or_shard] shared-lm_head logits.
+        first_prev_tokens: [B] long, anchor token ids (draft vocab).
+        step_bias_fn: ``(prev_tokens [B], step_hidden or None) -> bias``. A
+            closure, so a stateful head (RNN) can carry its recurrent state
+            across positions without a second loop.
+        hidden_states: [B, K, d] fed to ``step_bias_fn`` one position at a
+            time; None for the memoryless heads.
+        next_token_fn: ``([B, vocab_or_shard]) -> [B]`` token ids in the FULL
+            draft vocab; defaults to a plain argmax. Drafters whose draft
+            logits are TP vocab-sharded pass a shard-aware argmax here.
+        cast_bias_to_logits: cast the bias down to ``base_logits.dtype``
+            before adding. The DFlash drafter does; the V4-Pro drafter does
+            not (its Markov weights and its logits already agree), and adding
+            the cast there would silently narrow its accumulation dtype.
+    Returns:
+        sampled_tokens [B, K], corrected_logits [B, K, vocab_or_shard].
+        Greedy per-position argmax of the corrected logits reproduces the
+        reference sampled chain exactly.
+    """
+    batch_size, block_size = base_logits.shape[:2]
+    if block_size == 0:
+        empty = torch.empty(batch_size,
+                            0,
+                            dtype=torch.long,
+                            device=base_logits.device)
+        return empty, base_logits
+    sampled, corrected = [], []
+    prev = first_prev_tokens.long()
+    for k in range(block_size):
+        step_hidden = None if hidden_states is None else hidden_states[:, k]
+        bias = step_bias_fn(prev, step_hidden)
+        if cast_bias_to_logits:
+            bias = bias.to(base_logits.dtype)
+        step_logits = base_logits[:, k] + bias
+        corrected.append(step_logits.unsqueeze(1))
+        if next_token_fn is None:
+            prev = torch.argmax(step_logits, dim=-1)
+        else:
+            prev = next_token_fn(step_logits).long()
+        sampled.append(prev)
+    return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
+
+
+class VanillaMarkov(nn.Module):
+    """Low-rank token-bigram logit bias: ``bias = W2(W1[token])``."""
+
+    markov_head_type = "vanilla"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        assert self.markov_rank > 0, (
+            f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}.")
+        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank,
+                                   self.vocab_size,
+                                   bias=False)
+
+    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return markov_prev_embeddings(token_ids, self.markov_w1.weight)
+
+    def project_bias(self,
+                     latent_states: torch.Tensor,
+                     *,
+                     vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        w2 = self.markov_w2.weight
+        if vocab_slice is not None:
+            w2 = w2[vocab_slice]
+        return F.linear(latent_states, w2)
+
+    def compute_step_bias(self,
+                          token_ids: torch.Tensor,
+                          hidden_states: Optional[torch.Tensor],
+                          *,
+                          vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        del hidden_states
+        w2 = self.markov_w2.weight
+        if vocab_slice is not None:
+            w2 = w2[vocab_slice]
+        return dspark_markov_step_bias(token_ids.long(), self.markov_w1.weight,
+                                       w2)
+
+    def apply_step_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        return logits + self.compute_step_bias(token_ids, hidden_states)
+
+    def sample_block_tokens(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        temperature: float = 0.0,
+        vocab_slice: Optional[slice] = None,
+        next_token_fn=None,
+        cast_bias_to_logits: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressive block sampling with the (memoryless) Markov bias.
+
+        Args:
+            base_logits: ``[batch, block_size, vocab]`` from backbone+lm_head.
+            first_prev_token_ids: ``[batch]`` token preceding the 1st position.
+            hidden_states: ``[batch, block_size, d]`` (unused by vanilla).
+            vocab_slice / next_token_fn / cast_bias_to_logits: see
+                :func:`dspark_markov_chain`; only the TP vocab-sharded DFlash
+                drafter sets them.
+        Returns:
+            sampled_tokens ``[batch, block_size]``,
+            corrected_logits ``[batch, block_size, vocab]``.
+        """
+
+        def _step_bias(prev_tokens, step_hidden):
+            return self.compute_step_bias(prev_tokens,
+                                          step_hidden,
+                                          vocab_slice=vocab_slice)
+
+        def _sample_step(step_logits):
+            return greedy_or_sample(step_logits, temperature)
+
+        return dspark_markov_chain(
+            base_logits,
+            first_prev_token_ids,
+            _step_bias,
+            hidden_states=hidden_states,
+            next_token_fn=_sample_step
+            if next_token_fn is None else next_token_fn,
+            cast_bias_to_logits=cast_bias_to_logits,
+        )
+
+
+class GatedMarkovHead(VanillaMarkov):
+    """Markov bias gated by a sigmoid of [hidden, prev_embedding]."""
+
+    markov_head_type = "gated"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
+
+    def compute_step_bias(self,
+                          token_ids: torch.Tensor,
+                          hidden_states: Optional[torch.Tensor],
+                          *,
+                          vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        assert hidden_states is not None
+        prev_emb = self.get_prev_embeddings(token_ids)
+        gate = torch.sigmoid(
+            self.gate_proj(torch.cat([hidden_states, prev_emb],
+                                     dim=-1))).to(dtype=prev_emb.dtype)
+        return self.project_bias(gate * prev_emb, vocab_slice=vocab_slice)
+
+
+class RNNHead(VanillaMarkov):
+    """GRU-style head carrying recurrent state across block positions."""
+
+    markov_head_type = "rnn"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.hidden_size = int(hidden_size)
+        # [s_{k-1}; W1[x_{k-1}]; h_k] -> [gate; candidate; output]
+        self.joint_proj = nn.Linear(2 * markov_rank + hidden_size,
+                                    3 * markov_rank)
+
+    def _rnn_step(self,
+                  state,
+                  prev_embeddings,
+                  hidden_states,
+                  *,
+                  vocab_slice: Optional[slice] = None):
+        z = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
+        gate_raw, cand_raw, out_raw = self.joint_proj(z).chunk(3, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        candidate = torch.tanh(cand_raw)
+        new_state = gate * state + (1.0 - gate) * candidate
+        bias = self.project_bias(torch.tanh(out_raw), vocab_slice=vocab_slice)
+        return new_state, bias
+
+    def sample_block_tokens(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        temperature: float = 0.0,
+        vocab_slice: Optional[slice] = None,
+        next_token_fn=None,
+        cast_bias_to_logits: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert hidden_states is not None
+        state = torch.zeros(base_logits.shape[0],
+                            self.markov_rank,
+                            device=base_logits.device,
+                            dtype=hidden_states.dtype)
+
+        def _step_bias(prev_tokens, step_hidden):
+            nonlocal state
+            prev_emb = self.get_prev_embeddings(prev_tokens)
+            state, bias = self._rnn_step(state,
+                                         prev_emb,
+                                         step_hidden,
+                                         vocab_slice=vocab_slice)
+            return bias
+
+        def _sample_step(step_logits):
+            return greedy_or_sample(step_logits, temperature)
+
+        return dspark_markov_chain(
+            base_logits,
+            first_prev_token_ids,
+            _step_bias,
+            hidden_states=hidden_states,
+            next_token_fn=_sample_step
+            if next_token_fn is None else next_token_fn,
+            cast_bias_to_logits=cast_bias_to_logits,
+        )
+
+
+def build_markov_head(*, markov_head_type: str, vocab_size: int,
+                      markov_rank: int,
+                      hidden_size: int) -> Optional[nn.Module]:
+    """Factory mirroring DeepSpec ``build_markov_head``; None if rank==0."""
+    if int(markov_rank) <= 0:
+        return None
+    kind = str(markov_head_type).lower()
+    if kind == "vanilla":
+        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+    if kind == "gated":
+        return GatedMarkovHead(vocab_size=vocab_size,
+                               markov_rank=markov_rank,
+                               hidden_size=hidden_size)
+    if kind == "rnn":
+        return RNNHead(vocab_size=vocab_size,
+                       markov_rank=markov_rank,
+                       hidden_size=hidden_size)
+    raise ValueError(f"Unsupported markov_head_type: {markov_head_type!r}")
+
+
+class DSparkConfidenceHead(nn.Module):
+    """Per-position acceptance-confidence predictor.
+
+    Emits one raw logit per position. :meth:`apply_sts` converts logits to
+    calibrated conditional acceptance probabilities.
+    """
+
+    def __init__(self,
+                 *,
+                 hidden_size: int,
+                 markov_rank: int = 0,
+                 with_markov: bool = False,
+                 bias: bool = False,
+                 block_size: int = 0):
+        super().__init__()
+        self.with_markov = bool(with_markov)
+        input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
+        self.proj = nn.Linear(input_dim,
+                              1,
+                              bias=bool(bias),
+                              dtype=torch.float32)
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                prev_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw, uncalibrated logits with shape ``[..., block]``."""
+        if self.with_markov:
+            assert prev_embeddings is not None
+            features = torch.cat(
+                [hidden_states,
+                 prev_embeddings.to(hidden_states.dtype)],
+                dim=-1)
+        else:
+            features = hidden_states
+        # fp32 matmul for a stable confidence score (mirrors the reference).
+        return self.proj(features.float()).squeeze(-1)
+
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Convert raw logits to calibrated acceptance probabilities."""
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
+
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """Return a lazily materialized CPU mirror of the STS table."""
+        cached = self._sts_temperatures_host
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
+
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """Update the fixed-address STS table in place."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device,
+                                           dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
+        self._sts_temperatures_host = None
+
+    def load_weights(self, weights: list) -> None:
+        """Load every confidence-head checkpoint parameter strictly."""
+        (module_weights, ) = weights
+        self._validate_checkpoint_weights(module_weights)
+        for name, param in self.named_parameters():
+            param.data.copy_(module_weights[name][:])
+
+    def _validate_checkpoint_weights(
+            self, module_weights: dict[str, torch.Tensor]) -> None:
+        """Validate a head namespace before generic embedded parameter loading."""
+        expected = dict(self.named_parameters())
+        unexpected = [key for key in module_weights if key not in expected]
+        missing = [key for key in expected if key not in module_weights]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                "DSparkConfidenceHead(bias=True); silently dropping it would bias every score."
+            )
+        if missing:
+            raise ValueError(
+                f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
+            )
+        for name, param in expected.items():
+            actual_shape = tuple(module_weights[name].shape)
+            if actual_shape != tuple(param.shape):
+                raise ValueError(
+                    f"DSpark confidence head checkpoint {name} has shape {actual_shape}; "
+                    f"expected {tuple(param.shape)}")
 
 
 class Eagle3Attention(Attention):
@@ -122,7 +658,8 @@ class Eagle3MLAttention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         next_layer_regular: bool = False,
     ):
         config = model_config.pretrained_config
@@ -152,7 +689,7 @@ class Eagle3MLAttention(MLA):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
         )
 
         # Override the kv_a_proj_with_mqa projection for first layer.
@@ -200,7 +737,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3MLAttention(
                 model_config,
                 layer_idx,
-                aux_stream=aux_stream,
+                aux_stream_dict={AuxStreamType.Attention: aux_stream},
                 next_layer_regular=self._next_layer_regular,
             )
         else:
@@ -248,7 +785,10 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """With ``pick_rows`` the attention runs on every input row and the
+        rest of the layer on ``pick_rows`` only."""
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -261,6 +801,9 @@ class Eagle3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
         )
+        if pick_rows is not None:
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -361,6 +904,10 @@ class Eagle3DraftModel(DecoderModel):
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
             )
+        # forward takes ``pick_rows`` (see speculative.interface.
+        # draft_layer_picks_rows) with one decoder layer: a later layer's
+        # attention would need every row.
+        self.supports_pick_rows = self.num_layers == 1
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -417,7 +964,16 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``pick_rows`` (single decoder layer only, see
+        ``supports_pick_rows``): the layer's attention runs on every input row,
+        everything after it on ``pick_rows`` only, so both outputs have
+        ``len(pick_rows)`` rows."""
+        # The worker passes pick_rows only when supports_pick_rows: a second
+        # decoder layer's attention would need every row.
+        assert pick_rows is None or self.supports_pick_rows, (
+            "pick_rows needs a single draft decoder layer")
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so
@@ -465,6 +1021,7 @@ class Eagle3DraftModel(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
+                    pick_rows=pick_rows,
                 )
 
             hidden_states, hidden_states_to_save = self.norm(
@@ -790,6 +1347,9 @@ class PARDForCausalLM(nn.Module):
         draft_config_no_spec = replace(draft_config,
                                        spec_config=None,
                                        lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -841,805 +1401,6 @@ class PARDForCausalLM(nn.Module):
         return hidden_states_out, hidden_states_out
 
 
-class DFlashForCausalLM(nn.Module):
-    """Draft model wrapper for DFlash speculative decoding.
-
-    DFlash uses cross-attention where Q comes from noise/query tokens and K/V
-    come from the concatenation of target hidden states and noise hidden states.
-    The target_hidden stays CONSTANT across all layers (no input_layernorm applied).
-
-    Reference: https://arxiv.org/pdf/2602.06036
-    """
-
-    def __init__(self, draft_config):
-        """Build the draft model, resolving its architecture from the draft config
-        (falling back to a model_type-derived name when the checkpoint uses a
-        custom DFlash architecture label)."""
-        super().__init__()
-
-        pretrained_cfg = draft_config.pretrained_config
-        try:
-            DraftModelClass, _ = get_model_architecture(pretrained_cfg)
-        except RuntimeError:
-            model_type = pretrained_cfg.model_type
-            arch_name = "".join(w.capitalize()
-                                for w in model_type.split("_")) + "ForCausalLM"
-            logger.info(
-                f"DFlash: architecture {pretrained_cfg.architectures} not found, "
-                f"falling back to {arch_name} based on model_type={model_type}")
-            original_archs = pretrained_cfg.architectures
-            try:
-                pretrained_cfg.architectures = [arch_name]
-                DraftModelClass, _ = get_model_architecture(pretrained_cfg)
-            finally:
-                pretrained_cfg.architectures = original_archs
-
-        # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config,
-                                       spec_config=None,
-                                       lm_head_gather_output=False)
-
-        # Weights will be loaded later by ModelLoader.load_draft_weights()
-        self.draft_model_full = DraftModelClass(draft_config_no_spec)
-        self.model = self.draft_model_full.model
-        self.lm_head = self.draft_model_full.lm_head
-
-        # Required by weight mappers
-        self.model_config = draft_config_no_spec
-        self.config = draft_config_no_spec.pretrained_config
-
-        # Get mask_token_id from dflash_config
-        pretrained_config = draft_config.pretrained_config
-        dflash_config = getattr(pretrained_config, 'dflash_config', {})
-        self.mask_token_id = dflash_config.get(
-            'mask_token_id',
-            getattr(pretrained_config, 'mask_token_id',
-                    pretrained_config.vocab_size))
-
-        self.target_layer_ids = dflash_config.get('target_layer_ids', None)
-        self.block_size = getattr(pretrained_config, 'block_size', None)
-        logger.info(
-            f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
-            f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}"
-        )
-
-        self.logits_processor = None  # Set by caller after construction
-
-        # RoPE - lazily initialized from draft model's attention module
-        self._rope_initialized = False
-        self._rotary_cos_sin = None
-        self._is_neox = True
-
-        self._cos_sin_cache_fp32 = None
-        self._rope_dummy_q = None
-
-        # Lazy-built after weights load (see _build_fused_kv_buffers).
-        self._fused_kv_weight = None
-        self._fused_kv_bias = None
-        self._k_norm_stacked = None
-        self._k_norm_eps = None
-        self._num_attn_layers = 0
-        self._head_dim = 0
-        self._num_kv_heads = 0
-        self._has_qk_norm = False
-        self._use_fused_qk_norm_rope = False
-        # Laguna-specific draft-layer behaviors, disabled by default so generic
-        # DFlash drafters keep the original contract (no context input_layernorm,
-        # non-causal block attention). Subclasses opt in.
-        self._context_input_layernorm = False
-        self._sliding_layers_causal = False
-
-    def _init_rope(self):
-        """Initialize RoPE from the draft model's attention configuration.
-
-        Reuses the existing RotaryEmbedding infrastructure which correctly
-        handles all RoPE variants (standard, YaRN, scaled, etc.).
-        """
-        # RoPE is read from layer 0; guard that the drafter is single-layer-type
-        # (the target uses per-layer-type RoPE, the drafter does not).
-        layer_types = getattr(self.config, 'layer_types', None)
-        if layer_types is not None and len(set(layer_types)) > 1:
-            raise ValueError(
-                "DFlash _init_rope() reads RoPE from layer 0 only, but the drafter "
-                f"has heterogeneous layer_types {sorted(set(layer_types))}; per-layer "
-                "RoPE resolution is required for this checkpoint.")
-        attn0 = self.model.layers[0].self_attn
-
-        if attn0.rotary_emb is not None:
-            self._rotary_cos_sin = attn0.rotary_emb.rotary_cos_sin
-            self._is_neox = attn0.rotary_emb.is_neox
-        elif attn0.pos_embd_params is not None:
-            rope_emb = RotaryEmbedding(
-                attn0.pos_embd_params.rope,
-                head_dim=attn0.head_dim,
-                is_neox=attn0.pos_embd_params.is_neox,
-            )
-            self._rotary_cos_sin = rope_emb.rotary_cos_sin
-            self._is_neox = rope_emb.is_neox
-        else:
-            # Fallback: basic NeoX-style RoPE
-            config = self.config
-            head_dim = getattr(config, 'head_dim',
-                               config.hidden_size // config.num_attention_heads)
-            rope_theta = getattr(config, 'rope_theta', 1000000.0)
-            max_pos = getattr(config, 'max_position_embeddings', 32768)
-
-            inv_freq = 1.0 / (rope_theta**(torch.arange(
-                0, head_dim, 2, dtype=torch.float32, device='cuda') / head_dim))
-            positions = torch.arange(max_pos,
-                                     dtype=torch.float32,
-                                     device='cuda')
-            freqs = torch.outer(positions, inv_freq)
-            rope_cos = freqs.cos().to(config.torch_dtype)
-            rope_sin = freqs.sin().to(config.torch_dtype)
-            # [max_pos, 2, rot_dim//2] to match RotaryEmbedding format
-            self._rotary_cos_sin = torch.stack([rope_cos, rope_sin], dim=1)
-            self._is_neox = True
-
-        self._rope_initialized = True
-
-    def project_target_hidden(self,
-                              hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project captured target hidden states into the draft hidden space.
-
-        Generic DFlash: fc then hidden_norm. Subclasses (e.g. Laguna) may
-        normalize the per-aux features first by overriding this method.
-        """
-        hidden_states = hidden_states.to(self.fc.weight.dtype)
-        return self.hidden_norm(self.fc(hidden_states))
-
-    def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads,
-                             head_dim):
-        """Hook applied to the block-attention output before o_proj.
-
-        No-op for generic DFlash; overridden by drafters that gate (e.g. Laguna).
-        """
-        return attn_output
-
-    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
-        """Load weights into the DFlash draft model.
-
-        DFlash checkpoints differ from standard HF format:
-        - Layer weights lack the 'model.' prefix (e.g., 'layers.0...' not 'model.layers.0...')
-        - Extra DFlash-specific weights: 'fc.weight', 'hidden_norm.weight'
-        - Missing embed_tokens and lm_head (shared with target model)
-        """
-        # Laguna DFlash checkpoints may ship a fused self_attn.qkv_proj; the draft
-        # loader expects split q/k/v (a fused key is silently dropped otherwise).
-        if any(k.endswith('self_attn.qkv_proj.weight') for k in weights):
-            for attr in ('num_attention_heads_per_layer',
-                         'num_key_value_heads_per_layer'):
-                per_layer = getattr(self.config, attr, None)
-                if per_layer is not None and len(set(per_layer)) > 1:
-                    raise ValueError(
-                        "DFlash load_weights() splits the fused qkv_proj using "
-                        "the global head count, but the drafter has heterogeneous "
-                        f"{attr} {sorted(set(per_layer))}; per-layer qkv splitting "
-                        "is required for this checkpoint.")
-            head_dim = getattr(
-                self.config, 'head_dim',
-                self.config.hidden_size // self.config.num_attention_heads)
-            num_kv_heads = getattr(self.config, 'num_key_value_heads',
-                                   self.config.num_attention_heads)
-            q = self.config.num_attention_heads * head_dim
-            kv = num_kv_heads * head_dim
-            split = {}
-            for k, v in weights.items():
-                if k.endswith('self_attn.qkv_proj.weight'):
-                    b = k[:-len('qkv_proj.weight')]
-                    split[b + 'q_proj.weight'] = v[:q]
-                    split[b + 'k_proj.weight'] = v[q:q + kv]
-                    split[b + 'v_proj.weight'] = v[q + kv:]
-                else:
-                    split[k] = v
-            weights = split
-
-        # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
-        remapped = {}
-        for key, value in weights.items():
-            if key in ('fc.weight', 'hidden_norm.weight'):
-                # DFlash-specific projection weights - store directly
-                remapped[key] = value
-            elif key == 'norm.weight':
-                remapped['model.norm.weight'] = value
-            elif not key.startswith('model.'):
-                remapped[f'model.{key}'] = value
-            else:
-                remapped[key] = value
-
-        # Load DFlash-specific weights directly
-        if 'fc.weight' in remapped:
-            self.fc = nn.Linear(remapped['fc.weight'].shape[1],
-                                remapped['fc.weight'].shape[0],
-                                bias=False,
-                                device='cuda',
-                                dtype=remapped['fc.weight'].dtype)
-            self.fc.weight.data.copy_(remapped['fc.weight'])
-            del remapped['fc.weight']
-
-        if 'hidden_norm.weight' in remapped:
-            rms_norm_eps = getattr(self.config, 'rms_norm_eps', 1e-6)
-            self.hidden_norm = nn.RMSNorm(
-                remapped['hidden_norm.weight'].shape[0],
-                eps=rms_norm_eps,
-                device='cuda',
-                elementwise_affine=True,
-                dtype=remapped['hidden_norm.weight'].dtype)
-            self.hidden_norm.weight.data.copy_(remapped['hidden_norm.weight'])
-            del remapped['hidden_norm.weight']
-
-        # Load remaining weights into the draft model.
-        # DFlash checkpoints don't include embed_tokens or lm_head, so allow partial loading
-        # since those modules won't find matching weights.
-        self.draft_model_full.load_weights(weights=remapped,
-                                           weight_mapper=weight_mapper,
-                                           allow_partial_loading=True)
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        """Share embed_tokens and lm_head from the target model."""
-        self.draft_model_full.model.embed_tokens = target_model.model.embed_tokens
-        self.draft_model_full.lm_head = target_model.lm_head
-        self.lm_head = target_model.lm_head
-
-    def precompute_context_kv(
-        self,
-        projected_hidden: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-norm / post-RoPE K and V for ALL drafter layers in one fused GEMM.
-
-        Args:
-            projected_hidden: [N, hidden_size], already fc + hidden_norm'd.
-            positions:        [N] int32/64, RoPE positions for each entry.
-        Returns:
-            k: [N, L, nkv, hd]  post k_norm and RoPE
-            v: [N, L, nkv, hd]  post split only
-        """
-        if self._fused_kv_weight is None:
-            self._build_fused_kv_buffers()
-        N = projected_hidden.shape[0]
-        L = self._num_attn_layers
-        nkv = self._num_kv_heads
-        hd = self._head_dim
-        weight_dtype = self._fused_kv_weight.dtype
-        if getattr(self, '_input_ln_eps', None) is not None:
-            ph = projected_hidden.float()
-            ph = ph * torch.rsqrt(
-                ph.pow(2).mean(-1, keepdim=True) + self._input_ln_eps)
-            projected_hidden = ph.to(weight_dtype)
-        elif projected_hidden.dtype != weight_dtype:
-            projected_hidden = projected_hidden.to(weight_dtype)
-
-        kv_flat = F.linear(projected_hidden, self._fused_kv_weight,
-                           self._fused_kv_bias)
-        # Per-layer layout [L0_K|L0_V|L1_K|L1_V|...] keeps K and V contiguous
-        # after the select() splits — no extra copy required.
-        kv = kv_flat.view(N, L, 2, nkv, hd)
-        k = kv[:, :, 0].contiguous()
-        v = kv[:, :, 1].contiguous()
-
-        if self._k_norm_stacked is not None:
-            # Fuse L per-layer RMSNorms into one. k is [N, L, nkv, hd];
-            # each layer has its own weight ([L, hd]) but shares eps.
-            k = F.rms_norm(k, (hd, ), eps=self._k_norm_eps)
-            k = k * self._k_norm_stacked.view(1, L, 1, hd)
-
-        self._fused_rope_inplace(k.view(N * L, nkv * hd), positions, N, L)
-        return k, v
-
-    def _get_cos_sin_cache(self) -> torch.Tensor:
-        """Return the flashinfer-style cos/sin cache for the drafter.
-
-        Shape [max_positions, head_dim], fp32 — flashinfer's
-        apply_rope_with_cos_sin_cache_inplace requires fp32 regardless of
-        the query/key dtype.
-        """
-        if self._cos_sin_cache_fp32 is not None:
-            return self._cos_sin_cache_fp32
-        if not self._rope_initialized:
-            self._init_rope()
-        max_pos = self._rotary_cos_sin.shape[0]
-        self._cos_sin_cache_fp32 = self._rotary_cos_sin.view(max_pos, -1).to(
-            torch.float32).contiguous()
-        return self._cos_sin_cache_fp32
-
-    def _fused_rope_inplace(
-        self,
-        k_flat: torch.Tensor,
-        positions: torch.Tensor,
-        N: int,
-        L: int,
-    ) -> None:
-        """In-place fused RoPE over [N*L, nkv*hd] K values.
-
-        Layout of k_flat: row (i*L + l) holds layer l of position i, so
-        positions must be repeat_interleaved by L to match.
-        """
-        positions_int32 = positions.view(-1).to(torch.int32)
-        if L > 1:
-            positions_int32 = positions_int32.repeat_interleave(L)
-
-        if _flashinfer_rope is not None:
-            # flashinfer requires a non-None query tensor; pass a single-head
-            # scratch so the extra rotate is negligible.
-            need_rows = k_flat.shape[0]
-            dummy_q = self._rope_dummy_q
-            if (dummy_q is None or dummy_q.dtype != k_flat.dtype
-                    or dummy_q.shape[0] < need_rows):
-                dummy_q = k_flat.new_empty(need_rows, self._head_dim)
-                self._rope_dummy_q = dummy_q
-            _flashinfer_rope(
-                positions_int32,
-                dummy_q[:need_rows],
-                k_flat,
-                self._head_dim,
-                self._get_cos_sin_cache(),
-                self._is_neox,
-            )
-            return
-
-        # Pure-PyTorch fallback (older environments without flashinfer).
-        cos, sin = self._get_rope_cos_sin(positions_int32.view(1, -1),
-                                          dtype=k_flat.dtype)
-        k_roped = RotaryEmbedding.apply_rotary_pos_emb(
-            k_flat.view(k_flat.shape[0], -1, self._head_dim),
-            cos.squeeze(0),
-            sin.squeeze(0),
-            unsqueeze_dim=1,
-            is_neox=self._is_neox,
-        )
-        k_flat.copy_(k_roped.view_as(k_flat))
-
-    def _build_fused_kv_buffers(self) -> None:
-        """Stack per-layer KV projection + k_norm weights for a single fused GEMM.
-
-        Must run after weights are loaded.
-        """
-        if self._fused_kv_weight is not None:
-            return
-        layers_attn = [layer.self_attn for layer in self.model.layers]
-        attn0 = layers_attn[0]
-        q_size = attn0.q_size
-        kv_size = attn0.kv_size
-        head_dim = attn0.head_dim
-        num_heads = attn0.num_heads
-        num_kv_heads = attn0.num_key_value_heads
-        # Head counts are read from layer 0 here and in dflash_forward; assert
-        # uniformity (the target uses per-layer heads, the drafter does not).
-        for a in layers_attn[1:]:
-            assert (
-                a.q_size == q_size and a.kv_size == kv_size
-                and a.head_dim == head_dim and a.num_heads == num_heads
-                and a.num_key_value_heads == num_kv_heads), (
-                    "DFlash fused KV requires all drafter layers to share "
-                    "q_size / kv_size / head_dim / num_heads / num_kv_heads.")
-
-        has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
-        assert all(has_k_norm) or not any(has_k_norm), (
-            "DFlash fused KV requires either all or no drafter layers to have k_norm."
-        )
-
-        kv_weights = [
-            a.qkv_proj.weight[q_size:q_size + 2 * kv_size] for a in layers_attn
-        ]
-        # Fold each drafter layer's input_layernorm weight into its KV projection
-        # so context K/V match the query path. vLLM laguna_dflash applies
-        # layer.input_layernorm to context states before KV; RMSNorm gives
-        # (x_hat * w) @ Wkv.T == x_hat @ (Wkv * w).T, and the shared 1/rms(x) is
-        # applied to projected_hidden in precompute_context_kv.
-        dlayers = self.model.layers
-        if self._context_input_layernorm and all(
-                hasattr(dl, 'input_layernorm') for dl in dlayers):
-            eps_set = {
-                getattr(dl.input_layernorm, 'variance_epsilon',
-                        getattr(self.config, 'rms_norm_eps', 1e-6))
-                for dl in dlayers
-            }
-            assert len(eps_set) == 1, (
-                "DFlash fused context input_layernorm needs all drafter layers "
-                f"to share variance_epsilon; got {sorted(eps_set)}")
-            self._input_ln_eps = eps_set.pop()
-            folded = []
-            for w, dl in zip(kv_weights, dlayers):
-                scale = dl.input_layernorm.weight.data
-                if getattr(dl.input_layernorm, 'use_gemma', False):
-                    scale = scale + 1
-                folded.append(w * scale[None, :].to(w.dtype))
-            kv_weights = folded
-        else:
-            self._input_ln_eps = None
-        fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
-        if attn0.qkv_proj.bias is not None:
-            kv_biases = [
-                a.qkv_proj.bias[q_size:q_size + 2 * kv_size]
-                for a in layers_attn
-            ]
-            self._fused_kv_bias = torch.cat(kv_biases, dim=0).contiguous()
-        else:
-            self._fused_kv_bias = None
-
-        if all(has_k_norm):
-            k_norm0 = layers_attn[0].k_norm
-            eps = k_norm0.variance_epsilon
-            eps_set = {a.k_norm.variance_epsilon for a in layers_attn}
-            assert len(eps_set) == 1, (
-                f"DFlash fused k_norm requires all drafter layers to share "
-                f"variance_epsilon; got {sorted(eps_set)}.")
-            self._k_norm_stacked = torch.stack(
-                [a.k_norm.weight.data for a in layers_attn])
-            self._k_norm_eps = eps
-        else:
-            self._k_norm_stacked = None
-            self._k_norm_eps = None
-        self._num_attn_layers = len(layers_attn)
-        self._head_dim = head_dim
-        self._num_kv_heads = num_kv_heads
-        self._fused_kv_weight = fused_kv_weight
-
-        # fused_qk_norm_rope derives YaRN / partial-rotary frequencies on
-        # the fly, which can disagree with precompute_context_kv's cached
-        # cos/sin. Only enable it when the drafter uses plain RoPE.
-        self._has_qk_norm = (all(has_k_norm)
-                             and all(hasattr(a, 'q_norm') for a in layers_attn))
-        rope_params = getattr(getattr(attn0, 'pos_embd_params', None), 'rope',
-                              None)
-        scale_type = getattr(rope_params, 'scale_type', None)
-        partial_rotary_factor = getattr(
-            getattr(attn0, 'pretrained_config', None), 'partial_rotary_factor',
-            1.0)
-        self._use_fused_qk_norm_rope = (self._has_qk_norm
-                                        and hasattr(attn0, 'apply_qk_norm_rope')
-                                        and rope_params is not None
-                                        and scale_type
-                                        in (None, RotaryScalingType.none)
-                                        and partial_rotary_factor == 1.0)
-
-        logger.debug(
-            f"DFlash: fused KV weights built for {self._num_attn_layers} layers "
-            f"(fused_kv_weight shape={tuple(self._fused_kv_weight.shape)})")
-
-    def _get_rope_cos_sin(self, positions, dtype=None):
-        """Get cos/sin for given positions, suitable for apply_rotary_pos_emb.
-
-        Args:
-            positions: [B, seq_len]
-            dtype: target dtype for cos/sin (default: keep original)
-        Returns:
-            rope_cos: [B, seq, rot_dim//2] (broadcastable with unsqueeze_dim=1)
-            rope_sin: [B, seq, rot_dim//2]
-        """
-        if not self._rope_initialized:
-            self._init_rope()
-
-        # rotary_cos_sin: [max_pos, 2, rot_dim//2]
-        rope_cache = self._rotary_cos_sin[positions]  # [B, seq, 2, rot_dim//2]
-        rope_cos = rope_cache[..., 0, :]  # [B, seq, rot_dim//2]
-        rope_sin = rope_cache[..., 1, :]
-        if dtype is not None:
-            rope_cos = rope_cos.to(dtype)
-            rope_sin = rope_sin.to(dtype)
-        return rope_cos, rope_sin
-
-    def dflash_forward(
-        self,
-        noise_embedding: torch.Tensor,
-        query_positions: torch.Tensor,
-        num_ctx_per_req: torch.Tensor,
-        ctx_k_cache: torch.Tensor,
-        ctx_v_cache: torch.Tensor,
-        ctx_cache_batch_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        """DFlash draft forward with cross-attention over a pooled K/V buffer.
-
-        All shapes are fixed so the forward is CUDA-graph compatible.
-
-        Args:
-            noise_embedding: [B, block_size, hidden_size]
-            query_positions: [B, block_size]
-            num_ctx_per_req: [B] — per-batch context length in the pool
-            ctx_k_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
-            ctx_v_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
-            ctx_cache_batch_idx: [B] — slot index into the pool per batch entry
-        Returns:
-            [B * block_size, hidden_size]
-        """
-        from flash_attn import flash_attn_with_kvcache
-
-        if self._fused_kv_weight is None:
-            self._build_fused_kv_buffers()
-
-        layer0 = self.model.layers[0]
-        attn0 = layer0.self_attn
-        q_size = attn0.q_size
-        kv_size = attn0.kv_size
-        head_dim = attn0.head_dim
-        # Uniformity across layers is asserted in _build_fused_kv_buffers (above).
-        num_heads_per_rank = attn0.num_heads
-        num_kv_heads_per_rank = attn0.num_key_value_heads
-
-        has_qk_norm = self._has_qk_norm
-        is_bf16 = noise_embedding.dtype == torch.bfloat16
-        use_fused_qk_norm_rope = self._use_fused_qk_norm_rope and is_bf16
-        use_fused_rope = (_flashinfer_rope is not None and has_qk_norm
-                          and is_bf16 and not use_fused_qk_norm_rope)
-
-        B = noise_embedding.shape[0]
-        block_size = noise_embedding.shape[1]
-
-        hidden_states = noise_embedding  # [B, block_size, hidden]
-
-        # Precompute RoPE cos/sin for the pure-PyTorch fallback path only.
-        # The fused flashinfer path reads self._get_cos_sin_cache() inline.
-        rope_dtype = hidden_states.dtype
-        if not use_fused_rope:
-            q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions,
-                                                            dtype=rope_dtype)
-        _rope = RotaryEmbedding.apply_rotary_pos_emb
-
-        # cache_seqlens (BEFORE append). flash_attn appends block_size
-        # k/v at cache_seqlens[i]..+block_size for batch i.
-        cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
-        cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
-
-        # Flatten query positions once for the fused QK-norm-RoPE kernel.
-        query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
-
-        residual = None
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            attn_mod = layer.self_attn
-
-            # Apply input_layernorm (flatten to 2D for norm, reshape back)
-            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-            if residual is None:
-                residual = hidden_states.clone()
-                hs_normed_flat = layer.input_layernorm(hs_flat)
-            else:
-                res_flat = residual.reshape(-1, residual.shape[-1])
-                hs_normed_flat, res_flat = layer.input_layernorm(
-                    hs_flat, res_flat)
-                residual = res_flat.reshape(B, block_size, -1)
-
-            # QKV projection on normed query tokens (2D)
-            qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
-
-            if use_fused_qk_norm_rope:
-                # One kernel does q_norm + k_norm + RoPE in-place on qkv.
-                # Only safe when the drafter's rope params don't use YaRN /
-                # long-rope / partial-rotary — otherwise fall back to the
-                # shared-cache path below.
-                attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
-                q_all_2d = qkv_query[:, :q_size]
-                k_noise_2d = qkv_query[:, q_size:q_size + kv_size]
-                v_noise_2d = qkv_query[:, q_size + kv_size:]
-                Q_bshd = q_all_2d.reshape(B, block_size, num_heads_per_rank,
-                                          head_dim)
-                k_noise_bshd = k_noise_2d.reshape(B, block_size,
-                                                  num_kv_heads_per_rank,
-                                                  head_dim)
-                v_noise_bshd = v_noise_2d.reshape(B, block_size,
-                                                  num_kv_heads_per_rank,
-                                                  head_dim)
-            elif use_fused_rope:
-                # Per-head RMSNorm on q/k (returns new contiguous tensors),
-                # then flashinfer in-place RoPE sharing the same cos/sin cache
-                # as precompute_context_kv.
-                q = attn_mod.q_norm(qkv_query[:, :q_size].reshape(
-                    -1, head_dim)).view(-1, q_size)
-                k = attn_mod.k_norm(qkv_query[:,
-                                              q_size:q_size + kv_size].reshape(
-                                                  -1,
-                                                  head_dim)).view(-1, kv_size)
-                _flashinfer_rope(
-                    query_positions_flat_i32,
-                    q,
-                    k,
-                    head_dim,
-                    self._get_cos_sin_cache(),
-                    self._is_neox,
-                )
-                Q_bshd = q.view(B, block_size, num_heads_per_rank, head_dim)
-                k_noise_bshd = k.view(B, block_size, num_kv_heads_per_rank,
-                                      head_dim)
-                v_noise_bshd = qkv_query[:, q_size + kv_size:].reshape(
-                    B, block_size, num_kv_heads_per_rank, head_dim)
-            else:
-                qkv_query_3d = qkv_query.reshape(B, block_size, -1)
-                q_all = qkv_query_3d[..., :q_size]
-                k_noise_all = qkv_query_3d[..., q_size:q_size + kv_size]
-                v_noise_all = qkv_query_3d[..., q_size + kv_size:]
-                if has_qk_norm:
-                    q_for_rope = attn_mod.q_norm(q_all.reshape(
-                        -1, head_dim)).reshape(B, block_size, q_size)
-                    k_noise_for_rope = attn_mod.k_norm(
-                        k_noise_all.reshape(-1, head_dim)).reshape(
-                            B, block_size, kv_size)
-                else:
-                    q_for_rope = q_all
-                    k_noise_for_rope = k_noise_all
-                Q = _rope(q_for_rope.reshape(B, block_size, num_heads_per_rank,
-                                             head_dim).transpose(1, 2),
-                          q_rope_cos,
-                          q_rope_sin,
-                          unsqueeze_dim=1,
-                          is_neox=self._is_neox)
-                k_noise_rope = _rope(k_noise_for_rope.reshape(
-                    B, block_size, num_kv_heads_per_rank,
-                    head_dim).transpose(1, 2),
-                                     q_rope_cos,
-                                     q_rope_sin,
-                                     unsqueeze_dim=1,
-                                     is_neox=self._is_neox)
-                Q_bshd = Q.transpose(1, 2)
-                k_noise_bshd = k_noise_rope.transpose(1, 2)
-                v_noise_bshd = v_noise_all.reshape(B, block_size,
-                                                   num_kv_heads_per_rank,
-                                                   head_dim)
-
-            # Per-layer view into the pooled ctx cache.
-            # [pool_batch, max_ctx+block, nkv, hd]; flash_attn dereferences
-            # each batch via cache_batch_idx, no gather.
-            layer_k_cache = ctx_k_cache[:, layer_idx]
-            layer_v_cache = ctx_v_cache[:, layer_idx]
-
-            # flash_attn appends k_noise/v_noise in-place at
-            # cache_seqlens[i]..+block_size for each batch i.
-            # DFlash sliding-attention draft layers use causal block attention;
-            # full-attention layers stay non-causal. Matches the vLLM reference,
-            # which overrides sliding_attention layers to causal metadata (the
-            # window itself is disabled; context K/V sit at absolute slots).
-            layer_types = getattr(self.config, 'layer_types', None)
-            causal = (self._sliding_layers_causal and bool(layer_types)
-                      and layer_types[layer_idx] == 'sliding_attention')
-            out = flash_attn_with_kvcache(
-                q=Q_bshd,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                k=k_noise_bshd,
-                v=v_noise_bshd,
-                cache_seqlens=cache_seqlens_i32,
-                cache_batch_idx=cache_batch_idx_i32,
-                causal=causal,
-            )
-            attn_output = out.reshape(B * block_size, q_size)
-
-            # Per-drafter post-attention gate (no-op for generic DFlash; Laguna
-            # applies per-head softplus g_proj gating). gate input is the
-            # input_layernorm output (the attention input).
-            attn_output = self._post_attention_gate(attn_output, hs_normed_flat,
-                                                    attn_mod,
-                                                    num_heads_per_rank,
-                                                    head_dim)
-
-            # o_proj (flat 2D, handles all-reduce internally)
-            hidden_out = attn_mod.o_proj(attn_output)
-
-            # Post-attention layernorm + MLP (flat 2D)
-            res_flat = residual.reshape(-1, residual.shape[-1])
-            hidden_out, res_flat = layer.post_attention_layernorm(
-                hidden_out, res_flat)
-            hidden_out = layer.mlp(hidden_out)
-
-            hidden_states = hidden_out.reshape(B, block_size, -1)
-            residual = res_flat.reshape(B, block_size, -1)
-
-        # Final norm
-        hidden_states_out, _ = self.model.norm(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            residual.reshape(-1, residual.shape[-1]))
-        return hidden_states_out
-
-    def forward(
-        self,
-        attn_metadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        return_context_logits: bool = False,
-        spec_metadata=None,
-        hidden_states: torch.Tensor | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the draft model and return (hidden_states, hidden_states) for the
-        speculative-decoding contract."""
-        hidden_states_out = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-
-        return hidden_states_out, hidden_states_out
-
-
-class DFlashLagunaForCausalLM(DFlashForCausalLM):
-    """Laguna DFlash drafter.
-
-    The generic block decode lives in DFlashForCausalLM; this subclass supplies
-    the Laguna draft-layer specifics: per-head g_proj softplus gating and the
-    per-aux fc_norm applied to captured target features before fc.
-    """
-
-    @staticmethod
-    def _normalize_config(config: PretrainedConfig) -> None:
-        """Fill TRT-LLM Laguna defaults missing from dense DFlash drafts."""
-        if getattr(config, "num_experts", None) is None:
-            config.num_experts = 0
-        if getattr(config, "mlp_layer_types", None) is None:
-            config.mlp_layer_types = ["dense"] * config.num_hidden_layers
-        if getattr(config, "block_size", None) is None:
-            dflash_config = getattr(config, "dflash_config", {})
-            if isinstance(dflash_config, dict):
-                config.block_size = dflash_config.get("block_size", None)
-
-    def __init__(self, draft_config):
-        """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
-        (context input_layernorm, causal sliding blocks); reject non-per-head
-        gating."""
-        # The checkpoint labels itself with the vLLM name (model_type "llama");
-        # remap to the Laguna architecture so TRT-LLM builds the Laguna layers.
-        draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
-        self._normalize_config(draft_config.pretrained_config)
-        super().__init__(draft_config)
-        self._context_input_layernorm = True
-        self._sliding_layers_causal = True
-        gating = getattr(self.config, 'gating', True)
-        if gating not in (True, 'per-head'):
-            raise NotImplementedError(
-                f"Laguna DFlash drafter supports per-head gating only, "
-                f"got gating={gating!r}")
-
-    def load_weights(self, weights, weight_mapper=None, **kwargs):
-        """Build the per-aux ``fc_norm`` from the drafter's ``aux_hidden_norms.*``
-        weights, then defer the remaining weights to the base loader."""
-        aux_keys = sorted(
-            (k for k in weights if k.startswith('aux_hidden_norms.')),
-            key=lambda k: int(k.split('.')[1]))
-        if not aux_keys:
-            raise ValueError(
-                "Laguna DFlash checkpoint is missing aux_hidden_norms.* weights"
-            )
-        weights = dict(weights)
-        eps = getattr(self.config, 'rms_norm_eps', 1e-6)
-        norms = []
-        for k in aux_keys:
-            w = weights.pop(k)
-            norm = nn.RMSNorm(w.shape[0],
-                              eps=eps,
-                              device='cuda',
-                              elementwise_affine=True,
-                              dtype=w.dtype)
-            norm.weight.data.copy_(w)
-            norms.append(norm)
-        self.fc_norm = nn.ModuleList(norms)
-        super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
-
-    def project_target_hidden(self, hidden_states):
-        """Project captured target features to the draft width: apply the per-aux
-        ``fc_norm`` to each hidden chunk, then ``fc`` + ``hidden_norm``."""
-        hidden_states = hidden_states.to(self.fc.weight.dtype)
-        fc_norm = getattr(self, 'fc_norm', None)
-        if fc_norm is not None:
-            chunks = hidden_states.chunk(len(fc_norm), dim=-1)
-            hidden_states = torch.cat(
-                [norm(chunk) for norm, chunk in zip(fc_norm, chunks)], dim=-1)
-        return self.hidden_norm(self.fc(hidden_states))
-
-    def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads,
-                             head_dim):
-        """Apply Laguna's per-head softplus output gate (``g_proj``) to the
-        attention output; a no-op when the layer has no ``g_proj``."""
-        g_proj = getattr(attn_mod, 'g_proj', None)
-        if g_proj is None:
-            return attn_output
-        gate = F.softplus(g_proj(gate_input).float()).to(attn_output.dtype)
-        return (attn_output.unflatten(-1, (num_heads, head_dim)) *
-                gate.unsqueeze(-1)).flatten(-2)
-
-
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -1648,12 +1409,26 @@ class MTPForCausalLM(nn.Module):
         start_layer_idx: int = 0,
         lm_head: nn.Module = None,
         model: nn.Module = None,
-    ):
+    ) -> None:
         super().__init__()
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
+        self.start_layer_idx = start_layer_idx
+        spec_config = model_config.spec_config
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
+        lm_head_quant_config = None
+        # Whether the MTP layer's forward takes the draft loop's deferred
+        # ``kv_lens_increment``.
+        folds_kv_lens_increment = False
+        # A target model that owns its MTP layer class (a Modeling V2
+        # target, for example) names it, and the drafter builds that class
+        # instead of the built-in one registered for the model type.
+        owned_mtp_layer = getattr(model, "mtp_layer_cls", None)
         match model_type:
+            case _ if owned_mtp_layer is not None:
+                mtp_layer = owned_mtp_layer
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
@@ -1669,24 +1444,54 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+                folds_kv_lens_increment = True
+            case "qwen4_exp_text":
+                from .modeling_qwen4_exp import Qwen4ExpMTP
+                mtp_layer = Qwen4ExpMTP
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
             case "deepseek_v4":
                 from .modeling_deepseekv4 import DeepseekV4MTP
                 mtp_layer = DeepseekV4MTP
+            case "glm5_next" | "glm5_next_text":
+                from .modeling_glm5_next import Glm5NextMTP
+                mtp_layer = Glm5NextMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
-        spec_dec_mode = model_config.spec_config.spec_dec_mode
+        # Optional layer capabilities: whether its forward takes pass 0's
+        # ``kept_rows``, and whether the target's recurrent-state promotion
+        # may run beside the draft loop.
+        takes_kept_rows = getattr(mtp_layer, "takes_kept_rows",
+                                  lambda _: False)(model_config)
+        promotes_target_state_beside = getattr(mtp_layer,
+                                               "promotes_target_state_beside",
+                                               lambda _: False)(model_config)
+
+        if (spec_config.uses_replacement_heads
+                and getattr(mtp_layer, "uses_shared_lm_head", True)):
+            if model_config.quant_config_dict is not None:
+                lm_head_quant_config = model_config.quant_config_dict.get(
+                    "lm_head")
+            elif (model_config.quant_config.quant_algo is not None
+                  and DecoderModelForCausalLM._checkpoint_has_lm_head_scale(
+                      model_config,
+                      checkpoint_dir=str(spec_config.speculative_model))):
+                lm_head_quant_config = model_config.quant_config
+            if model_config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head"):
+                lm_head_quant_config = None
+
+        spec_dec_mode = spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
         checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
-            mtp_repeat_count = model_config.spec_config.max_draft_len
+            mtp_repeat_count = spec_config.max_draft_len
         else:
-            mtp_num_layers = min(model_config.spec_config.max_draft_len,
+            mtp_num_layers = min(spec_config.max_draft_len,
                                  checkpoint_mtp_num_layers)
             mtp_repeat_count = 1
 
@@ -1697,247 +1502,628 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
-        self.lm_head = lm_head
+        self.folds_kv_lens_increment = folds_kv_lens_increment
+        self.takes_kept_rows = takes_kept_rows
+        self.promotes_target_state_beside = promotes_target_state_beside
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
+        self.owns_lm_head = lm_head_quant_config is not None
+        if self.owns_lm_head:
+            if getattr(model_config.pretrained_config, "tie_word_embeddings",
+                       False):
+                raise ValueError(
+                    "A quantized replacement MTP head cannot tie embeddings")
+            if (model_config.mapping.enable_attention_dp
+                    and model_config.mapping.enable_lm_head_tp_in_adp):
+                raise ValueError("Quantized replacement MTP LM heads require "
+                                 "enable_lm_head_tp_in_adp=False")
+            self.lm_head = LMHead(
+                model_config.pretrained_config.vocab_size,
+                model_config.pretrained_config.hidden_size,
+                dtype=model_config.pretrained_config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=model_config.lm_head_gather_output,
+                reduce_output=False,
+                use_custom_cublas_mm=getattr(lm_head, "use_custom_cublas_mm",
+                                             False),
+                quant_config=lm_head_quant_config,
+            )
+        else:
+            self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        for name, module in self.named_modules():
+            if name.startswith("mtp_layers."):
+                _, layer_idx, *suffix = name.split(".")
+                prefix = f"model.layers.{self.start_layer_idx + int(layer_idx)}"
+                yield ".".join([prefix, *suffix]), module
+            elif self.owns_lm_head and (name == "lm_head"
+                                        or name.startswith("lm_head.")):
+                yield name, module
 
-class MTPDraftModel(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
-        super().__init__()
-        # Import here to avoid circular import
-        model_type = model_config.pretrained_config.model_type
-        if model_type == "glm4_moe":
-            from .modeling_glm import Glm4MTP
-            mtp_layer = Glm4MTP(model_config,
-                                layer_idx,
-                                aux_stream_dict,
-                                is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
-            from .modeling_deepseekv3 import DeepseekV3MTP
-            mtp_layer = DeepseekV3MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
-        elif model_type in ["exaone_moe"]:
-            from .modeling_exaone_moe import ExaoneMoeMTP
-            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-        else:
-            raise ValueError(
-                f"MTPDraftModel does not support model_type: {model_type}")
-        setattr(self, f"layers.{layer_idx}", mtp_layer)
-        self.layers = mtp_layer
-        self.layer_idx = layer_idx
-        self.config = model_config.pretrained_config
-        self.embed_tokens = Embedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=self.config.torch_dtype,
-        )
-
-    def __repr__(self):
-        """Custom string representation to display layer index"""
-        return f"(layers): ({self.layer_idx}): {repr(self.layers)}"
-
-    def forward(
-        self,
-        input_ids: torch.IntTensor,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.layers(
-            input_ids,
-            position_ids,
-            hidden_states,
-            embed_tokens=self.embed_tokens,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-        )
-
-        return hidden_states
+    def apply_quant_config(self) -> None:
+        apply_layerwise_quant_config(self.model_config,
+                                     self._quantization_named_modules())
+        apply_quant_config_exclude_modules(self.model_config,
+                                           self._quantization_named_modules())
 
 
-@register_auto_model("MTPDraftModelForCausalLM")
-class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
-                                                       PretrainedConfig]):
+def _draft_moe_selection(
+    model_config: ModelConfig,
+    spec_config: object,
+    *,
+    load_balancer: Optional[MoeLoadBalancerConfigType],
+) -> Optional[MoESelection]:
+    """The MoE selection a draft model or MTP layers make for themselves, or
+    None when they inherit the target's.
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        self.model_config = model_config
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
-        self.aux_stream_dict = {
-            AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared: aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+    ``speculative_config.moe_tactic`` pins, else
+    ``speculative_config.moe_backend`` selects. With neither the draft
+    inherits the target's literal, unless ``moe_config.tactic`` pins the
+    target: that tactic names implementations of the target's experts, so the
+    draft resolves AUTO for its own weights. AUTO never resolves to VANILLA
+    and no tactic names it, so this default never changes the expert weight
+    layout of Nemotron-H embedded MTP, which goes through the target's
+    checkpoint weight mapper.
+
+    Args:
+        model_config: The target's config.
+        spec_config: The speculative config, read for ``moe_tactic`` and
+            ``moe_backend``.
+        load_balancer: The EPLB config the draft's MoE layers register into
+            when they share the target's balancer, else None. An AUTO
+            selection resolves under it as the target's does
+            (``auto_moe_backend_for_load_balancer``). Every caller passes it,
+            so that each draft path states whether it shares the balancer.
+    """
+    moe_tactic = getattr(spec_config, "moe_tactic", None)
+    if moe_tactic is not None:
+        return MoESelection(tactic=moe_tactic)
+    moe_backend = getattr(spec_config, "moe_backend", None)
+    if moe_backend is None:
+        if model_config.moe_tactic is None:
+            return None
+        # A tactic admits no other backend, so moe_config.backend is AUTO.
+        moe_backend = "AUTO"
+    if moe_backend == "AUTO":
+        moe_backend = auto_moe_backend_for_load_balancer(load_balancer)
+    return MoESelection(backend=moe_backend)
+
+
+def _draft_loader_moe_kwargs(
+        model_config: ModelConfig, draft_moe_selection: Optional[MoESelection]
+) -> Dict[str, Optional[str]]:
+    """The MoE kwargs that load a separate draft checkpoint for ``draft_moe_selection``.
+
+    With ``draft_moe_selection`` None the draft inherits the target's resolved
+    literal. A separate checkpoint never inherits a tactic, which names the
+    target's implementations: when ``moe_config.tactic`` is set,
+    ``_draft_moe_selection`` returns an AUTO selection instead of None.
+    """
+    selection = draft_moe_selection or MoESelection(
+        backend=model_config.moe_backend)
+    return selection.loader_kwargs()
+
+
+def _copy_model_config_with_moe_selection(
+    model_config: ModelConfig,
+    selection: MoESelection,
+    quant_config: Optional[QuantConfig] = None,
+    layer_quant_overrides: Optional[Dict[str, QuantConfig]] = None,
+) -> ModelConfig:
+    """Copy a ModelConfig and resolve ``selection`` against its own weights.
+
+    ``quant_config`` describes the copied layers when they are not quantized
+    as the checkpoint is globally. ``layer_quant_overrides`` replaces
+    ``quant_config_dict`` entries in a dict the copy owns, so the original's
+    is untouched. The copy drops any implementation the target pinned through
+    ``moe_config.tactic``.
+    """
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or []
+    # An explicit quant_config describes the copied layers alone, so the
+    # checkpoint's other layer formats must not widen a tactic's family.
+    resolved_moe_backend = selection.resolve_backend(
+        architectures[0] if architectures else "",
+        model_config.quant_config if quant_config is None else quant_config,
+        model_config.quant_config_dict if quant_config is None else None)
+    changes = {
+        "moe_backend": resolved_moe_backend,
+        "moe_tactic": selection.tactic,
+    }
+    if layer_quant_overrides:
+        changes["quant_config_dict"] = {
+            **(model_config.quant_config_dict or {}),
+            **layer_quant_overrides
         }
-        super().__init__(
-            MTPDraftModel(self.model_config,
-                          self.model_config.pretrained_config.num_hidden_layers,
-                          self.aux_stream_dict),
-            config=self.model_config,
-            hidden_size=self.model_config.pretrained_config.hidden_size,
-            vocab_size=self.model_config.pretrained_config.vocab_size)
+    return model_config.copy_with(**changes)
 
-    def load_weights(self, weights: Dict):
-        # Import here to avoid circular import
-        model_type = self.model_config.pretrained_config.model_type
-        match model_type:
-            case "glm4_moe":
-                from .modeling_glm import Glm4WeightLoader
-                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
-                from .modeling_deepseekv3 import DeepseekV3WeightLoader
-                weight_loader = DeepseekV3WeightLoader(self,
-                                                       is_draft_model=True)
-            case "exaone_moe":
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
-                )
-            case _:
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP")
-        weight_loader.load_weights(weights)
 
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        if self.model.embed_tokens is None:
-            self.model.embed_tokens = target_model.model.embed_tokens
-        self.lm_head = target_model.lm_head
+# The formats MXFP4 expert weights run as. The checkpoint stores MXFP4 alone;
+# the MoE selection picks the format (moe_resolution.mxfp4_quant_algo).
+_MXFP4_RUN_FORMATS = frozenset({
+    QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.W4A8_MXFP4_FP8,
+    QuantAlgo.W4A16_MXFP4,
+})
 
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: torch.IntTensor = None,
-                position_ids: torch.IntTensor = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                return_context_logits: bool = False,
-                spec_metadata: Optional[SpecMetadata] = None,
-                hidden_states: torch.Tensor = None,
-                **kwargs) -> torch.Tensor:
 
-        hidden_states = spec_metadata.get_hidden_states()
-        output = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-            **kwargs)
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+def _mxfp4_run_quant_config(model_config: ModelConfig, selection: MoESelection,
+                            quant_config: QuantConfig) -> QuantConfig:
+    """``quant_config`` running in the MXFP4 format ``selection`` picks.
+
+    Checkpoint parsing writes the format the target's selection picks, so a
+    draft that selects for itself picks again. A format outside
+    ``_MXFP4_RUN_FORMATS`` is the checkpoint's and is returned as is.
+    """
+    if quant_config.quant_algo not in _MXFP4_RUN_FORMATS:
+        return quant_config
+    if selection.tactic is None:
+        # AUTO names its implementations only once resolved.
+        architectures = getattr(model_config.pretrained_config, "architectures",
+                                None) or []
+        selection = MoESelection(backend=selection.resolve_backend(
+            architectures[0] if architectures else "", quant_config))
+    quant_algo = ModelConfig.get_mxfp4_quant_algo(**selection.loader_kwargs())
+    if quant_algo is None or quant_algo == quant_config.quant_algo:
+        return quant_config
+    run_quant_config = quant_config.model_copy(
+        update={"quant_algo": quant_algo})
+    # model_copy keeps the cached quant modes derived from the stored format.
+    run_quant_config.__dict__.pop("quant_mode", None)
+    run_quant_config.__dict__.pop("layer_quant_mode", None)
+    return run_quant_config
+
+
+def _get_mtp_moe_quant_config(model_config: ModelConfig,
+                              layer_idx: int) -> QuantConfig:
+    """Return the routed-expert quant config for an embedded MTP layer.
+
+    The first constructed MTP layer represents all MTP layers when resolving
+    AUTO because they share one backend setting. Experts the checkpoint
+    excludes from quantization, or a MIXED_PRECISION checkpoint lists no entry
+    for, are unquantized, as the MTP layers build them.
+    """
+    global_quant_config = model_config.quant_config
+    unquantized = QuantConfig(
+        kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    # Exclusion wins over a per-layer entry, as in moe_experts_quant_config.
+    for module in (f"model.layers.{layer_idx}",
+                   f"model.layers.{layer_idx}.mlp.experts"):
+        if global_quant_config.is_module_excluded_from_quantization(module):
+            return unquantized
+
+    layer_quant_configs = model_config.quant_config_dict or {}
+    prefixes = [f"model.layers.{layer_idx}."]
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        prefixes.append(f"mtp.layers.{layer_idx - num_hidden_layers}.")
+
+    for prefix in prefixes:
+        quant_config = layer_quant_configs.get(f"{prefix}mlp.experts")
+        if quant_config is not None:
+            return quant_config
+    for prefix in prefixes:
+        for name, quant_config in layer_quant_configs.items():
+            if name.startswith(prefix) and ".experts" in name:
+                return quant_config
+    if global_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+        # MIXED_PRECISION lists every quantized module.
+        return unquantized
+    return global_quant_config
+
+
+def _mtp_experts_modules(quant_config_dict: Dict[str, QuantConfig],
+                         start_layer_idx: int) -> List[str]:
+    """The experts modules of MTP layers, numbered from ``start_layer_idx``,
+    that ``quant_config_dict`` has entries for, by the module name the layers
+    look their experts up by (``layerwise_moe_quant_config``): an entry of the
+    module itself or of a per-expert key below it."""
+    modules = []
+    for name in quant_config_dict:
+        segments = name.split(".")
+        if (len(segments) > 3 and segments[:2] == ["model", "layers"]
+                and segments[2].isdigit()
+                and int(segments[2]) >= start_layer_idx
+                and "experts" in segments[3:]):
+            module = ".".join(segments[:segments.index("experts") + 1])
+            if module not in modules:
+                modules.append(module)
+    return modules
+
+
+def _copy_mtp_model_config_with_moe_selection(
+        mtp_model_config: ModelConfig, selection: MoESelection,
+        start_layer_idx: int) -> ModelConfig:
+    """Copy the config of MTP layers numbered from ``start_layer_idx`` and
+    resolve ``selection`` against their routed experts' format.
+
+    MXFP4 experts run in the format ``selection`` picks
+    (``_mxfp4_run_quant_config``), which the copy's own ``quant_config_dict``
+    records for the experts module of every MTP layer it has entries for; any
+    other format is the checkpoint's. ``selection`` is resolved against the
+    format the layers are then built in.
+    """
+    mtp_quant_config = _get_mtp_moe_quant_config(mtp_model_config,
+                                                 start_layer_idx)
+    layer_quant_overrides = None
+    # The MXFP4 run format is written per layer, so only a per-layer map can
+    # carry the one the draft's selection picks.
+    if mtp_model_config.quant_config_dict is not None:
+        run_quant_config = _mxfp4_run_quant_config(mtp_model_config, selection,
+                                                   mtp_quant_config)
+        if run_quant_config is not mtp_quant_config:
+            # An entry of the module itself is what a layer reads first, so it
+            # overrides per-expert entries below it too.
+            layer_quant_overrides = {
+                module: run_quant_config
+                for module in _mtp_experts_modules(
+                    mtp_model_config.quant_config_dict, start_layer_idx)
+            }
+            if layer_quant_overrides:
+                mtp_quant_config = run_quant_config
+    return _copy_model_config_with_moe_selection(
+        mtp_model_config,
+        selection,
+        quant_config=mtp_quant_config,
+        layer_quant_overrides=layer_quant_overrides)
+
+
+def _enable_trtllm_moe_preload_for_draft(model: nn.Module,
+                                         moe_backend: str) -> None:
+    """Preserve TRTLLM-Gen's serial weight-loading order for draft-only use."""
+    preload_weight_modules = getattr(model, "preload_weight_modules", None)
+    if moe_backend != "TRTLLM" or preload_weight_modules is None:
+        return
+    for module_name in ("experts", "routing_method", "all_reduce"):
+        if module_name not in preload_weight_modules:
+            preload_weight_modules.append(module_name)
+
+
+def external_drafter_config_kwargs(model_config, spec_config) -> dict:
+    """`ModelConfig.from_pretrained` kwargs for a one-model external drafter.
+
+    The drafter is a separate checkpoint, so it gets its own `ModelConfig`; the
+    kwargs below are the execution-layout properties it must inherit from the
+    target engine it runs inside.
+
+    `moe_load_balancer` is propagated for DSpark ONLY. DSpark's draft stages are
+    full DeepSeek-V4 blocks sharing the target's expert topology and layer-index
+    namespace (`layer_idx = num_hidden_layers + stage_id`), so they can register
+    into the target's EPLB manager. Other external drafters (PARD, DFlash,
+    draft-target) are independent checkpoints whose expert topology and layer
+    numbering need not match the target's, and whose EPLB configs would therefore
+    be keyed against a different namespace -- do not generalize this without
+    designing a per-drafter EPLB config domain and layer identity first.
+    """
+    # Only the embedded DSpark draft shares the target's EPLB namespace (its
+    # stages are target decoder blocks registered into the target's balancer).
+    # A standalone DSpark drafter is an independent checkpoint, so it falls
+    # under the "other external drafters" rule above.
+    shares_load_balancer = (spec_config.spec_dec_mode.is_dspark()
+                            and spec_config.draft_is_embedded_in_target)
+    load_balancer = (model_config.moe_load_balancer
+                     if shares_load_balancer else None)
+    draft_moe_selection = _draft_moe_selection(model_config,
+                                               spec_config,
+                                               load_balancer=load_balancer)
+    if (shares_load_balancer and draft_moe_selection is not None
+            and draft_moe_selection.tactic is not None):
+        # The embedded draft loads the target checkpoint, whose expert map
+        # describes the main layers, not the draft stages a draft tactic pins.
+        # DSv4DSparkDraftModel resolves the tactic against the stages' entries,
+        # so load the checkpoint as an AUTO draft selection would.
+        draft_moe_selection = MoESelection(
+            backend=auto_moe_backend_for_load_balancer(load_balancer))
+    kwargs = dict(
+        trust_remote_code=True,
+        attn_backend=model_config.attn_backend,
+        **_draft_loader_moe_kwargs(model_config, draft_moe_selection),
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
+        spec_config=None,  # Avoid recursive spec-dec
+        max_num_tokens=model_config.max_num_tokens,
+        moe_max_num_tokens=model_config.moe_max_num_tokens,
+        use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
+        # The user's value, NOT the engine's: py_executor_creator raises it past
+        # this and never writes back, so drafters read _runtime_position_ceiling.
+        # None sizes position tables from max_position_embeddings: 1M for K3.
+        max_seq_len=model_config.max_seq_len,
+        # The MoE combine wire format is an engine setting (moe_config), not a
+        # checkpoint property: a drafter's expert-parallel MoE communication uses
+        # the same format as the target's.
+        use_low_precision_moe_combine=model_config.
+        use_low_precision_moe_combine,
+        # A MEGAMOE_CUTEDSL drafter shares the target's bucket workspaces, so its kernels must match.
+        megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
+    )
+    if shares_load_balancer:
+        kwargs["moe_load_balancer"] = load_balancer
+    return kwargs
+
+
+@register_draft_model(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
+def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
+    """Build the EAGLE3 one-model drafter for the configured draft arch."""
+    eagle3_model_arch = model_config.spec_config.eagle3_model_arch
+    if eagle3_model_arch == "llama3":
+        # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
+        return Eagle3ForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers)
+    elif eagle3_model_arch == "mistral_large3":
+        return MistralLarge3EagleForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers,
+            model.aux_stream_dict)
+    else:
+        raise ValueError(
+            f"Unsupported eagle3 model architecture: {eagle3_model_arch}")
+
+
+@register_draft_model(SpeculativeDecodingMode.MTP)
+@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
+def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
+    """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
+    mtp_model_config = draft_config if draft_config is not None else model_config
+    spec_config = model_config.spec_config
+    embedded_nemotron_h = (draft_config is None
+                           and model_config.pretrained_config.model_type
+                           in {"nemotron_h", "nemotron_h_puzzle"})
+    # The MTP layers register into the target's load balancer.
+    draft_moe_selection = _draft_moe_selection(
+        model_config, spec_config, load_balancer=model_config.moe_load_balancer)
+    if draft_moe_selection is not None:
+        mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+            mtp_model_config, draft_moe_selection,
+            model_config.pretrained_config.num_hidden_layers)
+        if embedded_nemotron_h and ((mtp_model_config.moe_backend == "VANILLA")
+                                    != (model_config.moe_backend == "VANILLA")):
+            raise ValueError(
+                "Nemotron-H embedded MTP layers must run VANILLA exactly when "
+                "the target does, because the target's checkpoint weight "
+                "mapper lays out VANILLA expert weights differently from every "
+                "other backend. "
+                f"speculative_config selects {mtp_model_config.moe_backend} "
+                f"while the target runs {model_config.moe_backend}.")
+        _enable_trtllm_moe_preload_for_draft(model,
+                                             mtp_model_config.moe_backend)
+    return MTPForCausalLM(mtp_model_config,
+                          model_config.pretrained_config.num_hidden_layers,
+                          lm_head, model)
+
+
+@register_draft_model(SpeculativeDecodingMode.PARD)
+def _build_pard_draft(model_config, draft_config, lm_head, model):
+    """Build the PARD drafter."""
+    return PARDForCausalLM(draft_config)
+
+
+@register_draft_model(SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL)
+def _build_draft_target_one_model_draft(model_config, draft_config, lm_head,
+                                        model):
+    """Build the one-model draft-target drafter from its own checkpoint."""
+    # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
+    # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
+    was_frozen = draft_config._frozen
+    draft_config._frozen = False
+    draft_config.lm_head_gather_output = False
+    draft_config._frozen = was_frozen
+    return AutoModelForCausalLM.from_config(draft_config)
 
 
 def get_draft_model(model_config, draft_config, lm_head, model):
-    """Construct the draft model for the configured speculative-decoding mode
-    (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
-    by detecting its architecture in the draft checkpoint's own config."""
-    assert getattr(model_config, 'spec_config', None) is not None
-    spec_dec_mode = model_config.spec_config.spec_dec_mode
-    if spec_dec_mode.is_eagle3_one_model():
-        if model_config.spec_config.eagle3_model_arch == "llama3":
-            # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
-            return Eagle3ForCausalLM(
-                draft_config, model_config.pretrained_config.num_hidden_layers)
-        elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
-            return MistralLarge3EagleForCausalLM(
-                draft_config, model_config.pretrained_config.num_hidden_layers,
-                model.aux_stream_dict)
-        else:
-            raise ValueError(
-                f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
-            )
+    """Construct the draft model for the configured speculative-decoding mode.
 
-    elif spec_dec_mode.is_mtp_one_model():
-        return MTPForCausalLM(model_config,
-                              model_config.pretrained_config.num_hidden_layers,
-                              lm_head, model)
-    elif spec_dec_mode.is_mtp_eagle():
-        return MTPDraftModelForCausalLM(model_config)
-    elif spec_dec_mode.is_pard():
-        return PARDForCausalLM(draft_config)
-    elif spec_dec_mode.is_dflash():
-        draft_arches = getattr(draft_config.pretrained_config, "architectures",
-                               None) or []
-        if any("Laguna" in arch for arch in draft_arches):
-            return DFlashLagunaForCausalLM(draft_config)
-        return DFlashForCausalLM(draft_config)
-    elif spec_dec_mode.is_dspark():
-        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
-        # modeling_speculative). The DSpark draft reuses the target's aux streams.
-        # The draft stage count (n_mtp_layers) is not in the HF config, so derive
-        # it from the checkpoint's mtp.* namespace.
-        from .modeling_dspark import DSparkForCausalLM, count_dspark_stages
-        num_stages = count_dspark_stages(
-            model_config.spec_config.speculative_model)
-        return DSparkForCausalLM(
-            draft_config,
-            getattr(model, "aux_stream_dict", None),
-            num_stages=num_stages,
-            block_size=model_config.spec_config.block_size,
-        )
-    elif spec_dec_mode.is_draft_target_one_model():
-        # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
-        # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
-        was_frozen = draft_config._frozen
-        draft_config._frozen = False
-        draft_config.lm_head_gather_output = False
-        draft_config._frozen = was_frozen
+    Dispatch is registry-based: each mode's builder lives next to the draft
+    model it constructs and registers itself via ``@register_draft_model``, so
+    this function never imports a concrete draft implementation (which is what
+    used to force a lazy import for DSpark, whose provider imports back into
+    this module through modeling_deepseekv4).
+
+    Args:
+        model_config: the target engine's ``ModelConfig``, carrying spec_config.
+        draft_config: the drafter's own ``ModelConfig``, or None when the mode
+            builds its draft from the target config alone.
+        lm_head: the target's LM head, shared by the one-model MTP drafter.
+        model: the target model, for drafters reusing its aux streams.
+
+    Returns:
+        The draft ``nn.Module`` for this mode.
+    """
+    assert getattr(model_config, 'spec_config', None) is not None
+    spec_config = model_config.spec_config
+    spec_dec_mode = spec_config.spec_dec_mode
+    # An external draft model is loaded straight from its own checkpoint, so it
+    # has no mode-specific builder to register: this stays an explicit pre-check
+    # ahead of the registry lookup rather than becoming a registry key.
+    #
+    # No mode guard is needed. `uses_external_draft_model` already implies
+    # `is_mtp_one_model()` (llm_args), which is disjoint from every other mode,
+    # so this branch cannot divert a drafter that a builder would have claimed.
+    # Pinned by test_draft_model_registry.py::
+    # test_external_draft_model_bypasses_the_registry.
+    if spec_config.uses_external_draft_model:
+        if draft_config is None:
+            raise ValueError(
+                "MTP speculative decoding with an external draft model requires "
+                "its model config.")
         return AutoModelForCausalLM.from_config(draft_config)
-    else:
+    builder = get_registered_draft_model_builder(spec_dec_mode)
+    if builder is None:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
         )
+    return builder(model_config, draft_config, lm_head, model)
+
+
+def drafter_hidden_extra_attrs(
+        model_cls: type, spec_config: object,
+        draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
+    """The target's ``extra_attrs`` keys to hide while its drafter is built:
+    the model's ``target_only_extra_attrs`` when the drafter comes from
+    another checkpoint (an Eagle3 head, an external MTP or PARD /
+    draft-target drafter; its ``draft_config`` shares the target's
+    ``extra_attrs``), none for the target's own MTP layers (no
+    ``draft_config``, or replacement MTP heads of the same architecture).
+
+    Args:
+        model_cls: The target model class.
+        spec_config: The speculative config.
+        draft_config: The drafter's config, or None.
+
+    Returns:
+        The keys to hide (possibly empty).
+    """
+    if draft_config is None or spec_config.uses_replacement_heads:
+        return ()
+    return tuple(model_cls.target_only_extra_attrs)
+
+
+@contextlib.contextmanager
+def hidden_extra_attrs(extra_attrs: Dict, keys: Tuple[str,
+                                                      ...]) -> Iterator[None]:
+    """Remove ``keys`` from ``extra_attrs`` for the block and put back the
+    values they had (also when the block raises).
+
+    Args:
+        extra_attrs: A model config's ``extra_attrs``.
+        keys: The keys to hide; absent ones are skipped.
+
+    Yields:
+        None.
+    """
+    saved = {key: extra_attrs.pop(key) for key in keys if key in extra_attrs}
+    try:
+        yield
+    finally:
+        extra_attrs.update(saved)
 
 
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
-    def __init__(self, model: TModel, model_config: ModelConfig[TConfig]):
+    # Set per instance from supports_spec_decode_fast_paths in __init__.
+    spec_decode_fast_paths: bool = False
+    # Declared by the model: under the fast paths, temperature rows of the TP
+    # key exchange draw Gumbel noise four entries per Philox call (another
+    # noise stream; TPKeyExchange fast_gumbel).
+    spec_decode_fast_gumbel: ClassVar[bool] = False
+    # Declared by the model: under the fast paths, the TP key exchange's
+    # argmax splits rows by its row-split bounds (TPKeyExchange
+    # argmax_row_split; same tokens, another launch shape).
+    spec_decode_argmax_row_split: ClassVar[bool] = False
+    # Declared by the model: its step-loop hooks under the fast paths (None:
+    # the defaults).
+    spec_decode_fast_path_runtime_hooks: ClassVar[Optional[RuntimeHooks]] = None
+    # Declared by the model: ``extra_attrs`` keys its construction writes for
+    # its own modules, hidden while a drafter from another checkpoint is built
+    # (drafter_hidden_extra_attrs).
+    target_only_extra_attrs: ClassVar[Tuple[str, ...]] = ()
+
+    @property
+    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+        """The model's ``spec_decode_fast_path_runtime_hooks`` under the fast
+        paths, else None."""
+        return (self.spec_decode_fast_path_runtime_hooks
+                if self.spec_decode_fast_paths else None)
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        """Whether one-engine speculative decoding of this model takes the
+        fast paths (``spec_decode_fast_paths``): greedy and temperature-only
+        tokens of vocabulary-sharded logits through the TP key exchange, the
+        temperature-only CUDA graph variant, the overlap loop on the execution
+        stream, the hoisted position ids, the MTP-Eagle draft loop's step-0
+        epilogue and the recorded steady decode-step prepare. A model enables
+        them where they are validated."""
+        return False
+
+    def __init__(self,
+                 model: TModel,
+                 model_config: ModelConfig[TConfig],
+                 hidden_size: int | None = None,
+                 vocab_size: int | None = None) -> None:
+        # Composite configs (e.g. vision-language wrappers) may not expose
+        # hidden_size/vocab_size at the top level; callers can pass the
+        # text-config values explicitly.
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
+        if vocab_size is None:
+            vocab_size = model_config.pretrained_config.vocab_size
         super().__init__(model,
                          config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+                         hidden_size=hidden_size,
+                         vocab_size=vocab_size)
         self.draft_model = None
         self.draft_config = None
         self.spec_worker = None
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
+        self.spec_decode_fast_paths = False
+        key_exchange = None
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            self.spec_decode_fast_paths = self.supports_spec_decode_fast_paths(
+                model_config)
+            if self.spec_decode_fast_paths:
+                # Greedy tokens of vocabulary-sharded draft / target logits
+                # come from one peer-memory key exchange per step (TP groups
+                # only; None elsewhere).
+                from ..distributed import ll_exchange
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping,
+                    model_config.max_num_tokens,
+                    fast_gumbel=self.spec_decode_fast_gumbel,
+                    argmax_row_split=self.spec_decode_argmax_row_split)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
+                    # Of the Eagle3 drafts, only the Mistral one registers into
+                    # the target's load balancer.
+                    shares_load_balancer = (
+                        spec_config.eagle3_model_arch == "mistral_large3")
+                    draft_moe_selection = _draft_moe_selection(
+                        model_config,
+                        spec_config,
+                        load_balancer=(model_config.moe_load_balancer
+                                       if shares_load_balancer else None))
+                    draft_loader_moe_kwargs = _draft_loader_moe_kwargs(
+                        model_config, draft_moe_selection)
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
-                            moe_backend=model_config.moe_backend,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
+                            **draft_loader_moe_kwargs,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
+                        if draft_moe_selection is not None:
+                            # Unlike ModelConfig.from_pretrained, the Mistral
+                            # loader does not resolve AUTO after loading quant
+                            # metadata. Resolve the selection against the draft
+                            # config now, before constructing any draft modules;
+                            # a tactic resolves to the family the loader
+                            # already derived.
+                            self.draft_config = _copy_model_config_with_moe_selection(
+                                self.draft_config, draft_moe_selection)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=model_config.moe_backend,
-                            mapping=model_config.mapping,
+                            **draft_loader_moe_kwargs,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1945,30 +2131,58 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
+
+                elif spec_config.uses_external_draft_model:
+                    self.draft_config = ModelConfig.from_pretrained(
+                        spec_config.speculative_model,
+                        trust_remote_code=True,
+                        attn_backend=model_config.attn_backend,
+                        **_draft_loader_moe_kwargs(
+                            model_config,
+                            _draft_moe_selection(model_config,
+                                                 spec_config,
+                                                 load_balancer=None)),
+                        mapping=model_config.mapping.mapping_for_full_rows(),
+                        spec_config=None,
+                        max_num_tokens=model_config.max_num_tokens,
+                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    self.draft_config.extra_attrs[
+                        _SPECULATIVE_POSITION_HEADROOM] = (
+                            2 * spec_config.tokens_per_gen_step)
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model,
-                        trust_remote_code=True,
-                        attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
-                        spec_config=None,  # Avoid recursive spec-dec
-                        max_num_tokens=model_config.max_num_tokens,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                        **external_drafter_config_kwargs(
+                            model_config, spec_config))
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
+
+                elif spec_config.uses_replacement_heads:
+                    self.draft_config = _replacement_mtp_model_config(
+                        model_config)
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
-                self.draft_model = get_draft_model(model_config,
-                                                   self.draft_config,
-                                                   self.lm_head, self.model)
+                # A drafter of another checkpoint shares extra_attrs: it must
+                # not build the target's declared decode kernels.
+                with hidden_extra_attrs(
+                        model_config.extra_attrs,
+                        drafter_hidden_extra_attrs(type(self), spec_config,
+                                                   self.draft_config)):
+                    self.draft_model = get_draft_model(model_config,
+                                                       self.draft_config,
+                                                       self.lm_head, self.model)
+                if spec_config.uses_replacement_heads:
+                    self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:
                     self.epilogue.append(self.draft_model)
                 if (spec_config.spec_dec_mode.is_parallel_draft()
@@ -1979,15 +2193,79 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
-                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
+                model_config.mapping.mapping_for_full_rows(),
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
+                spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
+                self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
+
+    def setup_aliases(self) -> None:
+        if (self.draft_model is not None
+                and getattr(self.draft_model, "shares_target_kv_cache", False)):
+            self.draft_model.load_weights_from_target_model(self)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        spec_config = self.spec_config
+        if (self.spec_worker is not None and spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.draft_lm_head_dtype == "mxfp8"):
+            from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
+
+            # Rebuilt from the current BF16 weights (idempotent on reloads),
+            # from the LM head the draft passes project with.
+            draft_lm_head = getattr(self.draft_model, "lm_head", None)
+            self.spec_worker.draft_head = None
+            self.spec_worker.draft_head = build_mxfp8_draft_head(
+                self.lm_head if draft_lm_head is None else draft_lm_head,
+                self.model_config.mapping, self.spec_worker.key_exchange)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.spec_worker is not None:
+            # Collective over the TP group; every rank loads in step.
+            self.spec_worker.prepare_vocab_sharded_sampling(self.lm_head)
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_from_vocab_shards)
+
+    def _verify_logits(
+            self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+            spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
+        """The target logits the worker verifies, and whether they are this rank's vocabulary
+        columns, which the worker samples without the head's gather."""
+        rows = hidden_states[spec_metadata.gather_ids]
+        worker = self.spec_worker
+        vocab_sharded = worker.takes_vocab_sharded_target_logits(
+            attn_metadata, spec_metadata)
+        if not vocab_sharded and not worker.reads_lm_head_dtype_logits:
+            # The target logits, in the layout the worker's acceptance reads.
+            return worker.target_logits(
+                rows,
+                self.lm_head,
+                self.logits_processor,
+                attn_metadata,
+                spec_metadata,
+                self.draft_model,
+            ), False
+        logits = self.logits_processor.forward(
+            rows,
+            worker.vocab_sharded_head(self.lm_head, spec_metadata)
+            if vocab_sharded else self.lm_head,
+            attn_metadata,
+            True,
+            keep_lm_head_dtype=worker.reads_lm_head_dtype_logits,
+        )
+        return logits, vocab_sharded
 
     def forward(
         self,
@@ -2000,6 +2278,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # A padded generation batch's (mrope) positions are a strided view; one
+        # copy here instead of one per attention layer that needs them dense.
+        # Not with context requests: a breakable prefill CUDA graph replays its
+        # body against the capture-time position tensor.
+        # Not under torch.compile: the inference-mode copy differs from the
+        # position-buffer view context batches pass, so every switch between
+        # them would recompile; the compiled graph makes its own dense copies.
+        hoist_positions = (self.spec_decode_fast_paths
+                           and self.spec_worker is not None
+                           and position_ids is not None
+                           and attn_metadata.num_contexts == 0
+                           and not is_torch_compiling())
+        if hoist_positions:
+            position_ids = position_ids.contiguous()
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -2008,6 +2300,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        if getattr(attn_metadata, "csa2_remote_tail_mode", None) == "source":
+            # The context worker intentionally stopped at the encoder/decoder
+            # boundary. Produce a disposable token for the existing context-only
+            # completion machinery, but do not run an embedded draft worker from
+            # an encoder-boundary activation. The handoff strips this token.
+            return self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                False,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -2016,13 +2319,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            logits, vocab_sharded = self._verify_logits(hidden_states,
+                                                        attn_metadata,
+                                                        spec_metadata)
+            worker_kwargs = {
+                "vocab_sharded_logits": True
+            } if vocab_sharded else {}
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -2038,6 +2340,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if hoist_positions:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,
@@ -2047,7 +2352,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    **worker_kwargs)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -2058,20 +2364,134 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        if not getattr(self.spec_config, "uses_replacement_heads", False):
+            return super()._quantization_named_modules()
+        owned_ids = {
+            id(module)
+            for _, module in self.draft_model._quantization_named_modules()
+        }
+        return ((name, module) for name, module in self.named_modules()
+                if id(module) not in owned_ids)
+
+    def __post_init__(self) -> None:
+        if getattr(self.spec_config, "uses_replacement_heads", False):
+            self.draft_model.apply_quant_config()
+        super().__post_init__()
+
+    def mtp_head_module_names(self) -> List[str]:
+        """Names of the MTP heads under every alias they are reachable by.
+
+        One-model MTP registers the same head objects twice: under
+        ``draft_model.mtp_layers.{h}`` and, after the target model extends its
+        layer list, under ``model.layers.{num_hidden_layers + h}``. A load that
+        wants to leave the heads untouched has to exclude both aliases.
+        """
+        mtp_layers = getattr(self.draft_model, "mtp_layers", None)
+        if not mtp_layers:
+            return []
+        head_ids = {id(layer) for layer in mtp_layers}
+        return [
+            name for name, module in self.named_modules(remove_duplicate=False)
+            if name and id(module) in head_ids
+        ]
+
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, uses_mtp_head_checkpoint)
+
+        skip_modules = ["draft_model"]
+        if uses_mtp_head_checkpoint(self.spec_config):
+            # The heads come from speculative_model in a second pass
+            # (load_draft_weights), so exclude them here. They must be
+            # *skipped* rather than tolerated via allow_partial_loading:
+            # partial loading suppresses process_weights_after_loading() on
+            # every quantized Linear/MoE it touches, which would leave the
+            # target model's quant scales (NVFP4 alphas, MoE input scales)
+            # uninitialized.
+            weights = filter_mtp_checkpoint_weights(weights)
+            skip_modules.extend(self.mtp_head_module_names())
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"],
+                             skip_modules=skip_modules,
                              params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            _load_weights_impl_v2
+        from tensorrt_llm._torch.speculative.utils import (
+            remap_preprocessed_mtp_weights_for_draft_model,
+            select_mtp_checkpoint_weights,
+            skip_modules_for_separate_mtp_checkpoint, uses_mtp_head_checkpoint)
+
+        if uses_mtp_head_checkpoint(self.spec_config):
+            # Load MTP heads into draft_model only, and verify every non-shared
+            # MTP parameter has a matching tensor. The previous parent-model
+            # load used allow_partial_loading=True, which silently left MTP
+            # modules at random init when keys did not bind.
+            n_total = len(weights)
+            lm_head_weights = {}
+            if getattr(self.draft_model, "owns_lm_head", False):
+                lm_head_weights = {
+                    name: value
+                    for name, value in weights.items()
+                    if name.startswith("lm_head.")
+                }
+                required_head_tensors = {"lm_head.weight"}
+                head_quant_algo = self.draft_model.lm_head.quant_config.quant_algo
+                if head_quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
+                    required_head_tensors.add("lm_head.weight_scale")
+                if head_quant_algo == QuantAlgo.W4A16_NVFP4:
+                    required_head_tensors.add("lm_head.weight_scale_2")
+                missing = sorted(required_head_tensors - lm_head_weights.keys())
+                if missing:
+                    raise ValueError(
+                        "Quantized replacement MTP checkpoint is missing " +
+                        ", ".join(missing))
+            weights = select_mtp_checkpoint_weights(weights)
+            if not weights:
+                raise ValueError(
+                    "speculative_model was set for MTP but no 'mtp.*' weights "
+                    f"were found in {self.spec_config.speculative_model!r}. "
+                    "Expected keys like 'mtp.layers.0.*'.")
+            n_dropped = n_total - len(weights) - len(lm_head_weights)
+            if n_dropped:
+                logger.warning(
+                    "Ignoring %d unrelated tensors from speculative_model while "
+                    "loading MTP heads (kept %d MTP and %d LM head tensors).",
+                    n_dropped, len(weights), len(lm_head_weights))
+            if weight_mapper is None:
+                raise ValueError(
+                    "weight_mapper is required to load separate MTP heads")
+            weights = weight_mapper.preprocess_weights(weights)
+            num_hidden_layers = self.config.num_hidden_layers
+            num_mtp_layers = len(self.draft_model.mtp_layers)
+            weights = remap_preprocessed_mtp_weights_for_draft_model(
+                weights,
+                num_hidden_layers=num_hidden_layers,
+                num_mtp_layers=num_mtp_layers,
+            )
+            weights.update(lm_head_weights)
+
+            # Skip optional modules (e.g. shared_head) only when absent from
+            # this checkpoint; architectures that ship those tensors still load
+            # them under allow_partial_loading=False.
+            _load_weights_impl_v2(
+                self.draft_model,
+                weights,
+                weight_mapper,
+                skip_modules=skip_modules_for_separate_mtp_checkpoint(weights),
+                allow_partial_loading=False,
+            )
+            return
+
         args = inspect.getfullargspec(self.draft_model.load_weights).args
         if "weight_mapper" in args:
             self.draft_model.load_weights(weights=weights,

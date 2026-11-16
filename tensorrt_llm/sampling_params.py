@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import json
+import operator
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, fields, make_dataclass
+from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -25,7 +28,20 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 100
+
+_GENERATION_CONFIG_SAMPLING_FIELDS = frozenset(
+    {
+        "early_stopping",
+        "length_penalty",
+        "min_p",
+        "no_repeat_ngram_size",
+        "repetition_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+    }
+)
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -80,14 +96,8 @@ class GuidedDecodingParams:
 
 class LogprobParams(NamedTuple):
     prompt_logprobs: Optional[int] = None
-    logprobs: Optional[int] = None
     # Drop the logits once the logprobs are computed
     drop_context_logits: bool = False
-    # Drop the geneation_logits once the logprobs are computed
-    drop_generation_logits: bool = False
-    # Return generation logprobs as `list[float]` instead of the default
-    # `list[dict[int, Logprob]]`. Only valid when logprobs == 0.
-    logprobs_simple_format: bool = False
     # Return prompt logprobs as `list[float]` instead of the default
     # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
     prompt_logprobs_simple_format: bool = False
@@ -129,7 +139,11 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far.
-                The shape is beam_width * sequence_length.
+                The shape is beam_width * sequence_length. Under beam search on the
+                PyTorch backend, row ``i`` is the prompt plus the hypothesis held by the
+                beam whose logits are row ``i`` of ``logits``; beams that already
+                finished are not included. With the overlap scheduler the history
+                trails the beam's newest token by one step, as for every request.
             stream_ptr (int, optional): The operation stream used by the logits tensor.
                 Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
@@ -220,16 +234,16 @@ class SamplingParams:
             If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
             Setting temperature = 0 results in greedy sampling.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
-        beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
+        beam_search_diversity_rate (float, optional): Encourages beams to diverge from each other by adding diversity_rate * source_beam_index to each candidate's ranking score during beam expansion, boosting candidates that expand from lower-ranked beams. Here source_beam_index is the rank of the beam a candidate expands from among the current step's input beams, ordered by cumulative log-probability (0 for the strongest beam). None means using C++ runtime default 0.f (disabled). Defaults to None.
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
         frequency_penalty (float, optional): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
         prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
-        length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
-        early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
-        no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
+        length_penalty (float, optional): Beam-search length penalty exponent. Beams are ranked by cum_log_prob / length**length_penalty, where length counts generated tokens only; the returned cumulative_logprob stays unnormalized. Must be >= 0. 0 disables the normalization. None means using C++ runtime default 0.f. Defaults to None.
+        early_stopping (int, optional): Three-state, following HuggingFace. 1 stops as soon as best_of finished candidates exist. 0 and 2 are exhaustive: they keep a pool of finished candidates and continue while an unfinished beam could still outscore the worst of them, 0 bounding attainability with the beams' current length and 2 ("never") with max_seq_len when length_penalty > 0. Any other integer is treated as 2. None means using C++ runtime default 1. Defaults to None.
+        no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
-        beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
+        beam_width_array (List[int], optional): Per-iteration beam widths for Variable-Beam-Width-Search; decoding past the end of the array holds its last entry. Must be non-decreasing -- a narrowing schedule is rejected. beam_width is raised to the array's maximum, which is the number of beams returned. Defaults to None.
 
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
                                   When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
@@ -243,11 +257,12 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        return_routed_experts (bool): Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids for train/inference routing alignment in MoE reinforcement learning. Requires the engine-level enable_return_routed_experts. Defaults to False.
         additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
-        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+        watermarking (bool, optional): Whether to watermark the generated text. Takes effect only when the engine is configured with `watermark_config`. None or True requests a watermark; False opts this request out (unless the engine sets `allow_request_opt_out=False`). Greedy and beam-search requests cannot carry a watermark and are generated normally. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -316,6 +331,12 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+    # Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids
+    # on this request's output (via additional_generation_outputs["routed_experts"]),
+    # for train/inference routing alignment in MoE reinforcement learning. Requires
+    # the engine-level enable_return_routed_experts. Separated-routing MoE backends
+    # only (fused backends fail closed).
+    return_routed_experts: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
     # Decoder tokens moved from generated output into the input prefix. The
@@ -324,20 +345,11 @@ class SamplingParams:
         default_factory=tuple, init=False, repr=False
     )
 
-    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
-    # Can be deprecated after migration to PyTorch backend.
-    _context_logits_auto_enabled: bool = False
-    _generation_logits_auto_enabled: bool = False
-
-    # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
-    _return_log_probs: bool = False
-
-    # Lookahead decoding config
-    lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
-
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
+
+    watermarking: Optional[bool] = None
 
     # Tokenizer-related configs
     ignore_eos: bool = False
@@ -349,6 +361,10 @@ class SamplingParams:
     # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
+    # None identifies direct LLM API SamplingParams, where non-None values are
+    # request-provided. Serving adapters set this to preserve which fields were
+    # explicitly present before they materialize their protocol defaults.
+    _request_provided_fields: Optional[frozenset[str]] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.pad_id is None:
@@ -364,6 +380,12 @@ class SamplingParams:
 
         self._validate()
 
+    def __reduce_ex__(self, protocol):
+        # Pickle the field values in field order; subclasses may add fields.
+        if type(self) is not SamplingParams:
+            return object.__reduce_ex__(self, protocol)
+        return _restore_sampling_params, (_get_sampling_params_state(self),)
+
     def _validate(self):
         """Verify the sampling parameters.
 
@@ -372,11 +394,18 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
-        if self.top_p is not None and (self.top_p < 0 or self.top_p > 1):
+        # These bounds are written as negated range checks rather than as
+        # `value < low or value > high`, so that NaN is rejected too: every
+        # comparison against NaN is False, which lets it slip through the
+        # positive form. The top_p_decay / top_p_min checks below already use
+        # this form.
+        if self.top_p is not None and not 0 <= self.top_p <= 1:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
-        if self.temperature is not None and self.temperature < 0:
+        if self.min_p is not None and not 0 <= self.min_p <= 1:
+            raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
+        if self.temperature is not None and not self.temperature >= 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
         # Top-p decay param ranges mirror the hard checks in the
@@ -441,8 +470,45 @@ class SamplingParams:
         if self.logprobs_simple_format and self.use_beam_search:
             raise ValueError("logprobs_simple_format is not supported with beam search")
 
+    def _set_request_provided_fields(self, field_names: Iterable[str]) -> None:
+        """Record sampler fields explicitly supplied by a serving request."""
+        self._request_provided_fields = frozenset(field_names) & _GENERATION_CONFIG_SAMPLING_FIELDS
+
+    def _apply_generation_config_defaults(self, generation_config: Mapping[str, Any]) -> None:
+        """Apply compatible model defaults without overriding request values."""
+        for field_name in _GENERATION_CONFIG_SAMPLING_FIELDS:
+            if field_name not in generation_config:
+                continue
+
+            # Direct LLM API calls preserve None as the unset sentinel. Serving
+            # adapters materialize protocol defaults, so they instead record
+            # which fields the request explicitly supplied.
+            if self._request_provided_fields is None:
+                request_provided = getattr(self, field_name) is not None
+            else:
+                request_provided = field_name in self._request_provided_fields
+            if request_provided:
+                continue
+
+            # A JSON null is also unset and must fall through to the existing
+            # TRT-LLM or serving default.
+            value = generation_config[field_name]
+            if value is None:
+                continue
+            # Hugging Face also permits "never", which the TRT-LLM integer
+            # early-stopping setting cannot represent.
+            if field_name == "early_stopping" and not isinstance(value, (bool, int)):
+                logger.warning(
+                    "Ignoring unsupported generation_config.json early_stopping value "
+                    f"{value!r}; TRT-LLM supports only boolean or integer values."
+                )
+                continue
+            setattr(self, field_name, value)
+
+        self._validate()
+
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampling_utils.resolve_sampling_strategy) only holds instances of
+    #     sampling_resolution.resolve_row_params) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
@@ -464,13 +530,16 @@ class SamplingParams:
         temperature: Optional[float],
         top_p: Optional[float],
         top_k: Optional[int],
+        min_p: Optional[float],
     ) -> bool:
         """Whether the request carries an explicit greedy control.
 
-        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed
-        to the implicit "all params unset" greedy default.
+        Explicit means top_k == 1, top_p == 0.0, min_p == 1.0, or temperature == 0,
+        as opposed to the implicit "all params unset" greedy default. min_p == 1.0
+        keeps only tokens whose probability equals the row maximum, so like
+        top_p == 0.0 it collapses sampling to a single token.
         """
-        return top_k == 1 or top_p == 0.0 or temperature == 0
+        return top_k == 1 or top_p == 0.0 or min_p == 1.0 or temperature == 0
 
     @staticmethod
     def params_imply_greedy_decoding(
@@ -479,23 +548,28 @@ class SamplingParams:
         top_p: Optional[float],
         top_k: Optional[int],
         use_beam_search: bool | None,
+        min_p: Optional[float] = None,
         top_p_decay: Optional[float] = None,
     ) -> bool:
         """Whether the parameters resolve to greedy decoding.
 
         An explicit greedy control always wins. The implicit "all params unset"
-        greedy default is overridden by an active top-p decay (which implies
-        top-p sampling so the decayed runtime top-p can take effect); callers
-        that do not support decay may omit ``top_p_decay``.
+        greedy default is overridden by any active sampling knob: an active
+        top-p decay (which implies top-p sampling so the decayed runtime top-p
+        can take effect) or a ``min_p`` in ``(0, 1)`` (which still selects among
+        multiple tokens); callers that do not support decay may omit
+        ``top_p_decay``.
         """
         if use_beam_search:
             return False
         if SamplingParams.params_imply_explicit_greedy(
-            temperature=temperature, top_p=top_p, top_k=top_k
+            temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p
         ):
             return True
         implicitly_greedy = temperature is None and top_p is None and top_k is None
-        return implicitly_greedy and not SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        min_p_active = min_p is not None and min_p > 0.0
+        decay_active = SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        return implicitly_greedy and not min_p_active and not decay_active
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -504,16 +578,9 @@ class SamplingParams:
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+            min_p=self.min_p,
             top_p_decay=self.top_p_decay,
         )
-
-    @property
-    def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits and not self._context_logits_auto_enabled
-
-    @property
-    def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
@@ -525,20 +592,7 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
-        def _encode(tokenizer, text, add_special_tokens):
-            try:
-                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
-            except TypeError:
-                # For tiktokenizer, the encode method does not have add_special_tokens argument
-                return tokenizer.encode(text)
-
-        if self.bad is not None:
-            strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
-
-        if self.stop is not None:
-            strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+        self._setup_word_ids(tokenizer, add_special_tokens)
 
         # Add eos_token_id in generation_config to stop_token_ids
         # The eos_token_id in generation_config are really mean to stop the text generation.
@@ -556,6 +610,28 @@ class SamplingParams:
                 self.stop_token_ids = None
 
         return self
+
+    def _setup_word_ids(self, tokenizer, add_special_tokens: bool = False) -> None:
+        """Tokenize the ``stop`` and ``bad`` strings into the token sequences the engine matches.
+
+        This only depends on the tokenizer, so it is needed whether or not ``end_id`` was
+        given explicitly.
+        """
+
+        def _encode(text):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [_encode(s) for s in strs]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [_encode(s) for s in strs]
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []
@@ -613,7 +689,7 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
-        fields = {f for f in dir(tllme.SamplingConfig) if not f.startswith("__")}
+        fields = _sampling_config_fields()
         unmatched_params = [
             "num_return_sequences",
             "beam_width",
@@ -631,34 +707,22 @@ class SamplingParams:
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(self, is_pytorch_backend: bool = False) -> tllme.OutputConfig:
-        sampling_param_fields = set(dir(SamplingParams))
-        fields = [
-            f
-            for f in dir(tllme.OutputConfig)
-            if not f.startswith("__") and f in sampling_param_fields
-        ]
+    def _get_output_config(self) -> tllme.OutputConfig:
+        fields = _output_config_fields()
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
-        if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = self.logprobs is not None
-            if self.prompt_logprobs is not None and not self.return_context_logits:
-                logger.info(
-                    "Since prompt_logprobs is requested but return_context_logits is False, "
-                    "internally enabling context logits for prompt logprobs computation. "
-                    "context logits will be dropped after computation as the user didn't explicitly request them."
-                )
-                # TODO: Find a more elegant way to do this.
-                # NOTE: This is an internal hack, so we can entirely avoid introducing
-                # `prompt_logprobs` into the executor bindings and further into
-                # model engine / sampler.
-                # This is because, prompt_logprobs is a derived quantity from
-                # context logits, and the capability to post-compute it
-                # already exists in the worker. (see _get_logprobs in worker.py)
-                config_kwargs["return_context_logits"] = True
-        else:
-            config_kwargs["return_log_probs"] = self._return_log_probs
+        config_kwargs["return_log_probs"] = self.logprobs is not None
+        if self.prompt_logprobs is not None and not self.return_context_logits:
+            logger.info(
+                "Since prompt_logprobs is requested but return_context_logits is False, "
+                "internally enabling context logits for prompt logprobs computation. "
+                "context logits will be dropped after computation as the user didn't explicitly request them."
+            )
+            # The context-output flag requests per-position predictions.
+            # Python workers carry prompt-logprob options separately to
+            # distinguish compact probability results from full logits.
+            config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:
             config_kwargs["additional_model_outputs"] = [
@@ -698,3 +762,35 @@ class SamplingParams:
             )
         else:
             return None
+
+
+_SAMPLING_PARAMS_FIELDS = tuple(f.name for f in fields(SamplingParams))
+_get_sampling_params_state = operator.attrgetter(*_SAMPLING_PARAMS_FIELDS)
+# Only its generated ``__init__`` is used: one store per field, no ``__post_init__``.
+_set_sampling_params_state = make_dataclass(
+    "_SamplingParamsState", _SAMPLING_PARAMS_FIELDS, repr=False, eq=False
+).__init__
+
+
+def _restore_sampling_params(state: tuple) -> "SamplingParams":
+    sampling_params = object.__new__(SamplingParams)
+    _set_sampling_params_state(sampling_params, *state)
+    return sampling_params
+
+
+@functools.cache
+def _sampling_config_fields() -> frozenset[str]:
+    """Return the ``tllme.SamplingConfig`` field names.
+
+    They are fixed by the bindings, so the ``dir()`` scan runs once instead of once per request.
+    """
+    return frozenset(f for f in dir(tllme.SamplingConfig) if not f.startswith("__"))
+
+
+@functools.cache
+def _output_config_fields() -> tuple[str, ...]:
+    """Return the ``tllme.OutputConfig`` field names that ``SamplingParams`` also defines."""
+    sampling_param_fields = set(dir(SamplingParams))
+    return tuple(
+        f for f in dir(tllme.OutputConfig) if not f.startswith("__") and f in sampling_param_fields
+    )

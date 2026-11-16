@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import os
 import re
@@ -17,12 +20,17 @@ import tensorrt_llm
 from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
-from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
+from tensorrt_llm._torch.models.modeling_mistral import (
+    MistralHFInputProcessor,
+    MistralNativeInputProcessor,
+)
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -170,6 +178,43 @@ def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
 
     assert "_image_token_ids" in dict(model.named_buffers())
     assert "_image_token_ids" not in model.state_dict()
+    assert model._vision_tower is not None
+    assert model._multi_modal_projector is not None
+
+
+def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
+        disable_mm_encoder=True,
+    )
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert model._vision_tower is None
+    assert model._multi_modal_projector is None
+    assert not any(
+        name.startswith(("_vision_tower", "_multi_modal_projector"))
+        for name, _ in model.named_parameters()
+    )
+
+    with mock.patch.object(model.llm, "load_weights") as load_llm_weights:
+        model.load_weights({})
+    load_llm_weights.assert_called_once()
+
+    multimodal_params = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.empty(1, 3, _PATCH_SIZE, _PATCH_SIZE),
+                "image_sizes": [[_PATCH_SIZE, _PATCH_SIZE]],
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="require a local multimodal encoder"):
+        model.encode_multimodal_inputs([multimodal_params])
 
 
 @pytest.mark.parametrize("quant_algo", [None, "FP8"])
@@ -434,7 +479,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0, False)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
@@ -642,22 +687,56 @@ def test_mistral_attention_swa_layer_types():
 # ``(h//patch)*(w//patch)`` -- deliberately *not* the hashing path's LLM-side
 # Pixtral count with framing tokens.
 # ---------------------------------------------------------------------------
-def _make_dummy_processor(*, patch_size=14, spatial_merge_size=2, image_size=1540, num_channels=3):
+def _make_dummy_processor(
+    *,
+    patch_size: int = 14,
+    spatial_merge_size: int = 2,
+    image_size: int = 1540,
+    num_channels: int = 3,
+    processor_cls: type[MistralHFInputProcessor]
+    | type[MistralNativeInputProcessor] = MistralHFInputProcessor,
+    geometry_from_processor: bool = False,
+) -> MistralHFInputProcessor | MistralNativeInputProcessor:
     """Construct a processor stub with just the geometry the dummy math reads.
 
-    Bypasses the real ``__init__`` (tokenizer/processor loading); the empty
-    ``_processor`` forces ``_vision_geometry`` to fall back to ``vision_config``
-    (the HF ``mistral3`` path).
+    Bypasses the real ``__init__`` (tokenizer/processor loading). By default the
+    empty ``_processor`` forces ``_vision_geometry`` to fall back to
+    ``vision_config`` (the HF ``mistral3`` path); ``geometry_from_processor``
+    instead exposes ``patch_size``/``image_size`` on the processor -- the
+    mistral-common source (``mm_config.image_patch_size`` / ``max_image_size``)
+    -- and blanks them on ``vision_config`` so a regression that ignores the
+    processor is caught. ``processor_cls`` selects the frontend; both share the
+    same encoder contract.
     """
-    instance = MistralHFInputProcessor.__new__(MistralHFInputProcessor)
+    instance = processor_cls.__new__(processor_cls)
     instance._config = SimpleNamespace(
         vision_config=SimpleNamespace(
-            patch_size=patch_size, image_size=image_size, num_channels=num_channels
+            patch_size=None if geometry_from_processor else patch_size,
+            image_size=None if geometry_from_processor else image_size,
+            num_channels=num_channels,
         ),
         spatial_merge_size=spatial_merge_size,
     )
-    instance._processor = SimpleNamespace()
+    instance._processor = (
+        SimpleNamespace(patch_size=patch_size, image_size=image_size)
+        if geometry_from_processor
+        else SimpleNamespace()
+    )
     instance._dtype = torch.float16
+    return instance
+
+
+def _make_text_only_native_processor() -> MistralNativeInputProcessor:
+    """A mistral-native processor for a checkpoint with no vision encoder.
+
+    ``MistralNativeInputProcessor`` serves every ``checkpoint_format="mistral"``
+    checkpoint, so `adapt_config_dict` leaves `vision_config` unset for the
+    text-only / MoE / mamba / audio shapes. Deliberately stubs *nothing* beyond
+    that config: the encoder geometry must not be reached at all, so dropping
+    the guard surfaces as an `AttributeError` rather than a soft assertion.
+    """
+    instance = MistralNativeInputProcessor.__new__(MistralNativeInputProcessor)
+    instance._config = SimpleNamespace()
     return instance
 
 
@@ -667,6 +746,96 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert set(demand) == {"image"}
     # max square = 1540 (a multiple of patch*merge=28); patches = (1540/14)^2.
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
+
+
+def test_attention_metadata_capacity_uses_token_budget():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=100) == {"attention": 25}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
+
+
+def test_mistral_item_metadata_separates_patch_and_embedding_units():
+    processor = _make_dummy_processor()
+
+    metadata = processor.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56], [56, 56]]}})
+
+    assert metadata.item_refs == (("image", 0), ("image", 1))
+    assert metadata.encoder_token_lengths == (8, 16)
+    assert metadata.output_embedding_lengths == (2, 4)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sizes, encoder_lengths, embedding_lengths",
+    [
+        ([[28, 56]], [8], [2]),
+        ([[28, 56], [28, 56]], [8, 8], [2, 2]),
+        ([[28, 56], [56, 84]], [8, 24], [2, 6]),
+    ],
+)
+def test_native_processed_images_preserve_item_sizes(
+    sizes: list[list[int]], encoder_lengths: list[int], embedding_lengths: list[int]
+) -> None:
+    """Keep unpadded per-image geometry through native processing and scheduling."""
+    proc = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
+    pixels = [
+        torch.full((3, height, width), float(i + 1)) for i, (height, width) in enumerate(sizes)
+    ]
+    encoded = transformers.BatchEncoding(
+        {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "pixel_values": [pixel.numpy() for pixel in pixels],
+            "image_sizes": sizes,
+        }
+    )
+    tokenizer = SimpleNamespace(
+        transformers_tokenizer=mock.Mock(),
+        instruct=SimpleNamespace(
+            mm_encoder=mock.Mock(
+                spec=modeling_mistral.ImageEncoder,
+                mm_config=SimpleNamespace(image_patch_size=14, max_image_size=1540),
+            )
+        ),
+    )
+
+    def apply_chat_template(
+        *args: Any, return_tensors: str | None, **kwargs: Any
+    ) -> transformers.BatchEncoding:
+        assert return_tensors is None
+        return encoded
+
+    tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
+    proc._processor = modeling_mistral.MistralCommonImageProcessor(tokenizer, proc.dtype)
+    input_ids, extra = proc.call_with_text_prompt(
+        {
+            "prompt": "Describe these images.",
+            "multi_modal_data": {"image": [Image.new("RGB", (w, h)) for h, w in sizes]},
+        },
+        tensorrt_llm.SamplingParams(),
+    )
+
+    assert input_ids == [1, 2, 3]
+    image = extra["multimodal_data"]["image"]
+    assert image["image_sizes"] == sizes
+    assert image["pixel_values"].shape == (
+        len(sizes),
+        3,
+        max(h for h, _ in sizes),
+        max(w for _, w in sizes),
+    )
+    for i, ((height, width), pixel) in enumerate(zip(sizes, pixels)):
+        torch.testing.assert_close(
+            image["pixel_values"][i, :, :height, :width], pixel.to(proc.dtype)
+        )
+        assert torch.count_nonzero(image["pixel_values"][i, :, height:]) == 0
+        assert torch.count_nonzero(image["pixel_values"][i, :, :, width:]) == 0
+    metadata = proc.get_mm_item_metadata(input_ids, extra["multimodal_data"])
+    metadata.validate()
+    assert metadata.item_refs == tuple(("image", i) for i in range(len(sizes)))
+    assert metadata.encoder_token_lengths == tuple(encoder_lengths)
+    assert metadata.output_embedding_lengths == tuple(embedding_lengths)
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
@@ -689,24 +858,143 @@ def test_dummy_get_size_rejects_non_positive_budget():
         proc.get_size_for_max_tokens(max_tokens=0)
 
 
-@pytest.mark.parametrize("budget", [4096, 8192])
-def test_dummy_get_dummy_mm_data_for_tokens_shapes_and_saturation(budget):
-    proc = _make_dummy_processor(num_channels=3)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float16
-    )
-    image = data["image"]
-    pv = image["pixel_values"]
-    sizes = image["image_sizes"]
-    n, c, h, w = pv.shape
-    assert c == 3 and pv.dtype == torch.float16
-    assert sizes == [[h, w]] * n
-    # The batch saturates the budget: total patches <= budget, within one image.
-    per_image = (h // 14) * (w // 14)
-    assert n * per_image <= budget
-    assert n * per_image + per_image > budget
-
-
-def test_dummy_for_tokens_empty_without_image_budget():
+def test_dummy_get_dummy_mm_data_rejects_negative_item_count():
     proc = _make_dummy_processor()
-    assert proc.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"audio": 1024}) == {}
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": -1})
+
+
+@pytest.mark.parametrize("budget", [4096, 8192])
+def test_dummy_get_dummy_mm_data_saturates_budget(budget):
+    proc = _make_dummy_processor()
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": 1},
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, channels, height, width = pixel_values.shape
+    assert num_images == 1
+    assert channels == 3
+    assert image["image_sizes"] == [[height, width]]
+    per_image = (height // 14) * (width // 14)
+    assert per_image <= budget
+    assert 2 * per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_respects_requested_item_count():
+    proc = _make_dummy_processor(image_size=448)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 3},
+        dtype=torch.float16,
+    )["image"]
+
+    assert image["pixel_values"].shape[0] == 3
+
+
+def test_dummy_mm_data_satisfies_the_encoder_input_contract():
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real batching step instead of restating its
+    expectations here, so a change on either side fails this test.
+    """
+    proc = _make_dummy_processor()
+    budget = 8192
+    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
+    num_images = min(8, budget // tokens_per_image)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": num_images},
+        dtype=torch.float16,
+    )["image"]
+
+    # `_vision_forward` collects one entry per request and converts the sizes to
+    # tensors before batching; mirror that, then run the real batching step.
+    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values=[image["pixel_values"]],
+        image_sizes=[torch.tensor(image["image_sizes"])],
+    )
+
+    num_images = image["pixel_values"].shape[0]
+    assert batched_pixel_values.shape[0] == num_images
+    assert batched_sizes.shape == (num_images, 2)
+    assert batched_pixel_values.dtype == torch.float16
+
+
+# ---------------------------------------------------------------------------
+# MM encoder item scheduling is enabled from the *model* class
+# (`Mistral3VLM.supports_mm_encoder_item_scheduling`), but the contract it
+# implies is required of the *input processor*, and `create_input_processor`
+# picks the processor from `checkpoint_format` alone. Both Mistral frontends
+# therefore have to satisfy the contract.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "processor_cls, geometry_from_processor",
+    [(MistralHFInputProcessor, False), (MistralNativeInputProcessor, True)],
+    ids=["hf-config", "native-processor"],
+)
+@pytest.mark.cpu_only
+def test_both_mistral_processors_satisfy_item_scheduling_contract(
+    processor_cls: type[MistralHFInputProcessor] | type[MistralNativeInputProcessor],
+    geometry_from_processor: bool,
+) -> None:
+    """Check encoder budgets, request metadata, and dummy inputs for both frontends."""
+    proc = _make_dummy_processor(
+        processor_cls=processor_cls, geometry_from_processor=geometry_from_processor
+    )
+    budget = 8192
+
+    # Exercise the sequence `ModelEngine.__init__` runs for item scheduling.
+    max_tokens_per_item = proc.get_mm_max_tokens_per_item()
+    assert max_tokens_per_item == {"image": 12100}
+
+    capacity = proc.get_mm_encoder_attention_metadata_capacity(budget)
+    assert capacity == {"attention": 2048}
+
+    max_output_embeddings = proc.get_max_mm_encoder_output_embeddings(budget)
+    assert max_output_embeddings == 2048
+
+    # ...and the request-routing hook, which gates the item-scheduled path.
+    metadata = proc.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56]]}})
+    assert metadata is not None
+    metadata.validate()
+    assert metadata.item_refs == (("image", 0),)
+    assert metadata.encoder_token_lengths == (8,)
+    assert metadata.output_embedding_lengths == (2,)
+
+    dummy = proc.get_dummy_mm_data(max_num_encoder_tokens=16, mm_counts={"image": 1})
+    assert dummy["image"]["pixel_values"].shape == (1, 3, 56, 56)
+    assert dummy["image"]["pixel_values"].dtype == proc.dtype
+    assert dummy["image"]["image_sizes"] == [[56, 56]]
+    dummy_metadata = proc.get_mm_item_metadata([], dummy)
+    assert dummy_metadata is not None
+    dummy_metadata.validate()
+    assert dummy_metadata.item_refs == (("image", 0),)
+    assert dummy_metadata.encoder_token_lengths == (16,)
+    assert dummy_metadata.output_embedding_lengths == (4,)
+
+
+# The native processor is shared by every `checkpoint_format="mistral"`
+# checkpoint, including the text-only / MoE / mamba / audio shapes that carry no
+# `vision_config` at all. Those must keep the base class's neutral behaviour
+# rather than raising `AttributeError` out of the encoder geometry -- the engine
+# calls `get_mm_max_tokens_per_item` unconditionally.
+@pytest.mark.cpu_only
+def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
+    proc = _make_text_only_native_processor()
+
+    assert proc.get_mm_max_tokens_per_item() == {}
+    assert proc.get_max_mm_encoder_output_embeddings(8192) is None
+    assert proc.get_mm_encoder_attention_metadata_capacity(8192) is None
+    # A text-only request carries no image payload, which the routing hook
+    # already treats as "not item-scheduled".
+    assert proc.get_mm_item_metadata([], {}) is None
+    assert proc.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56]]}}) is None
+
+    # The memory profiler treats `NotImplementedError` as "skip MM profiling".
+    with pytest.raises(NotImplementedError):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=8192, mm_counts={"image": 1})

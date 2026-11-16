@@ -32,13 +32,16 @@ Prerequisites:
   pip install lmcache
 
 How to run:
-  PYTHONHASHSEED=0 python llm_lmcache_connector.py Qwen/Qwen2-1.5B-Instruct
+  PYTHONHASHSEED=0 LMCACHE_CHUNK_SIZE=32 \
+    python llm_lmcache_connector.py Qwen/Qwen2-1.5B-Instruct
 
 Note: PYTHONHASHSEED=0 must be set before the Python process starts
 to ensure deterministic cache key hashing in LMCache.
 
 Expected output:
-  Second request logs show "Retrieved N tokens" and both outputs are identical.
+  The first request logs "Stored N ... tokens". The second request logs
+  "Retrieved N ... tokens" with N > 0, then the script prints
+  "OK: outputs match." The LMCache retrieval log is the cache-hit signal.
 
 See Also:
   examples/llm-api/configs/trtllm_lmcache_connector_extra.yaml -- trtllm-serve YAML
@@ -71,12 +74,14 @@ _TEST_PROMPT = (
 @click.command()
 @click.argument("model", type=str)
 def main(model: str):
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+    # Match LMCACHE_CHUNK_SIZE and disable TensorRT-LLM's in-GPU block reuse.
+    # Otherwise it can serve the repeated prompt without exercising LMCache.
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, tokens_per_block=32)
     kv_connector_config = KvCacheConnectorConfig(connector="lmcache")
     sampling_params = SamplingParams(max_tokens=32)
 
-    # Both requests go to the same LLM instance so the in-process LMCache
-    # engine (and its CPU memory cache) survives between the two calls.
+    # The in-process LMCache engine is scoped to the LLM instance, so both
+    # requests use the same instance.
     llm = LLM(
         model=model,
         backend="pytorch",
@@ -84,22 +89,20 @@ def main(model: str):
         kv_connector_config=kv_connector_config,
     )
 
-    print("--- First request (cold cache, KV will be computed and stored) ---")
+    print("--- First request (cold LMCache; KV will be stored) ---")
     output0 = llm.generate([_TEST_PROMPT], sampling_params)
     text0 = output0[0].outputs[0].text
     print("First output:", text0)
 
-    print("\n--- Second request (warm cache, KV should be retrieved) ---")
+    print("\n--- Second request (warm LMCache; watch for 'Retrieved N ... tokens') ---")
     output1 = llm.generate([_TEST_PROMPT], sampling_params)
     text1 = output1[0].outputs[0].text
-    print("Second output (using LMCache KV cache):", text1)
+    print("Second output:", text1)
 
     assert text0 == text1, (
-        f"Outputs differ — cache reuse may not have worked correctly.\n"
-        f"First:  {text0!r}\n"
-        f"Second: {text1!r}"
+        f"Outputs differ between identical requests.\nFirst:  {text0!r}\nSecond: {text1!r}"
     )
-    print("\nOK: outputs match, LMCache KV reuse confirmed.")
+    print("\nOK: outputs match. The LMCache retrieval log above confirms external KV reuse.")
 
     destroy_engine()
 

@@ -48,13 +48,17 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
+from tensorrt_llm._torch.pyexecutor.hang_diagnostics import HANG_DIAGNOSTICS_ENV  # noqa: E402
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
 
 # These dummy models are tiny, but the default KV-cache fraction sizes the pool
 # to most of the (very large B200) device memory, leaving nothing for the other
 # executor components -> OOM at executor creation. Cap it so the whole pipeline
 # fits regardless of card size.
-_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5)
+# These tests never offload KV pages, so also skip the host tier that KV cache
+# manager V2 otherwise sizes to match the device pool: tens of GiB of pinned
+# host memory that executor startup must populate and shutdown must release.
+_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5, host_cache_size=0)
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {
@@ -233,8 +237,11 @@ def test_e2e_text_e2b_dummy():
 
 
 @requires_gemma4_transformers
-def test_e2e_text_31b_dummy():
+@pytest.mark.timeout(600)
+def test_e2e_text_31b_dummy(monkeypatch):
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""
+    # Preserve worker phase and CUDA completion state if this rare CI stall recurs.
+    monkeypatch.setenv(HANG_DIAGNOSTICS_ENV, "1")
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["31B"])
     try:
         llm = LLM(

@@ -1,14 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-import subprocess
-import sys
 
 import pytest
-from utils.util import skip_gpu_memory_less_than_80gb, skip_pre_hopper
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+__extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
+from utils.util import skip_gpu_memory_less_than_80gb, skip_pre_hopper
 
 
 @pytest.fixture(scope="module")
@@ -44,11 +57,9 @@ def dataset_path(dataset_name: str):
 
 
 @skip_gpu_memory_less_than_80gb
-@pytest.mark.parametrize("model_name", [
-    "llama-3.1-model/Meta-Llama-3.1-8B",
-    pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)
-],
-                         indirect=True)
+@pytest.mark.parametrize(
+    "model_name", [pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)],
+    indirect=True)
 def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
                                 model_path: str):
     model_name = model_path.split("/")[-1]
@@ -74,11 +85,6 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
         "1.0",
     ]
 
-    # CalledProcessError will be raised if any errors occur
-    result = subprocess.run(benchmark_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True)
+    result = run_command_with_output(benchmark_cmd, timeout=3600)
     assert result.returncode == 0
-    assert "Serving Benchmark Result" in result.stdout
+    assert "Serving Benchmark Result" in result.stdout, result.stdout

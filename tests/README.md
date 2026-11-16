@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # How to run TRT-LLM tests
 
 ## 1. Unit test (Python)
@@ -55,7 +60,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype"
+pytest "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
@@ -76,16 +81,26 @@ pytest -k llmapi --co -q
 You can set the output directory for logs/runtime data using the --output-dir flag.
 For more options, refer to pytest --help, paying attention to Custom options added for TRT-LLM.
 
+### Optional media dependencies
+
+Video multimodal and VisualGen tests need optional packages that are not part of
+the default install (OpenCV, and for VisualGen also PyAV / ffmpeg).
+
+If these are already installed, tests proceed without further action. Otherwise
+set the following to auto-install missing packages:
+
+```bash
+export TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1
+```
+
+When set, an autouse session fixture installs `opencv-python-headless` if needed,
+and VisualGen fixtures additionally install `av` and `ffmpeg` if needed. If the
+packages are missing and the flag is unset, those fixtures fail with an install
+hint.
+
 ### Common issues:
 
-1. `trtllm-build: not found`
-
-    Many of the test cases use `trtllm-build` command to build engines.
-    If you meet the error of `trtllm-build: not found`, you should add the `trtllm-build` path into your `PATH` env before launchig pytest. Normally if you install trtllm in the `$HOME/.local` or use `pip install -e ./` to install trtllm in-place, the trtllm-build command should be located in `$HOME/.local/bin`.
-
-    Thus you should do `export PATH=$HOME/.local/bin:$PATH` before running the pytest
-
-2. The `LLM_MODELS_ROOT` is not set correctly
+1. The `LLM_MODELS_ROOT` is not set correctly
 
     ```bash
         AssertionError: ...llm-models/gpt2-medium does not exist, and fail_if_path_is_invalid is True, please check the cache directory
@@ -102,10 +117,9 @@ For more options, refer to pytest --help, paying attention to Custom options add
 
 TRT-LLM C++ runtime tests are using [google-test](https://github.com/google/googletest) framework, and Pytest is used to run sets of these tests.
 
-The C++ runtime relies on TRT-LLM python frontend to generate engines as test data, so there are scripts to generate the engines in the C++ test [resources directory](../cpp/tests/resources/).
-Pytest calls these scripts from fixtures prior to launching the test cases.
-
-Details on usage of the resources scripts can be found in the [C++ Test document](../cpp/tests/README.md).
+The current C++ unit tests exercise shared runtime components and kernels. They are launched by
+[`test_unit_tests.py`](integration/defs/cpp/test_unit_tests.py).
+The targets are defined in [`cpp/tests/CMakeLists.txt`](../cpp/tests/CMakeLists.txt).
 
 ## 4. Performance regression test
 
@@ -123,15 +137,17 @@ In file `jenkins/L0_Test.groovy`, the variables `x86TestConfigs`, `SBSATestConfi
 
 Currently the yml files are manually maintained, which requires developer to update them when new test cases are added.
 
-### How to choose GPU type
+### How to choose whether a GPU is needed and which GPU type
 
-The CI resource of each GPU type is different. Usually you should choose the cheapest GPU that fulfills test requirements. In most cases, an integration test case should only run on one GPU type, unless it's very important or has different behaviours on different GPUs.
+While TensorRT LLM is GPU-centric, the specific feature covered by a unit test may not need to interact with a GPU on its own. For unit tests that do not intrinsically require a GPU, prefer the CPU-only stages to avoid reserving unnecessary GPU resources. The CPU-only option applies only to unit tests.
 
-The priority is A10 > A30 > L40s > A100 > H100 > B200.
+When a test requires a GPU, choose the cheapest GPU that fulfills its requirements. In most cases, an integration test case should run on only one GPU type, unless it is especially important or behaves differently on different GPUs.
+
+The priority is A10 > A30 > L40S > A100 > H100 > B200.
 
 ## 2. Add an integration test
 
-Integrations tests usually run entire workflow, containing checkpoint converting, engine building and evaluating, to check functional and accuracy.
+Integration tests exercise model loading, inference, serving, and evaluation to check functionality and accuracy. Tests requiring model weights need GPU access and a valid `LLM_MODELS_ROOT`.
 
 Integration tests are stored in [`integration/defs`](./integration/defs). In particular, please see [`integration/defs/accuracy`](./integration/defs/accuracy) for more detailed guidance to add accuracy tests.
 
@@ -140,6 +156,8 @@ Once a new integration test case is added, the yml files must be updated to cont
 ## 3. Add a unit test
 
 A unit test are used to test a standalone feature or building block, and only runs partial workflow.
+
+Mark a unit test that does not require a GPU to run with `@pytest.mark.cpu_only` or file-level `pytestmark = pytest.mark.cpu_only`. Only these tests run in the CPU-only stages. You can define CPU and GPU cases in the same test file.
 
 For legacy and case management reason, the CI doesn't run unit tests directly. It uses a bridge to map multiple unit test cases into one integration test case, and manages these bridged cases.
 The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_generate_tests` function in `tests/integration/defs/conftest.py`.
@@ -161,9 +179,9 @@ pytest unittest/an_existing_file.py -m "part0 and gpu2" # run some cases in a fi
 ```
 
 2. Check existing bridge cases and make sure your cases are not covered by an existing one.
-For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not thrid_keyword"` which covers your filter.
+For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not third_keyword"` which covers your filter.
 
-3. Choose a suitable GPU and add a line of your cases. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
+3. Choose a suitable CI stage and add a line to the corresponding test list config. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
 
 ## 4. Run a CI stage locally
 

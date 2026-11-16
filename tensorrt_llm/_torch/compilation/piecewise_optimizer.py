@@ -1,4 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
+import os
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
 
@@ -11,13 +15,18 @@ from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
+from ..nccl_window_graph import nccl_window_graph_capture
 from ..utils import (get_model_extra_attrs,
-                     get_per_request_piecewise_cuda_graph_flag,
+                     get_per_request_prefill_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import (get_capture_piecewise_cuda_graph_flag,
                     get_optional_trtllm_op, is_call_function)
+
+# TLLM_PWCG_NVTX_PROBE=1 brackets every piecewise runner call in an NVTX range
+# (host-side attribution of the glue between graph launches in nsys traces).
+_PWCG_NVTX_PROBE = os.environ.get("TLLM_PWCG_NVTX_PROBE", "0") == "1"
 
 
 def _piecewise_boundary_ops():
@@ -26,6 +35,7 @@ def _piecewise_boundary_ops():
         "mla_custom_op_inplace",
         "mla_dsa_attn_inplace",
         "gdn_custom_op_inplace",
+        "mamba2_custom_op_inplace",
         "minimax_m3_attn_custom_op_inplace",
     ]
     return [
@@ -143,6 +153,8 @@ class Entry:
 
 class PiecewiseRunner(object):
 
+    WARMUP_STEPS = 3
+
     def __init__(
         self,
         graph: GraphModule,
@@ -191,6 +203,15 @@ class PiecewiseRunner(object):
             entry.output = None
 
     def __call__(self, *args):
+        if _PWCG_NVTX_PROBE:
+            torch.cuda.nvtx.range_push("pwcg_runner")
+            try:
+                return self._call(*args)
+            finally:
+                torch.cuda.nvtx.range_pop()
+        return self._call(*args)
+
+    def _call(self, *args):
         runtime_num_of_token = None
         if self.runtime_num_tokens_idx != None:
             runtime_num_of_token = int(
@@ -202,7 +223,7 @@ class PiecewiseRunner(object):
         if (runtime_num_of_token is None
                 or runtime_num_of_token not in self.entries
                 or not get_piecewise_cuda_graph_flag()
-                or not get_per_request_piecewise_cuda_graph_flag()):
+                or not get_per_request_prefill_cuda_graph_flag()):
             return self.default_callable(*args)
 
         if self.is_first_runner or self.is_last_runner:
@@ -222,7 +243,7 @@ class PiecewiseRunner(object):
             if not get_capture_piecewise_cuda_graph_flag():
                 return entry.callable(*args)
 
-            if entry.warmup_count < 3:
+            if entry.warmup_count < self.WARMUP_STEPS:
                 entry.warmup_count += 1
                 return entry.callable(*args)
 
@@ -239,7 +260,7 @@ class PiecewiseRunner(object):
                 # it's ready rather than capture it ourselves
                 # Graph Capture would override the stream. We need to setup the stream correctly.
                 extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                with nccl_window_graph_capture(graph, self.graph_pool_handle):
                     extra_attrs["global_stream"] = torch.cuda.current_stream()
                     output = entry.callable(*args)
                 extra_attrs["global_stream"] = torch.cuda.current_stream()
@@ -275,7 +296,6 @@ def piecewise_optimizer(
     enable_inductor: bool,
     input_num_tokens: Union[int | torch.SymInt],
     capture_num_tokens: Sequence[int],
-    graph_pool_handle: tuple[int, int],
     max_num_streams: int = 1,
 ) -> tuple[GraphModule, int, List[PiecewiseRunner]]:
     graph_pool_handle = torch.cuda.graph_pool_handle()

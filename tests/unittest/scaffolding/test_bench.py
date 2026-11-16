@@ -17,6 +17,8 @@ from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy, ConstantRateStrategy, LoadGenerationStrategy,
     PoissonRateStrategy, SynchronousStrategy, ThroughputStrategy)
 
+pytestmark = pytest.mark.cpu_only
+
 OUTPUT_STR = "Yes."
 
 

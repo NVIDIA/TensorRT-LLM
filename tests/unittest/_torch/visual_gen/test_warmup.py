@@ -3,13 +3,177 @@
 
 """Tests for VisualGen warmup configuration, plan resolution, and shape validation."""
 
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from pydantic import ValidationError
 
+import tensorrt_llm._torch.visual_gen.cuda_graph_runner as graph_runner_module
+import tensorrt_llm._torch.visual_gen.pipeline as pipeline_module
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.visual_gen.args import CompilationConfig, VisualGenArgs
+
+
+def test_graph_capture_warmups_discard_outputs(monkeypatch):
+    discarded = []
+
+    @contextlib.contextmanager
+    def discard(inputs):
+        discarded.append(inputs)
+        yield
+
+    monkeypatch.setattr(graph_runner_module, "discard_nccl_window_tensor_outputs", discard)
+    monkeypatch.setattr(graph_runner_module.torch.cuda, "CUDAGraph", MagicMock)
+    monkeypatch.setattr(graph_runner_module.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(graph_runner_module.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(graph_runner_module.torch.cuda, "graph_pool_handle", lambda: (1, 2))
+    monkeypatch.setattr(
+        graph_runner_module, "nccl_window_graph_capture", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(graph_runner_module.gc, "collect", lambda: None)
+
+    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    runner.capture((), lambda marker: marker, (1,), {})
+
+    assert len(discarded) == runner.WARMUP_STEPS
+
+
+def test_cleanup_releases_distinct_nccl_window_graph_owners_after_graph_reset(monkeypatch):
+    class FakeCUDAGraph:
+        def __init__(self):
+            self.was_reset = False
+
+        def reset(self):
+            self.was_reset = True
+
+    first_pool = (1, 2)
+    second_pool = (3, 4)
+    graphs = [FakeCUDAGraph(), FakeCUDAGraph(), FakeCUDAGraph()]
+    runners = {}
+    for name, graph, pool in (
+        ("first", graphs[0], first_pool),
+        ("second", graphs[1], first_pool),
+        ("third", graphs[2], second_pool),
+    ):
+        runner = CUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True, cuda_graph_mem_pool=pool)
+        )
+        runner.graphs = {"decode": graph}
+        runners[name] = runner
+
+    pipeline = object.__new__(BasePipeline)
+    pipeline._profiler = MagicMock()
+    pipeline.offloader = MagicMock()
+    pipeline._cuda_graph_runners = runners
+    released_pools = []
+
+    def release_graph_pool(graph_pool):
+        assert all(graph.was_reset for graph in graphs)
+        assert all(not runner.graphs for runner in runners.values())
+        released_pools.append(graph_pool)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "release_nccl_window_graph_owner",
+        release_graph_pool,
+    )
+
+    pipeline.cleanup()
+
+    pipeline._profiler.close_window.assert_called_once_with()
+    assert set(released_pools) == {first_pool, second_pool}
+    assert len(released_pools) == 2
+    assert all(runner.memory_pool is None for runner in runners.values())
+
+
+def test_request_scopes_nccl_window_outputs(monkeypatch):
+    events = []
+    anchor = object()
+    output = object()
+
+    class Scope:
+        def __enter__(self):
+            events.append(("begin", anchor))
+            return self
+
+        def escape(self, value):
+            events.append(("escape", value))
+            return value
+
+        def __exit__(self, *args):
+            events.append(("end",))
+
+    pipeline = object.__new__(BasePipeline)
+    pipeline._is_warmup = True
+    pipeline._profiler = MagicMock()
+    pipeline._nccl_window_tensor_scope_anchor = lambda: anchor
+    pipeline.infer = lambda req: output
+    monkeypatch.setattr(pipeline_module, "nccl_window_tensor_scope", lambda value: Scope())
+
+    assert pipeline.run_inference(object()) is output
+    assert events == [("begin", anchor), ("escape", output), ("end",)]
+
+
+def test_transformer_blocks_receive_nccl_window_scopes(monkeypatch):
+    class Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+
+    handles = [MagicMock(), MagicMock()]
+    captured = []
+
+    def install(modules):
+        captured.extend(modules)
+        return handles
+
+    pipeline = object.__new__(BasePipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_config = MagicMock(allreduce_strategy=AllReduceStrategy.NCCL)
+    pipeline.mapping = MagicMock(tp_size=2)
+    pipeline.transformer = Transformer()
+    pipeline._nccl_window_tensor_scope_hooks = []
+    monkeypatch.setattr(
+        type(pipeline), "transformer_components", property(lambda self: ["transformer"])
+    )
+    monkeypatch.setattr(pipeline_module, "install_module_nccl_window_tensor_scopes", install)
+
+    pipeline._install_nccl_window_tensor_scope_hooks()
+    assert captured == list(pipeline.transformer.blocks)
+    assert pipeline._nccl_window_tensor_scope_hooks == handles
+
+    pipeline._remove_nccl_window_tensor_scope_hooks()
+    for handle in handles:
+        handle.remove.assert_called_once_with()
+
+
+def test_warmup_pass_discards_nccl_window_outputs(monkeypatch):
+    events = []
+    anchor = object()
+
+    @contextlib.contextmanager
+    def discard(value):
+        events.append(("begin", value))
+        yield
+        events.append(("end",))
+
+    pipeline = object.__new__(BasePipeline)
+    pipeline._nccl_window_tensor_scope_anchor = lambda: anchor
+    pipeline._run_warmup = lambda *args: events.append(("warmup", args))
+    monkeypatch.setattr(pipeline_module, "discard_nccl_window_tensor_outputs", discard)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "synchronize", lambda: None)
+
+    pipeline._run_warmup_pass([(16, 32, 1)], 2)
+
+    assert events == [
+        ("begin", anchor),
+        ("warmup", (16, 32, 1, 2)),
+        ("end",),
+    ]
 
 
 class TestCompilationConfig:
@@ -104,6 +268,8 @@ class _BaseStubPipeline(BasePipeline):
         self._warmed_up_shapes = set()
         self.pipeline_config = MagicMock()
         self.pipeline_config.compilation = warmup_cfg or CompilationConfig()
+        # warmup() branches on this; keep the stub on the plain (no-autotune) path.
+        self.pipeline_config.torch_compile.enable_autotune = False
 
     def forward(self, *args, **kwargs):
         pass
@@ -285,6 +451,66 @@ class TestWarmupExecution:
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
         assert pipe._warmed_up_shapes == {(480, 832, 33)}
+
+
+class TestWarmupPhasing:
+    """warmup() tune/merge/capture phasing: number of warmup passes per config.
+
+    Fully mocked (autotune, communicator, dist, the pass itself) so it exercises
+    the branch logic without a GPU or a real process group.
+    """
+
+    def _count_passes(self, monkeypatch, *, enable_autotune, world_size, cuda_graph_enable):
+        import tensorrt_llm._torch.visual_gen.pipeline as pmod
+
+        pipe = _make_stub_pipeline(CompilationConfig(resolutions=[(480, 832)], num_frames=[33]))
+        pipe.pipeline_config.torch_compile.enable_autotune = enable_autotune
+        pipe.pipeline_config.cuda_graph.enable = cuda_graph_enable
+
+        passes = {"n": 0}
+        monkeypatch.setattr(
+            pipe, "_run_warmup_pass", lambda shapes, steps: passes.__setitem__("n", passes["n"] + 1)
+        )
+        monkeypatch.setattr(pipe, "disallow_cuda_graph_capture", lambda: contextlib.nullcontext())
+        monkeypatch.setattr(pmod, "autotune", lambda **kw: contextlib.nullcontext())
+        monkeypatch.setattr(pmod, "_VisualGenAutotuneDist", lambda amap: object())
+        monkeypatch.setattr(pmod.dist, "is_initialized", lambda: world_size > 1)
+        monkeypatch.setattr(pmod.dist, "get_world_size", lambda: world_size)
+
+        pipe.warmup()
+        return passes["n"]
+
+    def test_no_autotune_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=False, world_size=1, cuda_graph_enable=True
+            )
+            == 1
+        )
+
+    def test_single_rank_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=1, cuda_graph_enable=True
+            )
+            == 1
+        )
+
+    def test_multi_rank_two_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=2, cuda_graph_enable=True
+            )
+            == 2
+        )
+
+    def test_multi_rank_graph_off_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=2, cuda_graph_enable=False
+            )
+            == 1
+        )
 
 
 class TestRequestValidation:

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "groupGemm.h"
 #include "splitkGroupGemm.h"
 
 #include "cutlass/cutlass.h"
@@ -35,7 +36,6 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-
 int64_t inline getGemmCoordSize(int64_t problemCount)
 {
     return (int64_t) (tensorrt_llm::common::divUp(problemCount * sizeof(cutlass::gemm::GemmCoord), 16) * 16);
@@ -232,6 +232,18 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes
     bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+
+#ifdef ENABLE_FP8
+    if (dataType == tensorrt_llm::DataType::kFP8)
+    {
+        // CUTLASS 3.x has no split-K grouped FP8 kernel. Reuse the regular
+        // cooperative implementation, which is also the intended split-K fallback.
+        groupedGemm(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace,
+            gemmWorkSpaceSize, isLoraIn, dataType, minKN, stream);
+        return;
+    }
+#endif // ENABLE_FP8
+
     if (isLoraIn)
     {
         // K >> N, like K = 1024, N = 8

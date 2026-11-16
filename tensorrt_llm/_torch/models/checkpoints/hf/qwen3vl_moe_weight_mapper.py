@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from torch import nn
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeTextConfig,
@@ -6,10 +9,11 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Qwen3VLMoeForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen3VLMoeForConditionalGeneration")
 class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
     def handle_special_instance_module(
         self,
@@ -18,7 +22,7 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoE):
+        if is_moe_weight_owner(module):
             # Qwen3VL MoE uses MoEWeightLoadingMode.FUSED_GATE_UP_PROJ, whose
             # loader expects gate_up_proj in [E, H, 2*I] and down_proj in
             # [E, I, H] format, but HF stores them transposed:

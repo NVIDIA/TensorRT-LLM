@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate the SLURM launch script for multi-node PerfSanity tests (CI mode).
 
 Unified replacement for jenkins/scripts/perf/aggregated/submit.py and
@@ -7,50 +22,370 @@ jenkins/scripts/perf/disaggregated/submit.py.
 Three test shapes are supported (all flow through the same parsing logic):
   1. Multi-node aggregated:        aggr[_upload]-{config_base}-{server_name}
         runtime_mode = "aggregated", benchmark_mode = None
-  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only-{config_base}
-        runtime_mode = "aggregated", benchmark_mode = "ctx_only"
-        (reads disagg yaml, but launches via the aggregated single-pytest path
-         using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+  2. Disagg yaml on the agg path:  aggr[_upload]-{ctx_only|gen_only_no_context}
+                                     [-{modifier}]-{config_base}
+        runtime_mode = "aggregated", benchmark_mode in AGGREGATED_DISAGG_YAML_MODES
+        (both read a disagg yaml but launch via the aggregated single-pytest path)
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
+        runtime_mode = "disaggregated", benchmark_mode in DISAGG_BENCHMARK_MODES
+        (four roles, one pytest each, rendezvousing through the hostnames dir)
+
+The optional {modifier} segment is an instrumentation flag that is orthogonal to
+the benchmark mode; the only one today is "time_breakdown", which launches
+exactly like its bare mode and differs only in what the harness asks the servers
+and the client to record.
 
 Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
 
 import argparse
+import heapq
+import json
 import math
 import os
 import re
+import shlex
+import sys
+from typing import List, Optional, Tuple
 
 import yaml
+from benchmark_utils import (
+    AGGREGATED_DISAGG_YAML_MODES,
+    DISAGG_BENCHMARK_MODES,
+    GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
+    ctx_only_world_size,
+    dwdp_ctx_layout,
+    dwdp_ctx_size,
+    gen_only_no_context_server_counts,
+    gen_only_no_context_world_size,
+    is_gen_only_no_context,
+    parse_positive_concurrency,
+)
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
+
+# Optional instrumentation segments that may follow the benchmark mode in a test
+# id. Keep in sync with test_perf_sanity.py:TEST_ID_MODIFIERS -- the grammar is
+# only decidable because no config file stem starts with one of these.
+TIME_BREAKDOWN_MODIFIER = "time_breakdown"
+TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
+
+# Benchmark modes test_perf_sanity.py actually mints a time_breakdown test id
+# for. gen_only is deliberately absent: its regression metric is the gen-worker
+# device step time, so the lifecycle spans add nothing there, and the collector
+# generates no such id. Keep in sync with the two *_TIME_BREAKDOWN_CONFIGS loops
+# in test_perf_sanity.py:get_disagg_test_cases and with the identical constant in
+# jenkins/scripts/perf/local/submit.py.
+TIME_BREAKDOWN_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
 # --------------------------------------------------------------------------- #
 # Test list parsing
 # --------------------------------------------------------------------------- #
-def parse_test_case_name(test_list_path, llm_src, split_group=0):
-    """Parse the selected line of the test list.
+def _read_test_list_lines(test_list_path):
+    """Read runnable entries from a generated test list.
 
-    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
-    See the module docstring for the supported test name shapes.
+    Args:
+        test_list_path: Path to the generated test-list file.
+
+    Returns:
+        Non-empty, non-comment test-list lines in source order.
+
+    Raises:
+        ValueError: If the test list has no runnable entries.
     """
     with open(test_list_path, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
-
+        lines = []
+        for line in f:
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith("#"):
+                lines.append(stripped_line)
     if not lines:
         raise ValueError(f"Test list is empty: {test_list_path}")
+    return lines
 
-    if split_group > 0:
+
+def _pytest_command_tokens(script_prefix_lines):
+    """Parse the exported pytest command from a launch-script prefix.
+
+    Args:
+        script_prefix_lines: Lines from the launch-script prefix.
+
+    Returns:
+        Shell-parsed pytest command tokens, or an empty list when the export is absent.
+    """
+    pytest_command_line = next(
+        (line for line in script_prefix_lines if "export pytestCommand=" in line), ""
+    )
+    if not pytest_command_line:
+        return []
+    command = pytest_command_line.split("=", 1)[1].strip()
+    if len(command) >= 2 and command[0] == command[-1] and command[0] in ('"', "'"):
+        command = command[1:-1]
+    return shlex.split(command)
+
+
+def _pytest_option(tokens, option):
+    """Return a pytest option's value from command tokens.
+
+    Args:
+        tokens: Shell-parsed pytest command tokens.
+        option: Option name to find, including its leading dashes.
+
+    Returns:
+        The option value, or ``None`` when the option or its value is absent.
+    """
+    for index, token in enumerate(tokens):
+        if token == option:
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token.startswith(f"{option}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _test_nodeid(test_line):
+    """Strip test-list markers from a line to recover pytest's node ID.
+
+    Args:
+        test_line: Test-list entry, optionally followed by execution markers.
+
+    Returns:
+        The pytest node ID from the entry.
+    """
+    return re.split(
+        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)",
+        test_line,
+        maxsplit=1,
+    )[0]
+
+
+def _test_marker(test_line):
+    """Return a test-list execution marker, or ``None`` when absent."""
+    line = test_line.partition("#")[0].strip()
+    match = re.search(r"\s+(XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)", line)
+    return match.group(1) if match else None
+
+
+def selected_test_is_skip_waived(selected_test_line, waives_file, test_prefix=None):
+    """Whether pytest will skip the selected case before executing its body.
+
+    The CI pipeline merges remote waives into the repository waives file
+    before invoking this launcher. Mirror the exact-nodeid SKIP decision here
+    so a skipped test does not run an otherwise unrelated precheck first.
+    """
+    if _test_marker(selected_test_line) == "SKIP":
+        return True
+
+    selected_nodeid = _test_nodeid(selected_test_line).strip()
+    try:
+        waive_lines = _read_test_list_lines(waives_file)
+    except (FileNotFoundError, ValueError):
+        return False
+
+    for line in waive_lines:
+        if _test_marker(line) != "SKIP":
+            continue
+        waived_nodeid = _test_nodeid(line).strip()
+        if waived_nodeid.startswith("full:"):
+            scope, separator, waived_nodeid = waived_nodeid[5:].partition("/")
+            if not separator or not test_prefix:
+                continue
+            # Match the platform-prefix handling in test_list_parser. SM
+            # waives require runtime GPU discovery and remain pytest-owned.
+            platform_prefix = test_prefix.split("-", 1)[0]
+            if scope.startswith("sm") or platform_prefix not in scope:
+                continue
+        if waived_nodeid == selected_nodeid:
+            return True
+    return False
+
+
+def _load_pytest_split_durations(tokens, llm_src):
+    """Load pytest-split duration data using the launcher's path fallback.
+
+    Args:
+        tokens: Shell-parsed pytest command tokens.
+        llm_src: TensorRT-LLM source-tree path used for the repository fallback.
+
+    Returns:
+        A pair containing the duration mapping and the path it was loaded from.
+
+    Raises:
+        FileNotFoundError: If neither the configured path nor its repository fallback exists.
+        ValueError: If the duration data is not a mapping or legacy list of pairs.
+    """
+    durations_option = _pytest_option(tokens, "--durations-path")
+    if durations_option:
+        durations_path = durations_option
+        if not os.path.exists(durations_path):
+            durations_path = os.path.join(
+                llm_src,
+                "tests",
+                "integration",
+                "defs",
+                os.path.basename(durations_option),
+            )
+    else:
+        durations_path = os.path.join(llm_src, "tests", "integration", "defs", ".test_durations")
+
+    try:
+        with open(durations_path, "r") as durations_file:
+            durations = json.load(durations_file)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"pytest-split durations file not found: {durations_path}"
+        ) from error
+    if isinstance(durations, list):
+        durations = dict(durations)
+    if not isinstance(durations, dict):
+        raise ValueError(f"Invalid pytest-split durations file: {durations_path}")
+    return durations, durations_path
+
+
+def _select_least_duration_group(lines, durations, splits, group):
+    """Mirror pytest-split's ``LeastDurationAlgorithm`` exactly.
+
+    Args:
+        lines: Test-list entries to distribute among the split groups.
+        durations: Mapping from pytest node IDs to recorded durations.
+        splits: Number of duration-balanced groups to create.
+        group: One-indexed group to return.
+
+    Returns:
+        Entries assigned to the requested group, in their original test-list order.
+
+    Raises:
+        ValueError: If ``splits`` is less than one or ``group`` is outside its range.
+    """
+    if splits < 1:
+        raise ValueError(f"pytest --splits must be >= 1, got {splits}")
+    if group < 1 or group > splits:
+        raise ValueError(f"pytest --group must be in [1, {splits}], got {group}")
+
+    nodeids = [_test_nodeid(line) for line in lines]
+    relevant_durations = {
+        nodeid: float(durations[nodeid]) for nodeid in nodeids if nodeid in durations
+    }
+    average_duration = (
+        sum(relevant_durations.values()) / len(relevant_durations) if relevant_durations else 1.0
+    )
+    items = [
+        (line, nodeid, relevant_durations.get(nodeid, average_duration), original_index)
+        for original_index, (line, nodeid) in enumerate(zip(lines, nodeids))
+    ]
+
+    # pytest-split first sorts by item name, then performs a stable descending
+    # duration sort. It greedily places each item in the least-loaded group.
+    items.sort(key=lambda item: item[1])
+    items.sort(key=lambda item: item[2], reverse=True)
+    selected = [[] for _ in range(splits)]
+    group_heap = [(0.0, group_index) for group_index in range(splits)]
+    heapq.heapify(group_heap)
+    for line, _nodeid, duration, original_index in items:
+        group_duration, group_index = heapq.heappop(group_heap)
+        selected[group_index].append((original_index, line))
+        heapq.heappush(group_heap, (group_duration + duration, group_index))
+
+    return [line for _original_index, line in sorted(selected[group - 1], key=lambda item: item[0])]
+
+
+def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_group=0):
+    """Select the same test as the pytest-split shard in ``pytestCommand``."""
+    lines = _read_test_list_lines(test_list_path)
+    if split_group <= 0:
+        return lines[0]
+
+    tokens = _pytest_command_tokens(script_prefix_lines)
+    splits_option = _pytest_option(tokens, "--splits")
+    group_option = _pytest_option(tokens, "--group")
+    algorithm = _pytest_option(tokens, "--splitting-algorithm")
+    if splits_option is None or group_option is None:
         if split_group > len(lines):
             raise ValueError(
                 f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
             )
-        line = lines[split_group - 1]
-    else:
-        line = lines[0]
+        return lines[split_group - 1]
+    if algorithm != "least_duration":
+        raise ValueError(
+            "Multi-node perf launcher only supports pytest-split's least_duration "
+            f"algorithm, got {algorithm!r}"
+        )
+
+    splits = int(splits_option)
+    pytest_group = int(group_option)
+    if pytest_group != split_group:
+        raise ValueError(
+            f"submit.py split_group={split_group} disagrees with pytest --group={pytest_group}"
+        )
+    durations, durations_path = _load_pytest_split_durations(tokens, llm_src)
+    selected = _select_least_duration_group(lines, durations, splits, pytest_group)
+    if len(selected) != 1:
+        raise ValueError(
+            "Multi-node perf launch requires exactly one test in each pytest-split "
+            f"group, but group {pytest_group}/{splits} selected {len(selected)} tests "
+            f"using {durations_path}: {selected}"
+        )
+    print(
+        f"Selected pytest-split group {pytest_group}/{splits} test using "
+        f"{durations_path}: {_test_nodeid(selected[0])}"
+    )
+    return selected[0]
+
+
+def _split_modifiers(
+    rest: List[str], bracket_content: str, benchmark_mode: str
+) -> Tuple[bool, str]:
+    """Peel the optional modifier segment off the front of the config stem.
+
+    Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
+    Returns (time_breakdown, config_base_name).
+    """
+    time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
+    if time_breakdown:
+        rest = rest[1:]
+    if not rest:
+        raise ValueError(f"Test name has a modifier but no config: {bracket_content}")
+    # Reject here rather than let the id through: it is well-formed and parses
+    # fine, but test_perf_sanity.py never generates it, so pytest would exit "no
+    # tests ran" after the whole job has been queued, built and allocated -- and
+    # every gate reports green on an empty selection.
+    if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
+        raise ValueError(
+            f"The {TIME_BREAKDOWN_MODIFIER} modifier is not generated for "
+            f"benchmark_mode {benchmark_mode!r}; supported modes are "
+            f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}: {bracket_content}"
+        )
+    return time_breakdown, "-".join(rest)
+
+
+def parse_test_case_name(
+    llm_src: str, selected_line: str
+) -> Tuple[str, Optional[str], Optional[str], str, bool]:
+    """Parse the selected test-list line.
+
+    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode,
+    time_breakdown). server_name is None for every disagg shape and for ctx_only;
+    benchmark_mode is None for a normal aggregated case. See the module docstring
+    for the supported test name shapes.
+    """
+    line = selected_line
 
     if "[" not in line or "]" not in line:
         raise ValueError(f"Invalid test list format. Expected name with brackets: {line}")
@@ -60,29 +395,37 @@ def parse_test_case_name(test_list_path, llm_src, split_group=0):
     if len(parts) < 2:
         raise ValueError(f"Invalid test name (need at least prefix and config): {bracket_content}")
 
+    time_breakdown = False
     prefix = parts[0]
     if "disagg" in prefix:
         if len(parts) < 3:
             raise ValueError(
-                f"Invalid disagg test format. Expected disagg[_upload]-{{e2e|gen_only}}-"
-                f"{{config_base}}, got: {bracket_content}"
+                f"Invalid disagg test format. Expected disagg[_upload]-"
+                f"{{{'|'.join(DISAGG_BENCHMARK_MODES)}}}[-{{modifier}}]-{{config_base}}, "
+                f"got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
             )
         runtime_mode = "disaggregated"
         server_name = None
-        config_base_name = "-".join(parts[2:])
+        time_breakdown, config_base_name = _split_modifiers(
+            parts[2:], bracket_content, benchmark_mode
+        )
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
-        if len(parts) > 2 and parts[1] == "ctx_only":
-            # ctx_only: aggr[_upload]-ctx_only-{config_base}; reads disagg yaml.
-            benchmark_mode = "ctx_only"
+        if len(parts) > 2 and parts[1] in AGGREGATED_DISAGG_YAML_MODES:
+            # ctx_only / gen_only_no_context:
+            # aggr[_upload]-{mode}[-{modifier}]-{config_base}; reads disagg yaml.
+            benchmark_mode = parts[1]
             runtime_mode = "aggregated"
             server_name = None
-            config_base_name = "-".join(parts[2:])
+            time_breakdown, config_base_name = _split_modifiers(
+                parts[2:], bracket_content, benchmark_mode
+            )
             config_yaml_path = os.path.join(
                 llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml"
             )
@@ -109,7 +452,7 @@ def parse_test_case_name(test_list_path, llm_src, split_group=0):
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
 
-    return config_yaml_path, server_name, benchmark_mode, runtime_mode
+    return config_yaml_path, server_name, benchmark_mode, runtime_mode, time_breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -126,23 +469,24 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         gpus_per_ctx_server, gpus_per_gen_server,
         nodes_per_ctx_server, nodes_per_gen_server,
         gpus_per_node_per_ctx_server, gpus_per_node_per_gen_server,
-        total_nodes, total_gpus
+        dwdp_size, ctx_nodes, total_nodes, total_gpus
+    where dwdp_size is 0 unless the ctx side is a DWDP group, in which case
+    every ctx server is one rank of a single MPI step spanning ctx_nodes.
     """
     hardware = config.get("hardware", {}) or {}
     gpus_per_node = hardware.get("gpus_per_node")
     if gpus_per_node is None:
         raise ValueError("hardware.gpus_per_node is required")
 
-    if benchmark_mode == "ctx_only":
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        gpus_per_server = gen_only_no_context_world_size(config)
+    elif benchmark_mode == "ctx_only":
         # ctx_only reads disagg yaml; size the launch from worker_config.ctx.
         worker_config = config.get("worker_config", {}) or {}
         ctx_config = worker_config.get("ctx", {}) or {}
         if not ctx_config:
             raise ValueError("worker_config.ctx is required for ctx_only mode")
-        tp = ctx_config.get("tensor_parallel_size", 1)
-        pp = ctx_config.get("pipeline_parallel_size", 1)
-        cp = ctx_config.get("context_parallel_size", 1)
-        gpus_per_server = ctx_config.get("world_size") or (tp * pp * cp)
+        gpus_per_server = ctx_config.get("world_size") or ctx_only_world_size(config)
     elif runtime_mode == "aggregated":
         # Regular agg: match server_configs by name.
         server_configs = config.get("server_configs", []) or []
@@ -159,13 +503,13 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         ctx_config = worker_config.get("ctx", {}) or {}
         gen_config = worker_config.get("gen", {}) or {}
 
-        # gen_only_no_context comes from the yaml's benchmark.mode, not the
-        # test name (test name is always "gen_only" for both gen_only and
-        # gen_only_no_context tests). When set, ctx workers are not launched.
-        yaml_mode = (config.get("benchmark", {}) or {}).get("mode", "")
-        is_gen_only_no_context = benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
-        num_ctx_servers = 0 if is_gen_only_no_context else hardware.get("num_ctx_servers")
-        num_gen_servers = hardware.get("num_gen_servers")
+        # On this path gen_only_no_context can only come from the yaml's
+        # benchmark.mode, not the test name. When set, ctx workers are not launched.
+        if is_gen_only_no_context(benchmark_mode, config):
+            num_ctx_servers, num_gen_servers = gen_only_no_context_server_counts()
+        else:
+            num_ctx_servers = hardware.get("num_ctx_servers")
+            num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_tp = ctx_config.get("tensor_parallel_size", 1)
         ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
@@ -184,9 +528,12 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         gpus_per_node_per_ctx_server = min(gpus_per_ctx_server, gpus_per_node)
         gpus_per_node_per_gen_server = min(gpus_per_gen_server, gpus_per_node)
 
-        total_nodes = (
-            num_ctx_servers * nodes_per_ctx_server + num_gen_servers * nodes_per_gen_server
-        )
+        ctx_nodes = num_ctx_servers * nodes_per_ctx_server
+        dwdp_size = 0 if is_gen_only_no_context(benchmark_mode, config) else dwdp_ctx_size(config)
+        if dwdp_size:
+            # One MPI step hosts every single-GPU ctx server, packed per node.
+            _, ctx_nodes, _ = dwdp_ctx_layout(config)
+        total_nodes = ctx_nodes + num_gen_servers * nodes_per_gen_server
         total_gpus = total_nodes * gpus_per_node
 
         return {
@@ -199,6 +546,8 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
             "nodes_per_gen_server": nodes_per_gen_server,
             "gpus_per_node_per_ctx_server": gpus_per_node_per_ctx_server,
             "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
+            "dwdp_size": dwdp_size,
+            "ctx_nodes": ctx_nodes,
             "total_nodes": total_nodes,
             "total_gpus": total_gpus,
         }
@@ -248,14 +597,16 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     ctx_env = _join_env(common, ctx_extra)
     gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
-        if benchmark_mode == "ctx_only":
+        if benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
             return {
                 "worker_env_var": common,
                 "ctx_worker_env_var": ctx_env,
                 "gen_worker_env_var": gen_env,
-                # ctx_only launches through the aggregated single-pytest path;
-                # the ctx-merged env is what actually runs.
-                "server_env_var": ctx_env,
+                # These modes launch through the aggregated single-pytest path;
+                # the env of the worker they actually run is what goes here.
+                "server_env_var": (
+                    gen_env if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE else ctx_env
+                ),
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -281,8 +632,7 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
 
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {}) or {}
-    concurrency_str = benchmark.get("concurrency_list", "1")
-    concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
     return {
         "mode": benchmark.get("mode", ""),
         "concurrency": concurrency,
@@ -400,6 +750,41 @@ def get_pytest_commands(script_prefix_lines, runtime_mode):
     return ("", worker_pytest_command, disagg_server_pytest_command, benchmark_pytest_command)
 
 
+DWDP_CTX_RANK_SCRIPT = "jenkins/scripts/perf/disaggregated/dwdp_ctx_rank.sh"
+
+
+def get_dwdp_ctx_worker_command(worker_pytest_command, rank_launcher):
+    """Derive the DWDP ctx worker command from the regular worker command.
+
+    Args:
+        worker_pytest_command: The `export partialPytestCommandWorker=...` line
+            from get_pytest_commands().
+        rank_launcher: Shell words that launch pytest on one DWDP ctx rank.
+
+    Returns:
+        str: An `export partialPytestCommandDWDPCtxWorker=...` line in which
+        trtllm-llmapi-launch is replaced by ``rank_launcher`` (or, when the
+        worker command has no launcher, ``rank_launcher`` precedes pytest).
+
+    Raises:
+        ValueError: If the worker command runs no pytest.
+    """
+    parts = _split_pytest_command_line(
+        worker_pytest_command.replace(
+            "partialPytestCommandWorker", "partialPytestCommandDWDPCtxWorker"
+        )
+    )
+    launcher_parts = [i for i, p in enumerate(parts) if "trtllm-llmapi-launch" in p]
+    if launcher_parts:
+        parts[launcher_parts[0]] = rank_launcher
+        parts = [p for i, p in enumerate(parts) if i not in launcher_parts[1:]]
+    elif "pytest" in parts:
+        parts.insert(parts.index("pytest"), rank_launcher)
+    else:
+        raise ValueError(f"worker command runs no pytest: {worker_pytest_command!r}")
+    return " ".join(parts)
+
+
 def get_test_output_dir(script_prefix_lines, test_case_name):
     """Build the per-test output directory from the inbound pytestCommand.
 
@@ -417,6 +802,57 @@ def get_test_output_dir(script_prefix_lines, test_case_name):
         return ""
     output_dir = m.group(1)
     return os.path.join(output_dir, test_case_name) if test_case_name else output_dir
+
+
+class _PytestCommandEnvMissing(ValueError):
+    """A valid pytestCommand does not provide the requested leading variable."""
+
+
+def extract_pytest_command_env(script_prefix_lines, name):
+    """Read a leading environment assignment from the exported pytest command."""
+    line = next((ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None)
+    if line is None:
+        raise ValueError("launch prefix does not export pytestCommand")
+    try:
+        outer_tokens = shlex.split(line)
+    except ValueError as e:
+        raise ValueError(f"cannot parse exported pytestCommand: {e}") from e
+    command_assignment = next(
+        (token for token in outer_tokens if token.startswith("pytestCommand=")), None
+    )
+    if command_assignment is None:
+        raise ValueError("launch prefix has a malformed pytestCommand export")
+    command = command_assignment.partition("=")[2]
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError as e:
+        raise ValueError(f"cannot parse pytestCommand payload: {e}") from e
+    for token in command_tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            break
+        key, value = token.split("=", 1)
+        if key == name:
+            return value
+    raise _PytestCommandEnvMissing(
+        f"pytestCommand does not set leading environment variable {name}"
+    )
+
+
+def _resolve_llm_models_root(script_prefix_lines):
+    """Resolve the precheck model root from pytestCommand or the submitter env."""
+    try:
+        return extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+    except _PytestCommandEnvMissing as e:
+        fallback = os.environ.get("LLM_MODELS_ROOT")
+        if fallback:
+            return fallback
+        # Fail closed when the precheck is enabled: without the model root it
+        # cannot reproduce serving's KV shape and model-specific defaults, so
+        # disabling the gate here would silently run an unvalidated workload.
+        raise ValueError(
+            f"{e}; LLM_MODELS_ROOT is also absent from the submitter environment "
+            "(pytestCommand is assembled by getPytestBaseCommandLine in L0_Test.groovy)"
+        ) from e
 
 
 def remove_whitespace_lines(lines):
@@ -453,25 +889,52 @@ def main():
         "--split-group",
         type=int,
         default=0,
-        help="1-indexed split group id. Selects the N-th test from the test list.",
+        help=(
+            "1-indexed pytest-split group id. Selects the same duration-balanced test as pytest."
+        ),
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Slurm cluster name as resolved by the Jenkins pipeline "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). "
+        "Used with the GPU type to pick UCX env settings.",
+    )
 
     args = parser.parse_args()
 
-    config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
-        args.test_list, args.llm_src, args.split_group
+    with open(args.script_prefix, "r") as f:
+        script_prefix_content = f.read()
+    script_prefix_lines = script_prefix_content.split("\n")
+
+    selected_test_line = select_test_case_line(
+        args.test_list,
+        args.llm_src,
+        script_prefix_lines,
+        args.split_group,
+    )
+    pytest_tokens = _pytest_command_tokens(script_prefix_lines)
+    selected_test_skipped = selected_test_is_skip_waived(
+        selected_test_line,
+        os.path.join(args.llm_src, "tests", "integration", "test_lists", "waives.txt"),
+        test_prefix=_pytest_option(pytest_tokens, "--test-prefix"),
+    )
+    if selected_test_skipped:
+        print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
+    # time_breakdown only changes what the harness records, never the launch
+    # topology or the mode token handed to the precheck, so it is unused here.
+    config_yaml, server_name, benchmark_mode, runtime_mode, _time_breakdown = parse_test_case_name(
+        args.llm_src,
+        selected_test_line,
     )
 
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
 
-    # Recover test_case_name (the bracketed pytest test id) for the per-test
-    # output dir — same line/split logic as parse_test_case_name.
-    with open(args.test_list, "r") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    sel = lines[args.split_group - 1] if args.split_group > 0 else lines[0]
-    test_case_name = sel.split("[")[-1].split("]")[0] if "[" in sel else ""
+    test_case_name = (
+        selected_test_line.split("[")[-1].split("]")[0] if "[" in selected_test_line else ""
+    )
 
     hardware_config = get_hardware_config(config, runtime_mode, benchmark_mode, server_name)
     env_config = get_env_config(config, runtime_mode, benchmark_mode, server_name)
@@ -484,13 +947,16 @@ def main():
     print(f"Environment configuration: {env_config}")
     print(f"Benchmark configuration: {benchmark_config}")
 
-    with open(args.script_prefix, "r") as f:
-        script_prefix_content = f.read()
-    script_prefix_lines = script_prefix_content.split("\n")
-
     with open(args.srun_args, "r") as f:
         srun_args_content = f.read()
     srun_args_lines = srun_args_content.split()
+    mounts_prefix = "--container-mounts="
+    srun_args_lines = [
+        mounts_prefix + add_eplb_shm_mount(line[len(mounts_prefix) :], config, args.llm_src)
+        if line.startswith(mounts_prefix)
+        else line
+        for line in srun_args_lines
+    ]
 
     (
         agg_pytest_command,
@@ -500,20 +966,33 @@ def main():
     ) = get_pytest_commands(script_prefix_lines, runtime_mode)
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
-    is_gb300 = "GB300" in args.stage_name.upper()
-    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
-        # Aggregated (incl. ctx_only): single pytestCommand built from the
-        # matched server_config's server_env_var (regular agg) or the disagg
-        # yaml's environment.worker_env_var (ctx_only). The prefix runs on
-        # every rank before trtllm-llmapi-launch dispatches to pytest (rank 0)
-        # or mgmn_worker_node (others).
+        # Aggregated (incl. ctx_only and gen_only_no_context): single pytestCommand
+        # built from the matched server_config's server_env_var (regular agg) or the
+        # disagg yaml's merged worker env. The prefix runs on every rank before
+        # trtllm-llmapi-launch dispatches to pytest (rank 0) or mgmn_worker_node
+        # (others). ucx_prefix is a shell command prefix, so it must lead.
+        ucx_prefix = ""
+        env_prefix_parts = []
+        if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+            env_prefix_parts.append(
+                "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} "
+                "HF_HOME=/tmp/hf_home"
+            )
+            ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+            print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
+            ucx_prefix = ucx_tls_cmd.strip()
+            env_prefix_parts.append("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+            script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+
         server_env_var = env_config["server_env_var"]
         if server_env_var.strip():
-            pytest_command_with_env = (
-                f'export pytestCommand="{server_env_var} $partialPytestCommand"'
-            )
+            env_prefix_parts.append(server_env_var.strip())
+        env_prefix = " ".join([ucx_prefix] + env_prefix_parts).strip()
+        if env_prefix:
+            pytest_command_with_env = f'export pytestCommand="{env_prefix} $partialPytestCommand"'
         else:
             pytest_command_with_env = 'export pytestCommand="$partialPytestCommand"'
 
@@ -532,7 +1011,6 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
-        srun_args_lines.append("--container-env=pytestCommand")
     else:
         # Disaggregated (e2e or gen_only).
         base_prefix = (
@@ -544,36 +1022,42 @@ def main():
         gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
         server_env_vars = env_config["server_env_var"]
 
-        # gen_only_no_context comes from yaml's benchmark.mode, not the test
-        # name — see get_hardware_config.
-        yaml_mode = benchmark_config.get("mode", "")
-        if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+        # On this path gen_only_no_context comes from the yaml's benchmark.mode,
+        # not the test name -- see get_hardware_config.
+        if is_gen_only_no_context(benchmark_mode, config):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
-            srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
-            ctx_worker_env_vars = (
-                f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
-            )
+            # GEN worker only: the same flag on the CTX worker has been seen to
+            # hang gen_only runs with KV blocks never released.
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
+
+        ctx_worker_command_var = "$partialPytestCommandWorker"
+        dwdp_ctx_worker_command = ""
+        if hardware_config["dwdp_size"]:
+            # Every DWDP ctx rank runs pytest itself, so the worker command's
+            # trtllm-llmapi-launch (which runs pytest on rank 0 only) is
+            # replaced by the per-rank launcher.
+            dwdp_ctx_worker_command = get_dwdp_ctx_worker_command(
+                worker_pytest_command,
+                f"bash $llmSrcNode/{DWDP_CTX_RANK_SCRIPT}",
+            )
+            ctx_worker_command_var = "$partialPytestCommandDWDPCtxWorker"
 
         pytest_common_vars = ""
         script_prefix_lines.extend(
             [
                 worker_pytest_command,
+                dwdp_ctx_worker_command,
                 disagg_server_pytest_command,
                 benchmark_pytest_command,
                 f'export PYTEST_COMMON_VARS="{pytest_common_vars}"',
@@ -582,7 +1066,7 @@ def main():
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
                 f'export pytestCommandCTXWorker="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
-                ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
+                f' $PYTEST_COMMON_VARS {ctx_worker_command_var}"',
                 f'export pytestCommandGENWorker="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS'
                 ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
                 f'export pytestCommandDisaggServer="{ucx_tls_server_cmd}'
@@ -601,21 +1085,60 @@ def main():
                 f"export nodesPerGenServer={hardware_config['nodes_per_gen_server']}",
                 f"export gpusPerNodePerCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
                 f"export gpusPerNodePerGenServer={hardware_config['gpus_per_node_per_gen_server']}",
+                f"export dwdpCtxSize={hardware_config['dwdp_size']}",
+                f"export dwdpCtxNodes={hardware_config['ctx_nodes']}",
                 f"export totalNodes={hardware_config['total_nodes']}",
                 f"export totalGpus={hardware_config['total_gpus']}",
                 f"export testOutputDir={test_output_dir}",
             ]
         )
-        srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+
+        # Cache-transceiver network precheck: runs BEFORE the real ctx/gen
+        # servers with the same instance topology, and reuses the exact
+        # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
+        # of the worker steps so the UCX environment matches by construction.
+        # Enable/kill-switch policy and timeouts live in precheck_config
+        # (single owner, shared with the local flow).
+        pcfg = _import_precheck_config(args.llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
+        precheck_will_run = precheck_enabled and not selected_test_skipped
+        # The model root is only consumed by the precheck (auto KV-cache-manager
+        # resolution needs the model config). Fail fast only when the precheck
+        # will actually run; otherwise degrade to a warning so stages whose
+        # pytestCommand does not carry LLM_MODELS_ROOT inline keep submitting.
+        llm_models_root = None
+        if precheck_enabled:
+            try:
+                llm_models_root = _resolve_llm_models_root(script_prefix_lines)
+            except ValueError as e:
+                if precheck_will_run:
+                    raise
+                print(
+                    f"WARNING: {e}; "
+                    "cache-transceiver precheck is skipped for this config so continuing"
+                )
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr=f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config["gpus_per_ctx_server"],
+                    hardware_config["gpus_per_gen_server"],
+                ),
+                stage_name=args.stage_name,
+                llm_models_root=llm_models_root,
+                skip_precheck=selected_test_skipped,
+            )
         )
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)
 
+    # Role variables inherit their exported job values. Any required image overrides
+    # belong in the caller's single comma-separated --container-env option;
+    # Repeating --container-env forwards only the last value.
     srun_args_lines = remove_whitespace_lines(srun_args_lines)
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]
     srun_args = "\n".join(srun_args_lines)
@@ -625,8 +1148,14 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_content.split("\n"))
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(args.draft_launch_sh, args.llm_src)
+
     with open(args.launch_sh, "w") as f:
-        f.write(f"{script_prefix}\n{srun_args}\n{draft_launch_content}")
+        f.write(f"{script_prefix}\n{srun_args}\n{gate_content}{draft_launch_content}")
 
     print(f"Launch script generated at: {args.launch_sh}")
     print(f"Launch script:\n{script_prefix}\n{srun_args}\n{draft_launch_content}")

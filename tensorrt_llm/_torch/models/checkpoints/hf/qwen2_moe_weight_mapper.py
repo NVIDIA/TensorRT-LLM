@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
 def _unfuse_moe_expert_weights(weights: dict) -> dict:
@@ -57,11 +61,11 @@ def _unfuse_moe_expert_weights(weights: dict) -> dict:
     return updated
 
 
-@register_mapper("HF", "Qwen2MoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen2MoeForCausalLM")
 class Qwen2MoeHfWeightMapper(HfWeightMapper):
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoE)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
             self,
@@ -69,7 +73,7 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
             module_name: str,
             module_weights: dict,
             allow_partial_loading: bool = False) -> None:
-        if isinstance(module, MoE):
+        if is_moe_weight_owner(module):
             # Transformers 5.x uses fused expert weights:
             #   gate_up_proj [num_experts, 2*intermediate, hidden]
             #   down_proj [num_experts, hidden, intermediate]

@@ -1,22 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import time
+from typing import Dict
+
 import pytest
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .lora_test_utils import (
-    check_llama_7b_multi_lora_from_request_test_harness,
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1,
-    test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
-from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
@@ -42,43 +43,12 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
                                             pipeline_parallel_size=pp_size)
 
 
-@pytest.mark.gpu2
-def test_llama_7b_lora_tp2():
-    llama_7b_lora_from_dir_test_harness(tensor_parallel_size=2,
-                                        kv_cache_config=global_kv_cache_config)
-
-
-@pytest.mark.gpu4
-@skip_ray  # https://nvbugs/5682551
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_tp4(cuda_graph_config):
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8,
-                             max_loras=1,
-                             max_cpu_loras=8)
-    check_llama_7b_multi_lora_from_request_test_harness(
-        LLM,
-        lora_config=lora_config,
-        tensor_parallel_size=4,
-        kv_cache_config=global_kv_cache_config,
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_ray  # https://nvbugs/5727075
-@pytest.mark.gpu2
-@test_lora_with_and_without_cuda_graph
-def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1(
-        cuda_graph_config) -> None:
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
-        LLM, cuda_graph_config=cuda_graph_config)
-
-
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_rpc_tp2():
+@pytest.mark.private_mpi_session
+def test_llm_rpc_tp2() -> None:
+    # RPC builds rank 0's engine on another thread. Reusing IPC workers would
+    # leave asymmetric thread-local allreduce caches across the ranks.
     with LLM(model=llama_model_path,
              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
              orchestrator_type="rpc",
@@ -97,7 +67,8 @@ def test_llm_rpc_tp2():
 @skip_ray
 @pytest.mark.gpu2
 @pytest.mark.asyncio
-async def test_llm_rpc_streaming_tp2():
+@pytest.mark.private_mpi_session
+async def test_llm_rpc_streaming_tp2() -> None:
     with LLM(model=llama_model_path,
              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
              orchestrator_type="rpc",
@@ -188,3 +159,85 @@ def test_llm_get_stats_async_tp2():
 @pytest.mark.gpu2
 def test_llm_get_stats_async_pp2():
     llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=True)
+
+
+def _context_requests_per_rank(llm: LLM) -> Dict[int, int]:
+    """Context requests each attention-DP rank scheduled since the last call.
+
+    One per request (no chunking), from the iteration stats that arrived.
+
+    Args:
+        llm: An attention-DP LLM with iteration stats on.
+
+    Returns:
+        Attention-DP rank -> context requests it ran.
+    """
+    time.sleep(2)  # as llm_get_stats_test_harness: let the stats arrive
+    counts: Dict[int, int] = {}
+    for stats in llm.get_stats(2):
+        stats = json.loads(stats) if isinstance(stats, str) else stats
+        rank = stats["attentionDpRank"]
+        counts[rank] = counts.get(
+            rank, 0) + stats["inflightBatchingStats"]["numContextRequests"]
+    return {rank: n for rank, n in counts.items() if n}
+
+
+@skip_ray
+@pytest.mark.gpu2
+def test_llm_attention_dp_home_wait_tp2():
+    """Home-wait runs every turn of a conversation on its home rank.
+
+    Conversation-affinity routing with home-wait on 2-GPU attention DP.
+
+    With one request slot per rank, later turns of a conversation wait for
+    their full home rank (the rank its first turn ran on), even while the
+    other rank is free: the per-rank context requests of the turns are three
+    per conversation homed there. Each turn completes with the same greedy
+    output as its first turn.
+    """
+    from tensorrt_llm.conversation_params import ConversationParams
+    from tensorrt_llm.llmapi import AttentionDpConfig
+
+    prompts = {
+        "conv-a": "The capital of France is",
+        "conv-b": "One, two, three, four,"
+    }
+    params = SamplingParams(max_tokens=8, temperature=0, end_id=-1)
+    with LLM(
+            model=llama_model_path,
+            kv_cache_config=global_kv_cache_config,
+            tensor_parallel_size=2,
+            enable_attention_dp=True,
+            max_batch_size=1,
+            enable_iter_perf_stats=True,
+            attention_dp_config=AttentionDpConfig(
+                kv_cache_routing_conversation_affinity=True,
+                # More rounds than the six turns take on one rank, so that
+                # no turn overflows to the free rank.
+                kv_cache_routing_home_wait_rounds=1000)) as llm:
+        _context_requests_per_rank(llm)  # drop any warmup rows
+        first, home = {}, {}
+        for conv, prompt in prompts.items():
+            first[conv] = llm.generate(
+                prompt,
+                params,
+                conversation_params=ConversationParams(
+                    conversation_id=conv)).outputs[0].token_ids
+            ranks = list(_context_requests_per_rank(llm))
+            assert len(ranks) == 1, (conv, ranks)
+            home[conv] = ranks[0]
+        convs = [conv for conv in prompts for _ in range(3)]
+        results = llm.generate([prompts[conv] for conv in convs],
+                               params,
+                               conversation_params=[
+                                   ConversationParams(conversation_id=conv)
+                                   for conv in convs
+                               ])
+        per_rank = _context_requests_per_rank(llm)
+    for conv, result in zip(convs, results):
+        assert len(first[conv]) == 8
+        assert result.outputs[0].token_ids == first[conv], conv
+    expected: Dict[int, int] = {}
+    for conv in convs:
+        expected[home[conv]] = expected.get(home[conv], 0) + 1
+    assert per_rank == expected, (home, per_rank)

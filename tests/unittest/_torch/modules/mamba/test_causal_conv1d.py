@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 
 
 def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias, apply_silu):
@@ -244,3 +247,340 @@ class TestCausalConv1d:
 
         torch.testing.assert_close(x_kernel_reshaped, out_ref, rtol=1e-2, atol=1e-1)
         torch.testing.assert_close(conv_state_kernel, conv_state_ref, rtol=1e-2, atol=1e-1)
+
+
+@skip_unsupported
+class TestCausalConv1dChannelLast:
+    """Tests for the channel-last (token-major) causal_conv1d forward kernel.
+
+    The existing channel-major kernel is the reference: both are dispatched from the same op,
+    so any difference is the channel-last kernel's own.
+    """
+
+    @staticmethod
+    def _case(
+        seed: int,
+        total_tokens: int,
+        dim: int,
+        dconv: int,
+        seq_lens: Sequence[int],
+        dtype: torch.dtype,
+        row_pitch: int | None = None,
+        pad_first: bool = False,
+    ) -> tuple[
+        torch.Tensor,  # x_tok_major  [total_tokens, dim]
+        torch.Tensor,  # weight       [dim, dconv]
+        torch.Tensor,  # bias         [dim]
+        torch.Tensor,  # query_start_loc
+        torch.Tensor,  # cache_indices
+        torch.Tensor,  # has_initial_state
+        torch.Tensor,  # conv_states  [num_cache_lines, dim, dconv - 1]
+    ]:
+        device = "cuda"
+        g = torch.Generator(device=device).manual_seed(seed)
+        pitch = row_pitch if row_pitch is not None else dim
+        # A wider row pitch models a column slice of a fused projection.
+        base = (torch.randn(total_tokens, pitch, generator=g, device=device) * 0.5).to(dtype)
+        x_tok_major = base[:, :dim]
+
+        weight = (torch.randn(dim, dconv, generator=g, device=device) * 0.3).to(dtype)
+        bias = (torch.randn(dim, generator=g, device=device) * 0.1).to(dtype)
+        query_start_loc = torch.tensor(
+            [0] + torch.tensor(seq_lens).cumsum(0).tolist(), dtype=torch.int32, device=device
+        )
+        batch = len(seq_lens)
+        # Make the state pool two lines larger than the batch and map sequence i
+        # to cache line i + 2, so cache line != batch position. This catches a
+        # kernel that indexes conv_states by batch row instead of going through
+        # the cache_indices indirection, and any stray write to the two unmapped
+        # lines at the front would corrupt data the reference check compares.
+        num_cache_lines = batch + 2
+        cache_indices = torch.arange(batch, dtype=torch.int32, device=device) + 2
+        if pad_first:
+            cache_indices[0] = PAD_SLOT_ID
+        # Alternate sequences with and without an initial state so a single
+        # batch exercises both the state-restoring and the zero-history paths.
+        has_initial_state = torch.zeros(batch, dtype=torch.bool, device=device)
+        has_initial_state[::2] = True
+        conv_states = (
+            torch.randn(num_cache_lines, dim, dconv - 1, generator=g, device=device) * 0.5
+        ).to(dtype)
+        return (
+            x_tok_major,
+            weight,
+            bias,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            conv_states,
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("apply_silu", [True, False])
+    @pytest.mark.parametrize("dconv", [2, 3, 4])
+    @pytest.mark.parametrize(
+        "dim,seq_lens,row_pitch",
+        [
+            (2048, [512], None),  # single-sequence prefill, 16B-aligned fast path
+            (2048, [200, 1, 3, 308], None),  # ragged varlen
+            (2048, [1, 2, 1, 3], None),  # sequences shorter than dconv - 1
+            (2054, [512], None),  # dim not a multiple of the vector width -> scalar path
+            (2048, [512], 5120),  # channel slice of a wider projection
+            (2048, [512], 5121),  # unaligned row pitch -> scalar path
+        ],
+    )
+    def test_matches_channel_major(
+        self,
+        dtype: torch.dtype,
+        apply_silu: bool,
+        dconv: int,
+        dim: int,
+        seq_lens: Sequence[int],
+        row_pitch: int | None,
+    ) -> None:
+        """Channel-last output and conv_states must match the channel-major kernel."""
+        x_tok_major, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=1234,
+            total_tokens=sum(seq_lens),
+            dim=dim,
+            dconv=dconv,
+            seq_lens=seq_lens,
+            dtype=dtype,
+            row_pitch=row_pitch,
+        )
+
+        # Reference: materialise the channel-major copy the old path required.
+        x_ref = x_tok_major.t().contiguous()
+        cs_ref = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_ref, weight, bias, cs_ref, qsl, cache_idx, has_init, apply_silu, PAD_SLOT_ID
+        )
+
+        # Channel-last: pass a transposed view, write into a token-major buffer.
+        out_tok_major = x_tok_major.contiguous().clone()
+        cs_new = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_tok_major.t(),
+            weight,
+            bias,
+            cs_new,
+            qsl,
+            cache_idx,
+            has_init,
+            apply_silu,
+            PAD_SLOT_ID,
+            out_tok_major.t(),
+        )
+
+        torch.testing.assert_close(out_tok_major, x_ref.t(), rtol=1e-2, atol=1e-2)
+        # conv_states are copied verbatim out of x, so they must be exact.
+        torch.testing.assert_close(cs_new, cs_ref, rtol=0, atol=0)
+
+    def test_pad_slot_is_skipped(self) -> None:
+        """Sequences mapped to PAD_SLOT_ID must leave out and conv_states untouched."""
+        seq_lens = [200, 312]
+        x_tok_major, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=7,
+            total_tokens=sum(seq_lens),
+            dim=1024,
+            dconv=4,
+            seq_lens=seq_lens,
+            dtype=torch.bfloat16,
+            pad_first=True,
+        )
+        sentinel = torch.full_like(x_tok_major, 3.0)
+        out = sentinel.contiguous().clone()
+        cs_new = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_tok_major.t(),
+            weight,
+            bias,
+            cs_new,
+            qsl,
+            cache_idx,
+            has_init,
+            True,
+            PAD_SLOT_ID,
+            out.t(),
+        )
+        torch.testing.assert_close(out[: seq_lens[0]], sentinel[: seq_lens[0]], rtol=0, atol=0)
+
+        # Only the padded sequence is skipped. Sequence 1 is real, so its own
+        # cache line must be rewritten -- asserting the whole tensor is
+        # unchanged would also pass if the kernel did nothing at all.
+        live = cache_idx[1].item()
+        untouched = [i for i in range(conv_states.shape[0]) if i != live]
+        torch.testing.assert_close(cs_new[untouched], conv_states[untouched], rtol=0, atol=0)
+        assert not torch.equal(cs_new[live], conv_states[live])
+
+        # ...and the live sequence's *output* must be written too. Checking only
+        # that the padded region is untouched would still pass for a kernel that
+        # updated conv_states but skipped every output store.
+        cm_in = x_tok_major.t().contiguous()
+        cs_ref = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            cm_in, weight, bias, cs_ref, qsl, cache_idx, has_init, True, PAD_SLOT_ID
+        )
+        # Same tolerance as test_matches_channel_major: the two kernels accumulate
+        # in a different order, so they agree to about a bf16 ulp, not bit-exactly.
+        torch.testing.assert_close(
+            out[seq_lens[0] :], cm_in.t()[seq_lens[0] :], rtol=1e-2, atol=1e-2
+        )
+        assert not torch.equal(out[seq_lens[0] :], sentinel[seq_lens[0] :])
+
+    def test_rejects_inplace_and_mismatched_out_layout(self) -> None:
+        """The chunked channel-last kernel reads a halo, so it cannot alias out onto x."""
+        seq_lens = [512]
+        x_tok_major, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=3,
+            total_tokens=sum(seq_lens),
+            dim=1024,
+            dconv=4,
+            seq_lens=seq_lens,
+            dtype=torch.bfloat16,
+        )
+        x_cl = x_tok_major.t()
+        with pytest.raises(RuntimeError, match="cannot run in-place"):
+            torch.ops.trtllm.causal_conv1d_fwd(
+                x_cl,
+                weight,
+                bias,
+                conv_states.clone(),
+                qsl,
+                cache_idx,
+                has_init,
+                True,
+                PAD_SLOT_ID,
+                x_cl,
+            )
+        channel_major_out = torch.empty_like(x_cl.contiguous())
+        with pytest.raises(RuntimeError, match="channel-last out"):
+            torch.ops.trtllm.causal_conv1d_fwd(
+                x_cl,
+                weight,
+                bias,
+                conv_states.clone(),
+                qsl,
+                cache_idx,
+                has_init,
+                True,
+                PAD_SLOT_ID,
+                channel_major_out,
+            )
+
+    def test_accepts_disjoint_column_blocks_of_one_buffer(self) -> None:
+        """Two column blocks of one buffer interleave their runs but share no element.
+
+        This is the natural way to convolve one slice of a fused projection into
+        another slice of the same allocation, so it has to be accepted -- comparing
+        enclosing byte spans alone would reject it.
+        """
+        seq_lens = [2048]
+        total = sum(seq_lens)
+        dim = 1024
+        x_src, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=17,
+            total_tokens=total,
+            dim=dim,
+            dconv=4,
+            seq_lens=seq_lens,
+            dtype=torch.bfloat16,
+        )
+        base = torch.empty(total, dim * 2, dtype=torch.bfloat16, device="cuda")
+        base[:, :dim] = x_src
+        x_cl = base[:, :dim].t()
+        out_cl = base[:, dim:].t()
+        assert x_cl.stride(0) == 1 and out_cl.stride(0) == 1
+        # spans interleave...
+        assert (
+            x_cl.data_ptr()
+            < out_cl.data_ptr()
+            < x_cl.data_ptr() + base.numel() * base.element_size()
+        )
+
+        reference = torch.empty(total, dim, dtype=torch.bfloat16, device="cuda").t()
+        cs_ref = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_cl, weight, bias, cs_ref, qsl, cache_idx, has_init, True, PAD_SLOT_ID, reference
+        )
+        cs_got = conv_states.clone()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_cl, weight, bias, cs_got, qsl, cache_idx, has_init, True, PAD_SLOT_ID, out_cl
+        )
+        torch.testing.assert_close(out_cl, reference, rtol=0, atol=0)
+        torch.testing.assert_close(cs_got, cs_ref, rtol=0, atol=0)
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 CUDA devices")
+    def test_rejects_out_on_another_device(self) -> None:
+        """The launch is guarded to x's device, so a foreign out must be rejected here.
+
+        Letting it through would hand the kernel a pointer it cannot address -- an
+        illegal access at some later point rather than a clean error at the call.
+        """
+        seq_lens = [512]
+        x_tok_major, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=5,
+            total_tokens=sum(seq_lens),
+            dim=1024,
+            dconv=4,
+            seq_lens=seq_lens,
+            dtype=torch.bfloat16,
+        )
+        x_cl = x_tok_major.t()
+        # _case allocates on the current device, which is not necessarily cuda:0 --
+        # hardcoding cuda:1 would make this a no-op whenever it already is cuda:1.
+        other = next(i for i in range(torch.cuda.device_count()) if i != x_cl.device.index)
+        foreign_out = torch.empty(x_tok_major.shape, dtype=x_cl.dtype, device=f"cuda:{other}").t()
+        assert foreign_out.device != x_cl.device
+        with pytest.raises(RuntimeError, match="same device"):
+            torch.ops.trtllm.causal_conv1d_fwd(
+                x_cl,
+                weight,
+                bias,
+                conv_states.clone(),
+                qsl,
+                cache_idx,
+                has_init,
+                True,
+                PAD_SLOT_ID,
+                foreign_out,
+            )
+
+    def test_python_wrapper_allocates_channel_last_out(self) -> None:
+        """causal_conv1d_fn must return a token-major result for a token-major input."""
+        seq_lens = [512]
+        x_tok_major, weight, bias, qsl, cache_idx, has_init, conv_states = self._case(
+            seed=11,
+            total_tokens=sum(seq_lens),
+            dim=1024,
+            dconv=4,
+            seq_lens=seq_lens,
+            dtype=torch.bfloat16,
+        )
+        out = causal_conv1d_fn(
+            x_tok_major.t(),
+            weight,
+            bias,
+            query_start_loc=qsl,
+            cache_indices=cache_idx,
+            has_initial_state=has_init,
+            conv_states=conv_states.clone(),
+            activation="silu",
+            pad_slot_id=PAD_SLOT_ID,
+        )
+        assert out.stride(0) == 1 and out.stride(1) == x_tok_major.shape[1]
+        assert out.data_ptr() != x_tok_major.data_ptr()
+
+        x_ref = x_tok_major.t().contiguous()
+        torch.ops.trtllm.causal_conv1d_fwd(
+            x_ref,
+            weight,
+            bias,
+            conv_states.clone(),
+            qsl,
+            cache_idx,
+            has_init,
+            True,
+            PAD_SLOT_ID,
+        )
+        torch.testing.assert_close(out, x_ref, rtol=1e-2, atol=1e-2)

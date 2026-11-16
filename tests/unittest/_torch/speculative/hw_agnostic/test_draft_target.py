@@ -1,28 +1,38 @@
-import os
-import sys
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, DraftTargetDecodingConfig, KvCacheConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
-from utils.util import similar
-
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])
 @pytest.mark.high_cuda_memory
-def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
+def test_qwen3_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 60:
-        pytest.skip("Not enough memory to load target model")
+    if total_mem_gb < 30:
+        pytest.skip("Not enough memory to load target and draft models")
 
     models_path = llm_models_root()
-    draft_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    draft_model_dir = f"{models_path}/Qwen3/Qwen3-0.6B"
+    target_model_dir = f"{models_path}/Qwen3/Qwen3-8B"
 
     max_batch_size = 2
     max_draft_len = 4
@@ -49,35 +59,42 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
+    # Eight tokens require at least two DraftTarget iterations while avoiding
+    # later shape-sensitive BF16 greedy ties observed on L40S.
+    max_tokens = 8
+    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
     results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert similar(text_spec, text_ref)
+    for prompt, result_spec, result_ref in zip(prompts, results_spec, results_ref, strict=True):
+        spec_output = result_spec.outputs[0]
+        ref_output = result_ref.outputs[0]
+        assert len(spec_output.token_ids) == max_tokens
+        assert len(ref_output.token_ids) == max_tokens
+        assert spec_output.token_ids == ref_output.token_ids, (
+            f"DraftTarget output tokens differ from greedy reference for prompt {prompt!r}: "
+            f"speculative={spec_output.token_ids}, reference={ref_output.token_ids}"
+        )
 
 
 @pytest.mark.high_cuda_memory
-def test_llama_draft_target_rejection():
+def test_qwen3_draft_target_rejection():
     """DraftTarget one-model with rejection sampling on: the rejection path
     (draft-prob capture -> fail-closed guard -> rejection acceptance) runs
     end-to-end with non-greedy sampling and produces coherent output."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 60:
-        pytest.skip("Not enough memory to load target model")
+    if total_mem_gb < 30:
+        pytest.skip("Not enough memory to load target and draft models")
 
     models_path = llm_models_root()
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    draft_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B-Instruct"
+    target_model_dir = f"{models_path}/Qwen3/Qwen3-8B"
+    draft_model_dir = f"{models_path}/Qwen3/Qwen3-0.6B"
 
     spec_config = DraftTargetDecodingConfig(
         max_draft_len=4,

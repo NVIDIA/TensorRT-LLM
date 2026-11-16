@@ -1,0 +1,9 @@
+version: 0.0.1
+infra_dry_run:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 0
+        lte: 1024
+  tests:
+  - test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark

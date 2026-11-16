@@ -14,6 +14,9 @@ import pytest
 
 from tensorrt_llm.llmapi.llm_args import LoadFormat, TorchLlmArgs
 
+pytestmark = pytest.mark.cpu_only
+
+
 _LOGGER_PATH = "tensorrt_llm.llmapi.llm_args.logger"
 _DUMMY_MODEL = "/tmp/test-gms-args-nonexistent"
 
@@ -122,6 +125,51 @@ class TestGmsCrossFieldWarning:
             assert relevant, "expected a warning about ignored gms_config"
         else:
             assert relevant == []
+
+
+class TestGmsMoeCompatibility:
+    @pytest.mark.parametrize(
+        "load_balancer",
+        [
+            pytest.param({"num_slots": 64}, id="standard"),
+            pytest.param(
+                {"mode": "per_layer_dynamic", "num_slots": 72},
+                id="per-layer-dynamic",
+            ),
+        ],
+    )
+    def test_rejects_gms_with_load_balancer(self, load_balancer):
+        with pytest.raises(
+            ValueError,
+            match=r"LoadFormat\.GMS.*moe_config\.load_balancer",
+        ):
+            _make_args(
+                load_format=LoadFormat.GMS,
+                moe_config={"load_balancer": load_balancer},
+            )
+
+    @pytest.mark.parametrize(
+        "load_format, load_balancer",
+        [
+            pytest.param(LoadFormat.GMS, None, id="gms-without-eplb"),
+            pytest.param(
+                LoadFormat.AUTO,
+                {"num_slots": 64},
+                id="standard-without-gms",
+            ),
+            pytest.param(
+                LoadFormat.AUTO,
+                {"mode": "per_layer_dynamic", "num_slots": 72},
+                id="per-layer-dynamic-without-gms",
+            ),
+        ],
+    )
+    def test_accepts_compatible_load_balancer(self, load_format, load_balancer):
+        args = _make_args(
+            load_format=load_format,
+            moe_config={"load_balancer": load_balancer},
+        )
+        assert args.load_format == load_format
 
 
 class TestLoadFormatGms:

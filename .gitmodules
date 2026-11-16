@@ -1,3 +1,0 @@
-[submodule "3rdparty/MSA"]
-	path = 3rdparty/MSA
-	url = https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa.git

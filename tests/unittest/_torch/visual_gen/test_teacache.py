@@ -19,11 +19,18 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.visual_gen.cache.teacache import TeaCacheBackend
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    TeaCacheBackend,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import TeaCacheConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _PipelineConfigShim:
@@ -299,6 +306,236 @@ class TestTeaCacheAcceleratorRefresh:
     def test_no_backends_is_noop(self):
         acc = self._make_accelerator([])
         acc.refresh(10)  # should not raise
+
+
+class TestQwenImageTeacacheTable:
+    """Qwen-Image built-in coefficient table resolves for any checkpoint path containing 'qwen'."""
+
+    def test_qwen_image_variant_resolves_from_checkpoint_path(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(_name_or_path="/weights/qwen-image/transformer"),
+                cache=TeaCacheConfig(teacache_thresh=0.2),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with patch.object(TeaCacheBackend, "enable"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+            BasePipeline._setup_cache_acceleration(pipeline)
+        assert pipeline.model_config.teacache.coefficients is not None
+        assert len(pipeline.model_config.teacache.coefficients) == 5
+
+    def test_qwen_image_unrelated_path_raises_valueerror(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(
+                    _name_or_path="/weights/some-other-model/transformer"
+                ),
+                cache=TeaCacheConfig(teacache_thresh=0.2),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with pytest.raises(ValueError, match="No coefficients found"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+
+    def test_user_coefficients_take_precedence_over_builtin_table(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(_name_or_path="/weights/qwen-image/transformer"),
+                cache=TeaCacheConfig(teacache_thresh=0.2, coefficients=[1.0, 2.0, 3.0]),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with patch.object(TeaCacheBackend, "enable"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+            BasePipeline._setup_cache_acceleration(pipeline)
+        assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("per_token", [False, True], ids=["t2v", "i2v"])
+@pytest.mark.parametrize("use_ret_steps", [False, True], ids=["standard", "ret_steps"])
+@torch.no_grad()
+def test_wan_teacache_timestep_embedding_matches_condition_embedder(
+    per_token: bool, use_ret_steps: bool
+) -> None:
+    """L1/T1: TeaCache timestep embeddings match Wan's normal condition embedder.
+
+    Compare standard/ret_steps outputs against the same weights and timesteps,
+    preserving batch and per-token dimensions for image-conditioned timesteps.
+    """
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTimeTextImageEmbedding
+
+    class FP32ModelConfig(DiffusionModelConfig):
+        @property
+        def torch_dtype(self) -> torch.dtype:
+            return torch.float32
+
+    dim = 8
+    with torch.random.fork_rng(devices=[]), torch.device("cpu"):
+        torch.manual_seed(0)
+        condition_embedder = WanTimeTextImageEmbedding(
+            dim=dim,
+            time_freq_dim=8,
+            time_proj_dim=6 * dim,
+            text_embed_dim=8,
+            model_config=FP32ModelConfig(device="cpu"),
+        ).eval()
+        # TRT-LLM Linear allocates empty weights; initialize the real projection.
+        torch.nn.init.normal_(condition_embedder.time_proj.weight, std=0.1)
+        torch.nn.init.normal_(condition_embedder.time_proj.bias, std=0.1)
+        encoder_hidden_states = torch.randn(2, 2, 8)
+        raw_timestep = torch.tensor(
+            [[0.0, 750.0, 500.0], [0.0, 250.0, 125.0]] if per_token else [750.0, 250.0],
+            dtype=torch.float32,
+        )
+
+    pipeline = SimpleNamespace(
+        scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)),
+        pipeline_config=SimpleNamespace(teacache=TeaCacheConfig(use_ret_steps=use_ret_steps)),
+    )
+    actual = WanPipeline._compute_wan_timestep_embedding(
+        pipeline,
+        SimpleNamespace(condition_embedder=condition_embedder),
+        timestep=raw_timestep / 1000,
+    )
+    temb, temb_proj, _, _ = condition_embedder(
+        raw_timestep.flatten(),
+        encoder_hidden_states,
+        timestep_seq_len=raw_timestep.shape[1] if per_token else None,
+    )
+    expected = temb_proj if use_ret_steps else temb
+
+    assert actual.shape == (*raw_timestep.shape, 6 * dim if use_ret_steps else dim)
+    assert not torch.equal(actual[0], actual[1])
+    if per_token:
+        assert not torch.equal(actual[:, 0], actual[:, 1])
+    reference_norm = torch.linalg.vector_norm(expected)
+    assert reference_norm > 0
+    relative_l2 = (torch.linalg.vector_norm(actual - expected) / reference_norm).item()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), expected.flatten(), dim=0
+    ).item()
+    max_abs = (actual - expected).abs().max().item()
+    diagnostic = (
+        f"Wan TeaCache {use_ret_steps=}, dtype={actual.dtype}, shape={tuple(actual.shape)}, "
+        f"relative_l2={relative_l2:.3e}, cosine={cosine:.8f}, max_abs={max_abs:.3e}"
+    )
+    print(diagnostic)
+    assert relative_l2 <= 1e-2 and cosine >= 0.9999 and max_abs <= 1e-3, diagnostic
+
+
+class _TupleTransformer(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        return_dict: bool = False,
+    ) -> tuple[torch.Tensor]:
+        assert not return_dict
+        return (hidden_states + 1,)
+
+
+def _identity_timestep_embedding(
+    _module: torch.nn.Module,
+    timestep: torch.Tensor,
+    **_kwargs,
+) -> torch.Tensor:
+    return timestep
+
+
+def test_teacache_preserves_tuple_output_on_cache_miss_and_hit() -> None:
+    transformer = _TupleTransformer()
+    register_extractor_from_config(
+        ExtractorConfig(
+            model_class_name=transformer.__class__.__name__,
+            timestep_embed_fn=_identity_timestep_embedding,
+            forward_params=["hidden_states", "timestep", "return_dict"],
+            return_dict_default=False,
+            return_tuple_when_return_dict_false=True,
+        )
+    )
+    backend = TeaCacheBackend(
+        TeaCacheConfig(
+            coefficients=[0.0, 0.0],
+            teacache_thresh=0.2,
+            use_ret_steps=False,
+        )
+    )
+    backend.enable(transformer)
+    backend.refresh(num_inference_steps=4)
+
+    hidden_states = torch.zeros(1, 8, 4)
+    timestep = torch.ones(1, 4)
+    try:
+        cache_miss = transformer(hidden_states, timestep, return_dict=False)
+        cache_hit = transformer(hidden_states, timestep, return_dict=False)
+        cache_stats = backend.get_stats()
+    finally:
+        backend.disable(transformer)
+
+    assert isinstance(cache_miss, tuple)
+    assert isinstance(cache_hit, tuple)
+    torch.testing.assert_close(cache_miss[0], hidden_states + 1)
+    torch.testing.assert_close(cache_hit[0], hidden_states + 1)
+    assert cache_stats["cached"] == 1
+
+
+class _TensorTransformer(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states + timestep[:, :1].unsqueeze(-1)
+
+
+def test_teacache_preserves_tensor_output_on_cache_miss_and_hit() -> None:
+    transformer = _TensorTransformer()
+    register_extractor_from_config(
+        ExtractorConfig(
+            model_class_name=transformer.__class__.__name__,
+            timestep_embed_fn=_identity_timestep_embedding,
+            forward_params=["hidden_states", "timestep"],
+            return_dict_default=False,
+        )
+    )
+    backend = TeaCacheBackend(
+        TeaCacheConfig(
+            coefficients=[0.0, 0.0],
+            teacache_thresh=0.2,
+            use_ret_steps=False,
+        )
+    )
+    backend.enable(transformer)
+    backend.refresh(num_inference_steps=4)
+
+    hidden_states = torch.zeros(1, 8, 4)
+    timestep = torch.ones(1, 4)
+    try:
+        cache_miss = transformer(hidden_states, timestep)
+        cache_hit = transformer(hidden_states, timestep)
+        cache_stats = backend.get_stats()
+    finally:
+        backend.disable(transformer)
+
+    assert isinstance(cache_miss, torch.Tensor)
+    assert isinstance(cache_hit, torch.Tensor)
+    torch.testing.assert_close(cache_miss, hidden_states + 1)
+    torch.testing.assert_close(cache_hit, hidden_states + 1)
+    assert cache_stats["cached"] == 1
 
 
 class TestFlux2TeacacheTable:

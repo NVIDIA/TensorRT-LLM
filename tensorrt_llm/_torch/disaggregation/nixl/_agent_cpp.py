@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 
@@ -50,6 +65,26 @@ class BindingsNixlTransferStatus(TransferStatus):
         get = getattr(self._cpp_status, "get_last_status", None)
         return int(get()) if get is not None else -1
 
+    def release(self) -> bool:
+        """Release the backend request handle (releases GIL).
+
+        Returns:
+            True if the backend accepted the release. For NIXL, calls after a
+            successful release return True without reaching the backend.
+        """
+        return self._cpp_status.release()
+
+    def __del__(self):
+        """Release the handle without the GIL before the C++ status is destroyed.
+
+        Releasing waits for the NIXL agent's lock, which load_remote_agent holds
+        for the whole metadata load. The C++ destructor that runs next finds
+        nothing left to release, so it cannot stop every Python thread while
+        it waits.
+        """
+        if getattr(self, "_cpp_status", None) is not None:
+            self.release()
+
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using C++ bindings with GIL release support.
@@ -67,14 +102,18 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         use_prog_thread: bool = True,
         num_threads: int = 1,
         enable_telemetry: bool = False,
+        rank: int | None = None,
+        world_size: int | None = None,
+        agent_buffer_size_mb: int = 0,
+        agent_bounce_params: dict[str, str] | None = None,
         **kwargs,
     ):
         backend_params = kwargs
         for key, value in backend_params.items():
             backend_params[key] = str(value)
         backend_params["num_threads"] = str(num_threads)
-        # C++ reads "num_workers" (not "num_threads") for progress threads, default 1.
-        # Env-gated so the default is unchanged (more threads can hurt the coalesced bounce WRITE).
+        # C++ reads "num_workers" (not "num_threads") for progress threads. It is set only from
+        # TRTLLM_NIXL_NUM_WORKERS; otherwise the backend default (1) applies.
         # Validate at the boundary: only a positive int reaches the backend.
         nixl_num_workers = os.environ.get("TRTLLM_NIXL_NUM_WORKERS")
         if nixl_num_workers is not None:
@@ -90,6 +129,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
                     "(expected a positive integer)"
                 )
 
+        # Bounce config stays OUT of backend_params: backend_params is forwarded verbatim to the
+        # NIXL backend plugin, while the bounce knobs ride their own BaseAgentConfig fields.
         config = BaseAgentConfig(
             name,
             use_prog_thread,
@@ -97,6 +138,10 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             use_listen_thread=False,
             enable_telemetry=enable_telemetry,
             backend_params=backend_params,
+            rank=rank,
+            world_size=world_size,
+            agent_buffer_size_mb=agent_buffer_size_mb,
+            bounce_params=agent_bounce_params or {},
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name
@@ -104,6 +149,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             f"BindingsNixlTransferAgent init: agent={name} "
             f"use_prog_thread={use_prog_thread} num_threads={num_threads} "
             f"enable_telemetry={enable_telemetry} backend_params={backend_params} "
+            f"agent_buffer_size_mb={agent_buffer_size_mb} "
+            f"agent_bounce_params={agent_bounce_params or {}} "
             f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
             f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
         )
@@ -140,6 +187,26 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     def load_remote_agent_by_connection(self, name: str, connection_info: str):
         """Load a remote agent by connection info."""
         self._cpp_agent.load_remote_agent_by_connection(name, connection_info)
+
+    @property
+    def bounce_enabled(self) -> bool:
+        """Whether the NIXL bounce v2 fast path is active on this agent."""
+        return self._cpp_agent.bounce_enabled
+
+    @property
+    def bounce_submit_count(self) -> int:
+        """Number of transfer requests routed to the bounce fast path so far."""
+        return self._cpp_agent.bounce_submit_count
+
+    @property
+    def bounce_reject_count(self) -> int:
+        """Number of transfer requests the bounce admission gate declined (bounce enabled)."""
+        return self._cpp_agent.bounce_reject_count
+
+    @property
+    def bounce_reject_counts(self) -> dict[str, int]:
+        """Per-reason rejection counts, keyed by the C++ BounceRejectReason snake_case name."""
+        return self._cpp_agent.bounce_reject_counts
 
     def get_local_agent_desc(self) -> bytes:
         """Get the local agent descriptor as bytes."""

@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
+import secrets
 import subprocess
 import tempfile
 import time
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -11,20 +16,139 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
 from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage,
-                                                create_cluster_storage_client)
+                                                create_cluster_storage_client,
+                                                key_time)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     DisaggClusterWorker)
+
+pytestmark = pytest.mark.cpu_only
 
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
-storage_types = ["http", "etcd"]
+storage_types = ["http", "etcd", "etcd-signed"]
+
+
+def worker_config(cluster_uri="http://localhost:18000", record_auth_key=None):
+    return DisaggClusterConfig(cluster_uri=cluster_uri,
+                               cluster_name="test",
+                               minimal_instances=MinimalInstances(
+                                   context_servers=1, generation_servers=1),
+                               inactive_timeout_sec=INACTIVE_TIMEOUT,
+                               heartbeat_interval_sec=HEARTBEAT_INTERVAL,
+                               record_auth_key=record_auth_key)
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_without_retry_returns_false():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.set.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    registered = await worker.register_worker(retry_interval=0)
+
+    assert not registered
+    assert worker._last_heartbeat == 0
+    assert worker._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovery_overwrites_stale_registration():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.expire.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+    worker._last_heartbeat = 0
+    worker._registration_expires_at = key_time() + config.inactive_timeout_sec
+    worker._heartbeat_task = asyncio.current_task()
+
+    async def stop_after_registration(*args, **kwargs):
+        worker._stop = True
+        return True
+
+    storage.set.side_effect = stop_after_registration
+
+    await asyncio.wait_for(worker._heartbeat(),
+                           timeout=config.inactive_timeout_sec * 2)
+
+    # Retrying is only worth it when the refresh stalled; "not refreshed" is a
+    # final answer, so burning the TTL window on it would only delay recovery.
+    assert storage.expire.await_count == 1, (
+        "a definitive refusal must not be retried inside the TTL window")
+    storage.set.assert_awaited_once_with(worker.worker_key,
+                                         ANY,
+                                         overwrite_if_exists=True,
+                                         ttl=config.inactive_timeout_sec)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_survives_stalled_refresh_within_ttl():
+    """A stalled refresh RPC must not let a live worker's registration lapse.
+
+    The storage client bounds a request only by its own coarse timeout, which
+    can exceed the whole TTL. If the heartbeat spends the window on a single
+    attempt, the coordinator evicts a healthy worker mid-request, so the
+    refresh must retry inside the window instead.
+    """
+    config = worker_config()
+    storage = AsyncMock()
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    refreshed_at = []
+    stalls_left = 1
+
+    async def stalled_then_ok(*args, **kwargs):
+        nonlocal stalls_left
+        if stalls_left > 0:
+            stalls_left -= 1
+            # Far longer than the TTL, as a stuck client-side timeout would be.
+            await asyncio.sleep(config.inactive_timeout_sec * 5)
+        refreshed_at.append(key_time())
+        worker._stop = True
+        return True
+
+    storage.expire.side_effect = stalled_then_ok
+    worker._last_heartbeat = key_time()
+    worker._registration_expires_at = (key_time() + config.inactive_timeout_sec)
+    deadline = worker._registration_expires_at
+    worker._heartbeat_task = asyncio.current_task()
+
+    await asyncio.wait_for(worker._heartbeat(),
+                           timeout=config.inactive_timeout_sec * 4)
+
+    assert storage.expire.await_count > 1, (
+        "a stalled refresh must be retried, not awaited for the whole window")
+    assert refreshed_at, "the refresh never succeeded"
+    assert refreshed_at[0] < deadline, (
+        f"refresh landed at {refreshed_at[0]} after the registration expired "
+        f"at {deadline}")
+    storage.set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_timeout_past_grace_returns_without_retry():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.expire.side_effect = asyncio.TimeoutError
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+    worker._registration_expires_at = 100
+
+    with patch("tensorrt_llm.serve.disagg_auto_scaling.key_time",
+               side_effect=[105, 105]):
+        assert not await worker._refresh_registration()
+
+    assert storage.expire.await_count == 1
 
 
 def get_uri(storage_type):
     if storage_type == "http":
         return f"http://localhost:18000"
-    elif storage_type == "etcd":
+    elif storage_type in ("etcd", "etcd-signed"):
         return f"etcd://localhost:2379"
     else:
         raise ValueError(f"Invalid storage type: {storage_type}")
@@ -32,13 +156,9 @@ def get_uri(storage_type):
 
 @pytest.fixture(scope="module")
 def config(request):
-    cluster_uri = get_uri(request.param)
-    return DisaggClusterConfig(cluster_uri=cluster_uri,
-                               cluster_name="test",
-                               minimal_instances=MinimalInstances(
-                                   context_servers=1, generation_servers=1),
-                               inactive_timeout_sec=INACTIVE_TIMEOUT,
-                               heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+    record_auth_key = (secrets.token_hex(16)
+                       if request.param == "etcd-signed" else None)
+    return worker_config(get_uri(request.param), record_auth_key)
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +174,8 @@ def storage_server(config):
                 ["etcd", "--data-dir", temp_dir, "--log-level", "debug"])
             time.sleep(2)  # wait for etcd to start
             yield create_cluster_storage(
-                config.cluster_uri, config.cluster_name), config.cluster_uri
+                config.cluster_uri, config.cluster_name,
+                **config.cluster_storage_options()), config.cluster_uri
         etcd.kill()
         etcd.wait()
     else:
@@ -62,9 +183,10 @@ def storage_server(config):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def storage_client(storage_server):
+async def storage_client(config, storage_server):
     _, cluster_uri = storage_server
-    return create_cluster_storage_client(cluster_uri, "test")
+    return create_cluster_storage_client(cluster_uri, "test",
+                                         **config.cluster_storage_options())
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -86,7 +208,8 @@ async def test_init_workers_first(config, storage_server):
         # init workers before initializing the manager, so the manager should be able to
         # get the pre-registered workers
         server, storage_uri = storage_server
-        storage_client = create_cluster_storage_client(storage_uri, "test")
+        storage_client = create_cluster_storage_client(
+            storage_uri, "test", **config.cluster_storage_options())
         ctx_worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
                                          config, storage_client)
         gen_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
@@ -264,3 +387,30 @@ async def test_cluster_worker_heartbeat(cluster_manager, storage_client,
     finally:
         await ctx_worker.deregister_worker()
         await gen_worker.deregister_worker()
+
+
+@pytest.mark.parametrize("config", ["etcd-signed"], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(20)
+@pytest.mark.asyncio(scope="module")
+async def test_signed_cluster_ignores_workers_without_the_key(
+        cluster_manager, storage_server, storage_client, config):
+    _, cluster_uri = storage_server
+    unsigned_worker = DisaggClusterWorker(
+        ServerRole.CONTEXT, "127.0.0.1", 8003, config,
+        create_cluster_storage_client(cluster_uri, "test"))
+    signed_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
+                                        8004, config, storage_client)
+    try:
+        await cluster_manager.watch_workers()
+        assert await unsigned_worker.register_worker()
+        await unsigned_worker.deregister_worker()
+        assert await signed_worker.register_worker()
+        # The unsigned worker's registration and removal are not reported.
+        expected = [(signed_worker.worker_info, WatchEventType.SET)]
+        assert await asyncio.wait_for(cluster_manager.get_worker_events(),
+                                      timeout=5) == expected
+        assert cluster_manager.current_ctx_worker_num == 0
+    finally:
+        await unsigned_worker.deregister_worker()
+        await signed_worker.deregister_worker()

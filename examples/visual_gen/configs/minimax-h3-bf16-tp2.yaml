@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DiT tensor parallelism on two GPUs; the text encoder stays replicated.
+parallel_config:
+  tp_size: 2
+
+cuda_graph_config:
+  enable: false
+
+attention_config:
+  backend: VANILLA
+
+compilation_config:
+  skip_warmup: true

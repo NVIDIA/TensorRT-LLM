@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import os
 from typing import Optional
 
@@ -10,7 +11,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.logger import logger
 
 try:
@@ -27,6 +28,49 @@ try:
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = True
 except (ImportError, RuntimeError):
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = False
+
+# The two launchers behind gated_delta_rule (internal FlashInfer symbols) for
+# flashinfer_gdn_decode_t1 below; either missing only disables that shortcut.
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        _select_wide_vec_tile_v as _fi_select_wide_vec_tile_v
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        gated_delta_rule_t1_wide_vec as _fi_gdn_decode_t1_wide_vec
+except (ImportError, RuntimeError):
+    _fi_select_wide_vec_tile_v = None
+    _fi_gdn_decode_t1_wide_vec = None
+
+# FlashInfer's compile cache of the MTP kernel and its config / key helpers, for
+# the compiled-kernel shortcut of flashinfer_gdn_tail_recurrent (internal
+# symbols; any of them missing keeps the tail on the public entry).
+try:
+    from flashinfer.gdn_kernels import \
+        gdn_decode_bf16_state as _fi_gdn_decode_mod
+    _fi_mtp_compiled = _fi_gdn_decode_mod._compiled_kernels_mtp
+    _fi_wide_vec_compiled = _fi_gdn_decode_mod._compiled_kernels_wide_vec
+    _fi_get_bf16_mtp_config = _fi_gdn_decode_mod._get_bf16_mtp_config
+    _fi_dtype_key = _fi_gdn_decode_mod._dtype_key
+    _fi_use_packed_fma = _fi_gdn_decode_mod._USE_PACKED_FMA
+    import cuda.bindings.driver as _cuda_driver
+except (ImportError, RuntimeError, AttributeError):
+    _fi_mtp_compiled = _fi_wide_vec_compiled = None
+    _fi_get_bf16_mtp_config = _fi_dtype_key = _fi_use_packed_fma = _cuda_driver = None
+
+_cu_streams: dict = {}
+
+
+def _current_cu_stream(device_index: int):
+    """The CUstream of the current torch stream, from the raw handle (the
+    torch.cuda.current_stream() Stream object costs ~2 us per call; the
+    handle lookup ~0.3 us) with the CUstream objects cached per handle."""
+    handle = torch._C._cuda_getCurrentRawStream(device_index)
+    stream = _cu_streams.get(handle)
+    if stream is None:
+        if len(_cu_streams) >= 64:
+            _cu_streams.clear()
+        stream = _cu_streams[handle] = _cuda_driver.CUstream(handle)
+    return stream
+
 
 # Max per-sequence token count served by the FlashInfer MTP verify kernel; the
 # parity test (test_flashinfer_gdn_verify.py) covers T=1..8 against the Triton
@@ -159,8 +203,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
             # Apply L2 normalization if enabled
             if USE_QK_L2NORM_IN_KERNEL:
-                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
-                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
 
             b_q = b_q * scale
 
@@ -218,7 +262,7 @@ def _can_use_flashinfer_gdn_decode(
     # FlashInfer's GDN decode kernel is built for Hopper (SM90) and datacenter
     # Blackwell (SM100/SM103) only; on consumer Blackwell (SM120) and other archs
     # it aborts at launch -> fall back to the Triton fused-recurrent kernel.
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None:
         return False
@@ -283,6 +327,16 @@ def _flashinfer_gdn_decode(
     if b.data_ptr() % 32 != 0:
         b = b.clone(memory_format=torch.contiguous_format)
 
+    # The int32 index tensor may likewise be a slice of a larger buffer
+    # (e.g. the decode half ``state_indices[num_prefills:]`` of a mixed
+    # batch) whose 4*offset storage offset breaks the 32-byte alignment;
+    # ``.int()`` is a no-op for int32 and keeps the misaligned pointer, so
+    # realign with an explicit copy when needed, matching
+    # ``_flashinfer_gdn_verify``.
+    initial_state_indices = initial_state_indices.int()
+    if initial_state_indices.data_ptr() % 32 != 0:
+        initial_state_indices = initial_state_indices.clone()
+
     # Reshape from packed varlen [1, N*T, ...] to batched [N, T, ...].
     q_bat = q.view(N, T_per_seq, q.shape[2], q.shape[3])
     k_bat = k.view(N, T_per_seq, k.shape[2], k.shape[3])
@@ -296,6 +350,10 @@ def _flashinfer_gdn_decode(
     assert T_per_seq == 1, (
         f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
         f"{T_per_seq}; _can_use_flashinfer_gdn_decode should keep T == N")
+    # TP8 leaves eight BF16 ``a`` values per Qwen3.5 GDN shard. Odd shards can
+    # start 16 bytes into fused projection storage, but CuTe requires 32B.
+    if a_bat.data_ptr() % 32:
+        a_bat = a_bat.clone(memory_format=torch.contiguous_format)
     _fi_gdn_decode_bf16_state_t1(
         A_log=A_log,
         a=a_bat,
@@ -307,7 +365,7 @@ def _flashinfer_gdn_decode(
         v=v_bat,
         b=b_bat,
         initial_state_source=initial_state_source,
-        initial_state_indices=initial_state_indices.int(),
+        initial_state_indices=initial_state_indices,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         scale=scale,
         output=output,
@@ -315,6 +373,150 @@ def _flashinfer_gdn_decode(
 
     # Reshape output from [N, T, HV, V] back to [1, N*T, HV, V].
     return output.reshape(1, T_total, HV, -1)
+
+
+@functools.lru_cache(maxsize=8)
+def flashinfer_gdn_bf16_state_available(pool_dtype: torch.dtype, K: int,
+                                        V: int) -> bool:
+    """Whether FlashInfer's bf16-state GDN launchers (the T=1 decode kernels) serve a state pool of this
+    dtype and head sizes on this device: the batch-independent conditions of
+    ``_can_use_flashinfer_gdn_decode`` plus the availability of the launchers,
+    evaluated once instead of per layer. Independent of the direct-launch knob,
+    which only picks how the kernels are launched."""
+    return (_FLASHINFER_GDN_BF16_STATE_AVAILABLE
+            and _fi_gdn_decode_t1_wide_vec is not None
+            and _fi_select_wide_vec_tile_v is not None
+            and os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") != "1"
+            and is_flashinfer_gdn_decode_supported_arch()
+            and pool_dtype == torch.bfloat16 and K == 128 and V == 128)
+
+
+@functools.lru_cache(maxsize=8)
+def flashinfer_gdn_decode_direct_available(pool_dtype: torch.dtype, K: int,
+                                           V: int) -> bool:
+    """Whether ``flashinfer_gdn_decode_t1`` serves one-token decode batches on a
+    state pool of this dtype and head sizes: the launchers are available."""
+    return flashinfer_gdn_bf16_state_available(pool_dtype, K, V)
+
+
+def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
+                             q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                             a: torch.Tensor, b: torch.Tensor,
+                             pool: torch.Tensor, indices: torch.Tensor,
+                             output: torch.Tensor,
+                             scale: float) -> torch.Tensor:
+    """One-token-per-sequence GDN decode straight into FlashInfer's bf16-state
+    launchers, for callers that already hold the kernel's layouts.
+
+    ``q``/``k`` ``[N, 1, H, K]``, ``v`` ``[N, 1, HV, V]``, ``a``/``b`` ``[N, 1, HV]``
+    with 32-byte aligned base pointers, ``indices`` contiguous int32 (aligned),
+    ``output`` ``[N, 1, HV, V]`` bf16; the pool rows ``indices`` are updated in
+    place. Same dispatch as FlashInfer's ``gated_delta_rule`` (the wide-vector
+    kernel from ``N * HV >= 512``, the MTP T=1 kernel below) without its per-call
+    validation and without the two adapter layers of
+    ``fused_sigmoid_gating_delta_rule_update`` above it: ~20 us of host time per
+    GDN layer of a mixed iteration, whose host thread is the critical path.
+    Callers check ``flashinfer_gdn_decode_direct_available`` and the alignment."""
+    tile_v = _fi_select_wide_vec_tile_v(q.shape[0], v.shape[2])
+    if tile_v is not None and tile_v >= 64:
+        entry = _fi_wide_vec_compiled_entry(q.shape[2], v.shape[2], pool, A_log,
+                                            dt_bias, indices, scale, tile_v)
+        if entry is not None:
+            # FlashInfer's compiled wide-vector kernel straight from its cache
+            # (filled by the public entry on the first call for this tile):
+            # the entry's per-call Python (casts, asserts, key, defaults) goes
+            # from ~12 us to ~7 us. Same kernel, same arguments.
+            compiled, inter = entry
+            compiled(pool, inter, A_log, a, dt_bias, q, k, v, b, output,
+                     indices, indices, _current_cu_stream(q.device.index))
+            return output
+        return _fi_gdn_decode_t1_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=indices,
+            output_state_indices=None,
+            intermediate_states_buffer=None,
+            disable_state_update=False,
+            use_qk_l2norm_in_kernel=True,
+            scale=scale,
+            output=output,
+            tile_v=tile_v,
+        )
+    return _fi_gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=indices,
+        output_state_indices=None,
+        output=output,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+
+_fi_wide_vec_entries: dict = {}
+
+
+def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor,
+                                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                                indices: torch.Tensor, scale: float,
+                                tile_v: int):
+    """``(compiled, dummy_intermediate)`` of FlashInfer's wide-vector T=1 decode
+    kernel for this pool geometry / tile, or None when FlashInfer's internals
+    are unavailable or the kernel is not compiled yet."""
+    if _fi_wide_vec_compiled is None:
+        return None
+    key = (H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype,
+           dt_bias.dtype, indices.dtype, scale, tile_v)
+    entry = _fi_wide_vec_entries.get(key)
+    if entry is not None:
+        return entry
+    K = V = pool.shape[-1]
+    contiguous = pool.is_contiguous()
+    cache_key = (
+        "v3_mtp_bf16_tiled_dynB",
+        1,
+        H,
+        HV,
+        K,
+        V,
+        -1 if contiguous else pool.shape[0],
+        (-1, ) if contiguous else tuple(int(s) for s in pool.stride()),
+        tile_v,
+        False,  # effective_disable_final
+        False,  # cache_intermediate_states
+        True,  # use_qk_l2norm_in_kernel
+        scale,
+        1.0,
+        20.0,
+        _fi_use_packed_fma,
+        True,  # same_pool: read and write the same slots
+        _fi_dtype_key(A_log, dt_bias, indices),
+    )
+    cache = _fi_wide_vec_compiled.get(cache_key)
+    if cache is None:
+        return None
+    # Own storage: a view would keep the whole pool alive in this module-level cache.
+    entry = (cache["compiled"], pool[:1, :1, :1].clone())
+    if len(_fi_wide_vec_entries) >= 256:
+        _fi_wide_vec_entries.clear()
+    _fi_wide_vec_entries[key] = entry
+    return entry
 
 
 def _can_use_flashinfer_gdn_verify(
@@ -338,7 +540,7 @@ def _can_use_flashinfer_gdn_verify(
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None or initial_state_source.dtype != torch.bfloat16:
         return False
@@ -386,9 +588,17 @@ def _flashinfer_gdn_verify(
     output = (output.view(N, T, HV, V) if output is not None else q.new_empty(
         N, T, HV, V))
     # The FI CuTe-DSL kernel asserts 32-byte data alignment on every tensor
-    # argument. The int32 index tensor may be a slice of a larger buffer
+    # argument. ``a`` starts ``num_v_heads_per_tp`` bf16 elements into the fused
+    # ``in_proj_ba`` output, so it is misaligned when that count is not a
+    # multiple of 16 (e.g. Qwen3.5 TEP16: 128 / 16 = 8) -- see the note in
+    # _flashinfer_gdn_decode for why this clones instead of .contiguous().
+    if a.data_ptr() % 32 != 0:
+        a = a.clone(memory_format=torch.contiguous_format)
+    if b.data_ptr() % 32 != 0:
+        b = b.clone(memory_format=torch.contiguous_format)
+    # The int32 index tensor may likewise be a slice of a larger buffer
     # (e.g. state_indices_d = cache_indices[num_prefills:]) whose 4*offset
-    # storage offset breaks that; .int() is a no-op for int32, so realign
+    # storage offset breaks alignment; .int() is a no-op for int32, so realign
     # with an explicit copy when needed.
     initial_state_indices = initial_state_indices.int()
     if initial_state_indices.data_ptr() % 32 != 0:

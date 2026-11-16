@@ -1,65 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import datetime
-import glob
+import importlib.metadata
 import logging as _logger
 import os as _os
 import pathlib as _pl
 import subprocess as _sp
 import sys as _sys
-from typing import Generator, List, Optional, Sequence
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
+from typing import Optional, Sequence
 
 from build_wheel import get_build_dir as get_trt_llm_build_dir
 
 default_test_parallel = 2
-default_test_timeout = 3600
-
-include_test_map = {
-    "gpt": ("Gpt[^j]", ),
-    "gpt_executor": ("GptExecutor", ),
-    "gpt_tests": ("GptTests", ),
-    "gptj": ("Gptj", ),
-    "llama": ("Llama", ),
-    "chatglm": ("ChatGlm", ),
-    "medusa": ("Medusa", ),
-    "eagle": ("Eagle", ),
-    "mamba": ("Mamba", ),
-    "recurrentgemma": ("RecurrentGemma", ),
-    "encoder": ("EncoderModelTestSingleGPU", ),
-    "bart": ("BartBasicTest", ),
-    "t5": (
-        "T5BasicTest",
-        "T5Beam2Test",
-    ),
-    "enc_dec_language_adapter": ("LanguageAdapterBasicTest", ),
-    "redrafter": ("ExplicitDraftTokens", )
-}
-
-
-def generate_included_model_tests(
-        test_list: List[str]) -> Generator[str, None, None]:
-
-    yield from (item for model in test_list for item in include_test_map[model])
-
-
-def generate_result_file_name(test_list: List[str],
-                              run_fp8=False) -> Generator[str, None, None]:
-    yield "results-single-gpu"
-    yield from test_list
-
-    if run_fp8:
-        yield "fp8"
-
-
-def generate_excluded_test_list(test_list):
-    if "gpt" in test_list:
-        if "gpt_executor" not in test_list:
-            yield "GptExecutor"
-        if "gpt_tests" not in test_list:
-            yield "GptTests"
 
 
 def find_dir_containing(files: Sequence[str],
@@ -92,8 +57,40 @@ def find_build_dir(build_type: str) -> _pl.Path:
         Absolute path to the C++ build directory.
     """
     root_dir = find_root_dir()
-    build_dir = get_trt_llm_build_dir(None, build_type)
+    build_root = _os.environ.get("TRTLLM_BUILD_ROOT") or None
+    build_dir = get_trt_llm_build_dir(None, build_type, build_root=build_root)
     return build_dir if build_dir.is_absolute() else root_dir / build_dir
+
+
+def find_test_bundle(build_type: str) -> Optional[_pl.Path]:
+    if (_sys.platform != "linux" or build_type != "Release"
+            or _os.environ.get("TRTLLM_BUILD_ROOT")):
+        return None
+    bundle = find_build_dir(build_type)
+    return bundle if (bundle / "CTestTestfile.cmake.in").is_file() else None
+
+
+def prepare_test_bundle(build_type: str) -> bool:
+    bundle = find_test_bundle(build_type)
+    if bundle is None:
+        return False
+    library_dir = importlib.metadata.distribution("tensorrt_llm").locate_file(
+        "tensorrt_llm/libs")
+    library_link = bundle / "lib"
+    if library_link.is_symlink() and library_link.readlink() != library_dir:
+        library_link.unlink()
+    if not library_link.is_symlink():
+        library_link.symlink_to(library_dir, target_is_directory=True)
+    source_root = str(find_root_dir())
+    for template in bundle.rglob("*.cmake.in"):
+        content = template.read_text().replace("__TRTLLM_CPP_BUNDLE_ROOT__",
+                                               str(bundle))
+        content = content.replace("__TRTLLM_CPP_SOURCE_ROOT__", source_root)
+        destination = template.with_suffix("")
+        if not destination.exists() or destination.read_text() != content:
+            destination.write_text(content)
+    _logger.info("Using packaged C++ tests: %s", bundle)
+    return True
 
 
 def run_command(command: Sequence[str],
@@ -181,6 +178,10 @@ def parallel_run_ctest(
     timeout=None,
     parallel=default_test_parallel,
 ) -> None:
+    report = _pl.Path(command[command.index("--output-junit") + 1])
+    if not report.is_absolute():
+        report = (cwd / report).resolve()
+    report.unlink(missing_ok=True)
     if parallel == 1:
         return run_ctest(command,
                          cwd=cwd,
@@ -191,26 +192,17 @@ def parallel_run_ctest(
     env = {} if env is None else env
     env['CTEST_PARALLEL_LEVEL'] = str(parallel)
 
-    def get_report():
-        reports = glob.glob("results-*.xml", root_dir=cwd)
-        if not reports:
-            return ''
-
-        return reports[0]
-
-    report = None
     try:
         run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
     # except _sp.TimeoutExpired:
     # Deliberately let timeout propagate. We don't want to retry on timeout
     except _sp.CalledProcessError:
-        report = get_report()
-        if report == '':
+        if not report.is_file():
             # Some catastrophic fail happened that there's no report generated
             raise
 
         # Avoid .xml extension to prevent CI from reading failures from it
-        parallel_report = 'parallel-' + report + ".intermediate"
+        parallel_report = 'parallel-' + report.name + ".intermediate"
         _os.rename(cwd / report, cwd / parallel_report)
 
         try:
@@ -224,21 +216,10 @@ def parallel_run_ctest(
                 # Use parallel result as final report
                 _os.rename(cwd / parallel_report, cwd / report)
             else:
-                retry_report = 'retry-' + report + ".intermediate"
+                retry_report = 'retry-' + report.name + ".intermediate"
                 _os.rename(cwd / report, cwd / retry_report)
                 merge_report(cwd / parallel_report, cwd / retry_report,
                              cwd / report)
     finally:
-        if report is None:
-            report = get_report()
-        if report:
+        if report.is_file():
             add_parallel_info(cwd / report, parallel)
-
-
-def produce_mpirun_command(*, global_commands, nranks, local_commands,
-                           leader_commands):
-    l = global_commands
-    for rank in range(nranks):
-        l += ["-n", "1"] + local_commands + (leader_commands
-                                             if rank == 0 else []) + [":"]
-    return l[:-1]
