@@ -1049,16 +1049,29 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            layout_kwargs = {}
-            if disaggregated_params.multimodal_input_layout is not None:
-                layout_kwargs[
-                    "encoder_inputs"] = disaggregated_params.multimodal_input_layout
-            prompt_token_ids, multimodal_params = (
-                self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs,
-                    mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes,
-                    **layout_kwargs))
+            if (getattr(self.input_processor, "supports_mm_item_handoff", False)
+                    and disaggregated_params.multimodal_input_layout is None
+                    and disaggregated_params.mrope_position_ids_handle is None):
+                # Items from an encode without the real prompt: build the
+                # prompt and its positions from the item metadata.
+                prompt_token_ids, multimodal_params = (
+                    self.input_processor.build_mm_item_prefill_inputs(
+                        inputs,
+                        mm_handles,
+                        sampling_params,
+                        mm_hashes=disaggregated_params.multimodal_hashes))
+                multimodal_params.to_handle("multimodal_data")
+            else:
+                layout_kwargs = {}
+                if disaggregated_params.multimodal_input_layout is not None:
+                    layout_kwargs[
+                        "encoder_inputs"] = disaggregated_params.multimodal_input_layout
+                prompt_token_ids, multimodal_params = (
+                    self.input_processor.build_disagg_prefill_multimodal_inputs(
+                        inputs,
+                        mm_handles,
+                        mm_hashes=disaggregated_params.multimodal_hashes,
+                        **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "

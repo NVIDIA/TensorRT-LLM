@@ -36,14 +36,14 @@ def _make_qwen3_vl_config(hidden_size: int):
 
 def _make_tokenizer(input_ids):
     tokenizer = Mock()
-    tokenizer.return_value.input_ids = [torch.tensor(input_ids)]
+    tokenizer.return_value.input_ids = input_ids
     return tokenizer
 
 
 def _make_qwen3_vl_processor(config, tokenizer):
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor"
                ) as mock_auto_processor:
-        mock_auto_processor.from_pretrained.return_value = Mock()
+        mock_auto_processor.from_pretrained.return_value = SimpleNamespace()
         return Qwen3VLInputProcessorBase(
             model_path="dummy_path",
             config=config,
@@ -57,10 +57,11 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     config = _make_qwen3_vl_config(hidden_size)
     expected_embedding_width = hidden_size * (
         1 + len(config.vision_config.deepstack_visual_indexes))
+    # Ids of the prompt after its image placeholder is expanded.
     tokenizer = _make_tokenizer([
         7,
         config.vision_start_token_id,
-        config.image_token_id,
+        *[config.image_token_id] * 4,
         config.vision_end_token_id,
         8,
     ])
@@ -73,7 +74,7 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     ).reshape(num_image_tokens, expected_embedding_width)
 
     prompt_token_ids, extra_processed_inputs = processor.attach_multimodal_embeddings(
-        {"prompt": "Describe this image."},
+        {"prompt": "Describe<|vision_start|><|image_pad|><|vision_end|>this."},
         {
             "image": [{
                 "mm_embeddings": image_embedding,
@@ -96,8 +97,11 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         config.vision_end_token_id,
         8,
     ]
-    tokenizer.assert_called_once_with("Describe this image.",
-                                      return_tensors="pt")
+    # The placeholder is expanded in the text, which is tokenized once.
+    tokenizer.assert_called_once_with("Describe<|vision_start|>" +
+                                      "<|image_pad|>" * 4 +
+                                      "<|vision_end|>this.",
+                                      add_special_tokens=True)
 
     multimodal_data = extra_processed_inputs["multimodal_data"]
     assert multimodal_data["multimodal_embedding"] == [image_embedding]

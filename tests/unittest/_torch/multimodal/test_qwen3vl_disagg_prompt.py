@@ -264,14 +264,20 @@ def test_external_embeddings_reuse_common_item_metadata(model):
 
     cls = Qwen3VLInputProcessorBase if model == "qwen3" else Qwen2_5VLInputProcessorBase
     processor = object.__new__(cls)
+    processor._processor = SimpleNamespace()
     processor._config = SimpleNamespace(
         image_token_id=_IMAGE_TOKEN_ID,
         video_token_id=_VIDEO_TOKEN_ID,
         vision_start_token_id=_VISION_START_TOKEN_ID,
-        text_config=SimpleNamespace(hidden_size=16),
+        text_config=SimpleNamespace(hidden_size=16, vocab_size=151936),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[], spatial_merge_size=2),
     )
-    processor._tokenizer = _FakeTokenizer([11, _IMAGE_TOKEN_ID, 12, _IMAGE_TOKEN_ID, 13])
+    # Ids of the prompt after its two image placeholders are expanded.
+    processor._tokenizer = Mock(
+        return_value=SimpleNamespace(
+            input_ids=[11, *([_IMAGE_TOKEN_ID] * 4), 12, *([_IMAGE_TOKEN_ID] * 9), 13]
+        )
+    )
     mrope_config = {"mrope_position_deltas": torch.zeros(1, dtype=torch.int32)}
     processor.get_mrope_config = lambda *args: mrope_config
     embeddings = [torch.ones(4, 16), torch.ones(9, 16)]
@@ -280,8 +286,9 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         {"mm_embeddings": embeddings[1], "image_grid_thw": [1, 6, 6]},
     ]
 
+    placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
     tokens, extra = processor.attach_multimodal_embeddings(
-        {"prompt": "video prompt"}, {"image": items}, SamplingParams()
+        {"prompt": f"a {placeholder} b {placeholder} c"}, {"image": items}, SamplingParams()
     )
     params = MultimodalParams(multimodal_data=extra["multimodal_data"])
 
