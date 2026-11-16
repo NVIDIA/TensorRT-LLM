@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,8 @@ from unittest import mock
 
 import pynvml
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm.bench.benchmark import get_general_cli_options
 from tensorrt_llm.bench.benchmark.utils.general import get_settings
@@ -550,29 +553,134 @@ def test_cli_options_read_the_model_type_of_the_checkpoint_format(tmp_path, chec
         load.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "limits", [{}, {"max_batch_size": 16}, {"max_batch_size": 16, "max_num_tokens": 32768}]
-)
-def test_settings_of_a_mistral_native_checkpoint_need_explicit_limits(tmp_path, limits):
-    """The tuning heuristic reads a config.json, which a Mistral-native checkpoint lacks."""
+# A small dense Mistral-native model: 2 layers, 4 query and 2 KV heads of 64.
+_MISTRAL_NATIVE_PARAMS = {
+    "dim": 256,
+    "n_layers": 2,
+    "head_dim": 64,
+    "hidden_dim": 512,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "norm_eps": 1e-5,
+    "vocab_size": 1024,
+    "rope_theta": 1e6,
+}
+# The Hugging Face config.json of another model, to tell which of the two files was read.
+_HF_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "num_hidden_layers": 3,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "vocab_size": 1024,
+    "torch_dtype": "bfloat16",
+}
+
+
+def _weights(*shapes):
+    return {f"w{i}": torch.zeros(shape, dtype=torch.bfloat16) for i, shape in enumerate(shapes)}
+
+
+def _mistral_native_checkpoint(path, *, weights="consolidated", hf_config=False):
+    """Write params.json and, by `weights`, consolidated, sharded consolidated or no weights."""
+    path.mkdir()
+    (path / "params.json").write_text(json.dumps(_MISTRAL_NATIVE_PARAMS))
+    if weights == "consolidated":
+        save_file(_weights((1024, 256), (256,)), path / "consolidated.safetensors")
+    elif weights == "sharded":
+        weight_map = {}
+        for shard, (name, tensor) in enumerate(_weights((1024, 256), (256,)).items(), 1):
+            file_name = f"consolidated-{shard:05d}-of-00002.safetensors"
+            save_file({name: tensor}, path / file_name)
+            weight_map[name] = file_name
+        (path / "consolidated.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+    if hf_config:
+        (path / "config.json").write_text(json.dumps(_HF_CONFIG))
+        save_file(_weights((1024, 128)), path / "model.safetensors")
+    return path
+
+
+def _tune(tmp_path, checkpoint, checkpoint_format="mistral"):
+    """Run get_settings without explicit limits; return the engine-setting arguments."""
+    params = {
+        "tp": 1,
+        "pp": 1,
+        "ep": 1,
+        "extra_llm_api_options": _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format, enable_chunked_prefill="false"
+        ),
+    }
+    metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.utils.general.get_benchmark_engine_settings",
+        return_value=(16, 32768),
+    ) as engine_settings:
+        settings = get_settings(params, metadata, "mistral-native", checkpoint)
+    assert settings["settings_config"]["max_batch_size"] == 16
+    assert settings["settings_config"]["max_num_tokens"] == 32768
+    model_config, quant_config = engine_settings.call_args.args[:2]
+    return model_config, quant_config
+
+
+@pytest.mark.parametrize("hf_config", [False, True], ids=["native_only", "with_config_json"])
+@pytest.mark.parametrize("weights", ["consolidated", "sharded"])
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+def test_tuning_reads_a_mistral_native_checkpoint_from_its_native_files(
+    tmp_path, checkpoint_format, weights, hf_config
+):
+    """The tuning heuristic reads params.json and the consolidated weights, as the runtime does."""
+    checkpoint = _mistral_native_checkpoint(
+        tmp_path / "checkpoint", weights=weights, hf_config=hf_config
+    )
+    model_config, quant_config = _tune(tmp_path, checkpoint, checkpoint_format)
+    assert model_config.model_type == "mistral_common"
+    assert model_config.num_hidden_layers == 2
+    assert model_config.num_attention_heads == 4
+    assert model_config.num_key_value_heads == 2
+    assert model_config.head_size == 64
+    assert model_config.dtype == "bfloat16"
+    assert not model_config.is_mla()
+    assert model_config.param_count == 1024 * 256 + 256
+    assert model_config.checkpoint_size_in_gb == (1024 * 256 + 256) * 2 / 1024**3
+    assert quant_config.quant_algo is None
+
+
+def test_tuning_reads_config_json_when_the_native_files_cannot_be_read(tmp_path):
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", weights=None, hf_config=True)
+    model_config, quant_config = _tune(tmp_path, checkpoint)
+    assert model_config.model_type == "llama"
+    assert model_config.num_hidden_layers == 3
+    assert model_config.param_count == 1024 * 128
+    assert quant_config.quant_algo is None
+
+
+def test_tuning_of_an_unreadable_mistral_native_checkpoint_needs_explicit_limits(tmp_path):
+    """Neither the native files nor a config.json describe the checkpoint."""
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", weights=None)
+    with pytest.raises(ValueError, match="pass --max_batch_size and --max_num_tokens"):
+        _tune(tmp_path, checkpoint)
+
+
+def test_explicit_limits_of_a_mistral_native_checkpoint_skip_the_tuning_heuristic(tmp_path):
     params = {
         "tp": 4,
         "pp": 1,
         "ep": 4,
+        "max_batch_size": 16,
+        "max_num_tokens": 32768,
         "extra_llm_api_options": _llm_api_options(
             tmp_path, checkpoint_format="mistral", enable_chunked_prefill="false"
         ),
-        **limits,
     }
     metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
     with mock.patch(
-        "tensorrt_llm.bench.benchmark.utils.general.get_model_config",
+        "tensorrt_llm.bench.benchmark.utils.general._tuning_model_configs",
         side_effect=AssertionError("the tuning heuristic must not read the checkpoint"),
     ):
-        if len(limits) < 2:
-            with pytest.raises(ValueError, match="--max_batch_size and --max_num_tokens"):
-                get_settings(params, metadata, "mistral-native", tmp_path)
-            return
         settings = get_settings(params, metadata, "mistral-native", tmp_path)
     assert settings["settings_config"]["max_batch_size"] == 16
     assert settings["settings_config"]["max_num_tokens"] == 32768
