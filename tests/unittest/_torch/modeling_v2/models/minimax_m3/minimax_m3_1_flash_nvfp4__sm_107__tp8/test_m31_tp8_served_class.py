@@ -104,9 +104,11 @@ def _worker(monkeypatch, served, rank, killed, *, real_layout=False):
         monkeypatch.setattr(dspark, "install_causal_draft", Mock(return_value=0))
         monkeypatch.setattr(dspark.dspark_ctxlen, "prepare", Mock(return_value=False))
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-        # The split-K drafter projections arm only without the his layout; arming them queries the device.
-        monkeypatch.setattr(dspark, "route_down_splitk", Mock(return_value=0))
-        monkeypatch.setattr(dspark, "route_oproj_splitk", Mock(return_value=0))
+        # The split-K drafter projections arm only without the his layout; arming them queries the device. They are
+        # kept out of ``routes`` (a namespace, not attached mocks) so its call order stays the layout routes'.
+        routes.splitk = SimpleNamespace(down=Mock(return_value=0), oproj=Mock(return_value=0))
+        monkeypatch.setattr(dspark, "route_down_splitk", routes.splitk.down)
+        monkeypatch.setattr(dspark, "route_oproj_splitk", routes.splitk.oproj)
     return worker, routes, log
 
 
@@ -132,6 +134,13 @@ def test_imported_dspark_prebuild_preserves_provider_order_and_kill(
         )
     # The his layout's fused MLPs take the gate_up SwiGLU; without the layout the epilogue route does.
     assert [c[0] for c in routes.mock_calls] == (["mx", "gu"] if disabled else ["his", "mx"])
+    # Prebuild offers the split-K routes the drafter's down and o projections once each; with the his layout those
+    # projections are the layout's, so split-K is not armed for them.
+    for split_k in (routes.splitk.down, routes.splitk.oproj):
+        split_k.assert_called_once()
+        assert split_k.call_args.args == (draft,)
+        if not disabled:
+            assert split_k.call_args.kwargs == {"enabled": False}
     count = "0 projections + 0 fused MLPs" if disabled else "15 projections + 5 fused MLPs"
     assert _registration(log) == [f"[M31_DRAFTER_HISLAYOUT] TP8 registered {count} on rank {rank}"]
 
