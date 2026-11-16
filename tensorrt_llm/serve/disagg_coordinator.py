@@ -673,6 +673,8 @@ COORDINATOR_UDS_SCHEME = "unix:"
 # so the CLIENT always closes an idle connection first; see
 # ``make_coordinator_session``. Mirrors ``openai_client``'s worker-facing pool.
 COORDINATOR_KEEPALIVE_TIMEOUT_S = 1
+# Per client session: excess calls queue in the pool instead of overflowing the accept backlog.
+COORDINATOR_UDS_CONNECTION_LIMIT = 128
 
 
 def coordinator_base_url(remote_url: str) -> str:
@@ -694,12 +696,10 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
     when the fleet is co-located with the implicit coordinator. Callers create
     the session lazily so it binds to the running event loop.
 
-    limit=0 (unlimited pool): each fleet worker has ~concurrency/num_workers
-    requests in flight (e.g. 320 at c1280/4), but aiohttp's default pool caps at
-    100 -- so most /select,/finish calls were BLOCKING on a free pooled
-    connection, which was the real ~hundreds-of-ms client.select latency (not the
-    ~0.1ms handler, not the transport). Uncapping lets all concurrent calls hold
-    a connection. The coordinator is a trusted local socket, so no cap needed.
+    UDS calls beyond a session's connection limit queue in its connector, within
+    the router's request timeout. This bounds each client's connection pressure;
+    aggregate fleet concurrency can still exceed the listener's accept backlog.
+    TCP retains its existing pool policy.
 
     keepalive_timeout below the coordinator's server-side keep-alive: aiohttp
     does not probe a pooled connection before reuse, so whenever the SERVER
@@ -711,7 +711,9 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
         sock_path = remote_url[len(COORDINATOR_UDS_SCHEME) :]
         return aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(
-                path=sock_path, limit=0, keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S
+                path=sock_path,
+                limit=COORDINATOR_UDS_CONNECTION_LIMIT,
+                keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S,
             )
         )
     return aiohttp.ClientSession(

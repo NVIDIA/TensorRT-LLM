@@ -1067,16 +1067,20 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
 
     assert dc.COORDINATOR_KEEPALIVE_TIMEOUT_S < TIMEOUT_KEEP_ALIVE
 
-    for url, connector_name in (
-        ("unix:/tmp/trtllm_disagg_coord_8333.sock", "UnixConnector"),
-        ("http://coordinator:8332", "TCPConnector"),
+    for url, connector_name, limit in (
+        (
+            "unix:/tmp/trtllm_disagg_coord_8333.sock",
+            "UnixConnector",
+            dc.COORDINATOR_UDS_CONNECTION_LIMIT,
+        ),
+        ("http://coordinator:8332", "TCPConnector", 0),
     ):
         with (
             patch.object(dc.aiohttp, connector_name) as connector,
             patch.object(dc.aiohttp, "ClientSession"),
         ):
             dc.make_coordinator_session(url)
-        assert connector.call_args.kwargs["limit"] == 0
+        assert connector.call_args.kwargs["limit"] == limit
         assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
 
 
@@ -1100,6 +1104,84 @@ def test_coordinator_uds_backlog_is_capped_by_somaxconn(monkeypatch, somaxconn, 
 
     monkeypatch.setattr("builtins.open", fake_open)
     assert coordinator_server._effective_uds_backlog() == expected
+
+
+@pytest.mark.asyncio
+async def test_coordinator_uds_sessions_queue_at_their_own_limits(tmp_path):
+    """Independent sessions queue locally; their aggregate concurrency exceeds one pool's limit."""
+    from contextlib import AsyncExitStack
+
+    from aiohttp import web
+
+    from tensorrt_llm.serve.disagg_coordinator import (
+        COORDINATOR_UDS_CONNECTION_LIMIT,
+        make_coordinator_session,
+    )
+
+    # Sixteen sessions at their limits fill uvicorn's default accept backlog.
+    session_count = 16
+    ready, release = asyncio.Event(), asyncio.Event()
+    limit = COORDINATOR_UDS_CONNECTION_LIMIT
+    live, peak = [0] * session_count, [0] * session_count
+    total_peak = 0
+
+    async def select(request):
+        nonlocal total_peak
+        session_id = int(request.match_info["session_id"])
+        live[session_id] += 1
+        peak[session_id] = max(peak[session_id], live[session_id])
+        total_peak = max(total_peak, sum(live))
+        if all(count == limit for count in live):
+            ready.set()
+        try:
+            await release.wait()
+            return web.Response(text=request.match_info["request_id"])
+        finally:
+            live[session_id] -= 1
+
+    app = web.Application()
+    app.router.add_post("/select/{session_id}/{request_id}", select)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    socket_path = str(tmp_path / "coordinator.sock")
+    # Match the running uvicorn version's default, rather than assuming a
+    # particular kernel/library backlog. This test checks connector queuing,
+    # not that arbitrary fleet sizes fit the accept queue.
+    backlog = uvicorn.Config(app).backlog
+    assert session_count * limit <= backlog
+    await web.UnixSite(runner, socket_path, backlog=backlog).start()
+    try:
+        async with AsyncExitStack() as stack:
+            sessions = [
+                await stack.enter_async_context(make_coordinator_session("unix:" + socket_path))
+                for _ in range(session_count)
+            ]
+
+            async def call(session_id, request_id):
+                async with sessions[session_id].post(
+                    f"http://localhost/select/{session_id}/{request_id}"
+                ) as response:
+                    response.raise_for_status()
+                    return int(await response.text())
+
+            requests_per_session = 2 * limit
+            calls = [
+                asyncio.create_task(call(session_id, index))
+                for session_id in range(session_count)
+                for index in range(requests_per_session)
+            ]
+            try:
+                await asyncio.wait_for(ready.wait(), 15)
+                await asyncio.sleep(0.05)
+                assert live == [limit] * session_count
+            finally:
+                release.set()
+                replies = await asyncio.wait_for(asyncio.gather(*calls), 15)
+            assert replies == list(range(requests_per_session)) * session_count
+            assert peak == [limit] * session_count
+            assert total_peak == limit * session_count
+    finally:
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio
