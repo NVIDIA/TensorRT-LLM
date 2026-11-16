@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Data-oblivious TurboQuant parameters: rotations, QJL projections, and Lloyd-Max codebooks.
+"""Data-oblivious TurboQuant parameters: rotations and Lloyd-Max codebooks.
 
 TurboQuant (Zandieh et al., arXiv 2504.19874) rotates every vector with a random orthogonal
 matrix, after which each coordinate of a unit vector in R^n follows the density
@@ -21,8 +21,6 @@ ROTATION = 0
 """Purpose of the Haar rotation of a group with a single instance (or of the outlier group)."""
 REGULAR_ROTATION = 1
 """Purpose of the Haar rotation of the regular-channel group of a fractional-bit setting."""
-QJL_PROJECTION = 2
-"""Purpose of the i.i.d. Gaussian QJL projection of TurboQuant-prod."""
 
 _MAX_SUPPORT = 12.0
 _GRID_POINTS = 1 << 18
@@ -44,15 +42,6 @@ def haar_rotation(seed: int, dim: int, purpose: int = ROTATION) -> torch.Tensor:
     q, r = torch.linalg.qr(gaussian)
     # Fixing the signs of R's diagonal makes Q exactly Haar distributed.
     return q * torch.sign(torch.diagonal(r)).unsqueeze(0)
-
-
-@functools.lru_cache(maxsize=None)
-def qjl_projection(seed: int, dim: int) -> torch.Tensor:
-    """Return the ``dim x dim`` float64 QJL matrix with i.i.d. N(0, 1) entries."""
-
-    return torch.randn(
-        dim, dim, generator=_generator(seed, dim, QJL_PROJECTION), dtype=torch.float64
-    )
 
 
 @functools.lru_cache(maxsize=None)

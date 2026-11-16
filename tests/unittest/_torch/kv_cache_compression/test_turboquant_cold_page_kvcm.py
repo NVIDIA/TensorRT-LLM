@@ -52,13 +52,12 @@ COMPRESS = DeepseekV4AttentionType.COMPRESS
 INDEXER = DeepseekV4AttentionType.INDEXER_COMPRESS
 
 
-def _provider(bits=4, mode="mse", skip_rope=False):
+def _provider(bits=4, skip_rope=False):
     pretrained_config = PretrainedConfig(partial_rotary_factor=ROPE_DIM / HEAD_DIM)
     pretrained_config.model_type = "qwen3_5"
     config = ColdPageQuantizationCompressionConfig(
         quant="turboquant",
         turboquant_bits=bits,
-        turboquant_mode=mode,
         skip_rope_quantization=skip_rope,
     )
     return TurboQuantColdPageQuantizationCompression(config, pretrained_config=pretrained_config)
@@ -272,17 +271,16 @@ def _assert_restored(provider, restored, original, max_nmse, rope_dim=0, num_tok
 
 
 @pytest.mark.parametrize(
-    ("bits", "mode", "skip_rope", "max_nmse"),
+    ("bits", "skip_rope", "max_nmse"),
     [
-        (4, "mse", True, 0.02),
-        (3, "mse", False, 0.05),
-        (3.5, "mse", False, 0.03),
-        (4, "prod", False, 0.08),
+        (4, True, 0.02),
+        (3, False, 0.05),
+        (3.5, False, 0.03),
     ],
-    ids=["mse4-skip-rope", "mse3", "mse3.5", "prod4"],
+    ids=["mse4-skip-rope", "mse3", "mse3.5"],
 )
-def test_host_tier_round_trip(bits, mode, skip_rope, max_nmse):
-    provider = _provider(bits, mode, skip_rope)
+def test_host_tier_round_trip(bits, skip_rope, max_nmse):
+    provider = _provider(bits, skip_rope)
     manager = _manager(provider)
     try:
         request, kv = _prefill(manager)

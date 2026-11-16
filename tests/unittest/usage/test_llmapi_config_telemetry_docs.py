@@ -390,8 +390,8 @@ def test_cold_page_rope_residual_dim_captures_only_supported_values(residual_dim
     assert json.loads(metadata_json)["capture_succeeded"] is True
 
 
-@pytest.mark.parametrize(("bits", "mode"), [(2.5, "mse"), (3, "prod")])
-def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits, mode) -> None:
+@pytest.mark.parametrize("bits", [2.5, 3])
+def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits) -> None:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, TorchLlmArgs
     from tensorrt_llm.usage.llmapi_config import (
         build_capture_manifest,
@@ -402,7 +402,6 @@ def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits, mod
     entries = {item.path: item for item in build_capture_manifest(TorchLlmArgs)}
     assert set(entries[prefix + "quant"].allowed_values) == {"nvfp4", "turboquant"}
     assert entries[prefix + "turboquant_bits"].capture_types == ("float",)
-    assert set(entries[prefix + "turboquant_mode"].allowed_values) == {"mse", "prod"}
     # The seed is an arbitrary high-cardinality integer, so it is not captured.
     assert prefix + "turboquant_seed" not in entries
 
@@ -412,7 +411,6 @@ def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits, mod
         kv_cache_compression_config=ColdPageQuantizationCompressionConfig(
             quant="turboquant",
             turboquant_bits=bits,
-            turboquant_mode=mode,
             turboquant_seed=seed,
         ),
     )
@@ -420,7 +418,6 @@ def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits, mod
     captured = json.loads(config_json)
     assert captured[prefix + "quant"] == "turboquant"
     assert captured[prefix + "turboquant_bits"] == bits
-    assert captured[prefix + "turboquant_mode"] == mode
     assert str(seed) not in config_json
     assert str(seed) not in metadata_json
     assert json.loads(metadata_json)["capture_succeeded"] is True

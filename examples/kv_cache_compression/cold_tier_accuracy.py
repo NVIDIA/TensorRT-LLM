@@ -28,7 +28,7 @@ ran to completion with a valid measurement.
 Run from a directory outside the TensorRT-LLM source tree, e.g. on 4 GPUs:
 
     python3 cold_tier_accuracy.py --model /path/to/Qwen3.8-Flash-Next-FP8 --tp-size 4 --ep-size 4 \
-        --formats none,nvfp4,tq-mse-4,tq-mse-3.5,tq-mse-3,tq-mse-2.5,tq-prod-4
+        --formats none,nvfp4,tq-mse-4,tq-mse-3.5,tq-mse-3,tq-mse-2.5
     python3 cold_tier_accuracy.py --model /path/to/GLM-5.3-Flash --tp-size 4 --ep-size 4 \
         --formats none,nvfp4,tq-mse-4
     python3 cold_tier_accuracy.py --model /path/to/GLM-5.3 --tp-size 4 --ep-size 4 \
@@ -91,11 +91,11 @@ def parse_format(name: str) -> Optional[Dict[str, Any]]:
     if name == "nvfp4":
         return {"quant": "nvfp4"}
     parts = name.split("-")
-    if len(parts) == 3 and parts[0] == "tq" and parts[1] in ("mse", "prod"):
+    if len(parts) == 3 and parts[0] == "tq" and parts[1] == "mse":
         bits = float(parts[2])
         bits = int(bits) if bits.is_integer() else bits
-        return {"quant": "turboquant", "turboquant_mode": parts[1], "turboquant_bits": bits}
-    raise ValueError(f"unknown format {name!r}; use none, nvfp4 or tq-<mse|prod>-<bits>")
+        return {"quant": "turboquant", "turboquant_bits": bits}
+    raise ValueError(f"unknown format {name!r}; use none, nvfp4 or tq-mse-<bits>")
 
 
 # Synthetic retrieval task, as token IDs so that every prefix has an exact length
@@ -543,7 +543,7 @@ def main() -> int:
     )
     add = parser.add_argument
     add("--model", required=True, help="Hugging Face checkpoint directory")
-    add("--formats", default="none,nvfp4", help="none, nvfp4, tq-<mse|prod>-<bits>; comma list")
+    add("--formats", default="none,nvfp4", help="none, nvfp4, tq-mse-<bits>; comma list")
     add("--tp-size", type=int, default=1)
     add("--ep-size", type=int, default=None, help="moe_expert_parallel_size")
     add("--mtp", type=int, nargs="?", const=3, default=0, help="one-model MTP draft length")

@@ -13,9 +13,8 @@ to 16 bytes; ``R`` rows, ``G`` coordinates per group, chunks of ``C`` coordinate
 
 * code planes: for each group and each bit plane of width ``w`` (``bits`` split into 4, 2 or 1
   bit planes), ``[G / C chunks][R rows][C * w / 8 bytes]``;
-* QJL signs (prod): ``[N / C chunks][R rows][C / 8 bytes]``;
-* per-row bf16 scalars ``[scalar][R]``: the mse scale; prod adds the residual norm;
-  fractional bits store one scale per group;
+* per-row bf16 scalars ``[scalar][R]``: the least-squares scale of every instance (rows wider
+  than 512 hold several); fractional bits store one scale per group;
 * fractional bits: one ``N``-bit outlier-channel mask per KV head;
 * the elements of each row outside the quantized range, copied unchanged.
 """
@@ -370,38 +369,9 @@ def _quantize_group(
 
 
 @triton.jit
-def _qjl_piece(acc, residual, s_ptr, krows, START: tl.constexpr, P: tl.constexpr, N: tl.constexpr):
-    columns = START + tl.arange(0, P)
-    return acc + tl.dot(residual, tl.load(s_ptr + krows[:, None] * N + columns[None, :]))
-
-
-@triton.jit
-def _store_signs(
-    cold,
-    projection,
-    rows,
-    row_mask,
-    OFF: tl.constexpr,
-    START: tl.constexpr,
-    P: tl.constexpr,
-    ROWS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    C: tl.constexpr,
-):
-    """Store the signs of projections [START, START + P) into the chunk-major QJL plane."""
-    CB: tl.constexpr = C // 8
-    packed = _pack((projection >= 0).to(tl.int32), 1, BLOCK_M, P)
-    byte = tl.arange(0, P // 8)
-    chunk = START // C + byte // CB
-    offsets = chunk[None, :] * (ROWS * CB) + rows[:, None] * CB + (byte % CB)[None, :]
-    tl.store(cold + OFF + offsets, packed, mask=row_mask[:, None])
-
-
-@triton.jit
 def _encode_block(
     cold,
     w_ptr,
-    s_ptr,
     h0,
     h1,
     h2,
@@ -410,7 +380,6 @@ def _encode_block(
     prescale,
     rows,
     row_mask,
-    MODE: tl.constexpr,
     COORD0: tl.constexpr,
     G: tl.constexpr,
     PIECES: tl.constexpr,
@@ -421,10 +390,8 @@ def _encode_block(
     W0: tl.constexpr,
     OFF1: tl.constexpr,
     W1: tl.constexpr,
-    OFF_QJL: tl.constexpr,
     OFF_SCALE: tl.constexpr,
     ALPHA_AT: tl.constexpr,
-    RHO_AT: tl.constexpr,
     N: tl.constexpr,
     P0: tl.constexpr,
     P1: tl.constexpr,
@@ -436,9 +403,7 @@ def _encode_block(
 ):
     """Encode one TurboQuant instance: rotated coordinates [COORD0, COORD0 + G) of pieces PIECES.
 
-    Stores the codes, the least-squares scale at scalar ``ALPHA_AT`` and, for prod, the QJL signs
-    of the residual (taken in the rotated domain, where S is i.i.d. Gaussian as well) and the
-    residual norm at scalar ``RHO_AT``.
+    Stores the codes and the least-squares scale at scalar ``ALPHA_AT``.
     """
     inv_norm = tl.where(norm > 0, tl.sqrt(G * 1.0) * tl.math.rsqrt(norm), 0.0)
     alpha = _quantize_group(
@@ -477,60 +442,6 @@ def _encode_block(
     )
     scale_ptr = (cold + OFF_SCALE).to(tl.pointer_type(tl.bfloat16))
     tl.store(scale_ptr + ALPHA_AT + rows, (alpha / prescale).to(tl.bfloat16), mask=row_mask)
-    if MODE == 1:
-        q0 = tl.zeros([BLOCK_M, P0], tl.float32)
-        q1 = tl.zeros([BLOCK_M, P1 if P1 > 0 else 16], tl.float32)
-        q2 = tl.zeros([BLOCK_M, P2 if P2 > 0 else 16], tl.float32)
-        q3 = tl.zeros([BLOCK_M, P3 if P3 > 0 else 16], tl.float32)
-        residual_norm = tl.zeros([BLOCK_M], tl.float32)
-        for j in range(G // C):
-            cols = COORD0 + j * C + tl.arange(0, C)
-            y = _rotate_chunk(
-                w_ptr,
-                cols,
-                h0,
-                h1,
-                h2,
-                h3,
-                rows,
-                rows,
-                rows,
-                rows,
-                N,
-                P0,
-                P1,
-                P2,
-                P3,
-                False,
-                PIECES,
-            )
-            code, value = _quantize(y * inv_norm[:, None], BITS, CB, lut)
-            residual = y - alpha[:, None] * value
-            residual_norm += tl.sum(residual * residual, axis=1)
-            r16 = residual.to(tl.float16)
-            if PIECES & 1:
-                q0 = _qjl_piece(q0, r16, s_ptr, cols, 0, P0, N)
-            if P1 > 0 and PIECES & 2:
-                q1 = _qjl_piece(q1, r16, s_ptr, cols, P0, P1, N)
-            if P2 > 0 and PIECES & 4:
-                q2 = _qjl_piece(q2, r16, s_ptr, cols, P0 + P1, P2, N)
-            if P3 > 0 and PIECES & 8:
-                q3 = _qjl_piece(q3, r16, s_ptr, cols, P0 + P1 + P2, P3, N)
-        if PIECES & 1:
-            _store_signs(cold[:, None], q0, rows, row_mask, OFF_QJL, 0, P0, ROWS, BLOCK_M, C)
-        if P1 > 0 and PIECES & 2:
-            _store_signs(cold[:, None], q1, rows, row_mask, OFF_QJL, P0, P1, ROWS, BLOCK_M, C)
-        if P2 > 0 and PIECES & 4:
-            _store_signs(cold[:, None], q2, rows, row_mask, OFF_QJL, P0 + P1, P2, ROWS, BLOCK_M, C)
-        if P3 > 0 and PIECES & 8:
-            _store_signs(
-                cold[:, None], q3, rows, row_mask, OFF_QJL, P0 + P1 + P2, P3, ROWS, BLOCK_M, C
-            )
-        tl.store(
-            scale_ptr + RHO_AT + rows,
-            (tl.sqrt(residual_norm) / prescale).to(tl.bfloat16),
-            mask=row_mask,
-        )
 
 
 @triton.jit
@@ -545,7 +456,6 @@ def _prescale(amax):
 def _encode_instance(
     cold,
     w_ptr,
-    s_ptr,
     row_ptr,
     prescale,
     rows,
@@ -560,7 +470,6 @@ def _encode_instance(
     W0: tl.constexpr,
     OFF1: tl.constexpr,
     W1: tl.constexpr,
-    OFF_QJL: tl.constexpr,
     OFF_SCALE: tl.constexpr,
     ALPHA_AT: tl.constexpr,
     N: tl.constexpr,
@@ -578,7 +487,6 @@ def _encode_instance(
     _encode_block(
         cold,
         w_ptr,
-        s_ptr,
         h,
         h,
         h,
@@ -587,7 +495,6 @@ def _encode_instance(
         prescale,
         rows,
         row_mask,
-        0,
         START,
         P,
         PIECE,
@@ -598,10 +505,8 @@ def _encode_instance(
         W0,
         OFF1,
         W1,
-        OFF_QJL,
         OFF_SCALE,
         ALPHA_AT,
-        0,
         N,
         P0,
         P1,
@@ -622,7 +527,6 @@ def _tq_encode_kernel(
     hot_ptr,
     table_ptr,
     w_ptr,
-    s_ptr,
     lut_ptr,
     ELEM: tl.constexpr,
     N: tl.constexpr,
@@ -653,7 +557,6 @@ def _tq_encode_kernel(
     W_B0: tl.constexpr,
     OFF_B1: tl.constexpr,
     W_B1: tl.constexpr,
-    OFF_QJL: tl.constexpr,
     OFF_SCALE: tl.constexpr,
     OFF_MASK: tl.constexpr,
     OFF_RAW: tl.constexpr,
@@ -692,8 +595,8 @@ def _tq_encode_kernel(
     cold = cold_ptr + cold_rows
     row_ptr = hot + rows.to(tl.int64) * STRIDE + QS
 
-    if BLOCKED == 2:
-        # Rows wider than 512 (mse): every piece is an independent instance, its codes in the
+    if BLOCKED:
+        # Rows wider than 512: every piece is an independent instance, its codes in the
         # piece's chunks of the shared bit planes, its scale at scalar row i. The pieces are
         # encoded one at a time, so only one is live: a first pass over the row finds the prescale
         # (the same power of two as for any other row), then each piece is read again (from L2).
@@ -708,7 +611,6 @@ def _tq_encode_kernel(
         _encode_instance(
             cold,
             w_ptr,
-            s_ptr,
             row_ptr,
             prescale,
             rows,
@@ -723,7 +625,6 @@ def _tq_encode_kernel(
             W_A0,
             OFF_A1,
             W_A1,
-            OFF_QJL,
             OFF_SCALE,
             0,
             N,
@@ -739,7 +640,6 @@ def _tq_encode_kernel(
             _encode_instance(
                 cold,
                 w_ptr,
-                s_ptr,
                 row_ptr,
                 prescale,
                 rows,
@@ -754,7 +654,6 @@ def _tq_encode_kernel(
                 W_A0,
                 OFF_A1 + P0 // C * ROWS * (C * W_A1 // 8),
                 W_A1,
-                OFF_QJL,
                 OFF_SCALE,
                 ROWS,
                 N,
@@ -770,7 +669,6 @@ def _tq_encode_kernel(
             _encode_instance(
                 cold,
                 w_ptr,
-                s_ptr,
                 row_ptr,
                 prescale,
                 rows,
@@ -785,7 +683,6 @@ def _tq_encode_kernel(
                 W_A0,
                 OFF_A1 + (P0 + P1) // C * ROWS * (C * W_A1 // 8),
                 W_A1,
-                OFF_QJL,
                 OFF_SCALE,
                 2 * ROWS,
                 N,
@@ -801,7 +698,6 @@ def _tq_encode_kernel(
             _encode_instance(
                 cold,
                 w_ptr,
-                s_ptr,
                 row_ptr,
                 prescale,
                 rows,
@@ -816,7 +712,6 @@ def _tq_encode_kernel(
                 W_A0,
                 OFF_A1 + (P0 + P1 + P2) // C * ROWS * (C * W_A1 // 8),
                 W_A1,
-                OFF_QJL,
                 OFF_SCALE,
                 3 * ROWS,
                 N,
@@ -849,7 +744,7 @@ def _tq_encode_kernel(
         x2 = x2 * prescale[:, None]
         x3 = x3 * prescale[:, None]
 
-        if MODE == 2:
+        if MODE == 1:
             G: tl.constexpr = N // 2
             # Rows holding NaN or Inf (garbage tokens of a partial Page) do not vote on the split.
             voters = row_mask & (amax < float("inf"))
@@ -963,11 +858,6 @@ def _tq_encode_kernel(
             tl.store(scale_ptr + rows, (alpha_hi / prescale).to(tl.bfloat16), mask=row_mask)
             tl.store(scale_ptr + ROWS + rows, (alpha_lo / prescale).to(tl.bfloat16), mask=row_mask)
         else:
-            h0 = x0.to(tl.float16)
-            h1 = x1.to(tl.float16)
-            h2 = x2.to(tl.float16)
-            h3 = x3.to(tl.float16)
-            norm_first = tl.sum(x0 * x0, axis=1)
             norm_rest = tl.zeros([BLOCK_M], tl.float32)
             if P1 > 0:
                 norm_rest += tl.sum(x1 * x1, axis=1)
@@ -975,117 +865,38 @@ def _tq_encode_kernel(
                 norm_rest += tl.sum(x2 * x2, axis=1)
             if P3 > 0:
                 norm_rest += tl.sum(x3 * x3, axis=1)
-            if BLOCKED == 1:
-                # Rows wider than 512 (prod): the first piece and the rest are independent instances.
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    norm_first,
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    0,
-                    P0,
-                    1,
-                    BITS0,
-                    CB0,
-                    lut0,
-                    OFF_A0,
-                    W_A0,
-                    OFF_A1,
-                    W_A1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    0,
-                    2 * ROWS,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    norm_rest,
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    P0,
-                    N - P0,
-                    14,
-                    BITS1,
-                    CB1,
-                    lut1,
-                    OFF_B0,
-                    W_B0,
-                    OFF_B1,
-                    W_B1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    ROWS,
-                    3 * ROWS,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
-            else:
-                _encode_block(
-                    cold,
-                    w_ptr,
-                    s_ptr,
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    norm_first + norm_rest,
-                    prescale,
-                    rows,
-                    row_mask,
-                    MODE,
-                    0,
-                    N,
-                    15,
-                    BITS0,
-                    CB0,
-                    lut0,
-                    OFF_A0,
-                    W_A0,
-                    OFF_A1,
-                    W_A1,
-                    OFF_QJL,
-                    OFF_SCALE,
-                    0,
-                    ROWS,
-                    N,
-                    P0,
-                    P1,
-                    P2,
-                    P3,
-                    ROWS,
-                    BLOCK_M,
-                    C,
-                )
+            _encode_block(
+                cold,
+                w_ptr,
+                x0.to(tl.float16),
+                x1.to(tl.float16),
+                x2.to(tl.float16),
+                x3.to(tl.float16),
+                tl.sum(x0 * x0, axis=1) + norm_rest,
+                prescale,
+                rows,
+                row_mask,
+                0,
+                N,
+                15,
+                BITS0,
+                CB0,
+                lut0,
+                OFF_A0,
+                W_A0,
+                OFF_A1,
+                W_A1,
+                OFF_SCALE,
+                0,
+                N,
+                P0,
+                P1,
+                P2,
+                P3,
+                ROWS,
+                BLOCK_M,
+                C,
+            )
 
     if RAW > 0:
         # Elements outside the quantized range (e.g. RoPE) are copied unchanged.
@@ -1165,63 +976,11 @@ def _accumulate_group(
 
 
 @triton.jit
-def _accumulate_signs(
-    cold,
-    s_ptr,
-    weight,
-    a0,
-    a1,
-    a2,
-    a3,
-    rows,
-    row_mask,
-    OFF: tl.constexpr,
-    N: tl.constexpr,
-    P0: tl.constexpr,
-    P1: tl.constexpr,
-    P2: tl.constexpr,
-    P3: tl.constexpr,
-    ROWS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    C: tl.constexpr,
-    J0: tl.constexpr,
-    J1: tl.constexpr,
-    FIRST: tl.constexpr,
-    LAST: tl.constexpr,
-):
-    """Add ``weight * (S Pi)^T sign`` of sign chunks J0..J1-1 to output pieces FIRST..LAST-1."""
-    CB: tl.constexpr = C // 8
-    for j in range(J0, J1):
-        offsets = j * (ROWS * CB) + rows[:, None] * CB + tl.arange(0, CB)[None, :]
-        bits = _unpack(
-            tl.load(cold[:, None] + OFF + offsets, mask=row_mask[:, None], other=0), 1, BLOCK_M, C
-        )
-        z = tl.where(bits != 0, weight[:, None], -weight[:, None]).to(tl.bfloat16)
-        krows = j * C + tl.arange(0, C)
-        if FIRST <= 0:
-            a0 += tl.dot(z, _decode_matrix(s_ptr, krows, tl.arange(0, P0), krows, N, False))
-        if P1 > 0 and FIRST <= 1 and 1 < LAST:
-            a1 += tl.dot(z, _decode_matrix(s_ptr, krows, P0 + tl.arange(0, P1), krows, N, False))
-        if P2 > 0 and FIRST <= 2 and 2 < LAST:
-            a2 += tl.dot(
-                z, _decode_matrix(s_ptr, krows, P0 + P1 + tl.arange(0, P2), krows, N, False)
-            )
-        if P3 > 0 and 3 < LAST:
-            a3 += tl.dot(
-                z, _decode_matrix(s_ptr, krows, P0 + P1 + P2 + tl.arange(0, P3), krows, N, False)
-            )
-    return a0, a1, a2, a3
-
-
-@triton.jit
 def _decode_rows(
     cold,
     w_ptr,
-    s_ptr,
     alpha,
     alpha_lo,
-    weight,
-    weight_lo,
     pos0,
     pos1,
     pos2,
@@ -1246,7 +1005,6 @@ def _decode_rows(
     W_B0: tl.constexpr,
     OFF_B1: tl.constexpr,
     W_B1: tl.constexpr,
-    OFF_QJL: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     C: tl.constexpr,
@@ -1259,7 +1017,7 @@ def _decode_rows(
     a1 = tl.zeros([BLOCK_M, P1 if P1 > 0 else 16], tl.float32)
     a2 = tl.zeros([BLOCK_M, P2 if P2 > 0 else 16], tl.float32)
     a3 = tl.zeros([BLOCK_M, P3 if P3 > 0 else 16], tl.float32)
-    if MODE == 2:
+    if MODE == 1:
         G: tl.constexpr = N // 2
         a0, a1, a2, a3 = _accumulate_group(
             cold,
@@ -1329,7 +1087,7 @@ def _decode_rows(
             FIRST,
             LAST,
         )
-    elif BLOCKED == 2:
+    elif BLOCKED:
         # Pass FIRST decodes the instance held by piece FIRST.
         START: tl.constexpr = (
             (P0 if FIRST >= 1 else 0) + (P1 if FIRST >= 2 else 0) + (P2 if FIRST >= 3 else 0)
@@ -1369,126 +1127,6 @@ def _decode_rows(
             FIRST,
             LAST,
         )
-    elif BLOCKED == 1 and FIRST == 0:
-        a0, a1, a2, a3 = _accumulate_group(
-            cold,
-            w_ptr,
-            alpha,
-            a0,
-            a1,
-            a2,
-            a3,
-            pos0,
-            pos1,
-            pos2,
-            pos3,
-            rows,
-            row_mask,
-            0,
-            P0,
-            BITS0,
-            lut0,
-            OFF_A0,
-            W_A0,
-            OFF_A1,
-            W_A1,
-            N,
-            P0,
-            P1,
-            P2,
-            P3,
-            False,
-            ROWS,
-            BLOCK_M,
-            C,
-            0,
-            1,
-        )
-        if MODE == 1:
-            a0, a1, a2, a3 = _accumulate_signs(
-                cold,
-                s_ptr,
-                weight,
-                a0,
-                a1,
-                a2,
-                a3,
-                rows,
-                row_mask,
-                OFF_QJL,
-                N,
-                P0,
-                P1,
-                P2,
-                P3,
-                ROWS,
-                BLOCK_M,
-                C,
-                0,
-                P0 // C,
-                0,
-                1,
-            )
-    elif BLOCKED == 1:
-        a0, a1, a2, a3 = _accumulate_group(
-            cold,
-            w_ptr,
-            alpha_lo,
-            a0,
-            a1,
-            a2,
-            a3,
-            pos0,
-            pos1,
-            pos2,
-            pos3,
-            rows,
-            row_mask,
-            P0,
-            N - P0,
-            BITS1,
-            lut1,
-            OFF_B0,
-            W_B0,
-            OFF_B1,
-            W_B1,
-            N,
-            P0,
-            P1,
-            P2,
-            P3,
-            False,
-            ROWS,
-            BLOCK_M,
-            C,
-            1,
-            4,
-        )
-        if MODE == 1:
-            a0, a1, a2, a3 = _accumulate_signs(
-                cold,
-                s_ptr,
-                weight_lo,
-                a0,
-                a1,
-                a2,
-                a3,
-                rows,
-                row_mask,
-                OFF_QJL,
-                N,
-                P0,
-                P1,
-                P2,
-                P3,
-                ROWS,
-                BLOCK_M,
-                C,
-                P0 // C,
-                N // C,
-                1,
-                4,
-            )
     else:
         a0, a1, a2, a3 = _accumulate_group(
             cold,
@@ -1524,31 +1162,6 @@ def _decode_rows(
             FIRST,
             LAST,
         )
-        if MODE == 1:
-            a0, a1, a2, a3 = _accumulate_signs(
-                cold,
-                s_ptr,
-                weight,
-                a0,
-                a1,
-                a2,
-                a3,
-                rows,
-                row_mask,
-                OFF_QJL,
-                N,
-                P0,
-                P1,
-                P2,
-                P3,
-                ROWS,
-                BLOCK_M,
-                C,
-                0,
-                N // C,
-                FIRST,
-                LAST,
-            )
     return a0, a1, a2, a3
 
 
@@ -1604,7 +1217,6 @@ def _tq_decode_kernel(
     hot_ptr,
     table_ptr,
     w_ptr,
-    s_ptr,
     lut_ptr,
     ELEM: tl.constexpr,
     N: tl.constexpr,
@@ -1635,7 +1247,6 @@ def _tq_decode_kernel(
     W_B0: tl.constexpr,
     OFF_B1: tl.constexpr,
     W_B1: tl.constexpr,
-    OFF_QJL: tl.constexpr,
     OFF_SCALE: tl.constexpr,
     OFF_MASK: tl.constexpr,
     OFF_RAW: tl.constexpr,
@@ -1690,9 +1301,7 @@ def _tq_decode_kernel(
     pos2 = rows
     pos3 = rows
     alpha_lo = alpha
-    weight = alpha
-    weight_lo = alpha
-    if MODE == 2:
+    if MODE == 1:
         G: tl.constexpr = N // 2
         mask_ptr = cold_ptr + tl.max(cold_rows, axis=0) + OFF_MASK + tile * (N // 8)
         pos0, before = _outlier_positions(_load_mask(mask_ptr, 0, P0), 0, 0, P0, G)
@@ -1707,28 +1316,14 @@ def _tq_decode_kernel(
                 _load_mask(mask_ptr, P0 + P1 + P2, P3), before, P0 + P1 + P2, P3, G
             )
         alpha_lo = tl.load(scale_ptr + ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-    SQRT_HALF_PI: tl.constexpr = 1.2533141373155003
-    if BLOCKED == 2:
+    if BLOCKED:
         alpha = tl.load(scale_ptr + PASS * ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-    elif BLOCKED == 1:
-        alpha_lo = tl.load(scale_ptr + ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-        if MODE == 1:
-            rho = tl.load(scale_ptr + 2 * ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-            rho_lo = tl.load(scale_ptr + 3 * ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-            weight = rho * (SQRT_HALF_PI / P0)
-            weight_lo = rho_lo * (SQRT_HALF_PI / (N - P0))
-    elif MODE == 1:
-        rho = tl.load(scale_ptr + ROWS + rows, mask=row_mask, other=0.0).to(tl.float32)
-        weight = rho * (SQRT_HALF_PI / N)
 
     # Rows with several instances decode one instance per launch (PASS): each reads only its
     # own codes and accumulates only its own output columns.
-    if BLOCKED == 2:
+    if BLOCKED:
         FIRST: tl.constexpr = PASS
         LAST: tl.constexpr = PASS + 1
-    elif BLOCKED == 1:
-        FIRST: tl.constexpr = 0 if PASS == 0 else 1
-        LAST: tl.constexpr = 1 if PASS == 0 else 4
     else:
         FIRST: tl.constexpr = 0
         LAST: tl.constexpr = 4
@@ -1768,11 +1363,8 @@ def _tq_decode_kernel(
         a0, a1, a2, a3 = _decode_rows(
             cold,
             w_ptr,
-            s_ptr,
             alpha,
             alpha_lo,
-            weight,
-            weight_lo,
             pos0,
             pos1,
             pos2,
@@ -1797,7 +1389,6 @@ def _tq_decode_kernel(
             W_B0,
             OFF_B1,
             W_B1,
-            OFF_QJL,
             ROWS,
             BLOCK_M,
             C,
