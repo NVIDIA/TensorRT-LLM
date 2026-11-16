@@ -4565,6 +4565,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
             # GPQA Medium Reasoning
             task = GPQADiamond(model_name)
+            task.EVALUATE_KWARGS = dict(sampling_override=True)
 
             chat_template_kwargs = dict(
                 **extra_evaluator_kwargs["chat_template_kwargs"],
