@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tupl
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
+from tensorrt_llm.runtime.kv_cache_manager_v2 import SsmLayerConfig
 
 if TYPE_CHECKING:
     from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -49,6 +50,7 @@ __all__ = [
     "KvCacheLayout",
     "KvCacheRegion",
     "build_kv_cache_layout_v2",
+    "has_state_layers",
     "valid_page_slots",
 ]
 
@@ -252,6 +254,14 @@ def _window_size(init_config, local_layer_id: int) -> Optional[int]:
         raise ValueError(f"no layer config for internal layer {local_layer_id}")
     window = getattr(layers[local_layer_id], "window_size", None)
     return None if window is None else int(window)
+
+
+def has_state_layers(manager: "KVCacheManagerV2") -> bool:
+    """Whether any layer keeps per-request state instead of per-token blocks.
+
+    Such a layer has no blocks for a connector to load or save.
+    """
+    return any(isinstance(layer, SsmLayerConfig) for layer in manager.impl.init_config.layers)
 
 
 def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:

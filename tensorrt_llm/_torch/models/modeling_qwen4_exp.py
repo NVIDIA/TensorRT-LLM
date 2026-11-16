@@ -1174,6 +1174,11 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
                 self.model.layers[: self.model.num_hidden_layers],
             )
 
+    @property
+    def resets_recurrent_state_in_context(self) -> bool:
+        """PLE resets its n-gram and convolution state only in the context forward."""
+        return self.model.has_ple
+
     @staticmethod
     def _register_auxiliary_speculative_state_handlers(
         spec_worker: "SpecWorkerBase", layers: Sequence[DecoderLayer]

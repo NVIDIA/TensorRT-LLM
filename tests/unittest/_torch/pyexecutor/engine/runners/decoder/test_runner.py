@@ -565,8 +565,6 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             "speculative_nonzero_runtime_draft",
             "beam",
             "extra_inputs",
-            "ple_recurrent_state",
-            "nested_ple_recurrent_state",
             "declared_recurrent_state",
             "declared_recurrent_state_on_the_multimodal_llm",
             "context_parallel",
@@ -593,12 +591,6 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                     spec_state = dict(enable_spec_decode=True, runtime_draft_len=1)
                 elif case == "extra_inputs":
                     engine._graphs._context_promotion_supported = False
-                elif case == "ple_recurrent_state":
-                    engine._model.has_ple = True
-                elif case == "nested_ple_recurrent_state":
-                    engine._model.model = SimpleNamespace(
-                        llm=SimpleNamespace(model=SimpleNamespace(has_ple=True))
-                    )
                 elif case == "declared_recurrent_state":
                     # The causal LM declares it; the decoder inside it does not.
                     engine._model.model = torch.nn.Identity()

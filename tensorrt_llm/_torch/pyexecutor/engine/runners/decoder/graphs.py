@@ -654,7 +654,6 @@ class DecoderCudaGraphs:
             # PLE owns recurrent n-gram and convolution state, and other models
             # may declare state that only their context path resets. Promoting
             # a fresh final-context row would skip its cache-slot reset.
-            and not self._model_uses_ple_recurrent_state
             and not self._model_resets_recurrent_state_in_context
             and self.mapping.cp_size == 1
             # Promoted rows are re-sorted by domain with the generation rows,
@@ -697,20 +696,6 @@ class DecoderCudaGraphs:
         model = getattr(self.model, "_orig_mod", self.model)
         causal_lm = getattr(get_top_level_model(model), "llm", model)
         return bool(getattr(causal_lm, "resets_recurrent_state_in_context", False))
-
-    @functools.cached_property
-    def _model_uses_ple_recurrent_state(self) -> bool:
-        """Detect PLE on text-only and multimodal model wrappers.
-
-        The answer is fixed once the model is loaded, and the CUDA-graph gate
-        below consults it on every forward that has context requests.
-        """
-        top_level_model = get_top_level_model(self.model)
-        if getattr(top_level_model, "has_ple", False):
-            return True
-        llm = getattr(top_level_model, "llm", None)
-        text_model = getattr(llm, "model", llm)
-        return bool(getattr(text_model, "has_ple", False))
 
     def run(
         self,

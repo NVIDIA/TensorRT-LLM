@@ -68,6 +68,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     # Its sparse MLA backend does not write or read mixed-precision high layers.
     _supports_mixed_precision_kv = False
 
+    @property
+    @override
+    def is_context_only_cache(self) -> bool:
+        return self.kda_context_only is True
+
     @override
     def __init__(
         self,

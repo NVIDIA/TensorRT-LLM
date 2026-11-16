@@ -1384,6 +1384,10 @@ class Fp4MlaV2CacheLayoutPolicy:
 class Fp4MlaKVCacheManagerV2(Fp4MlaV2CacheLayoutPolicy, KVCacheManagerV2):
     """Compatibility manager applying the FP4 MLA V2 layout policy."""
 
+    @property
+    def is_context_only_cache(self) -> bool:
+        return self.fp4_mla_context_only_cache is True
+
 
 __all__ = [
     "Fp4MlaKVCacheManagerV2",

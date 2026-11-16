@@ -2267,6 +2267,7 @@ def resolve_fork_join_attn(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    is_context_only_cache: bool = False
     gen_preemption_headroom: int = 0
     # Host memory this rank donates to remote cache levels (remote_cache_config.donor); closed by shutdown().
     _remote_donor: Optional["RemoteMemDonor"] = None
@@ -2287,6 +2288,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0
+    # The longest prompt tail an in-forward snapshot covers and the fewest
+    # chunk tokens before its point; 0 on a manager that takes none.
+    inforward_snapshot_max_tail: int = 0
+    inforward_snapshot_min_main: int = 0
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
     # Deferred KvCache closes of finished generation-only requests (enable_deferred_close);

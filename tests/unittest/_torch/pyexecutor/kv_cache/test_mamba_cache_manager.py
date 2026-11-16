@@ -16,7 +16,10 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+    Fp4MlaKVCacheManagerV2,
+    Fp4MlaV2CacheLayoutPolicy,
+)
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -86,6 +89,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     MambaKVCacheParams,
     extract_mamba_kv_cache_params,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import has_state_layers
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PAGE_PRIORITY_DEFAULT,
@@ -3594,8 +3598,9 @@ def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     assert mgr._minimum_live_gpu_quota() == 3 * (64 + 32)
 
 
-def test_cpp_hybrid_prepare_expect_snapshot_points():
-    mgr = object.__new__(CppMambaHybridCacheManager)
+@pytest.mark.parametrize("manager_cls", [CppMambaHybridCacheManager, MixedMambaHybridCacheManager])
+def test_cpp_hybrid_prepare_expect_snapshot_points(manager_cls):
+    mgr = object.__new__(manager_cls)
     mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -3615,6 +3620,71 @@ def test_cpp_hybrid_prepare_expect_snapshot_points():
         [64, 128],
         [],
     ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("manager_cls", "owned_flags"),
+    [
+        (Fp4MlaKVCacheManagerV2, ("fp4_mla_context_only_cache",)),
+        (MambaHybridCacheManagerV2, ()),
+        (KimiK3HybridCacheManager, ("kda_context_only", "fp4_mla_context_only_cache")),
+        (Glm5NextCacheManager, ("kda_context_only",)),
+    ],
+)
+@pytest.mark.parametrize("kda", [False, True, 1, None])
+@pytest.mark.parametrize("fp4", [False, True, 1, None])
+def test_context_only_capability_preserves_owner_flags(
+    manager_cls: type[KVCacheManagerV2],
+    owned_flags: tuple[str, ...],
+    kda: bool | int | None,
+    fp4: bool | int | None,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.resource_manager import is_context_only_kv_cache
+
+    mgr = object.__new__(manager_cls)
+    mgr.kda_context_only = kda
+    mgr.fp4_mla_context_only_cache = fp4
+    flags = {"kda_context_only": kda, "fp4_mla_context_only_cache": fp4}
+    expected = any(flags[flag] is True for flag in owned_flags)
+
+    assert is_context_only_kv_cache(mgr) is expected
+    assert is_context_only_kv_cache(None) is False
+    mgr.fp4_mla_context_only_cache = False
+    mgr.kda_context_only = False
+    assert is_context_only_kv_cache(mgr) is False
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda monkeypatch: _build_v2_mamba2_replay_manager(), id="mamba2"),
+        pytest.param(lambda monkeypatch: _build_v2_gdn_replay_manager(), id="gdn"),
+        pytest.param(
+            lambda monkeypatch: _build_v2_gdn_replay_manager(Qwen4ExpHybridCacheManager),
+            id="gdn-ple",
+        ),
+        pytest.param(
+            lambda monkeypatch: _build_kda_replay_manager(
+                model_manager_cls=KimiK3HybridCacheManager
+            ),
+            id="kda",
+        ),
+        pytest.param(
+            lambda monkeypatch: _build_kda_replay_manager(model_manager_cls=Glm5NextCacheManager),
+            id="kda-kpool",
+        ),
+        pytest.param(lambda monkeypatch: _build_v2_hybrid_fp4_mla(monkeypatch), id="kda-fp4-mla"),
+    ],
+)
+def test_v2_hybrid_layout_has_state_layers(monkeypatch: pytest.MonkeyPatch, build) -> None:
+    """The KV connector is rejected by this layout fact for every recurrent family."""
+    mgr = build(monkeypatch)
+    try:
+        assert has_state_layers(mgr)
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.parametrize(

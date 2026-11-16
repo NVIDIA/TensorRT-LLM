@@ -203,6 +203,8 @@ def _other_pp_stage_indexer() -> Mock:
 class _StandInMambaCacheManager:
     """Concrete stand-in for the abstract Mamba cache-manager type check."""
 
+    is_context_only_cache = False
+
     def __init__(self, available_tokens: int = 8) -> None:
         self._available_tokens = available_tokens
 
@@ -216,9 +218,10 @@ class _StandInMambaCacheManager:
 def test_general_and_memory_pool_warmups_leave_out_generation_shapes_on_context_only_cache(
     cache_flag: str, context_only: bool
 ) -> None:
-    """A context-only cache that is not a Mamba hybrid one runs the general and memory-pool phases.
+    """The general and memory-pool phases take their shapes from these lists.
 
-    Both take their shapes from these lists, so the lists must hold context shapes only.
+    The lists must hold context shapes only on a context-only cache. Only a cache that is not a
+    Mamba hybrid one runs those phases; the KDA manager's lists are built the same way.
     """
     warmup = decoder_warmup(decoder_config(), agreement=_agreement(world_size=4, dwdp_size=4))
     resources = _context_only_cache_resources(cache_flag, context_only)
@@ -461,7 +464,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
-    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    cache = SimpleNamespace(
+        is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+    )
     resources = SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -569,7 +574,9 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
-    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    cache = SimpleNamespace(
+        is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+    )
     resources = SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -729,7 +736,15 @@ def _context_only_warmup_requests(context_only: bool) -> Mock:
 
 
 def _context_only_cache_resources(cache_flag: str, context_only: bool) -> SimpleNamespace:
-    cache = SimpleNamespace(**{cache_flag: context_only}, get_num_available_tokens=lambda **_: 16)
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+    manager_cls = (
+        KimiK3HybridCacheManager if cache_flag == "kda_context_only" else Fp4MlaKVCacheManagerV2
+    )
+    cache = object.__new__(manager_cls)
+    setattr(cache, cache_flag, context_only)
+    cache.get_num_available_tokens = lambda **_: 16
     return SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1043,7 +1058,9 @@ def test_decode_prewarm_skips_verify_kernels_on_context_only_cache() -> None:
     model = _kimi_linear_model()
     owner = _decode_prewarm_owner([model], tp_size=1, spec_config=object())
     with patch.object(torch.cuda, "synchronize"):
-        DecoderWarmup._prewarm_model_decode_kernels(owner, SimpleNamespace(kda_context_only=True))
+        DecoderWarmup._prewarm_model_decode_kernels(
+            owner, SimpleNamespace(is_context_only_cache=True)
+        )
     model.prewarm_decode_kernels.assert_called_once_with(96, False)
 
 
@@ -1223,7 +1240,9 @@ class TestWarmupCleanup(unittest.TestCase):
             _forward_warmup=Mock(),
             _completed_autotuner_warmup_num_tokens=None,
         )
-        kv_cache_manager = SimpleNamespace(get_num_available_tokens=get_num_available_tokens)
+        kv_cache_manager = SimpleNamespace(
+            is_context_only_cache=False, get_num_available_tokens=get_num_available_tokens
+        )
         resource_manager = SimpleNamespace(
             get_resource_manager=lambda key: (
                 kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1416,7 +1435,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1546,7 +1567,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1654,7 +1677,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -2082,7 +2107,7 @@ def _fmha_prewarm_owner(modules: list, pp_size: int, tp_size: int = 1) -> Simple
 def _fmha_prewarm_cache() -> SimpleNamespace:
     from tensorrt_llm.bindings import DataType
 
-    return SimpleNamespace(dtype=DataType.BF16, tokens_per_block=32)
+    return SimpleNamespace(dtype=DataType.BF16, tokens_per_block=32, is_context_only_cache=False)
 
 
 def _attention_layer(

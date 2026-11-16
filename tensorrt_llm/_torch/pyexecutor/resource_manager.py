@@ -161,7 +161,8 @@ class ResourceManagerType(enum.Enum):
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
-def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
+def is_context_only_kv_cache(
+        kv_cache_manager: "KVCacheManager | KVCacheManagerV2 | None") -> bool:
     """Whether a KV cache manager can serve context requests only.
 
     A disaggregated context worker may omit generation-only cache state: the
@@ -169,9 +170,7 @@ def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
     scales and packed V (``fp4_mla_context_only_cache``). Such a worker
     cannot run a generation row, including a warmup or padding dummy.
     """
-    return (getattr(kv_cache_manager, "kda_context_only", False) is True
-            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
-                       False) is True)
+    return kv_cache_manager is not None and kv_cache_manager.is_context_only_cache is True
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -244,6 +243,13 @@ class BaseResourceManager(ABC):
 
     def add_dummy_requests(self, request_ids: List[int]):
         pass
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: list[LlmRequest]) -> None:
+        """Prepare optional snapshot boundaries before scheduling."""
+
+    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
+        """Notify optional state owners after a disaggregated transfer."""
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -398,6 +404,7 @@ def scan_kv_buffer_for_invalid_values(buffer: torch.Tensor,
 
 
 class KVCacheManager(BaseResourceManager):
+    is_context_only_cache: bool = False
     # Declared on the class so it is present even when an instance is built
     # without running __init__ (which overwrites it from the spec config);
     # prepare_resources reads it on such test-built instances. Zero disables

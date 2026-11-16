@@ -164,9 +164,6 @@ class BaseMambaCacheManager(ABC):
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache | None:
         """Return the typed recurrent cache payload for one layer."""
 
-    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
-        """Notify a model manager after a disaggregated transfer."""
-
 
 class _PrefixReuseDiagnostics(Protocol):
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int: ...
@@ -274,6 +271,7 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             return None
         return self._dummy_request_mask_buffer.tensor
 
+    @override
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.enable_block_reuse:

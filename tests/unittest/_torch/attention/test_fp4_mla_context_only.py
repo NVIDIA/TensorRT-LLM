@@ -111,23 +111,15 @@ def test_context_only_layer_bytes_exclude_v_scales(monkeypatch):
     assert manager._extra_buffers_per_layer(tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK) == {0: []}
 
 
-@pytest.mark.parametrize(
-    "attrs,expected",
-    [
-        ({}, False),
-        ({"kda_context_only": True}, True),
-        ({"fp4_mla_context_only_cache": True}, True),
-        ({"kda_context_only": False, "fp4_mla_context_only_cache": False}, False),
-    ],
-)
-def test_context_only_kv_cache_predicate(attrs, expected):
-    assert is_context_only_kv_cache(SimpleNamespace(**attrs)) is expected
+@pytest.mark.parametrize("reported", [False, True])
+def test_context_only_kv_cache_predicate(reported):
+    assert is_context_only_kv_cache(SimpleNamespace(is_context_only_cache=reported)) is reported
     # A Mock manager answers any attribute with a truthy Mock; only True counts.
     assert is_context_only_kv_cache(Mock()) is False
 
 
 def _dummy_requests(monkeypatch, context_only: bool):
-    cache = SimpleNamespace(fp4_mla_context_only_cache=context_only, context_swa_layer_limit=None)
+    cache = SimpleNamespace(is_context_only_cache=context_only, context_swa_layer_limit=None)
     resources = SimpleNamespace(
         get_resource_manager=lambda key: cache
         if key == ResourceManagerType.KV_CACHE_MANAGER

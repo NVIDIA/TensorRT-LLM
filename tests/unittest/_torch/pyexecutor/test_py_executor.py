@@ -40,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ExecutorRequest,
@@ -866,8 +867,12 @@ def test_remote_tail_source_with_empty_prefix_remains_schedulable(
     assert request.py_csa2_remote_tail_start == transfer_end
 
 
+@pytest.mark.parametrize("enable_spec_decode", [False, True])
+@pytest.mark.parametrize("manager_cls", [None, KVCacheManager, KVCacheManagerV2])
 @pytest.mark.parametrize("accepted", [False, True])
-def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: bool) -> None:
+def test_disagg_generation_model_state_is_prepared_after_first_token(
+    accepted: bool, manager_cls, enable_spec_decode: bool
+) -> None:
     events = []
     request = types.SimpleNamespace(
         is_disagg_generation_transmission_complete=True,
@@ -884,11 +889,16 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         prepare_disagg_generation_request=lambda req: events.append(("draft", req))
     )
     executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=target),
-        enable_spec_decode=False,
+        model_engine=types.SimpleNamespace(model=target, max_total_draft_tokens=0),
+        enable_spec_decode=enable_spec_decode,
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=types.SimpleNamespace(
-            resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+            resource_managers={
+                ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
+                ResourceManagerType.KV_CACHE_MANAGER: object.__new__(manager_cls)
+                if manager_cls is not None
+                else None,
+            }
         ),
         kv_cache_transceiver=None,
         disagg=types.SimpleNamespace(
@@ -908,7 +918,10 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         assert events == []
 
 
-def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> None:
+@pytest.mark.parametrize("enable_spec_decode", [False, True])
+def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
+    enable_spec_decode: bool,
+) -> None:
     events = []
     received = types.SimpleNamespace(
         is_disagg_generation_transmission_complete=True,
@@ -922,6 +935,9 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
     )
 
     def setup_sampler_step(_requests):
+        events.append(
+            ("sampler", [req.py_request_id for req in _requests.context_requests_last_chunk])
+        )
         # A failed sampler setup terminates the request before generation.
         terminated.is_disagg_generation_transmission_complete = False
 
@@ -930,12 +946,13 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         return False
 
     kv_cache_manager = types.SimpleNamespace(
+        on_state_transfer_complete=lambda ids: events.append(("transfer", ids)),
         rebuild_disagg_imported_cache=lambda requests: events.append(
             ("rebuild", [req.py_request_id for req in requests])
-        )
+        ),
     )
     executor = types.SimpleNamespace(
-        enable_spec_decode=False,
+        enable_spec_decode=enable_spec_decode,
         resource_manager=types.SimpleNamespace(
             resource_managers={
                 ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
@@ -953,7 +970,12 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         executor, types.SimpleNamespace(generation_requests=[received, terminated])
     )
 
-    assert events == [("rebuild", [41]), ("finish", 41), ("finish", 42)]
+    transfer = [("transfer", [41, 42])] if enable_spec_decode else []
+    assert events == [("sampler", [41, 42])] + transfer + [
+        ("rebuild", [41]),
+        ("finish", 41),
+        ("finish", 42),
+    ]
 
 
 def test_free_request_resources_releases_target_and_draft_model_state() -> None:
@@ -2588,8 +2610,10 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
 
+@pytest.mark.parametrize("manager_kind", ["hook", "none", "v1", "v2"])
 def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     monkeypatch,
+    manager_kind,
 ):
     class StopLocalSchedule(RuntimeError):
         pass
@@ -2614,13 +2638,20 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     request = Mock()
     executor.active_requests = [request]
     executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager = {
+        "hook": Mock(),
+        "none": None,
+        "v1": object.__new__(KVCacheManager),
+        "v2": object.__new__(KVCacheManagerV2),
+    }[manager_kind]
+    request.expect_snapshot_points = [13]
     executor.scheduler = Mock()
 
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
-        calls.append(("prepare", requests))
-    )
+    if manager_kind == "hook":
+        executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
+            calls.append(("prepare", requests))
+        )
 
     def stop_after_schedule(requests, inflight_req_ids):
         calls.append(("schedule", requests, inflight_req_ids))
@@ -2635,10 +2666,11 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     with pytest.raises(StopLocalSchedule):
         PyExecutor._executor_loop_pp(executor)
 
-    assert calls == [
-        ("prepare", executor.active_requests),
+    expected = [("prepare", executor.active_requests)] if manager_kind == "hook" else []
+    assert calls == expected + [
         ("schedule", executor.active_requests, executor.inflight_req_ids),
     ]
+    assert request.expect_snapshot_points == [13]
 
 
 @pytest.mark.parametrize(
@@ -2773,7 +2805,8 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor._revert_ctx_alloc.assert_called_once_with([local_only])
 
 
-def test_schedule_prepares_snapshot_points_before_scheduling():
+@pytest.mark.parametrize("manager_kind", ["hook", "none", "v1", "v2"])
+def test_schedule_prepares_snapshot_points_before_scheduling(manager_kind):
     class StopSchedule(RuntimeError):
         pass
 
@@ -2781,13 +2814,20 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     request = Mock()
     executor.active_requests = [request]
     executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager = {
+        "hook": Mock(),
+        "none": None,
+        "v1": object.__new__(KVCacheManager),
+        "v2": object.__new__(KVCacheManagerV2),
+    }[manager_kind]
+    request.expect_snapshot_points = [13]
     executor.scheduler = Mock()
 
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
-        calls.append(("prepare", requests))
-    )
+    if manager_kind == "hook":
+        executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
+            calls.append(("prepare", requests))
+        )
 
     def stop_after_schedule(requests, inflight_req_ids):
         calls.append(("schedule", requests, inflight_req_ids))
@@ -2798,10 +2838,11 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     with pytest.raises(StopSchedule):
         PyExecutor._schedule(executor)
 
-    assert calls == [
-        ("prepare", executor.active_requests),
+    expected = [("prepare", executor.active_requests)] if manager_kind == "hook" else []
+    assert calls == expected + [
         ("schedule", executor.active_requests, executor.inflight_req_ids),
     ]
+    assert request.expect_snapshot_points == [13]
 
 
 class TestComputeScheduledTokens:
@@ -3222,7 +3263,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
-        kv_cache_manager.kda_context_only = False
+        kv_cache_manager.is_context_only_cache = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -4193,7 +4234,7 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -4213,7 +4254,7 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
 
 def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -4232,17 +4273,14 @@ def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
 
 
 @pytest.mark.parametrize("enable_non_overlap_adp_forward_intent", [False, True])
-@pytest.mark.parametrize("context_only_attr", ["fp4_mla_context_only_cache", "kda_context_only"])
-def test_pad_dummy_is_context_on_context_only_cache(
-    enable_non_overlap_adp_forward_intent, context_only_attr
-):
+def test_pad_dummy_is_context_on_context_only_cache(enable_non_overlap_adp_forward_intent):
     # The default role and the peers' intent say generation, but a
     # context-only cache cannot run a generation row.
     stub = _StubADPExecutor(
         enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
     )
-    setattr(stub.kv_cache_manager, context_only_attr, True)
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -4266,7 +4304,7 @@ def test_pad_dummy_keeps_generation_role_on_full_cache():
 
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.max_total_draft_tokens = 3
     # The dummy role can still say generation when no transceiver drives it.
     stub._adp_dummy_is_gen = True
