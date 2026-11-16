@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,8 @@ from fmha_test_utils import FakeAttention
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
+    _trtllm_gen_batch_context_with_kv_cache,
+    _trtllm_gen_batch_decode_with_kv_cache,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -30,9 +34,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
     CustomAttentionMask,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
+
+if IS_FLASHINFER_AVAILABLE:
+    import flashinfer
 
 _FLASHINFER_TRTLLM_GEN_MODULE = "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen"
 
@@ -308,3 +317,234 @@ def test_sm107_serves_only_extra_page_sizes(
         assert supported is expected, reason
         if not expected:
             assert "SM107" in reason
+
+
+def _trtllm_gen_device_or_skip() -> None:
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("The trtllm-gen FMHA kernels need an SM100 or SM103 GPU.")
+    if not IS_FLASHINFER_AVAILABLE:
+        pytest.skip("FlashInfer is not installed.")
+
+
+def _trtllm_gen_paged_kv(
+    kv_lens: list[int],
+    num_kv_heads: int,
+    page_size: int,
+    head_dim: int,
+    kv_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A TRT-LLM style paged KV cache: one pool of pages read as both the K and the V cache,
+    and a ``[batch, 2, max_pages]`` table holding each request's K pages and V pages."""
+    max_pages = max((kv_len + page_size - 1) // page_size for kv_len in kv_lens)
+    num_pages = 2 * len(kv_lens) * max_pages
+    kv_pool = (torch.randn(num_pages, num_kv_heads, page_size, head_dim, device="cuda") * 0.5).to(
+        kv_dtype
+    )
+    block_tables = (
+        torch.randperm(num_pages, device="cuda", dtype=torch.int32)
+        .view(len(kv_lens), 2, max_pages)
+        .contiguous()
+    )
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    return kv_pool, block_tables, seq_lens
+
+
+def _trtllm_gen_scales(
+    fp8_query: bool,
+) -> tuple[float | torch.Tensor, float | torch.Tensor, float | torch.Tensor]:
+    """BMM scales as the FMHA passes them: host floats, or for FP8 queries the preprocess
+    ``[scale, scale * log2(e)]`` BMM1 buffer and a one-element BMM2 buffer.
+
+    Returns ``(bmm1_scale, bmm1_raw, bmm2_scale)``; ``bmm1_raw`` is the BMM1 scale in the form
+    the public FlashInfer functions take.
+    """
+    scale = 1.0 / 8.0
+    if not fp8_query:
+        return scale, scale, 1.0
+    bmm1 = torch.tensor([scale * 0.75], dtype=torch.float32, device="cuda")
+    bmm1_scale = torch.cat([bmm1, bmm1 * math.log2(math.e)])
+    bmm2_scale = torch.tensor([1.25], dtype=torch.float32, device="cuda")
+    return bmm1_scale, bmm1_scale.narrow(0, 0, 1), bmm2_scale
+
+
+_TRTLLM_GEN_CONTEXT_CASES = [
+    # (query dtype, KV cache dtype, sliding window, attention sinks)
+    pytest.param(torch.bfloat16, torch.bfloat16, False, False, id="bf16"),
+    pytest.param(torch.bfloat16, torch.bfloat16, True, True, id="bf16_swa_sinks"),
+    pytest.param(torch.float8_e4m3fn, torch.float8_e4m3fn, True, True, id="fp8"),
+]
+# Generation also reads an FP8 KV cache with BF16 queries.
+_TRTLLM_GEN_DECODE_CASES = _TRTLLM_GEN_CONTEXT_CASES + [
+    pytest.param(torch.bfloat16, torch.float8_e4m3fn, False, False, id="bf16q_fp8kv"),
+]
+
+
+@pytest.mark.parametrize("q_dtype,kv_dtype,sliding_window,use_sinks", _TRTLLM_GEN_DECODE_CASES)
+@pytest.mark.parametrize("q_lens", [None, [1, 3, 2]], ids=["uniform_q", "ragged_q"])
+def test_trtllm_gen_decode_launch_matches_flashinfer(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    sliding_window: bool,
+    use_sinks: bool,
+    q_lens: list[int] | None,
+) -> None:
+    """The library's decode launch writes what ``trtllm_batch_decode_with_kv_cache`` writes."""
+    _trtllm_gen_device_or_skip()
+    torch.manual_seed(0)
+    num_heads, num_kv_heads, head_dim, page_size = 16, 2, 64, 32
+    kv_lens = [300, 37, 129]
+    kv_pool, block_tables, seq_lens = _trtllm_gen_paged_kv(
+        kv_lens, num_kv_heads, page_size, head_dim, kv_dtype
+    )
+    if q_lens is None:
+        q_len_per_req, max_q_len, cum_seq_lens_q = 1, None, None
+        num_tokens = len(kv_lens)
+    else:
+        q_len_per_req, max_q_len = None, max(q_lens)
+        cum_seq_lens_q = torch.tensor(
+            [0] + list(itertools.accumulate(q_lens)), dtype=torch.int32, device="cuda"
+        )
+        num_tokens = sum(q_lens)
+    query = torch.randn(num_tokens, num_heads, head_dim, device="cuda").to(q_dtype)
+    bmm1_scale, bmm1_raw, bmm2_scale = _trtllm_gen_scales(q_dtype == torch.float8_e4m3fn)
+    sinks = torch.randn(num_heads, device="cuda") if use_sinks else None
+    window_left = 127 if sliding_window else -1
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    counter = torch.zeros(1024 * 1024, dtype=torch.uint8, device="cuda")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    expected = torch.zeros(num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=query,
+        kv_cache=(kv_pool, kv_pool),
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max(kv_lens),
+        bmm1_scale=bmm1_raw,
+        bmm2_scale=bmm2_scale,
+        window_left=window_left,
+        out=expected,
+        sinks=sinks,
+        kv_layout="HND",
+        enable_pdl=False,
+        backend="trtllm-gen",
+        q_len_per_req=q_len_per_req,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=cum_seq_lens_q,
+        uses_shared_paged_kv_idx=False,
+        bmm1_scale_log2=(
+            bmm1_scale.narrow(0, 1, 1) if isinstance(bmm1_scale, torch.Tensor) else None
+        ),
+        multi_ctas_kv_counter_buffer=counter,
+    )
+    out = torch.zeros_like(expected)
+    _trtllm_gen_batch_decode_with_kv_cache(
+        query,
+        kv_pool,
+        None,  # kv_scale_pool
+        workspace,
+        counter,
+        block_tables,
+        seq_lens,
+        max(kv_lens),
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        out,
+        sinks,
+        q_len_per_req,
+        max_q_len,
+        cum_seq_lens_q,
+        sm_count,
+        False,  # enable_pdl
+        False,  # uses_shared_paged_kv_idx
+    )
+    torch.cuda.synchronize()
+
+    assert expected.abs().sum() > 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("q_dtype,kv_dtype,sliding_window,use_sinks", _TRTLLM_GEN_CONTEXT_CASES)
+def test_trtllm_gen_context_launch_matches_flashinfer(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    sliding_window: bool,
+    use_sinks: bool,
+) -> None:
+    """The library's context launch writes what ``trtllm_batch_context_with_kv_cache`` writes."""
+    _trtllm_gen_device_or_skip()
+    torch.manual_seed(0)
+    num_heads, num_kv_heads, head_dim, page_size = 16, 2, 64, 32
+    q_lens = [200, 37, 129]
+    cached_lens = [64, 0, 3]
+    kv_lens = [q_len + cached for q_len, cached in zip(q_lens, cached_lens)]
+    kv_pool, block_tables, seq_lens = _trtllm_gen_paged_kv(
+        kv_lens, num_kv_heads, page_size, head_dim, kv_dtype
+    )
+    cum_seq_lens_q = torch.tensor(
+        [0] + list(itertools.accumulate(q_lens)), dtype=torch.int32, device="cuda"
+    )
+    cum_seq_lens_kv = torch.tensor(
+        [0] + list(itertools.accumulate(kv_lens)), dtype=torch.int32, device="cuda"
+    )
+    query = torch.randn(sum(q_lens), num_heads, head_dim, device="cuda").to(q_dtype)
+    bmm1_scale, bmm1_raw, bmm2_scale = _trtllm_gen_scales(q_dtype == torch.float8_e4m3fn)
+    sinks = torch.randn(num_heads, device="cuda") if use_sinks else None
+    window_left = 127 if sliding_window else -1
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    counter = torch.zeros(1024 * 1024, dtype=torch.uint8, device="cuda")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    expected = torch.zeros(sum(q_lens), num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        query=query,
+        kv_cache=(kv_pool, kv_pool),
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_q_len=max(q_lens),
+        max_kv_len=max(kv_lens),
+        bmm1_scale=bmm1_raw,
+        bmm2_scale=bmm2_scale,
+        batch_size=len(q_lens),
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        window_left=window_left,
+        out=expected,
+        kv_layout="HND",
+        enable_pdl=False,
+        sinks=sinks,
+        uses_shared_paged_kv_idx=False,
+        causal=True,
+        multi_ctas_kv_counter_buffer=counter,
+    )
+    out = torch.zeros_like(expected)
+    _trtllm_gen_batch_context_with_kv_cache(
+        query,
+        kv_pool,
+        None,  # kv_scale_pool
+        workspace,
+        counter,
+        block_tables,
+        seq_lens,
+        max(q_lens),
+        max(kv_lens),
+        bmm1_scale,
+        bmm2_scale,
+        len(q_lens),
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        window_left,
+        out,
+        sinks,
+        sm_count,
+        False,  # enable_pdl
+        False,  # uses_shared_paged_kv_idx
+        True,  # causal
+    )
+    torch.cuda.synchronize()
+
+    assert expected.abs().sum() > 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
