@@ -47,8 +47,9 @@ class MistralNativeServingExtension(ServingExtension):
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
         """Validate the template controls and resolve the model settings.
 
-        A request-level ``chat_template`` cannot apply to mistral-common and is
-        rejected. An explicit top-level ``reasoning_effort`` is passed to the renderer
+        A request-level ``chat_template``, top-level or in ``chat_template_kwargs``,
+        cannot apply to mistral-common and is rejected. An explicit top-level
+        ``reasoning_effort`` is passed to the renderer
         through ``chat_template_kwargs``; a ``reasoning_effort`` already in
         ``chat_template_kwargs`` is accepted as well, and the two must agree when both
         are given. Unset, the checkpoint's default effort applies; a checkpoint that
@@ -56,9 +57,9 @@ class MistralNativeServingExtension(ServingExtension):
         format is passed on as well, for the renderer to state in the prompt; it
         constrains decoding either way.
         """
-        if request.chat_template is not None:
-            raise ValueError("chat_template is not supported for Mistral-native checkpoints.")
         kwargs = dict(request.chat_template_kwargs or {})
+        if request.chat_template is not None or kwargs.get("chat_template") is not None:
+            raise ValueError("chat_template is not supported for Mistral-native checkpoints.")
         from_kwargs = kwargs.get("reasoning_effort")
         if from_kwargs is not None:
             from_kwargs = _reasoning_effort(from_kwargs)
