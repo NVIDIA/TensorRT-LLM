@@ -380,28 +380,32 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             run_generation(params)
             bounds = params.meta.helix_kv_bounds[: params.num_tokens]
             empty = bounds == 0
-            if empty.any():
-                assert torch.count_nonzero(params.output[empty]) == 0
-                empty_bounds_checked = True
+            active = ~empty
+            stats = params.fwd.softmax_stats_tensor
             if not graph_checked:
                 assert params.seq_offset == 1
                 positions = params.meta.helix_position_offsets[: params.num_tokens].view(
                     -1, query_width
                 )
                 assert torch.any(positions[:, 0] // page != positions[:, -1] // page)
-                eager = params.output.clone()
-                stats = params.fwd.softmax_stats_tensor
-                eager_stats = stats.clone()
+                eager = params.output[active].clone()
+                eager_stats = stats[active].clone()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run_generation(params)
-                params.output.zero_()
-                stats.zero_()
+                params.output.fill_(float("nan"))
+                stats.fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
-                torch.testing.assert_close(params.output, eager, atol=0, rtol=0)
-                torch.testing.assert_close(stats, eager_stats, atol=0, rtol=0)
+                torch.testing.assert_close(params.output[active], eager, atol=0, rtol=0)
+                torch.testing.assert_close(stats[active], eager_stats, atol=0, rtol=0)
                 graph_checked = True
+            if empty.any():
+                # Raw empty rows are unspecified; the full Helix path must
+                # neutralize them before the final output/reference comparison.
+                params.output[empty] = float("nan")
+                stats[empty] = float("nan")
+                empty_bounds_checked = True
 
         fmha.run_mla_generation = check_generation
 

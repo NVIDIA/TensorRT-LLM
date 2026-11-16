@@ -2328,7 +2328,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         "mask_type": "causal",
         "store_softmax_stats": helix,
         "use_kv_bounds": helix,
-        "zero_empty_rows": True,
+        "zero_empty_rows": False,
     }
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args

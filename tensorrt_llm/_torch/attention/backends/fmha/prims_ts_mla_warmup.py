@@ -178,7 +178,7 @@ def _plan_decode(profile: _MlaDecodePlan, workspace: torch.Tensor) -> None:
 
     wrapper = BatchMLADecodePagedTSWrapper()
     try:
-        wrapper.plan(**asdict(profile), workspace_buffer=workspace, zero_empty_rows=True)
+        wrapper.plan(**asdict(profile), workspace_buffer=workspace, zero_empty_rows=False)
     finally:
         del wrapper, workspace
 

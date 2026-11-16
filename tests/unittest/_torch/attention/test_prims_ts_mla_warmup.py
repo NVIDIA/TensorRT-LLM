@@ -393,7 +393,7 @@ def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
         assert workspace.numel() == expected_sizes[device]
         assert workspaces.setdefault(device, workspace) is workspace
         assert call.kwargs["max_kv_len"] == 4608
-        assert call.kwargs["zero_empty_rows"] is True
+        assert call.kwargs["zero_empty_rows"] is False
     assert library._mla_decode_wrappers == {(1, 6): wrapper}
     assert _run(warmer, planners, model, max_batch_size=4, max_num_tokens=19) == (0, 0)
     assert len(planners.allocations) == 2
