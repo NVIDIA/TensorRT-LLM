@@ -85,3 +85,41 @@ def test_stage_inputs_replays_in_a_cuda_graph():
     torch.cuda.synchronize()
     for name, value in expected.items():
         torch.testing.assert_close(buffers[name], value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 48])
+@torch.inference_mode()
+def test_stage_inputs_unscaled_activation_has_no_scale_leg(num_tokens):
+    """The bf16 kind stages bf16 rows with no scale factors (neither ``x_sf`` nor ``sf_buffer``)."""
+    from tensorrt_llm._torch.moe.kernels.blackwell.megamoe_stage_inputs import stage_megamoe_inputs
+
+    buffers = _buffers(torch.int64)
+    del buffers["sf_buffer"]
+    idx, weights, x, x_sf = _inputs(num_tokens)
+    expected = {name: value.clone() for name, value in buffers.items()}
+    expected["idx_buffer"][:num_tokens] = idx.to(expected["idx_buffer"].dtype)
+    expected["weights_buffer"][:num_tokens] = weights
+    expected["act_buffer"][:num_tokens] = x
+    expected["idx_buffer"][num_tokens:] = -1
+    expected["weights_buffer"][num_tokens:] = 0
+    # The same bytes as bf16 rows; the comparison stays on the uint8 storage (some are NaN as bf16).
+    act_buffer = buffers.pop("act_buffer")
+    stage_megamoe_inputs(
+        idx,
+        weights,
+        x=x.view(torch.bfloat16),
+        act_buffer=act_buffer.view(torch.bfloat16),
+        **buffers,
+    )
+    buffers["act_buffer"] = act_buffer
+    for name, value in expected.items():
+        torch.testing.assert_close(buffers[name], value, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="x_sf and sf_buffer"):
+        stage_megamoe_inputs(
+            idx,
+            weights,
+            x=x,
+            x_sf=x_sf,
+            act_buffer=act_buffer,
+            **{k: buffers[k] for k in ("idx_buffer", "weights_buffer")},
+        )
