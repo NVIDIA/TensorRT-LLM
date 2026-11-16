@@ -143,9 +143,7 @@ class Contract:
 
 #: Accuracy-block keys only other gates read. Every other key, one added
 #: later included, is part of an accuracy check's equivalence.
-_NOT_ACCURACY_INPUTS = frozenset(
-    {"boot", "acceptance", "disagg", "envelope", "serve", "benchmark_members"}
-)
+_NOT_ACCURACY_INPUTS = frozenset({"boot", "acceptance", "disagg", "serve", "benchmark_members"})
 
 
 def _per_unit(key: str) -> Callable[[Mapping[str, Any], str], Any]:
@@ -223,7 +221,6 @@ def equivalence_key(
             "speculation": speculation_flags(features),
             "llm_api_options": _options(accuracy, unit),
             "workload": workload,
-            "boundaries": accuracy.get("envelope"),
         }
     elif gate == "acceptance":
         inputs = {

@@ -104,21 +104,7 @@ def gate_workdir(workdir: str | Path) -> Path:
     return directory
 
 
-#: The tuning a process does for itself, pinned across the legs of a gate that
-#: compares them exactly: the AutoTuner's tactic cache, and every
-#: ``@triton.autotune`` kernel's chosen config (cached under
-#: ``TRITON_CACHE_AUTOTUNING=1`` in one ``TRITON_CACHE_DIR``).
-AUTOTUNER_CACHE_ENV = "TLLM_AUTOTUNER_CACHE_PATH"
-
-
-TRITON_CACHE_AUTOTUNING_ENV = "TRITON_CACHE_AUTOTUNING"
-
-
 TRITON_CACHE_DIR_ENV = "TRITON_CACHE_DIR"
-
-
-#: The file Triton writes one kernel's autotuning result to, in its cache.
-TRITON_AUTOTUNE_RESULT_GLOB = "*.autotune.json"
 
 
 #: The run's own Triton cache, under its workspace, when the task names none.
@@ -138,28 +124,6 @@ def default_triton_cache(task_data: dict[str, Any], workspace: str | Path) -> No
     env.setdefault(TRITON_CACHE_DIR_ENV, str(Path(workspace).resolve() / RUN_TRITON_CACHE_DIRNAME))
 
 
-def pin_tuning(directory: str | Path) -> dict[str, str]:
-    """The environment that makes every leg of one gate run share its tuning choices.
-
-    The AutoTuner and ``@triton.autotune`` choose by timing in each process, so
-    two legs can differ in the last bit. Call it once per gate run, before the
-    first leg: it deletes the choices a previous run left. Merge the result
-    over ``environment.env``, not under it.
-    """
-    root = Path(directory) / "tuning"
-    triton = root / "triton-cache"
-    autotuner = root / "autotuner.cache"
-    autotuner.unlink(missing_ok=True)
-    for result in triton.rglob(TRITON_AUTOTUNE_RESULT_GLOB):
-        result.unlink(missing_ok=True)
-    triton.mkdir(parents=True, exist_ok=True)
-    return {
-        AUTOTUNER_CACHE_ENV: str(autotuner),
-        TRITON_CACHE_AUTOTUNING_ENV: "1",
-        TRITON_CACHE_DIR_ENV: str(triton),
-    }
-
-
 def write_driver_spec(
     path: str | Path,
     *,
@@ -170,7 +134,6 @@ def write_driver_spec(
     concurrency: int = 1,
     ignore_eos: bool = False,
     reuse_probe: bool = False,
-    phases: Sequence[Mapping[str, Any]] = (),
 ) -> Path:
     """Write public engine options and the workload to materialize before engine launch."""
     spec = {
@@ -182,8 +145,6 @@ def write_driver_spec(
         "ignore_eos": bool(ignore_eos),
         "reuse_probe": bool(reuse_probe),
     }
-    if phases:
-        spec["phases"] = [dict(phase) for phase in phases]
     if not dataset:
         spec["requests"] = workload_io.normalize_requests(spec)
         spec.pop("dataset")
@@ -240,7 +201,6 @@ def in_tree(runner: Callable[..., Any], tree: Path | None) -> Callable[..., Any]
 
 __all__ = [
     "in_tree",
-    "AUTOTUNER_CACHE_ENV",
     "BOOT_TIMEOUT_S",
     "ENGINE_DRIVER",
     "MODELING_V2_ENV",
@@ -251,15 +211,12 @@ __all__ = [
     "RUN_TRITON_CACHE_DIRNAME",
     "STEP_CONTRACT_ENV",
     "ShellRunner",
-    "TRITON_AUTOTUNE_RESULT_GLOB",
-    "TRITON_CACHE_AUTOTUNING_ENV",
     "TRITON_CACHE_DIR_ENV",
     "default_shell_runner",
     "default_triton_cache",
     "engine_driver_command",
     "gate_workdir",
     "parse_driver_records",
-    "pin_tuning",
     "with_mode",
     "write_driver_spec",
 ]

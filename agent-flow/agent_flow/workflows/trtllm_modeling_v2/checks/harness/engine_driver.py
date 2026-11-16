@@ -150,10 +150,8 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     return record
 
 
-def _run_requests(
-    llm: Any, base: Any, spec: Mapping[str, Any], *, phase: str = ""
-) -> dict[str, int]:
-    """Drain one phase before submitting the next, keeping the same engine and cache."""
+def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int]:
+    """Send the requests, ``concurrency`` at a time, and count what the cache reused."""
     if spec.get("dataset"):
         raise ValueError("dataset was not normalized before engine launch")
     requests = spec.get("requests") or []
@@ -194,8 +192,6 @@ def _run_requests(
                 raise RuntimeError("the engine streamed no output for a request")
             index = start + offset
             record = record_of(index, request, output, steps)
-            if phase:
-                record["phase"] = phase
             wio.emit(wio.RECORD_MARKER, record)
             summary["requests"] += 1
             cached = record["cached_tokens"]
@@ -207,17 +203,8 @@ def _run_requests(
 
 
 def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
-    """Run ordinary requests then optional boot phases, with one final cache probe."""
-    summary = _run_requests(llm, base, spec, phase="boot" if spec.get("phases") else "")
-    for phase in spec.get("phases") or ():
-        result = _run_requests(
-            llm,
-            base,
-            {**spec, **phase},
-            phase=phase["id"],
-        )
-        for key, value in result.items():
-            summary[key] += value
+    """Run the requests, then one final cache probe."""
+    summary = _run_requests(llm, base, spec)
     probe = (
         reuse_probe.probe(llm, sampling_for(base, 1, True), spec["llm"])
         if spec.get("reuse_probe")

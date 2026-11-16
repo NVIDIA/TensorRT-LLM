@@ -191,8 +191,7 @@ COVERAGE_KEYS: tuple[str, ...] = ("accept",)
 #: configuration variant and no delivery check. A run whose every unit is one of
 #: the two owes no CI files either (``completion.CI_DELIVERY_CHECKS``);
 #: ``standard`` is the contract as the spec states it; ``certified`` also turns on
-#: boot boundary phases and the serve gate. A switch the spec sets itself keeps
-#: its value.
+#: the serve gate. A switch the spec sets itself keeps its value.
 PROFILE_FIELD = "profile"
 PROFILE_SMOKE = "smoke"
 PROFILE_BRINGUP = "bringup"
@@ -242,7 +241,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark_args",
     "floor",
     "boot",
-    "envelope",
     "serve",
     # The benchmark's sample count, scalar or per unit, for the standard
     # error behind the statistical floor.
@@ -280,22 +278,6 @@ BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
 GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-
-# Optional runtime-boundary phases of ordinary boot (checks/boot.py).
-# Disabled by default; certified enables them unless explicitly disabled.
-# timeout bounds the complete boot invocation, not a second engine launch.
-ENVELOPE_KEYS: tuple[str, ...] = (
-    "enabled",
-    "max_tokens",
-    "agree_tokens",
-    "long_prompts",
-    "probes",
-    "timeout",
-    # Nats within which two tokens a probe's legs part on are a near-tie, which passes.
-    "tie_margin",
-    # The members whose boot runs the phases; default one per unit (checks/boot.py).
-    "members",
-)
 
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
 SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
@@ -1110,50 +1092,6 @@ def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
             )
 
 
-def _validate_envelope(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.envelope``."""
-    where = f"{ACCURACY_FIELD}.envelope"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, ENVELOPE_KEYS, errors, where=where)
-    _validate_fields(
-        block,
-        {
-            "enabled": _FLAG,
-            "max_tokens": _POS_INT,
-            "agree_tokens": _POS_INT,
-            "timeout": _POS_INT,
-            "long_prompts": (
-                lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
-                "must be an integer >= 0",
-            ),
-            "probes": (
-                lambda v: bool(v) and _nonempty_strings(v),
-                "must be a non-empty list of prompts",
-            ),
-            "tie_margin": (
-                lambda v: _number(v) and v >= 0,
-                "must be a number of nats >= 0",
-            ),
-            "members": (
-                lambda v: (
-                    bool(v)
-                    and _nonempty_strings(v)
-                    and all(PARALLEL_PATTERN.match(str(m)) for m in v)
-                ),
-                "must be a non-empty list of members (tp<N>, tep<N>, dep<N>)",
-            ),
-        },
-        errors,
-        where,
-    )
-    max_tokens = block.get("max_tokens") or 16
-    agree_tokens = block.get("agree_tokens") or 4
-    if _positive_int(max_tokens) and _positive_int(agree_tokens) and agree_tokens > max_tokens:
-        errors.append(f"'{where}.agree_tokens' must not exceed max_tokens")
-
-
 def _validate_serve(block: Any, errors: list[str]) -> None:
     """Validate ``accuracy.serve``."""
     where = f"{ACCURACY_FIELD}.serve"
@@ -1188,18 +1126,17 @@ def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
 def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
     """The switches the run's ``profile`` sets where ``accuracy`` leaves them unsaid, in place.
 
-    ``certified`` turns on boot boundary phases and the serve gate; ``bringup``
-    and ``smoke`` turn them off. ``standard`` sets nothing.
+    ``certified`` turns on the serve gate; ``bringup`` and ``smoke`` turn it off.
+    ``standard`` sets nothing.
     """
     if profile not in (PROFILE_SMOKE, PROFILE_BRINGUP, PROFILE_CERTIFIED):
         return
     on = profile == PROFILE_CERTIFIED
-    for key in ("envelope", "serve"):
-        block = accuracy.get(key)
-        if block is None:
-            accuracy[key] = {"enabled": on}
-        elif isinstance(block, dict):
-            block.setdefault("enabled", on)
+    block = accuracy.get("serve")
+    if block is None:
+        accuracy["serve"] = {"enabled": on}
+    elif isinstance(block, dict):
+        block.setdefault("enabled", on)
 
 
 def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
@@ -1337,9 +1274,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
 
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
-
-    if block.get("envelope") is not None:
-        _validate_envelope(block["envelope"], errors)
 
     if block.get("disagg") is not None:
         _validate_disagg(block["disagg"], errors)

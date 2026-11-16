@@ -81,7 +81,7 @@ states it:
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
   its boot), and each axis a variant; a variant on a feature unit (a KV dtype under MTP) is a
   combination, added only when the request names it. A variant of disagg owes nothing.
-- Leave the boot boundaries off (section 5) and the profile at `standard` unless the request asks.
+- Leave the profile at `standard` unless the request asks.
 
 The lint prints the checks per unit and variant; past ~30 deserves a second look.
 
@@ -148,12 +148,6 @@ benchmark you start by hand runs captured too.
 - **Boot prompts.** Two or three short prompts. Boot and serve require an answer, not a
   word in it: an answer cut at `max_tokens` passes, and whether it is right is the
   benchmark's to judge.
-- **Boot boundaries** (`accuracy.envelope`). Off unless the request asks for them (prompts at
-  `max_seq_len`, loaded batches). When on, one boot per unit runs them (`members` picks it), and a
-  probe whose legs part on a near-tie (`tie_margin`) passes with a note. Give `probes` with one
-  right continuation, e.g.
-  `["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]`: open-ended prompts have near-tied
-  tokens that flip with batch shape (MoE routing, low-precision GEMM tactics) far more often.
 
 ## 6. Environment
 

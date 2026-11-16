@@ -675,39 +675,6 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def boot_rules(ctx: LintContext) -> Iterator[Finding]:
-    envelope = ctx.accuracy.get("envelope") or {}
-    on = envelope.get("enabled") or (envelope == {} and profile_of(ctx.task) == "certified")
-    if on and not envelope.get("probes"):
-        yield Finding(
-            "envelope-open-ended-probes",
-            WARN,
-            "boot boundaries compare each probe's first tokens alone and under load with the "
-            "default open-ended prompts; their near-tied tokens flip with batch shape (MoE "
-            "routing, low-precision GEMM tactics) and fail every boot without a defect",
-            "set accuracy.envelope.probes to continuations with one right answer, e.g. "
-            '["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]',
-        )
-    if envelope.get("enabled") and profile_of(ctx.task) != "certified":
-        from ..checks.boot import BootBoundarySpec
-
-        spec = BootBoundarySpec.from_task(ctx.task)
-        boots = ctx.contract.required() if ctx.contract is not None else ()
-        at = [
-            f"{c.unit}@{c.member}"
-            for c in boots
-            if c.gate == "boot" and spec.runs_at(ctx.task, c.unit, c.member, ctx.world)
-        ]
-        yield Finding(
-            "envelope-on",
-            INFO,
-            f"accuracy.envelope is on: the boot at {', '.join(at) or 'one member of each unit'} "
-            "also runs the boundary probes (alone, then under load, at the longest prompt the "
-            "engine takes); a probe whose legs part past a near-tie fails that boot. Leave it off "
-            "unless the request asks for boot boundaries; the certified profile turns it on",
-        )
-
-
 def disagg_rules(ctx: LintContext) -> Iterator[Finding]:
     """The disaggregated-serving test the run writes is named, and is there or planned."""
     spec = disagg_checks.DisaggSpec.from_task(ctx.task)
@@ -870,7 +837,6 @@ RULES: tuple[Rule, ...] = (
     feature_rules,
     coverage_rules,
     accuracy_rules,
-    boot_rules,
     disagg_rules,
     environment_rules,
     agents_rules,
