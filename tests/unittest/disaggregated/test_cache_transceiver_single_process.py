@@ -199,8 +199,8 @@ class KvCacheConfigV2:
     # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
     remote_cache_config: Optional[RemoteCacheConfig] = None
     enable_kv_pool_rebalance: bool = False
-    # Mirrors KvCacheConfig.enable_disagg_completion_reservation in
-    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2.__init__() reads it.
+    # Stand-in for KvCacheConfig.enable_disagg_completion_reservation, which
+    # KVCacheManagerV2.__init__() reads.
     enable_disagg_completion_reservation: bool = False
 
 

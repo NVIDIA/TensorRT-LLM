@@ -72,7 +72,7 @@ def _failed_load_manager(
     The query, update and finish callbacks of a tensor-parallel manager go
     through the leader broadcast, and the restart guard reads the world size,
     so a non-ADP manager needs its MPI patches for the whole test: they are
-    entered into ``stack``.
+    entered into `stack`.
     """
     worker = ADPAdapterMock(reports_failed_loads=True)
     worker.get_finished.return_value = ([], [])
@@ -1899,7 +1899,7 @@ def test_failed_async_load_in_adp_recovery_loop_is_not_resumed(
         req.context_chunk_size = 4
         manager.update_state_after_alloc(req, [5, 6])
 
-    # Mirror the executor's already-prepared batch and initial load plan.
+    # Reproduce the executor's already-prepared batch and initial load plan.
     manager.build_scheduler_output(batch, cache)
     manager.handle_metadata()
     executor = object.__new__(PyExecutor)
@@ -2174,7 +2174,7 @@ def test_failed_async_load_reported_after_its_finish_is_fatal(
     assert manager.pop_failed_async_loads() == []
     assert not manager.should_add_sequence(req)
 
-    # The scheduler can now admit the request over the loaded pages; the next
+    # The scheduler can admit the request over the loaded pages; the next
     # poll names it anyway.
     manager.worker.get_finished.return_value = ([], [])
     assert manager.get_finished() == []

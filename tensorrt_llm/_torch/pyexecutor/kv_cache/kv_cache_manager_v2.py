@@ -5253,7 +5253,7 @@ class KVCacheManagerV2(BaseResourceManager):
         reuse.
 
         Returns:
-            The ledger ``tokens_per_block`` when a backoff is in effect, partial reuse is
+            The ledger `tokens_per_block` when a backoff is in effect, partial reuse is
             off and the connector requires block-aligned reuse; otherwise 1.
         """
         if self.reuse_match_backoff <= 0:
@@ -7249,7 +7249,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def _disagg_completion_limit(self, end: int) -> int:
-        """Ledger blocks to reach ``end`` plus the maximum generation lead."""
+        """Ledger blocks to reach `end` plus the maximum generation lead."""
         capacity = end + self._generation_kv_capacity_headroom
         blocks = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
         # Matching can share a partial tail page. Reserve its private copy even
@@ -7263,7 +7263,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def _can_reserve_disagg_completion(self, request_id: int, limit: int) -> bool:
         """Check every full-attention pool without allocating future KV pages.
 
-        ``available`` is free plus evictable slots: it already excludes resident
+        `available` is free plus evictable slots: it already excludes resident
         prompts, generation KV and outgoing transfers, and counts droppable
         reusable pages as free. Add only the unallocated part of each admitted
         request's bound, including incoming transfers and connector first chunks

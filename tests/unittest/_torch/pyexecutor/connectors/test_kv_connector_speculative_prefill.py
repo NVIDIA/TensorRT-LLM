@@ -68,7 +68,7 @@ def _manager(
 
     A tensor-parallel manager reaches the leader broadcast on every query, so
     it needs its MPI patches for the whole test: they are entered into
-    ``stack``, and the broadcast is an identity that records its calls.
+    `stack`, and the broadcast is an identity that records its calls.
     """
     worker = SpecMock(capacity_only=capacity_only)
     worker.get_finished.return_value = ([], [])

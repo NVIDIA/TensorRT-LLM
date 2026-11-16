@@ -6200,7 +6200,7 @@ class PyExecutor:
                         # A parked request whose load failed went back to the
                         # scheduler without an allocation. Nothing here waits
                         # for it and it must not rejoin this batch. Its freed
-                        # pages may now let padding succeed where it failed
+                        # pages may let padding succeed where it failed
                         # before parking.
                         pending_before = len(loading_context)
                         loading_context = [
@@ -6514,7 +6514,7 @@ class PyExecutor:
             req: A request that was parked for an asynchronous load.
 
         Returns:
-            True when ``req`` was restarted and must not rejoin the batch.
+            True when `req` was restarted and must not rejoin the batch.
         """
         return (req.state == LlmRequestState.CONTEXT_INIT
                 and self.kv_connector_manager.should_add_sequence(req))

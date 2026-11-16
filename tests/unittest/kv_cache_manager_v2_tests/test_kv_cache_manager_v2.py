@@ -10970,7 +10970,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         window; without it the manager is told the final length up front and skips
         allocating out-of-window blocks -- which is exactly the situation that leaves a
         partial page behind, so the two cannot be combined in the same turn.
-        ``initialize_full_attention`` writes only full-attention pages while retaining
+        `initialize_full_attention` writes only full-attention pages while retaining
         that partial SWA snapshot, for a later reference-checked rewind.
         """
         with TemporaryCudaStream([]) as s:

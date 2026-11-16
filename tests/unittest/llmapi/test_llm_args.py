@@ -2038,6 +2038,7 @@ def test_KvCacheConfig_defer_generation_only_release():
                       use_kv_cache_manager_v2=False)
 
 
+@pytest.mark.cpu_only
 def test_KvCacheConfig_disagg_completion_reservation() -> None:
     assert KvCacheConfig().enable_disagg_completion_reservation is False
     field = KvCacheConfig.model_fields["enable_disagg_completion_reservation"]
