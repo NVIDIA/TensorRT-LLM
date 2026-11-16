@@ -599,7 +599,8 @@ def test_markov_feedback_matches_float64_model():
     """The Markov draft chain advances on the sampled token: position ``i`` samples from the logits
     ``base_i + w2 @ w1[prev]`` with ``prev_0 = anchor``, using draw 0 of
     ``(seed ^ DRAFT_KEY_XOR, subsequence b * K + i, offset + 1)`` for request ``b``. Every token must
-    match the float64 model up to `_CDF_TOL`."""
+    match the float64 model up to `_CDF_TOL`, and every stored proposal row must be that position's
+    distribution."""
     gen = torch.Generator(device=DEV).manual_seed(5)
     num_gens, rank = 4, 256
     checked = mism = 0
@@ -610,6 +611,7 @@ def test_markov_feedback_matches_float64_model():
         w2 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
         anchor = torch.randint(0, V, (num_gens,), generator=gen, device=DEV)
         seed, offset = 555 + trial, 6 * trial
+        buf = torch.zeros((8, K, V), dtype=torch.float32, device=DEV)
         tok = frs.fast_rs_draft_markov_feedback(
             base,
             anchor,
@@ -618,11 +620,12 @@ def test_markov_feedback_matches_float64_model():
             torch.ones(num_gens, device=DEV),
             torch.arange(num_gens, dtype=torch.int64, device=DEV),
             -1,
-            torch.zeros((8, K, V), dtype=torch.float32, device=DEV),
+            buf,
             torch.full((num_gens,), seed, dtype=torch.int64, device=DEV),
             torch.full((num_gens,), offset, dtype=torch.int64, device=DEV),
             1,
         )
+        stored = buf.double().cpu().numpy()
         # Same batched bias GEMM as the kernel path (F.linear of the [G, rank] embeddings).
         prev = anchor.clone()
         live = [True] * num_gens
@@ -633,6 +636,8 @@ def test_markov_feedback_matches_float64_model():
             for b in range(num_gens):
                 if not live[b]:
                     continue
+                # Request b's slot is b; its chain still conditions on the model's tokens here.
+                assert float(np.abs(stored[b, i] - q[b]).max()) < 1e-5
                 u = curand_uniform(_draft_key(seed), offset + 1, b * K + i, 0)
                 ref_tok = _inv_cdf(q[b], u)
                 checked += 1
@@ -658,17 +663,22 @@ def _small_support_logits(rows, gen, support=96):
 def _chi2_pvalue(tokens, probs, min_expected=20.0):
     """Chi-square goodness-of-fit test of ``tokens`` against ``probs``.
 
-    Tokens expected fewer than ``min_expected`` times share one bin, which is dropped when it is also
-    too small. Returns: (statistic, degrees of freedom, p-value from the Wilson-Hilferty approximation).
+    Tokens expected fewer than ``min_expected`` times share one bin, which joins the smallest kept bin
+    when it is also too small, so no observation is dropped. A token expected less than once in a
+    thousand runs must not be observed at all. Returns: (statistic, degrees of freedom, p-value from
+    the Wilson-Hilferty approximation).
     """
     n = len(tokens)
+    assert bool((probs[tokens] * n >= 1e-3).all()), "a token of negligible probability was drawn"
     keep = [int(i) for i in np.argsort(-probs) if probs[i] * n >= min_expected]
     obs = np.array([np.sum(tokens == i) for i in keep] + [0], dtype=np.float64)
     exp = np.array([probs[i] * n for i in keep] + [0.0], dtype=np.float64)
     obs[-1] = n - obs[:-1].sum()
     exp[-1] = n - exp[:-1].sum()
     if exp[-1] < min_expected:
-        obs, exp = obs[:-1], exp[:-1] * (obs[:-1].sum() / exp[:-1].sum())
+        obs[-2] += obs[-1]
+        exp[-2] += exp[-1]
+        obs, exp = obs[:-1], exp[:-1]
     stat = float(((obs - exp) ** 2 / exp).sum())
     dof = len(obs) - 1
     z = ((stat / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
@@ -802,8 +812,8 @@ def _capture(fn):
 
 
 def test_cuda_graph_replay_matches_eager():
-    """Verify and draft block captured in one CUDA graph replay what eager runs compute, also with new
-    logits written into the captured tensors."""
+    """Verify, draft block and the Markov chain captured in one CUDA graph replay what eager runs
+    compute, also with new logits and anchors written into the captured tensors."""
     gen = torch.Generator(device=DEV).manual_seed(9)
     g = 8
     tgt, drf = _correlated_case(g, gen, 0.5)
@@ -813,12 +823,20 @@ def test_cuda_graph_replay_matches_eager():
     seeds = torch.full((g,), 5, dtype=torch.int64, device=DEV)
     offs = torch.full((g,), 12, dtype=torch.int64, device=DEV)
     s_tgt, s_drf = tgt.clone(), drf.clone().view(-1, V)
+    rank = 256
+    w1 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
+    w2 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
+    anchor = torch.randint(0, V, (g,), generator=gen, device=DEV)
     drafts = frs.fast_rs_draft_block(s_drf, temps_req, slots, -1, buf, seeds, offs, 1)
     drafts = drafts.view(g, K).contiguous()
 
     def step():
         acc, num = frs.fast_rs_verify(s_tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
-        return acc, num, frs.fast_rs_draft_block(s_drf, temps_req, slots, -1, buf, seeds, offs, 1)
+        blk = frs.fast_rs_draft_block(s_drf, temps_req, slots, -1, buf, seeds, offs, 1)
+        fb = frs.fast_rs_draft_markov_feedback(
+            s_drf.view(g, K, V), anchor, w1, w2, temps_req, slots, -1, buf, seeds, offs, 1
+        )
+        return acc, num, blk, fb, buf.clone()
 
     snapshot = buf.clone()
     eager = [x.clone() for x in step()]
@@ -832,6 +850,7 @@ def test_cuda_graph_replay_matches_eager():
     tgt2, drf2 = _correlated_case(g, gen, 0.5)
     s_tgt.copy_(tgt2)
     s_drf.copy_(drf2.view(-1, V))
+    anchor.copy_(torch.randint(0, V, (g,), generator=gen, device=DEV))
     snapshot = buf.clone()
     graph.replay()
     torch.cuda.synchronize()
