@@ -4079,6 +4079,7 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _store_softmax_stats(self, lse_ptr, raw_maximum, denominator):
+        """Write this split row's raw-QK max and unscaled sum to private LSE sidecars."""
         if cutlass.const_expr(self.softmax_stats is not None):
             rows = Int64(cute.cosize(self.partial_lse.layout))
             (lse_ptr + rows).store(raw_maximum)
@@ -4086,6 +4087,10 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _store_final_softmax_stats(self, storage_row, batch_idx, maximum, denominator):
+        """Publish an unsplit owner's max/sum in public flattened token/head order.
+
+        The shared store converts the raw-QK maximum to natural-log units.
+        """
         if cutlass.const_expr(
             self.softmax_stats is not None and self.partial_lse is None
         ):

@@ -714,6 +714,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         reduced_sum: cutlass.Array,
         num_scale_groups: Constexpr[int],
     ) -> None:
+        """Let warp-zero owner lanes publish valid rows of the swapped-Q tile.
+
+        The final store maps to public batch/query/head order and converts raw
+        maxima and internal probability sums to natural-log max/unscaled sum.
+        """
         if cutlass.const_expr(self.cfg.store_softmax_stats):
             if warp_idx == Int32(0) and lane_idx < Int32(4 * num_scale_groups):
                 stats_idx = lane_idx >> Int32(2)

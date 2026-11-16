@@ -2026,6 +2026,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             mask_type=self.mask_type,
             softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
             sparse_profile=self.sparse_profile,
+            store_softmax_stats=self.store_softmax_stats,
         )
         cfg = dataclass_replace(
             cfg,

@@ -3030,6 +3030,11 @@ def _prepare_out(
 
 
 def _validate_softmax_stats(softmax_stats, *, q, enabled, validate):
+    """Check caller-owned FP32 [token/head rows, max/sum] output metadata.
+
+    Presence must match the plan in both modes; detailed metadata checks are
+    optional. Values are written at run time, with maxima in natural-log units.
+    """
     if enabled != (softmax_stats is not None):
         raise ValueError(
             "softmax_stats must be supplied exactly when "

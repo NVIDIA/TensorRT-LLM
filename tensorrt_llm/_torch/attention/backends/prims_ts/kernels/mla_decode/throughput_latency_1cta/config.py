@@ -73,7 +73,9 @@ def align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def estimated_throughput_latency_smem_data_bytes(cfg: "MlaConfig") -> int:
+def estimated_throughput_latency_smem_data_bytes(
+    cfg: "MlaConfig", *, store_softmax_stats: bool = False
+) -> int:
     """Estimate steady SMEM data allocation for the 1CTA resource set."""
     stensor = cfg.stensor_align
     total = 0
@@ -88,8 +90,11 @@ def estimated_throughput_latency_smem_data_bytes(cfg: "MlaConfig") -> int:
     total += 2 * align_up(cfg.softmax_scratch_bytes, 16)
     total += align_up(cfg.o_smem_tile_bytes, stensor)
     total += align_up(cfg.corr_scratch_bytes, 16)
-    if cfg.cluster_reduction_smem_bytes:
-        total += align_up(cfg.cluster_reduction_smem_bytes, 64)
+    cluster_bytes = cfg.cluster_reduction_smem_bytes_for(
+        store_softmax_stats=store_softmax_stats
+    )
+    if cluster_bytes:
+        total += align_up(cluster_bytes, 64)
         total += align_up(8, 8)
     return total
 
@@ -494,9 +499,21 @@ class MlaConfig(Nvfp4KVConfig):
         return ceil(self.tile_size_q / self.cluster_reduction_rows_per_slice)
 
     def cluster_reduction_smem_bytes_for(
-        self, num_ctas_kv: int, *, store_softmax_stats: bool = False
+        self, num_ctas_kv: int | None = None, *, store_softmax_stats: bool = False
     ) -> int:
-        """Return multi-CTA KV cluster reduction SMEM footprint."""
+        """Return one fanout's SMEM bytes, or the maximum over runtime fanouts."""
+        if num_ctas_kv is None:
+            if self.use_multi_ctas_kv != 1 or self.use_cluster_reduction != 1:
+                return 0
+            return max(
+                (
+                    self.cluster_reduction_smem_bytes_for(
+                        splits, store_softmax_stats=store_softmax_stats
+                    )
+                    for splits in range(2, self.num_ctas_per_seq_kv + 1)
+                ),
+                default=0,
+            )
         if num_ctas_kv <= 1:
             return 0
         rows_per_slice = self.cluster_reduction_rows_per_slice
@@ -515,14 +532,7 @@ class MlaConfig(Nvfp4KVConfig):
 
     @property
     def cluster_reduction_smem_bytes(self) -> int:
-        if self.use_multi_ctas_kv != 1 or self.use_cluster_reduction != 1:
-            return 0
-        max_bytes = 0
-        for num_ctas_kv in range(2, self.num_ctas_per_seq_kv + 1):
-            max_bytes = max(
-                max_bytes, self.cluster_reduction_smem_bytes_for(num_ctas_kv)
-            )
-        return max_bytes
+        return self.cluster_reduction_smem_bytes_for()
 
     @property
     def tmem_total_cols(self) -> int:
@@ -1100,13 +1110,19 @@ def resolve_auto_cluster_reduction_config(
     cfg: MlaConfig,
     *,
     reduction_mode: str | None,
+    store_softmax_stats: bool = False,
 ) -> MlaConfig:
     """Disable auto cluster reduction when the static SMEM footprint is too large."""
 
     if reduction_mode not in (None, "auto") or cfg.use_cluster_reduction != 1:
         return cfg
 
-    if estimated_throughput_latency_smem_data_bytes(cfg) > MAX_CLUSTER_SMEM_DATA_BYTES:
+    if (
+        estimated_throughput_latency_smem_data_bytes(
+            cfg, store_softmax_stats=store_softmax_stats
+        )
+        > MAX_CLUSTER_SMEM_DATA_BYTES
+    ):
         return replace(cfg, use_cluster_reduction=0)
 
     return cfg
@@ -1116,12 +1132,15 @@ def validate_explicit_cluster_reduction_config(
     cfg: MlaConfig,
     *,
     reduction_mode: str | None,
+    store_softmax_stats: bool = False,
 ) -> None:
     """Reject explicit cluster requests that exceed the SMEM launch budget."""
 
     if reduction_mode != "cluster":
         return
-    smem_data_bytes = estimated_throughput_latency_smem_data_bytes(cfg)
+    smem_data_bytes = estimated_throughput_latency_smem_data_bytes(
+        cfg, store_softmax_stats=store_softmax_stats
+    )
     if smem_data_bytes > MAX_CLUSTER_SMEM_DATA_BYTES:
         raise ValueError(
             "explicit cluster reduction exceeds the SM100A shared-memory budget: "
@@ -1720,6 +1739,7 @@ def make_throughput_latency_mla_config(
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
     softmax_rescale_threshold_log2: float = 0.0,
+    store_softmax_stats: bool = False,
     sparse_profile=None,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile.
@@ -1941,10 +1961,13 @@ def make_throughput_latency_mla_config(
             )
         )
     cfg = MlaConfig(**config_kwargs)
-    validate_explicit_cluster_reduction_config(cfg, reduction_mode=reduction_mode)
+    validate_explicit_cluster_reduction_config(
+        cfg, reduction_mode=reduction_mode, store_softmax_stats=store_softmax_stats
+    )
     cfg = resolve_auto_cluster_reduction_config(
         cfg,
         reduction_mode=reduction_mode,
+        store_softmax_stats=store_softmax_stats,
     )
     return cfg
 

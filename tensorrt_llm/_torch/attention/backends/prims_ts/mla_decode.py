@@ -1027,6 +1027,7 @@ def _resolve_mla_decode_launch_spec(
             prepared_cfg = resolve_auto_cluster_reduction_config(
                 decision.config,
                 reduction_mode=None,
+                store_softmax_stats=store_softmax_stats,
             )
             reduction_mode = (
                 "gmem_separate"
@@ -1913,6 +1914,9 @@ class BatchMLADecodePagedTSWrapper:
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
+            Size it with :func:`get_prims_ts_batch_mla_decode_workspace_size`
+            using matching geometry, dtypes, ``store_softmax_stats`` and
+            ``use_kv_bounds`` flags, including when ``validate=False``.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
         validate : bool
@@ -2291,6 +2295,9 @@ def batch_mla_decode_with_paged_kv_cache(
         Output dtype.
     workspace_buffer : torch.Tensor, optional
         Caller-owned byte scratch, exclusive to one in-flight launch/graph.
+        Size it with :func:`get_prims_ts_batch_mla_decode_workspace_size`
+        using matching geometry, dtypes, ``store_softmax_stats`` and
+        ``use_kv_bounds`` flags, including when ``validate=False``.
     validate : bool
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;

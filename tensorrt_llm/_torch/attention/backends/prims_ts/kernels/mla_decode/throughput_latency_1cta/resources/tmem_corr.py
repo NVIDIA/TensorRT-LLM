@@ -686,6 +686,11 @@ class TmemCorrResource(MlaResource):
 
     @cute.jit
     def _store_cluster_softmax_stats(self, owner_row_idx, local_lse, output_row):
+        """Merge split raw-QK maxima/sums on the owner and publish one token/head row.
+
+        The final store scales the maximum to natural-log units; sums remain
+        relative to that maximum, without the internal FP8 probability scale.
+        """
         if cutlass.const_expr(self.softmax_stats is not None):
             maximum = Float32(-Float32.inf)
             for split in cutlass.range_constexpr(self.cfg.num_ctas_per_seq_kv):
