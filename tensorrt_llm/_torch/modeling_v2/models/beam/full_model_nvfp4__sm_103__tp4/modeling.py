@@ -151,7 +151,6 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         )
         self._prefill = PrefillTarget(self.model)
         self._decode = DecodeTarget(self.model)
-        self.load_record: dict | None = None
         logger.info(
             f"[modeling_v2] {type(self).__name__}: {NUM_LAYERS} layers, rank {mapping.rank} of "
             f"{mapping.world_size}, max {MAX_NUM_TOKENS} tokens per call"
@@ -172,8 +171,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
                 f"weights from {checkpoint_dir!r} do not belong to the configuration of "
                 f"{self.checkpoint_dir!r}"
             )
-        self.load_record = self.model.load(checkpoint_dir, record_digests=self.model.diagnostics)
-        return self.load_record
+        return self.model.load(checkpoint_dir, record_digests=self.model.diagnostics)
 
     def validate_request(self, request: LlmRequest) -> None:
         """Reject invalid requests at admission, before they can fail a shared batch."""

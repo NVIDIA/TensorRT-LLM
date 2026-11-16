@@ -266,11 +266,9 @@ def test_checkpoint_digests_follow_diagnostic_mode(diagnostics, tmp_path) -> Non
     target = NS(
         checkpoint_dir=checkpoint,
         model=NS(diagnostics=diagnostics, load=load),
-        load_record=None,
     )
     assert Target.load_checkpoint(target, checkpoint) is record
     load.assert_called_once_with(checkpoint, record_digests=diagnostics)
-    assert target.load_record is record
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64])
