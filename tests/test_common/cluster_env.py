@@ -17,7 +17,8 @@ There are two consumers:
   --cluster-name.
 * Multi-node tests call apply_ucx_env() on the environment they hand to the
   servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Only
-  cluster-specific rules are applied there; the catch-all rule's clear-only
+  cluster-specific rules are applied by default; callers can opt into TCP
+  route fallback for unlisted clusters. The catch-all rule's clear-only
   behavior is limited to PerfSanity.
 
 Cluster names follow SlurmPartition.clusterName in the bloom Jenkins shared
@@ -30,6 +31,7 @@ wildcards to match both forms.
 
 import functools
 import os
+import socket
 import subprocess
 from fnmatch import fnmatch
 
@@ -227,37 +229,79 @@ def detect_gpu_type():
     return gpu_type_from_stage_name(out)
 
 
-def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None):
-    """Apply the cluster's UCX rule to an environment mapping in place.
+def _tcp_route_device(peer: tuple[str, int]) -> str:
+    """Return the interface with the local IPv4 address routed to the peer."""
+    import psutil
 
-    When a cluster-specific rule matches, clears BASE_UCX_UNSET_VARS and sets
-    the rule's vars. When the cluster is unset or only the catch-all rule
-    matches, the mapping is left unchanged.
+    try:
+        # UDP connect selects a route without sending traffic to the peer.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+            route_socket.connect(peer)
+            local_address = route_socket.getsockname()[0]
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot determine the network route to {peer[0]}; "
+            "set UCX_NET_DEVICES to an available TCP network interface."
+        ) from error
+    for name, addresses in psutil.net_if_addrs().items():
+        if any(
+            address.family == socket.AF_INET and address.address == local_address
+            for address in addresses
+        ):
+            return name
+    raise RuntimeError(
+        f"No network interface found for local address {local_address} on the route "
+        f"to {peer[0]}; set UCX_NET_DEVICES to an available TCP network interface."
+    )
+
+
+def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None, *, fallback_peer=None):
+    """Apply cluster UCX settings, optionally falling back to a TCP route.
+
+    A cluster-specific rule clears BASE_UCX_UNSET_VARS and sets its vars.
+    Without a matching rule, the mapping is unchanged unless fallback_peer
+    is provided. The fallback selects TCP/CUDA/shm transports and the NIC
+    routed to that peer. With fallback enabled, an explicit UCX_NET_DEVICES
+    in the supplied mapping takes precedence over both rules and detection.
 
     Args:
         environ: Mapping to update; defaults to os.environ.
         cluster_name: Cluster name; defaults to SLURM_CLUSTER_NAME.
         gpu_type: GPU type token; defaults to detect_gpu_type().
+        fallback_peer: Optional (host, port) tuple for TCP route selection.
 
     Returns:
-        The vars that were set, or None when no cluster-specific rule applies.
+        The vars that were set, or None when no rule or fallback applies.
     """
     if environ is None:
         environ = os.environ
     if cluster_name is None:
         cluster_name = environ.get("SLURM_CLUSTER_NAME", "")
-    if not cluster_name:
+    if not cluster_name and fallback_peer is None:
         return None
-    if gpu_type is None:
+    if gpu_type is None and cluster_name:
         gpu_type = detect_gpu_type()
     env = get_ucx_env(cluster_name, gpu_type)
+    clear_vars = BASE_UCX_UNSET_VARS if env else ()
+    explicit_devices = environ.get("UCX_NET_DEVICES") if fallback_peer is not None else None
     if not env:
-        return None
-    for key in BASE_UCX_UNSET_VARS:
+        if fallback_peer is None:
+            return None
+        env = {
+            "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
+            "UCX_NET_DEVICES": (
+                explicit_devices
+                if explicit_devices is not None
+                else _tcp_route_device(fallback_peer)
+            ),
+        }
+    if explicit_devices is not None:
+        env["UCX_NET_DEVICES"] = explicit_devices
+    for key in clear_vars:
         environ.pop(key, None)
     environ.update(env)
     print(
         f"UCX env for cluster={cluster_name!r} gpu={gpu_type!r}: "
-        f"cleared {list(BASE_UCX_UNSET_VARS)}, set {env}"
+        f"cleared {list(clear_vars)}, set {env}"
     )
     return env

@@ -32,14 +32,12 @@ slower than context startup.
 import contextlib
 import os
 import re
-import socket
 import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Iterator, Optional
 
 import openai
-import psutil
 import pytest
 import requests
 from test_common.cluster_env import apply_ucx_env
@@ -190,7 +188,6 @@ def _worker_env() -> dict[str, str]:
             "MASTER_ADDR",
             "MASTER_PORT",
             "UCX_TLS",
-            "UCX_NET_DEVICES",
         }
     }
     # Pyxis runs as root; dynamic MPI spawn needs these explicit overrides.
@@ -201,43 +198,11 @@ def _worker_env() -> dict[str, str]:
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
         }
     )
-    ucx_settings = apply_ucx_env(env, cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""))
-    if ucx_settings is None:
-        # Unlisted clusters use the TCP interface routed to the peer.
-        env["UCX_TLS"] = "tcp,self,sm,cuda_copy,cuda_ipc"
-    ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
-    if ucx_settings is None and ucx_net_devices is None:
-        peer_node = NODE_LIST[1 - NODE_RANK]
-        try:
-            # UDP connect selects a route without sending traffic to the peer.
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
-                route_socket.connect((peer_node, CTX_SERVER_PORT))
-                local_address = route_socket.getsockname()[0]
-        except OSError as error:
-            raise RuntimeError(
-                f"Cannot determine the network route to {peer_node}; "
-                "set UCX_NET_DEVICES to an available TCP network interface."
-            ) from error
-        ucx_net_devices = next(
-            (
-                name
-                for name, addresses in psutil.net_if_addrs().items()
-                if any(
-                    address.family == socket.AF_INET and address.address == local_address
-                    for address in addresses
-                )
-            ),
-            None,
-        )
-        if ucx_net_devices is None:
-            raise RuntimeError(
-                f"No network interface found for local address {local_address} on the route "
-                f"to {peer_node}; set UCX_NET_DEVICES to an available TCP network interface."
-            )
-
-    # Preserve an explicit device selection over the shared cluster defaults.
-    if ucx_net_devices is not None:
-        env["UCX_NET_DEVICES"] = ucx_net_devices
+    apply_ucx_env(
+        env,
+        cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),
+        fallback_peer=(NODE_LIST[1 - NODE_RANK], CTX_SERVER_PORT),
+    )
     return env
 
 
