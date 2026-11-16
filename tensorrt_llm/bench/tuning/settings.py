@@ -93,6 +93,28 @@ def get_benchmark_engine_settings(
     return max_batch_size, max_num_tokens
 
 
+def load_runtime_model_config(checkpoint: str | Path, checkpoint_format: str | None = None):
+    """Read a checkpoint's runtime model configuration with the LLM API's config loader.
+
+    The loader is the one the LLM API registers for `checkpoint_format`: a Mistral-native
+    format reads params.json, the Hugging Face format config.json.
+
+    Args:
+        checkpoint (str | Path): Checkpoint directory or Hugging Face model name.
+        checkpoint_format (str | None): Checkpoint format the LLM API loads; None is the
+            Hugging Face format, the LLM API's default.
+
+    Returns:
+        tensorrt_llm._torch.model_config.ModelConfig: The runtime model configuration.
+    """
+    # Importing the checkpoints package registers the built-in config loaders.
+    import tensorrt_llm._torch.models.checkpoints  # noqa: F401
+    from tensorrt_llm._torch.models.modeling_utils import get_config_loader
+
+    config_loader = get_config_loader(checkpoint_format or CheckpointFormat.HF)()
+    return config_loader.load(str(checkpoint), trust_remote_code=True)
+
+
 def get_model_config(
     model_name: str, model_path: Path = None, checkpoint_format: str | None = None
 ) -> ModelConfig:

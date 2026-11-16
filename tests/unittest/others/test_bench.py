@@ -28,7 +28,7 @@ from safetensors.torch import save_file
 from tensorrt_llm.bench.benchmark import get_general_cli_options
 from tensorrt_llm.bench.benchmark.utils.general import get_settings
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment, DatasetMetadata
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning import heuristics
@@ -684,3 +684,57 @@ def test_explicit_limits_of_a_mistral_native_checkpoint_skip_the_tuning_heuristi
         settings = get_settings(params, metadata, "mistral-native", tmp_path)
     assert settings["settings_config"]["max_batch_size"] == 16
     assert settings["settings_config"]["max_num_tokens"] == 32768
+
+
+def _fp8_mistral_native_checkpoint(path, *, hf_config):
+    """A Mistral-native checkpoint whose FP8 quantization only params.json declares.
+
+    The quantization a report shows tells whether it read params.json or config.json.
+    """
+    checkpoint = _mistral_native_checkpoint(path, hf_config=hf_config)
+    params = json.loads((checkpoint / "params.json").read_text())
+    params["quantization"] = {"qformat_weight": "fp8_e4m3", "qscheme_act": "TENSOR"}
+    (checkpoint / "params.json").write_text(json.dumps(params))
+    return checkpoint
+
+
+def _engine_report(checkpoint, checkpoint_format):
+    """Return the engine section of the report of a one-request run on `checkpoint`."""
+    keeper = StatsKeeper()
+    keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
+    stats = PercentileStats.from_iterable([8])
+    metadata = DatasetMetadata(
+        isl_stats=stats, osl_stats=stats, seq_len_stats=stats, num_requests=1
+    )
+    runtime_config = _benchmark_runtime_config("pytorch").model_copy(
+        update={
+            "model": "mistral-native",
+            "model_path": checkpoint,
+            "mapping": {"pp_size": 1, "tp_size": 1, "moe_ep_size": 1, "world_size": 1},
+        }
+    )
+    llm_args = {"kv_cache_config": {"dtype": "auto"}, "checkpoint_format": checkpoint_format}
+    report = ReportUtility(keeper, metadata, runtime_config, mock.Mock(), llm_args)
+    with mock.patch.object(ReportUtility, "_query_gpu_info", return_value=None):
+        return report.get_statistics_dict()["engine"]
+
+
+@pytest.mark.parametrize("hf_config", [False, True], ids=["native_only", "with_config_json"])
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+def test_report_reads_a_mistral_native_checkpoint_from_its_native_files(
+    tmp_path, checkpoint_format, hf_config
+):
+    """The report reads the checkpoint in the format the LLM loaded, here params.json."""
+    checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=hf_config)
+    engine = _engine_report(checkpoint, checkpoint_format)
+    assert engine["dtype"] == "bfloat16"
+    assert engine["quantization"] == QuantAlgo.FP8_BLOCK_SCALES
+    assert engine["kv_cache_dtype"] is None
+
+
+@pytest.mark.parametrize("checkpoint_format", [None, "HF"])
+def test_report_reads_config_json_in_the_hugging_face_format(tmp_path, checkpoint_format):
+    checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=True)
+    engine = _engine_report(checkpoint, checkpoint_format)
+    assert engine["dtype"] == "bfloat16"
+    assert engine["quantization"] is None

@@ -17,7 +17,8 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
 from tensorrt_llm.bench.tuning.dataclasses import (NemotronHybridConfig,
                                                    Qwen3HybridConfig)
 from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
-                                                get_model_config)
+                                                get_model_config,
+                                                load_runtime_model_config)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -46,15 +47,12 @@ def _tuning_model_configs(model: str, model_path: Union[Path, None],
         ValueError: When a local Mistral-native checkpoint can be read neither
             from its native files nor from a config.json.
     """
-    from tensorrt_llm._torch.model_config import ModelConfig
     checkpoint = model_path or model
     if checkpoint_format in (CheckpointFormat.MISTRAL,
                              CheckpointFormat.MISTRAL_LARGE_3):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
         try:
             return (get_model_config(model, model_path, checkpoint_format),
-                    MistralConfigLoader().load(checkpoint))
+                    load_runtime_model_config(checkpoint, checkpoint_format))
         except (ValueError, RuntimeError) as e:
             if (Path(checkpoint).is_dir()
                     and not (Path(checkpoint) / "config.json").is_file()):
@@ -66,8 +64,8 @@ def _tuning_model_configs(model: str, model_path: Union[Path, None],
                 f"checkpoint_format={checkpoint_format}: the tuning heuristic "
                 f"cannot read the native files of {checkpoint} ({e}); reading "
                 "its config.json instead")
-    return (get_model_config(model, model_path),
-            ModelConfig.from_pretrained(checkpoint, trust_remote_code=True))
+    model_config = get_model_config(model, model_path)
+    return model_config, load_runtime_model_config(checkpoint)
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
