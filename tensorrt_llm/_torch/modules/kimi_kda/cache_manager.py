@@ -1739,6 +1739,14 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return isinstance(self._kda_replay, KDAMtpReplayState)
 
     @property
+    def commits_every_generation_step(self) -> bool:
+        """Whether every generation step, drafts or not, needs ``update_mamba_states``.
+
+        The KDA MTP replay verifies one-token steps too and commits them after sampling.
+        """
+        return self.use_kda_mtp_replay
+
+    @property
     def keeps_kda_draft_records(self) -> bool:
         return self.kda_state_tok is not None
 

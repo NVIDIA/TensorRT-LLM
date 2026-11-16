@@ -1502,6 +1502,7 @@ class KvCacheCreator:
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
         if (not is_draft and self._speculative_config is not None
+                and isinstance(manager_cls, type)
                 and issubclass(manager_cls, MambaHybridCacheManagerV2)
                 and self._model_engine is not None
                 and _uses_kda_mtp_replay(self._model_engine.model)):
