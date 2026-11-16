@@ -817,6 +817,7 @@ class mHC(nn.Module):
         nvfp4_scale: Optional[torch.Tensor] = None,
         residual_after_wait: bool = False,
         coefficients_release_after_wait: bool = False,
+        l2_prefetch: tuple = (),
     ) -> tuple:
         """Lagged boundary as a critical half and a coefficient half (decode-sized M).
 
@@ -835,7 +836,8 @@ class mHC(nn.Module):
         dependency wait (a split boundary), so their launch may release it from its own wait on.
 
         With ``allreduce`` (a :class:`~.mhc_lowm.LamportAllReduce`), ``x_prev`` is this rank's
-        tensor-parallel partial sum and the critical half all-reduces it in the same launch.
+        tensor-parallel partial sum and the critical half all-reduces it in the same launch; it
+        also reads the ``l2_prefetch`` tensors into L2 (see ``mhc_allreduce_post_collapse_norm``).
 
         Returns ``(residual, pre, post, comb, layer_input, coeff_event)``; ``residual`` is
         ``residual_prev`` itself when ``x_prev`` is None. ``mxfp8`` appends ``layer_input``'s
@@ -878,6 +880,7 @@ class mHC(nn.Module):
                 allreduce,
                 mxfp8=mxfp8,
                 nvfp4_scale=nvfp4_scale,
+                l2_prefetch=l2_prefetch,
             )
         else:
             residual, layer_input, *quantized = mhc_post_collapse_norm(
