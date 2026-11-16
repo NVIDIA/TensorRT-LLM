@@ -360,6 +360,10 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
@@ -566,6 +570,41 @@ class AttentionMetadata:
             cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        """Bound the KV length the decode kernels choose their path on.
+
+        A CUDA graph runner that keys its decode graphs by KV regime passes
+        the regime ceiling of the graph this metadata serves, an upper bound
+        of the longest KV a replay reads.
+
+        Args:
+            kv_regime: The regime ceiling in tokens; None restores the
+                page-table capacity. Backends whose decode path does not
+                depend on the KV length ignore it.
+        """
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
+        return None
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        """Fix whether the decode launches its KV split budget.
+
+        A CUDA graph runner that keys its decode graphs by the split
+        decision passes the decision of the graph this metadata serves.
+
+        Args:
+            packed_split: True launches the split budget, False one task
+                per request; None restores the per-call decision. Backends
+                without a split decode ignore it.
+        """
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
@@ -1132,6 +1171,11 @@ class AttentionForwardArgs:
     # the output sets output_gate_applied, and the caller applies the gate otherwise.
     output_gate: Optional[torch.Tensor] = None
     output_gate_applied: bool = False
+    # o_proj's static FP8 input scale offered together with output_gate: an FMHA library that applies the gate may
+    # also write the gated output as E4M3 at this scale, byte for byte as o_proj's own static quant would, into
+    # output_fp8 [num_tokens, num_heads * head_dim]; the caller then passes output_fp8 to o_proj (output unwritten).
+    gated_out_scale: Optional[torch.Tensor] = None
+    output_fp8: Optional[torch.Tensor] = None
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.

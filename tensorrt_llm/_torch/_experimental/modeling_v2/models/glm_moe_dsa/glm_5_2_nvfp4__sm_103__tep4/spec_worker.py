@@ -559,8 +559,11 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
         # torch.argmax.
         self._glm_argmax_on = os.environ.get("TRTLLM_GLM52_GREEDY_ARGMAX", "1") == "1"
 
-    def _glm_pick(self, logits: torch.Tensor, route: str) -> torch.Tensor | None:
-        """int32 argmax tokens of `logits` on the CuTe DSL kernel, or None for the built-in."""
+    def _glm_pick(
+        self, logits: torch.Tensor, route: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        """int32 argmax tokens of `logits` on the CuTe DSL kernel, or None for the built-in.
+        `out` (int32 `[rows]`, contiguous), when given, receives them and is returned."""
         rows = self._glm_argmax_rows() if self._glm_argmax_on else None
         if rows is None:
             return None
@@ -568,17 +571,25 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
         self._glm_count(route, hit)
         if not hit:
             return None
-        tokens = torch.empty([logits.shape[0]], dtype=torch.int32, device=logits.device)
-        return cute_dsl_argmax(logits, tokens, rows)
+        if out is None:
+            out = torch.empty([logits.shape[0]], dtype=torch.int32, device=logits.device)
+        return cute_dsl_argmax(logits, out, rows)
 
     def greedy_sample_draft_with_tp_gather(
-        self, logits: torch.Tensor, spec_metadata=None, mapping_lm_head_tp=None
+        self,
+        logits: torch.Tensor,
+        spec_metadata=None,
+        mapping_lm_head_tp=None,
+        tokens_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """The base contract: with `tokens_out` the tokens are written there and it is returned."""
         if mapping_lm_head_tp is None:
-            tokens = self._glm_pick(logits, "greedy_draft")
+            tokens = self._glm_pick(logits, "greedy_draft", out=tokens_out)
             if tokens is not None:
                 return tokens
-        return super().greedy_sample_draft_with_tp_gather(logits, spec_metadata, mapping_lm_head_tp)
+        return super().greedy_sample_draft_with_tp_gather(
+            logits, spec_metadata, mapping_lm_head_tp, tokens_out=tokens_out
+        )
 
     def _sample_tokens_for_batch(
         self, logits: torch.Tensor, spec_metadata, num_contexts: int, batch_size: int

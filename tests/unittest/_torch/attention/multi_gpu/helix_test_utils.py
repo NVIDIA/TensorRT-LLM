@@ -14,7 +14,10 @@
 # limitations under the License.
 """Shared utilities for Helix context-parallelism unit tests (MHA & MLA)."""
 
+import sys
 import traceback
+from functools import partial
+from types import SimpleNamespace
 
 import torch
 from mpi4py.futures import MPIPoolExecutor
@@ -37,6 +40,21 @@ CACHE_TYPE_SELFKONLY = tensorrt_llm.bindings.internal.batch_manager.CacheType.SE
 # ---------------------------------------------------------------------------
 # Weight helpers
 # ---------------------------------------------------------------------------
+
+
+def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
+    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    module = SimpleNamespace(
+        num_heads_tp=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        helix_v_b_proj_full=v_full,
+        use_cute_dsl_bf16_bmm=False,
+    )
+    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
+    return module
 
 
 def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
@@ -326,7 +344,8 @@ def run_helix_test(
     """Parse *comms_medium*, launch MPI workers, and assert mismatch ratio."""
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     print(f"Testing with comms_medium={comms_medium}.")
-    with MPIPoolExecutor(max_workers=world_size) as executor:
+    # Workers import the shared test helpers through the same paths as pytest.
+    with MPIPoolExecutor(max_workers=world_size, path=sys.path) as executor:
         results = executor.map(
             run_single_rank,
             *zip(

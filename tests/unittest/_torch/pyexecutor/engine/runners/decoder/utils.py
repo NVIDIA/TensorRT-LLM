@@ -76,6 +76,7 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
         mm_encoder_cache_enabled=False,
         enable_autotuner=True,
         cuda_graph_specialize_lora=False,
+        samples_from_vocab_shards=False,
         spec_decode_fast_paths=False,
     )
     spec = changes.get("spec_config")
