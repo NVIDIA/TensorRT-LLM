@@ -10,6 +10,12 @@ the subclasses here as ``RuntimeHooks.kv_cache_manager_cls``, and the engine bui
 * :class:`KimiK3Sm107CacheManager` (dep16, helix8): mid-chunk snapshots off, which leaves every step
   as the engine's ``KimiK3HybridCacheManager`` runs it.
 
+A target may subclass either one to turn on the recurrent-state cache policies, class constants of
+:class:`KimiK3Sm107CacheManager`: the lowest eviction priority for short prompts' recurrent-state
+pages (``LOW_PRIORITY_SNAPSHOT_PROMPT_LEN``) and the one-kernel upload of the recurrent-state indices
+and the dummy-request mask (``STATE_INDEX_UPLOAD_KERNEL``). They change how recurrent-state pages are
+kept and uploaded, never what a forward computes.
+
 Both keep the KDA replay buffers of speculative decoding in the recurrent-state slot, which the
 SM107 KDA kernels address them by, instead of the engine's replay region.
 
@@ -30,7 +36,10 @@ committed. The scheduler reads the manager's per-request marks ``py_midchunk_sna
 from __future__ import annotations
 
 import sys
+import time
 from typing import ClassVar, NamedTuple
+
+import torch
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -41,9 +50,17 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
+    PagePriorityCallback,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle
 
 from ...common.kda_metadata import KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT
+from ...kernels.k3r_state_upload.state_upload_kernel import copy_small_pinned_pair
 
 __all__ = ["KimiK3Sm107CacheManager", "KimiK3Sm107MidchunkCacheManager"]
 
@@ -58,6 +75,17 @@ class _KDAMidchunkSnapshot(NamedTuple):
     # Pending SSM page that receives the snapshot. None on a rank without
     # local KDA layers, or when no page was available (snapshot skipped).
     slot: int | None
+
+
+def _format_ratio(ratio) -> str:
+    return "[" + ", ".join(f"{share:.4f}" for share in ratio) + "]"
+
+
+def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
+    """Lowest eviction priority for recurrent-state pages, the default for attention pages."""
+    if isinstance(life_cycle, AttnLifeCycle):
+        return PAGE_PRIORITY_DEFAULT
+    return PAGE_PRIORITY_MIN
 
 
 class _StateSlotKDAReplayState(KDAReplayState):
@@ -82,6 +110,9 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
 
     The KDA replay buffers of speculative decoding share the recurrent-state slot
     (:class:`_StateSlotKDAReplayState`), and the KV cache size estimate counts them per state slot.
+
+    With block reuse on, the recurrent snapshot and reuse counters are logged at INFO at most once a
+    minute, and the pool ratio a unified draft pool resolves to is logged once.
     """
 
     # Step alignment, in tokens, at which the model's KDA prefill stores a snapshot inside a context
@@ -89,6 +120,21 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
     KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT: ClassVar[int] = 0
     # Step alignment of mid-chunk snapshot points; None when they are off.
     _kda_midchunk_snapshot_alignment: int | None = None
+    # Context requests whose prompt is shorter than this many tokens commit their recurrent-state
+    # pages (live state and snapshots) at the lowest eviction priority; attention pages keep theirs.
+    # A snapshot is reusable only at its exact token boundary and takes a whole state slot whatever
+    # the prompt length, while a short prompt is cheap to recompute. 0: off. Needs block reuse; a
+    # draft model's manager keeps it off.
+    LOW_PRIORITY_SNAPSHOT_PROMPT_LEN: ClassVar[int] = 0
+    _low_priority_snapshot_prompt_len = 0
+    # When the batch's recurrent-state indices or dummy-request mask change, write both device
+    # buffers with one SM kernel from pinned snapshots instead of two copy-engine copies, whose
+    # engine hand-offs delay the execution stream in front of the next step's inputs. Unchanged
+    # buffers are not written either way.
+    STATE_INDEX_UPLOAD_KERNEL: ClassVar[bool] = False
+    # The recurrent snapshot and reuse counters are logged at INFO at most this often.
+    _BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S: ClassVar[float] = 60.0
+    _branch_snapshot_counters_logged_at = float("-inf")
 
     @override
     def __init__(self, *args, **kwargs) -> None:
@@ -97,8 +143,12 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
         self._kda_midchunk_handed_out: set[int] = set()
         self._kda_midchunk_snapshots_taken_total = 0
         self._kda_midchunk_snapshots_skipped_total = 0
+        # Pinned snapshots read by in-flight state-index upload kernels, with the event after
+        # which each is free (_upload_state_indices_and_dummy_mask).
+        self._state_upload_snapshots: list = []
         super().__init__(*args, **kwargs)
         self._kda_midchunk_snapshot_alignment = self._get_kda_midchunk_snapshot_alignment()
+        self._low_priority_snapshot_prompt_len = self._get_low_priority_snapshot_prompt_len()
 
     @override
     def _initialize_spec_state(self):
@@ -138,6 +188,102 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
             return None
         logger.info("KDA mid-chunk recurrent-state snapshots are enabled")
         return alignment
+
+    def _get_low_priority_snapshot_prompt_len(self) -> int:
+        """``LOW_PRIORITY_SNAPSHOT_PROMPT_LEN`` where it applies, else 0."""
+        length = self.LOW_PRIORITY_SNAPSHOT_PROMPT_LEN
+        if length <= 0 or not self.enable_block_reuse or self.is_draft:
+            return 0
+        logger.info(
+            f"Recurrent-state pages of context requests shorter than {length} tokens use the "
+            "lowest eviction priority"
+        )
+        return length
+
+    @override
+    def _context_priority_callback(self, req) -> PagePriorityCallback | None:
+        """Lowest eviction priority for the recurrent state of short prompts.
+
+        See ``LOW_PRIORITY_SNAPSHOT_PROMPT_LEN``.
+        """
+        if (
+            self.local_num_mamba_layers > 0
+            and not req.is_dummy
+            and req.prompt_len < self._low_priority_snapshot_prompt_len
+        ):
+            return _low_priority_recurrent_state
+        return super()._context_priority_callback(req)
+
+    @override
+    def _upload_state_indices_and_dummy_mask(self, is_dummy: list[bool]) -> bool:
+        """Both uploads of ``_setup_state_indices`` as one SM kernel.
+
+        See ``STATE_INDEX_UPLOAD_KERNEL``. Like the two ``DeviceCopyBuffer.update`` calls it
+        replaces, nothing is written while both buffers already hold the host values. Otherwise one
+        kernel writes both at the same stream position. The kernel reads fresh pinned snapshots of
+        the host buffers (an admission and the scheduled batch may refill those in one iteration
+        before the first upload has run); the pinned allocator does not see a kernel's reads, so
+        the snapshots are held until an event recorded after the kernel. Returns False (nothing
+        uploaded) to fall back to the copies.
+        """
+        if not self.STATE_INDEX_UPLOAD_KERNEL or self._dummy_request_mask_buffer is None:
+            return super()._upload_state_indices_and_dummy_mask(is_dummy)
+        self._fill_dummy_request_mask_host(is_dummy)
+        indices, mask = self._state_indices_buffer, self._dummy_request_mask_buffer
+        if indices.matches(self._host_state_indices) and mask.matches(
+            self._dummy_request_mask_host
+        ):
+            return True
+        snapshots = tuple(
+            torch.empty_like(host, pin_memory=prefer_pinned()).copy_(host)
+            for host in (self._host_state_indices, self._dummy_request_mask_host)
+        )
+        if not copy_small_pinned_pair(indices.tensor, snapshots[0], mask.tensor, snapshots[1]):
+            return False
+        indices.record(self._host_state_indices)
+        mask.record(self._dummy_request_mask_host)
+        done = torch.cuda.Event()
+        done.record()
+        self._state_upload_snapshots = [
+            (held, event) for held, event in self._state_upload_snapshots if not event.query()
+        ]
+        self._state_upload_snapshots.append((snapshots, done))
+        return True
+
+    @override
+    def _with_draft_pool_ratio(self, config):
+        resolved = super()._with_draft_pool_ratio(config)
+        if config.initial_pool_ratio is not None and self._appended_draft_layer_specs:
+            logger.info(
+                f"Unified draft pool ratio: layer-group ratios "
+                f"{_format_ratio(resolved.initial_pool_ratio)} "
+                f"(configured {_format_ratio(config.initial_pool_ratio)})"
+            )
+        return resolved
+
+    def _maybe_log_branch_snapshot_counters(self) -> None:
+        """Log the recurrent snapshot and reuse counters at INFO, at most once a minute.
+
+        Called on every context admission of a block-reuse manager, so the line shows whether
+        branch, waiter and mid-chunk snapshots are being taken.
+        """
+        now = time.monotonic()
+        if (
+            now - self._branch_snapshot_counters_logged_at
+            < self._BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S
+        ):
+            return
+        self._branch_snapshot_counters_logged_at = now
+        logger.info(
+            f"[MambaHybridCacheManagerV2] recurrent snapshot counters "
+            f"{self._format_branch_snapshot_counters()}"
+        )
+
+    @override
+    def _record_branch_snapshot_point(self, req, kv_cache, num_lookup_tokens) -> None:
+        if not req.is_dummy_request:
+            self._maybe_log_branch_snapshot_counters()
+        super()._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
     @override
     def _format_branch_snapshot_counters(self) -> str:

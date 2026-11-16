@@ -68,14 +68,10 @@ def test_runtime_hooks_reach_the_engine():
     """The engine arms its hooks only from the ``RuntimeHooks`` it reads off the outermost model
     (``runtime_hooks_of``), the target's registered class. The text model declares none (no fused
     decode head); the target class adds the 4 GiB left outside the PyTorch cap and the context
-    servers' recurrent-state cache policies (recurrent pages of prompts under 16384 tokens at the
-    lowest priority, exact demotion) and their cache manager (the family's, with KDA mid-chunk
-    snapshots at the 64-token prefill chunk); everything else stays at the default."""
-    from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
-        DEFAULT_RUNTIME_HOOKS,
-        HybridCachePolicy,
-        runtime_hooks_of,
-    )
+    servers' exact demotion and their cache manager (the family's, with KDA mid-chunk snapshots at
+    the 64-token prefill chunk and the recurrent pages of prompts under 16384 tokens at the lowest
+    priority); everything else stays at the default."""
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, runtime_hooks_of
 
     text, outer = _text_and_outer()
     assert text.spec_decode_prologue is None
@@ -86,15 +82,16 @@ def test_runtime_hooks_reach_the_engine():
     assert hooks.decode_prologue is None
     assert hooks.torch_mem_safety_margin == 4 * 1024**3
     assert hooks.kv_balanced_admission_planner is None
-    assert hooks.hybrid_cache == HybridCachePolicy(low_priority_snapshot_prompt_len=16384)
     assert hooks.exact_context_demotion is True
     cache = _k3_module("ops.cache.k3_sm107_cache_manager")
-    assert hooks.kv_cache_manager_cls is cache.KimiK3Sm107MidchunkCacheManager
-    assert hooks.kv_cache_manager_cls.KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT == 64
+    manager_cls = hooks.kv_cache_manager_cls
+    assert manager_cls.__bases__ == (cache.KimiK3Sm107MidchunkCacheManager,)
+    assert manager_cls.KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT == 64
+    assert manager_cls.LOW_PRIORITY_SNAPSHOT_PROMPT_LEN == 16384
+    assert manager_cls.STATE_INDEX_UPLOAD_KERNEL is False
     rest = dataclasses.replace(
         hooks,
         torch_mem_safety_margin=None,
-        hybrid_cache=DEFAULT_RUNTIME_HOOKS.hybrid_cache,
         exact_context_demotion=DEFAULT_RUNTIME_HOOKS.exact_context_demotion,
         kv_cache_manager_cls=None,
     )

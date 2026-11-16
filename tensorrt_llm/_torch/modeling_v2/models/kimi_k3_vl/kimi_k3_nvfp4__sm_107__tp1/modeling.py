@@ -4548,6 +4548,13 @@ class KimiK3DefaultForCausalLM(
 _LOW_PRIORITY_SNAPSHOT_PROMPT_LEN = 16384
 
 
+class KimiK3Sm107Tp1CacheManager(KimiK3Sm107MidchunkCacheManager):
+    """The tp1 context servers' cache manager: KDA mid-chunk snapshots at the prefill chunk, and short
+    prompts' recurrent-state pages at the lowest eviction priority."""
+
+    LOW_PRIORITY_SNAPSHOT_PROMPT_LEN: ClassVar[int] = _LOW_PRIORITY_SNAPSHOT_PROMPT_LEN
+
+
 class ModelingV2KimiK3Nvfp4Sm107Tp1(KimiK3DefaultWeights, PreTrainedModel):
     """Kimi K3 NVFP4 on SM107, tp1.
 
@@ -4678,21 +4685,14 @@ class ModelingV2KimiK3Nvfp4Sm107Tp1(KimiK3DefaultWeights, PreTrainedModel):
     def runtime_hooks(self) -> RuntimeHooks:
         """The text model's step-loop hooks (the engine reads them off the outer model), 4 GiB
         left outside the PyTorch memory cap, and the context servers' recurrent-state cache
-        policies: KDA mid-chunk snapshots at the prefill chunk, the lowest eviction priority for
-        short prompts' recurrent pages, and exact long-prefill demotion (in effect where the
-        recipe sets a demotion threshold)."""
-        hooks = replace(
+        policies (``KimiK3Sm107Tp1CacheManager``): KDA mid-chunk snapshots at the prefill chunk and
+        the lowest eviction priority for short prompts' recurrent pages; and exact long-prefill
+        demotion (in effect where the recipe sets a demotion threshold)."""
+        return replace(
             self.llm.runtime_hooks or DEFAULT_RUNTIME_HOOKS,
             torch_mem_safety_margin=4 * 1024**3,
-        )
-        return replace(
-            hooks,
-            hybrid_cache=replace(
-                hooks.hybrid_cache,
-                low_priority_snapshot_prompt_len=_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN,
-            ),
             exact_context_demotion=True,
-            kv_cache_manager_cls=KimiK3Sm107MidchunkCacheManager,
+            kv_cache_manager_cls=KimiK3Sm107Tp1CacheManager,
         )
 
     def set_guided_decoder(self, *args, **kwargs):

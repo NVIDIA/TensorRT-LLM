@@ -7693,6 +7693,13 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
 __all__ = ["HELIX8_CONSTANTS", "KimiK3DefaultForCausalLM", "KimiK3Sm107ForConditionalGeneration"]
 
 
+class KimiK3Sm107Helix8CacheManager(KimiK3Sm107CacheManager):
+    """The helix8 generation servers' cache manager: the recurrent-state indices and the dummy-request
+    mask are uploaded with one kernel when they change."""
+
+    STATE_INDEX_UPLOAD_KERNEL: ClassVar[bool] = True
+
+
 class ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4(KimiK3Sm107ForConditionalGeneration):
     """Kimi K3 NVFP4 on SM107, helix8_moetp2ep4."""
 
@@ -7700,14 +7707,8 @@ class ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4(KimiK3Sm107ForConditionalGenerat
 
     @property
     def runtime_hooks(self) -> RuntimeHooks:
-        """The family's hooks; the recurrent-state indices and the dummy-request mask are uploaded
-        with one kernel when they change."""
-        hooks = super().runtime_hooks
-        return replace(
-            hooks,
-            hybrid_cache=replace(hooks.hybrid_cache, state_index_upload_kernel=True),
-            kv_cache_manager_cls=KimiK3Sm107CacheManager,
-        )
+        """The family's hooks, with ``KimiK3Sm107Helix8CacheManager`` as the KV cache manager."""
+        return replace(super().runtime_hooks, kv_cache_manager_cls=KimiK3Sm107Helix8CacheManager)
 
 
 __all__ = ["ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4"]

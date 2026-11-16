@@ -179,11 +179,7 @@ def test_engine_declarations_are_helix8():
     import torch
     from torch import nn
 
-    from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
-        DEFAULT_RUNTIME_HOOKS,
-        HybridCachePolicy,
-        runtime_hooks_of,
-    )
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 
     modeling = _glue()
     drafter = importlib.import_module(f"{_FAMILY}.dspark.drafter")
@@ -205,12 +201,14 @@ def test_engine_declarations_are_helix8():
         outer.llm = text
         hooks = runtime_hooks_of(outer)
         assert hooks.torch_mem_safety_margin == 4 * 1024**3
-        assert hooks.hybrid_cache == HybridCachePolicy(state_index_upload_kernel=True)
-        assert hooks.kv_cache_manager_cls is cache.KimiK3Sm107CacheManager
+        manager_cls = hooks.kv_cache_manager_cls
+        assert manager_cls.__bases__ == (cache.KimiK3Sm107CacheManager,)
+        assert manager_cls.STATE_INDEX_UPLOAD_KERNEL is True
+        assert manager_cls.LOW_PRIORITY_SNAPSHOT_PROMPT_LEN == 0
+        assert manager_cls.KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT == 0
         rest = dataclasses.replace(
             hooks,
             torch_mem_safety_margin=None,
-            hybrid_cache=DEFAULT_RUNTIME_HOOKS.hybrid_cache,
             kv_cache_manager_cls=None,
         )
         assert rest == text_hooks

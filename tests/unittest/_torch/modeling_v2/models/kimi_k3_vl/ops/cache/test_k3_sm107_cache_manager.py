@@ -33,13 +33,18 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k
     KimiK3Sm107CacheManager,
     KimiK3Sm107MidchunkCacheManager,
     _KDAMidchunkSnapshot,
+    _low_priority_recurrent_state,
 )
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor._util import model_declared_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
+    BlockReusePolicy,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     mamba_cache_manager_v2 as mamba_cache_manager_v2_module,
@@ -56,7 +61,8 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
+from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_kv_cache_manager_v2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle, _KVCache
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_pending_ssm_pages = pytest.mark.skipif(
@@ -219,6 +225,51 @@ def test_alignment_is_off_for_draft_or_without_block_reuse():
     mgr.is_draft = False
     mgr.enable_block_reuse = False
     assert mgr._get_kda_midchunk_snapshot_alignment() is None
+
+
+class _LowPriority48(KimiK3Sm107MidchunkCacheManager):
+    LOW_PRIORITY_SNAPSHOT_PROMPT_LEN = 48
+
+
+@pytest.mark.cpu_only
+def test_low_priority_recurrent_state_callback_maps_life_cycles():
+    """The C++ backend passes the page's life cycle: only recurrent-state pages are demoted."""
+    attention = AttnLifeCycle(None, 0)
+    sliding_window = AttnLifeCycle(256, 0)
+    recurrent_state = runtime_kv_cache_manager_v2._cpp.SsmLifeCycle()
+    assert _low_priority_recurrent_state(0, attention) == PAGE_PRIORITY_DEFAULT
+    assert _low_priority_recurrent_state(3, sliding_window) == PAGE_PRIORITY_DEFAULT
+    assert _low_priority_recurrent_state(3, recurrent_state) == PAGE_PRIORITY_MIN
+
+
+@pytest.mark.cpu_only
+def test_low_priority_prompt_len_follows_the_declared_class():
+    assert KimiK3Sm107CacheManager.LOW_PRIORITY_SNAPSHOT_PROMPT_LEN == 0
+    assert _manager_stub(cls=KimiK3Sm107CacheManager)._get_low_priority_snapshot_prompt_len() == 0
+    mgr = _manager_stub(cls=_LowPriority48)
+    assert mgr._get_low_priority_snapshot_prompt_len() == 48
+    # Without block reuse no snapshot is ever committed; a draft manager keeps the default.
+    mgr.is_draft = True
+    assert mgr._get_low_priority_snapshot_prompt_len() == 0
+    mgr.is_draft = False
+    mgr.enable_block_reuse = False
+    assert mgr._get_low_priority_snapshot_prompt_len() == 0
+
+
+@pytest.mark.cpu_only
+def test_low_priority_snapshot_callback_selection():
+    def request(prompt_len, dummy=False):
+        return SimpleNamespace(prompt_len=prompt_len, is_dummy=dummy)
+
+    mgr = _manager_stub(cls=_LowPriority48)
+    assert mgr._context_priority_callback(request(32)) is None
+    mgr._low_priority_snapshot_prompt_len = 48
+    assert mgr._context_priority_callback(request(32)) is _low_priority_recurrent_state
+    assert mgr._context_priority_callback(request(64)) is None
+    assert mgr._context_priority_callback(request(32, dummy=True)) is None
+    # A rank without local KDA layers has no recurrent-state pages to demote.
+    mgr.local_num_mamba_layers = 0
+    assert mgr._context_priority_callback(request(32)) is None
 
 
 @pytest.mark.cpu_only
