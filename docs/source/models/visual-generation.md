@@ -70,7 +70,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
-| **LTX-2.5** | Yes | Yes | No | No | No | No | No | No | No | No | No | Not validated | No | No | No | No | No |
+| **LTX-2.5** | No | No | No | No | No | No | No | No | No | No | No | Not validated | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
@@ -86,9 +86,9 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
-LTX-2.5 entries describe the single-GPU IC-LoRA workflow. Quantization support is
-functional support; see the [LTX-2.5 notes](#ltx-25-notes) and model-specific
-documentation for generated-media quality measurements. Its `trtllm-serve` path
+LTX-2.5 entries describe the single-GPU IC-LoRA workflow. FP8 blockwise and NVFP4
+are marked No because their outputs have not met the reported quality thresholds;
+see the [LTX-2.5 notes](#ltx-25-notes). Its `trtllm-serve` path
 has not been validated; use the standalone Python example.
 
 ## Quick Start
@@ -180,8 +180,10 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 (ltx-25-notes)=
 ## LTX-2.5 Notes
 
-LTX-2.5 supports IC-LoRA video-to-video generation with audio on one GPU, using
-BF16, FP8_BLOCK_SCALES or NVFP4. All three modes load the distilled BF16
+LTX-2.5 supports IC-LoRA video-to-video generation with audio on one GPU using
+BF16. Experimental FP8_BLOCK_SCALES and NVFP4 configurations are available, but
+their quantized video and audio outputs have not met the reported quality
+thresholds and remain UNQUALIFIED. All three modes load the distilled BF16
 transformer checkpoint and the matching LTX-tuned Gemma4-with-projection,
 convolutional video VAE, audio VAE/vocoder, x2 latent upsampler and IC-LoRA adapter.
 Use a dedicated Gemma4-compatible environment; see the
