@@ -374,6 +374,7 @@ def fused_gdn_post_conv(
     g_linear: bool = False,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     check: bool = True,
+    block_tokens: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse GDN post-conv split, Q/K normalization, and gate preparation.
 
@@ -398,6 +399,9 @@ def fused_gdn_post_conv(
             layers of one iteration; skips the five allocations per call.
         check: Verify the shapes / dtypes / contiguity of ``out`` (callers that
             built ``out`` for these very arguments may pass False).
+        block_tokens: Tokens per program. The Q/K squared norm of a token is reduced inside its
+            block, so its rounding depends on the token's row in the block; one token per program
+            gives every token the same reduction.
     Returns:
         Contiguous Q, K, V, G (log space, or linear space with ``g_linear``), and beta tensors with shapes
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
@@ -435,7 +439,6 @@ def fused_gdn_post_conv(
     # compile-time eliminates all decode address arithmetic and loads, so this
     # pointer and its strides are never interpreted as a decode tensor.
     decode_input = prefill if decode is None else decode
-    block_tokens = 16
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = triton.next_power_of_2(head_v_dim)
     num_heads = num_k_heads + num_v_heads

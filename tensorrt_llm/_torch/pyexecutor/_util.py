@@ -4267,6 +4267,12 @@ def _create_kv_cache_manager(
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
+        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
+        if (mamba_params.mamba_chunk_size is not None and issubclass(
+                kv_cache_manager_cls, NemotronHybridCacheManager)):
+            # The FORCE_DETERMINISTIC replay state sizes its buffers by it.
+            mamba_manager_extra_kwargs[
+                "mamba_chunk_size"] = mamba_params.mamba_chunk_size
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):

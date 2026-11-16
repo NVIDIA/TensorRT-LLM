@@ -72,6 +72,7 @@ from .fuse_elementwise_ops import (
     fused_gdn_post_conv,
     pack_gdn_decode_qkv,
 )
+from .gdn_exact_replay import gdn_exact_replay_forward_core
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import InforwardSnapshotSplit, Mamba2Metadata
@@ -2443,6 +2444,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             return None
         mamba_metadata = attn_metadata.mamba_metadata
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        if getattr(layer_cache, "replay_q", None) is not None:
+            # Exact replay runs prefill rows one sequence at a time.
+            return None
         key = (
             num_contexts,
             mamba_metadata.query_start_loc.data_ptr(),
@@ -2585,6 +2589,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
+
+        if spec_metadata is None and getattr(layer_cache, "replay_q", None) is not None:
+            # The cache manager bound the exact-replay state
+            # (FORCE_DETERMINISTIC): prefill and decode share the chunked
+            # delta-rule arithmetic from each slot's last chunk boundary.
+            return gdn_exact_replay_forward_core(
+                self, mixed_qkv, a, b, attn_metadata, mamba_metadata, layer_cache, output
+            )
 
         # Everything below that derives from the metadata alone is the same for
         # every GDN layer of the iteration: the first layer builds it, the

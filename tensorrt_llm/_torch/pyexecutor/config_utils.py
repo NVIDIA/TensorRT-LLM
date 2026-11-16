@@ -569,6 +569,8 @@ class MambaKVCacheParams:
     dtype: torch.dtype  # config.torch_dtype
     mamba_ssm_cache_dtype: Optional[
         torch.dtype]  # quant_config.mamba_ssm_cache_dtype
+    # Mamba2 SSD chunk size (None for models without one).
+    mamba_chunk_size: Optional[int] = None
 
     def get_layer_masks(
         self,
@@ -649,7 +651,8 @@ def build_mamba_kv_cache_params(config,
                                 mamba_mask,
                                 target_full_attn_mask,
                                 spec_config=None,
-                                quant_config=None) -> MambaKVCacheParams:
+                                quant_config=None,
+                                chunk_size=None) -> MambaKVCacheParams:
     """Normalize dtype and draft layout after model-owned geometry extraction."""
     num_draft_layers = 0
     if spec_config is not None:
@@ -679,6 +682,7 @@ def build_mamba_kv_cache_params(config,
         num_draft_layers=num_draft_layers,
         dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+        mamba_chunk_size=chunk_size,
     )
 
 

@@ -528,6 +528,20 @@ class Mamba2Metadata:
                                             dtype=torch.long,
                                             device="cuda")
 
+        # Exact-replay rows of this step (see exact_replay.py), filled by
+        # prepare() when the cache manager exposes its slot token counts.
+        self.replay_pos = torch.zeros(max_batch_size,
+                                      dtype=torch.long,
+                                      device="cuda")
+        self.replay_has_boundary = torch.zeros(max_batch_size,
+                                               dtype=torch.bool,
+                                               device="cuda")
+        self.replay_conv_has_initial = torch.ones(max_batch_size,
+                                                  dtype=torch.bool,
+                                                  device="cuda")
+        self.replay_prefill_n_pre: list[int] = []
+        self.replay_prefill_has_boundary: list[bool] = []
+
     def arange_long(self, n: int) -> torch.Tensor:
         """``[0, 1, ..., n]`` as int64 on the device: the cu_seqlens of ``n`` one-token sequences."""
         return self._arange_buffer_long[:n + 1]
@@ -548,6 +562,15 @@ class Mamba2Metadata:
 
         self.query_start_loc = None
         self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
+
+        replay_counter = getattr(kv_cache_manager, "mamba_replay_num_tokens",
+                                 None)
+        if replay_counter is not None and batch_size > 0:
+            # Exact replay advances its rows on every step, steady or not.
+            from .exact_replay import prepare_exact_replay_rows
+            prepare_exact_replay_rows(
+                self, replay_counter, batch_size, 0, None,
+                getattr(kv_cache_manager, "mamba_replay_chunk_size", None))
 
         flush = getattr(kv_cache_manager, "flush_state_transfers", None)
         if flush is not None:
@@ -883,6 +906,14 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        replay_counter = getattr(kv_cache_manager, "mamba_replay_num_tokens",
+                                 None)
+        if replay_counter is not None and batch_size > 0:
+            from .exact_replay import prepare_exact_replay_rows
+            prepare_exact_replay_rows(
+                self, replay_counter, batch_size, num_contexts, context_lens,
+                getattr(kv_cache_manager, "mamba_replay_chunk_size", None))
 
         self.inforward_split = None
         plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)

@@ -40,6 +40,7 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
+from .exact_replay import exact_replay_forward_core
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
@@ -506,6 +507,16 @@ class Mamba2Mixer(nn.Module):
             self.layer_idx)
         conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
+
+        if (spec_metadata is None and zxbcdt.dtype == torch.bfloat16
+                and getattr(layer_cache, "replay_x", None) is not None):
+            # The cache manager bound the exact-replay state
+            # (FORCE_DETERMINISTIC): prefill and decode share the
+            # chunked-scan arithmetic from each slot's last chunk boundary.
+            exact_replay_forward_core(self, zxbcdt, attn_metadata,
+                                      mamba_metadata, layer_cache,
+                                      preallocated_ssm_out)
+            return
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

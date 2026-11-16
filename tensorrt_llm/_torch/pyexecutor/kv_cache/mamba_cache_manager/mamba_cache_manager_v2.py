@@ -248,6 +248,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     fp4_mla_context_only_cache = False
     # A disaggregated context server never decodes and keeps no replay buffers.
     _disagg_context_only = False
+    _is_disagg = False
     # Replay buffers of the managed replay state, by global layer; see
     # _managed_replay_state.
     _replay_layouts = MappingProxyType({})
@@ -336,7 +337,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_layer_mask = list(mamba_layer_mask)
         self.spec_config = spec_config
         self.gdn_fused_verify = gdn_fused_verify
-        self._disagg_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
+        self._is_disagg = bool(kwargs.get("is_disagg", False))
+        self._disagg_context_only = _is_disagg_context_server(self._is_disagg)
         self._recurrent_evicted_blocks_total = 0
         self._recurrent_onboarded_blocks_total = 0
         self._recurrent_dropped_blocks_total = 0
@@ -1581,8 +1583,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
-        if self._speculative_state is not None and self.spec_config is not None:
-            return self._speculative_state.make_layer_cache(
+        state = self._speculative_state
+        if state is not None and (
+            self.spec_config is not None or getattr(state, "provides_layer_cache", False)
+        ):
+            return state.make_layer_cache(
                 self.mamba_layer_offsets[layer_idx],
                 self.get_conv_states(layer_idx),
                 self.get_ssm_states(layer_idx),
