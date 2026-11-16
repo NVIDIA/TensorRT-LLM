@@ -12,11 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import sys
 import traceback
-from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -1187,8 +1185,6 @@ def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
     return parts, res, post, comb, pre, weight
 
 
-# Pool workers run later tests: restore the environment.
-@patch.dict(os.environ)
 @torch.inference_mode()
 def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
     """Fused boundary vs the library all-reduce + boundary, eager and replayed, interleaved with
@@ -1199,7 +1195,6 @@ def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
         mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
         if mnnvl:
             # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
-            os.environ["TLLM_TEST_MNNVL"] = "1"
             allreduce = AllReduce(mapping=mapping,
                                   strategy=AllReduceStrategy.MNNVL,
                                   dtype=torch.bfloat16)

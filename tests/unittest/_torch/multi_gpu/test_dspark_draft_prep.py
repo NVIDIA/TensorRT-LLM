@@ -15,12 +15,10 @@
 """DSpark draft prep under TP: the forked back-fill projection on its own all-reduce workspace equals
 the inline one."""
 
-import os
 import pickle
 import sys
 import traceback
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -60,13 +58,8 @@ def _fp8(gen, n, k):
     return (w / scale).to(torch.float8_e4m3fn), torch.exp2(exponent).to(torch.float8_e8m0fnu)
 
 
-# Pool workers run later tests: restore the environment.
-@patch.dict(os.environ)
 @torch.inference_mode()
 def _check(rank: int, tp_size: int, strategy: str) -> None:
-    if strategy == "MNNVL":
-        # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
-        os.environ["TLLM_TEST_MNNVL"] = "1"
     mapping = Mapping(
         world_size=tp_size,
         tp_size=tp_size,

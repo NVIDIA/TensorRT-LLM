@@ -554,13 +554,16 @@ def test_allreduce_constructs_mnnvl_for_supported_policy(
     assert construct.call_args.kwargs["dispatch_plan"].is_supported
 
 
-@pytest.mark.parametrize("kind", ["draft_exchange", "k3_spec_accept", "k3_markov"])
+@pytest.mark.parametrize(
+    "kind", ["draft_exchange", "draft_exchange_throughput", "k3_spec_accept", "k3_markov"]
+)
 @pytest.mark.parametrize("cross_node_tp", [False, True])
 def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross_node_tp):
     prefix = "tensorrt_llm._torch._experimental.modeling_v2.models."
-    if kind == "draft_exchange":
+    if kind.startswith("draft_exchange"):
+        target = "high_throughput" if kind == "draft_exchange_throughput" else "low_latency"
         module = importlib.import_module(
-            prefix + "glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec._draft_exchange"
+            prefix + f"glm_moe_dsa.glm_5_2_nvfp4__sm_107__{target}.ops.spec._draft_exchange"
         )
     else:
         module = importlib.import_module(prefix + f"kimi_k3_vl.kernels.{kind}.op")
@@ -569,7 +572,7 @@ def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross
     # A multi-node world can contain node-local TP groups.
     mapping.is_multi_node = lambda: True
     comm = object()
-    if kind == "draft_exchange":
+    if kind.startswith("draft_exchange"):
         monkeypatch.setattr(module, "_get_mnnvl_workspace_comm", lambda mapping: comm)
         monkeypatch.setattr(module, "_mnnvl_device_index", lambda mapping: 0)
         construct = Mock(return_value=None)

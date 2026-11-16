@@ -84,12 +84,11 @@ def blackwell(monkeypatch) -> None:
 
 
 def _fabric(monkeypatch, aarch64: bool) -> None:
-    """The MNNVL hardware check of MNNVLAllReduce.is_mnnvl: an NVLink fabric on an aarch64 (Grace) node."""
-    from tensorrt_llm._torch.distributed import mnnvl_memory, ops
+    """The model's tuning envelope: an NVLink fabric on an aarch64 (Grace) node."""
+    from tensorrt_llm._torch.distributed import mnnvl_memory
 
-    monkeypatch.delenv("TLLM_TEST_MNNVL", raising=False)
     monkeypatch.setattr(mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
-    monkeypatch.setattr(ops.platform, "machine", lambda: "aarch64" if aarch64 else "x86_64")
+    monkeypatch.setattr(m.platform, "machine", lambda: "aarch64" if aarch64 else "x86_64")
 
 
 @pytest.mark.parametrize(

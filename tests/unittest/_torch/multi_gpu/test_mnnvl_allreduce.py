@@ -469,6 +469,9 @@ def mnnvl_rejects_shifted_workspace(
     glm_ops = load_target_ops(
         "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__low_latency")
+    glm_throughput_ops = load_target_ops(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "glm_5_2_nvfp4__sm_107__high_throughput")
     rank = tensorrt_llm.mpi_rank()
     assert rank == tensor_parallel_rank
     torch.cuda.set_device(rank)
@@ -554,6 +557,42 @@ def mnnvl_rejects_shifted_workspace(
                                       num_accepted=None,
                                       next_new_tokens=None)
 
+    def invoke_mtp_head_gather(workspace: torch.Tensor) -> None:
+        glm_throughput_ops.glm_rubin_mtp_head_gather(
+            input_tensor.to(torch.int32), workspace, flags,
+            tensor_parallel_size)
+
+    def invoke_mtp_draft(workspace: torch.Tensor) -> None:
+        glm_throughput_ops.glm_rubin_mtp_sample_glue_adp(
+            logits=input_tensor,
+            exchange_buffer=workspace,
+            exchange_flags=flags,
+            group_size=tensor_parallel_size,
+            segment_rows=1,
+            draft_tokens=flags,
+            draft_step=0,
+            embed_table=None,
+            hidden=None,
+            enorm_weight=None,
+            hnorm_weight=None,
+            eps=1e-5,
+            col_lo=0,
+            col_hi=0,
+            glue_out=None,
+            positions_in=None,
+            positions_out=None,
+            gather_ids=None,
+            seq_lens=None,
+            fill_seq_lens=False,
+            kv_lens=None,
+            kv_update=0,
+            rewind_accepted=None,
+            draft_len=0,
+            accepted_tokens=None,
+            batch_indices=None,
+            num_accepted=None,
+            next_new_tokens=None)
+
     def invoke_kimi_fusion(workspace: torch.Tensor) -> None:
         kimi_ops.k3_mnnvl_fusion_allreduce(input_tensor, norm_weight, None,
                                            1e-5, workspace, flags, True, None,
@@ -575,6 +614,9 @@ def mnnvl_rejects_shifted_workspace(
         (invoke_hist_topk, "logits must be a row-major FP32 matrix"),
         (invoke_hop, "comm_buffer must be the"),
         (invoke_draft, r"logits must be \[rows, vocab_shard\]"),
+        (invoke_mtp_head_gather, "supports BF16 and FP32 input"),
+        (invoke_mtp_draft,
+         r"logits must be \[group_size \* segment_rows, vocab_shard\]"),
         (invoke_kimi_fusion, "input must have at least 2 dimensions"),
         (invoke_kimi_attn_res, r"input must be \[num_tokens, hidden\]"),
         (invoke_kimi_allgather_split, "input must be a contiguous"),
@@ -742,7 +784,6 @@ def mnnvl_rms_norm_forward(
     norm_weight = norm_weight.cuda()
     reference_norm = reference_norm.cuda()
 
-    os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
 
     allreduce = AllReduce(

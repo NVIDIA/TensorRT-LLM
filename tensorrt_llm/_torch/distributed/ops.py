@@ -1668,11 +1668,11 @@ class AllReduce(nn.Module):
         # AUTO, or TWOSHOT (the kernel is a reduce-scatter + all-gather); other strategies run as chosen.
         if (tp2_fused_norm and not self.mapping.enable_attention_dp
                 and self.strategy in (AllReduceStrategy.AUTO,
-                                                 AllReduceStrategy.TWOSHOT)
+                                      AllReduceStrategy.TWOSHOT)
                 and self.mapping.tp_size == 2 and not self._disable_mpi
                 and self.mnnvl_allreduce is None
-                and dtype in (None, torch.bfloat16)
-                and hidden_size is not None and max_num_tokens is not None):
+                and dtype in (None, torch.bfloat16) and hidden_size is not None
+                and max_num_tokens is not None):
             from .tp2_allreduce import Tp2AllReduceNorm
             if Tp2AllReduceNorm.is_supported(self.mapping, hidden_size,
                                              max_num_tokens):
@@ -1683,8 +1683,7 @@ class AllReduce(nn.Module):
                         kernel = Tp2AllReduceNorm(self.mapping, hidden_size,
                                                   max_num_tokens)
                     except RuntimeError as error:  # raised on every rank
-                        logger.warning(
-                            f"[TP2 all-reduce] unavailable: {error}")
+                        logger.warning(f"[TP2 all-reduce] unavailable: {error}")
                     AllReduce.tp2_fused_norm_kernels[key] = kernel
                 self.tp2_allreduce = AllReduce.tp2_fused_norm_kernels[key]
 

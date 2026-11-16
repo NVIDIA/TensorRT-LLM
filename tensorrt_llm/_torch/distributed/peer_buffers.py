@@ -69,7 +69,17 @@ class PeerBuffers:
         if can_access_peer(mapping):
             return PeerTransport.IPC
         if mapping.is_multi_node() and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16):
-            return PeerTransport.MNNVL
+            from cuda.bindings import driver as cuda
+
+            from .mnnvl_memory import TpMnnvlMemory
+
+            # This allocator's handle type must permit importing memory across hosts.
+            prop = TpMnnvlMemory.get_allocation_prop(torch.cuda.current_device())
+            if (
+                prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            ):
+                return PeerTransport.MNNVL
         return None
 
     @classmethod

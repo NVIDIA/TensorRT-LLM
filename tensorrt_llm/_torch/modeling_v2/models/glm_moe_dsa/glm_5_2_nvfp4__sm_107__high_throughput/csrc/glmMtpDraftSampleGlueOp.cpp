@@ -16,10 +16,9 @@
  */
 
 #include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpDraftSampleGlue.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -47,8 +46,11 @@ int64_t setDraftStepExchangeAdp(sd::DraftSampleGlueAdpParams& params, at::Tensor
     at::Tensor& draft_tokens, int64_t draft_step)
 {
     char const* op = "glm_rubin_mtp_sample_glue_adp";
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(exchange_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(exchange_buffer);
     TORCH_CHECK(mcastMem != nullptr, op, ": exchange_buffer must come from a McastGPUBuffer");
+    TORCH_CHECK(mcastMem->isMapped(), op, ": the MNNVL workspace handles are not attached");
+    TORCH_CHECK(exchange_buffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()), op,
+        ": exchange_buffer must start at the local unicast allocation base");
     TORCH_CHECK(static_cast<int64_t>(mcastMem->getWorldSize()) == group_size, op, ": group_size ", group_size,
         " does not match the workspace group of ", mcastMem->getWorldSize(), " ranks");
     TORCH_CHECK(group_size >= 2 && group_size <= sd::kDraftSampleGlueAdpMaxRanks, op, ": group_size must be 2 to ",
