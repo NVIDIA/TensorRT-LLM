@@ -158,6 +158,14 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     #: last block whose lookahead the prompt holds, and saves publish only the
     #: blocks a pass computed.
     supports_speculative_prefill = True
+    #: A query only resets and refills this request's offer state
+    #: (`get_num_new_matched_tokens`), the pool lookup is a read-only
+    #: `count_prefix_hit`, and transfers are built only once the allocation is
+    #: reported (`update_state_after_alloc_by_layer_group`) or the batch is
+    #: final (`build_connector_meta`), so an admission-time answer has no other
+    #: effect and a repeated query replaces it. `request_reset` drops the state
+    #: of a request whose first chunk gave its pages back.
+    supports_admission_query = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)

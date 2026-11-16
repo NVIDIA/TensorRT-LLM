@@ -7331,3 +7331,46 @@ def test_auto_v1_warns_when_completion_reservation_cannot_take_effect() -> None:
     assert any(
         "enable_disagg_completion_reservation will not take effect" in str(item)
         for item in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+class TestKvCacheConnectorAdmissionQuery:
+    """kv_connector_config.admission_query: admission-time connector queries."""
+
+    @staticmethod
+    def _config(**kwargs):
+        from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+        return KvCacheConnectorConfig(connector="mooncake-store", **kwargs)
+
+    def test_off_by_default(self) -> None:
+        assert self._config().admission_query is None
+
+    def test_empty_mapping_enables_page_booking_only(self) -> None:
+        admission = self._config(admission_query={}).admission_query
+        assert admission.max_uncharged_parks == 0
+        assert admission.max_offer_deferrals == 16
+
+    def test_round_trip(self) -> None:
+        from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+        config = self._config(admission_query={
+            "max_uncharged_parks": 4,
+            "max_offer_deferrals": 0
+        })
+        dumped = config.model_dump()
+        assert dumped["admission_query"] == {
+            "max_uncharged_parks": 4,
+            "max_offer_deferrals": 0
+        }
+        restored = KvCacheConnectorConfig.model_validate_json(
+            config.model_dump_json())
+        assert restored.admission_query == config.admission_query
+
+    @pytest.mark.parametrize("field",
+                             ["max_uncharged_parks", "max_offer_deferrals"])
+    def test_negative_values_are_rejected(self, field: str) -> None:
+        with pytest.raises(ValidationError, match=field):
+            self._config(admission_query={field: -1})
+
+    def test_unknown_key_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="max_parks"):
+            self._config(admission_query={"max_parks": 1})

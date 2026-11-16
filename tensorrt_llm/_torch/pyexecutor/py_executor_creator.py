@@ -1345,7 +1345,12 @@ def _create_py_executor(
                 connector_worker,
                 connector_scheduler,
                 enable_attention_dp=mapping.enable_attention_dp,
-                speculative_prefill_only=speculative_prefill_only)
+                speculative_prefill_only=speculative_prefill_only,
+                # Read from the class, which every rank resolved above: under
+                # tensor parallelism only rank 0 holds a scheduler instance.
+                admission_query=getattr(scheduler_cls,
+                                        "supports_admission_query", False)
+                is True)
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise
