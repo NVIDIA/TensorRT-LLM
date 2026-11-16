@@ -72,6 +72,7 @@ from .fuse_elementwise_ops import (
     fused_gdn_post_conv,
     pack_gdn_decode_qkv,
 )
+from .fused_gdn_conv import fused_gdn_conv_post_conv
 from .gdn_inforward_split import (
     gather_tail_tokens,
     scatter_tail,
@@ -863,6 +864,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     # output); not bitwise to the stock kernels in q / k / v (SiLU form, FP32 order of the q / k L2 norms) and alpha
     # (libdevice expf vs tl.exp), see gdn_prefill_conv.py.
     fused_prefill_conv: bool = False
+    # Prefill rows that do not take gdn_prefill_conv_post, mixed and target-verify batches included, run
+    # fused_gdn_conv_post_conv instead of the causal conv and fused_gdn_post_conv (default 0).
+    _fused_conv_post_conv = os.environ.get("TRTLLM_GDN_FUSED_CONV", "0") == "1"
     # The in-forward snapshot split runs its state / token copies as bit-identical Triton launches.
     fused_split_copies: bool = False
     # Row gates of the verify step's resident-weight in_proj_qkvz and split-K in_proj_ba (0: never).
@@ -2066,14 +2070,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if has_initial_states_p is None:
                 has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p_t = self._prefill_conv(
-                mixed_qkv_p,
-                conv_states_to_use,
-                has_initial_states_p,
-                state_indices_p,
-                query_start_loc_p,
-            )
-
             if is_target_verify:
                 a_d = a[num_prefill_tokens:]
                 b_d = b[num_prefill_tokens:]
@@ -2112,19 +2108,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
             if is_target_verify:
                 if num_prefill_tokens > 0:
-                    query_p, key_p, value_p, g_p, beta_p = fused_gdn_post_conv(
-                        mixed_qkv_p_t,
-                        None,
+                    query_p, key_p, value_p, g_p, beta_p, _ = self._prefill_conv_post_conv(
+                        mixed_qkv_p,
+                        conv_states_to_use,
+                        has_initial_states_p,
+                        state_indices_p,
+                        query_start_loc_p,
                         a[:num_prefill_tokens],
                         b[:num_prefill_tokens],
-                        self.A_log,
-                        self.dt_bias,
-                        self.num_k_heads_per_tp,
-                        self.head_k_dim,
-                        self.num_v_heads_per_tp,
-                        self.head_v_dim,
+                        g_linear,
                         beta_dtype=b.dtype,
-                        g_linear=g_linear,
+                        scratch=False,
                     )
                 layer_cache = kwargs.get("layer_cache")
                 if (
@@ -2153,8 +2147,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 # prefill state workspace holds prefill requests only.
                 assert num_decode_tokens == num_decodes, "mixed decode rows are one token each"
                 decode_recurrent = (mixed_qkv_d, a[num_prefill_tokens:], b[num_prefill_tokens:])
-                query, key, value, g, beta, packed = self._post_conv(
-                    mixed_qkv_p_t, None, a[:num_prefill_tokens], b[:num_prefill_tokens], g_linear
+                query, key, value, g, beta, packed = self._prefill_conv_post_conv(
+                    mixed_qkv_p,
+                    conv_states_to_use,
+                    has_initial_states_p,
+                    state_indices_p,
+                    query_start_loc_p,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    g_linear,
                 )
         elif fused_conv:
             query, key, value, g, beta, packed = self._fused_prefill_conv_post(
@@ -2178,14 +2179,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
                     )
         else:
-            mixed_qkv_t = self._prefill_conv(
-                mixed_qkv, conv_states_to_use, has_initial_states, cache_indices, query_start_loc
+            query, key, value, g, beta, packed = self._prefill_conv_post_conv(
+                mixed_qkv,
+                conv_states_to_use,
+                has_initial_states,
+                cache_indices,
+                query_start_loc,
+                a,
+                b,
+                g_linear,
             )
             if inforward_split is not None:
                 _inforward_split_conv_states(
                     conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
                 )
-            query, key, value, g, beta, packed = self._post_conv(mixed_qkv_t, None, a, b, g_linear)
 
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
@@ -2563,38 +2570,83 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc=query_start_loc,
         )
 
-    def _post_conv(self, prefill_t: torch.Tensor, decode, a, b, g_linear: bool):
-        """fused_gdn_post_conv on scratch-backed outputs (fp32 beta; the scan paths):
-        ``(q, k, v, g, beta, packed)`` with ``packed`` the ``_PackedPostConv`` of
-        the same buffers."""
-        num_tokens = prefill_t.shape[1] + (0 if decode is None else decode.shape[0])
-        shape = (
-            num_tokens,
-            self.num_k_heads_per_tp,
-            self.head_k_dim,
-            self.num_v_heads_per_tp,
-            self.head_v_dim,
-            prefill_t.dtype,
-            prefill_t.device,
-        )
-        scratch = _prefill_scratch()
-        out = scratch.post_conv(*shape)
-        packed = scratch.post_conv_packed(*shape)
-        q, k, v, g, beta = fused_gdn_post_conv(
-            prefill_t,
-            decode,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            self.num_k_heads_per_tp,
-            self.head_k_dim,
-            self.num_v_heads_per_tp,
-            self.head_v_dim,
-            g_linear=g_linear,
-            out=out,
-            check=False,
-        )
+    def _prefill_conv_post_conv(
+        self,
+        mixed_qkv_p: torch.Tensor,
+        conv_states: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        g_linear: bool,
+        beta_dtype: torch.dtype = torch.float32,
+        scratch: bool = True,
+    ):
+        """The prefill causal conv, then fused_gdn_post_conv: ``(q, k, v, g, beta, packed)``.
+
+        With ``scratch`` the outputs are scratch-backed and ``packed`` is their
+        ``_PackedPostConv``; otherwise they are new tensors and ``packed`` is None.
+        With ``_fused_conv_post_conv`` one kernel does both steps and the conv
+        output is never stored; not under FORCE_DETERMINISTIC, like
+        gdn_prefill_conv_post."""
+        out = packed = None
+        if scratch:
+            shape = (
+                mixed_qkv_p.shape[0],
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+                mixed_qkv_p.dtype,
+                mixed_qkv_p.device,
+                beta_dtype,
+            )
+            buffers = _prefill_scratch()
+            out = buffers.post_conv(*shape)
+            packed = buffers.post_conv_packed(*shape)
+        heads = (self.num_k_heads_per_tp, self.head_k_dim, self.num_v_heads_per_tp, self.head_v_dim)
+        if (
+            self._fused_conv_post_conv
+            and self.activation in ("silu", "swish")
+            and mixed_qkv_p.stride(1) == 1
+            and os.getenv("FORCE_DETERMINISTIC", "0") != "1"
+        ):
+            q, k, v, g, beta = fused_gdn_conv_post_conv(
+                mixed_qkv_p,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states,
+                query_start_loc,
+                cache_indices,
+                has_initial_state,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                *heads,
+                beta_dtype=beta_dtype,
+                g_linear=g_linear,
+                out=out,
+                check=False,
+            )
+        else:
+            conv_out = self._prefill_conv(
+                mixed_qkv_p, conv_states, has_initial_state, cache_indices, query_start_loc
+            )
+            q, k, v, g, beta = fused_gdn_post_conv(
+                conv_out,
+                None,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                *heads,
+                beta_dtype=beta_dtype,
+                g_linear=g_linear,
+                out=out,
+                check=False,
+            )
         return q, k, v, g, beta, packed
 
     def _fused_prefill_conv_post(

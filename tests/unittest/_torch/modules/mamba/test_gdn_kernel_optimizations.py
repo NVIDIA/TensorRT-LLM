@@ -533,6 +533,168 @@ def test_pack_gdn_decode_qkv(
     torch.testing.assert_close(actual_v.view(num_tokens, -1), expected_v, rtol=0, atol=0)
 
 
+# ---- Tests for fused_gdn_conv_post_conv ----
+
+
+def _ref_prefill_conv(x, weight, bias, conv_states, query_start_loc, cache_indices, has_init):
+    """Varlen causal conv1d + SiLU of token-major x; rolls conv_states forward in place."""
+    from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+    width = weight.shape[1]
+    out = torch.zeros_like(x)
+    starts = query_start_loc.tolist()
+    for seq, (slot, init) in enumerate(zip(cache_indices.tolist(), has_init.tolist())):
+        if slot == PAD_SLOT_ID:
+            continue
+        window = conv_states[slot].T if init else torch.zeros_like(conv_states[slot].T)
+        padded = torch.cat((window, x[starts[seq] : starts[seq + 1]])).float()
+        y = F.conv1d(
+            padded.T.unsqueeze(0),
+            weight.float().unsqueeze(1),
+            None if bias is None else bias.float(),
+            groups=weight.shape[0],
+        )
+        out[starts[seq] : starts[seq + 1]] = F.silu(y[0].T).to(x.dtype)
+        conv_states[slot] = padded[-(width - 1) :].T.to(conv_states.dtype)
+    return out
+
+
+def _run_fused_gdn_conv_post_conv(
+    heads,
+    seq_lens,
+    has_init,
+    width,
+    has_bias=False,
+    beta_dtype=torch.float32,
+    g_linear=False,
+    preallocated=False,
+    cache_indices=None,
+    num_slots=None,
+    slot_padding=0,
+):
+    """Run fused_gdn_conv_post_conv and the reference on the same random inputs; return both.
+
+    Conv windows are strided views into a pool with ``slot_padding`` unrelated elements per slot,
+    which the op must leave exactly as the reference does. By default sequence ``i`` uses slot
+    ``num_slots - 1 - 2 * i`` of a pool with three spare slots.
+    """
+    from tensorrt_llm._torch.modules.mamba.fused_gdn_conv import fused_gdn_conv_post_conv
+
+    if cache_indices is None:
+        num_slots = len(seq_lens) + 3
+        cache_indices = [num_slots - 1 - 2 * i for i in range(len(seq_lens))]
+    num_k_heads, head_k_dim, num_v_heads, head_v_dim = heads
+    qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+    num_tokens = sum(seq_lens)
+    bf16 = {"dtype": torch.bfloat16, "device": "cuda"}
+    # Row-strided views, as sliced out of the in_proj outputs.
+    projected = torch.randn(num_tokens, qkv_dim + 64, **bf16) * 0.5
+    ba = torch.randn(num_tokens, 2 * num_v_heads, **bf16)
+    mixed_qkv = projected[:, :qkv_dim]
+    weight = torch.randn(qkv_dim, width, **bf16) * 0.5
+    bias = torch.randn(qkv_dim, **bf16) * 0.1 if has_bias else None
+    pool = torch.randn(num_slots, qkv_dim * (width - 1) + slot_padding, **bf16) * 0.5
+    expected_pool = pool.clone()
+    conv_states, expected_states = (
+        p.as_strided((num_slots, qkv_dim, width - 1), (p.stride(0), width - 1, 1))
+        for p in (pool, expected_pool)
+    )
+    seq_args = (
+        torch.tensor([0, *seq_lens], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.tensor(cache_indices, dtype=torch.int32, device="cuda"),
+        torch.tensor(has_init, dtype=torch.bool, device="cuda"),
+    )
+    gate_args = (
+        ba[:, num_v_heads:],
+        ba[:, :num_v_heads],
+        torch.randn(num_v_heads, device="cuda") - 2.0,
+        torch.randn(num_v_heads, device="cuda") * 0.1,
+        *heads,
+    )
+
+    conv_out = _ref_prefill_conv(mixed_qkv, weight, bias, expected_states, *seq_args)
+    expected = list(_ref_gdn_post_conv(conv_out.T, None, *gate_args, beta_dtype))
+    if g_linear:
+        expected[3] = torch.exp(expected[3])
+    out = tuple(torch.full_like(t, float("nan")) for t in expected) if preallocated else None
+    actual = fused_gdn_conv_post_conv(
+        mixed_qkv,
+        weight,
+        bias,
+        conv_states,
+        *seq_args,
+        *gate_args,
+        beta_dtype=beta_dtype,
+        g_linear=g_linear,
+        out=out,
+    )
+    if preallocated:
+        assert all(got is buf for got, buf in zip(actual, out))
+    # Conv windows hold raw inputs, so they match exactly; the rest of the pool is untouched.
+    assert torch.equal(pool, expected_pool)
+    return actual, expected
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "heads",
+    [
+        (16, 128, 64, 128),  # Qwen3.5-397B: num_k_heads, head_k_dim, num_v_heads, head_v_dim
+        (4, 64, 8, 64),
+        (2, 96, 4, 96),
+    ],
+)
+@pytest.mark.parametrize(
+    "seq_lens,has_init,beta_dtype",
+    [
+        ((77,), (False,), torch.float32),  # fresh prefill
+        # Chunked-prefill continuations, including chunks shorter than the conv window.
+        ((1, 2, 3, 40), (True, True, True, True), torch.float32),
+        ((5, 1, 300, 17), (True, False, True, False), torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("width,has_bias", [(4, False), (3, True)])
+@pytest.mark.parametrize("g_linear,preallocated", [(False, False), (True, True)])
+def test_fused_gdn_conv_post_conv(
+    heads, seq_lens, has_init, beta_dtype, width, has_bias, g_linear, preallocated
+):
+    """Fused token-major conv matches a varlen conv reference followed by the post-conv."""
+    torch.manual_seed(42)
+    actual, expected = _run_fused_gdn_conv_post_conv(
+        heads, seq_lens, has_init, width, has_bias, beta_dtype, g_linear, preallocated
+    )
+    for actual_output, expected_output in zip(actual[:3], expected[:3]):
+        assert actual_output.is_contiguous()
+        torch.testing.assert_close(actual_output, expected_output, rtol=1e-2, atol=1e-2)
+    for actual_output, expected_output in zip(actual[3:], expected[3:]):
+        assert actual_output.dtype == expected_output.dtype
+        torch.testing.assert_close(actual_output, expected_output, rtol=1e-4, atol=1e-4)
+
+
+@skip_no_cuda
+def test_fused_gdn_conv_post_conv_pad_slot_and_strided_states():
+    """Padded sequences keep their windows; conv windows may live in a strided pool view."""
+    from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+    torch.manual_seed(42)
+    seq_lens = (6, 2, 10)
+    actual, expected = _run_fused_gdn_conv_post_conv(
+        (4, 64, 8, 64),
+        seq_lens,
+        (True, True, False),
+        width=4,
+        cache_indices=[3, PAD_SLOT_ID, 0],
+        num_slots=5,
+        slot_padding=32,
+    )
+    live_tokens = torch.ones(sum(seq_lens), dtype=torch.bool, device="cuda")
+    live_tokens[6:8] = False  # outputs of the padded sequence are unspecified
+    for actual_output, expected_output in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_output[:, live_tokens], expected_output[:, live_tokens], rtol=1e-2, atol=1e-2
+        )
+
+
 # ---- Tests for the GDN compile boundary and derived state ----
 
 
