@@ -42,6 +42,18 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
     supports_gptoss_style = True
     needs_zero_expert_bias = True
 
+    # Packed MXFP4 TMA descriptors (CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B)
+    # require a 128-aligned logical intermediate extent. Round up to match the
+    # zero-padded weight shard layout.
+    _TMA_MXFP4_ALIGNMENT = 128
+
+    @classmethod
+    def _round_up_valid_intermediate_size(cls, valid_intermediate_size: int | None) -> int | None:
+        if valid_intermediate_size is None:
+            return None
+        align = cls._TMA_MXFP4_ALIGNMENT
+        return ((valid_intermediate_size + align - 1) // align) * align
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(cls, p, d)
@@ -73,6 +85,9 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
             "e4m3_mxe2m1_block_scale_moe_runner does not support do_finalize=False"
         )
         intermediate_size_per_partition_padded = self.w3_w1_weight.shape[-2] // 2
+        valid_intermediate_size = self._round_up_valid_intermediate_size(
+            self.quant_method.intermediate_size_per_partition_lean
+        )
 
         result = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
             k.router_logits,
@@ -96,7 +111,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
             k.topk_group,
             intermediate_size_per_partition_padded,
             self.hidden_size,
-            self.quant_method.intermediate_size_per_partition_lean,
+            valid_intermediate_size,
             self.slot_start,
             self.expert_size_per_partition,
             k.routed_scaling_factor,

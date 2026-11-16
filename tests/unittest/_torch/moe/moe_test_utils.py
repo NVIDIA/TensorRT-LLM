@@ -496,23 +496,10 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # Packed FP4 TMA descriptors require a 128-aligned logical K dimension.
-    # MXFP4 passes the TP shard width rather than its padded width.
-    if (
-        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
-        and moe_tp_size > 1
-        and intermediate_size % moe_tp_size == 0
-        and (intermediate_size // moe_tp_size) % 128 != 0
-    ):
-        return (
-            "[NVBUG-7085659] W4A8_MXFP4_FP8 TP uses a non-128-aligned "
-            f"logical TMA dimension (intermediate_size={intermediate_size}, "
-            f"moe_tp_size={moe_tp_size})."
-        )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
-    # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
-    # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
+    # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8) auto-pad to
+    # 128 alignment, but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8)
+    # crash:
     #   - FP8_BLOCK_SCALES: block scale tensor size mismatch
     #     (ceil(per_shard/128) vs floor(per_shard/128))
     #   - NVFP4: unswizzle_sf shape '[-1, w3_w1, 128]' invalid
