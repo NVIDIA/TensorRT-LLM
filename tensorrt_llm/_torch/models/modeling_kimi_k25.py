@@ -1193,6 +1193,11 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         token_h = (new_h + pad_h) // factor
         return token_h * token_w
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # Video frames go to the remote processor's `_to_pil`, which takes
+        # tensors or PIL images, not uint8 arrays.
+        return {"video": {"format": "pt"}}
+
     def get_num_tokens_per_video(self, *, video: List, **kwargs) -> int:
         """Calculate total tokens for a video (list of PIL frames).
 

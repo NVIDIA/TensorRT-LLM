@@ -14,7 +14,6 @@ import numpy as np
 import soundfile
 import torch
 from PIL import Image
-from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
@@ -23,7 +22,8 @@ from tensorrt_llm.inputs.chat_template_guard import \
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
-from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, ImageMediaIO,
+                                          VideoMediaIO,
                                           _decode_base64_with_limit,
                                           _load_and_convert_image,
                                           _normalize_file_uri,
@@ -34,7 +34,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
-from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
+from tensorrt_llm.inputs.registry import (INPUT_PROCESSOR_REGISTRY,
+                                          MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.metrics.perf_utils import _time_input_processing
@@ -68,10 +69,11 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
     return image_data
 
 
-def load_image(image: Union[str, Image.Image],
-               format: str = "pt",
-               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+def load_image(
+        image: Union[str, Image.Image],
+        format: str = "pt",
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor, np.ndarray]:
+    image_io = ImageMediaIO(format=format, device=device)
 
     if isinstance(image, Image.Image):
         return image.convert('RGB')
@@ -88,17 +90,14 @@ def load_image(image: Union[str, Image.Image],
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    if format == "pt":
-        return ToTensor()(image).to(device=device)
-    else:
-        return image
+    return image_io._postprocess(image)
 
 
 async def async_load_image(
         image: Union[str, Image.Image],
         format: str = "pt",
-        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor, np.ndarray]:
+    image_io = ImageMediaIO(format=format, device=device)
 
     if isinstance(image, Image.Image):
         return image.convert('RGB')
@@ -117,11 +116,7 @@ async def async_load_image(
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    if format == "pt":
-        return await asyncio.to_thread(lambda: ToTensor()
-                                       (image).to(device=device))
-    else:
-        return image
+    return await asyncio.to_thread(image_io._postprocess, image)
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -139,10 +134,18 @@ def load_base64_video(video: str) -> BytesIO:
 def load_video(video: str,
                num_frames: int = 10,
                fps: int = 30,
-               format: str = "pt",
+               format: str = "np",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
     """Load video frames with the shared source-byte cache identity.
+
+    `format` sets the type of the returned `VideoData.frames`:
+      `"np"`  - one uint8 array of shape (N, H, W, 3) (default).
+      `"pt"`  - a list of float32 tensors of shape (3, H, W) in [0, 1].
+      `"pil"` - a list of PIL images.
+    Changed in 1.4: the default was `"pt"`. Pass `format="pt"` to keep float
+    frames. This function does not know the model, so pass the video format
+    the model declares in `get_preferred_media_io_kwargs()`.
 
     Encoded video inputs share the serving loader's size limit. Local files
     are read fully into memory during decoding. Local-file I/O failures raise
@@ -174,17 +177,19 @@ def load_video(video: str,
 async def async_load_video(video: str,
                            num_frames: int = 10,
                            fps: int = 30,
-                           format: str = "pt",
+                           format: str = "np",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
     """Load video frames without blocking the event loop.
+
+    Same `format` values and default as `load_video`: uint8 (N, H, W, 3)
+    frames by default (changed in 1.4 from `"pt"`); pass `format="pt"` to
+    keep float frames.
 
     Encoded video inputs share the serving loader's size limit. Local files
     are read fully into memory during decoding. Local-file I/O failures raise
     ValueError, with the original OSError as their cause.
     """
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
     # See `load_video`: share the serving decode path so hashes agree.
     video_io = VideoMediaIO(num_frames=num_frames,
                             fps=fps,
@@ -1016,6 +1021,9 @@ async def async_build_multimodal_prompt(
         prompt: The user's text, without any placeholder tokens.
         media: URLs, `data:` URIs or local paths, one per item.
         modality: Registered media modality, e.g. `"image"`.
+        media_io_kwargs: Per-modality loader kwargs (`format`, `num_frames`,
+            ...). Like per-request kwargs in `trtllm-serve`, they override the
+            defaults the model declares in `get_preferred_media_io_kwargs()`.
 
     Returns:
         A `TextPrompt` carrying `multi_modal_data`, ready for
@@ -1025,7 +1033,10 @@ async def async_build_multimodal_prompt(
     if media_io_cls is None:
         raise ValueError(f"Unsupported modality {modality!r}. "
                          f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
-    media_io = media_io_cls.create((media_io_kwargs or {}).get(modality), None)
+    model_kwargs = INPUT_PROCESSOR_REGISTRY.get_preferred_media_io_kwargs(
+        model_type)
+    media_io = media_io_cls.create(model_kwargs.get(modality),
+                                   (media_io_kwargs or {}).get(modality))
 
     mm_data_tracker = MultimodalDataTracker(model_type)
     content_parts: List[Union[str, Dict[str, Any]]] = []
@@ -1075,14 +1086,31 @@ def default_multimodal_input_loader(
     modality: str,
     prompts: List[str],
     media: Optional[Union[List[str], List[List[str]]]] = None,
-    image_data_format: str = "pt",
+    image_data_format: Optional[str] = None,
     num_frames: int = 8,
     mm_embeddings: Optional[Union[List[torch.Tensor],
                                   List[List[torch.Tensor]]]] = None,
     device: str = "cpu",
     extract_audio: bool = False,
     trust_remote_code: bool = True,
+    media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
+    """Load media and render prompts for `LLM.generate`.
+
+    `image_data_format`, when set, is the decode format for every modality.
+    Otherwise each modality uses the `format` in `media_io_kwargs`, then the
+    format the model declares in `get_preferred_media_io_kwargs()` (as
+    `trtllm-serve` does), then its loader's default: `"pt"` for images and
+    `"np"` for video.
+    """
+    model_kwargs = INPUT_PROCESSOR_REGISTRY.get_preferred_media_io_kwargs(
+        model_type)
+
+    def format_kwargs(modality: str) -> Dict[str, str]:
+        caller_kwargs = (media_io_kwargs or {}).get(modality, {})
+        data_format = (image_data_format or caller_kwargs.get("format")
+                       or model_kwargs.get(modality, {}).get("format"))
+        return {"format": data_format} if data_format else {}
 
     def convert_to_conversation_message(
         prompt: str,
@@ -1101,7 +1129,7 @@ def default_multimodal_input_loader(
                     media = [media]
             else:
                 _load = lambda mm: load_image(
-                    mm, format=image_data_format, device=device)
+                    mm, device=device, **format_kwargs("image"))
 
             mm_data = [
                 MultimodalData(modality=modality,
@@ -1118,9 +1146,9 @@ def default_multimodal_input_loader(
                     modality=modality,
                     data=load_video(i,
                                     num_frames,
-                                    format=image_data_format,
                                     device=device,
-                                    extract_audio=extract_audio),
+                                    extract_audio=extract_audio,
+                                    **format_kwargs("video")),
                     is_embedding=False,
                 ) for i in media
             ]
@@ -1149,8 +1177,8 @@ def default_multimodal_input_loader(
                 if _modal is None:
                     try:
                         data = load_image(m,
-                                          format=image_data_format,
-                                          device=device)
+                                          device=device,
+                                          **format_kwargs("image"))
                         _modal = "image"
                     except Exception:
                         pass
@@ -1174,8 +1202,8 @@ def default_multimodal_input_loader(
                         MultimodalData(
                             modality="image",
                             data=load_image(m,
-                                            format=image_data_format,
-                                            device=device),
+                                            device=device,
+                                            **format_kwargs("image")),
                             is_embedding=False,
                         ))
         else:

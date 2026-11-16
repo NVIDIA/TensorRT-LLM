@@ -261,7 +261,12 @@ class BaseMultimodalInputProcessor(ABC):
             "This processor does not support prepared decode inputs")
 
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
-        """Return per-modality decode defaults, below server and request overrides."""
+        """Return per-modality decode defaults, below server and request overrides.
+
+        Helpers that know only the model type read this without loading the
+        checkpoint (`InputProcessorRegistry.get_preferred_media_io_kwargs`),
+        so keep it a constant where possible.
+        """
         return {}
 
     def get_disagg_prefill_inputs(
@@ -1140,6 +1145,32 @@ class InputProcessorRegistry:
     def __init__(self) -> None:
         self._input_processors_cls_by_model_type: Dict[
             Type[nn.Module], Type[InputProcessor]] = {}
+        # Keyed by the HF `model_type` string, for callers that know only that.
+        self._input_processor_cls_by_model_type_name: Dict[
+            str, Type[InputProcessor]] = {}
+
+    def get_preferred_media_io_kwargs(
+            self, model_type: str) -> Dict[str, Dict[str, Any]]:
+        """Media-IO decode defaults that the processor of `model_type` declares.
+
+        For helpers that know the model only by its type, so they decode media
+        the way `trtllm-serve` does for it. Returns `{}` for a type with no
+        processor and for a preference that reads the checkpoint; pass the
+        loaded processor's `get_preferred_media_io_kwargs()` for those.
+        """
+        MULTIMODAL_PLACEHOLDER_REGISTRY._ensure_provider_imported(model_type)
+        processor_cls = self._input_processor_cls_by_model_type_name.get(
+            model_type)
+        if processor_cls is None or not issubclass(
+                processor_cls, BaseMultimodalInputProcessor):
+            return {}
+        try:
+            # Skip `__init__`, which loads the checkpoint: most preferences
+            # are constants.
+            return processor_cls.__new__(
+                processor_cls).get_preferred_media_io_kwargs() or {}
+        except AttributeError:
+            return {}
 
 
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
@@ -1207,6 +1238,14 @@ def register_input_processor(
             model_type,
             placeholder_metadata,
             registrant_module=model_cls.__module__)
+        # Same rule as the placeholder metadata: a built-in registration does
+        # not replace an existing one. Function-local to avoid a circular
+        # import (see `set_placeholder_metadata`).
+        from tensorrt_llm._torch.models._arch_index import is_builtin_zoo_module
+        processors_by_name = INPUT_PROCESSOR_REGISTRY._input_processor_cls_by_model_type_name
+        if (model_type not in processors_by_name
+                or not is_builtin_zoo_module(model_cls.__module__)):
+            processors_by_name[model_type] = processor_cls
 
         # Expose the registered model_type on the processor class so callers
         # can look it up without re-deriving it from the HF config.

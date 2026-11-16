@@ -104,11 +104,13 @@ def add_multimodal_args(parser):
                         type=int,
                         default=8,
                         help="The number of video frames to be sampled.")
-    parser.add_argument("--image_format",
-                        type=str,
-                        choices=["pt", "pil"],
-                        default="pt",
-                        help="The format of the image.")
+    parser.add_argument(
+        "--image_format",
+        type=str,
+        choices=["pt", "np", "pil"],
+        default=None,
+        help="The format of the decoded media. Defaults to the format the "
+        "model asks for.")
     parser.add_argument("--device",
                         type=str,
                         default="cpu",
@@ -206,6 +208,9 @@ def main():
                                      multimodal_config=multimodal_config)
 
     image_format = args.image_format
+    # Decode media in the format the model asks for, as trtllm-serve does.
+    media_io_kwargs = getattr(llm.input_processor,
+                              "get_preferred_media_io_kwargs", dict)()
     if args.model_type is not None:
         model_type = args.model_type
     else:
@@ -242,9 +247,10 @@ def main():
                     modality=args.modality,
                     prompts=[cur_prompt],
                     media=args.media,
-                    image_data_format="pt",
+                    image_data_format=image_format,
                     num_frames=8,
-                    device="cpu")
+                    device="cpu",
+                    media_io_kwargs=media_io_kwargs)
 
                 lora_request = None
                 if args.load_lora:
@@ -312,7 +318,8 @@ def main():
                                              media=args.media,
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
-                                             device=args.device)
+                                             device=args.device,
+                                             media_io_kwargs=media_io_kwargs)
     lora_request = None
     if args.load_lora:
         lora_request = model_class.lora_request(len(inputs), args.modality,

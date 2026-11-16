@@ -941,6 +941,25 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     assert processor.get_mm_max_tokens_per_item() == expected_max_tokens_per_item
 
 
+@pytest.mark.cpu_only
+def test_qwen_vl_processors_ask_for_their_frame_format() -> None:
+    """Processors that pass one `do_rescale` for images and video keep both float; Qwen3-VL keeps uint8."""
+    for processor_cls in (
+        modeling_qwen2vl.Qwen2VLInputProcessorBase,
+        modeling_qwen2vl.Qwen2_5VLInputProcessorBase,
+    ):
+        processor = processor_cls.__new__(processor_cls)
+        assert processor.get_preferred_media_io_kwargs() == {
+            "image": {"format": "pt"},
+            "video": {"format": "pt"},
+        }
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+    assert processor.get_preferred_media_io_kwargs() == {
+        "image": {"format": "np"},
+        "video": {"format": "np"},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Accuracy tests for the fused Triton bilinear position-embedding kernel used
 # by the Qwen3-VL vision tower. Mirrors vLLM's

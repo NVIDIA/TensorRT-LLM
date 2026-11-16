@@ -1207,6 +1207,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                              device=input_device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # Float frames for both modalities: `_preprocess` passes one
+        # `do_rescale` for images and videos, so both must arrive already
+        # rescaled.
+        return {"image": {"format": "pt"}, "video": {"format": "pt"}}
+
     def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")

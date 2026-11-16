@@ -839,7 +839,7 @@ def _load_video_by_cv2(
     video: Union[str, bytes],
     num_frames: int = 10,
     fps: int = 30,
-    format: str = "pt",
+    format: str = "np",
     device: str = "cpu",
     extract_audio: bool = False,
     cv2_backend: Optional[int] = None,
@@ -857,11 +857,11 @@ def _load_video_by_cv2(
     available should spill to a tempfile themselves and pass a path.
 
     `format` controls the return type:
+      `"np"`  - np.ndarray of shape (N, H, W, 3), dtype=uint8 (default); a
+                single contiguous 4D buffer that HF video processors pass
+                through without an extra frame-by-frame copy.
       `"pt"`  - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
                 [0, 1]; rescaled and permuted to CHW here.
-      `"np"`  - np.ndarray of shape (N, H, W, 3), dtype=uint8; a single
-                contiguous 4D buffer that HF video processors pass through
-                without an extra frame-by-frame copy.
       `"pil"` - list[PIL.Image], one per sampled frame.
 
     When `max_decoded_frame_bytes` or `decoded_memory_reserver` is set, the
@@ -1705,14 +1705,15 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         self,
         num_frames: int = 10,
         fps: int = 30,
-        format: str = "pt",
+        format: str = "np",
         device: str = "cpu",
         extract_audio: bool = False,
         max_decoded_frame_bytes: Optional[int] = None,
         decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
     ) -> None:
-        # `"pt"` is the safe default every video model handles; models tuned
-        # for the uint8-HWC path opt into `"np"` via
+        # uint8 `"np"` frames are a quarter of the size of float `"pt"` frames
+        # and HF video processors rescale them themselves. Models whose
+        # processors still need float frames ask for `"pt"` via
         # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")

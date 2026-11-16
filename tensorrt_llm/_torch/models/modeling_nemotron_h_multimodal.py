@@ -1160,6 +1160,11 @@ class NemotronHMultimodalInputProcessor(
             return modalities - {"audio"}
         return modalities
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # The video helpers (`_media_to_raw_chw` and the shape helpers) read
+        # CHW tensors or PIL images, not uint8 HWC arrays.
+        return {"video": {"format": "pt"}}
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -21,10 +22,24 @@ pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
 from tensorrt_llm.inputs import media_io  # noqa: E402
+from tensorrt_llm.inputs import utils as input_utils  # noqa: E402
+from tensorrt_llm.inputs.content_format import ContentFormat  # noqa: E402
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
 from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
-from tensorrt_llm.inputs.utils import async_load_video, load_base64_video, load_video  # noqa: E402
+from tensorrt_llm.inputs.registry import (  # noqa: E402
+    INPUT_PROCESSOR_REGISTRY,
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+)
+from tensorrt_llm.inputs.utils import (  # noqa: E402
+    async_build_multimodal_prompt,
+    async_load_video,
+    default_multimodal_input_loader,
+    load_base64_video,
+    load_video,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -67,6 +82,218 @@ def test_pil_format_returns_list_of_pil_images(sample_video_path: str) -> None:
     for frame in video.frames:
         assert isinstance(frame, Image.Image)
         assert frame.size == (64, 64)
+
+
+def _digest(video: VideoData) -> str:
+    """Hash the video data and sampling metadata."""
+    hasher = default_hasher()
+    video.update_hash(hasher)
+    return hasher.hexdigest()
+
+
+def test_loaders_default_to_uint8_frames_and_keep_pt(sample_video_path: str) -> None:
+    """Every video loader returns uint8 frames by default; `format="pt"` still gives float frames."""
+    defaults = [
+        VideoMediaIO(num_frames=10).load_file(sample_video_path),
+        load_video(sample_video_path, num_frames=10),
+        asyncio.run(async_load_video(sample_video_path, num_frames=10)),
+        asyncio.run(async_load_video(sample_video_path, num_frames=10, format="np")),
+    ]
+    floats = [
+        VideoMediaIO(num_frames=10, format="pt").load_file(sample_video_path),
+        load_video(sample_video_path, num_frames=10, format="pt"),
+        asyncio.run(async_load_video(sample_video_path, num_frames=10, format="pt")),
+    ]
+    expected = defaults[0]
+    for video in defaults:
+        assert isinstance(video.frames, np.ndarray)
+        assert video.frames.dtype == np.uint8
+        assert video.frames.shape == (10, 64, 64, 3)
+        np.testing.assert_array_equal(video.frames, expected.frames)
+        assert video.metadata == expected.metadata
+    for video in floats:
+        stacked = torch.stack(video.frames)
+        assert stacked.dtype == torch.float32
+        assert stacked.shape == (10, 3, 64, 64)
+        assert 0.0 <= stacked.min().item() and stacked.max().item() <= 1.0
+        # Same pixels: the float frames are the uint8 frames / 255 in CHW layout.
+        restored = (stacked.permute(0, 2, 3, 1) * 255).round().to(torch.uint8).numpy()
+        np.testing.assert_array_equal(restored, expected.frames)
+        assert video.metadata == expected.metadata
+
+
+def test_video_hash_uses_source_bytes_not_frame_format(sample_video_path: str) -> None:
+    """Loaded videos hash their source bytes; a `VideoData` built from frames hashes the frames."""
+    uint8_video = load_video(sample_video_path, num_frames=10)
+    float_video = load_video(sample_video_path, num_frames=10, format="pt")
+    assert uint8_video.raw_bytes_hash == float_video.raw_bytes_hash
+    assert _digest(uint8_video) == _digest(float_video)
+
+    built = VideoData(frames=uint8_video.frames.copy(), metadata=uint8_video.metadata)
+    same = VideoData(frames=uint8_video.frames.copy(), metadata=uint8_video.metadata)
+    changed_frames = uint8_video.frames.copy()
+    changed_frames[-1, 0, 0, 0] ^= 1
+    changed = VideoData(frames=changed_frames, metadata=uint8_video.metadata)
+    assert _digest(built) == _digest(same)
+    assert _digest(built) != _digest(changed)
+    assert _digest(built) != _digest(uint8_video)
+
+
+@pytest.mark.parametrize(
+    ("image_data_format", "media_io_kwargs", "expected_format"),
+    [
+        (None, None, "np"),
+        (None, {"video": {"format": "pt"}}, "pt"),
+        ("pt", {"video": {"format": "np"}}, "pt"),
+    ],
+    ids=["default", "model_preference", "explicit_format"],
+)
+def test_default_loader_video_format(
+    sample_video_path: str,
+    image_data_format: str | None,
+    media_io_kwargs: dict | None,
+    expected_format: str,
+) -> None:
+    """`default_multimodal_input_loader` uses an explicit format, else the given preference."""
+    model_type = "test_video_format_model"
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        model_type,
+        MultimodalPlaceholderMetadata(
+            placeholder_map={"video": "<video>"},
+            placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+            content_format=ContentFormat.PASSTHROUGH,
+        ),
+    )
+    try:
+        [inputs] = default_multimodal_input_loader(
+            tokenizer=None,
+            model_dir="unused",
+            model_type=model_type,
+            modality="video",
+            prompts=["Describe the video."],
+            media=[sample_video_path],
+            image_data_format=image_data_format,
+            num_frames=4,
+            media_io_kwargs=media_io_kwargs,
+        )
+    finally:
+        MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(model_type)
+    [video] = inputs["multi_modal_data"]["video"]
+    if expected_format == "np":
+        assert isinstance(video.frames, np.ndarray)
+        assert video.frames.shape == (4, 64, 64, 3)
+    else:
+        assert [tuple(frame.shape) for frame in video.frames] == [(3, 64, 64)] * 4
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "video_format"),
+    [
+        # Their video paths read CHW tensors or PIL images.
+        ("modeling_nemotron_h_multimodal", "NemotronHMultimodalInputProcessor", "pt"),
+        ("modeling_kimi_k25", "KimiK25InputProcessor", "pt"),
+        ("modeling_vila", "VilaInputProcessor", "pt"),
+        # Their HF processors take uint8 frames, so they use the loader default.
+        ("modeling_gemma4mm", "Gemma4InputProcessor", None),
+        ("modeling_gemma4_unified", "Gemma4UnifiedInputProcessor", None),
+        ("modeling_glm5_next_vision", "Glm5NextInputProcessor", None),
+        ("modeling_minicpmv4_6", "MiniCPMV4_6InputProcessor", None),
+    ],
+)
+def test_model_video_format_preference(
+    module_name: str, class_name: str, video_format: str | None
+) -> None:
+    """Models whose processors need float video frames ask for `"pt"`."""
+    module = importlib.import_module(f"tensorrt_llm._torch.models.{module_name}")
+    processor_cls = getattr(module, class_name)
+    # The preference does not depend on the checkpoint, so skip `__init__`.
+    preferences = processor_cls.__new__(processor_cls).get_preferred_media_io_kwargs()
+    assert preferences.get("video", {}).get("format") == video_format
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("qwen2_5_vl", {"image": {"format": "pt"}, "video": {"format": "pt"}}),
+        # Registered with the same processor as "cosmos3".
+        (
+            "cosmos3_omni",
+            {"image": {"format": "np"}, "video": {"format": "np", "num_frames": -1, "fps": -1}},
+        ),
+        ("gemma4", {}),
+        # Its preference reads the checkpoint config, so helpers use the loader defaults.
+        ("muse_spark", {}),
+        ("not_a_registered_model_type", {}),
+    ],
+)
+def test_preferred_media_io_kwargs_by_model_type(model_type: str, expected: dict) -> None:
+    assert INPUT_PROCESSOR_REGISTRY.get_preferred_media_io_kwargs(model_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_type", "media_io_kwargs", "video_format"),
+    [
+        # Declared "pt": their video paths need float frames.
+        ("qwen2_5_vl", None, "pt"),
+        ("NemotronH_Nano_VL_V2", None, "pt"),
+        # Declared "np", and nothing declared (the loader default).
+        ("qwen3_vl", None, "np"),
+        ("gemma4", None, "np"),
+        # The caller's kwargs win, as per-request kwargs do in trtllm-serve.
+        ("qwen2_5_vl", {"video": {"format": "np"}}, "np"),
+    ],
+)
+@pytest.mark.parametrize("helper", ["async_build_multimodal_prompt", "default_loader"])
+def test_prompt_helpers_follow_model_video_format(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_video_path: str,
+    helper: str,
+    model_type: str,
+    media_io_kwargs: dict | None,
+    video_format: str,
+) -> None:
+    """Helpers that name the model decode video in the format it declares."""
+
+    # Only the media path is under test: skip loading and rendering the template.
+    async def render(**kwargs) -> str:
+        return "rendered"
+
+    monkeypatch.setattr(input_utils, "async_apply_chat_template", render)
+    monkeypatch.setattr(input_utils, "apply_chat_template", lambda **kwargs: "rendered")
+    monkeypatch.setattr(input_utils, "resolve_hf_chat_template", lambda *args: None)
+    monkeypatch.setattr(input_utils, "AutoProcessor", Mock())
+    if helper == "async_build_multimodal_prompt":
+        inputs = asyncio.run(
+            async_build_multimodal_prompt(
+                model_type=model_type,
+                tokenizer=Mock(),
+                processor=None,
+                prompt="Describe the video.",
+                media=[sample_video_path],
+                modality="video",
+                media_io_kwargs=media_io_kwargs,
+            )
+        )
+    else:
+        [inputs] = default_multimodal_input_loader(
+            tokenizer=Mock(),
+            model_dir="unused",
+            model_type=model_type,
+            modality="video",
+            prompts=["Describe the video."],
+            media=[sample_video_path],
+            num_frames=4,
+            media_io_kwargs=media_io_kwargs,
+        )
+    [video] = inputs["multi_modal_data"]["video"]
+    if video_format == "np":
+        assert isinstance(video.frames, np.ndarray)
+        assert video.frames.dtype == np.uint8
+    else:
+        assert all(
+            isinstance(frame, torch.Tensor) and frame.dtype == torch.float32
+            for frame in video.frames
+        )
 
 
 def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> None:
@@ -200,13 +427,6 @@ def test_offline_loaders_match_serve_video_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The offline loaders must produce the same cache identity as serve's `VideoMediaIO`."""
-
-    def digest(video: VideoData) -> str:
-        """Hash the video data and sampling metadata."""
-        hasher = default_hasher()
-        video.update_hash(hasher)
-        return hasher.hexdigest()
-
     path = Path(sample_video_path)
     encoded = path.read_bytes()
     monkeypatch.setattr(media_io, "_MAX_RESPONSE_BYTES", len(encoded))
@@ -228,7 +448,7 @@ def test_offline_loaders_match_serve_video_hash(
     assert serve.raw_bytes_hash == default_hasher(encoded).hexdigest()
     assert offline.raw_bytes_hash == serve.raw_bytes_hash
     assert offline_async.raw_bytes_hash == serve.raw_bytes_hash
-    assert digest(offline) == digest(serve) == digest(offline_async)
+    assert _digest(offline) == _digest(serve) == _digest(offline_async)
 
 
 @pytest.mark.parametrize("file_uri", [False, True], ids=["path", "file_uri"])

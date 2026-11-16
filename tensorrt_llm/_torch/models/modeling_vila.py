@@ -956,6 +956,10 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
     def model_path(self) -> str:
         return self._model_path
 
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, str]]:
+        # `process_images` reads video frames as CHW tensors.
+        return {"video": {"format": "pt"}}
+
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self,
                     mm_data: dict[str, any],

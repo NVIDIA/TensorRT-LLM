@@ -33,7 +33,9 @@ once the pin is bumped (at which point the local shim can be removed).
 
 import copy
 import json
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import transformers
@@ -252,6 +254,34 @@ class TestTransformersGuard:
 
         monkeypatch.setattr(transformers, "__version__", version)
         mod._ensure_transformers_supports_minicpmv4_6()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("frames", "do_rescale"),
+    [
+        (np.zeros((2, 4, 4, 3), dtype=np.uint8), True),
+        ([torch.zeros(3, 4, 4)] * 2, False),
+    ],
+    ids=["uint8_stack", "float_frames"],
+)
+def test_video_token_count_accepts_stacked_uint8_frames(frames, do_rescale):
+    """The video token count takes the loader's (N, H, W, 3) uint8 stack as well as float frames."""
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6InputProcessor
+
+    calls = []
+
+    def hf_processor(**kwargs):
+        calls.append(kwargs)
+        return {"input_ids": torch.tensor([[7, 7, 1]])}
+
+    processor = MiniCPMV4_6InputProcessor.__new__(MiniCPMV4_6InputProcessor)
+    processor._processor = hf_processor
+    processor._config = SimpleNamespace(video_token_id=7)
+    processor.video_token_str = "<video>"
+
+    assert processor.get_num_tokens_per_video(video=frames) == 2
+    assert calls[0]["do_rescale"] is do_rescale
 
 
 # ---------------------------------------------------------------------------
