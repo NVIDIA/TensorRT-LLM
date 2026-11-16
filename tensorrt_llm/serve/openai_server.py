@@ -895,43 +895,48 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
-            if self._attached_frontends_stopped is not None:
-                # The engine serves the attached frontends' requests until
-                # they exit.
-                await self._attached_frontends_stopped
-            await self._perf_metrics_writer.close()
-            for task in (self._launcher_watchdog_task, self._clock_offset_task):
-                if task is not None:
-                    task.cancel()
+            try:
+                if self._attached_frontends_stopped is not None:
+                    # The engine serves the attached frontends' requests until
+                    # they exit. A drain that raises still shuts the engine
+                    # down; the launcher terminates the frontends that remain.
+                    await self._attached_frontends_stopped
+            finally:
+                await self._perf_metrics_writer.close()
+                for task in (self._launcher_watchdog_task,
+                             self._clock_offset_task):
+                    if task is not None:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                if self._launcher_forwarder is not None:
+                    await self._launcher_forwarder.close()
+                if self._tokenization_owners is not None:
+                    await asyncio.to_thread(self._tokenization_owners.close)
+                if self.encode_batcher is not None:
+                    await self.encode_batcher.shutdown()
+                    logger.info("Stopped encode dynamic batcher")
+
+                # Stop background iteration stats collector
+                if self._iteration_stats_collector_task is not None:
+                    self._iteration_stats_collector_task.cancel()
                     try:
-                        await task
+                        await self._iteration_stats_collector_task
                     except asyncio.CancelledError:
                         pass
-            if self._launcher_forwarder is not None:
-                await self._launcher_forwarder.close()
-            if self._tokenization_owners is not None:
-                await asyncio.to_thread(self._tokenization_owners.close)
-            if self.encode_batcher is not None:
-                await self.encode_batcher.shutdown()
-                logger.info("Stopped encode dynamic batcher")
+                    logger.info(
+                        "Stopped background iteration stats collector task")
 
-            # Stop background iteration stats collector
-            if self._iteration_stats_collector_task is not None:
-                self._iteration_stats_collector_task.cancel()
-                try:
-                    await self._iteration_stats_collector_task
-                except asyncio.CancelledError:
-                    pass
-                logger.info("Stopped background iteration stats collector task")
-
-            await self._deregister_server()
-            if self.resource_governor is not None:
-                self.resource_governor.close()
-            self.generator.shutdown()
-            # A stats read still in flight fails fast now that the executor is
-            # down; the /metrics handler already treats that as no stats.
-            self._metrics_stats_executor.shutdown(wait=False,
-                                                  cancel_futures=True)
+                await self._deregister_server()
+                if self.resource_governor is not None:
+                    self.resource_governor.close()
+                self.generator.shutdown()
+                # A stats read still in flight fails fast now that the executor
+                # is down; the /metrics handler already treats that as no stats.
+                self._metrics_stats_executor.shutdown(wait=False,
+                                                      cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
