@@ -473,7 +473,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
-  # LTX-2.5 tests use the model-specific Gemma4 environment documented in its example.
+  # No dedicated LTX-2.5 dependency-install job is configured. The text-encoder
+  # tests skip unless Transformers matches requirements.ltx2_5.txt (5.14.1).
   - unittest/_torch/visual_gen/test_ltx2_5_conditioning.py
   - unittest/_torch/visual_gen/test_ltx2_5_bwe.py
   - unittest/_torch/visual_gen/test_ltx2_5_registry.py

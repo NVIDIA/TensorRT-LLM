@@ -6,6 +6,8 @@ import json
 
 import pytest
 import torch
+import transformers
+from packaging.version import Version
 from safetensors.torch import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -25,7 +27,16 @@ from tensorrt_llm._torch.visual_gen.models.ltx2_5.text_encoder import (
     tokenize_gemma4,
 )
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(
+        Version(transformers.__version__) != Version("5.14.1"),
+        reason=(
+            "LTX-2.5 Gemma4 tests require transformers==5.14.1; install "
+            "examples/visual_gen/models/requirements.ltx2_5.txt in a dedicated environment"
+        ),
+    ),
+]
 
 
 def test_unknown_gemma_tensor_is_not_silently_discarded(tmp_path):
