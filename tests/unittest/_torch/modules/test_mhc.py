@@ -2428,10 +2428,10 @@ def _check_delivered_boundary(
     if (
         kernel is None
         or module._boundary_weight is None
-        or get_sm_version() not in (100, 103)
+        or get_sm_version() not in (100, 103, 107)
         or mhc_cuda._get_mega_mhc() is None
     ):
-        pytest.skip("the delivered boundaries need SM100/SM103, the CuTe DSL and mega_mhc")
+        pytest.skip("the delivered boundaries need SM100/SM103/SM107, the CuTe DSL and mega_mhc")
     norm_w = norm_w.clone()
     if not single_pass:
         # All-zero blocks, tiny ones whose scales fall below DeepGEMM's 2^-22 floor, huge ones.
@@ -2616,7 +2616,7 @@ def test_nvfp4_quantize_matches_fp4_quantize():
 @skip_pre_blackwell
 @requires_cuda
 def test_fused_hc_lagged_mega_mhc_cuda_graph_matches_eager():
-    """A captured 1024-token lagged boundary replays the eager ``mega_mhc`` result exactly."""
+    """Adjacent captured lagged boundaries match eager after input changes."""
     module_prev = _build_mhc(1024, seed=0)
     module = _build_mhc(1024, seed=2)
     residual_prev = _residual(1024, 1024, seed=1)
@@ -2635,11 +2635,19 @@ def test_fused_hc_lagged_mega_mhc_cuda_graph_matches_eager():
     capture = torch.cuda.graph(graph)
     eager = boundary()
     with capture:
-        captured = boundary()
-    graph.replay()
-    torch.cuda.synchronize()
-    for replayed, expected in zip(captured, eager):
-        assert torch.equal(replayed, expected)
+        captured_first = boundary()
+        captured_second = boundary()
+    for phase in range(3):
+        # Keep the captured addresses but change the values consumed by replay.
+        x_prev.normal_().mul_(0.25 + phase * 0.1)
+        residual_prev.normal_().mul_(0.5 + phase * 0.1)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = boundary()
+        torch.cuda.synchronize()
+        for captured in (captured_first, captured_second):
+            for replayed, expected in zip(captured, eager):
+                assert torch.equal(replayed, expected)
 
 
 @skip_pre_blackwell

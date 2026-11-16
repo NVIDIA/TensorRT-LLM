@@ -150,6 +150,10 @@ def _get_mega_mhc():
 # Streams on which ``mega_mhc`` already allocated its split barriers, so a capture there may take it.
 _MEGA_MHC_CAPTURE_STREAMS: set[int] = set()
 
+# ``mega_mhc`` keeps a split task's X1 in tensor memory (up to 10 K blocks of 64), which every split choice
+# DeepGEMM makes meets up to this hidden size.
+_MEGA_MHC_MAX_HIDDEN = 5120
+
 
 def mhc_gemm_rms_dg_cuda(
     x: torch.Tensor,
@@ -1263,14 +1267,15 @@ def mhc_fused_hc(
     explores the full tactic space regardless of ``norm_weight``.
 
     V4.1 boundaries of at least 1024 tokens (of any size with ``deterministic``) with a folded
-    RMSNorm run DeepGEMM's ``mega_mhc`` on SM100/SM103 instead: one launch with the same math.
-    Its split-K count follows the token count (DeepGEMM fits the split tasks to whole waves of
-    SMs), so a token's result can change in the last bits with its batch size; a given size
-    repeats bitwise. It allocates per-stream split barriers on its first launch, which graph capture
-    forbids, so once ``torch.cuda.graph`` has created its default capture stream, the next eager
-    launch also runs once there. A capture on another stream takes it once an eager launch ran on
-    that stream (as a pass graph's warm runs do), else keeps the backends above. The barriers
-    carry the launch's grid id, so a captured launch re-initializes them on every replay.
+    RMSNorm and a hidden size of at most 5120 run DeepGEMM's ``mega_mhc`` on SM100, SM103 and SM107
+    instead: one launch with the same math. Its split-K count follows the token count (DeepGEMM fits
+    the split tasks to whole waves of SMs), so a token's result can change in the last bits with its
+    batch size; a given size repeats bitwise. It allocates per-stream split barriers on its first
+    launch, which graph capture forbids, so once ``torch.cuda.graph`` has created its default
+    capture stream, the next eager launch also runs once there. A capture on another stream takes it
+    once an eager launch ran on that stream (as a pass graph's warm runs do), else keeps the
+    backends above. The barriers carry the launch's grid id, so a captured launch re-initializes
+    them on every replay.
 
     With ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` every boundary runs one
     fixed FMA tactic instead, whose result for a token does not depend on its batch.
@@ -1294,8 +1299,9 @@ def mhc_fused_hc(
         and norm_weight is not None
         and n == 4
         and hidden_size % 1024 == 0
+        and hidden_size <= _MEGA_MHC_MAX_HIDDEN
         and (1 if deterministic else 1024) <= residual_prev.shape[0] <= 1 << 20
-        and get_sm_version() in (100, 103)
+        and get_sm_version() in (100, 103, 107)
         and not AutoTuner.get().is_tuning_mode
         and (
             not torch.cuda.is_current_stream_capturing()
