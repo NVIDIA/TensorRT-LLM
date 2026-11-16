@@ -401,14 +401,14 @@ $$
 \text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
 $$
 
-Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
+Across requests, **average TPOT** weights each request equally, while **average ITL** averages the recorded inter-token intervals:
 
 $$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
 $$
 
 $$
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num measured inter-token intervals}}
 $$
 
 #### End-to-End (E2E) Latency
