@@ -129,16 +129,45 @@ def _assert_grids(native_processor, payload, images):
         assert torch.equal(payload["pixel_values"][index, :, :h, :w], single["pixel_values"][0])
 
 
+@pytest.mark.parametrize("form", [lambda image: image, ToTensor()], ids=["pil", "pt"])
 @pytest.mark.parametrize("name", ["merlion.png", "excel_table_test.jpg"])
-def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(native_processor, name):
-    """Nothing lossy lies between the loaded image and mistral-common's resize and normalize."""
+def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
+    native_processor, name, form, monkeypatch
+):
+    """Nothing lies between the loaded image and mistral-common's resize and normalize.
+
+    The server loads images as ``pt`` tensors; no image is serialized on the way.
+    """
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
     processor = MistralCommonImageProcessor(native_processor.tokenizer, torch.float32)
     image = Image.open(_INPUT_FILES / name).convert("RGB")
     expected = torch.as_tensor(processor.image_processor(ImageChunk(image=image)).image)
-    pixels = processor("", images=[image])["pixel_values"][0]
+    loaded = form(image)
+
+    def no_serialization(*args, **kwargs):
+        raise AssertionError("the processor serialized an image")
+
+    monkeypatch.setattr(Image.Image, "save", no_serialization)
+    processed = processor("", images=[loaded])
+    pixels = processed["pixel_values"][0]
     assert torch.equal(pixels, expected.to(pixels.dtype))
+    assert processed["image_sizes"].tolist() == [list(expected.shape[-2:])]
+
+
+@pytest.mark.parametrize(
+    "image,size",
+    [
+        (_rgb(size=(23, 37)), (37, 23)),
+        (ToTensor()(_rgb(size=(23, 37))), (37, 23)),
+        (np.zeros((23, 37, 3), dtype=np.uint8), (37, 23)),
+        (np.zeros((23, 37), dtype=np.uint8), (37, 23)),
+    ],
+    ids=["pil", "chw_tensor", "hwc_array", "hw_array"],
+)
+def test_pil_image_size_is_the_size_of_the_pil_image(image, size):
+    assert MistralCommonImageProcessor.pil_image_size(image) == size
+    assert _to_pil(image).size == size
 
 
 def test_two_different_image_sizes_preserve_each_grid(native_processor):

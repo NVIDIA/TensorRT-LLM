@@ -51,10 +51,10 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
                                             MultimodalParams)
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
@@ -354,27 +354,47 @@ class MistralCommonImageProcessor:
         return Image.fromarray(np.ascontiguousarray(array))
 
     @staticmethod
-    def image_list(images):
+    def pil_image_size(image: Any) -> Tuple[int, int]:
+        """The ``(width, height)`` of an image in any form ``to_pil_image`` takes."""
+        if isinstance(image, Image.Image):
+            return image.size
+        if isinstance(image, torch.Tensor) and image.ndim == 3:
+            return int(image.shape[2]), int(image.shape[1])
+        if isinstance(image, np.ndarray) and image.ndim in (2, 3):
+            return int(image.shape[1]), int(image.shape[0])
+        raise TypeError(
+            f"unsupported image {type(image).__name__}; expected a PIL image, "
+            "a (C, H, W) tensor or a (H, W, C) array")
+
+    @staticmethod
+    def image_list(images: Any) -> List[Any]:
+        """``images`` as a list: one image, a list or tuple of them, or none."""
         if images is None:
             return []
-        return images if isinstance(images, (list, tuple)) else [images]
+        return list(images) if isinstance(images, (list, tuple)) else [images]
 
-    def __call__(self, text, images=None, **kwargs):
+    def __call__(self,
+                 text: str,
+                 images: Optional[Sequence[Any]] = None,
+                 **kwargs: Any) -> Dict[str, torch.Tensor]:
         """Tokenize one user turn of ``text`` and its images with mistral-common.
 
         The images go where ``text`` has ``[IMG]`` markers, one per image, or
-        after the text when it has none. Images of different sizes are padded
+        after the text when it has none. mistral-common resizes and
+        normalizes each image as loaded. Images of different sizes are padded
         to one batch; ``image_sizes`` keeps each one's size.
         """
+        from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
+        from mistral_common.protocol.instruct.messages import UserMessage
+        from mistral_common.protocol.instruct.request import \
+            ChatCompletionRequest
+
         images = self.image_list(images)
-        # PNG keeps the pixels exact: mistral-common resizes and normalizes the
-        # image as decoded, so a lossy encoding would change the model input.
-        mm_items = [{
-            "type":
-            "image",
-            "base64":
-            encode_base64_image(self.to_pil_image(image), image_format="PNG")
-        } for image in images]
+        image_chunks = [
+            ImageChunk(
+                image=convert_image_mode(self.to_pil_image(image), "RGB"))
+            for image in images
+        ]
         if "[IMG]" in text:
             parts = text.split("[IMG]")
             if len(parts) != len(images) + 1:
@@ -383,20 +403,22 @@ class MistralCommonImageProcessor:
             content = []
             for index, part in enumerate(parts):
                 if part:
-                    content.append({"type": "text", "text": part})
-                if index < len(mm_items):
-                    content.append(mm_items[index])
+                    content.append(TextChunk(text=part))
+                if index < len(image_chunks):
+                    content.append(image_chunks[index])
         else:
-            content = [{"type": "text", "text": text}, *mm_items]
-        conversation = [{"role": "user", "content": content}]
-        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
-            conversation, tokenize=True, return_dict=True, return_tensors=None)
-        processed = {"input_ids": torch.tensor([encoded["input_ids"]])}
-        if "pixel_values" in encoded:
+            content = [TextChunk(text=text), *image_chunks]
+        encoded = self.tokenizer.mistral.encode_chat_completion(
+            ChatCompletionRequest(messages=[UserMessage(content=content)]))
+        processed = {"input_ids": torch.tensor([encoded.tokens])}
+        if encoded.images:
             pixel_values, image_sizes = Mistral3VLM.batch_pixel_values([
                 torch.as_tensor(image, dtype=self.dtype).unsqueeze(0)
-                for image in encoded["pixel_values"]
-            ], [torch.tensor([size]) for size in encoded["image_sizes"]])
+                for image in encoded.images
+            ], [
+                torch.tensor([list(image.shape[-2:])])
+                for image in encoded.images
+            ])
             processed.update({
                 "pixel_values": pixel_values,
                 "image_sizes": image_sizes,
