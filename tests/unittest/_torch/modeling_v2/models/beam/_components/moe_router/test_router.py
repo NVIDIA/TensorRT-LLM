@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the Beam MoE router component of block 3: bf16 / sm_103 / tp1.
 
-Configuration under test, fixed in ``_router_cases.py`` and nowhere else: 256 experts in
+Configuration under test, fixed in ``_router_cases.py``: 256 experts in
 8 groups of 32, 4 groups kept, 8 experts per token, hidden 5120; FP32 router weight and
 correction bias, BF16 already-normalized input; one sm_103 GPU; eager; generated
 parameters; seeds {17, 41} x tokens {1, 17, 129}, and the controlled fixtures there.
@@ -46,7 +46,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch.overrides import TorchFunctionMode, resolve_name
 
 import tensorrt_llm
 
@@ -266,42 +265,6 @@ def builtin_router_forbidden():
     finally:
         for name, fn in saved.items():
             setattr(builtin_beam.BeamRouter, name, fn)
-
-
-def _tensors_of(value):
-    if isinstance(value, torch.Tensor):
-        return [value]
-    if isinstance(value, (tuple, list)):
-        return [t for v in value for t in _tensors_of(v)]
-    if isinstance(value, dict):
-        return [t for v in value.values() for t in _tensors_of(v)]
-    return []
-
-
-class TorchCallTrace(TorchFunctionMode):
-    """Every torch call made inside the block, with the device and dtype of what it returned,
-    and the fp32 matmul and autocast state at each projection."""
-
-    def __init__(self):
-        super().__init__()
-        self.calls: list[dict] = []
-
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        name = resolve_name(func) or getattr(func, "__qualname__", None) or repr(func)
-        entry = {"func": name}
-        if func is torch.ops.trtllm.cublas_mm:
-            entry["math"] = {
-                "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
-                "autocast_cuda": torch.is_autocast_enabled("cuda"),
-            }
-            entry["operand_dtypes"] = [str(t.dtype) for t in _tensors_of(args)]
-        out = func(*args, **kwargs)
-        produced = _tensors_of(out)
-        if produced:
-            entry["outputs"] = [[str(t.device), str(t.dtype), list(t.shape)] for t in produced]
-        self.calls.append(entry)
-        return out
 
 
 def loaded_router(weight: torch.Tensor, bias: torch.Tensor) -> BeamMoeRouterBf16Sm103Tp1:
@@ -568,7 +531,10 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
     torch.backends.cuda.matmul.fp32_precision = "tf32"
     try:
         ambient = torch.backends.cuda.matmul.fp32_precision
-        with torch.autocast("cuda", dtype=torch.bfloat16), TorchCallTrace() as trace:
+        with (
+            torch.autocast("cuda", dtype=torch.bfloat16),
+            support.TorchCallTrace(projection=torch.ops.trtllm.cublas_mm) as trace,
+        ):
             weights, ids, route = routed(router, hidden)
         after = torch.backends.cuda.matmul.fp32_precision
     finally:
@@ -626,7 +592,7 @@ def test_matrix(seed, tokens) -> None:
 
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     with torch.profiler.profile(activities=activities) as prof:
-        with TorchCallTrace() as trace:
+        with support.TorchCallTrace(projection=torch.ops.trtllm.cublas_mm) as trace:
             previous = torch.cuda.get_sync_debug_mode()
             torch.cuda.set_sync_debug_mode("error")
             try:

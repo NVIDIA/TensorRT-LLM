@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the Beam MoE component of decoder block 3: bf16 / sm_103 / tp1.
 
-Configuration under test, fixed below and nowhere else: block 3's MoE at hidden 5120 --
+Configuration under test: block 3's MoE at hidden 5120 --
 256 experts of intermediate 2560 in 8 groups of 32, 4 groups and 8 experts per token,
 routed scaling factor 2.5; an fp32 router and bf16 experts with the source model's fp32
 steps; one sm_103 GPU; eager, one call per case on already-normalized bf16 hidden

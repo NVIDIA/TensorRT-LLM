@@ -36,8 +36,6 @@ from typing import TYPE_CHECKING, NoReturn
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
-import tensorrt_llm
-
 if TYPE_CHECKING:
     from _components.moe.moe import BeamMoeBf16Sm103Tp1
 
@@ -103,6 +101,8 @@ def ieee_fp32_session(write_evidence: Callable[[str, dict], None]) -> Iterator[d
 
 
 def git_revision() -> str | None:
+    import tensorrt_llm
+
     root = Path(tensorrt_llm.__file__).resolve().parents[1]
     try:
         out = subprocess.run(
@@ -118,6 +118,8 @@ def git_revision() -> str | None:
 
 def environment(ieee: dict, execution: Mapping[str, object], **extra: object) -> dict:
     """The device and software a case ran on; ``extra`` entries follow ``execution``."""
+    import tensorrt_llm
+
     device = torch.cuda.current_device()
     return {
         "device_name": torch.cuda.get_device_name(device),
@@ -167,12 +169,15 @@ def compare(
     rule: str | None,
     tolerance: tuple[float, float] | None,
     dtype: torch.dtype,
+    *,
+    max_unequal: float | None = None,
 ) -> dict:
     """Score one tensor against one rule; ``rule=None`` measures without judging.
 
     ``tolerance`` is the rule's ``(atol, rtol)`` from the calling test file and ``dtype``
     the dtype both tensors must have. An element passes when |actual - expected| <= atol +
     rtol * |expected|, both widened to fp64; no NaN or Inf is accepted.
+    ``max_unequal`` optionally limits the fraction of numerically unequal elements.
     """
     result = {
         "tensor": name,
@@ -215,6 +220,11 @@ def compare(
             f"{violations} of {numel} elements outside atol {atol} + rtol {rtol} * |ref| "
             f"(max abs {result['max_abs']:.3g})"
         )
+    if max_unequal is not None:
+        allowed = math.floor(max_unequal * numel)
+        result["max_unequal"] = allowed
+        if result["unequal"] > allowed:
+            problems.append(f"{result['unequal']} unequal elements, at most {allowed} allowed")
     result.update(passed=not problems, problems=problems)
     return result
 
@@ -291,6 +301,7 @@ def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Same dtype, shape and bits (so -0.0 differs from +0.0)."""
     if a.dtype != b.dtype or a.shape != b.shape:
         return False
+    b = b.to(a.device)
     view = {torch.bfloat16: torch.int16, torch.float32: torch.int32}.get(a.dtype)
     if view is None:
         return bool(torch.equal(a, b))
@@ -445,12 +456,26 @@ def no_dispatch(ops: Sequence[Callable[..., object]]) -> Iterator[None]:
             cls.__call__ = original
 
 
-class TorchCallTrace(TorchFunctionMode):
-    """The name of every torch call made inside the block and the devices of its outputs."""
+def _tensors_of(value: object) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [t for v in value for t in _tensors_of(v)]
+    if isinstance(value, dict):
+        return [t for v in value.values() for t in _tensors_of(v)]
+    return []
 
-    def __init__(self) -> None:
+
+class TorchCallTrace(TorchFunctionMode):
+    """Trace torch calls; a projection enables detailed router precision/output records."""
+
+    def __init__(
+        self, *, projection: Callable[..., object] | None = None, include_tf32: bool = False
+    ) -> None:
         super().__init__()
-        self.calls: list[tuple[str, list[str]]] = []
+        self.projection = projection
+        self.include_tf32 = include_tf32
+        self.calls: list[tuple[str, list[str]] | dict] = []
 
     def __torch_function__(
         self,
@@ -459,10 +484,28 @@ class TorchCallTrace(TorchFunctionMode):
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
+        name = resolve_name(func) or getattr(func, "__qualname__", None) or repr(func)
+        entry = {"func": name}
+        if func is self.projection:
+            entry["math"] = {
+                "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+                "autocast_cuda": torch.is_autocast_enabled("cuda"),
+            }
+            if self.include_tf32:
+                entry["math"]["cuda_matmul_allow_tf32"] = bool(
+                    torch.backends.cuda.matmul.allow_tf32
+                )
+            entry["operand_dtypes"] = [str(t.dtype) for t in _tensors_of(args)]
         out = func(*args, **(kwargs or {}))
-        outs = out if isinstance(out, (tuple, list)) else [out]
-        devices = [str(t.device) for t in outs if isinstance(t, torch.Tensor)]
-        self.calls.append((resolve_name(func) or repr(func), devices))
+        if self.projection is None:
+            outs = out if isinstance(out, (tuple, list)) else [out]
+            devices = [str(t.device) for t in outs if isinstance(t, torch.Tensor)]
+            self.calls.append((resolve_name(func) or repr(func), devices))
+        else:
+            produced = _tensors_of(out)
+            if produced:
+                entry["outputs"] = [[str(t.device), str(t.dtype), list(t.shape)] for t in produced]
+            self.calls.append(entry)
         return out
 
 

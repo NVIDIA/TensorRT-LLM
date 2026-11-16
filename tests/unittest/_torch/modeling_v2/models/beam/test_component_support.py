@@ -10,7 +10,7 @@ import torch
 __extra_import_path__ = [".", "_components/dense_block"]
 
 import _dense_block_reference as reference  # noqa: E402
-from _beam_component_support import cache_rows  # noqa: E402
+from _beam_component_support import TorchCallTrace, cache_rows, compare  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,3 +58,30 @@ def test_dense_reference_preserves_rng(seed: int) -> None:
         assert first.keys() == second.keys()
         for name in first:
             torch.testing.assert_close(first[name], second[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "unequal,fraction,passed", [(1, 0.25, True), (2, 0.25, False), (1, 0.24, False)]
+)
+def test_compare_unequal_limit(unequal: int, fraction: float, passed: bool) -> None:
+    expected = torch.zeros(4)
+    actual = expected.clone()
+    actual[:unequal] = 0.01  # Within absolute tolerance, but still unequal.
+    result = compare(
+        "fraction", actual, expected, "test", (1.0, 0.0), actual.dtype, max_unequal=fraction
+    )
+    assert result["passed"] is passed
+    assert result["violations"] == 0
+
+
+def test_projection_trace_retains_precision_and_outputs() -> None:
+    x, w = torch.ones(1, 2), torch.ones(3, 2)
+    with TorchCallTrace(projection=torch.nn.functional.linear) as trace:
+        output = torch.nn.functional.linear(x, w)
+    projection = next(call for call in trace.calls if "math" in call)
+    assert projection["math"] == {
+        "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+        "autocast_cuda": torch.is_autocast_enabled("cuda"),
+    }
+    assert projection["operand_dtypes"] == [str(x.dtype), str(w.dtype)]
+    assert projection["outputs"] == [["cpu", str(output.dtype), [1, 3]]]

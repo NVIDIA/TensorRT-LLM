@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the Beam dense block 0 component: bf16 / sm_103 / tp1.
 
-Configuration under test, fixed below and nowhere else: block 0 (sliding attention,
+Configuration under test: block 0 (sliding attention,
 dense MLP) at hidden 5120, intermediate 20480 and 48 q / 8 kv heads of 128; bf16
 weights and activations with the source model's fp32 steps; one sm_103 GPU; eager,
 batch 1, one fresh context per call; generated weights; seeds {17, 41} x lengths
@@ -36,7 +36,6 @@ Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable. No mod
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import math
 import os
@@ -225,54 +224,10 @@ _write_evidence = functools.partial(support.write_evidence, "BEAM_DENSE_BLOCK_EV
 
 
 def compare(name: str, actual: torch.Tensor, expected: torch.Tensor, rule: str | None) -> dict:
-    """Score one tensor against one rule; `rule=None` measures without judging."""
-    result = {
-        "tensor": name,
-        "rule": rule,
-        "shape": list(expected.shape),
-        "dtype": str(actual.dtype),
-    }
-    problems = []
-    if tuple(actual.shape) != tuple(expected.shape):
-        problems.append(f"shape {tuple(actual.shape)} != {tuple(expected.shape)}")
-    if actual.dtype != DTYPE or expected.dtype != DTYPE:
-        problems.append(f"dtypes {actual.dtype}/{expected.dtype}, need {DTYPE}")
-    if problems:
-        result.update(passed=False, problems=problems)
-        return result
-    a, r = actual.double(), expected.double()
-    if not bool(torch.isfinite(a).all()) or not bool(torch.isfinite(r).all()):
-        result.update(passed=False, problems=["non-finite values"])
-        return result
-    diff = (a - r).abs()
-    numel = diff.numel()
-    worst = int(diff.argmax())
-    result.update(
-        numel=numel,
-        max_abs=float(diff.max()),
-        mean_abs=float(diff.mean()),
-        worst_index=[int(i) for i in torch.unravel_index(torch.tensor(worst), diff.shape)],
-        worst_actual=float(a.reshape(-1)[worst]),
-        worst_expected=float(r.reshape(-1)[worst]),
-        unequal=int((a != r).sum()),
+    atol, rtol, max_unequal = RULES[rule] if rule is not None else (None, None, None)
+    return support.compare(
+        name, actual, expected, rule, (atol, rtol), DTYPE, max_unequal=max_unequal
     )
-    if rule is None:
-        result["passed"] = None
-        return result
-    atol, rtol, max_unequal = RULES[rule]
-    violations = int((diff > atol + rtol * r.abs()).sum())
-    result.update(atol=atol, rtol=rtol, violations=violations)
-    if violations:
-        problems.append(
-            f"{violations} of {numel} elements outside atol {atol} + rtol {rtol} * |ref|"
-        )
-    if max_unequal is not None:
-        allowed = math.floor(max_unequal * numel)
-        result["max_unequal"] = allowed
-        if result["unequal"] > allowed:
-            problems.append(f"{result['unequal']} unequal elements, at most {allowed} allowed")
-    result.update(passed=not problems, problems=problems)
-    return result
 
 
 # ----------------------------------------------------------------------------- state, inputs, fresh context
@@ -577,50 +532,27 @@ def accounting(seed: int, blk: BeamDenseBlockBf16Sm103Tp1) -> dict:
 # ----------------------------------------------------------------------------- op-path instrumentation
 
 
-@contextlib.contextmanager
 def recording(*wrappers):
-    """Log every call of these entries, in order, with the arguments that identify the path."""
-    calls: list[dict] = []
-    saved = []
-    for w in wrappers:
-        cls = type(w)
-        original = cls.__call__
-        saved.append((cls, original))
-
-        def logged(self, *args, _original=original, _name=cls.__name__, **kwargs):
-            entry = {"op": _name}
-            tensors = [a for a in args if isinstance(a, torch.Tensor)]
-            entry["shapes"] = [list(t.shape) for t in tensors]
-            for key in (
-                "num_heads",
-                "num_kv_heads",
-                "head_size",
-                "attention_window_size",
-                "max_seq_len",
-                "tokens_per_block",
-                "mask_type",
-                "is_fused_qkv",
-                "num_contexts",
-                "num_ctx_tokens",
-                "use_paged_context_fmha",
-                "position_embedding_type",
-                "local_layer_idx",
-                "quant_mode",
-            ):
-                if key in kwargs:
-                    entry[key] = kwargs[key]
-            if "q" in kwargs:
-                entry["q_shape"] = list(kwargs["q"].shape)
-                entry["qkv"] = kwargs["q"]
-            calls.append(entry)
-            return _original(self, *args, **kwargs)
-
-        cls.__call__ = logged
-    try:
-        yield calls
-    finally:
-        for cls, original in reversed(saved):
-            cls.__call__ = original
+    return support.recording(
+        *wrappers,
+        recorded_kwargs=(
+            "num_heads",
+            "num_kv_heads",
+            "head_size",
+            "attention_window_size",
+            "max_seq_len",
+            "tokens_per_block",
+            "mask_type",
+            "is_fused_qkv",
+            "num_contexts",
+            "num_ctx_tokens",
+            "use_paged_context_fmha",
+            "position_embedding_type",
+            "local_layer_idx",
+            "quant_mode",
+        ),
+        qkv=True,
+    )
 
 
 def builtin_beam_forbidden():

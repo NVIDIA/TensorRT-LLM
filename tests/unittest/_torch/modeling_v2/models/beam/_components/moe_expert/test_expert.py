@@ -32,7 +32,7 @@ import torch
 __extra_import_path__ = [".", "../..", "../../../.."]
 
 import _expert_cases as cases  # noqa: E402
-from _beam_component_support import TorchCallTrace  # noqa: E402
+from _beam_component_support import TorchCallTrace, bitwise_equal  # noqa: E402
 from _validating import validating  # noqa: E402
 
 from _components.moe_expert.expert import WEIGHT_SHAPES, BeamMoeExpertBf16Sm103Tp1  # noqa: E501
@@ -107,14 +107,6 @@ def loaded(weights: dict) -> BeamMoeExpertBf16Sm103Tp1:
     expert = BeamMoeExpertBf16Sm103Tp1(device="cuda")
     expert.load_weights(weights)
     return expert
-
-
-def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return (
-        a.dtype == b.dtype
-        and a.shape == b.shape
-        and torch.equal(a.view(torch.int16), b.view(torch.int16))
-    )
 
 
 # ----------------------------------------------------------------------------- state

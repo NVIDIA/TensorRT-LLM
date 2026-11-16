@@ -11,7 +11,7 @@ RoPE rounded once; causal GQA attention, 6 q heads per kv head, scale 1/sqrt(128
 (1/sqrt(8), sqrt(7)/sqrt(8)) after attention and (1/3, sqrt(8)/3) after the feed-forward,
 each scaled term and each sum rounded to bf16.
 
-Only torch and that MoE reference are imported. The attention core is torch's SDPA, which
+Only torch and the independent dense/MoE references are imported. The attention core is torch's SDPA, which
 the component never runs. State and input are generated on the GPU as the MoE reference
 generates its own, one seeded generator per tensor; the block's 770 ``mlp.`` tensors are
 exactly the MoE reference's state of the same seed.
@@ -25,7 +25,8 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
-__extra_import_path__ = ["../moe"]
+__extra_import_path__ = ["../moe", "../dense_block"]
+import _dense_block_reference as block_reference  # noqa: E402
 import _moe_reference as moe_reference  # noqa: E402
 
 HIDDEN = 5120
@@ -54,12 +55,7 @@ STATE_RECIPE = {
 }
 
 
-def depth_coefs(layer_idx: int, is_attention: bool) -> tuple[float, float]:
-    """(branch, stream) scales of the n-th residual add, 1 / sqrt(n) and sqrt(n - 1) /
-    sqrt(n); block i's attention add is the 2(i + 1)-th, its feed-forward add the next."""
-    num_adds = 2 * (layer_idx + 1) + (0 if is_attention else 1)
-    denom = math.sqrt(num_adds)
-    return 1.0 / denom, math.sqrt(num_adds - 1) / denom
+depth_coefs = block_reference.depth_coefs
 
 
 ATTENTION_SCALES = depth_coefs(LAYER_IDX, True)
@@ -178,10 +174,7 @@ def state_problems(state: "dict[str, torch.Tensor]", seed: int) -> list[str]:
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Over the last dim: fp32 statistics, normalization and affine, rounded once."""
-    x32 = x.float()
-    normed = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    return (normed * weight.float()).to(x.dtype)
+    return block_reference.rms_norm(x, weight, EPS)
 
 
 def rope(
@@ -206,32 +199,15 @@ def rope(
 
 
 def attention_core(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Causal windowed GQA over one fresh context: ``q [T, 48, 128]``, ``k`` and ``v``
-    ``[T, 8, 128]`` bf16, q head h reading kv head h // 6; returns ``[T, 48, 128]`` bf16."""
-    tokens = q.shape[0]
-    repeat = HEADS // KV_HEADS
-    k = k.repeat_interleave(repeat, dim=1)
-    v = v.repeat_interleave(repeat, dim=1)
-    position = torch.arange(tokens, device=q.device)
-    distance = position.unsqueeze(1) - position.unsqueeze(0)
-    keep = (distance >= 0) & (distance < WINDOW)
-    out = F.scaled_dot_product_attention(
-        q.transpose(0, 1).unsqueeze(0),
-        k.transpose(0, 1).unsqueeze(0),
-        v.transpose(0, 1).unsqueeze(0),
-        attn_mask=keep,
-        dropout_p=0.0,
-        scale=HEAD_DIM**-0.5,
-    )
-    return out.squeeze(0).transpose(0, 1)
+    """Adapt the shared reference's batched GQA to this block's single context."""
+    dims = block_reference.Dims(heads=HEADS, kv_heads=KV_HEADS, head_dim=HEAD_DIM, window=WINDOW)
+    return block_reference.attention_core(
+        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), dims
+    ).squeeze(0)
 
 
 def output_gate(core: torch.Tensor, gate: torch.Tensor, gate_bias: torch.Tensor) -> torch.Tensor:
-    """``core * sigmoid(gate + gate_bias)`` per head, ``[T, 48, 128]``: the add, the
-    sigmoid and the product each rounded to bf16."""
-    biased = (gate.float() + gate_bias.float().view(1, HEADS, 1)).to(torch.bfloat16)
-    weight = torch.sigmoid(biased.float()).to(torch.bfloat16)
-    return (core.float() * weight.float()).to(torch.bfloat16)
+    return block_reference.output_gate(core.unsqueeze(0), gate.unsqueeze(0), gate_bias).squeeze(0)
 
 
 def attention(

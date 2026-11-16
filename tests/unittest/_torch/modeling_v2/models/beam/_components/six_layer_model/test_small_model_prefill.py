@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the Beam six-block small model: bf16 / sm_103 / tp1.
 
-Configuration under test, fixed below and nowhere else: the first six logical layers of the
+Configuration under test: the first six logical layers of the
 checkpoint's schedule -- dense sliding-attention blocks 0-2, sparse sliding-attention blocks
 3-4 and the sparse full-attention block 5 without position embedding -- at hidden 5120 with
 48 q / 8 kv heads of 128, 256 experts of 2560 per sparse block, vocabulary 151936, untied

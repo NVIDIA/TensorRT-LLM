@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the Beam sparse decoder block 3 component: bf16 / sm_103 / tp1.
 
-Configuration under test, fixed below and nowhere else: block 3 of the 52-block model
+Configuration under test: block 3 of the 52-block model
 (sliding attention, MoE feed-forward) at hidden 5120 with 48 q / 8 kv heads of 128, and
 block 3's MoE: 256 experts of intermediate 2560, 8 per token from 4 of 8 groups, routed
 scaling factor 2.5; bf16 weights and activations with the source model's fp32 steps and
