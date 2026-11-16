@@ -912,6 +912,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
         use_kv_bounds: bool = False,
+        zero_empty_rows: bool = True,
         softmax_rescale_threshold_log2: float = 0.0,
         fixed_seqlen: bool = False,
         store_softmax_stats: bool = False,
@@ -1014,6 +1015,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
         self.use_kv_bounds = use_kv_bounds
+        self.zero_empty_rows = zero_empty_rows
         # Validate eagerly: the config (and its own check) is only built when
         # the kernel is traced, after plan() has bound a workspace.
         self.softmax_rescale_threshold_log2 = (
@@ -1089,6 +1091,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.seq_len_q if self.fixed_seqlen else None,
             self.mask_type,
             self.use_kv_bounds,
+            self.zero_empty_rows,
             self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
             self.query_tile_layout if self.fixed_seqlen else None,
@@ -1694,7 +1697,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
             softmax_scale_operand = softmax_scale * LOG2_E
 
-        if cutlass.const_expr(self.use_kv_bounds):
+        if cutlass.const_expr(self.use_kv_bounds and self.zero_empty_rows):
             from ..helpers.kv_bounds import initialize_empty_rows
 
             initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)

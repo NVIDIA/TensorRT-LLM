@@ -2328,6 +2328,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         "mask_type": "causal",
         "store_softmax_stats": helix,
         "use_kv_bounds": helix,
+        "zero_empty_rows": True,
     }
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
@@ -2389,7 +2390,9 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
     assert len(fmha._mla_decode_plan_profiles) == 1
     assert asdict(next(iter(fmha._mla_decode_plan_profiles))) == {
-        key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"
+        key: value
+        for key, value in plan_kwargs.items()
+        if key not in ("workspace_buffer", "zero_empty_rows")
     }
 
 

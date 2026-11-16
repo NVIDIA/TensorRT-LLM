@@ -4334,59 +4334,42 @@ class TmemSPResource(MemoryResource):
             tile_max = tile_max * tile_scale
             _tmem_sp_tile_scale[id(self)] = tile_scale
         row_max = cute.math.max(row_max, tile_max)
-        if cutlass.const_expr(causal_loop_mask):
-            seq_coord, _, _ = _resolve_work_tile_coords(
-                self.cfg, stage_info.work_tile.tile_idx
-            )
-            q_min = (
-                q_offset
-                + seq_coord * self.cfg.cta_tiler[0]
-                + self.q_half * self.cfg.q_tile_m
-            )
-            kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
-            k_max = kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
-            if q_min < k_max:
-                q_idx = (
-                    q_min
-                    + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
-                    + cute.arch.lane_idx()
+        if cutlass.const_expr(causal_loop_mask or dense_k_mask):
+            if cutlass.const_expr(causal_loop_mask):
+                seq_coord, _, _ = _resolve_work_tile_coords(
+                    self.cfg, stage_info.work_tile.tile_idx
                 )
-                # Discard the unmasked maxima when any key can be invisible.
-                masked_row_max = old_row_max
-                for chunk_idx in cutlass.range_constexpr(num_chunks):
-                    num_valid = cute.math.min(
-                        cute.math.max(
-                            q_idx - kv_base - chunk_idx * tmem_x + Int32(1),
-                            Int32(0),
-                        ),
-                        Int32(tmem_x),
-                    )
-                    mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-                    masked_values = cutlass.vector.full_like(
-                        s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
-                    )
-                    s_data[chunk_idx] = cutlass.vector.where(
-                        mask, s_data[chunk_idx], masked_values
-                    )
-                    masked_row_max = cute.math.max(
-                        masked_row_max, s_data[chunk_idx].reduce("max")
-                    )
-                row_max = masked_row_max
-        elif cutlass.const_expr(dense_k_mask):
-            if cutlass.const_expr(section == FmhaStage.Loop):
-                kv_tile_idx = stage_info.loop_offset
+                q_min = (
+                    q_offset
+                    + seq_coord * self.cfg.cta_tiler[0]
+                    + self.q_half * self.cfg.q_tile_m
+                )
+                kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
+                needs_mask = q_min < kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
             else:
-                kv_tile_idx = stage_info.loop_end
-            kv_base = kv_tile_idx * self.cfg.kv_tile_n
-            kv_end = kv_base + Int32(self.cfg.kv_tile_n)
-            if seqlen_k < kv_end:
+                if cutlass.const_expr(section == FmhaStage.Loop):
+                    kv_tile_idx = stage_info.loop_offset
+                else:
+                    kv_tile_idx = stage_info.loop_end
+                kv_base = kv_tile_idx * self.cfg.kv_tile_n
+                needs_mask = seqlen_k < kv_base + Int32(self.cfg.kv_tile_n)
+            if needs_mask:
+                if cutlass.const_expr(causal_loop_mask):
+                    right_bound = (
+                        q_min
+                        + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
+                        + cute.arch.lane_idx()
+                        + Int32(1)
+                    )
+                else:
+                    right_bound = seqlen_k
                 # Invalid lanes can contain another request's scores or TMA
                 # padding. Neither may contribute to the maximum or softmax.
                 masked_row_max = old_row_max
                 for chunk_idx in cutlass.range_constexpr(num_chunks):
                     chunk_base = kv_base + Int32(chunk_idx * tmem_x)
                     valid_in_chunk = cute.math.min(
-                        cute.math.max(seqlen_k - chunk_base, Int32(0)),
+                        cute.math.max(right_bound - chunk_base, Int32(0)),
                         Int32(tmem_x),
                     )
                     mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])

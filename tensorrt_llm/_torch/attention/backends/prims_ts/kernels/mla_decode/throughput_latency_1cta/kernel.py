@@ -1794,6 +1794,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
         use_kv_bounds: bool = False,
+        zero_empty_rows: bool = True,
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
@@ -1836,6 +1837,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
         self.use_kv_bounds = use_kv_bounds
+        self.zero_empty_rows = zero_empty_rows
         self.sparse_profile = sparse_profile
         self.kv_cache_format = kv_cache_format
         self.extra_kv_cache_format = extra_kv_cache_format
@@ -1988,6 +1990,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.lse_dtype,
             self.runtime_split_kv,
             self.store_softmax_stats,
+            self.zero_empty_rows,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
@@ -2513,7 +2516,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
             softmax_scale_operand = softmax_scale * LOG2_E
 
-        if cutlass.const_expr(self.use_kv_bounds):
+        if cutlass.const_expr(self.use_kv_bounds and self.zero_empty_rows):
             from ..helpers.kv_bounds import initialize_empty_rows
 
             initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)

@@ -1075,7 +1075,7 @@ class PrimsTSFmha(PhasedFmha):
             store_softmax_stats=store_softmax_stats,
             use_kv_bounds=use_kv_bounds,
         )
-        wrapper.plan(**plan_kwargs, workspace_buffer=workspace_buffer)
+        wrapper.plan(**plan_kwargs, workspace_buffer=workspace_buffer, zero_empty_rows=True)
         self._mla_decode_plan_profiles.add(_MlaDecodePlan(**plan_kwargs))
         self._mla_decode_wrappers[key] = wrapper
         return wrapper

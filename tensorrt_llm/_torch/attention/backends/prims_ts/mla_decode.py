@@ -116,6 +116,7 @@ class _MLADecodeCompileSpec:
     scale_types: tuple[bool, bool, bool] = (False, False, False)
     store_softmax_stats: bool = False
     use_kv_bounds: bool = False
+    zero_empty_rows: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,7 @@ class _MLADecodePlanState:
     output_scale: GlobalScale = 1.0
     store_softmax_stats: bool = False
     use_kv_bounds: bool = False
+    zero_empty_rows: bool = True
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1249,7 @@ def _make_mla_decode_compile_spec(
     scale_types: tuple[bool, bool, bool] = (False, False, False),
     store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
+    zero_empty_rows: bool = True,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1255,6 +1258,7 @@ def _make_mla_decode_compile_spec(
     kernel.runtime_kv_lengths = runtime_kv_lengths
     kernel.store_softmax_stats = store_softmax_stats
     kernel.use_kv_bounds = use_kv_bounds
+    kernel.zero_empty_rows = use_kv_bounds and zero_empty_rows
     return _MLADecodeCompileSpec(
         device_index=device_index,
         kernel_signature=_mla_kernel_compile_signature(kernel),
@@ -1276,6 +1280,7 @@ def _make_mla_decode_compile_spec(
         scale_types=scale_types,
         store_softmax_stats=store_softmax_stats,
         use_kv_bounds=use_kv_bounds,
+        zero_empty_rows=kernel.zero_empty_rows,
     )
 
 
@@ -1848,6 +1853,7 @@ class BatchMLADecodePagedTSWrapper:
         lse_mode: Literal["none", "base2"] = "none",
         store_softmax_stats: bool = False,
         use_kv_bounds: bool = False,
+        zero_empty_rows: bool = True,
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
         tuning: Optional[MLAAttentionTuning] = None,
@@ -1911,6 +1917,13 @@ class BatchMLADecodePagedTSWrapper:
             Compile per-query prefix masking. Every run must supply ``kv_bounds``;
             these graph-live counts replace dense/causal visibility and may be zero.
             The planned K/V capacity remains positive. Defaults to ``False``.
+        zero_empty_rows : bool
+            Initialize zero-bound rows to zero output, negative-infinity LSE,
+            and (-inf, 0) statistics when those outputs are enabled. Defaults
+            to ``True``; ignored without ``use_kv_bounds``. ``False`` omits the
+            initialization launch but keeps prefix masking. Empty-row results
+            are then unspecified: initialize them or exclude them from merging.
+            This selects the compiled launch program, not workspace size.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -1955,6 +1968,8 @@ class BatchMLADecodePagedTSWrapper:
             raise TypeError("store_softmax_stats must be a bool")
         if not isinstance(use_kv_bounds, bool):
             raise TypeError("use_kv_bounds must be a bool")
+        if not isinstance(zero_empty_rows, bool):
+            raise TypeError("zero_empty_rows must be a bool")
         if validate:
             if not isinstance(packed_query, bool):
                 raise TypeError("packed_query must be a bool")
@@ -2029,6 +2044,7 @@ class BatchMLADecodePagedTSWrapper:
             scale_types=(*scale_types(softmax_scale, output_scale), False),
             store_softmax_stats=store_softmax_stats,
             use_kv_bounds=use_kv_bounds,
+            zero_empty_rows=zero_empty_rows,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -2080,6 +2096,7 @@ class BatchMLADecodePagedTSWrapper:
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             store_softmax_stats=store_softmax_stats,
             use_kv_bounds=use_kv_bounds,
+            zero_empty_rows=zero_empty_rows,
         )
 
     @flashinfer_experimental_api
@@ -2126,7 +2143,9 @@ class BatchMLADecodePagedTSWrapper:
         [total_q] for packed Q. Counts are shared by heads, nondecreasing within
         each request, and in [0, seq_lens_kv[b]]. They replace mask_type visibility;
         zero prefixes write zero O, negative-infinity LSE when enabled, and (-inf,0)
-        merge statistics when enabled. Zero local K/V lengths are supported in this
+        merge statistics when enabled, unless zero_empty_rows=False was planned.
+        That opt-out leaves empty-row results unspecified, not preserved.
+        Zero local K/V lengths are supported in this
         mode. With validate=False the caller must preserve these value constraints;
         only presence is checked, without a device readback.
 
@@ -2247,6 +2266,7 @@ def batch_mla_decode_with_paged_kv_cache(
     workspace_buffer: Optional[torch.Tensor] = None,
     store_softmax_stats: bool = False,
     kv_bounds: Optional[torch.Tensor] = None,
+    zero_empty_rows: bool = True,
     softmax_stats: Optional[torch.Tensor] = None,
     validate: bool = True,
     tuning: Optional[MLAAttentionTuning] = None,
@@ -2287,6 +2307,10 @@ def batch_mla_decode_with_paged_kv_cache(
         Per-query int32 prefix counts; see :meth:`BatchMLADecodePagedTSWrapper.run`.
         Supplying them enables bounded mode. If all local K/V lengths are zero,
         an omitted static ``max_kv_len`` defaults to one.
+    zero_empty_rows : bool
+        Initialize bounded empty rows to neutral output/LSE/statistics by default.
+        ``False`` omits this launch and leaves empty-row results unspecified.
+        Ignored without ``kv_bounds``; does not change workspace size.
     softmax_scale, output_scale : float or torch.Tensor
         QK and value/output scaling factors.
     out : torch.Tensor, optional
@@ -2425,6 +2449,7 @@ def batch_mla_decode_with_paged_kv_cache(
         workspace_buffer=workspace_buffer,
         store_softmax_stats=store_softmax_stats,
         use_kv_bounds=kv_bounds is not None,
+        zero_empty_rows=zero_empty_rows,
         validate=validate,
         tuning=tuning,
         lse_mode=validate_lse_mode(lse_mode)
