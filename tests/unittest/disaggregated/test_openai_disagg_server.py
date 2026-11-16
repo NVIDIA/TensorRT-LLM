@@ -23,6 +23,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import Headers
+from test_common.serve.app_factory import DisaggConfig, ServeTestEnv, isolated_serve_env
 
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole, extract_disagg_cfg
@@ -532,7 +533,9 @@ class _WorkersRetryingContext(_Workers):
         return await super().send_context_request(request, server, hooks, req_id)
 
 
-def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
+def _messages_server(
+    env: ServeTestEnv, schedule_style: str, workers: _Workers
+) -> OpenAIDisaggServer:
     """A disaggregated server in front of ``workers``."""
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
     service = OpenAIDisaggregatedService(
@@ -546,7 +549,7 @@ def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServ
     service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
     service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
 
-    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server = env.build_disagg_server(DisaggConfig())
     server._config = config
     server._service = service
     server._perf_metrics_collector = Mock()
@@ -555,9 +558,9 @@ def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServ
     return server
 
 
-def _messages_app(schedule_style: str, workers: _Workers) -> FastAPI:
+def _messages_app(env: ServeTestEnv, schedule_style: str, workers: _Workers) -> FastAPI:
     """The /v1/messages route of a disaggregated server in front of ``workers``."""
-    server = _messages_server(schedule_style, workers)
+    server = _messages_server(env, schedule_style, workers)
     app = FastAPI()
     app.add_middleware(ServerArrivalTimeMiddleware)
     app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
@@ -650,7 +653,7 @@ def _waits_for(event: asyncio.Event):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_messages_stream_starts_and_pings_while_the_context_phase_runs(
-    monkeypatch, schedule_style
+    monkeypatch, schedule_style, tmp_path
 ):
     _short_waits(monkeypatch)
     pinged = asyncio.Event()
@@ -663,46 +666,48 @@ async def test_messages_stream_starts_and_pings_while_the_context_phase_runs(
         elif message.get("body", b"").startswith(b"event: ping\n"):
             pinged.set()
 
-    sent = await _post_messages(_messages_app(schedule_style, workers), on_send=on_send)
+    with isolated_serve_env(tmp_path) as env:
+        sent = await _post_messages(_messages_app(env, schedule_style, workers), on_send=on_send)
 
-    assert _status(sent) == 200
-    assert started_during_context_phase == [True]
-    events = [event for event, _ in _sse_events(sent)]
-    message_start = events.index("message_start")
-    assert message_start > 0
-    assert set(events[:message_start]) == {"ping"}
-    assert [event for event in events[message_start:] if event != "ping"] == _MESSAGE_EVENTS
-    delta = {
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "text_delta", "text": "hello"},
-    }
-    assert ("content_block_delta", delta) in _sse_events(sent)
+        assert _status(sent) == 200
+        assert started_during_context_phase == [True]
+        events = [event for event, _ in _sse_events(sent)]
+        message_start = events.index("message_start")
+        assert message_start > 0
+        assert set(events[:message_start]) == {"ping"}
+        assert [event for event in events[message_start:] if event != "ping"] == _MESSAGE_EVENTS
+        delta = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hello"},
+        }
+        assert ("content_block_delta", delta) in _sse_events(sent)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_messages_stream_after_a_fast_context_phase_is_the_reframed_generation(
-    schedule_style,
+    schedule_style, tmp_path
 ):
     async def context_phase():
         pass
 
-    sent = await _post_messages(_messages_app(schedule_style, _Workers(context_phase)))
+    with isolated_serve_env(tmp_path) as env:
+        sent = await _post_messages(_messages_app(env, schedule_style, _Workers(context_phase)))
 
-    async def generation():
-        for frame in _generation_frames():
-            yield frame
+        async def generation():
+            for frame in _generation_frames():
+                yield frame
 
-    reframed = anthropic_adapter.reframe_openai_stream(generation(), model=_MODEL)
-    expected = "".join([frame async for frame in reframed])
+        reframed = anthropic_adapter.reframe_openai_stream(generation(), model=_MODEL)
+        expected = "".join([frame async for frame in reframed])
 
-    def without_message_id(text):
-        return re.sub(r'"id":"msg_[0-9a-f_]+"', '"id":"msg"', text)
+        def without_message_id(text):
+            return re.sub(r'"id":"msg_[0-9a-f_]+"', '"id":"msg"', text)
 
-    assert _status(sent) == 200
-    assert "event: ping" not in _body(sent)
-    assert without_message_id(_body(sent)) == without_message_id(expected)
+        assert _status(sent) == 200
+        assert "event: ping" not in _body(sent)
+        assert without_message_id(_body(sent)) == without_message_id(expected)
 
 
 @pytest.mark.asyncio
@@ -710,7 +715,7 @@ async def test_messages_stream_after_a_fast_context_phase_is_the_reframed_genera
 @pytest.mark.parametrize("starts_early", [True, False], ids=["early_start", "fast_context"])
 @pytest.mark.parametrize("context_retried", [False, True], ids=["once", "ctx_retried"])
 async def test_messages_stream_is_named_after_the_disagg_request(
-    monkeypatch, schedule_style, starts_early, context_retried
+    monkeypatch, schedule_style, starts_early, context_retried, tmp_path
 ):
     """message_start carries the disaggregated request id the context phase ended with.
 
@@ -733,16 +738,19 @@ async def test_messages_stream_is_named_after_the_disagg_request(
         if message.get("body", b"").startswith(b"event: ping\n"):
             pinged.set()
 
-    sent = await _post_messages(_messages_app(schedule_style, workers), on_send=on_send)
+    with isolated_serve_env(tmp_path) as env:
+        sent = await _post_messages(_messages_app(env, schedule_style, workers), on_send=on_send)
 
-    assert _status(sent) == 200
-    events = _sse_events(sent)
-    assert (events[0][0] == "ping") == starts_early
-    message_id = next(data["message"]["id"] for event, data in events if event == "message_start")
-    (disagg_request_id,) = workers.context_request_ids
-    if context_retried:
-        assert workers.first_attempt_ids != [disagg_request_id]
-    assert re.fullmatch(rf"msg_{disagg_request_id}_[0-9a-f]{{16}}", message_id)
+        assert _status(sent) == 200
+        events = _sse_events(sent)
+        assert (events[0][0] == "ping") == starts_early
+        message_id = next(
+            data["message"]["id"] for event, data in events if event == "message_start"
+        )
+        (disagg_request_id,) = workers.context_request_ids
+        if context_retried:
+            assert workers.first_attempt_ids != [disagg_request_id]
+        assert re.fullmatch(rf"msg_{disagg_request_id}_[0-9a-f]{{16}}", message_id)
 
 
 @pytest.mark.asyncio
@@ -755,23 +763,25 @@ async def test_messages_stream_is_named_after_the_disagg_request(
     ],
 )
 async def test_messages_stream_with_a_fast_context_failure_is_an_http_error(
-    schedule_style, status, worker_message, error_type
+    schedule_style, status, worker_message, error_type, tmp_path
 ):
     async def context_phase():
         raise _worker_rejection(status, worker_message)
 
-    streamed = await _post_messages(_messages_app(schedule_style, _Workers(context_phase)))
-    not_streamed = await _post_messages(
-        _messages_app(schedule_style, _Workers(context_phase)), stream=False
-    )
+    with isolated_serve_env(tmp_path / "streamed") as env:
+        streamed = await _post_messages(_messages_app(env, schedule_style, _Workers(context_phase)))
+    with isolated_serve_env(tmp_path / "nonstreamed") as env:
+        not_streamed = await _post_messages(
+            _messages_app(env, schedule_style, _Workers(context_phase)), stream=False
+        )
 
-    assert _status(streamed) == status
-    error = json.loads(_body(streamed))
-    assert error["type"] == "error"
-    assert error["error"]["type"] == error_type
-    # The error response of the same failure without a stream.
-    assert _status(not_streamed) == status
-    assert error == json.loads(_body(not_streamed))
+        assert _status(streamed) == status
+        error = json.loads(_body(streamed))
+        assert error["type"] == "error"
+        assert error["error"]["type"] == error_type
+        # The error response of the same failure without a stream.
+        assert _status(not_streamed) == status
+        assert error == json.loads(_body(not_streamed))
 
 
 @pytest.mark.asyncio
@@ -784,7 +794,7 @@ async def test_messages_stream_with_a_fast_context_failure_is_an_http_error(
     ],
 )
 async def test_messages_stream_with_a_late_context_failure_ends_with_an_error_event(
-    monkeypatch, schedule_style, status, worker_message
+    monkeypatch, schedule_style, status, worker_message, tmp_path
 ):
     _short_waits(monkeypatch)
     pinged = asyncio.Event()
@@ -798,33 +808,35 @@ async def test_messages_stream_with_a_late_context_failure_ends_with_an_error_ev
         if message.get("body", b"").startswith(b"event: ping\n"):
             pinged.set()
 
-    streamed = await _post_messages(
-        _messages_app(schedule_style, _Workers(context_phase)), on_send=on_send
-    )
+    with isolated_serve_env(tmp_path / "streamed") as env:
+        streamed = await _post_messages(
+            _messages_app(env, schedule_style, _Workers(context_phase)), on_send=on_send
+        )
     pinged.set()
-    not_streamed = await _post_messages(
-        _messages_app(schedule_style, _Workers(context_phase)), stream=False
-    )
+    with isolated_serve_env(tmp_path / "nonstreamed") as env:
+        not_streamed = await _post_messages(
+            _messages_app(env, schedule_style, _Workers(context_phase)), stream=False
+        )
 
-    assert _status(streamed) == 200
-    events = _sse_events(streamed)
-    assert {event for event, _ in events[:-1]} == {"ping"}
-    assert events[-1][0] == "error"
-    # An error event as the stream reports any failure, with the message of
-    # the error response of the same failure without a stream.
-    assert events[-1][1] == {
-        "type": "error",
-        "error": {
-            "type": "api_error",
-            "message": json.loads(_body(not_streamed))["error"]["message"],
-        },
-    }
+        assert _status(streamed) == 200
+        events = _sse_events(streamed)
+        assert {event for event, _ in events[:-1]} == {"ping"}
+        assert events[-1][0] == "error"
+        # An error event as the stream reports any failure, with the message of
+        # the error response of the same failure without a stream.
+        assert events[-1][1] == {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": json.loads(_body(not_streamed))["error"]["message"],
+            },
+        }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_client_leaving_after_the_response_starts_cancels_the_context_phase(
-    monkeypatch, schedule_style
+    monkeypatch, schedule_style, tmp_path
 ) -> None:
     _short_waits(monkeypatch)
     workers = _Workers(_waits_for(asyncio.Event()))
@@ -834,15 +846,18 @@ async def test_client_leaving_after_the_response_starts_cancels_the_context_phas
         if message["type"] == "http.response.start":
             left.set()
 
-    await _post_messages(_messages_app(schedule_style, workers), on_send=on_send, leave=left)
+    with isolated_serve_env(tmp_path) as env:
+        await _post_messages(
+            _messages_app(env, schedule_style, workers), on_send=on_send, leave=left
+        )
 
-    await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_cancelling_the_messages_handler_during_its_wait_cancels_the_context_phase(
-    monkeypatch, schedule_style
+    monkeypatch, schedule_style, tmp_path
 ) -> None:
     monkeypatch.setattr(openai_disagg_server, "_MESSAGES_STREAM_START_WAIT_S", 60)
     context_started = asyncio.Event()
@@ -853,36 +868,37 @@ async def test_cancelling_the_messages_handler_during_its_wait_cancels_the_conte
         await release_context.wait()
 
     workers = _Workers(context_phase)
-    server = _messages_server(schedule_style, workers)
-    request = AnthropicMessagesRequest(
-        model=_MODEL,
-        max_tokens=16,
-        stream=True,
-        messages=[{"role": "user", "content": "hi"}],
-    )
-    raw_request = Request({"type": "http", "headers": []})
-    raw_request.state.server_arrival_time = 0
-    handler = asyncio.create_task(server.anthropic_messages(request, raw_request))
-    try:
-        await asyncio.wait_for(context_started.wait(), 2)
-        assert not handler.done()
-        handler.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await handler
-        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
-        assert not workers.context_done.is_set()
-    finally:
-        release_context.set()
-        handler.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await handler
+    with isolated_serve_env(tmp_path) as env:
+        server = _messages_server(env, schedule_style, workers)
+        request = AnthropicMessagesRequest(
+            model=_MODEL,
+            max_tokens=16,
+            stream=True,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raw_request = Request({"type": "http", "headers": []})
+        raw_request.state.server_arrival_time = 0
+        handler = asyncio.create_task(server.anthropic_messages(request, raw_request))
+        try:
+            await asyncio.wait_for(context_started.wait(), 2)
+            assert not handler.done()
+            handler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await handler
+            await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+            assert not workers.context_done.is_set()
+        finally:
+            release_context.set()
+            handler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 @pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
 async def test_disconnect_before_the_messages_body_starts_cancels_context(
-    monkeypatch, schedule_style, asgi_version
+    monkeypatch, schedule_style, asgi_version, tmp_path
 ) -> None:
     """Response cleanup must run even if the streaming iterator never starts."""
     from starlette.requests import ClientDisconnect
@@ -890,51 +906,52 @@ async def test_disconnect_before_the_messages_body_starts_cancels_context(
     _short_waits(monkeypatch)
     release_context = asyncio.Event()
     workers = _Workers(_waits_for(release_context))
-    server = _messages_server(schedule_style, workers)
-    request = AnthropicMessagesRequest(
-        model=_MODEL,
-        max_tokens=16,
-        stream=True,
-        messages=[{"role": "user", "content": "hi"}],
-    )
-    raw_request = Request({"type": "http", "headers": []})
-    raw_request.state.server_arrival_time = 0
-    response = await server.anthropic_messages(request, raw_request)
-    response_started = asyncio.Event()
-    sent = []
+    with isolated_serve_env(tmp_path) as env:
+        server = _messages_server(env, schedule_style, workers)
+        request = AnthropicMessagesRequest(
+            model=_MODEL,
+            max_tokens=16,
+            stream=True,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raw_request = Request({"type": "http", "headers": []})
+        raw_request.state.server_arrival_time = 0
+        response = await server.anthropic_messages(request, raw_request)
+        response_started = asyncio.Event()
+        sent = []
 
-    async def send(message):
-        sent.append(message)
-        response_started.set()
-        if asgi_version == "2.4":
-            raise OSError("client disconnected")
-        await asyncio.Event().wait()
+        async def send(message):
+            sent.append(message)
+            response_started.set()
+            if asgi_version == "2.4":
+                raise OSError("client disconnected")
+            await asyncio.Event().wait()
 
-    async def receive():
-        await response_started.wait()
-        return {"type": "http.disconnect"}
+        async def receive():
+            await response_started.wait()
+            return {"type": "http.disconnect"}
 
-    try:
-        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
-        if asgi_version == "2.4":
-            with pytest.raises(ClientDisconnect):
+        try:
+            scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
+            if asgi_version == "2.4":
+                with pytest.raises(ClientDisconnect):
+                    await response(scope, receive, send)
+            else:
                 await response(scope, receive, send)
-        else:
-            await response(scope, receive, send)
-        assert [message["type"] for message in sent] == ["http.response.start"]
-        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
-        if schedule_style == "generation_first":
-            await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
-        assert not workers.context_done.is_set()
-    finally:
-        release_context.set()
+            assert [message["type"] for message in sent] == ["http.response.start"]
+            await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+            if schedule_style == "generation_first":
+                await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
+            assert not workers.context_done.is_set()
+        finally:
+            release_context.set()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 @pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
 async def test_disconnect_before_the_messages_body_starts_closes_the_stream_it_answered_with(
-    monkeypatch, schedule_style, asgi_version
+    monkeypatch, schedule_style, asgi_version, tmp_path
 ) -> None:
     """The pipeline answers with a stream after the response is returned, which no body reads."""
     from starlette.requests import ClientDisconnect
@@ -942,42 +959,43 @@ async def test_disconnect_before_the_messages_body_starts_closes_the_stream_it_a
     _short_waits(monkeypatch)
     release_context = asyncio.Event()
     workers = _WorkersStillGenerating(_waits_for(release_context))
-    server = _messages_server(schedule_style, workers)
-    request = AnthropicMessagesRequest(
-        model=_MODEL,
-        max_tokens=16,
-        stream=True,
-        messages=[{"role": "user", "content": "hi"}],
-    )
-    raw_request = Request({"type": "http", "headers": []})
-    raw_request.state.server_arrival_time = 0
-    response = await asyncio.wait_for(server.anthropic_messages(request, raw_request), 2)
-    chat = response._chat
-    answered = asyncio.Event()
-    sent = []
+    with isolated_serve_env(tmp_path) as env:
+        server = _messages_server(env, schedule_style, workers)
+        request = AnthropicMessagesRequest(
+            model=_MODEL,
+            max_tokens=16,
+            stream=True,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raw_request = Request({"type": "http", "headers": []})
+        raw_request.state.server_arrival_time = 0
+        response = await asyncio.wait_for(server.anthropic_messages(request, raw_request), 2)
+        chat = response._chat
+        answered = asyncio.Event()
+        sent = []
 
-    async def send(message):
-        sent.append(message)
-        # The pipeline answers while the response starts, before the body does.
-        release_context.set()
-        await asyncio.wait((chat,), timeout=2)
-        answered.set()
+        async def send(message):
+            sent.append(message)
+            # The pipeline answers while the response starts, before the body does.
+            release_context.set()
+            await asyncio.wait((chat,), timeout=2)
+            answered.set()
+            if asgi_version == "2.4":
+                raise OSError("client disconnected")
+            await asyncio.Event().wait()
+
+        async def receive():
+            await answered.wait()
+            return {"type": "http.disconnect"}
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
         if asgi_version == "2.4":
-            raise OSError("client disconnected")
-        await asyncio.Event().wait()
-
-    async def receive():
-        await answered.wait()
-        return {"type": "http.disconnect"}
-
-    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
-    if asgi_version == "2.4":
-        with pytest.raises(ClientDisconnect):
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+        else:
             await response(scope, receive, send)
-    else:
-        await response(scope, receive, send)
 
-    assert [message["type"] for message in sent] == ["http.response.start"]
-    assert isinstance(chat.result(), StreamingResponse)
-    # Closed by the time the response is done, while the generation worker goes on.
-    assert workers.generation_closed.is_set()
+        assert [message["type"] for message in sent] == ["http.response.start"]
+        assert isinstance(chat.result(), StreamingResponse)
+        # Closed by the time the response is done, while the generation worker goes on.
+        assert workers.generation_closed.is_set()
