@@ -38,6 +38,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `Lightricks/LTX-2.5` | IC-LoRA Video-to-Video (with Audio) |
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
@@ -69,6 +70,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
+| **LTX-2.5** | Yes | Yes | No | No | No | No | No | No | No | No | No | Not validated | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
@@ -83,6 +85,11 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 \*\* SeaCache on Cosmos3: single-GPU base (non-distilled) checkpoints, multi-frame video generation without audio, action or transfer controls; see [SeaCache](#seacache).
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
+
+LTX-2.5 entries describe the single-GPU IC-LoRA workflow. Quantization support is
+functional support; see the [LTX-2.5 notes](#ltx-25-notes) and model-specific
+documentation for generated-media quality measurements. Its `trtllm-serve` path
+has not been validated; use the standalone Python example.
 
 ## Quick Start
 
@@ -169,6 +176,36 @@ params.image_reference = [
 FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
+
+(ltx-25-notes)=
+## LTX-2.5 Notes
+
+LTX-2.5 supports IC-LoRA video-to-video generation with audio on one GPU, using
+BF16, FP8_BLOCK_SCALES or NVFP4. All three modes load the distilled BF16
+transformer checkpoint and the matching LTX-tuned Gemma4-with-projection,
+convolutional video VAE, audio VAE/vocoder, x2 latent upsampler and IC-LoRA adapter.
+Use a dedicated Gemma4-compatible environment; see the
+[setup and validation guide](../../../examples/visual_gen/models/README.ltx2_5.md).
+
+Stage 1 runs eight Euler steps at half resolution with IC-LoRA and clean reference
+tokens. After x2 latent upsampling, Stage 2 runs three steps at full resolution
+with pristine base weights and no reference tokens. Audio is generated in both
+stages. Provide the SDR control through `VisualGenParams.video_reference` and set
+the adapter through `pipeline_config.iclora_path`. Use `8n+1` frames and dimensions
+aligned to `64 * reference_downscale_factor` (128 for the supplied ref0.5 adapter).
+
+Run the [standalone example](../../../examples/visual_gen/models/ltx2_5.py) with the
+[BF16](../../../examples/visual_gen/configs/ltx2_5-iclora-bf16-1gpu.yaml),
+[FP8_BLOCK_SCALES](../../../examples/visual_gen/configs/ltx2_5-iclora-fp8-experimental-1gpu.yaml),
+[NVFP4](../../../examples/visual_gen/configs/ltx2_5-iclora-nvfp4-vanilla-experimental-1gpu.yaml)
+or [NVFP4 video attention](../../../examples/visual_gen/configs/ltx2_5-iclora-nvfp4-attention-experimental-1gpu.yaml)
+configuration. This workflow uses eager execution with caching, CUDA Graph and
+`torch.compile` disabled. Temporal/spatial VAE tiling is supported on one GPU;
+parallel VAE decoding is not enabled for this workflow.
+
+Public audio retains its raw generated length and amplitude. MP4 saving pads only
+the encoding copy; use the original audio for scoring. See the model-specific
+guide for measured video/audio quality and validated shapes.
 
 ## MiniMax-H3 Notes
 
