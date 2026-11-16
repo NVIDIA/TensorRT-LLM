@@ -338,6 +338,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             return None
         return self._dummy_request_mask_buffer.tensor
 
+    def get_replay_dummy_request_mask(self) -> Optional[torch.Tensor]:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        Replay kernels skip dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.enable_block_reuse:
