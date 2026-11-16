@@ -123,8 +123,7 @@ class OpWrapper(ABC):
 
     What that keeps true: what an entry computes is a pure function of its
     arguments, so `CELLS` covers the entry's whole input space, and `reference`
-    and `is_valid` mirror `__call__` directly. A gate in the claims suite
-    enforces that `__call__` reads no attribute of `self`.
+    and `is_valid` mirror `__call__` directly.
 
     Instances carry no state, so one module-level instance per entry is the
     normal way to reach it; a target may also construct its own.

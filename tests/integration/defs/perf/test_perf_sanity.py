@@ -18,6 +18,7 @@ import copy
 import fcntl
 import glob
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
+from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
@@ -269,19 +271,20 @@ PERF_METRIC_LOG_QUERIES = {
     "token_throughput": re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "total_token_throughput": re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "user_throughput": re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
-    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
-    "median_itl": re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
-    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
-    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_itl": re.compile(r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     "mean_e2el": re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
 
 # Spec-decoding-only metrics: parsed from benchmark output but only stored
 # (and regression-checked) when the test runs with speculative decoding.
@@ -962,7 +965,8 @@ def add_perf_metric_value(
 ) -> None:
     """Populate `new_data` with per-test perf metrics from `metrics`.
 
-    - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
+    - Copies available values in PERF_METRIC_LOG_QUERIES as `d_<name>`;
+      explicit N/A measurements are omitted from upload and comparison.
     - Adds `d_al` only when spec_decoding=True *and* the value was parsed;
       non-spec rows omit it so OpenSearch baselines don't blend the two
       populations, and spec rows exempted from reporting it (AgentX) omit it
@@ -985,7 +989,9 @@ def add_perf_metric_value(
     whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
-        new_data[f"d_{metric_name}"] = metrics[metric_name]
+        value = metrics[metric_name]
+        if value is not None:
+            new_data[f"d_{metric_name}"] = value
     if spec_decoding:
         # 'al' is legitimately absent for AgentX lanes: aiperf does not propagate
         # TRT-LLM's non-standard avg_decoded_tokens_per_iter field. Omit the
@@ -1103,6 +1109,7 @@ STARTUP_METADATA_NAMES = (
     "checkpoint_weight_loader_kind",
     "checkpoint_source_kind",
     "load_format",
+    "checkpoint_io_policy_source",
 )
 
 
@@ -1274,6 +1281,42 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
     return statuses
 
 
+def _normalize_checkpoint_io_policy(policy: object) -> Optional[dict]:
+    """Validate a finalized primary-model status without inferring activation.
+
+    Args:
+        policy: Structured policy from the primary model's startup metrics.
+
+    Returns:
+        A normalized policy with a bounded fallback reason, or None if invalid.
+    """
+    if not isinstance(policy, dict):
+        return None
+    policies = ("native", "rank_striped_read_ahead")
+    if (
+        policy.get("requested") not in (*policies, "auto")
+        or policy.get("selected") not in policies
+        or policy.get("effective") not in policies
+        or not isinstance(policy.get("activated"), bool)
+        or "fallback_reason" not in policy
+        or not isinstance(policy["fallback_reason"], (str, type(None)))
+    ):
+        return None
+    if (policy["activated"] and policy["selected"] != "rank_striped_read_ahead") or (
+        policy["effective"] == "rank_striped_read_ahead" and not policy["activated"]
+    ):
+        return None
+    reason = policy["fallback_reason"] or "none"
+    return {
+        "requested": policy["requested"],
+        "selected": policy["selected"],
+        "activated": policy["activated"],
+        "effective": policy["effective"],
+        "fallback_reason": _bounded_checkpoint_io_fallback_reason(reason),
+        "fallback_category": checkpoint_io_fallback_category(reason),
+    }
+
+
 def make_startup_observation(server_info: dict, log_paths: List[str], role: str) -> dict:
     """Normalize startup data from ``/server_info`` and server logs."""
     startup_metrics = server_info.get("startup_metrics", {})
@@ -1290,7 +1333,12 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
             continue
         for metric_name in STARTUP_METRIC_NAMES:
             value = loader_metrics.get(metric_name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
                 metrics[f"{metric_prefix}{metric_name}"] = float(value)
         for metadata_name in STARTUP_METADATA_NAMES:
             value = loader_metrics.get(metadata_name)
@@ -1306,11 +1354,23 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
                 metrics[f"{metric_prefix}{name}"] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
             )
 
+    primary_loader = startup_metrics.get("model_loader", {})
+    if isinstance(primary_loader, dict) and "checkpoint_io_policy" in primary_loader:
+        # An explicit unknown status is authoritative. Do not substitute logs
+        # that could describe a draft load or a different initialization phase.
+        policy = _normalize_checkpoint_io_policy(primary_loader["checkpoint_io_policy"])
+        policies = [policy] if policy is not None else []
+        policy_source = "server_info"
+    else:
+        policies = parse_checkpoint_io_policies(log_paths)
+        policy_source = "legacy_logs" if policies else "unknown"
+    metadata["checkpoint_io_policy_source"] = policy_source
+
     return {
         "role": role,
         "metrics": metrics,
         "metadata": metadata,
-        "checkpoint_io_policies": parse_checkpoint_io_policies(log_paths),
+        "checkpoint_io_policies": policies,
     }
 
 
@@ -1505,6 +1565,24 @@ def add_startup_metric_values(
     )
 
     successful = [entry for entry in selected if not entry.get("error")]
+    collection_complete = (
+        expected_server_count > 0 and len(successful) == expected_server_count and not failed
+    )
+    required_timings = (*CHECKPOINT_PIPELINE_PHASES, "total_model_loading_seconds")
+    new_data[f"b_{field_prefix}startup_metrics_timing_complete"] = collection_complete and all(
+        isinstance(value := entry.get("metrics", {}).get(name), (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+        for entry in successful
+        for name in required_timings
+    )
+    new_data[f"b_{field_prefix}checkpoint_io_policy_complete"] = collection_complete and all(
+        entry.get("metadata", {}).get("checkpoint_io_policy_source") == "server_info"
+        and len(entry.get("checkpoint_io_policies", [])) == 1
+        and _normalize_checkpoint_io_policy(entry["checkpoint_io_policies"][0]) is not None
+        for entry in successful
+    )
     metric_names = {name for entry in successful for name in entry.get("metrics", {})}
     for metric_name in metric_names:
         values = [entry.get("metrics", {}).get(metric_name) for entry in successful]
@@ -1573,6 +1651,8 @@ def add_startup_metric_values(
     )
     new_data[f"s_{field_prefix}checkpoint_io_experiment_classification"] = (
         classify_checkpoint_io_experiment(assignment, policies)
+        if collection_complete and all(entry.get("checkpoint_io_policies") for entry in successful)
+        else "unknown"
     )
 
 
@@ -1641,6 +1721,24 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     return int(float(val)) if val is not None else 0
 
 
+def get_node_address() -> str:
+    """Return the address this node's servers bind and publish to the other roles.
+
+    An IP rather than the hostname, so neither binding it nor dialing a published
+    address needs DNS. get_local_ip() returns loopback when it finds no routable
+    interface, and its hostname-lookup fallback can return a link-local address;
+    other nodes cannot dial either, so the hostname is used instead.
+    """
+    hostname = socket.gethostname()
+    ip = get_local_ip()
+    address = ipaddress.ip_address(ip)
+    if address.is_loopback or address.is_link_local:
+        print_warning(f"No routable IP found on {hostname}; using the hostname instead")
+        return hostname
+    print_info(f"Using {ip} as the server address of {hostname}")
+    return ip
+
+
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
@@ -1666,9 +1764,16 @@ def reserve_multi_frontend_port(host: str) -> int:
     between the probe and the server's bind. So the socket stays bound instead.
     In multi-frontend mode every frontend binds with SO_REUSEPORT (see
     launch_server), and Linux lets same-uid SO_REUSEPORT sockets share a port
-    provided the *first* binder set the flag, which this one does. So the
-    reservation is transparent to the server while still refusing a plain bind()
-    from any unrelated process on the node.
+    provided the *first* binder set the flag, which this one does. Before that,
+    the launcher probes the port with a plain SO_REUSEADDR bind to refuse a port
+    another server already uses (_reserve_multi_frontend_port in serve.py). That
+    probe fails with EADDRINUSE against a bound socket that did not set
+    SO_REUSEADDR, so this one sets it too; another server still fails the probe,
+    because its sockets are listening. So the reservation is transparent to the
+    server while still refusing a bind() without SO_REUSEADDR from an unrelated
+    process on the node. The reservation is not exclusive: a process that sets
+    SO_REUSEADDR can bind the port too, and if it then listens, the launcher's
+    probe fails loudly.
 
     The socket is deliberately never listen()ed: only *listening* SO_REUSEPORT
     sockets join the kernel's accept load-balancing group, so a bound-only socket
@@ -1684,10 +1789,13 @@ def reserve_multi_frontend_port(host: str) -> int:
     )
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, 0))
     port = sock.getsockname()[1]
     _RESERVED_PORT_SOCKETS.append(sock)
-    print_info(f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT socket)")
+    print_info(
+        f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT+SO_REUSEADDR socket)"
+    )
     return port
 
 
@@ -3020,11 +3128,13 @@ class DisaggTestCmds(NamedTuple):
 
         Reused across runs; slurm_launch_draft.sh clears it before each attempt.
         The step id is excluded so all roles (separate srun steps) agree on it.
-        A DWDP ctx task sees SLURM_JOB_ID only under DWDP_SAVED_ENV_PREFIX.
+        Every role reads SLURM_JOB_ID from its own pytest environment. The worker
+        launchers (trtllm-llmapi-launch, dwdp_ctx_rank.sh) hide it, and slurm_run.sh
+        unsets it for the disagg server and the benchmark, so all roles of a Slurm
+        run use "local". A DWDP ctx task must not take the copy that dwdp_ctx_rank.sh
+        saves, or its CTX files land where the disagg server never looks.
         """
-        run_id = os.environ.get(
-            "SLURM_JOB_ID", os.environ.get(f"{DWDP_SAVED_ENV_PREFIX}SLURM_JOB_ID", "local")
-        )
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
 
     def _hostname_file(self, server_idx: int, worker_name: str = "") -> str:
@@ -3609,7 +3719,8 @@ class DisaggTestCmds(NamedTuple):
         urls = []
         for rank in range(world_size):
             path = os.path.join(reserved_dir, f"{rank}.txt")
-            urls.append(wait_for_reported_addr(path, max(1, int(deadline - time.time()))))
+            host, port = wait_for_reported_addr(path, max(1, int(deadline - time.time())))
+            urls.append(f"{host}:{port}")
 
         # Same LLM args a plain ctx server gets from its --config file, with
         # the speculative model / load balancer paths already resolved.
@@ -4645,6 +4756,7 @@ class PerfSanityTestConfig:
         model_name = metadata.get("model_name", "")
         assert model_name, "model_name is required in metadata section"
 
+        gen_server_config = None
         # Use self.benchmark_mode instead of reading from config file
         benchmark_mode = self.benchmark_mode
         # The mode segments of the test id, reused verbatim as the config name so
@@ -4777,7 +4889,7 @@ class PerfSanityTestConfig:
             disagg_config = DisaggConfig(
                 name=f"{test_label}-{config_file_base_name}",
                 disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
+                hostname=get_node_address(),
                 numa_bind=numa_bind,
                 timeout=timeout,
                 benchmark_mode=benchmark_mode,
@@ -5229,7 +5341,7 @@ class PerfSanityTestConfig:
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
 
-        def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
+        def parse_metrics_from_output(output: str) -> dict[str, float | None]:
             """Parse all metrics from a single output string."""
             metrics = {}
             all_queries = {
@@ -5259,7 +5371,10 @@ class PerfSanityTestConfig:
                         continue
                     match = regex.search(line)
                     if match:
-                        metrics[metric_type] = float(match.group(1))
+                        # Preserve explicit N/A as a present key so validation
+                        # can distinguish it from missing or malformed output.
+                        value = match.group(1)
+                        metrics[metric_type] = None if value == "N/A" else float(value)
                         break
             return metrics
 

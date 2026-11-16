@@ -27,6 +27,19 @@ from ...kernels.moe import moe_prefill_schedule as _geo
 #: any row count in 1..64, one compile each.
 ROWS = (1, 2, 4, 8, 16, 32, 48, 64)
 
+#: The MTP3 / MTP5 decode row counts (32 sequences x 4 / 6), past the decode kernel's 64:
+#: the prefill split-K kernel (`moe_prefill_shared_splitk`) at a schedule measured for
+#: each, `(tile_n, stages, split_k, physical_m)`. Built only on request (`build_all(...,
+#: MTP_ROWS)`), for an engine drafting more than one token. B300, cold weights: 128 rows
+#: split-K 4 over two 64-row tiles (128 CTAs) 6.72 us; 192 rows the prefill family's own
+#: (split-K 2, 96 CTAs) 8.41 us, split-K 4 there 11.46 us. The prefill GEMM + SwiGLU rows
+#: the MTP layer took: 24.2 / 24.3 us.
+MTP_SCHEDULES: dict[int, tuple[int, int, int, int]] = {
+    128: (64, 8, 4, 64),
+    192: (64, 12, 2, 64),
+}
+MTP_ROWS = tuple(MTP_SCHEDULES)
+
 #: `[M, 6144] x [1024, 6144] -> [M, 1024]`, then SwiGLU halves it to 512.
 _K, _GU, _OUT = _kernel.INPUT_FEATURES, _kernel.GATE_UP_FEATURES, _kernel.OUTPUT_FEATURES
 
@@ -49,21 +62,37 @@ def prepare_weight(weight: torch.Tensor) -> torch.Tensor:
     return _kernel.prepare_weight(weight)
 
 
+def _mtp_kernel(rows: int) -> Runner:
+    """The split-K instance `MTP_SCHEDULES[rows]` names, compiled on a symbolic row count
+    (any count in 65..8192; the runner is used at `rows` only). Checks its operands'
+    shapes, dtypes, alignment and overlap on every call."""
+    tile_n, stages, split_k, physical_m = MTP_SCHEDULES[rows]
+    return _splitk.compile_projection(
+        up=True,
+        tile_n=tile_n,
+        stages=stages,
+        split_k=split_k,
+        physical_m=physical_m,
+        use_pdl=_USE_PDL,
+    )
+
+
 def build(rows: int, prepared_weight: torch.Tensor) -> Runner:
-    """Compile the kernel for exactly `rows` rows (1..64). Call at load.
+    """Compile the kernel for exactly `rows` rows (1..64, or one of `MTP_ROWS`). Call at
+    load.
 
     `prepared_weight` is any one layer's `prepare_weight` result: the kernel
     checks its layout on this first call and never again, and the runner does
     not keep it. Costs one CuTe DSL compile (cached by the kernel module per
-    row count) and one launch on zeros. Raises if `rows` is outside 1..64 or
-    the compile fails.
+    row count) and one launch on zeros. Raises if `rows` is outside 1..64 and
+    `MTP_ROWS`, or the compile fails.
     """
     rows = int(rows)
     dev = prepared_weight.device
     x = torch.zeros([rows, _K], dtype=torch.bfloat16, device=dev)
     out = torch.empty([rows, _OUT], dtype=torch.bfloat16, device=dev)
     with torch.cuda.device(dev):
-        runner = _kernel.build()
+        runner = _mtp_kernel(rows) if rows in MTP_SCHEDULES else _kernel.build()
         runner(x, prepared_weight, out)
     return runner
 
@@ -168,6 +197,8 @@ class CuteDslSharedGateUpSwiglu(OpWrapper):
         Cell(why="MTP width 2, one sequence", spec=dict(rows=2)),
         Cell(why="48 rows: the 128-CTA high schedule", spec=dict(rows=48)),
         Cell(why="the full decode batch: the tail schedule", spec=dict(rows=64)),
+        Cell(why="MTP3's decode batch, 32 x 4 rows: split-K", spec=dict(rows=128)),
+        Cell(why="MTP5's decode batch, 32 x 6 rows: split-K", spec=dict(rows=192)),
         Cell(
             why="prefill at 65 rows: the split-K up family's first count",
             spec=dict(prefill="splitk_up64_s12_k2", edge="first"),
@@ -196,7 +227,9 @@ class CuteDslSharedGateUpSwiglu(OpWrapper):
 
     note = """
     The target compiles one runner per row count in `ROWS` (1, 2, 4, 8, 16, 32,
-    48, 64). Any other decode row count takes the two-launch path
+    48, 64); an engine drafting more than one token also `MTP_ROWS` (128, 192),
+    the split-K kernel at a schedule of its own, taken by a decode step's rows
+    only (trunk and MTP layer). Any other decode row count takes the two-launch path
     (`cute_dsl_projection` "shared_gate_up" or cuBLAS, then SwiGLU) at the
     target's call site.
 

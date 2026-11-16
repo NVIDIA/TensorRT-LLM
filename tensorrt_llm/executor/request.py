@@ -23,6 +23,8 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
+from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -129,6 +131,7 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ):
         if prompt_adapter_request is not None:
             warnings.warn(
@@ -173,6 +176,7 @@ class GenerationRequest:
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
+        self.kv_hints = snapshot_kv_hints(kv_hints)
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
@@ -234,8 +238,29 @@ class GenerationRequest:
     # zero blast radius on any other attribute.
     _I32 = "\x00i32be"
 
+    # Prompt-tail transport (executor/prompt_tail.py): a frontend sets
+    # ``_prompt_tail_tokens`` on an eligible request so that ``__getstate__``
+    # ships only that many trailing ids; the receiving side records the number
+    # of ids left out in ``_prompt_trimmed_prefix``.
+    _prompt_tail_tokens: int = 0
+    _prompt_trimmed_prefix: int = 0
+
+    @property
+    def prompt_len(self) -> int:
+        """Prompt length, counting ids the prompt-tail transport left out."""
+        buf = self.__dict__.get("_prompt_token_ids_i32")
+        ids = buf if buf is not None else self.__dict__.get("_prompt_token_ids")
+        return self._prompt_trimmed_prefix + (len(ids)
+                                              if ids is not None else 0)
+
     @property
     def prompt_token_ids(self):
+        if self._prompt_trimmed_prefix:
+            raise RuntimeError(
+                f"Request {self.id} carries only its last prompt ids "
+                f"({self._prompt_trimmed_prefix} left out by "
+                "gen_prompt_tail_tokens); the full prompt is not "
+                "available on the worker")
         ptids = self.__dict__.get("_prompt_token_ids")
         if ptids is None:
             buf = self.__dict__.get("_prompt_token_ids_i32")
@@ -253,6 +278,19 @@ class GenerationRequest:
         # replaced prompt must not leave the old tokens behind in it.
         self._prompt_token_ids_i32 = None
 
+    @property
+    def num_prompt_tokens(self) -> int:
+        """Prompt length, read off the int32 buffer when the list was never built.
+
+        Metrics and tracing need only the length; going through
+        `prompt_token_ids` would materialize the O(ISL) list the buffer avoids.
+        """
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is not None:
+            return len(ptids)
+        buf = self.__dict__.get("_prompt_token_ids_i32")
+        return 0 if buf is None else len(buf)
+
     @staticmethod
     def _enc_tokens(v):
         # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
@@ -265,8 +303,16 @@ class GenerationRequest:
     def __getstate__(self):
         state = self.__dict__.copy()
         buf = state.pop("_prompt_token_ids_i32", None)
+        tail = state.pop("_prompt_tail_tokens", 0)
         ptids = state.get("_prompt_token_ids")
-        if ptids is not None:
+        if tail:
+            ids = buf if buf is not None else ptids
+            tail_ids = np.ascontiguousarray(ids[len(ids) - tail:],
+                                            dtype=np.int32)
+            state["_prompt_token_ids"] = (GenerationRequest._I32,
+                                          tail_ids.tobytes())
+            state["_prompt_trimmed_prefix"] = len(ids) - tail
+        elif ptids is not None:
             state["_prompt_token_ids"] = GenerationRequest._enc_tokens(ptids)
         elif buf is not None:
             # not yet materialized -> encode the buffer's bytes directly
@@ -274,6 +320,7 @@ class GenerationRequest:
         return state
 
     def __setstate__(self, state):
+        state.setdefault("kv_hints", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(

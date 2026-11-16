@@ -236,6 +236,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     item_scheduling: bool,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util, model_engine
+    from tensorrt_llm._torch.pyexecutor.engine import model_setup
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         encoder_cuda_graph_modality = "vision"
@@ -257,7 +258,10 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     model.encoder = Encoder(mm_config)
     model.config = SimpleNamespace(torch_dtype=torch.float32)
     model.model_config = SimpleNamespace(
-        pretrained_config=model.config, mapping=mapping, sparse_attention_config=None
+        pretrained_config=model.config,
+        mapping=mapping,
+        sparse_attention_config=None,
+        is_generation=True,
     )
     llm_args = SimpleNamespace(
         encode_only=False,
@@ -291,7 +295,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     ):
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
-    monkeypatch.setattr(model_engine, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     monkeypatch.setattr(model_engine, "create_input_processor", Mock(return_value=object()))
     monkeypatch.setattr(
         model_engine, "resolve_mrope_position_deltas_cache", Mock(return_value=None)
@@ -312,10 +316,9 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     )
     engine_cls = model_engine.ModelEngine
     monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
-    monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
     monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
     monkeypatch.setattr(
-        model_engine,
+        model_setup,
         "get_attention_backend",
         Mock(side_effect=RuntimeError("encoder graph setup complete")),
     )

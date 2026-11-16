@@ -171,7 +171,10 @@ void resizeFile(int fd, size_t newSize); // throws DiskOOMError
 using HostMadviseFn = int (*)(void*, size_t, int);
 using HostMemsetFn = void* (*) (void*, int, size_t);
 
-bool hostUseThp();
+//! Whether a range gets transparent huge pages, given whether it asks for them.
+//! TLLM_KV_CACHE_MANAGER_V2_THP overrides the request: "1" enables them for every range, any
+//! other value disables them for every range (with a warning when a range had asked).
+bool hostUseThp(bool requested);
 
 //! Total host memory the OS reports, in bytes. Used as the default reservation
 //! bound, since no host allocation can exceed it.

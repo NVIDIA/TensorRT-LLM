@@ -18,9 +18,12 @@ l0_gb300_multi_nodes_node2_gpu8:
   # recipe. Measured 25m45s on 2x4 GB300.
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
   # The MiniMax-M3 modeling_v2 tp8 target (two trays): GSM8K, and with Eagle3 GSM8K plus a chat acceptance gate.
-  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_gsm8k TIMEOUT (60)
-  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_eagle3_gsm8k_and_acceptance TIMEOUT (60)
-  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp8]
-  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
-  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]
-  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep8]
+  - accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_gsm8k TIMEOUT (60)
+  - accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_eagle3_gsm8k_and_acceptance TIMEOUT (60)
+  - accuracy/modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp8]
+  - accuracy/modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
+  - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]
+  - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep8]
+  # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
+  # Measured 34 min on 2x4 GB300 (batch 1).
+  - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)

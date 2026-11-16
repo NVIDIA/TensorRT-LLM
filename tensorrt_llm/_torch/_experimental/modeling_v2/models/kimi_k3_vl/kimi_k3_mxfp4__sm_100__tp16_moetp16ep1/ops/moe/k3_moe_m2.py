@@ -82,8 +82,11 @@ class K3MoeM2(OpWrapper):
     hbuf, counts, epochs, out and the push exchange's multicast storage.
     Tests retain eight payloads, bitwise repeats, twelve steps of three
     layers, four rewritten-input graph replays with eager calls, two-state
-    interleaving, epoch wraps and construction refusals. Kernel tests also
-    compare k3_moe with both tokens routed to the same or disjoint experts.
+    interleaving, epoch wraps, construction refusals and the refusal of a
+    768-wide intermediate. Each payload is also within one bf16 ulp of the
+    row max of k3_moe, including both tokens routed to the same 16 experts
+    and the second token's logits set to -30 on the first token's top 16
+    raw logits, so the two tokens' experts mostly differ.
     """
 
     def __call__(
