@@ -1242,6 +1242,8 @@ class PyExecutor:
                 "TLLM_HELIX_AGG_CHECK_SCHEDULE=1 is ignored: the schedule check "
                 "only runs with aggregated helix context parallelism "
                 "and pipeline parallelism disabled.")
+        elif self._check_helix_schedule and self.dist.mapping.cp_rank == 0:
+            logger.info("Aggregated helix schedule check enabled.")
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches

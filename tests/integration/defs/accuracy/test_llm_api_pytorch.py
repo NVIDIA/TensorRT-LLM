@@ -1371,8 +1371,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         worth of tokens, so requests are suspended and resumed while reused
         blocks are claimed and evicted. reuse_host_offload adds a host tier
         to that small pool, so evicted blocks move to host memory and reuse
-        hits bring them back. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on every
-        rank to also compare the per-rank schedules each iteration.
+        hits bring them back. Every mode compares the CP ranks' schedules
+        each iteration (TLLM_HELIX_AGG_CHECK_SCHEDULE).
         """
         enable_block_reuse = mode != "no_reuse"
         kv_cache_kwargs = {}
@@ -1387,6 +1387,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             kv_cache_kwargs["host_cache_size"] = 8 << 30
         with LLM(
                 self.MODEL_PATH,
+                env_overrides={"TLLM_HELIX_AGG_CHECK_SCHEDULE": "1"},
                 tensor_parallel_size=1,
                 context_parallel_size=2,
                 moe_expert_parallel_size=2,
