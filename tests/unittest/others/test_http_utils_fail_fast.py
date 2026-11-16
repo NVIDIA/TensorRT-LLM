@@ -128,11 +128,14 @@ def test_fail_if_proc_died_noop_when_alive_or_none(tmp_path):
         proc.wait()
 
 
-def test_endpoint_down_requires_default_consecutive_failed_probes(monkeypatch) -> None:
+@pytest.mark.parametrize("response_status", [200, 503])
+def test_endpoint_down_requires_default_consecutive_failed_probes(
+    monkeypatch, response_status: int
+) -> None:
     probes = iter(
         [
             requests.ReadTimeout("slow probe"),
-            SimpleNamespace(status_code=200),
+            SimpleNamespace(status_code=response_status),
             *[requests.ConnectionError("router stopped") for _ in range(10)],
         ]
     )

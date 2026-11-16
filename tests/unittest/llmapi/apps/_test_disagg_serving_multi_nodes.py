@@ -48,9 +48,12 @@ GEN_TASK_HANDSHAKE_PORT = 8003
 GEN_TASK_HANDSHAKE_TIMEOUT_S = 300
 ROUTER_READY_TIMEOUT_S = (RemoteOpenAIServer.MAX_SERVER_START_WAIT_S +
                           DISAGG_SERVER_START_TIMEOUT_S)
-# Router shutdown should be quick; allow cleanup without consuming the model-load budget.
+# Completion work can span multiple client requests; keep it separate from shutdown.
+COMPLETION_WORK_TIMEOUT_S = RemoteOpenAIServer.MAX_SERVER_START_WAIT_S
+# Router shutdown should be quick once rank zero explicitly signals completion.
 ROUTER_STOP_TIMEOUT_S = 300
 READY_MESSAGE_PREFIX = "ready "
+SHUTDOWN_MESSAGE = b"shutdown"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -106,8 +109,8 @@ def get_the_other_host(idx=0):
     return node_list[idx]
 
 
-def wait_for_gen_task_handshake(test_id: str) -> None:
-    """Wait until the generation task is ready for router shutdown."""
+def wait_for_gen_task_handshake(test_id: str) -> socket.socket:
+    """Wait for readiness and return the live coordination connection."""
     expected_signal = f"{READY_MESSAGE_PREFIX}{test_id}".encode()
     deadline = time.monotonic() + GEN_TASK_HANDSHAKE_TIMEOUT_S
     empty_connections = 0
@@ -121,52 +124,79 @@ def wait_for_gen_task_handshake(test_id: str) -> None:
                 connection, peer = listener.accept()
             except TimeoutError:
                 break
-            with connection:
-                connection.settimeout(max(deadline - time.monotonic(), 0.001))
-                chunks = []
-                while True:
-                    try:
-                        chunk = connection.recv(4096)
-                    except TimeoutError as error:
-                        raise RuntimeError(
-                            "Generation task did not complete its handshake on port "
-                            f"{GEN_TASK_HANDSHAKE_PORT} within "
-                            f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                ready_signal = b"".join(chunks)
+            connection.settimeout(max(deadline - time.monotonic(), 0.001))
+            chunks = []
+            while True:
+                try:
+                    chunk = connection.recv(4096)
+                except TimeoutError as error:
+                    connection.close()
+                    raise RuntimeError(
+                        "Generation task did not complete its handshake on port "
+                        f"{GEN_TASK_HANDSHAKE_PORT} within "
+                        f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            ready_signal = b"".join(chunks)
             if not ready_signal:
+                connection.close()
                 empty_connections += 1
                 print(f"Ignoring empty generation handshake from {peer}")
                 continue
             if ready_signal != expected_signal:
+                connection.close()
                 raise RuntimeError(
                     "Generation task handshake is for a different test: "
                     f"expected {expected_signal!r}, got {ready_signal!r}")
-            return
+            return connection
     raise RuntimeError(
         "Generation task did not complete a valid handshake on port "
         f"{GEN_TASK_HANDSHAKE_PORT} within {GEN_TASK_HANDSHAKE_TIMEOUT_S}s; "
         f"ignored {empty_connections} empty connection(s)")
 
 
-def send_gen_task_handshake(host: str, test_id: str) -> None:
-    """Tell rank zero that the generation task is awaiting router shutdown."""
+def wait_for_gen_task_shutdown(host: str, test_id: str) -> None:
+    """Announce readiness, then wait until rank zero finishes requests."""
+    ready_signal = f"{READY_MESSAGE_PREFIX}{test_id}".encode()
     deadline = time.monotonic() + GEN_TASK_HANDSHAKE_TIMEOUT_S
-    last_error: OSError | None = None
-    while time.monotonic() < deadline:
+    connection = None
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            with socket.create_connection((host, GEN_TASK_HANDSHAKE_PORT),
-                                          timeout=5) as connection:
-                connection.sendall(f"{READY_MESSAGE_PREFIX}{test_id}".encode())
-                return
-        except OSError as error:
-            last_error = error
+            connection = socket.create_connection(
+                (host, GEN_TASK_HANDSHAKE_PORT), timeout=min(5, remaining))
+            break
+        except (ConnectionRefusedError, TimeoutError, OSError) as error:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Generation task could not coordinate with rank zero at "
+                    f"{host}:{GEN_TASK_HANDSHAKE_PORT} within "
+                    f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
             time.sleep(1)
-    raise RuntimeError(
-        f"Could not reach rank 0 at {host}:{GEN_TASK_HANDSHAKE_PORT} within "
-        f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from last_error
+    if connection is None:
+        raise RuntimeError(
+            "Generation task could not coordinate with rank zero at "
+            f"{host}:{GEN_TASK_HANDSHAKE_PORT} within "
+            f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s")
+    with connection:
+        connection.sendall(ready_signal)
+        connection.shutdown(socket.SHUT_WR)
+        connection.settimeout(COMPLETION_WORK_TIMEOUT_S)
+        try:
+            shutdown_signal = connection.recv(len(SHUTDOWN_MESSAGE))
+        except TimeoutError as error:
+            raise RuntimeError(
+                "Rank zero did not finish completion work within "
+                f"{COMPLETION_WORK_TIMEOUT_S}s") from error
+        if shutdown_signal != SHUTDOWN_MESSAGE:
+            raise RuntimeError(
+                "Rank zero closed the generation coordination channel "
+                f"before signaling shutdown; got {shutdown_signal!r}")
+
+
+def signal_gen_task_shutdown(connection: socket.socket) -> None:
+    """Tell the generation task to start its bounded router-down wait."""
+    connection.sendall(SHUTDOWN_MESSAGE)
 
 
 def is_ctx_node() -> bool:
@@ -318,20 +348,21 @@ def test_completion(request: pytest.FixtureRequest, client: openai.OpenAI,
     """Verify one completion while coordinating worker shutdown."""
     if is_rank_zero():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
-        wait_for_gen_task_handshake(request.node.callspec.id)
-        prompt = "What is the result of 1+1? Answer in one word: "
-        completion = client.completions.create(
-            model=model_name,
-            prompt=prompt,
-            max_tokens=10,
-            temperature=0.0,
-        )
-        print(f"Output: {completion.choices[0].text}")
-        assert completion.id is not None
-        message = completion.choices[0].text
-        assert message.startswith('2.')
-
-        disagg_server.terminate()
+        with wait_for_gen_task_handshake(
+                request.node.callspec.id) as gen_connection:
+            prompt = "What is the result of 1+1? Answer in one word: "
+            completion = client.completions.create(
+                model=model_name,
+                prompt=prompt,
+                max_tokens=10,
+                temperature=0.0,
+            )
+            print(f"Output: {completion.choices[0].text}")
+            assert completion.id is not None
+            message = completion.choices[0].text
+            assert message.startswith('2.')
+            signal_gen_task_shutdown(gen_connection)
+            disagg_server.terminate()
 
     elif is_gen_node():
         # Keep the generation worker alive until the disaggregated server exits.
@@ -340,7 +371,7 @@ def test_completion(request: pytest.FixtureRequest, client: openai.OpenAI,
         wait_for_endpoint_ready(url,
                                 timeout=ROUTER_READY_TIMEOUT_S,
                                 server_proc=worker.proc)
-        send_gen_task_handshake(router_host, request.node.callspec.id)
+        wait_for_gen_task_shutdown(router_host, request.node.callspec.id)
         wait_for_endpoint_down(url, timeout=ROUTER_STOP_TIMEOUT_S)
         exit_code = worker.proc.poll()
         assert exit_code is None, (
