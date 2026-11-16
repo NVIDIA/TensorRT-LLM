@@ -239,6 +239,27 @@ def test_recipe_rejections(mutate, match) -> None:
         layout.check_recipe(q, layout.tensor_specs(model_config(), layers=(0, 7, 9)))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+@pytest.mark.parametrize("scheme", [None, "FP8", "unknown", {}, {"type": "float", "num_bits": 8}])
+def test_checkpoint_kv_cache_scheme(tmp_path, monkeypatch, nested, scheme) -> None:
+    q = recipe()
+    (q["quantization"] if nested else q)["kv_cache_scheme"] = scheme
+    cfg = model_config()
+    specs = layout.tensor_specs(cfg, layers=(0, 7, 9))
+    monkeypatch.setattr(layout, "tensor_specs", lambda config: specs)
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(q))
+    if scheme is None:
+        assert layout.check_recipe(q, specs)["kv_cache_quant_algo"] is None
+        assert layout.check_checkpoint(tmp_path) == cfg
+    else:
+        with pytest.raises(ValueError, match="kv_cache_scheme"):
+            layout.check_recipe(q, specs)
+        with pytest.raises(ValueError, match="kv_cache_scheme"):
+            layout.check_checkpoint(tmp_path)
+
+
 # ------------------------------------------------------------------ generated checkpoints
 
 
