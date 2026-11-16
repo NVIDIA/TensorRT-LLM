@@ -26,12 +26,12 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include "tensorrt_llm/common/tllmDataType.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -41,11 +41,24 @@
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
-using tensorrt_llm::executor::insertRequestInOrder;
 namespace tc = tensorrt_llm::common;
 
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using VecTokens = std::vector<TokenIdType>;
+
+namespace
+{
+
+// Insert in descending priority order, preserving arrival order for ties.
+void insertRequestInOrder(RequestList& reqList, std::shared_ptr<LlmRequest> const& req)
+{
+    auto const it = std::upper_bound(std::begin(reqList), std::end(reqList), req,
+        [](std::shared_ptr<LlmRequest> const& a, std::shared_ptr<LlmRequest> const& b)
+        { return a->priority() > b->priority(); });
+    reqList.insert(it, req);
+}
+
+} // namespace
 
 struct RequestState
 {
@@ -2608,6 +2621,21 @@ std::shared_ptr<LlmRequest> createEncoderInitRequest(
     EXPECT_EQ(req->getState(), LlmRequestState::kENCODER_INIT);
     return req;
 }
+
+std::shared_ptr<LlmRequest> createFeatureEncoderInitRequest(
+    int32_t promptLen, int32_t maxNewTokens, int32_t encoderInputLen, int32_t encoderOutputLen, uint64_t reqId)
+{
+    auto inputTokens = VecTokens(promptLen, 1);
+    auto executorReq = tensorrt_llm::executor::Request(inputTokens, maxNewTokens);
+    auto encoderInputFeatures = tensorrt_llm::executor::Tensor::cpu(
+        tensorrt_llm::executor::DataType::kFP32, {encoderInputLen, /*featureSize=*/1});
+    executorReq.setEncoderInputFeatures(std::move(encoderInputFeatures));
+    executorReq.setEncoderOutputLength(encoderOutputLen);
+    auto req = std::make_shared<LlmRequest>(reqId, executorReq);
+    EXPECT_EQ(req->getState(), LlmRequestState::kENCODER_INIT);
+    EXPECT_FALSE(req->getEncoderUniqueTokens().has_value());
+    return req;
+}
 } // namespace
 
 // GuaranteedNoEvict: a single encoder-init request is admitted without
@@ -2687,4 +2715,46 @@ TEST_F(CapacitySchedulerTest, EncoderInitDoesNotConsumeCrossPool)
         EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), selfFreeBefore) << "policy=" << static_cast<int>(policy);
         EXPECT_EQ(crossKvCacheManager->getNumFreeBlocks(), crossFreeBefore) << "policy=" << static_cast<int>(policy);
     }
+}
+
+TEST_F(CapacitySchedulerTest, FeatureEncoderWithoutTokensSkipsCrossPoolReuseAnalysis)
+{
+    SizeType32 const maxNumRequests = 1;
+    SizeType32 const tokensPerBlock = 10;
+    SizeType32 const selfMaxTokens = 100;
+    SizeType32 const crossMaxTokens = 20;
+    int32_t const promptLen = 10;
+    int32_t const encoderInputLen = 20;
+    int32_t const encoderOutputLen = 20;
+
+    auto kvCacheManager = getKvCacheManager(maxNumRequests, tokensPerBlock, selfMaxTokens, selfMaxTokens,
+        /*sinkTokenLength=*/0, /*enableReuse=*/true);
+    auto crossKvCacheManager = getKvCacheManager(maxNumRequests, tokensPerBlock, crossMaxTokens, crossMaxTokens,
+        /*sinkTokenLength=*/0, /*enableReuse=*/true, kv_cache_manager::CacheType::kCROSS);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, LlmRequestState::kENCODER_INIT, LlmRequestState::kGENERATION_COMPLETE);
+    auto req = createFeatureEncoderInitRequest(
+        promptLen, /*maxNewTokens=*/40, encoderInputLen, encoderOutputLen, /*reqId=*/1);
+    RequestList activeRequests{req};
+
+    auto expectRequestScheduled = [&]()
+    {
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, crossKvCacheManager);
+        ASSERT_EQ(fittingRequests.size(), 1u);
+        EXPECT_EQ(fittingRequests.front()->mRequestId, req->mRequestId);
+        EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+        EXPECT_TRUE(pausedRequests.empty());
+    };
+
+    // Whisper-like feature encoders have no token IDs to key cross-KV reuse.
+    // Exercise encoder admission, first decoder context, and chunked decoder
+    // context, which use the scheduler's three cross-prefix analysis paths.
+    expectRequestScheduled();
+    req->setState(LlmRequestState::kCONTEXT_INIT);
+    expectRequestScheduled();
+    req->setContextCurrentPosition(1);
+    expectRequestScheduled();
 }

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,19 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ShrinkTouchedPool)
 
     // Leave the allocator quiescent so the debug-build destructor checks pass.
     releaseSlots(allocator, slots, 0, 8);
+}
+
+// SlotId is signed, so an upper-bound-only test admits negative ids, which convert to a huge
+// size_t and index far outside the pool.
+TEST(KvCacheManagerV2SlotAllocatorTest, RejectsSlotIdsOutsideThePool)
+{
+    SlotAllocator allocator{SlotCount{8}};
+
+    EXPECT_FALSE(allocator.isValidSlotId(SlotId{-1}));
+    EXPECT_FALSE(allocator.isValidSlotId(SlotId{std::numeric_limits<SlotCount>::min()}));
+    EXPECT_TRUE(allocator.isValidSlotId(SlotId{0}));
+    EXPECT_TRUE(allocator.isValidSlotId(SlotId{7}));
+    EXPECT_FALSE(allocator.isValidSlotId(SlotId{8}));
 }
 
 } // namespace

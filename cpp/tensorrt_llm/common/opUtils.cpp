@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 #include "cuda.h"
 #include <cuda_bf16.h>
@@ -56,6 +57,32 @@ namespace
 // Get NCCL unique ID for a group of ranks.
 ncclUniqueId getUniqueId(std::set<int> const& group)
 {
+    if (!useMPI())
+    {
+        auto const pg = pg_utils::get_world_pg();
+        TLLM_CHECK_WITH_INFO(pg != nullptr, "Host process group is not initialized");
+        pg_utils::PgHelper host(pg);
+        ncclUniqueId id{};
+        auto bytes = at::from_blob(&id, {sizeof(id)}, at::TensorOptions().dtype(at::kByte));
+        int const root = *group.begin();
+        int const tag = static_cast<int>(mpi::MpiTag::kNcclUniqueId);
+        if (pg->getRank() == root)
+        {
+            NCCLCHECK_THROW(ncclGetUniqueId(&id));
+            for (auto const rank : group)
+            {
+                if (rank != root)
+                {
+                    PGCHECK_THROW(host.send(bytes, rank, tag));
+                }
+            }
+        }
+        else
+        {
+            PGCHECK_THROW(host.recv(bytes, root, tag));
+        }
+        return id;
+    }
     auto const rank = COMM_SESSION.getRank();
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
@@ -64,12 +91,12 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
         NCCLCHECK_THROW(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
+            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kNcclUniqueId);
         }
     }
     else
     {
-        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
+        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kNcclUniqueId);
     }
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
@@ -78,7 +105,9 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
-    auto const rank = COMM_SESSION.getRank();
+    auto const hostPg = useMPI() ? nullptr : pg_utils::get_world_pg();
+    TLLM_CHECK_WITH_INFO(useMPI() || hostPg != nullptr, "Host process group is not initialized");
+    auto const rank = useMPI() ? COMM_SESSION.getRank() : hostPg->getRank();
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
@@ -104,6 +133,27 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     }
 
     TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    // Finish every environment update before getUniqueId(): on the group root, ncclGetUniqueId() starts NCCL's
+    // bootstrap thread, which reads the environment with getenv(), and a concurrent setenv() may reallocate
+    // environ underneath it.
+#if defined(_WIN32)
+    // Need static connection initialization for accurate KV cache size estimation
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    // Disable graph register to avoid startup hangs
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
+#else
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
+    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
+    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
+    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
+    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
+    {
+        setenv("NCCL_NVLS_ENABLE", "0", 0);
+    }
+#endif // _WIN32
     ncclUniqueId id = getUniqueId(group);
     int groupRank = 0;
     for (auto const& currentRank : group)
@@ -152,24 +202,6 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
             // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
             delete comm;
         });
-#if defined(_WIN32)
-    // Need static connection initialization for accurate KV cache size estimation
-    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
-        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
-    // Disable graph register to avoid startup hangs
-    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
-        _putenv_s("NCCL_GRAPH_REGISTER", "0");
-#else
-    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
-    setenv("NCCL_GRAPH_REGISTER", "0", 0);
-    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
-    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
-    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
-    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
-    {
-        setenv("NCCL_NVLS_ENABLE", "0", 0);
-    }
-#endif // _WIN32
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.graphUsageMode = 1;
@@ -177,6 +209,20 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    if (common::nccl_util::isNcclWindowSupported())
+    {
+        std::vector<int> const ranks(group.begin(), group.end());
+        if (useMPI())
+        {
+            common::nccl_util::registerHostCommunicator(*ncclComm, COMM_SESSION, ranks);
+        }
+        else
+        {
+            common::nccl_util::registerHostCommunicator(*ncclComm, hostPg, ranks);
+        }
+    }
+#endif
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;

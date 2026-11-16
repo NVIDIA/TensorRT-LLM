@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # TensorRT-LLM Examples
 
 ## Quick Start
@@ -32,7 +37,6 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | [`kv_cache_compression/`](kv_cache_compression/) | KV cache compression examples, including NVFP4 cold-page quantization and TriAttention |
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
 | [`configs/`](configs/) | Pre-tuned serving configurations — [curated](configs/curated/) quick-starts and a [comprehensive database](configs/database/) |
-| [`auto_deploy/`](auto_deploy/) | AutoDeploy (beta) development examples, cookbooks, and model registry |
 | [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
 
@@ -51,29 +55,12 @@ For model-specific walkthroughs and an interactive recipe selector, see the
 [Model Recipes](https://nvidia.github.io/TensorRT-LLM/deployment-guide/index.html)
 deployment guide.
 
-## AutoDeploy (Beta)
+## Migrating from the Engine-Build Workflow
 
-The [AutoDeploy](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html)
-backend automatically translates HuggingFace models into optimized inference graphs.
-It is accessed through the same `trtllm-serve`, `trtllm-bench`, and LLM API entry
-points as the default PyTorch backend.
-
-See [`auto_deploy/`](auto_deploy/) for development examples, Jupyter cookbooks,
-and a registry of 90+ validated models.
-
-## Legacy Engine-Build Workflow
-
-> **⚠️ Legacy:** The `convert_checkpoint.py` → `trtllm-build` → `run.py`
-> workflow is legacy and may not receive new features.
-> For new projects, use `trtllm-serve` or the LLM API as shown above.
-
-The [`models/`](models/) directory contains per-model scripts for the legacy
-TensorRT engine-build workflow. These scripts convert Hugging Face checkpoints
-to TensorRT engines for deployment. While still functional for supported models,
-this workflow is no longer the recommended path and may not support newly added
-models.
-
-If you are following a tutorial or guide that references `convert_checkpoint.py`
-or `trtllm-build`, please refer to the
+The legacy TensorRT execution backend and its `convert_checkpoint.py` →
+`trtllm-build` → `run.py` workflow have been removed. Use `trtllm-serve` or the
+LLM API as shown above. See the
 [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-for the current recommended workflow.
+for the current workflow and the
+[legacy documentation](../docs/source/legacy/)
+for historical engine-build instructions.

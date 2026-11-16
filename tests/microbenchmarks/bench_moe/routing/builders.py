@@ -111,6 +111,31 @@ def _random_weights(n: int, *, seed: int, label: str, index: int) -> List[float]
     return [rng.random() for _ in range(n)]
 
 
+_DEFAULT_POWERLAW_ALPHA = 0.8
+
+
+def _powerlaw_weights(n: int, alpha: float, *, seed: int, label: str, index: int) -> List[float]:
+    """Weights for a Zipf-style power-law hotness curve.
+
+    ``p_i = (i + 1) ** -alpha / sum_j (j + 1) ** -alpha`` ranks bin ``0`` as the
+    hottest. Bin identity is otherwise arbitrary here (e.g. local expert id), so
+    the hotness ranking is shuffled with a seeded RNG before being handed back —
+    without this, bin/expert ``0`` would always be the hottest, which does not
+    match observed traces where hot experts are not concentrated at low ids.
+    """
+    if n <= 0:
+        return []
+    ranked = [(i + 1) ** (-float(alpha)) for i in range(n)]
+    total = sum(ranked)
+    weights = [w / total for w in ranked]
+    order = list(range(n))
+    random.Random(f"bench_moe:{int(seed)}:{label}:{int(index)}").shuffle(order)
+    shuffled = [0.0] * n
+    for rank, bin_index in enumerate(order):
+        shuffled[bin_index] = weights[rank]
+    return shuffled
+
+
 def _build_per_rank_num_tokens(
     spec: RoutingControlSpec,
     num_tokens: int,
@@ -275,6 +300,11 @@ def _build_expert_histogram(
                 # remainder uniformly.
                 weights = [(1.0 - hotness) / max(experts_per_rank, 1)] * experts_per_rank
                 weights[0] += hotness
+        elif name == "powerlaw":
+            alpha = float(kwargs.get("alpha", _DEFAULT_POWERLAW_ALPHA))
+            weights = _powerlaw_weights(
+                experts_per_rank, alpha, seed=seed, label="expert_powerlaw", index=dst
+            )
         else:
             raise ValueError(f"unknown expert_pattern {name!r}")
         histogram[dst] = _largest_remainder_split(target_total, weights)

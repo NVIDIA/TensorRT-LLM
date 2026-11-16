@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import itertools
+import os
+import sys
 from collections.abc import Sequence
 from functools import cached_property
 from importlib.util import find_spec
@@ -20,46 +22,45 @@ from typing import TYPE_CHECKING, NamedTuple
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
         AttentionLayerConfig,
         BeamIndex,
         CudaStream,
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        MemAddress,
+        PageIndexMode,
         SsmLayerConfig,
         TokenIdExt,
         _KVCache,
-    )
-    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress, PageIndexMode
-    from kv_cache_manager_v2._utils import (
-        HalfOpenRange,
-        div_up,
-        exact_div,
-        get_uniform_attribute,
-        intersect,
-        temporary_sys_path,
-        typed_range,
-        value_or,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
         AttentionLayerConfig,
         BeamIndex,
         CudaStream,
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        MemAddress,
+        PageIndexMode,
         SsmLayerConfig,
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
-        BAD_PAGE_INDEX,
-        NDEBUG,
-        MemAddress,
-        PageIndexMode,
-    )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import (  # noqa: E402
         HalfOpenRange,
         div_up,
         exact_div,
@@ -69,10 +70,11 @@ else:
         typed_range,
         value_or,
     )
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
-import os
-
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+with temporary_sys_path(_TEST_DIR):
     from kernels import check_values, fill_values
 
 
@@ -154,14 +156,14 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
+        lc_id = manager.get_layer_group_id(layer_id)
         index_mode = (
             PageIndexMode.SHARED
-            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED, lc_id)
             else PageIndexMode.PER_LAYER
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: only one page (the SSM slot), only check the last history token
             if not history:
@@ -172,8 +174,12 @@ class FakeEngine:
         else:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
@@ -230,14 +236,14 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
+        lc_id = manager.get_layer_group_id(layer_id)
         index_mode = (
             PageIndexMode.SHARED
-            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED, lc_id)
             else PageIndexMode.PER_LAYER
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: write only the last input token at position 0 of the SSM page
             ssm_idx = kv_cache.get_ssm_block_base_index(lc_id, beam)
@@ -250,8 +256,12 @@ class FakeEngine:
                 : div_up(history_len + len(input), tokens_per_block)
             ]
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:

@@ -199,9 +199,9 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
             dim_position_ids = position_ids[:, :, i]
             dim_position_ids_expanded = dim_position_ids[:, None, :].float()
             with torch.autocast(device_type=x.device.type, enabled=False):
-                freqs = (inv_freq_expanded.float() @ dim_position_ids_expanded.float()).transpose(
-                    1, 2
-                )
+                # This is an outer product. Keep it out of GEMM so TF32 matmul settings cannot
+                # reduce rotary phase precision.
+                freqs = (inv_freq_expanded * dim_position_ids_expanded).transpose(1, 2)
                 emb = torch.cat((freqs, freqs), dim=-1)
                 cos = emb.cos() * self.attention_scaling
                 sin = emb.sin() * self.attention_scaling
@@ -279,8 +279,9 @@ class Gemma4VisionAttention(Attention):
     """Bidirectional attention with q/k/v RMSNorms and 2D RoPE.
 
     Inherits ``Attention`` to participate in the TRT-LLM backend dispatch.
-    Vision sub_config is forced to ``attn_backend="TRTLLM"`` in
-    ``modeling_gemma4mm.get_sub_model_config`` (same pattern Qwen2.5-VL uses).
+    Vision defaults to ``attn_backend="TRTLLM"``; an explicit
+    ``multimodal_config.encoder_attention_backend['vision']`` selects another
+    supported backend in ``modeling_gemma4mm.get_sub_model_config``.
     Vision is context-only and runs through ``forward_impl`` with
     ``PredefinedAttentionMask.FULL`` and a tower-local ``attn_metadata``
     (``kv_cache_manager=None``).
@@ -300,7 +301,7 @@ class Gemma4VisionAttention(Attention):
     so we pass ``q_scaling = 1 / sqrt(head_dim)`` to neutralize the sqrt.
     """
 
-    # trtllm-gen FMHA on sm100a ships cubins for these head_dim sizes only.
+    # trtllm-gen FMHA on the SM100 family (SM100/SM103/SM107) ships cubins for these head_dim sizes only.
     # Variants whose HF ``head_dim`` is not in this set are padded up to the
     # next supported size; the kernel sees zero-padded q/k/v while RMSNorm,
     # RoPE, and o_proj math run on the unpadded HF channels (see ``forward``

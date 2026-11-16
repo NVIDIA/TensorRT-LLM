@@ -12,11 +12,22 @@ from tensorrt_llm.mapping import Mapping
 
 from ..linear import Linear
 from ..mamba.layernorm_gated import RMSNorm as TritonRMSNorm
-from .hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
+from .hyper_connection_kernels import (
+    hc_combine,
+    hc_combine_norm,
+    hc_gate_mix,
+    hc_moe_finalize_combine_norm,
+    hc_silu,
+)
 
 __all__ = ["GroupedRMSNorm", "HCResidual", "Qwen4ExpHyperConnection"]
 
 _PACKED_PROJECTION_ALIGNMENT = 16
+
+# The fused MoE finalize re-reads the routed and shared outputs once per HC
+# stream, so it stops paying once the combine turns bandwidth-bound. Measured
+# crossover on B200 is between 2048 and 8192 rows; decode never gets near it.
+_FUSED_FINALIZE_MAX_ROWS = 2048
 
 
 class GroupedRMSNorm(TritonRMSNorm):
@@ -392,6 +403,72 @@ class Qwen4ExpHyperConnection(nn.Module):
             normed = self._normed_bundle(hidden_states)
         mixed, residual = self._mix_normed(hidden_states, normed)
         return hidden_states, mixed, residual
+
+    def can_fuse_deferred_moe(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this HC instance may request deferred MoE operands.
+
+        The MoE block asks before deferring, so a ``False`` here costs a kernel
+        rather than dropping the shared-expert gate.
+        """
+        return (
+            self.use_combine
+            and not torch.is_grad_enabled()
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] <= _FUSED_FINALIZE_MAX_ROWS
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+        )
+
+    def combine_deferred_moe_and_mix(
+        self,
+        routed_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        shared_gate_logits: torch.Tensor,
+        previous_residual: HCResidual,
+    ) -> Tuple[torch.Tensor, torch.Tensor, HCResidual]:
+        """Finalize a MoE block while combining and normalizing its HC output."""
+        hyper_input, injection_logits = previous_residual
+        if injection_logits is None:
+            raise RuntimeError("deferred MoE combine is missing injection logits")
+        row_tensors = (
+            hyper_input,
+            routed_output,
+            shared_output,
+            shared_gate_logits,
+            injection_logits,
+        )
+        eligible = (
+            self.can_fuse_deferred_moe(hyper_input)
+            and self.hc_per_branch_norm
+            and self._fused_cuda_eligible(*row_tensors)
+            and all(
+                tensor.shape[0] <= 1 or tensor.stride(0) >= tensor.shape[1]
+                for tensor in row_tensors
+            )
+            and self._fused_norm_weight_eligible(self.hc_norm.weight, hyper_input)
+        )
+        if eligible:
+            hidden_states, normed = hc_moe_finalize_combine_norm(
+                hyper_input,
+                routed_output,
+                shared_output,
+                shared_gate_logits,
+                injection_logits,
+                self.hc_norm.weight,
+                self.hc_norm.variance_epsilon,
+                self.hc_count,
+            )
+            mixed, residual = self._mix_normed(hidden_states, normed)
+            return hidden_states, mixed, residual
+
+        from ...moe.fused_shared_expert import fused_sigmoid_gate_mul_add
+
+        block_output = fused_sigmoid_gate_mul_add(
+            routed_output,
+            shared_gate_logits,
+            shared_output,
+        )
+        return self.combine_and_mix(block_output, previous_residual)
 
     def extra_repr(self) -> str:
         return (

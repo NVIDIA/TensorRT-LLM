@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -39,11 +40,11 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _lpips_model_path,
     _lpips_pinned_fp32_matmul_precision,
     _preserve_lpips_candidate_on_failure,
+    _require_exists,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
     _run_single_device_feature_generator,
     _save_lpips_video_mp4,
-    _skip_if_missing,
     _validate_single_feature_config,
 )
 
@@ -101,7 +102,6 @@ COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
 # golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json.
 COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
 
-
 COSMOS3_FEATURE_LPIPS_THRESHOLD = 0.05
 COSMOS3_QUANTIZATION_IGNORE = [
     "language_model.*",
@@ -153,13 +153,33 @@ def _build_cosmos3_accuracy_cases():
 COSMOS3_ACCURACY_CASES = _build_cosmos3_accuracy_cases()
 
 
-def _run_cosmos3_lpips_pipeline(num_frames, video=None):
-    """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
+def _run_cosmos3_lpips_pipeline(
+    num_frames,
+    video=None,
+    image=None,
+    model_subpath=(COSMOS3_NANO_MODEL_SUBPATH,),
+    label="Cosmos3-Nano checkpoint",
+    height=COSMOS3_LPIPS_HEIGHT,
+    width=COSMOS3_LPIPS_WIDTH,
+    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+    output_type="video",
+):
+    """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
-    or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
-    decoded on the worker's NVDEC) yields the video-to-video path.
+    or ``None`` if generation produced no video. Passing ``video`` (encoded MP4
+    bytes, decoded on the worker's NVDEC) yields the video-to-video path;
+    passing ``image`` yields the image-to-video path.
+
+    ``output_type="image"`` selects the real text-to-image path and returns
+    ``(B, H, W, C)`` instead. It is not the same as ``num_frames=1``: the
+    pipeline keys T2I off ``output_type``, which also swaps in
+    ``COSMOS3_T2I_PARAMS``, the T2I system prompt and the image resolution
+    template, so a one-frame video run exercises none of that.
+
+    ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a
+    tuple of path components, so nested checkpoints (the FP8 builds ship inside
+    a dated subdirectory) address the same way as top-level ones.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -174,8 +194,8 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        model_path = _lpips_model_path(*model_subpath)
+        _require_exists(model_path, label, is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -194,18 +214,24 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    height=COSMOS3_LPIPS_HEIGHT,
-                    width=COSMOS3_LPIPS_WIDTH,
+                    height=height,
+                    width=width,
                     num_frames=num_frames,
-                    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+                    num_inference_steps=num_inference_steps,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                     video=video,
+                    image=image,
+                    output_type=output_type,
                 )
-            if result is None or result.video is None:
+            if result is None:
                 return None
-            return result.video.detach().cpu()
+            # T2I returns image (B, H, W, C) and leaves video unset.
+            produced = result.image if output_type == "image" else result.video
+            if produced is None:
+                return None
+            return produced.detach().cpu()
         finally:
             del pipeline
             _cleanup_cuda()
@@ -234,7 +260,7 @@ COSMOS3_LPIPS_V2V_REFERENCE_MP4 = os.path.join(
 
 
 def _cosmos3_v2v_lpips_reference_bytes():
-    _skip_if_missing(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
+    _require_exists(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
     with open(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "rb") as f:
         return f.read()
 
@@ -271,7 +297,7 @@ def _generate_cosmos3_feature_image(case, output_path):
     pipeline = None
     try:
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         # Pin fp32-matmul arithmetic only for the profiles whose goldens are
         # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
@@ -427,17 +453,33 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
     _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
-def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
+@pytest.fixture
+def _cosmos3_example_deps(request, model_subpath):
+    """Filter the Super release platform before checking media dependencies."""
+    if model_subpath == "Cosmos3-Super" and conftest.get_sm_version() != 100:
+        pytest.skip("Cosmos3-Super release tests target B200/GB200 (SM100)")
+    request.getfixturevalue("_visual_gen_deps")
 
-    Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
-    work together as documented. Uses the local Cosmos3-Nano checkpoint and
-    the shared FP8 dynamic-quant config.
+
+@pytest.mark.parametrize(
+    "model_subpath",
+    [
+        pytest.param("Cosmos3-Nano", id="nano-1gpu"),
+        pytest.param("Cosmos3-Super", id="super-1gpu"),
+    ],
+)
+def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_venv):
+    """Run the Nano or Super example with the shared single-GPU config.
+
+    Uses VANILLA attention and the checkpoint's quantization settings through
+    ``configs/cosmos3-nano-1gpu.yaml``, which supports both models.
     """
-    model_path = _lpips_model_path("Cosmos3-Nano")
-    _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+    model_path = _lpips_model_path(model_subpath)
+    _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
 
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example")
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example", model_subpath
+    )
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_output.mp4")
 
@@ -477,7 +519,7 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
     checkpoint's fixed distilled schedule; the run must produce an image.
     """
     model_path = _lpips_model_path("Cosmos3-Super-Text2Image-4Step")
-    _skip_if_missing(model_path, "Cosmos3-Super-Text2Image-4Step checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Super-Text2Image-4Step checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_t2i_4step_example"
@@ -545,7 +587,7 @@ def test_cosmos3_i2v_4step_example(_visual_gen_deps, llm_root, llm_venv):
     must produce a video.
     """
     model_path = _lpips_model_path("Cosmos3-Super-Image2Video-4Step")
-    _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_i2v_4step_example"
@@ -601,7 +643,7 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
 
         model_path = _lpips_model_path(COSMOS3_I2V_4STEP_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -721,7 +763,7 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     video.
     """
     model_path = _lpips_model_path("Cosmos3-Edge")
-    _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_edge_i2v_example"
@@ -775,7 +817,7 @@ def test_cosmos3_edge_policy_droid_example(_visual_gen_deps, llm_root, llm_venv)
     from safetensors.torch import load_file
 
     model_path = _lpips_model_path("Cosmos3-Edge-Policy-DROID")
-    _skip_if_missing(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(),
@@ -858,12 +900,21 @@ COSMOS3_EDGE_T2I_LPIPS_PROMPT = (
 )
 COSMOS3_EDGE_T2I_LPIPS_STEPS = 50
 COSMOS3_EDGE_T2I_LPIPS_THRESHOLD = 0.05
+# Staged by llm-models !635. Seven steps is the smallest count that runs the
+# W8A16 windows (first 3 and last 3) and one W8A8 middle step.
+COSMOS3_EDGE_FP8_SUBPATH = "Cosmos3-Edge-FP8/cosmos3-edge-fp8-04112026"
+COSMOS3_EDGE_FP8_SMOKE_STEPS = 7
+COSMOS3_EDGE_FP8_SMOKE_FRAMES = 9
+# Per-step precision for the 7-step smoke run: True is W8A16, False is W8A8.
+# The policy is 3 first and 3 last steps at W8A16, with one W8A8 middle step.
+COSMOS3_EDGE_FP8_SMOKE_W8A16_STEPS = [True, True, True, False, True, True, True]
 
 
-def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
-    """Run the Cosmos3-Edge pipeline and return the PipelineOutput.
+def _run_cosmos3_edge_lpips_pipeline(model_subpath="Cosmos3-Edge", **forward_kwargs):
+    """Run a Cosmos3-Edge pipeline and return the PipelineOutput.
 
     VANILLA attention, compile-off; guardrails disabled for the run.
+    ``model_subpath`` selects the checkpoint under the CI model root.
     """
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
     previous_guardrails_env = os.environ.get(guardrails_env_key)
@@ -877,8 +928,8 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path("Cosmos3-Edge")
-        _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+        model_path = _lpips_model_path(model_subpath)
+        _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -1023,3 +1074,130 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
         "cosmos3_edge_t2i_lpips_golden.png",
     )
     _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2I_LPIPS_THRESHOLD)
+
+
+@contextlib.contextmanager
+def _record_edge_fp8_runtime():
+    """Record per-step precision selection and the decoder output before ``uint8``.
+
+    For the duration of one pipeline run this wraps two runtime entry points:
+    the transformer's per-step precision selector, and ``postprocess_video_tensor``,
+    which receives the float decoder output before it is cast to ``uint8``.
+
+    Yields ``(step_calls, decoded_finite)``. ``step_calls`` holds one
+    ``(step_index, high_precision)`` pair per selector call, where True means
+    W8A16. ``decoded_finite`` holds one bool per postprocess call.
+    """
+    from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3VFMTransformer,
+    )
+
+    step_calls = []
+    decoded_finite = []
+    original_set_step = Cosmos3VFMTransformer.set_denoising_step
+    original_postprocess = pipeline_cosmos3.postprocess_video_tensor
+
+    def recording_set_step(self, step_index, num_steps):
+        original_set_step(self, step_index=step_index, num_steps=num_steps)
+        step_calls.append((step_index, self.step_precision_controller.high_precision))
+
+    def recording_postprocess(video):
+        decoded_finite.append(bool(torch.isfinite(video.float()).all()))
+        return original_postprocess(video)
+
+    Cosmos3VFMTransformer.set_denoising_step = recording_set_step
+    pipeline_cosmos3.postprocess_video_tensor = recording_postprocess
+    try:
+        yield step_calls, decoded_finite
+    finally:
+        Cosmos3VFMTransformer.set_denoising_step = original_set_step
+        pipeline_cosmos3.postprocess_video_tensor = original_postprocess
+
+
+def _assert_edge_fp8_step_pattern(step_calls, expected_high_precision):
+    """Require each step's CFG branches to agree and the steps to follow the policy."""
+    by_step = {}
+    for step_index, high_precision in step_calls:
+        by_step.setdefault(step_index, set()).add(high_precision)
+    assert sorted(by_step) == list(range(len(expected_high_precision))), sorted(by_step)
+    observed = [by_step[index] for index in range(len(expected_high_precision))]
+    assert observed == [{value} for value in expected_high_precision], observed
+
+
+def _assert_decoder_finite(decoded_finite):
+    """Check the decoder output before the ``uint8`` cast, where NaN and inf still exist."""
+    assert decoded_finite, "decoder output was never post-processed"
+    assert all(decoded_finite), "non-finite decoder output before uint8 conversion"
+
+
+def _assert_media_contract(tensor, shape):
+    """Require the ``PipelineOutput`` contract: a leading batch, ``uint8``, non-empty."""
+    assert tuple(tensor.shape) == (1, *shape), tuple(tensor.shape)
+    assert tensor.dtype == torch.uint8
+    assert tensor.numel() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_t2i_smoke():
+    """Edge-FP8 text-to-image: output contract, finite decoder output, and step pattern.
+
+    Seven denoising steps cover both W8A16 windows and one W8A8 middle step.
+    """
+    with _record_edge_fp8_runtime() as (step_calls, decoded_finite):
+        result = _run_cosmos3_edge_lpips_pipeline(
+            COSMOS3_EDGE_FP8_SUBPATH,
+            prompt=COSMOS3_EDGE_T2I_LPIPS_PROMPT,
+            height=640,
+            width=640,
+            num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+            guidance_scale=4.0,
+            output_type="image",
+        )
+    assert result is not None and result.image is not None, "Edge-FP8 T2I produced no image"
+    _assert_media_contract(result.image, (640, 640, 3))
+    _assert_decoder_finite(decoded_finite)
+    _assert_edge_fp8_step_pattern(step_calls, COSMOS3_EDGE_FP8_SMOKE_W8A16_STEPS)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_t2v_smoke():
+    """Edge-FP8 text-to-video at the native 832x480 canvas, nine frames."""
+    with _record_edge_fp8_runtime() as (step_calls, decoded_finite):
+        result = _run_cosmos3_edge_lpips_pipeline(
+            COSMOS3_EDGE_FP8_SUBPATH,
+            prompt=COSMOS3_EDGE_T2V_LPIPS_PROMPT,
+            height=480,
+            width=832,
+            num_frames=COSMOS3_EDGE_FP8_SMOKE_FRAMES,
+            num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+            guidance_scale=5.0,
+            frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+        )
+    assert result is not None and result.video is not None, "Edge-FP8 T2V produced no video"
+    _assert_media_contract(result.video, (COSMOS3_EDGE_FP8_SMOKE_FRAMES, 480, 832, 3))
+    _assert_decoder_finite(decoded_finite)
+    _assert_edge_fp8_step_pattern(step_calls, COSMOS3_EDGE_FP8_SMOKE_W8A16_STEPS)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_i2v_smoke(tmp_path):
+    """Edge-FP8 image-to-video from a deterministic 832x480 conditioning frame."""
+    image_path = tmp_path / "cosmos3_edge_fp8_conditioning.png"
+    _write_cosmos3_edge_conditioning_image(image_path)
+    with _record_edge_fp8_runtime() as (step_calls, decoded_finite):
+        result = _run_cosmos3_edge_lpips_pipeline(
+            COSMOS3_EDGE_FP8_SUBPATH,
+            prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
+            image=image_path.read_bytes(),
+            height=480,
+            width=832,
+            num_frames=COSMOS3_EDGE_FP8_SMOKE_FRAMES,
+            num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+            guidance_scale=5.0,
+            frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+        )
+    assert result is not None and result.video is not None, "Edge-FP8 I2V produced no video"
+    _assert_media_contract(result.video, (COSMOS3_EDGE_FP8_SMOKE_FRAMES, 480, 832, 3))
+    _assert_decoder_finite(decoded_finite)
+    _assert_edge_fp8_step_pattern(step_calls, COSMOS3_EDGE_FP8_SMOKE_W8A16_STEPS)

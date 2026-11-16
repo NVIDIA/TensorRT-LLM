@@ -81,7 +81,14 @@ from .defaults import (
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
-from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
+from .sampling import (
+    DISTILLED_GUIDANCE_SCALE,
+    Cosmos3SamplingPolicy,
+    SamplingSchedule,
+    SigmaGrid,
+    load_scheduler,
+    resolve_sampling_schedule,
+)
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
     TRANSFER_DEFAULTS,
@@ -395,6 +402,14 @@ class _ResolvedRequest:
     use_state: bool
     action_content_height: Optional[int]
     action_content_width: Optional[int]
+    schedule: SamplingSchedule
+
+
+def _transfer_flow_shift(transfer_config: Cosmos3TransferConfig) -> float:
+    """The flow shift a transfer request runs with when it selects none itself."""
+    if transfer_config.flow_shift is not None:
+        return float(transfer_config.flow_shift)
+    return COSMOS3_V2V_DEFAULT_FLOW_SHIFT
 
 
 @dataclass
@@ -424,6 +439,7 @@ class _PreparedLatents:
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
         "nvidia/Cosmos3-Edge",
+        "nvidia/Cosmos3-Edge-FP8",
         "nvidia/Cosmos3-Edge-Policy-DROID",
     ],
     doc="Cosmos3 Omnimodal world models.",
@@ -446,7 +462,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.default_use_system_prompt = False
         self.use_native_flow_schedule = False
         self.family = resolve_arch_recipe(primary_pretrained_config).name
-        # Schedulers are identified by their resolved (flow_shift, karras) pair
+        # Schedulers are identified by their resolved (grid, flow_shift, stream) recipe
         self._scheduler_cache: dict = {}
         if getattr(
             primary_pretrained_config,
@@ -755,7 +771,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     "Please run the following installation commands or "
                     "explicitly disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 "
                     "(user is responsible for deploying the model without guardrails). "
-                    "- `pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+                    "- `pip install cosmos_guardrail==0.3.2 && pip uninstall opencv-python "
+                    "&& pip install opencv-python-headless`"
                 )
             # Guardrails are only evaluated on rank 0; load them only there to avoid
             # dead model weights occupying GPU memory on every other rank.
@@ -779,8 +796,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_steps(self):
+        steps = super().default_warmup_steps
+        # A step policy's edge windows cover every step of a short warmup; one
+        # more step than both windows reaches the FP8 middle as well.
+        controller = getattr(self.transformer, "step_precision_controller", None)
+        if controller is not None:
+            steps = max(steps, controller.first_steps + controller.last_steps + 1)
         # Distilled checkpoints only run their fixed schedule length.
-        return self.sampling.num_steps(super().default_warmup_steps)
+        return self.sampling.num_steps(steps)
 
     @property
     def default_generation_params(self):
@@ -852,21 +875,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 enable_audio=False,
             )
 
-    def _scheduler_for(
-        self,
-        target_shift: Optional[float],
-        use_karras_sigmas: Optional[bool] = None,
-        *,
-        stream: str = "video",
-    ) -> Any:
-        """The scheduler for one resolved sampling configuration, built once.
+    def _scheduler_for(self, schedule: SamplingSchedule, *, stream: str = "video") -> Any:
+        """The scheduler ``schedule`` runs on for ``stream``.
 
-        A scheduler's identity is its resolved ``(flow_shift, karras)`` pair,
-        not the request mode: modes that resolve to the same pair share an
-        instance, and a pair is never rebuilt once seen. Streams get separate
-        instances at the same configuration because schedulers mutate internal
-        state on every ``.step()`` — video and audio denoise in lockstep, so
-        they must share the knobs but not the object.
+        Schedulers are cached by their ``(grid, flow_shift, stream)`` recipe, not by
+        the request mode: modes that resolve to the same recipe reuse one entry. Only
+        shifts this checkpoint resolves to on its own are cached (see
+        ``_cacheable_flow_shifts``); a caller-supplied shift outside them gets a
+        scheduler built for the request. Entries whose knobs match the stream's base
+        scheduler may hold that same object; that is safe because ``set_timesteps``
+        programs the scheduler for every request. Streams build from their own base
+        instances, since schedulers mutate internal state on every ``.step()`` and
+        video and audio denoise in lockstep.
         """
         if stream == "audio":
             base = getattr(self, "_base_audio_scheduler", None) or self.audio_scheduler
@@ -879,20 +899,60 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # domain, so caching every value seen would let a client grow the cache
         # for the worker's lifetime; a one-off value builds a scheduler that is
         # discarded with the request instead.
-        if target_shift is not None and target_shift not in self._cacheable_flow_shifts():
-            return self.sampling.set_flow_shift(
-                base, target_shift, use_karras_sigmas=use_karras_sigmas
-            )
+        if schedule.flow_shift not in self._cacheable_flow_shifts():
+            return self.sampling.set_flow_shift(base, schedule)
 
         cache = getattr(self, "_scheduler_cache", None)
         if cache is None:
             cache = self._scheduler_cache = {}
-        key = (target_shift, use_karras_sigmas, stream)
+        key = (schedule.grid, schedule.flow_shift, stream)
         if key not in cache:
-            cache[key] = self.sampling.set_flow_shift(
-                base, target_shift, use_karras_sigmas=use_karras_sigmas
-            )
+            cache[key] = self.sampling.set_flow_shift(base, schedule)
         return cache[key]
+
+    def _resolve_schedule(
+        self,
+        *,
+        sigma_grid: Optional[SigmaGrid],
+        flow_shift: Optional[float],
+        mode_flow_shift: float,
+        mode_use_karras_sigmas: Optional[bool],
+    ) -> SamplingSchedule:
+        """Resolve a request's sampling schedule; see ``resolve_sampling_schedule``."""
+        schedule = resolve_sampling_schedule(
+            self.sampling,
+            sigma_grid=sigma_grid,
+            flow_shift=flow_shift,
+            mode_flow_shift=mode_flow_shift,
+            mode_use_karras_sigmas=mode_use_karras_sigmas,
+        )
+        if schedule.inactive_flow_shift and self.rank == 0:
+            logger.warning(
+                f"Cosmos3 flow_shift={flow_shift} has no effect: this request samples the "
+                "checkpoint's Karras sigma grid, which is not flow-shifted. Set "
+                "extra_params sigma_grid='native' or 'diffusers' to apply a flow shift."
+            )
+        return schedule
+
+    def _transfer_schedule(
+        self,
+        transfer_config: Cosmos3TransferConfig,
+        *,
+        sigma_grid: Optional[SigmaGrid] = None,
+    ) -> SamplingSchedule:
+        """The schedule a transfer request samples with.
+
+        The request's ``sigma_grid``, else the mode's non-Karras default. The shift
+        comes from ``transfer_config`` alone: the request's ``flow_shift`` when
+        ``flow_shift_explicit`` is set, else the hint preset's (see
+        :func:`_transfer_flow_shift`).
+        """
+        return self._resolve_schedule(
+            sigma_grid=sigma_grid,
+            flow_shift=transfer_config.flow_shift if transfer_config.flow_shift_explicit else None,
+            mode_flow_shift=_transfer_flow_shift(transfer_config),
+            mode_use_karras_sigmas=False,
+        )
 
     def _cacheable_flow_shifts(self) -> frozenset:
         """Flow shifts reachable without a caller override, for this checkpoint.
@@ -1076,7 +1136,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             video=video,
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
-            flow_shift=extra_params.get("flow_shift"),
+            # A transfer request's flow_shift travels in transfer_config.
+            flow_shift=None if transfer_config is not None else extra_params.get("flow_shift"),
+            sigma_grid=extra_params.get("sigma_grid"),
             action_mode=action_mode,
             domain_name=extra_params.get("domain_name"),
             domain_id=extra_params.get("domain_id"),
@@ -1109,6 +1171,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         come here, matching the reference, so a JSON negative prompt keeps its
         serialized form and gains the sentences after it.
         """
+        if duration_template is None and resolution_template is None:
+            return prompt
+
         parts: List[str] = []
         head = prompt.rstrip(".").strip()
         if head:
@@ -1137,7 +1202,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         resolution_template: Optional[str],
         force_duration_template: bool = False,
     ) -> str:
-        """Apply cosmos-framework-style metadata to plain text or JSON prompts."""
+        """Fill missing JSON metadata or append it to a plain-text prompt."""
         stripped = prompt.strip()
         if stripped.startswith("{"):
             try:
@@ -1146,22 +1211,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 data = None
             else:
                 if isinstance(data, dict):
+                    metadata_defaults = {}
                     if duration_template is not None and (
                         num_frames > 1 or force_duration_template
                     ):
                         # Truncated, not rounded, and integer-valued even though the
-                        # text template above stays fractional: both mirror the
-                        # reference (cosmos-framework _format_json_prompt_with_template).
-                        data["duration"] = f"{int(num_frames / frame_rate)}s"
-                        data["fps"] = float(frame_rate)
-                    else:
-                        # A still carries no duration: drop whatever the caller's
-                        # JSON declared rather than leaving it stale.
-                        data.pop("duration", None)
-                        data.pop("fps", None)
+                        # text template above stays fractional.
+                        metadata_defaults["duration"] = f"{int(num_frames / frame_rate)}s"
+                        metadata_defaults["fps"] = float(frame_rate)
                     if resolution_template is not None:
-                        data["resolution"] = {"H": int(height), "W": int(width)}
-                        data["aspect_ratio"] = _aspect_ratio_bucket(height, width)
+                        metadata_defaults["resolution"] = {"H": int(height), "W": int(width)}
+                        metadata_defaults["aspect_ratio"] = _aspect_ratio_bucket(height, width)
+                    missing_defaults = {
+                        key: value for key, value in metadata_defaults.items() if key not in data
+                    }
+                    if not missing_defaults:
+                        return prompt
+                    data.update(missing_defaults)
                     return json.dumps(data)
 
         return self._apply_metadata_templates(
@@ -1693,6 +1759,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_resolution: Optional[int],
         action_fps: Optional[float],
         transfer_config: Optional[Cosmos3TransferConfig],
+        sigma_grid: Optional[SigmaGrid] = None,
     ) -> _ResolvedRequest:
         """Resolve workflow defaults, schedulers, and action canvas geometry."""
         normalized_action_mode = normalize_action_mode(action_mode)
@@ -1822,21 +1889,28 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if mode_shift is None:
             mode_shift = self.sampling.checkpoint_flow_shift
         if is_v2v:
-            target_shift = COSMOS3_V2V_FLOW_SHIFT if flow_shift is None else flow_shift
-            target_karras = False
-        else:
-            target_shift = mode_shift if flow_shift is None else flow_shift
-            target_karras = None
+            mode_shift = COSMOS3_V2V_FLOW_SHIFT
         if transfer_config is None:
-            self.scheduler = self._scheduler_for(target_shift, target_karras)
+            schedule = self._resolve_schedule(
+                sigma_grid=sigma_grid,
+                flow_shift=flow_shift,
+                mode_flow_shift=mode_shift,
+                mode_use_karras_sigmas=False if is_v2v else None,
+            )
+            self.scheduler = self._scheduler_for(schedule)
             if getattr(self, "audio_scheduler", None) is not None:
-                self.audio_scheduler = self._scheduler_for(
-                    target_shift, target_karras, stream="audio"
-                )
+                self.audio_scheduler = self._scheduler_for(schedule, stream="audio")
             if getattr(self, "action_scheduler", None) is not None:
-                self.action_scheduler = self._scheduler_for(
-                    target_shift, target_karras, stream="action"
+                self.action_scheduler = self._scheduler_for(schedule, stream="action")
+        else:
+            # Resolved here so an unsupported selection is rejected before any control
+            # is decoded; _forward_transfer builds its scheduler from this schedule.
+            if flow_shift is not None:
+                raise ValueError(
+                    "A Cosmos3 transfer request takes its flow_shift from the transfer "
+                    "config; set Cosmos3TransferConfig.flow_shift instead."
                 )
+            schedule = self._transfer_schedule(transfer_config, sigma_grid=sigma_grid)
 
         if self.rank == 0:
             logger.info(
@@ -1909,6 +1983,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_state=bool(use_state),
             action_content_height=action_content_h,
             action_content_width=action_content_w,
+            schedule=schedule,
         )
 
     def _is_text_blocked(
@@ -1952,7 +2027,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         if not request.do_action:
-            use_duration_template = use_duration_template and not request.is_t2i
             duration_template = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
             if use_resolution_template:
                 resolution_template = (
@@ -2227,6 +2301,21 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return prepared
 
+    def _select_step_precision(self, step_index: int) -> None:
+        """Select this denoising step's activation precision on the transformer.
+
+        A pure function of step_index, so the conditional and unconditional CFG
+        branches of one step always select the same path even though each
+        calls this separately. No-op unless the checkpoint declares a step
+        policy.
+        """
+        # getattr: the transformer is not always a Cosmos3Transformer.
+        # Distilled-pipeline tests substitute a lightweight stand-in, and a
+        # transformer with no step policy has no reason to carry these.
+        set_step = getattr(self.transformer, "set_denoising_step", None)
+        if set_step is not None:
+            set_step(step_index=step_index, num_steps=len(self.scheduler.timesteps))
+
     def _denoise_request(
         self,
         request: _ResolvedRequest,
@@ -2245,12 +2334,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         latents = prepared.video_latents
         video_shape = tuple(latents.shape[2:5])
 
-        self.sampling.set_timesteps(self.scheduler, request.num_inference_steps, device=self.device)
+        self.sampling.set_timesteps(
+            self.scheduler,
+            request.num_inference_steps,
+            device=self.device,
+            schedule=request.schedule,
+        )
         if request.do_action:
             self.sampling.set_timesteps(
                 self.action_scheduler,
                 request.num_inference_steps,
                 device=self.device,
+                schedule=request.schedule,
             )
 
         do_audio = request.enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
@@ -2272,6 +2367,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self.audio_scheduler,
                 request.num_inference_steps,
                 device=self.device,
+                schedule=request.schedule,
             )
 
         action_domain_ids_tensor = None
@@ -2288,6 +2384,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
+            self._select_step_precision(step_index)
+
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None
 
@@ -2375,23 +2473,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         should_pin_condition = (
             prepared.condition_latents is not None and prepared.velocity_mask is not None
         )
-        denoise_result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=request.guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-            extra_streams=extra_streams,
-            guidance_interval=request.guidance_interval,
-            post_step_fn=(
-                post_step_fn
-                if (request.do_action or should_pin_condition)
-                else self._conditioning_anchor_post_step(prepared.image_latent)
-            ),
-            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
-        )
+        try:
+            denoise_result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=request.guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams=extra_streams,
+                guidance_interval=request.guidance_interval,
+                post_step_fn=(
+                    post_step_fn
+                    if (request.do_action or should_pin_condition)
+                    else self._conditioning_anchor_post_step(prepared.image_latent)
+                ),
+                scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            )
+        finally:
+            # In a finally because a failed request must not leave the selection
+            # latched. The transfer path runs the transformer without selecting
+            # a step, so it would inherit whatever the failed request left
+            # behind and run every call in 16-bit with nothing to indicate it.
+            reset_step = getattr(self.transformer, "reset_denoising_step", None)
+            if reset_step is not None:
+                reset_step()
 
         action_latents = prepared.action_latents
         if extra_streams is not None:
@@ -2505,6 +2612,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_resolution: Optional[int] = None,
         action_fps: Optional[float] = None,
         transfer_config: Optional[Cosmos3TransferConfig] = None,
+        sigma_grid: Optional[SigmaGrid] = None,
     ):
         """Run one generation. ``infer()`` is the resolved entry point.
 
@@ -2547,6 +2655,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             action_resolution=action_resolution,
             action_fps=action_fps,
             transfer_config=transfer_config,
+            sigma_grid=sigma_grid,
         )
 
         if isinstance(prompt, str):
@@ -2579,6 +2688,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 timer=timer,
                 transfer_config=transfer_config,
                 video=video,
+                schedule=request.schedule,
             )
 
         generator = make_noise_generator(seed, self.device)
@@ -2739,7 +2849,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
 
-        branch_caches: dict[str, tuple[Any, Any]] = {}
+        branch_caches: dict[
+            str,
+            tuple[Any, Any, torch.Tensor | None, list[int] | None, bool | None],
+        ] = {}
 
         def run_branch(
             cache_key: str,
@@ -2749,10 +2862,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_control_latents: list[torch.Tensor] | None,
             timestep: torch.Tensor,
         ) -> torch.Tensor:
-            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
-                cache_key,
-                (None, None),
-            )
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
+            ) = branch_caches.get(cache_key, (None, None, None, None, None))
             result = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
@@ -2766,6 +2882,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_caches[cache_key] = (
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
             )
             if result.video is None:
                 raise ValueError("Cosmos3 transfer diffusion expects video predictions.")
@@ -2859,6 +2978,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         timer: CudaPhaseTimer,
         transfer_config: Cosmos3TransferConfig,
         video: Optional[bytes],
+        schedule: SamplingSchedule,
     ) -> PipelineOutput:
         if self.rank == 0:
             logger.info(f"Cosmos3 transfer target={width}x{height} (WxH)")
@@ -2964,18 +3084,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     f"{DISTILLED_GUIDANCE_SCALE}; per-hint guidance presets do not apply."
                 )
             guidance_scale = DISTILLED_GUIDANCE_SCALE
-        flow_shift_target = float(
-            transfer_config.flow_shift
-            if transfer_config.flow_shift is not None
-            else COSMOS3_V2V_DEFAULT_FLOW_SHIFT
-        )
         max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
         # forward() skips its own scheduler rebuild for transfer, so this is the
         # only setup on this path: assigning is what keeps a previous request's
         # scheduler from carrying over on a reused worker.
-        self.scheduler = self._scheduler_for(flow_shift_target, use_karras_sigmas=False)
+        self.scheduler = self._scheduler_for(schedule)
 
         generator = make_noise_generator(seed, self.device)
 
@@ -3117,7 +3232,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 transfer_share_vision_temporal_positions=transfer_config.share_vision_temporal_positions,
             )
 
-            self.sampling.set_timesteps(self.scheduler, num_inference_steps, device=self.device)
+            self.sampling.set_timesteps(
+                self.scheduler, num_inference_steps, device=self.device, schedule=schedule
+            )
             latents = self.diffuse_transfer(
                 latents=latents,
                 timesteps=self.scheduler.timesteps,

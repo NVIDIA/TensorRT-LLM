@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/batchedPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h"
-#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/stagingBuffer.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -226,7 +226,7 @@ TEST(KvCacheManagerV2StagingBufferTest, EphemeralHostIndicesUploadIntoDeviceRing
         auto device = deviceManager.acquire(sizeof(PageIndexPair), std::min(remainingBytes, kChunkBytes),
             sizeof(PageIndexPair), alignof(PageIndexPair), reinterpret_cast<CUstream>(stream));
         size_t const chunkPairs = std::min(input.size() - offset, device.size() / sizeof(PageIndexPair));
-        detail::copyPageIndicesToDevice(static_cast<CUdeviceptr>(device.address()), input.data() + offset, chunkPairs,
+        copyToDeviceSyncSource(static_cast<CUdeviceptr>(device.address()), input.data() + offset, chunkPairs,
             reinterpret_cast<CUstream>(stream));
 
         // The helper captures the pageable host source before returning.

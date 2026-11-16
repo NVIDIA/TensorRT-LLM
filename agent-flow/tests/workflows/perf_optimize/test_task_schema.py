@@ -26,6 +26,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
     # perf-analyze base defaults still merge.
     assert data["benchmark"]["random_input_len"] == 1024
     assert data["profile"]["methods"] == ["nsys", "ncu"]
+    assert data["casebook"] == {"enabled": True}
     # perf-optimize defaults merge.
     assert data["optimize"] == {
         "max_rounds": 5,
@@ -639,3 +640,26 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
     )
 
     assert unknown == []
+
+
+def test_optimize_roles_survive_the_reused_analyze_validation_pass(tmp_path):
+    task = _write_task(
+        tmp_path,
+        {
+            "agents": {
+                "roles": {
+                    "optimizer": {"backend": "codex"},
+                    "evaluator": {"model": "gpt-5.6-sol"},
+                    "integrator": {"reasoning_effort": "medium"},
+                    "qa": {"reasoning_effort": "medium"},
+                }
+            }
+        },
+    )
+    resolved = task_schema.load_and_validate_task_yaml(task)
+    assert set(resolved["agents"]["roles"]) == {
+        "optimizer",
+        "evaluator",
+        "integrator",
+        "qa",
+    }

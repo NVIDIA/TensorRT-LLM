@@ -4,22 +4,22 @@ By NVIDIA TensorRT LLM Team and UCSD Hao AI Lab
 
 ## Table of Contents
 - [Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation)](#inference-time-compute-implementation-in-tensorrt-llm)
-  - [Table of Content](#table-of-content)
+  - [Table of Content](#table-of-contents)
   - [Background and Motivation](#background-and-motivation)
-  - [Introduction for Scaffolding: A Framework for inference-time compute](#introduction-for-scaffolding)
-    - [Core Features](#scaffolding-core-feature)
-    - [Architecture](#scaffolding-architecture)
-      - [Worker](#scaffolding-architecture-worker)
-      - [Controller](#scaffolding-architecture-controller)
-      - [ScaffoldingLlm](#scaffolding-architecture-scaffoldingllm)
-  - [An Example: Implement Dynasor on Scaffolding](#example-for-scaffolding)
-    - [Introduction for Dynasor](#dynasor-introduction)
-    - [Implement Dynasor-CoT in Scaffolding](#dynasor-cot-implement-in-scaffolding)
-    - [Implement Dynasor-CoT based Majority Voting in Scaffolding](#dynasor-cot-based-majority-vote-in-scaffolding)
-    - [Acknowledgements](#dynasor-acknowledgements)
-    - [Reference](#dynasor-reference)
-  - [Feature List on Scaffolding](#scaffolding-feature-list)
-  - [Future Work](#scaffolding-future-work)
+  - [Introduction for Scaffolding: A Framework for inference-time compute](#introduction-for-scaffolding-a-framework-for-inference-time-compute)
+    - [Core Features](#core-features)
+    - [Architecture](#architecture)
+      - [Worker](#worker)
+      - [Controller](#controller)
+      - [ScaffoldingLlm](#scaffoldingllm)
+  - [An Example: Implement Dynasor on Scaffolding](#an-example-implement-dynasor-cot-on-scaffolding)
+    - [Introduction for Dynasor](#introduction-for-dynasor-cot)
+    - [Implement Dynasor-CoT in Scaffolding](#implement-dynasor-cot-in-scaffolding)
+    - [Implement Dynasor-CoT based Majority Voting in Scaffolding](#implement-dynasor-cot-based-majority-voting-in-scaffolding)
+    - [Acknowledgements](#acknowledgements)
+    - [Reference](#reference)
+  - [Feature List on Scaffolding](#feature-list-on-scaffolding)
+  - [Future Work](#future-work)
 
 
 ## Background and Motivation
@@ -200,12 +200,12 @@ is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT
 #### Motivation of Dynasor-CoT
 LLM reasoning is highly token-inefficient, often requiring far more tokens to achieve the same accuracy as non-reasoning models. A major source of this inefficiency is that reasoning models tend to **self-doubt**; they often reach the correct answer early but then engage in extended verification behaviors like double-checking and reassessment.
 
-For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
+For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, DeepSeek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
 
 <div align="center">
     <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_hesitation.png" alt="Motivation" width="900px">
 </div>
-<p align="center"><sub><em>Figure 2. An example answer from reasoning model (Deepseek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
+<p align="center"><sub><em>Figure 2. An example answer from reasoning model (DeepSeek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
 
 #### The "Probe" technique
 Dynasor-CoT uses a **"Probe-In-The-Middle"** (or "probe" for short) technique, which prompts reasoning models to output early-stage results during intermediate steps of reasoning. Imagine you're in a math exam working on a hard problem. When time is up, you're forced to write down your final answer, regardless of how confident you are.

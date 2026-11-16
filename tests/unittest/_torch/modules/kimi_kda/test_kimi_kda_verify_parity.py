@@ -25,6 +25,7 @@ pytest.importorskip("fla")
 
 from kimi_kda_test_utils import get_production_decode_kernel_path
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -77,6 +78,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     metadata = SimpleNamespace(
         mamba_metadata=SimpleNamespace(
             state_indices=state_indices,
+            replay_state_indices=state_indices,
             query_start_loc_long=torch.zeros(1, dtype=torch.long),
         ),
         num_contexts=0,
@@ -113,8 +115,12 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
         output: torch.Tensor | None = None,
+        allow_prequantized_output: bool = False,
+        replay_slot_indices: torch.Tensor | None = None,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
+        captured["replay_slot_indices"] = replay_slot_indices
         return torch.zeros_like(hidden_states)
 
     monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
@@ -128,10 +134,12 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         use_kda_replay_update = True
 
         def __init__(self) -> None:
-            self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+            self._state_indices_buffer = DeviceCopyBuffer(
+                torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+            )
 
         def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
-            return self.state_indices[: len(request_ids)]
+            return self._state_indices_buffer.tensor[: len(request_ids)]
 
         def mamba_layer_cache(self, layer_idx: int) -> SimpleNamespace:
             return layer_cache
@@ -163,6 +171,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
 
     assert output.shape == hidden_states.shape
     assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
+    # Without replay slots of their own, the replay caches use the state slots.
+    assert captured["replay_slot_indices"].data_ptr() == aligned_indices.data_ptr()
     torch.testing.assert_close(aligned_indices, generation_slice)
 
 
@@ -183,8 +193,10 @@ class _LayerCache:
 
 def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -> SimpleNamespace:
     batch = slot_indices.shape[0]
+    state_indices = slot_indices.to(torch.int32)
     mamba_metadata = SimpleNamespace(
-        state_indices=slot_indices.to(torch.int32),
+        state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc_long=torch.zeros(1, device=slot_indices.device, dtype=torch.long),
         _arange_buffer=torch.arange(batch + 1, device=slot_indices.device, dtype=torch.int32),
     )
@@ -203,8 +215,10 @@ def _prefill_metadata(
     layer_cache: SimpleNamespace, slot_indices: torch.Tensor, cu_seqlens: torch.Tensor
 ) -> SimpleNamespace:
     batch = slot_indices.shape[0]
+    state_indices = slot_indices.to(torch.int32)
     mamba_metadata = SimpleNamespace(
-        state_indices=slot_indices.to(torch.int32),
+        state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc=cu_seqlens.to(torch.int32),
         query_start_loc_long=cu_seqlens,
         has_initial_states=torch.zeros(batch, dtype=torch.bool, device=slot_indices.device),

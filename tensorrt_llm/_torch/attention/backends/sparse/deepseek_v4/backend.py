@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -27,8 +28,16 @@ from tensorrt_llm._torch.attention.backends.interface import (
     merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantMode
 
+from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_row_indices,
+    overlay_mixed_precision_high_rows,
+)
+from ..offload import NVFP4_SCRATCH_TAIL_ROWS
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -40,8 +49,60 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 
+def _alloc_nvfp4_compress_fp8_scratch(
+    num_rows: int, head_dim: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the FP8 scratch the sparse MLA FMHA reads as its aux KV pool.
+
+    Rows [0, num_rows) receive the dequantized compressed KV. With FP8 KV the aux pool is the
+    whole compressed KV pool, so the FMHA's reads past the last indexed row stay inside it;
+    this per-call scratch is sized to the batch, so it carries the same zeroed tail of one
+    FMHA KV tile as the offload scratch (``NVFP4_SCRATCH_TAIL_ROWS``). Without it the FMHA
+    faults whenever the caching allocator places the scratch at the end of a mapped segment.
+    """
+    scratch = torch.empty(
+        (num_rows + NVFP4_SCRATCH_TAIL_ROWS, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    scratch[num_rows:].zero_()
+    return scratch
+
+
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
+
+    @property
+    def uses_fp4_mla_attention(self) -> bool:
+        """Compressed NVFP4 rows are dequantized before sparse MLA."""
+        return False
+
+    def _configure_compress_quant_mode(self) -> None:
+        source_quant_mode = (
+            self.quant_config.layer_quant_mode if self.quant_config is not None else QuantMode(0)
+        )
+        self._uses_nvfp4_compress = source_quant_mode.has_fp4_kv_cache()
+        if self._uses_nvfp4_compress:
+            self.quant_mode = int(
+                (source_quant_mode & ~QuantMode.NVFP4_KV_CACHE) | QuantMode.FP8_KV_CACHE
+            )
+            self.has_fp4_kv_cache = False
+            self.has_fp8_kv_cache = True
+            self._nvfp4_global_scale = 448.0 * 6.0 / _get_nvfp4_mla_kv_cache_amax()
+            self._nvfp4_compress_scale_quant_orig = torch.full_like(
+                self.kv_cache_scaling_factor, 1.0 / self._nvfp4_global_scale
+            )
+        else:
+            self._nvfp4_global_scale = 1.0
+            self._nvfp4_compress_scale_quant_orig = self.kv_scale_quant_orig
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        super().update_quant_config(new_quant_config)
+        self._configure_compress_quant_mode()
+        if self._uses_nvfp4_compress:
+            # The base update builds FMHA libraries before the effective cache
+            # mode is converted from NVFP4 storage to FP8 execution.
+            self._fmha_manager = FmhaManager(self)
 
     def __init__(
         self,
@@ -95,6 +156,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             **kwargs,
         )
 
+        self._configure_compress_quant_mode()
+
         self.sparse_attention_config = sparse_attention_config
         self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
 
@@ -116,7 +179,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             has_fp8_kv_cache = False
             if quant_config is not None:
                 has_fp8_kv_cache = quant_config.layer_quant_mode.has_fp8_kv_cache()
-            kv_cache_dtype = "fp8_pertensor" if has_fp8_kv_cache else "default"
+            kv_cache_dtype = (
+                "nvfp4"
+                if self._uses_nvfp4_compress
+                else "fp8_pertensor"
+                if has_fp8_kv_cache
+                else "default"
+            )
             self.compressor = Compressor(
                 mla_params,
                 layer_idx,
@@ -127,6 +196,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 kv_cache_dtype=kv_cache_dtype,
                 dtype=dtype,
                 rotate_activation=False,
+                nvfp4_global_scale=self._nvfp4_global_scale,
             )
             if self.use_fp8_ds_mla:
                 self.compressor.enable_footer_scale_cache()
@@ -135,7 +205,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> None:
+    ) -> AttentionForwardArgs:
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -147,11 +217,16 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = replace(forward_args.sparse_runtime_params)
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
-        if self.compress_ratio > 1:
+        if self.compress_ratio == 4 and metadata.sparse_offload_state is not None:
+            descriptor = metadata.sparse_offload_state.layers[self.layer_idx]
+            sparse_args.aux_kv_cache_pool_ptr = descriptor.arena_base_addresses[
+                descriptor.data_buffer_index
+            ]
+        elif self.compress_ratio > 1:
             sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
         else:
             sparse_args.aux_kv_cache_pool_ptr = None
@@ -160,6 +235,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.sparse_attention_config.window_size
             + metadata.max_compressed_indices[self.compress_ratio]
         )
+        return replace(forward_args, sparse_runtime_params=sparse_args)
 
     def forward(
         self,
@@ -176,7 +252,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
-        self._prepare_sparse_forward_args(metadata, forward_args)
+        forward_args = self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
     def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
@@ -206,9 +282,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         # Token stride
         index_head_dim = self.sparse_attention_config.index_head_dim
-        has_fp8_kv_cache = False
-        if self.quant_config is not None:
-            has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache()
+        has_fp8_kv_cache = kv_cache_manager.dtype == DataType.FP8
         token_stride = get_token_bytes(
             self.head_dim,
             index_head_dim,
@@ -237,6 +311,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
+        sparse_state = None
+        sparse_index_kwargs = {}
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
@@ -249,6 +325,45 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 topk_indices = sparse_backend_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
+                if self.sparse_attention_config.enable_kv_cache_offload:
+                    sparse_state = metadata.sparse_offload_state
+                    if (
+                        sparse_state is None
+                        or attention_input_type != AttentionInputType.generation_only
+                    ):
+                        raise NotImplementedError(
+                            "Sparse arena attention requires prepared decode metadata"
+                        )
+                    descriptor = sparse_state.layers[layer_idx]
+                    if sparse_state.write_layer != layer_idx:
+                        raise RuntimeError(
+                            "Prepare this layer's compressor writes before sparse attention"
+                        )
+                    compressed_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                        : metadata.num_seqs
+                    ]
+                    fetched = kv_cache_manager.fetch_sparse_indices(
+                        sparse_state, layer_idx, topk_indices, req_id, compressed_lengths
+                    )
+                    data_index = descriptor.data_buffer_index
+                    # Read at the slot: buffers whose arena indices coincide share one
+                    # slice, and the slices no buffer maps to are never written.
+                    data_slot = sparse_state.out_slots[layer_idx][data_index]
+                    sparse_index_kwargs = dict(
+                        compressed_fetched_indices=fetched[:, data_slot, :],
+                        compressed_write_indices=sparse_state.write_indices[
+                            len(descriptor.buffer_ids)
+                        ][:, data_slot],
+                        compressed_history_lengths=sparse_state.history_lengths,
+                        compressed_lengths=compressed_lengths,
+                        compressed_batch_rows=sparse_state.batch_rows,
+                        active_request_count=sparse_state.active_request_count,
+                        compressed_coverage=sparse_state.coverage,
+                    )
+                    compress_pool_base_ptr = descriptor.arena_base_addresses[data_index]
+                    forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
+                        compress_pool_base_ptr
+                    )
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
@@ -300,6 +415,11 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             swa_buffer_ptr=swa_buffer_ptr,
             tokens_per_block=kv_cache_manager.tokens_per_block,
             token_stride=token_stride,
+            compressed_token_stride=(
+                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
+                if self._uses_nvfp4_compress
+                else token_stride
+            ),
             block_table_compressed=block_table_compressed,
             compressed_local_indices=compressed_local_indices,
             compress_pool_base_ptr=compress_pool_base_ptr,
@@ -308,11 +428,133 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
+            mask_invalid_pages=sparse_state is not None,
+            **sparse_index_kwargs,
         )
 
         if self.use_fp8_ds_mla:
             return result
-        return result, None
+        global_indices = result
+
+        if (
+            self.compress_ratio > 1
+            and metadata.has_mixed_precision_high_rows
+            and kv_cache_manager.mixed_precision_low_dtype
+            == kv_cache_manager.mixed_precision_high_dtype
+        ):
+            # Cold-page window: a selected compressed row the high layer holds is read from its row.
+            num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+            mixed_precision_high_row_indices(
+                metadata,
+                self,
+                compressed_local_indices,
+                global_indices[:, -num_compressed_indices:],
+                req_id,
+            )
+            return global_indices, None
+
+        if self._uses_nvfp4_compress and self.compress_ratio > 1:
+            num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+            compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
+            if sparse_state is not None:
+                if descriptor.scale_buffer_index is None or sparse_state.nvfp4_scratch is None:
+                    raise RuntimeError(
+                        "Sparse NVFP4 attention requires block scales and gather scratch"
+                    )
+                scratch = sparse_state.nvfp4_scratch[: compressed_indices.shape[0]]
+                data_pool, scale_pool = kv_cache_manager.get_sparse_compress_buffers(layer_idx)
+                # Paired arena geometry gives data and scales the same row indices.
+                # The existing gather replaces those indices with FP8 scratch indices.
+                torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                    data_pool,
+                    scale_pool,
+                    compressed_indices,
+                    scratch,
+                    self._nvfp4_compress_scale_quant_orig,
+                    kv_cache_manager.nvfp4_residual_dim,
+                    data_pool.shape[0],
+                )
+            else:
+                data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(
+                    self.compress_ratio
+                )
+                num_pool_tokens = data_pool.numel() // (
+                    (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
+                )
+                # The previous layer has already enqueued its attention on this stream.
+                # Release its Python reference before allocating the next scratch so
+                # the caching allocator can reuse the storage in stream order.
+                metadata.nvfp4_compress_fp8_scratch = None
+                if attention_input_type == AttentionInputType.generation_only:
+                    num_scratch_rows = compressed_indices.numel()
+                    scratch = _alloc_nvfp4_compress_fp8_scratch(
+                        num_scratch_rows, self.head_dim, global_indices.device
+                    )
+                    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                        data_pool,
+                        scale_pool,
+                        compressed_indices,
+                        scratch[:num_scratch_rows].view(*compressed_indices.shape, self.head_dim),
+                        self._nvfp4_compress_scale_quant_orig,
+                        kv_cache_manager.nvfp4_residual_dim,
+                        num_pool_tokens,
+                    )
+                else:
+                    request_count = (
+                        metadata.num_contexts
+                        if attention_input_type == AttentionInputType.context_only
+                        else metadata.num_seqs
+                    )
+                    compressed_kv_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                        :request_count
+                    ].contiguous()
+                    total_raw_kv_tokens = int(metadata.host_total_kv_lens[0].item())
+                    if attention_input_type == AttentionInputType.mixed:
+                        total_raw_kv_tokens += int(metadata.host_total_kv_lens[1].item())
+                    # Sum(floor(kv_len / ratio)) <= floor(sum(kv_len) / ratio).
+                    # The latter is a host-known upper bound for the logical-token
+                    # compaction workspace and avoids a device synchronization.
+                    max_compressed_kv_tokens = total_raw_kv_tokens // self.compress_ratio
+                    # Dynamic sparse FMHA may prefetch a full fixed-width Top-K
+                    # tile even when only a short prefix is valid. Match the DSA
+                    # context gather contract by keeping at least one index row's
+                    # width addressable in the scratch pool.
+                    scratch_capacity = max(
+                        compressed_indices.shape[1],
+                        min(max_compressed_kv_tokens, compressed_indices.numel()),
+                    )
+                    scratch = _alloc_nvfp4_compress_fp8_scratch(
+                        scratch_capacity, self.head_dim, global_indices.device
+                    )
+                    if max_compressed_kv_tokens > 0:
+                        torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather_direct(
+                            data_pool,
+                            scale_pool,
+                            compressed_local_indices.contiguous(),
+                            req_id.contiguous(),
+                            compressed_kv_lengths,
+                            compressed_indices,
+                            scratch[:scratch_capacity].unsqueeze(1),
+                            self._nvfp4_compress_scale_quant_orig,
+                            kv_cache_manager.nvfp4_residual_dim,
+                            max_compressed_kv_tokens,
+                            num_pool_tokens,
+                        )
+            if metadata.has_mixed_precision_high_rows:
+                overlay_mixed_precision_high_rows(
+                    self,
+                    metadata,
+                    compressed_local_indices,
+                    req_id,
+                    compressed_indices,
+                    scratch,
+                    shared_rows=attention_input_type != AttentionInputType.generation_only,
+                )
+            metadata.nvfp4_compress_fp8_scratch = scratch
+            global_indices[:, -num_compressed_indices:] = compressed_indices
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+
+        return global_indices, None
 
     def sparse_kv_predict(
         self,

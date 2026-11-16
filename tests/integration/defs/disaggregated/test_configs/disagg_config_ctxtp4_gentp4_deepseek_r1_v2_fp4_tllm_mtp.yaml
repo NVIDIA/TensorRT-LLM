@@ -33,7 +33,6 @@ context_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 16384
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -73,4 +72,3 @@ generation_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 16384

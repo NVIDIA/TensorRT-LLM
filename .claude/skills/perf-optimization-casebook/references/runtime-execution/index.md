@@ -53,7 +53,7 @@ a *variation* of a case, not its exact instance.
   bookkeeping vs steady-state compute (online-EPLB rebalance); draft forward vs
   target work (two-model MTP). The hard part is proving data-independence (disjoint
   output slices / disjoint step state); stream-switching only pays off under
-  CUDA-graph capture. _(Instances: [overlap scheduler](overlap-scheduler.md), [multi-stream](multi-stream-shared-routed-expert.md), [EPLB](overlap-online-eplb.md), and [two-model MTP](two-model-mtp-eagle.md) cases.)_
+  CUDA-graph capture. _(Instances: [overlap scheduler](overlap-scheduler.md), [multi-stream](multi-stream-shared-routed-expert.md), [EPLB](overlap-online-eplb.md) cases.)_
 - **Process only the real work, not padded-to-max.** Variable-length DP
   collectives, a single dummy request instead of pad-every-rank, capping
   CUDA-graph capture / KV to the reachable set. Carries to any DP/ragged-batch
@@ -155,7 +155,6 @@ all runtime/execution cases are **lossless** (output-equivalent).
 | Case | Applies when (signal) | Pattern (generalizes to) | Risk |
 |------|----------------------|--------------------------|------|
 | [Relaxed MTP acceptance](relaxed-mtp-acceptance.md) | MTP spec-decode, low accept rate, reasoning model with a thinking phase (R1); not with attention_dp | trade exact-match draft verify for a bounded relaxed criterion where divergence is tolerable | lossy |
-| [Two-model MTP-Eagle overlap](two-model-mtp-eagle.md) | MTP-Eagle where the one-model path constrains and the draft forward is exposed | split a fused speculator into target+draft so the draft forward overlaps target work | lossless |
 
 ## Suggested slots (optional — replace or delete)
 

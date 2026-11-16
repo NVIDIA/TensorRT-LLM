@@ -17,8 +17,11 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -54,7 +57,7 @@ class BaseCheckpointLoader(ABC):
 
     @property
     @abstractmethod
-    def checkpoint_format(self) -> str:
+    def checkpoint_format(self) -> CheckpointFormat | str:
         ...
 
     def load_config(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
@@ -90,6 +93,11 @@ class BaseCheckpointLoader(ABC):
         """
         return False
 
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Return source metadata for shadow planning when available."""
+        return None
+
     def post_load_apply(self,
                         model: nn.Module,
                         *,
@@ -104,7 +112,8 @@ class BaseCheckpointLoader(ABC):
         """Publish format-specific loaded weights after the load path."""
 
     @classmethod
-    def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":
+    def get(cls, checkpoint_format: CheckpointFormat | str,
+            **kwargs) -> "BaseCheckpointLoader":
         try:
             return CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[checkpoint_format](
                 **kwargs)

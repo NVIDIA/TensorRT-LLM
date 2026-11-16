@@ -39,8 +39,9 @@ Example:
 """
 
 import math
+import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -61,11 +62,12 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
-from .interface import FmhaPhase
+from .interface import FmhaPhase, FmhaPrewarmConfig
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
+    get_multi_ctas_kv_counter_size,
     get_multi_processor_count_for_device,
     get_trtllm_gen_context_workspace_size,
 )
@@ -217,27 +219,124 @@ if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
 
 
-_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_sequences: int,
-    multi_processor_count: int,
-) -> int:
-    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
-    aligned_num_counters = (
-        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
-        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-    )
-    return aligned_num_counters * torch.int32.itemsize
-
-
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
     return bmm1_scale.narrow(0, 1, 1)
+
+
+# The typed signature of FlashInfer's private trtllm-gen decode op that trtllm_gen_paged_decode's positional call is
+# written for (FlashInfer 0.7), as the op's TVM-FFI wrapper reports it.
+_PAGED_DECODE_SIGNATURE = (
+    "trtllm_paged_attention_decode(0: DLTensor*, 1: Optional<DLTensor*>, 2: DLTensor*, 3: DLTensor*, 4: DLTensor*, "
+    "5: DLTensor*, 6: DLTensor*, 7: DLTensor*, 8: DLTensor*, 9: int, 10: int, 11: Variant<float, ffi.Tensor>, "
+    "12: Variant<float, ffi.Tensor>, 13: float, 14: int, 15: int, 16: int, 17: int, 18: int, 19: int, 20: bool, "
+    "21: int, 22: Optional<DLTensor*>, 23: Optional<DLTensor*>, 24: Optional<DLTensor*>, 25: Optional<DLTensor*>, "
+    "26: Optional<float>, 27: Optional<bool>, 28: Optional<DLTensor*>, 29: float, 30: int, 31: int, 32: bool, "
+    "33: Optional<DLTensor*>, 34: int, 35: Optional<bool>) -> void"
+)
+
+
+@lru_cache(maxsize=1)
+def trtllm_gen_paged_decode_supported() -> bool:
+    """Whether FlashInfer's private positional ``trtllm_paged_attention_decode`` has the signature
+    trtllm_gen_paged_decode passes its arguments for; callers decline otherwise (FlashInfer's public decode runs).
+
+    Probed once by calling the op without arguments: its TVM-FFI wrapper checks the argument count before running
+    anything and names its typed signature in the TypeError. Another signature, another error, or a module that
+    does not load all decline.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return False
+    try:
+        op = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+    except (AttributeError, ImportError, OSError, RuntimeError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm-gen decode op is unavailable ({e}); its direct calls are declined"
+        )
+        return False
+    try:
+        op()
+    except TypeError as e:
+        found = re.search(r"`([^`]*)`", str(e))
+        if found is not None and found.group(1) == _PAGED_DECODE_SIGNATURE:
+            return True
+        logger.warning(
+            "FlashInfer's trtllm_paged_attention_decode does not have the signature trtllm_gen_paged_decode was "
+            f"written for ({e}); its direct calls are declined"
+        )
+        return False
+    except (RuntimeError, ValueError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm_paged_attention_decode did not report its signature ({e}); its direct calls are "
+            "declined"
+        )
+        return False
+    return False
+
+
+def trtllm_gen_paged_decode(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    kv_pool: torch.Tensor,
+    workspace: torch.Tensor,
+    counter: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    batch_size: int,
+    window_left: int,
+    sm_count: int,
+    enable_pdl: bool,
+    sinks: Optional[torch.Tensor] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> None:
+    """FlashInfer's trtllm-gen paged decode op (behind ``trtllm_batch_decode_with_kv_cache``) with an explicit SM count,
+    from which the kernel derives its KV split. Query and KV of one dtype, HND pool, a [requests, 2, pages] page table;
+    bmm1_scale a float or the [raw, raw * log2e] tensor; lse (base 2) optional. Callers check
+    trtllm_gen_paged_decode_supported() first."""
+    flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+        out,
+        None,  # out_scale_factor
+        query,
+        kv_pool,
+        kv_pool,
+        workspace,
+        counter,
+        block_tables,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
+        bmm2_scale,
+        -1.0,  # o_sf_scale
+        -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
+        batch_size,
+        window_left,
+        0,  # sparse_mla_top_k
+        sm_count,
+        enable_pdl,
+        workspace.numel() * workspace.element_size(),
+        sinks,
+        cum_seq_lens_q,
+        None,  # k_block_scales
+        None,  # v_block_scales
+        None,  # skip_softmax_threshold_scale_factor
+        False,  # uses_shared_paged_kv_idx
+        lse,
+        1.0,  # lse_scale
+        lse.stride(0) if lse is not None else 0,
+        lse.stride(1) if lse is not None else 0,
+        False,  # enable_block_sparse_attention
+        None,  # sparse_mla_top_k_lens
+        0,  # bf16q_fp8kv_transform_mode (query and KV of one dtype)
+        None,  # use_fp16_softmax
+    )
 
 
 @lru_cache(maxsize=128)
@@ -369,6 +468,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # SMs on which this library serves only a KV cache manager's extra page
+    # sizes (``trtllm_gen_extra_tokens_per_block``); every other request there
+    # stays on the fallback FMHA.
+    EXTRA_PAGE_SIZES_ONLY_SMS = frozenset({107})
     # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
     MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
@@ -392,17 +495,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
-                "enabled and unsupported."
-            )
-            return False
-
+    def is_environment_available(cls) -> bool:
+        """Check dependencies and architecture before constructing an attention layer."""
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -416,10 +510,94 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if sm not in (100, 103, 107):
             logger.debug(
-                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"requires SM100, SM103 or SM107, got SM{sm}."
             )
+            return False
+
+        return True
+
+    @staticmethod
+    def prewarm() -> None:
+        """Build flashinfer's TRTLLM-Gen FMHA module now instead of on first use.
+
+        On first use flashinfer downloads the module's kernel metadata and
+        compiles its launcher with nvcc; later calls only load the built module.
+        """
+        # Decode, prefill and MLA all load the same fmha_gen JIT spec. One
+        # getter builds its shared library and installs its cubin loader.
+        flashinfer.decode.get_trtllm_gen_fmha_module()
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Check static phase eligibility without allocating request tensors."""
+        attn = self.attn
+        if config.helix or self.serves_only_extra_page_sizes() or attn.sparse_params is not None:
+            return False
+        if (
+            attn.position_embedding_type in (4, 5)
+            or config.dtype not in self.SUPPORTED_INPUT_DTYPES
+        ):
+            return False
+        page_size = config.tokens_per_block
+        if (
+            page_size <= 0
+            or page_size & (page_size - 1)
+            or page_size not in self.SUPPORTED_TOKENS_PER_BLOCK | config.extra_tokens_per_block
+        ):
+            return False
+        kv_dtype = config.kv_cache_dtype
+        output_dtype = attn.get_quantize_output_dtype(False) or config.dtype
+        low_precision_output = output_dtype == torch.float8_e4m3fn
+        context_q_dtype = (
+            torch.float8_e4m3fn
+            if low_precision_output or kv_dtype in (DataType.FP8, DataType.NVFP4)
+            else config.dtype
+        )
+        generation_q_dtype = (
+            torch.float8_e4m3fn
+            if low_precision_output or kv_dtype == DataType.NVFP4
+            else config.dtype
+        )
+        if attn.is_mla_enable:
+            generation_supported, _ = self._check_mla_generation_support(
+                head_size=attn.head_dim,
+                num_heads=attn.num_heads,
+                tokens_per_block=page_size,
+                kv_lora_rank=attn.kv_lora_rank,
+                qk_rope_head_dim=attn.qk_rope_head_dim,
+            )
+            context_supported = False
+        else:
+            # Keep unusual dense head sizes on lazy initialization even if a
+            # generation request might eventually find a compatible kernel.
+            if attn.head_dim in self.UNSUPPORTED_HEAD_SIZES_CONTEXT:
+                return False
+            context_supported = True
+            generation_supported = (
+                attn.num_heads // attn.num_kv_heads <= self.MAX_HEADS_RATIO_GENERATION
+            )
+        return (
+            config.context
+            and context_supported
+            and (context_q_dtype, kv_dtype, output_dtype) in self.SUPPORTED_DTYPE_COMBOS_CONTEXT
+        ) or (
+            config.generation
+            and generation_supported
+            and page_size >= self.MIN_TOKENS_PER_BLOCK
+            and (generation_q_dtype, kv_dtype, output_dtype)
+            in self.SUPPORTED_DTYPE_COMBOS_GENERATION
+        )
+
+    @classmethod
+    def serves_only_extra_page_sizes(cls) -> bool:
+        """Whether this device uses the library only for a KV cache manager's extra page sizes."""
+        return get_sm_version() in cls.EXTRA_PAGE_SIZES_ONLY_SMS
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls.is_environment_available():
             return False
 
         has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)
@@ -489,6 +667,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
@@ -527,6 +706,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
+            )
+
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
             return (
                 False,
@@ -537,7 +726,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -612,11 +801,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and 0 < meta.num_contexts <= 4
             and attn.head_dim != 512
             and not has_q_only
+            and meta.num_generations == 0
+            and not (
+                meta.use_paged_context_fmha
+                and meta.tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
+            )
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
             # Let the FMHA selector choose the fallback implementation. H512
-            # and Q-only cached-KV requests cannot use that fallback.
+            # and Q-only cached-KV requests cannot use that fallback. Neither
+            # can paged prefill with model-specific page sizes such as M3's 128.
+            # Keep mixed batches on FlashInfer: the monolithic fallback also
+            # switches decoding to C++ kernels that generation-only warmup
+            # does not cover, causing first-use JIT stalls (NVBug 6716104).
             return False, (
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "
@@ -720,7 +918,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
                     return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] unsupported attention mask: {fwd.attention_mask!r}."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -759,6 +957,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
@@ -770,9 +969,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, f"non-positive tokens_per_block ({tokens_per_block})."
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
-        if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
-            supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
+        # A KV cache manager may allow extra page sizes, e.g. MiniMax-M3 adds 128.
+        extra_tokens_per_block = frozenset(
+            getattr(meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+        )
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | extra_tokens_per_block
+        if tokens_per_block not in supported_tokens_per_block:
+            supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+        # On SM107 this library serves only the extra page sizes, which the
+        # fallback thop FMHA has no paged-context kernels for. Every other SM107
+        # request stays on the fallback.
+        if self.serves_only_extra_page_sizes() and tokens_per_block not in extra_tokens_per_block:
+            return False, (
+                f"tokens_per_block ({tokens_per_block}) on SM107, which uses this library "
+                "only for the KV cache manager's extra page sizes."
+            )
 
         return True, ""
 
@@ -817,9 +1029,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # One counter per head per decoder sequence; beam search expands each
         # request into ``beam_width`` sequences.
-        required_counter_size = _get_multi_ctas_kv_counter_size(
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        required_counter_size = get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_sequences or metadata.max_num_requests,
+            max_num_sequences,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
@@ -848,8 +1061,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires output.")
         fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
-        workspace_max_tokens = max(num_tokens, metadata.max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
+        workspace_max_tokens = max(num_tokens, metadata.max_context_length, max_num_sequences)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_sequences)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
@@ -857,7 +1070,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_size=attn.head_dim,
-            max_num_requests=metadata.max_num_requests,
+            max_num_requests=max_num_sequences,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )
@@ -911,10 +1124,48 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
+    def _uses_paged_context_fp8(
+        self,
+        fp8_context_fmha: bool,
+        query: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        bmm1_scale: Optional[torch.Tensor],
+        kv_scale_pool: Optional[torch.Tensor],
+        causal: bool,
+        attention_sinks: Optional[torch.Tensor],
+        window_left: int,
+        output: torch.Tensor,
+    ) -> bool:
+        """Whether a context call offers trtllm::fmha_paged_context_fp8 the layer's declared
+        ``context_fmha_head_dim_per_stage_kv``: causal E4M3 Q / KV (no KV scale factors, sinks or window), BF16
+        output, TRT-LLM's contiguous paged KV pool with separate K / V page indices. The op declines a call whose
+        selected kernel has no precompiled cubin, which then runs FlashInfer's kernel."""
+        return (
+            self.attn.context_fmha_head_dim_per_stage_kv > 0
+            and fp8_context_fmha
+            and causal
+            and isinstance(bmm1_scale, torch.Tensor)
+            and kv_scale_pool is None
+            and attention_sinks is None
+            and window_left < 0
+            and query.dtype == torch.float8_e4m3fn
+            and kv_pool.dtype == torch.float8_e4m3fn
+            and kv_pool.dim() == 4
+            and kv_pool.is_contiguous()
+            and block_tables.dim() == 3
+            and block_tables.size(1) == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+        )
+
     def run_context(
         self,
         params: FmhaParams,
     ) -> None:
+        attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
+        if attention_input is None:
+            raise RuntimeError("trtllm-gen context requires QKV or query input.")
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
@@ -937,7 +1188,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
         ) = thop.trtllm_gen_context_preprocess(
-            params.qkv_input,  # qkv_input
+            attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.context_lengths,  # context_lengths
@@ -1002,35 +1253,85 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=ctx_bmm1_scale,
-            bmm2_scale=ctx_bmm2_scale,
-            batch_size=params.batch_size,
-            cum_seq_lens_q=cu_q_seqlens,
-            cum_seq_lens_kv=cu_kv_seqlens,
-            window_left=window_left,
-            out=params.context_buf,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            sinks=fwd.attention_sinks,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            causal=causal,
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        paged_context_fp8 = self._uses_paged_context_fp8(
+            fp8_context_fmha,
+            q_processed,
+            kv_pool,
+            block_tables,
+            bmm1_scale,
+            kv_scale_pool,
+            causal,
+            fwd.attention_sinks,
+            window_left,
+            params.output,
         )
+
+        def fmha(query, out, cu_q, max_q):
+            if paged_context_fp8 and torch.ops.trtllm.fmha_paged_context_fp8(
+                query,
+                kv_pool,
+                block_tables,
+                params.sequence_lengths,
+                cu_q,
+                cu_kv_seqlens,
+                out,
+                bmm1_scale,
+                bmm2_scale,
+                max_q,
+                max_kv_len,
+                attn.context_fmha_head_dim_per_stage_kv,
+            ):
+                return
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=query,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_q_len=max_q,
+                max_kv_len=max_kv_len,
+                bmm1_scale=ctx_bmm1_scale,
+                bmm2_scale=ctx_bmm2_scale,
+                batch_size=params.batch_size,
+                cum_seq_lens_q=cu_q,
+                cum_seq_lens_kv=cu_kv_seqlens,
+                window_left=window_left,
+                out=out,
+                kv_layout=self._layout,
+                enable_pdl=self._enable_pdl,
+                sinks=fwd.attention_sinks,
+                kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+                uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+                causal=causal,
+                multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            )
+
+        if (
+            attn.context_last_rows_only
+            and not params.is_cross
+            and meta.num_generations == 0
+            and params.num_tokens > params.batch_size
+        ):
+            # Each request's last row only, against the full KV (preprocess appended every row's K / V).
+            # The PDL-launched FMHA may read its sequence offsets before its dependency wait, so they are not
+            # written by the kernel right before it (the query gather, which it reads after the wait).
+            cu_q_last = torch.arange(
+                params.batch_size + 1, dtype=cu_q_seqlens.dtype, device=cu_q_seqlens.device
+            )
+            last = (cu_q_seqlens[1 : params.batch_size + 1] - 1).long()
+            q_last = q_processed.index_select(0, last)
+            out_last = params.output.new_empty((params.batch_size, *params.output.shape[1:]))
+            fmha(q_last, out_last, cu_q_last, 1)
+            params.output.zero_()
+            params.output.index_copy_(0, last, out_last)
+        else:
+            fmha(q_processed, params.output, cu_q_seqlens, max_q_len)
 
         if params.is_cross:
             return
 
         thop.trtllm_gen_context_postprocess(
-            params.qkv_input,  # qkv_input
+            attention_input,  # qkv_input
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.context_lengths,  # context_lengths
@@ -1073,10 +1374,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
+        attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
+        if attention_input is None:
+            raise RuntimeError("trtllm-gen generation requires QKV or query input.")
         attn = params.attn
-        meta = params.meta
         fwd = params.fwd
-        rope_params = attn.rope_params
         bmm1_scale_static = get_bmm1_scale(attn)
         attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
@@ -1095,8 +1397,62 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
             is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
-            params.qkv_input,  # qkv_input
+        ) = self._run_generation_preprocess(
+            params,
+            attention_input,
+            batch_beam,
+            bmm1_scale_static,
+            attention_chunk_size,
+            fp8_context_fmha,
+        )
+
+        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv and kv_scale_pool is None:
+            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
+        if has_fp4_kv or fp8_context_fmha:
+            q_processed = (
+                q_processed.view(torch.uint8)
+                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, attn.num_heads, attn.head_dim)
+            )
+        gen_bmm1_scale = (
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+        )
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+
+        self._run_generation_decode(
+            params,
+            q_processed,
+            kv_pool,
+            block_tables,
+            kv_scale_pool,
+            max_kv_len,
+            window_left,
+            None if is_multi_token_gen else params.input_seq_length,
+            max_q_len if is_multi_token_gen else None,
+            cu_seqlens if is_multi_token_gen else None,
+            gen_bmm1_scale,
+            gen_bmm2_scale,
+            fmha_workspace,
+        )
+
+    def _run_generation_preprocess(
+        self,
+        params: FmhaParams,
+        attention_input: torch.Tensor,
+        batch_beam: int,
+        bmm1_scale_static: float,
+        attention_chunk_size: int,
+        fp8_context_fmha: bool,
+    ) -> tuple:
+        """C++ generation preprocess: query, K / V append into the paged cache, FMHA scales and cache views."""
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        rope_params = attn.rope_params
+        return thop.trtllm_gen_generation_preprocess(
+            attention_input,  # qkv_input (also accepts Q-only input for cached KV)
             params.workspace,  # workspace
             params.sequence_lengths,  # sequence_lengths
             params.spec_decoding_generation_lengths,  # spec_decoding_generation_lengths
@@ -1141,49 +1497,46 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
-        q_len_per_req = None if is_multi_token_gen else params.input_seq_length
-        decode_max_q_len = max_q_len if is_multi_token_gen else None
-        decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
-
-        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
-        if has_fp4_kv and kv_scale_pool is None:
-            raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or fp8_context_fmha:
-            q_processed = (
-                q_processed.view(torch.uint8)
-                .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
-                .view(torch.float8_e4m3fn)
-                .view(params.num_tokens, attn.num_heads, attn.head_dim)
-            )
-        gen_bmm1_scale = (
-            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
-        )
-        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
-
+    def _run_generation_decode(
+        self,
+        params: FmhaParams,
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_scale_pool: Optional[torch.Tensor],
+        max_kv_len: int,
+        window_left: int,
+        q_len_per_req: Optional[int],
+        max_q_len: Optional[int],
+        cu_seqlens: Optional[torch.Tensor],
+        bmm1_scale,
+        bmm2_scale,
+        fmha_workspace: torch.Tensor,
+    ) -> None:
+        """Generation attention over the cache the preprocess wrote: q_len_per_req tokens per request, or for
+        non-uniform q lengths (q_len_per_req None) max_q_len and cu_seqlens."""
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
+            query=q,
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
             max_seq_len=max_kv_len,
-            bmm1_scale=gen_bmm1_scale,
-            bmm2_scale=gen_bmm2_scale,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             window_left=window_left,
-            out=params.context_buf,
-            sinks=fwd.attention_sinks,
+            out=params.output,
+            sinks=params.fwd.attention_sinks,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
             backend="trtllm-gen",
             q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cu_seqlens,
             kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
             bmm1_scale_log2=(
-                _get_bmm1_scale_log2(gen_bmm1_scale)
-                if isinstance(gen_bmm1_scale, torch.Tensor)
-                else None
+                _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else None
             ),
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
@@ -1204,8 +1557,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.batch_size
-        if params.attention_input is None:
-            raise RuntimeError("MLA generation requires attention_input.")
+        if params.query_input is None:
+            raise RuntimeError("MLA generation requires query_input.")
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1219,7 +1572,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.quant_mode,  # kv_cache_quant_mode
             params.seq_offset,  # batch_start
             batch_beam,  # batch_size
-            params.attention_input.dtype,  # dtype
+            params.query_input.dtype,  # dtype
         )
 
         kv_lora_rank = attn.kv_lora_rank or 0
@@ -1260,7 +1613,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale = bmm1_scale_buffer.flatten()[:1]
             bmm2_scale = bmm2_scale_buffer.flatten()[:1]
         else:
-            query = params.qkv_input.view(
+            query = params.query_input.view(
                 batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
@@ -1278,7 +1631,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
-            params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
+            params.output.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
             bmm1_scale,  # bmm1_scale
             bmm2_scale,  # bmm2_scale
             fwd.attention_sinks,  # sinks

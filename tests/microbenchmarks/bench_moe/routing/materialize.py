@@ -41,15 +41,27 @@ from .builders import RoutingPlan, _largest_remainder_split
 def _split_slot_count_to_experts(
     slot_count: int,
     target_histogram_row: List[int],
+    *,
+    prior_cells: Tuple[int, ...] = (),
 ) -> List[int]:
-    """Allocate ``slot_count`` slots across local experts proportionally.
+    """Allocate ``slot_count`` slots across local experts.
 
-    Largest-remainder over ``target_histogram_row`` ensures the per-local-expert
-    distribution within this (src, dst) cell tracks the global histogram for
-    the target rank. Returns a list of length ``len(target_histogram_row)``.
+    ``prior_cells`` are the slot counts of the (src, dst) cells already
+    allocated for this target rank, in source order. Draining them from
+    ``target_histogram_row`` first makes the per-source allocations sum back
+    to ``target_histogram_row`` exactly: rounding every cell against the full
+    target independently makes every source make the same rounding decision
+    (since they see identical inputs) instead of the errors cancelling out,
+    e.g. target ``[4, 2, 1, 1]`` split into four cells of 2 each turns into
+    ``[4, 4, 0, 0]`` when every cell rounds against ``[4, 2, 1, 1]`` from
+    scratch, but ``[4, 2, 1, 1]`` when each cell rounds against what the
+    earlier cells left behind.
     """
-    weights = [float(v) for v in target_histogram_row]
-    return _largest_remainder_split(int(slot_count), weights)
+    remaining = [float(v) for v in target_histogram_row]
+    for cell in prior_cells:
+        taken = _largest_remainder_split(int(cell), remaining)
+        remaining = [r - t for r, t in zip(remaining, taken)]
+    return _largest_remainder_split(int(slot_count), remaining)
 
 
 def _flatten_plan_slots_for_rank(
@@ -81,7 +93,8 @@ def _flatten_plan_slots_for_rank(
         if cell == 0:
             continue
         target_hist = list(plan.expert_histogram[dst])
-        per_le = _split_slot_count_to_experts(cell, target_hist)
+        prior_cells = tuple(int(plan.dispatch_matrix[s][dst]) for s in range(src_rank))
+        per_le = _split_slot_count_to_experts(cell, target_hist, prior_cells=prior_cells)
         for le, cnt in enumerate(per_le):
             if cnt <= 0:
                 continue

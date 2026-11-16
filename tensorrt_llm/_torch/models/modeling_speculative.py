@@ -1,38 +1,49 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import contextlib
 import inspect
+import os
 from dataclasses import replace
-from typing import Dict, Generic, List, Optional, Tuple
+from typing import ClassVar, Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import (MoeLoadBalancerConfigType,
+                                          auto_moe_backend_for_load_balancer)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...functional import PositionEmbeddingType
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
-from ..model_config import ModelConfig, TConfig
+from ..model_config import ModelConfig, MoESelection, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
+from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
+                             apply_layerwise_quant_config,
+                             apply_quant_config_exclude_modules,
                              get_model_architecture,
                              get_registered_draft_model_builder,
                              register_auto_model, register_draft_model)
@@ -50,6 +61,80 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
         "Set 'draft_vocab_size' explicitly if the draft head uses a different vocabulary."
     )
     config.draft_vocab_size = config.vocab_size
+
+
+def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
+                                   target_config: ModelConfig) -> None:
+    """Inherit the target KV dtype unless the model requests a draft override."""
+    algo = target_config.quant_config.kv_cache_quant_algo
+    override = target_config.extra_attrs.get(
+        "draft_kv_cache_quant_algo_override")
+    if override is not None:
+        algo = QuantAlgo(override)
+    draft_config.quant_config.kv_cache_quant_algo = algo
+    if override is not None and draft_config.quant_config_dict is not None:
+        for layer_quant_config in draft_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = algo
+
+
+def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
+    """Build an independent quantization scope for replacement MTP weights."""
+    from .checkpoints.auto_mapper import AutoCheckpointMapper
+
+    checkpoint_dir = str(model_config.spec_config.speculative_model)
+    architecture = model_config.pretrained_config.architectures[0]
+    quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+    quant_config, layer_configs = QuantConfig(), None
+    if os.path.isfile(quant_path):
+        # Parsed for the selection the heads' MTP layers make, with AUTO
+        # hinted by architecture as ModelConfig.from_pretrained hints it.
+        moe_kwargs = _draft_loader_moe_kwargs(
+            model_config,
+            _draft_moe_selection(model_config,
+                                 model_config.spec_config,
+                                 load_balancer=model_config.moe_load_balancer))
+        moe_kwargs["moe_backend"] = ModelConfig.resolve_moe_backend(
+            moe_kwargs["moe_backend"], architecture)
+        quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
+            quant_path, checkpoint_dir, architecture=architecture, **moe_kwargs)
+
+    mapper = AutoCheckpointMapper.get(CheckpointFormat.HF, architecture)
+    start_layer_idx = model_config.pretrained_config.num_hidden_layers
+    if layer_configs is not None:
+        normalized = {}
+        for name, config in layer_configs.items():
+            if name != "lm_head" and not name.startswith("mtp."):
+                continue
+            candidates = [name]
+            if name.endswith((".q_proj", ".k_proj", ".v_proj")):
+                candidates.append(name.rsplit(".", 1)[0] + ".qkv_proj")
+            if any(
+                    quant_config.is_module_excluded_from_quantization(candidate)
+                    for candidate in candidates):
+                raise ValueError(
+                    f"Replacement quantization exclusion conflicts with {name}")
+            mapped_name = mapper.map_mtp_module_name(name, start_layer_idx)
+            if mapped_name.startswith("mtp."):
+                raise ValueError(
+                    f"{type(mapper).__name__} does not map replacement MTP "
+                    f"quantization for {name}")
+            normalized[mapped_name] = config
+        layer_configs = normalized
+    if quant_config.exclude_modules is not None:
+        quant_config.exclude_modules = [
+            mapper.map_mtp_module_name(name, start_layer_idx)
+            for name in quant_config.exclude_modules
+        ]
+
+    draft_config = replace(model_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_configs,
+                           skip_create_weights_in_init=True)
+    draft_config.extra_attrs = model_config.extra_attrs
+    _set_draft_kv_cache_quant_algo(draft_config, model_config)
+    for config in (draft_config.quant_config_dict or {}).values():
+        config.kv_cache_quant_algo = draft_config.quant_config.kv_cache_quant_algo
+    return draft_config
 
 
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
@@ -90,6 +175,26 @@ def greedy_or_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return sampled.view(probs.shape[:-1])
 
 
+def markov_prev_embeddings(prev_tokens: torch.Tensor,
+                           markov_w1: torch.Tensor) -> torch.Tensor:
+    """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
+
+    The anchor is the last accepted token, which on the one-model rejection path
+    comes from ``trtllm::chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1``. Mask like modules/embedding.py does, so such a
+    position contributes no bias instead of tripping a device assert.
+
+    Args:
+        prev_tokens: previous token ids (draft vocab), any shape.
+        markov_w1: [vocab, rank].
+    Returns:
+        ``prev_tokens.shape + (rank,)`` in ``markov_w1``'s dtype.
+    """
+    prev_tokens, invalid = get_masked_input_and_mask(prev_tokens.long(), 0,
+                                                     markov_w1.shape[0])
+    return F.embedding(prev_tokens, markov_w1).masked_fill(invalid, 0)
+
+
 def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
                             markov_w2: torch.Tensor) -> torch.Tensor:
     """Vanilla Markov head logit bias for one intra-block draft step.
@@ -107,7 +212,7 @@ def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
     Returns:
         [B, vocab_or_shard] bias in the markov weights' dtype.
     """
-    return F.linear(F.embedding(prev_tokens, markov_w1), markov_w2)
+    return F.linear(markov_prev_embeddings(prev_tokens, markov_w1), markov_w2)
 
 
 def dspark_markov_chain(
@@ -182,31 +287,6 @@ def dspark_markov_chain(
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
 
 
-def dspark_markov_chain_logits(base_logits: torch.Tensor,
-                               first_prev_tokens: torch.Tensor,
-                               markov_w1: torch.Tensor,
-                               markov_w2: torch.Tensor,
-                               argmax_fn=None) -> torch.Tensor:
-    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
-
-    For drafters that keep the Markov head as plain checkpoint tensors rather
-    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
-    already be sliced down to this rank's TP vocab shard, in which case
-    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
-    """
-
-    def _step_bias(prev_tokens, step_hidden):
-        del step_hidden
-        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-    _, corrected = dspark_markov_chain(base_logits,
-                                       first_prev_tokens,
-                                       _step_bias,
-                                       next_token_fn=argmax_fn,
-                                       cast_bias_to_logits=True)
-    return corrected
-
-
 class VanillaMarkov(nn.Module):
     """Low-rank token-bigram logit bias: ``bias = W2(W1[token])``."""
 
@@ -224,7 +304,7 @@ class VanillaMarkov(nn.Module):
                                    bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return F.embedding(token_ids.long(), self.markov_w1.weight)
+        return markov_prev_embeddings(token_ids, self.markov_w1.weight)
 
     def project_bias(self,
                      latent_states: torch.Tensor,
@@ -409,30 +489,37 @@ def build_markov_head(*, markov_head_type: str, vocab_size: int,
 
 
 class DSparkConfidenceHead(nn.Module):
-    """Per-position acceptance-confidence predictor (DeepSpec
-    AcceptRatePredictor).
+    """Per-position acceptance-confidence predictor.
 
-    Input features are the backbone hidden state, optionally concatenated with
-    the Markov head's previous-token embedding. Output is a single logit per
-    position.
+    Emits one raw logit per position. :meth:`apply_sts` converts logits to
+    calibrated conditional acceptance probabilities.
     """
 
     def __init__(self,
                  *,
                  hidden_size: int,
                  markov_rank: int = 0,
-                 with_markov: bool = False):
+                 with_markov: bool = False,
+                 bias: bool = False,
+                 block_size: int = 0):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
-        # confidence score is computed in fp32 (mirrors the DeepSpec reference
-        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        self.proj = nn.Linear(input_dim,
+                              1,
+                              bias=bool(bias),
+                              dtype=torch.float32)
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
 
     def forward(self,
                 hidden_states: torch.Tensor,
                 prev_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw, uncalibrated logits with shape ``[..., block]``."""
         if self.with_markov:
             assert prev_embeddings is not None
             features = torch.cat(
@@ -444,20 +531,68 @@ class DSparkConfidenceHead(nn.Module):
         # fp32 matmul for a stable confidence score (mirrors the reference).
         return self.proj(features.float()).squeeze(-1)
 
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Convert raw logits to calibrated acceptance probabilities."""
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
 
-def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
-                            threshold: float) -> int:
-    """First position k where ``sigmoid(confidence_k) < threshold``.
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """Return a lazily materialized CPU mirror of the STS table."""
+        cached = self._sts_temperatures_host
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
 
-    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
-    are confident. Assumes batch size 1 (functional-first scope).
-    """
-    if threshold <= 0.0:
-        return int(block_size)
-    below = confidence_logits.sigmoid() < threshold
-    if not bool(below[0].any().item()):
-        return int(block_size)
-    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """Update the fixed-address STS table in place."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device,
+                                           dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
+        self._sts_temperatures_host = None
+
+    def load_weights(self, weights: list) -> None:
+        """Load every confidence-head checkpoint parameter strictly."""
+        (module_weights, ) = weights
+        self._validate_checkpoint_weights(module_weights)
+        for name, param in self.named_parameters():
+            param.data.copy_(module_weights[name][:])
+
+    def _validate_checkpoint_weights(
+            self, module_weights: dict[str, torch.Tensor]) -> None:
+        """Validate a head namespace before generic embedded parameter loading."""
+        expected = dict(self.named_parameters())
+        unexpected = [key for key in module_weights if key not in expected]
+        missing = [key for key in expected if key not in module_weights]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                "DSparkConfidenceHead(bias=True); silently dropping it would bias every score."
+            )
+        if missing:
+            raise ValueError(
+                f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
+            )
+        for name, param in expected.items():
+            actual_shape = tuple(module_weights[name].shape)
+            if actual_shape != tuple(param.shape):
+                raise ValueError(
+                    f"DSpark confidence head checkpoint {name} has shape {actual_shape}; "
+                    f"expected {tuple(param.shape)}")
 
 
 class Eagle3Attention(Attention):
@@ -650,7 +785,10 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """With ``pick_rows`` the attention runs on every input row and the
+        rest of the layer on ``pick_rows`` only."""
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -663,6 +801,9 @@ class Eagle3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
         )
+        if pick_rows is not None:
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -763,6 +904,10 @@ class Eagle3DraftModel(DecoderModel):
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
             )
+        # forward takes ``pick_rows`` (see speculative.interface.
+        # draft_layer_picks_rows) with one decoder layer: a later layer's
+        # attention would need every row.
+        self.supports_pick_rows = self.num_layers == 1
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -819,7 +964,16 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``pick_rows`` (single decoder layer only, see
+        ``supports_pick_rows``): the layer's attention runs on every input row,
+        everything after it on ``pick_rows`` only, so both outputs have
+        ``len(pick_rows)`` rows."""
+        # The worker passes pick_rows only when supports_pick_rows: a second
+        # decoder layer's attention would need every row.
+        assert pick_rows is None or self.supports_pick_rows, (
+            "pick_rows needs a single draft decoder layer")
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so
@@ -867,6 +1021,7 @@ class Eagle3DraftModel(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
+                    pick_rows=pick_rows,
                 )
 
             hidden_states, hidden_states_to_save = self.norm(
@@ -1192,6 +1347,9 @@ class PARDForCausalLM(nn.Module):
         draft_config_no_spec = replace(draft_config,
                                        spec_config=None,
                                        lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -1251,12 +1409,26 @@ class MTPForCausalLM(nn.Module):
         start_layer_idx: int = 0,
         lm_head: nn.Module = None,
         model: nn.Module = None,
-    ):
+    ) -> None:
         super().__init__()
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
+        self.start_layer_idx = start_layer_idx
+        spec_config = model_config.spec_config
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
+        lm_head_quant_config = None
+        # Whether the MTP layer's forward takes the draft loop's deferred
+        # ``kv_lens_increment``.
+        folds_kv_lens_increment = False
+        # A target model that owns its MTP layer class (a Modeling V2
+        # target, for example) names it, and the drafter builds that class
+        # instead of the built-in one registered for the model type.
+        owned_mtp_layer = getattr(model, "mtp_layer_cls", None)
         match model_type:
+            case _ if owned_mtp_layer is not None:
+                mtp_layer = owned_mtp_layer
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
@@ -1272,6 +1444,7 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+                folds_kv_lens_increment = True
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1281,18 +1454,44 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v4":
                 from .modeling_deepseekv4 import DeepseekV4MTP
                 mtp_layer = DeepseekV4MTP
+            case "glm5_next" | "glm5_next_text":
+                from .modeling_glm5_next import Glm5NextMTP
+                mtp_layer = Glm5NextMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
-        spec_dec_mode = model_config.spec_config.spec_dec_mode
+        # Optional layer capabilities: whether its forward takes pass 0's
+        # ``kept_rows``, and whether the target's recurrent-state promotion
+        # may run beside the draft loop.
+        takes_kept_rows = getattr(mtp_layer, "takes_kept_rows",
+                                  lambda _: False)(model_config)
+        promotes_target_state_beside = getattr(mtp_layer,
+                                               "promotes_target_state_beside",
+                                               lambda _: False)(model_config)
+
+        if (spec_config.uses_replacement_heads
+                and getattr(mtp_layer, "uses_shared_lm_head", True)):
+            if model_config.quant_config_dict is not None:
+                lm_head_quant_config = model_config.quant_config_dict.get(
+                    "lm_head")
+            elif (model_config.quant_config.quant_algo is not None
+                  and DecoderModelForCausalLM._checkpoint_has_lm_head_scale(
+                      model_config,
+                      checkpoint_dir=str(spec_config.speculative_model))):
+                lm_head_quant_config = model_config.quant_config
+            if model_config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head"):
+                lm_head_quant_config = None
+
+        spec_dec_mode = spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
         checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
-            mtp_repeat_count = model_config.spec_config.max_draft_len
+            mtp_repeat_count = spec_config.max_draft_len
         else:
-            mtp_num_layers = min(model_config.spec_config.max_draft_len,
+            mtp_num_layers = min(spec_config.max_draft_len,
                                  checkpoint_mtp_num_layers)
             mtp_repeat_count = 1
 
@@ -1303,146 +1502,287 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
-        self.lm_head = lm_head
+        self.folds_kv_lens_increment = folds_kv_lens_increment
+        self.takes_kept_rows = takes_kept_rows
+        self.promotes_target_state_beside = promotes_target_state_beside
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
+        self.owns_lm_head = lm_head_quant_config is not None
+        if self.owns_lm_head:
+            if getattr(model_config.pretrained_config, "tie_word_embeddings",
+                       False):
+                raise ValueError(
+                    "A quantized replacement MTP head cannot tie embeddings")
+            if (model_config.mapping.enable_attention_dp
+                    and model_config.mapping.enable_lm_head_tp_in_adp):
+                raise ValueError("Quantized replacement MTP LM heads require "
+                                 "enable_lm_head_tp_in_adp=False")
+            self.lm_head = LMHead(
+                model_config.pretrained_config.vocab_size,
+                model_config.pretrained_config.hidden_size,
+                dtype=model_config.pretrained_config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=model_config.lm_head_gather_output,
+                reduce_output=False,
+                use_custom_cublas_mm=getattr(lm_head, "use_custom_cublas_mm",
+                                             False),
+                quant_config=lm_head_quant_config,
+            )
+        else:
+            self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        for name, module in self.named_modules():
+            if name.startswith("mtp_layers."):
+                _, layer_idx, *suffix = name.split(".")
+                prefix = f"model.layers.{self.start_layer_idx + int(layer_idx)}"
+                yield ".".join([prefix, *suffix]), module
+            elif self.owns_lm_head and (name == "lm_head"
+                                        or name.startswith("lm_head.")):
+                yield name, module
 
-class MTPDraftModel(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
-        super().__init__()
-        # Import here to avoid circular import
-        model_type = model_config.pretrained_config.model_type
-        if model_type == "glm4_moe":
-            from .modeling_glm import Glm4MTP
-            mtp_layer = Glm4MTP(model_config,
-                                layer_idx,
-                                aux_stream_dict,
-                                is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
-            from .modeling_deepseekv3 import DeepseekV3MTP
-            mtp_layer = DeepseekV3MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
-        elif model_type in ["exaone_moe"]:
-            from .modeling_exaone_moe import ExaoneMoeMTP
-            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-        else:
-            raise ValueError(
-                f"MTPDraftModel does not support model_type: {model_type}")
-        setattr(self, f"layers.{layer_idx}", mtp_layer)
-        self.layers = mtp_layer
-        self.layer_idx = layer_idx
-        self.config = model_config.pretrained_config
-        self.embed_tokens = Embedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=self.config.torch_dtype,
-        )
-
-    def __repr__(self):
-        """Custom string representation to display layer index"""
-        return f"(layers): ({self.layer_idx}): {repr(self.layers)}"
-
-    def forward(
-        self,
-        input_ids: torch.IntTensor,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.layers(
-            input_ids,
-            position_ids,
-            hidden_states,
-            embed_tokens=self.embed_tokens,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-        )
-
-        return hidden_states
+    def apply_quant_config(self) -> None:
+        apply_layerwise_quant_config(self.model_config,
+                                     self._quantization_named_modules())
+        apply_quant_config_exclude_modules(self.model_config,
+                                           self._quantization_named_modules())
 
 
-@register_auto_model("MTPDraftModelForCausalLM")
-class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
-                                                       PretrainedConfig]):
+def _draft_moe_selection(
+    model_config: ModelConfig,
+    spec_config: object,
+    *,
+    load_balancer: Optional[MoeLoadBalancerConfigType],
+) -> Optional[MoESelection]:
+    """The MoE selection a draft model or MTP layers make for themselves, or
+    None when they inherit the target's.
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        self.model_config = model_config
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
-        self.aux_stream_dict = {
-            AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared: aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+    ``speculative_config.moe_tactic`` pins, else
+    ``speculative_config.moe_backend`` selects. With neither the draft
+    inherits the target's literal, unless ``moe_config.tactic`` pins the
+    target: that tactic names implementations of the target's experts, so the
+    draft resolves AUTO for its own weights. AUTO never resolves to VANILLA
+    and no tactic names it, so this default never changes the expert weight
+    layout of Nemotron-H embedded MTP, which goes through the target's
+    checkpoint weight mapper.
+
+    Args:
+        model_config: The target's config.
+        spec_config: The speculative config, read for ``moe_tactic`` and
+            ``moe_backend``.
+        load_balancer: The EPLB config the draft's MoE layers register into
+            when they share the target's balancer, else None. An AUTO
+            selection resolves under it as the target's does
+            (``auto_moe_backend_for_load_balancer``). Every caller passes it,
+            so that each draft path states whether it shares the balancer.
+    """
+    moe_tactic = getattr(spec_config, "moe_tactic", None)
+    if moe_tactic is not None:
+        return MoESelection(tactic=moe_tactic)
+    moe_backend = getattr(spec_config, "moe_backend", None)
+    if moe_backend is None:
+        if model_config.moe_tactic is None:
+            return None
+        # A tactic admits no other backend, so moe_config.backend is AUTO.
+        moe_backend = "AUTO"
+    if moe_backend == "AUTO":
+        moe_backend = auto_moe_backend_for_load_balancer(load_balancer)
+    return MoESelection(backend=moe_backend)
+
+
+def _draft_loader_moe_kwargs(
+        model_config: ModelConfig, draft_moe_selection: Optional[MoESelection]
+) -> Dict[str, Optional[str]]:
+    """The MoE kwargs that load a separate draft checkpoint for ``draft_moe_selection``.
+
+    With ``draft_moe_selection`` None the draft inherits the target's resolved
+    literal. A separate checkpoint never inherits a tactic, which names the
+    target's implementations: when ``moe_config.tactic`` is set,
+    ``_draft_moe_selection`` returns an AUTO selection instead of None.
+    """
+    selection = draft_moe_selection or MoESelection(
+        backend=model_config.moe_backend)
+    return selection.loader_kwargs()
+
+
+def _copy_model_config_with_moe_selection(
+    model_config: ModelConfig,
+    selection: MoESelection,
+    quant_config: Optional[QuantConfig] = None,
+    layer_quant_overrides: Optional[Dict[str, QuantConfig]] = None,
+) -> ModelConfig:
+    """Copy a ModelConfig and resolve ``selection`` against its own weights.
+
+    ``quant_config`` describes the copied layers when they are not quantized
+    as the checkpoint is globally. ``layer_quant_overrides`` replaces
+    ``quant_config_dict`` entries in a dict the copy owns, so the original's
+    is untouched. The copy drops any implementation the target pinned through
+    ``moe_config.tactic``.
+    """
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or []
+    # An explicit quant_config describes the copied layers alone, so the
+    # checkpoint's other layer formats must not widen a tactic's family.
+    resolved_moe_backend = selection.resolve_backend(
+        architectures[0] if architectures else "",
+        model_config.quant_config if quant_config is None else quant_config,
+        model_config.quant_config_dict if quant_config is None else None)
+    changes = {
+        "moe_backend": resolved_moe_backend,
+        "moe_tactic": selection.tactic,
+    }
+    if layer_quant_overrides:
+        changes["quant_config_dict"] = {
+            **(model_config.quant_config_dict or {}),
+            **layer_quant_overrides
         }
-        super().__init__(
-            MTPDraftModel(self.model_config,
-                          self.model_config.pretrained_config.num_hidden_layers,
-                          self.aux_stream_dict),
-            config=self.model_config,
-            hidden_size=self.model_config.pretrained_config.hidden_size,
-            vocab_size=self.model_config.pretrained_config.vocab_size)
+    return model_config.copy_with(**changes)
 
-    def load_weights(self, weights: Dict):
-        # Import here to avoid circular import
-        model_type = self.model_config.pretrained_config.model_type
-        match model_type:
-            case "glm4_moe":
-                from .modeling_glm import Glm4WeightLoader
-                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
-                from .modeling_deepseekv3 import DeepseekV3WeightLoader
-                weight_loader = DeepseekV3WeightLoader(self,
-                                                       is_draft_model=True)
-            case "exaone_moe":
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
-                )
-            case _:
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP")
-        weight_loader.load_weights(weights)
 
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        if self.model.embed_tokens is None:
-            self.model.embed_tokens = target_model.model.embed_tokens
-        self.lm_head = target_model.lm_head
+# The formats MXFP4 expert weights run as. The checkpoint stores MXFP4 alone;
+# the MoE selection picks the format (moe_resolution.mxfp4_quant_algo).
+_MXFP4_RUN_FORMATS = frozenset({
+    QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.W4A8_MXFP4_FP8,
+    QuantAlgo.W4A16_MXFP4,
+})
 
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: torch.IntTensor = None,
-                position_ids: torch.IntTensor = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                return_context_logits: bool = False,
-                spec_metadata: Optional[SpecMetadata] = None,
-                hidden_states: torch.Tensor = None,
-                **kwargs) -> torch.Tensor:
 
-        hidden_states = spec_metadata.get_hidden_states()
-        output = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-            **kwargs)
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+def _mxfp4_run_quant_config(model_config: ModelConfig, selection: MoESelection,
+                            quant_config: QuantConfig) -> QuantConfig:
+    """``quant_config`` running in the MXFP4 format ``selection`` picks.
+
+    Checkpoint parsing writes the format the target's selection picks, so a
+    draft that selects for itself picks again. A format outside
+    ``_MXFP4_RUN_FORMATS`` is the checkpoint's and is returned as is.
+    """
+    if quant_config.quant_algo not in _MXFP4_RUN_FORMATS:
+        return quant_config
+    if selection.tactic is None:
+        # AUTO names its implementations only once resolved.
+        architectures = getattr(model_config.pretrained_config, "architectures",
+                                None) or []
+        selection = MoESelection(backend=selection.resolve_backend(
+            architectures[0] if architectures else "", quant_config))
+    quant_algo = ModelConfig.get_mxfp4_quant_algo(**selection.loader_kwargs())
+    if quant_algo is None or quant_algo == quant_config.quant_algo:
+        return quant_config
+    run_quant_config = quant_config.model_copy(
+        update={"quant_algo": quant_algo})
+    # model_copy keeps the cached quant modes derived from the stored format.
+    run_quant_config.__dict__.pop("quant_mode", None)
+    run_quant_config.__dict__.pop("layer_quant_mode", None)
+    return run_quant_config
+
+
+def _get_mtp_moe_quant_config(model_config: ModelConfig,
+                              layer_idx: int) -> QuantConfig:
+    """Return the routed-expert quant config for an embedded MTP layer.
+
+    The first constructed MTP layer represents all MTP layers when resolving
+    AUTO because they share one backend setting. Experts the checkpoint
+    excludes from quantization, or a MIXED_PRECISION checkpoint lists no entry
+    for, are unquantized, as the MTP layers build them.
+    """
+    global_quant_config = model_config.quant_config
+    unquantized = QuantConfig(
+        kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    # Exclusion wins over a per-layer entry, as in moe_experts_quant_config.
+    for module in (f"model.layers.{layer_idx}",
+                   f"model.layers.{layer_idx}.mlp.experts"):
+        if global_quant_config.is_module_excluded_from_quantization(module):
+            return unquantized
+
+    layer_quant_configs = model_config.quant_config_dict or {}
+    prefixes = [f"model.layers.{layer_idx}."]
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        prefixes.append(f"mtp.layers.{layer_idx - num_hidden_layers}.")
+
+    for prefix in prefixes:
+        quant_config = layer_quant_configs.get(f"{prefix}mlp.experts")
+        if quant_config is not None:
+            return quant_config
+    for prefix in prefixes:
+        for name, quant_config in layer_quant_configs.items():
+            if name.startswith(prefix) and ".experts" in name:
+                return quant_config
+    if global_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+        # MIXED_PRECISION lists every quantized module.
+        return unquantized
+    return global_quant_config
+
+
+def _mtp_experts_modules(quant_config_dict: Dict[str, QuantConfig],
+                         start_layer_idx: int) -> List[str]:
+    """The experts modules of MTP layers, numbered from ``start_layer_idx``,
+    that ``quant_config_dict`` has entries for, by the module name the layers
+    look their experts up by (``layerwise_moe_quant_config``): an entry of the
+    module itself or of a per-expert key below it."""
+    modules = []
+    for name in quant_config_dict:
+        segments = name.split(".")
+        if (len(segments) > 3 and segments[:2] == ["model", "layers"]
+                and segments[2].isdigit()
+                and int(segments[2]) >= start_layer_idx
+                and "experts" in segments[3:]):
+            module = ".".join(segments[:segments.index("experts") + 1])
+            if module not in modules:
+                modules.append(module)
+    return modules
+
+
+def _copy_mtp_model_config_with_moe_selection(
+        mtp_model_config: ModelConfig, selection: MoESelection,
+        start_layer_idx: int) -> ModelConfig:
+    """Copy the config of MTP layers numbered from ``start_layer_idx`` and
+    resolve ``selection`` against their routed experts' format.
+
+    MXFP4 experts run in the format ``selection`` picks
+    (``_mxfp4_run_quant_config``), which the copy's own ``quant_config_dict``
+    records for the experts module of every MTP layer it has entries for; any
+    other format is the checkpoint's. ``selection`` is resolved against the
+    format the layers are then built in.
+    """
+    mtp_quant_config = _get_mtp_moe_quant_config(mtp_model_config,
+                                                 start_layer_idx)
+    layer_quant_overrides = None
+    # The MXFP4 run format is written per layer, so only a per-layer map can
+    # carry the one the draft's selection picks.
+    if mtp_model_config.quant_config_dict is not None:
+        run_quant_config = _mxfp4_run_quant_config(mtp_model_config, selection,
+                                                   mtp_quant_config)
+        if run_quant_config is not mtp_quant_config:
+            # An entry of the module itself is what a layer reads first, so it
+            # overrides per-expert entries below it too.
+            layer_quant_overrides = {
+                module: run_quant_config
+                for module in _mtp_experts_modules(
+                    mtp_model_config.quant_config_dict, start_layer_idx)
+            }
+            if layer_quant_overrides:
+                mtp_quant_config = run_quant_config
+    return _copy_model_config_with_moe_selection(
+        mtp_model_config,
+        selection,
+        quant_config=mtp_quant_config,
+        layer_quant_overrides=layer_quant_overrides)
+
+
+def _enable_trtllm_moe_preload_for_draft(model: nn.Module,
+                                         moe_backend: str) -> None:
+    """Preserve TRTLLM-Gen's serial weight-loading order for draft-only use."""
+    preload_weight_modules = getattr(model, "preload_weight_modules", None)
+    if moe_backend != "TRTLLM" or preload_weight_modules is None:
+        return
+    for module_name in ("experts", "routing_method", "all_reduce"):
+        if module_name not in preload_weight_modules:
+            preload_weight_modules.append(module_name)
 
 
 def external_drafter_config_kwargs(model_config, spec_config) -> dict:
@@ -1461,22 +1801,50 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     be keyed against a different namespace -- do not generalize this without
     designing a per-drafter EPLB config domain and layer identity first.
     """
-    kwargs = dict(
-        trust_remote_code=True,
-        attn_backend=model_config.attn_backend,
-        moe_backend=model_config.moe_backend,
-        mapping=model_config.mapping,
-        spec_config=None,  # Avoid recursive spec-dec
-        max_num_tokens=model_config.max_num_tokens,
-        moe_max_num_tokens=model_config.moe_max_num_tokens,
-    )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
     # A standalone DSpark drafter is an independent checkpoint, so it falls
     # under the "other external drafters" rule above.
-    if (spec_config.spec_dec_mode.is_dspark()
-            and spec_config.draft_is_embedded_in_target):
-        kwargs["moe_load_balancer"] = model_config.moe_load_balancer
+    shares_load_balancer = (spec_config.spec_dec_mode.is_dspark()
+                            and spec_config.draft_is_embedded_in_target)
+    load_balancer = (model_config.moe_load_balancer
+                     if shares_load_balancer else None)
+    draft_moe_selection = _draft_moe_selection(model_config,
+                                               spec_config,
+                                               load_balancer=load_balancer)
+    if (shares_load_balancer and draft_moe_selection is not None
+            and draft_moe_selection.tactic is not None):
+        # The embedded draft loads the target checkpoint, whose expert map
+        # describes the main layers, not the draft stages a draft tactic pins.
+        # DSv4DSparkDraftModel resolves the tactic against the stages' entries,
+        # so load the checkpoint as an AUTO draft selection would.
+        draft_moe_selection = MoESelection(
+            backend=auto_moe_backend_for_load_balancer(load_balancer))
+    kwargs = dict(
+        trust_remote_code=True,
+        attn_backend=model_config.attn_backend,
+        **_draft_loader_moe_kwargs(model_config, draft_moe_selection),
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
+        spec_config=None,  # Avoid recursive spec-dec
+        max_num_tokens=model_config.max_num_tokens,
+        moe_max_num_tokens=model_config.moe_max_num_tokens,
+        use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
+        # The user's value, NOT the engine's: py_executor_creator raises it past
+        # this and never writes back, so drafters read _runtime_position_ceiling.
+        # None sizes position tables from max_position_embeddings: 1M for K3.
+        max_seq_len=model_config.max_seq_len,
+        # The MoE combine wire format is an engine setting (moe_config), not a
+        # checkpoint property: a drafter's expert-parallel MoE communication uses
+        # the same format as the target's.
+        use_low_precision_moe_combine=model_config.
+        use_low_precision_moe_combine,
+        # A MEGAMOE_CUTEDSL drafter shares the target's bucket workspaces, so its kernels must match.
+        megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
+    )
+    if shares_load_balancer:
+        kwargs["moe_load_balancer"] = load_balancer
     return kwargs
 
 
@@ -1501,15 +1869,32 @@ def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
 @register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
-    return MTPForCausalLM(model_config,
+    mtp_model_config = draft_config if draft_config is not None else model_config
+    spec_config = model_config.spec_config
+    embedded_nemotron_h = (draft_config is None
+                           and model_config.pretrained_config.model_type
+                           in {"nemotron_h", "nemotron_h_puzzle"})
+    # The MTP layers register into the target's load balancer.
+    draft_moe_selection = _draft_moe_selection(
+        model_config, spec_config, load_balancer=model_config.moe_load_balancer)
+    if draft_moe_selection is not None:
+        mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+            mtp_model_config, draft_moe_selection,
+            model_config.pretrained_config.num_hidden_layers)
+        if embedded_nemotron_h and ((mtp_model_config.moe_backend == "VANILLA")
+                                    != (model_config.moe_backend == "VANILLA")):
+            raise ValueError(
+                "Nemotron-H embedded MTP layers must run VANILLA exactly when "
+                "the target does, because the target's checkpoint weight "
+                "mapper lays out VANILLA expert weights differently from every "
+                "other backend. "
+                f"speculative_config selects {mtp_model_config.moe_backend} "
+                f"while the target runs {model_config.moe_backend}.")
+        _enable_trtllm_moe_preload_for_draft(model,
+                                             mtp_model_config.moe_backend)
+    return MTPForCausalLM(mtp_model_config,
                           model_config.pretrained_config.num_hidden_layers,
                           lm_head, model)
-
-
-@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE)
-def _build_mtp_eagle_draft(model_config, draft_config, lm_head, model):
-    """Build the two-model MTP-Eagle drafter."""
-    return MTPDraftModelForCausalLM(model_config)
 
 
 @register_draft_model(SpeculativeDecodingMode.PARD)
@@ -1576,8 +1961,87 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
+def drafter_hidden_extra_attrs(
+        model_cls: type, spec_config: object,
+        draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
+    """The target's ``extra_attrs`` keys to hide while its drafter is built:
+    the model's ``target_only_extra_attrs`` when the drafter comes from
+    another checkpoint (an Eagle3 head, an external MTP or PARD /
+    draft-target drafter; its ``draft_config`` shares the target's
+    ``extra_attrs``), none for the target's own MTP layers (no
+    ``draft_config``, or replacement MTP heads of the same architecture).
+
+    Args:
+        model_cls: The target model class.
+        spec_config: The speculative config.
+        draft_config: The drafter's config, or None.
+
+    Returns:
+        The keys to hide (possibly empty).
+    """
+    if draft_config is None or spec_config.uses_replacement_heads:
+        return ()
+    return tuple(model_cls.target_only_extra_attrs)
+
+
+@contextlib.contextmanager
+def hidden_extra_attrs(extra_attrs: Dict, keys: Tuple[str,
+                                                      ...]) -> Iterator[None]:
+    """Remove ``keys`` from ``extra_attrs`` for the block and put back the
+    values they had (also when the block raises).
+
+    Args:
+        extra_attrs: A model config's ``extra_attrs``.
+        keys: The keys to hide; absent ones are skipped.
+
+    Yields:
+        None.
+    """
+    saved = {key: extra_attrs.pop(key) for key in keys if key in extra_attrs}
+    try:
+        yield
+    finally:
+        extra_attrs.update(saved)
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
+
+    # Set per instance from supports_spec_decode_fast_paths in __init__.
+    spec_decode_fast_paths: bool = False
+    # Declared by the model: under the fast paths, temperature rows of the TP
+    # key exchange draw Gumbel noise four entries per Philox call (another
+    # noise stream; TPKeyExchange fast_gumbel).
+    spec_decode_fast_gumbel: ClassVar[bool] = False
+    # Declared by the model: under the fast paths, the TP key exchange's
+    # argmax splits rows by its row-split bounds (TPKeyExchange
+    # argmax_row_split; same tokens, another launch shape).
+    spec_decode_argmax_row_split: ClassVar[bool] = False
+    # Declared by the model: its step-loop hooks under the fast paths (None:
+    # the defaults).
+    spec_decode_fast_path_runtime_hooks: ClassVar[Optional[RuntimeHooks]] = None
+    # Declared by the model: ``extra_attrs`` keys its construction writes for
+    # its own modules, hidden while a drafter from another checkpoint is built
+    # (drafter_hidden_extra_attrs).
+    target_only_extra_attrs: ClassVar[Tuple[str, ...]] = ()
+
+    @property
+    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+        """The model's ``spec_decode_fast_path_runtime_hooks`` under the fast
+        paths, else None."""
+        return (self.spec_decode_fast_path_runtime_hooks
+                if self.spec_decode_fast_paths else None)
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        """Whether one-engine speculative decoding of this model takes the
+        fast paths (``spec_decode_fast_paths``): greedy and temperature-only
+        tokens of vocabulary-sharded logits through the TP key exchange, the
+        temperature-only CUDA graph variant, the overlap loop on the execution
+        stream, the hoisted position ids, the MTP-Eagle draft loop's step-0
+        epilogue and the recorded steady decode-step prepare. A model enables
+        them where they are validated."""
+        return False
 
     def __init__(self,
                  model: TModel,
@@ -1601,29 +2065,65 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
+        self.spec_decode_fast_paths = False
+        key_exchange = None
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            self.spec_decode_fast_paths = self.supports_spec_decode_fast_paths(
+                model_config)
+            if self.spec_decode_fast_paths:
+                # Greedy tokens of vocabulary-sharded draft / target logits
+                # come from one peer-memory key exchange per step (TP groups
+                # only; None elsewhere).
+                from ..distributed import ll_exchange
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping,
+                    model_config.max_num_tokens,
+                    fast_gumbel=self.spec_decode_fast_gumbel,
+                    argmax_row_split=self.spec_decode_argmax_row_split)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
+                    # Of the Eagle3 drafts, only the Mistral one registers into
+                    # the target's load balancer.
+                    shares_load_balancer = (
+                        spec_config.eagle3_model_arch == "mistral_large3")
+                    draft_moe_selection = _draft_moe_selection(
+                        model_config,
+                        spec_config,
+                        load_balancer=(model_config.moe_load_balancer
+                                       if shares_load_balancer else None))
+                    draft_loader_moe_kwargs = _draft_loader_moe_kwargs(
+                        model_config, draft_moe_selection)
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
-                            moe_backend=model_config.moe_backend,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
+                            **draft_loader_moe_kwargs,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
+                        if draft_moe_selection is not None:
+                            # Unlike ModelConfig.from_pretrained, the Mistral
+                            # loader does not resolve AUTO after loading quant
+                            # metadata. Resolve the selection against the draft
+                            # config now, before constructing any draft modules;
+                            # a tactic resolves to the family the loader
+                            # already derived.
+                            self.draft_config = _copy_model_config_with_moe_selection(
+                                self.draft_config, draft_moe_selection)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=model_config.moe_backend,
-                            mapping=model_config.mapping,
+                            **draft_loader_moe_kwargs,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1631,8 +2131,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_external_draft_model:
@@ -1640,15 +2140,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
+                        **_draft_loader_moe_kwargs(
+                            model_config,
+                            _draft_moe_selection(model_config,
+                                                 spec_config,
+                                                 load_balancer=None)),
+                        mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = dict(
-                        model_config.extra_attrs)
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
                             2 * spec_config.tokens_per_gen_step)
@@ -1658,16 +2161,28 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
+
+                elif spec_config.uses_replacement_heads:
+                    self.draft_config = _replacement_mtp_model_config(
+                        model_config)
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
-                self.draft_model = get_draft_model(model_config,
-                                                   self.draft_config,
-                                                   self.lm_head, self.model)
+                # A drafter of another checkpoint shares extra_attrs: it must
+                # not build the target's declared decode kernels.
+                with hidden_extra_attrs(
+                        model_config.extra_attrs,
+                        drafter_hidden_extra_attrs(type(self), spec_config,
+                                                   self.draft_config)):
+                    self.draft_model = get_draft_model(model_config,
+                                                       self.draft_config,
+                                                       self.lm_head, self.model)
+                if spec_config.uses_replacement_heads:
+                    self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:
                     self.epilogue.append(self.draft_model)
                 if (spec_config.spec_dec_mode.is_parallel_draft()
@@ -1678,13 +2193,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
-                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
+                model_config.mapping.mapping_for_full_rows(),
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
+                spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
+                self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
@@ -1692,6 +2210,62 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if (self.draft_model is not None
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
             self.draft_model.load_weights_from_target_model(self)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        spec_config = self.spec_config
+        if (self.spec_worker is not None and spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.draft_lm_head_dtype == "mxfp8"):
+            from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
+
+            # Rebuilt from the current BF16 weights (idempotent on reloads),
+            # from the LM head the draft passes project with.
+            draft_lm_head = getattr(self.draft_model, "lm_head", None)
+            self.spec_worker.draft_head = None
+            self.spec_worker.draft_head = build_mxfp8_draft_head(
+                self.lm_head if draft_lm_head is None else draft_lm_head,
+                self.model_config.mapping, self.spec_worker.key_exchange)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.spec_worker is not None:
+            # Collective over the TP group; every rank loads in step.
+            self.spec_worker.prepare_vocab_sharded_sampling(self.lm_head)
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_from_vocab_shards)
+
+    def _verify_logits(
+            self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+            spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
+        """The target logits the worker verifies, and whether they are this rank's vocabulary
+        columns, which the worker samples without the head's gather."""
+        rows = hidden_states[spec_metadata.gather_ids]
+        worker = self.spec_worker
+        vocab_sharded = worker.takes_vocab_sharded_target_logits(
+            attn_metadata, spec_metadata)
+        if not vocab_sharded and not worker.reads_lm_head_dtype_logits:
+            # The target logits, in the layout the worker's acceptance reads.
+            return worker.target_logits(
+                rows,
+                self.lm_head,
+                self.logits_processor,
+                attn_metadata,
+                spec_metadata,
+                self.draft_model,
+            ), False
+        logits = self.logits_processor.forward(
+            rows,
+            worker.vocab_sharded_head(self.lm_head, spec_metadata)
+            if vocab_sharded else self.lm_head,
+            attn_metadata,
+            True,
+            keep_lm_head_dtype=worker.reads_lm_head_dtype_logits,
+        )
+        return logits, vocab_sharded
 
     def forward(
         self,
@@ -1704,6 +2278,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # A padded generation batch's (mrope) positions are a strided view; one
+        # copy here instead of one per attention layer that needs them dense.
+        # Not with context requests: a breakable prefill CUDA graph replays its
+        # body against the capture-time position tensor.
+        # Not under torch.compile: the inference-mode copy differs from the
+        # position-buffer view context batches pass, so every switch between
+        # them would recompile; the compiled graph makes its own dense copies.
+        hoist_positions = (self.spec_decode_fast_paths
+                           and self.spec_worker is not None
+                           and position_ids is not None
+                           and attn_metadata.num_contexts == 0
+                           and not is_torch_compiling())
+        if hoist_positions:
+            position_ids = position_ids.contiguous()
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1712,6 +2300,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        if getattr(attn_metadata, "csa2_remote_tail_mode", None) == "source":
+            # The context worker intentionally stopped at the encoder/decoder
+            # boundary. Produce a disposable token for the existing context-only
+            # completion machinery, but do not run an embedded draft worker from
+            # an encoder-boundary activation. The handoff strips this token.
+            return self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                False,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -1720,13 +2319,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            logits, vocab_sharded = self._verify_logits(hidden_states,
+                                                        attn_metadata,
+                                                        spec_metadata)
+            worker_kwargs = {
+                "vocab_sharded_logits": True
+            } if vocab_sharded else {}
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -1742,6 +2340,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if hoist_positions:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,
@@ -1751,7 +2352,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    **worker_kwargs)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -1761,6 +2363,21 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             )
 
         return logits
+
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        if not getattr(self.spec_config, "uses_replacement_heads", False):
+            return super()._quantization_named_modules()
+        owned_ids = {
+            id(module)
+            for _, module in self.draft_model._quantization_named_modules()
+        }
+        return ((name, module) for name, module in self.named_modules()
+                if id(module) not in owned_ids)
+
+    def __post_init__(self) -> None:
+        if getattr(self.spec_config, "uses_replacement_heads", False):
+            self.draft_model.apply_quant_config()
+        super().__post_init__()
 
     def mtp_head_module_names(self) -> List[str]:
         """Names of the MTP heads under every alias they are reachable by.
@@ -1820,18 +2437,36 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             # load used allow_partial_loading=True, which silently left MTP
             # modules at random init when keys did not bind.
             n_total = len(weights)
+            lm_head_weights = {}
+            if getattr(self.draft_model, "owns_lm_head", False):
+                lm_head_weights = {
+                    name: value
+                    for name, value in weights.items()
+                    if name.startswith("lm_head.")
+                }
+                required_head_tensors = {"lm_head.weight"}
+                head_quant_algo = self.draft_model.lm_head.quant_config.quant_algo
+                if head_quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
+                    required_head_tensors.add("lm_head.weight_scale")
+                if head_quant_algo == QuantAlgo.W4A16_NVFP4:
+                    required_head_tensors.add("lm_head.weight_scale_2")
+                missing = sorted(required_head_tensors - lm_head_weights.keys())
+                if missing:
+                    raise ValueError(
+                        "Quantized replacement MTP checkpoint is missing " +
+                        ", ".join(missing))
             weights = select_mtp_checkpoint_weights(weights)
             if not weights:
                 raise ValueError(
                     "speculative_model was set for MTP but no 'mtp.*' weights "
                     f"were found in {self.spec_config.speculative_model!r}. "
                     "Expected keys like 'mtp.layers.0.*'.")
-            n_dropped = n_total - len(weights)
+            n_dropped = n_total - len(weights) - len(lm_head_weights)
             if n_dropped:
                 logger.warning(
-                    "Ignoring %d non-mtp.* tensors from speculative_model while "
-                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
-                    len(weights))
+                    "Ignoring %d unrelated tensors from speculative_model while "
+                    "loading MTP heads (kept %d MTP and %d LM head tensors).",
+                    n_dropped, len(weights), len(lm_head_weights))
             if weight_mapper is None:
                 raise ValueError(
                     "weight_mapper is required to load separate MTP heads")
@@ -1843,6 +2478,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 num_hidden_layers=num_hidden_layers,
                 num_mtp_layers=num_mtp_layers,
             )
+            weights.update(lm_head_weights)
 
             # Skip optional modules (e.g. shared_head) only when absent from
             # this checkpoint; architectures that ship those tensors still load

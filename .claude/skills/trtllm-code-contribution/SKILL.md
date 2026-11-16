@@ -367,7 +367,7 @@ Address these points in the PR description:
 
 ### API Stability Tests
 
-Some APIs are protected by the [API stability testsuite](tests/api_stability). If your PR breaks a protected API, the stability tests will fail with `API stability validation failed`. In this case, request review from the API code owners.
+Some APIs are protected by the [API stability testsuite](../../../tests/unittest/api_stability). If your PR breaks a protected API, the stability tests will fail with `API stability validation failed`. In this case, request review from the API code owners.
 
 ## Quantified Impact of Common Mistakes
 

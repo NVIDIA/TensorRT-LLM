@@ -17,6 +17,7 @@
 
 // Rest of includes
 #include "mcastDeviceMemory.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -74,9 +75,30 @@ bool cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
     }
 }
 
+//! Did every rank of the group report success? Built on allgather so it works for any
+//! McastGroupComm backend; the interface deliberately carries no reduction primitive, and one
+//! int32 per rank is negligible on a path that only runs while a workspace is set up.
+bool allRanksSucceeded(McastGroupComm& comm, bool localSuccess)
+{
+    int32_t const local{localSuccess ? 1 : 0};
+    std::vector<int32_t> perRank(comm.getSize());
+    comm.allgather(&local, perRank.data(), sizeof(int32_t));
+    return std::all_of(perRank.begin(), perRank.end(), [](int32_t value) { return value != 0; });
+}
+
+//! Smallest and largest value of \p localState across the group. Checkpoint transitions compare
+//! the two to confirm every rank sits in the same state before anything is mutated; allgather
+//! stands in for the MIN/MAX reduction pair because McastGroupComm carries no reduction primitive.
+std::pair<int32_t, int32_t> gatherStateRange(McastGroupComm& comm, int32_t localState)
+{
+    std::vector<int32_t> perRank(comm.getSize());
+    comm.allgather(&localState, perRank.data(), sizeof(int32_t));
+    auto const range = std::minmax_element(perRank.begin(), perRank.end());
+    return {*range.first, *range.second};
+}
+
 template <typename Action>
-void runCollectivePhase(
-    tensorrt_llm::mpi::MpiComm const& comm, char const* phase, Action action, bool failureIsTerminal = true)
+void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, bool failureIsTerminal = true)
 {
     std::exception_ptr localError;
     try
@@ -88,10 +110,7 @@ void runCollectivePhase(
         localError = std::current_exception();
     }
 
-    int32_t const localSuccess{localError == nullptr ? 1 : 0};
-    int32_t allSucceeded{0};
-    comm.allreduce(&localSuccess, &allSucceeded, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-    if (allSucceeded != 0)
+    if (allRanksSucceeded(comm, localError == nullptr))
     {
         return;
     }
@@ -127,6 +146,13 @@ void runCollectivePhase(
 
 McastDeviceMemory::McastDeviceMemory(
     size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
+    : McastDeviceMemory(
+        bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
+{
+}
+
+McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx,
+    bool mnNvlink, std::shared_ptr<McastGroupComm> groupComm)
     : mIsMNNvlink(mnNvlink)
     , mDeviceIdx(deviceIdx)
     , mGroupSize(groupSize)
@@ -137,12 +163,7 @@ McastDeviceMemory::McastDeviceMemory(
     , mMcPtr(0)
     , mUcBasePtr(0)
     , mMcHandle(0)
-#if ENABLE_MULTI_DEVICE
-    , mGroupComm(std::in_place, MPI_Comm_f2c(mpiCommFortranHandle), false)
-#else
-    , mGroupComm(std::in_place, nullptr, false)
-#endif
-    , mGroupWorldRanks(tensorrt_llm::mpi::getWorldRanks(*mGroupComm))
+    , mGroupComm(std::move(groupComm))
     , mUcPtrsDev(nullptr)
     , mSignalPadsDev(nullptr)
     , mState(State::kUnmapped)
@@ -150,12 +171,25 @@ McastDeviceMemory::McastDeviceMemory(
     , mMcBound(false)
     , mNvlsHandle(nullptr)
 {
+    // Local checks first: a mismatch here silently corrupts the handle exchange (each rank would
+    // allocate for a different number of peers) and would deadlock the collectives below.
+    TLLM_CHECK_WITH_INFO(mGroupComm != nullptr, "[McastDeviceMemory] group communicator must not be null.");
+    TLLM_CHECK_WITH_INFO(mGroupComm->getSize() == mGroupSize,
+        "[McastDeviceMemory] group communicator size (%u) does not match the requested group size (%u). Under a "
+        "non-MPI orchestrator this usually means the process group passed in does not cover the TP group.",
+        mGroupComm->getSize(), mGroupSize);
+    TLLM_CHECK_WITH_INFO(mGroupComm->getRank() == mGroupRank,
+        "[McastDeviceMemory] group communicator rank (%u) does not match the requested group rank (%u).",
+        mGroupComm->getRank(), mGroupRank);
+
+    // Retained so checkpointRestore() can confirm a replacement backend covers the same processes.
+    mGroupWorldRanks = mGroupComm->getWorldRanks();
+
     runCollectivePhase(*mGroupComm, "device capability validation",
         [this]()
         {
-            TLLM_CHECK_WITH_INFO(mGroupRank < mGroupSize && mGroupComm->getRank() == static_cast<int>(mGroupRank)
-                    && mGroupComm->getSize() == static_cast<int>(mGroupSize),
-                "[McastDeviceMemory] Constructor communicator does not match the supplied rank or group size.");
+            TLLM_CHECK_WITH_INFO(
+                mGroupRank < mGroupSize, "[McastDeviceMemory] group rank is out of range for the group size.");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
             int multicastSupported{0};
             TLLM_CU_CHECK(
@@ -174,12 +208,11 @@ McastDeviceMemory::McastDeviceMemory(
     // From pytorch implementation for alignment
     constexpr size_t kSignalPadAlignment = 16UL;
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
-    int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
 
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
+        "[McastDeviceMemory] World Rank: %d, Group Rank: %u, Group size: %u, isMultiNode: %d, "
         "device_idx: %d, Signal pad offset: %zu",
-        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
 
     if (mIsMNNvlink)
     {
@@ -348,7 +381,7 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
                     cuMemExportToShareableHandle(&myHandle, mUcHandles[mGroupRank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
                 TLLM_CUDA_CHECK(cudaMallocHost(&exportedHandles, mGroupSize * sizeof(CUmemFabricHandle)));
             });
-        mGroupComm->allgather(&myHandle, exportedHandles, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
+        mGroupComm->allgather(&myHandle, exportedHandles, sizeof(CUmemFabricHandle));
         runCollectivePhase(*mGroupComm, "unicast handle import",
             [&]()
             {
@@ -376,7 +409,7 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
                         cuMemExportToShareableHandle(multicastFabricHandle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
                 }
             });
-        mGroupComm->bcast(multicastFabricHandle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
+        mGroupComm->bcast(multicastFabricHandle, sizeof(CUmemFabricHandle), 0);
         runCollectivePhase(*mGroupComm, "multicast handle import",
             [&]()
             {
@@ -522,17 +555,13 @@ void McastDeviceMemory::checkpointPrepare()
         mIsMNNvlink, "[McastDeviceMemory] Stable-VA checkpointing is only supported for fabric-backed MNNVL memory.");
     if (mState == State::kUnmapped)
     {
-        TLLM_CHECK_WITH_INFO(!mGroupComm.has_value(),
+        TLLM_CHECK_WITH_INFO(mGroupComm == nullptr,
             "[McastDeviceMemory] Unmapped checkpoint state unexpectedly retained an MPI communicator.");
         return;
     }
     TLLM_CHECK_WITH_INFO(
-        mGroupComm.has_value(), "[McastDeviceMemory] Mapped checkpoint state is missing its MPI communicator.");
-    int32_t const localState{static_cast<int32_t>(mState)};
-    int32_t minState{0};
-    int32_t maxState{0};
-    mGroupComm->allreduce(&localState, &minState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-    mGroupComm->allreduce(&localState, &maxState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MAX);
+        mGroupComm != nullptr, "[McastDeviceMemory] Mapped checkpoint state is missing its MPI communicator.");
+    auto const [minState, maxState] = gatherStateRange(*mGroupComm, static_cast<int32_t>(mState));
     if (minState != static_cast<int32_t>(State::kMapped) || maxState != minState)
     {
         mState = State::kBroken;
@@ -569,30 +598,29 @@ void McastDeviceMemory::checkpointPrepare()
 
 bool McastDeviceMemory::checkpointRestore(int64_t mpiCommFortranHandle)
 {
+    // Own the duplicate: the caller may release its communicator as soon as this returns, but the
+    // object keeps using it until the next checkpointPrepare().
+    return checkpointRestore(std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle, /*takeOwnership=*/true));
+}
+
+bool McastDeviceMemory::checkpointRestore(std::shared_ptr<McastGroupComm> groupComm)
+{
     TLLM_CHECK_WITH_INFO(
         mIsMNNvlink, "[McastDeviceMemory] Stable-VA checkpointing is only supported for fabric-backed MNNVL memory.");
-#if ENABLE_MULTI_DEVICE
-    auto restoredGroupComm = tensorrt_llm::mpi::MpiComm(MPI_Comm_f2c(mpiCommFortranHandle), false);
-#else
-    auto restoredGroupComm = tensorrt_llm::mpi::MpiComm(nullptr, false);
-#endif
+    TLLM_CHECK_WITH_INFO(groupComm != nullptr, "[McastDeviceMemory] Restore group communicator must not be null.");
+    auto& restoredGroupComm = *groupComm;
     runCollectivePhase(
         restoredGroupComm, "restore communicator validation",
         [this, &restoredGroupComm]()
         {
-            TLLM_CHECK_WITH_INFO(restoredGroupComm.getRank() == static_cast<int>(mGroupRank)
-                    && restoredGroupComm.getSize() == static_cast<int>(mGroupSize),
+            TLLM_CHECK_WITH_INFO(restoredGroupComm.getRank() == mGroupRank && restoredGroupComm.getSize() == mGroupSize,
                 "[McastDeviceMemory] Restore communicator does not match the original rank or group size.");
-            TLLM_CHECK_WITH_INFO(tensorrt_llm::mpi::getWorldRanks(restoredGroupComm) == mGroupWorldRanks,
+            TLLM_CHECK_WITH_INFO(restoredGroupComm.getWorldRanks() == mGroupWorldRanks,
                 "[McastDeviceMemory] Restore communicator does not match the original ordered world-rank "
                 "membership.");
         },
         false);
-    int32_t const localState{static_cast<int32_t>(mState)};
-    int32_t minState{0};
-    int32_t maxState{0};
-    restoredGroupComm.allreduce(&localState, &minState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-    restoredGroupComm.allreduce(&localState, &maxState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MAX);
+    auto const [minState, maxState] = gatherStateRange(restoredGroupComm, static_cast<int32_t>(mState));
     if (minState == static_cast<int32_t>(State::kMapped) && maxState == minState)
     {
         return false;
@@ -608,18 +636,11 @@ bool McastDeviceMemory::checkpointRestore(int64_t mpiCommFortranHandle)
         restoredGroupComm, "restore communicator ownership validation",
         [this]()
         {
-            TLLM_CHECK_WITH_INFO(!mGroupComm.has_value(),
+            TLLM_CHECK_WITH_INFO(mGroupComm == nullptr,
                 "[McastDeviceMemory] Restore found a communicator retained past checkpoint prepare.");
         },
         false);
-#if ENABLE_MULTI_DEVICE
-    MPI_Comm ownedGroupComm{MPI_COMM_NULL};
-    runCollectivePhase(restoredGroupComm, "restore communicator duplication",
-        [&]() { TLLM_MPI_CHECK(MPI_Comm_dup(restoredGroupComm, &ownedGroupComm)); });
-    mGroupComm.emplace(ownedGroupComm, true);
-#else
-    mGroupComm.emplace(std::move(restoredGroupComm));
-#endif
+    mGroupComm = std::move(groupComm);
     mState = State::kTransitioning;
     try
     {
@@ -641,13 +662,9 @@ void McastDeviceMemory::checkpointRestoreComplete(bool localProtocolResetSucceed
 {
     TLLM_CHECK_WITH_INFO(
         mIsMNNvlink, "[McastDeviceMemory] Stable-VA checkpointing is only supported for fabric-backed MNNVL memory.");
-    TLLM_CHECK_WITH_INFO(mGroupComm.has_value(),
+    TLLM_CHECK_WITH_INFO(mGroupComm != nullptr,
         "[McastDeviceMemory] Checkpoint restore completion does not have an active MPI communicator.");
-    int32_t const localState{static_cast<int32_t>(mState)};
-    int32_t minState{0};
-    int32_t maxState{0};
-    mGroupComm->allreduce(&localState, &minState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-    mGroupComm->allreduce(&localState, &maxState, 1, mpi::MpiType::kINT32, mpi::MpiOp::MAX);
+    auto const [minState, maxState] = gatherStateRange(*mGroupComm, static_cast<int32_t>(mState));
     if (minState != static_cast<int32_t>(State::kTransitioning) || maxState != minState)
     {
         mState = State::kBroken;
@@ -675,11 +692,14 @@ void McastDeviceMemory::checkpointRestoreComplete(bool localProtocolResetSucceed
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
 {
-    // Get the world ranks for ranks in this group
-    auto ranks_ = tensorrt_llm::mpi::getWorldRanks(*mGroupComm);
+    // Globally unique ids of the ranks in this group. ipcNvlsAllocate only uses the set for its
+    // size; peers are addressed by group rank through mGroupComm. Reuse the membership captured at
+    // construction so this does not re-run a collective on every allocation.
+    auto const& ranks_ = mGroupWorldRanks;
     std::set<int> ranks(ranks_.begin(), ranks_.end());
-    // Reuse existing implementation
-    mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks);
+    // Reuse existing implementation, handing it this group's collective so the allocation works
+    // under MPI and non-MPI (Ray) orchestrators alike.
+    mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks, mGroupComm);
     mMcHandle = mNvlsHandle->mc_handle;
     mMcPtr = mNvlsHandle->mc_va;
     mUcPtrs = mNvlsHandle->ipc_uc_vas;

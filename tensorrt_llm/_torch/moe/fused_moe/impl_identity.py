@@ -15,6 +15,7 @@
 """Stable identities, queries, and registration for leaf MoE implementations."""
 
 import difflib
+import itertools
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
@@ -139,6 +140,15 @@ class MoEImplQuery:
         """
         return _SEP.join(getattr(self, name) or _WILDCARD for name in _ID_FIELDS)
 
+    def compact(self) -> str:
+        """The pinned fields only, in canonical order; empty for an empty query.
+
+        Round-trips for a non-empty query: segments find their fields by value,
+        so :meth:`MoEImplRegistry.parse_query` needs no ``*`` placeholders.
+        """
+        pinned = (getattr(self, name) for name in _ID_FIELDS)
+        return _SEP.join(value for value in pinned if value is not None)
+
     def __str__(self):
         return self.describe()
 
@@ -171,12 +181,10 @@ class MoEImplRegistry:
         self._token_to_field: Dict[str, str] = {}
 
     def _check_tokens_disjoint(self, identity: MoEImplId) -> None:
-        # ``claimed`` holds the tokens this identity used for its own earlier
-        # fields. Without it only previously registered ids are in scope, so an
-        # identity reusing one token twice would register fine and then be
-        # unaddressable: the later field wins the token below, so parse_query
-        # hands both segments to that field and refuses the identity's own
-        # canonical string.
+        # Tokens this identity already used for its own earlier fields. Without
+        # them an identity reusing one token twice registers fine and is then
+        # unaddressable: the later field wins the token, so ``parse_query``
+        # refuses the identity's own canonical string.
         claimed: Dict[str, str] = {}
         for name in _ID_FIELDS:
             token = getattr(identity, name)
@@ -221,8 +229,8 @@ class MoEImplRegistry:
     def suggest(self, token: str) -> Tuple[str, ...]:
         """Nearest known tokens, in descending similarity, for a typo message.
 
-        Empty when nothing is close, which includes the case that matters most
-        during the migration: a registry too sparse to hold a neighbour.
+        Empty when nothing is close, including when the registry is still too
+        sparse to hold a neighbour.
         """
         return tuple(difflib.get_close_matches(token, self._token_to_field, n=3))
 
@@ -233,12 +241,22 @@ class MoEImplRegistry:
         and ``mega_moe.deepgemm`` are the same request and a bare ``mega_moe``
         is a legal one. Position carries no meaning here; that is what
         :meth:`_check_tokens_disjoint` buys at registration time.
+
+        Whitespace is stripped around the whole text only. ``MoeConfig``
+        stores a tactic as this method reads it, so a segment that would only
+        match after stripping is refused rather than accepted here and kept
+        malformed in the config.
         """
         tokens = []
-        for raw in text.split(_SEP):
-            token = raw.strip().lower()
-            if not token:
-                raise ValueError(f"empty segment in MoE impl specification {text!r}")
+        for raw in text.strip().split(_SEP):
+            token = raw.lower()
+            # fullmatch, not match: `$` also matches before a trailing newline, so
+            # match() would accept "cutlass\n".
+            if token != _WILDCARD and _FIELD_RE.fullmatch(token) is None:
+                raise ValueError(
+                    f"malformed segment {raw!r} in MoE impl specification {text!r}: each "
+                    f"segment must match {_FIELD_RE.pattern} or be {_WILDCARD!r}"
+                )
             tokens.append(token)
 
         # The per-field duplicate check below bounds named tokens only. A
@@ -257,9 +275,8 @@ class MoEImplRegistry:
             name = self._token_to_field.get(token)
             if name is None:
                 near = self.suggest(token)
-                # Near misses while the registry has neighbours to compare
-                # against; the full vocabulary only while it is small enough
-                # for that to be a listing rather than noise.
+                # Near misses once the registry has neighbours to offer; the
+                # full vocabulary only while it is small enough to be readable.
                 hint = (
                     f"Closest known values: {list(near)}"
                     if near
@@ -278,6 +295,27 @@ class MoEImplRegistry:
         """Every registered impl the query matches, in registration order."""
         return [(ident, cls) for ident, cls in self._store.items() if query.matches(ident)]
 
+    def shortest_query(self, identity: MoEImplId) -> MoEImplQuery:
+        """The query of fewest segments that matches ``identity`` and no other id.
+
+        Ties go to the earlier fields in canonical order, ``provider`` first, so
+        the answer is fixed for a given registry. It holds for the
+        implementations registered now; one registered later can match the same
+        query.
+
+        Raises:
+            KeyError: ``identity`` is not registered.
+        """
+        if identity not in self._store:
+            raise KeyError(f"MoE impl {identity.canonical()} is not registered")
+        for size in range(1, len(_ID_FIELDS)):
+            for names in itertools.combinations(_ID_FIELDS, size):
+                query = MoEImplQuery(**{name: getattr(identity, name) for name in names})
+                if len(self.find(query)) == 1:
+                    return query
+        # Identities are unique, so the full one matches only itself.
+        return MoEImplQuery(**{name: getattr(identity, name) for name in _ID_FIELDS})
+
     def identities(self) -> Tuple[MoEImplId, ...]:
         return tuple(self._store)
 
@@ -285,10 +323,10 @@ class MoEImplRegistry:
         return len(self._store)
 
 
-# Created empty; each leaf registers itself at import time as it migrates, so
-# the registry is partial for as long as the migration runs. A pin that names
-# nothing registered fails hard rather than falling back, which is what keeps a
-# partial registry from answering with a kernel the caller did not ask for.
+# Created empty; each impl registers itself at import time, so the registry is
+# partial while the migration runs. A pin naming nothing registered fails hard
+# rather than falling back, so a partial registry cannot answer with a kernel
+# the caller did not ask for.
 MOE_IMPL_REGISTRY = MoEImplRegistry()
 
 

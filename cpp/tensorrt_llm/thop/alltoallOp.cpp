@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,12 +15,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <c10/cuda/CUDAGuard.h>
+#include <optional>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -112,6 +115,74 @@ std::vector<torch::Tensor> alltoall_helix(
 #endif // ENABLE_MULTI_DEVICE
 }
 
+torch::Tensor alltoallvTokens(
+    torch::Tensor input, torch::List<int64_t> counts, torch::List<int64_t> groupRanks, int64_t rank)
+{
+#if ENABLE_MULTI_DEVICE
+    CHECK_TH_CUDA(input);
+    CHECK_CONTIGUOUS(input);
+    TORCH_CHECK(input.dim() == 2, "alltoallv_tokens: input must be 2D [rows, row_size], got ", input.dim(), "D");
+    auto const groupSize = static_cast<int>(groupRanks.size());
+    TORCH_CHECK(counts.size() == groupRanks.size(), "alltoallv_tokens: ", counts.size(), " counts for ", groupSize,
+        " group ranks");
+    TORCH_CHECK(rank >= 0 && rank < groupSize, "alltoallv_tokens: rank ", rank, " outside a group of ", groupSize);
+    // getComm numbers the group's ranks in increasing order: the index into groupRanks is the NCCL peer.
+    int64_t const sessionRank = COMM_SESSION.getRank();
+    TORCH_CHECK(static_cast<int64_t>(groupRanks[rank]) == sessionRank, "alltoallv_tokens: group rank ",
+        static_cast<int64_t>(groupRanks[rank]), " at index ", rank, " is not this process's rank ", sessionRank);
+    std::set<int> group;
+    int64_t localStart = 0;
+    int64_t totalRows = 0;
+    for (int peer = 0; peer < groupSize; ++peer)
+    {
+        int64_t const peerRank = groupRanks[peer];
+        int64_t const peerRows = counts[peer];
+        TORCH_CHECK(peer == 0 || peerRank > static_cast<int64_t>(groupRanks[peer - 1]),
+            "alltoallv_tokens: group ranks must be strictly increasing");
+        TORCH_CHECK(peerRows >= 0, "alltoallv_tokens: negative row count ", peerRows, " for peer ", peer);
+        group.insert(static_cast<int>(peerRank));
+        localStart += peer < rank ? peerRows : 0;
+        totalRows += peerRows;
+    }
+    TORCH_CHECK(
+        totalRows == input.size(0), "alltoallv_tokens: counts sum to ", totalRows, " rows, input has ", input.size(0));
+    c10::cuda::CUDAGuard deviceGuard(input.device());
+    auto const localRows = counts[rank];
+    auto output = torch::empty({groupSize, localRows, input.size(1)}, input.options());
+    auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    auto const communicator = getComm(group);
+    auto const rowBytes = static_cast<size_t>(input.size(1)) * input.element_size();
+    auto const localBytes = static_cast<size_t>(localRows) * rowBytes;
+    auto const* source = static_cast<uint8_t const*>(input.data_ptr());
+    auto* destination = static_cast<uint8_t*>(output.mutable_data_ptr());
+    if (localBytes > 0)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(destination + rank * localBytes, source + localStart * rowBytes, localBytes,
+            cudaMemcpyDeviceToDevice, stream));
+    }
+    ncclGroupStart();
+    size_t sourceOffset = 0;
+    for (int peer = 0; peer < groupSize; ++peer)
+    {
+        auto const sendBytes = static_cast<size_t>(counts[peer]) * rowBytes;
+        if (peer != rank && sendBytes > 0)
+        {
+            ncclSend(source + sourceOffset, sendBytes, ncclUint8, peer, *communicator, stream);
+        }
+        if (peer != rank && localBytes > 0)
+        {
+            ncclRecv(destination + peer * localBytes, localBytes, ncclUint8, peer, *communicator, stream);
+        }
+        sourceOffset += sendBytes;
+    }
+    NCCLCHECK_THROW(ncclGroupEnd());
+    return output;
+#else
+    TORCH_CHECK(false, "alltoallv_tokens requires multi-device support");
+    return {};
+#endif
+}
+
 /**
  * Helix All-to-All operation with two fields.
  *
@@ -125,10 +196,13 @@ std::vector<torch::Tensor> alltoall_helix(
  * @param workspace Workspace tensor (uint64, strided across ranks)
  * @param cp_rank Current context parallel rank
  * @param cp_size Total number of context parallel ranks
+ * @param zero_kv_mask Optional bool mask of rows this rank owns no KV for. The
+ * sender replaces them with a no-op contribution, so the caller must not
+ * sanitize itself. Its length must divide entry_count.
  * @return tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs
  */
-std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
-    torch::Tensor partial_o, torch::Tensor softmax_stats, torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
+std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor partial_o, torch::Tensor softmax_stats,
+    torch::Tensor workspace, int64_t cp_rank, int64_t cp_size, std::optional<torch::Tensor> zero_kv_mask)
 {
 
     // Input validation
@@ -224,6 +298,30 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
     params.channelCount = 0; // auto-compute
     params.maxChannelCount = tensorrt_llm::kernels::computeHelixMaxChannelCount(cp_size);
 
+    // Optional zero-local-KV sanitization, applied by the sender in shared memory
+    params.zeroKvMask = nullptr;
+    params.zeroKvMaskDivisor = 1;
+    if (zero_kv_mask.has_value())
+    {
+        auto const& mask = zero_kv_mask.value();
+        CHECK_TH_CUDA(mask);
+        // CHECK_TH_CUDA only asserts "is a CUDA tensor". The kernel dereferences
+        // this pointer on partial_o's device, so a mask on a different device
+        // would be an invalid access rather than an error.
+        TORCH_CHECK(mask.device() == partial_o.device(), "zero_kv_mask must be on the same device as partial_o (got ",
+            mask.device(), " vs ", partial_o.device(), ")");
+        CHECK_CONTIGUOUS(mask);
+        CHECK_TYPE(mask, at::ScalarType::Bool);
+        TORCH_CHECK(mask.numel() > 0 && entry_count % mask.numel() == 0, "zero_kv_mask numel (", mask.numel(),
+            ") must divide the all-to-all entry count (", entry_count, ")");
+        params.zeroKvMask = reinterpret_cast<uint8_t const*>(mask.data_ptr());
+        // entry_count can legitimately be 0 for an empty batch, in which case
+        // the kernel never indexes the mask; keep the divisor positive so the
+        // launch-side contract still holds.
+        int const divisor = static_cast<int>(entry_count / mask.numel());
+        params.zeroKvMaskDivisor = divisor > 0 ? divisor : 1;
+    }
+
     // Launch kernel
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchHelixAllToAll(params, allowVariableField1, stream);
@@ -257,10 +355,11 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("alltoallv_tokens(Tensor input, int[] counts, int[] group, int rank) -> Tensor");
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
         "alltoall_helix_native(Tensor partial_o, Tensor softmax_stats, Tensor(a!) workspace, int "
-        "cp_rank, int cp_size) -> (Tensor, Tensor)");
+        "cp_rank, int cp_size, Tensor? zero_kv_mask=None) -> (Tensor, Tensor)");
     m.def(
         "initialize_helix_workspace(Tensor(a!) workspace, int cp_rank, int cp_size) "
         "-> ()");
@@ -268,6 +367,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("alltoallv_tokens", &tensorrt_llm::torch_ext::alltoallvTokens);
     m.impl("alltoall_helix", &tensorrt_llm::torch_ext::alltoall_helix);
     m.impl("alltoall_helix_native", &tensorrt_llm::torch_ext::alltoall_helix_native);
     m.impl("initialize_helix_workspace", &tensorrt_llm::torch_ext::initialize_helix_workspace);

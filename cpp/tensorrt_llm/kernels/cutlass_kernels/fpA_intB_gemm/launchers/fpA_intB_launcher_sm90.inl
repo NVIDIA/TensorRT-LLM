@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -292,7 +292,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 
 #else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
-        "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an arch "
+        "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90 as an arch "
         "to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }

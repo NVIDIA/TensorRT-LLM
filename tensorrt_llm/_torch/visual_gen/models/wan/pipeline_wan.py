@@ -26,7 +26,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -138,16 +138,23 @@ class WanPipeline(BasePipeline):
         # Fixed latent for reproducible benchmarking (e.g. MLPerf).
         # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
         # noise tensor; it will be used in place of freshly sampled random latents for
-        # all T2V requests.  Loaded once at server startup, reused across requests.
+        # all T2V requests. Loaded on first use: torch.load fails under MetaInitMode.
         self._fixed_latent: Optional[torch.Tensor] = None
-        _fixed_latent_path = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
-        if _fixed_latent_path:
-            self._fixed_latent = torch.load(_fixed_latent_path, weights_only=True)
-            logger.warning(
-                f"Loaded fixed latent from {_fixed_latent_path}, shape={self._fixed_latent.shape}"
-            )
+        self._fixed_latent_path: Optional[str] = (
+            os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH") or None
+        )
 
         super().__init__(pipeline_config)
+        # CUDA graphs capture the VSA partition/mask tensor addresses. Keep
+        # their shape cache alive across requests so replay never references
+        # metadata owned by a completed forward call.
+        self._vsa_metadata_builder = VSAMetadataBuilder()
+
+    def cleanup(self):
+        """Release CUDA graphs before clearing captured attention state."""
+
+        super().cleanup()
+        self._vsa_metadata_builder.clear()
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
@@ -160,7 +167,14 @@ class WanPipeline(BasePipeline):
         # The forward path receives normalized timesteps. TeaCache coefficients
         # were calibrated against WAN's raw scheduler timestep scale.
         timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        if timestep_for_embedding.ndim == 2:
+            timestep_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
+        else:
+            timestep_seq_len = None
         t_freq = ce.timesteps_proj(timestep_for_embedding)
+        if timestep_seq_len is not None:
+            t_freq = t_freq.unflatten(0, (-1, timestep_seq_len))
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype
@@ -438,7 +452,7 @@ class WanPipeline(BasePipeline):
                 width=width,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=5.0,
+                guidance_scale=self.default_generation_params["guidance_scale"],
                 seed=42,
                 max_sequence_length=512,
             )
@@ -591,8 +605,8 @@ class WanPipeline(BasePipeline):
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
-        elif self._fixed_latent is not None:
-            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
+        elif (fixed_latent := self._get_fixed_latent()) is not None:
+            latents = fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
@@ -608,15 +622,15 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
-        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        # VSA metadata is cached at pipeline scope and reused across requests.
         _attn_cfg = self.pipeline_config.primary_model_config.attention
         _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
         _vsa_active = (
-            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
             and _sparse_cfg is not None
             and getattr(_sparse_cfg, "algorithm", None) == "vsa"
         )
-        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_builder = self._vsa_metadata_builder if _vsa_active else None
         _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
         _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
 
@@ -793,6 +807,16 @@ class WanPipeline(BasePipeline):
         neg_embeds = get_embeds(neg_prompt)
 
         return prompt_embeds, neg_embeds
+
+    def _get_fixed_latent(self) -> Optional[torch.Tensor]:
+        """Fixed latent, loaded on first use; subclasses must call this."""
+        if self._fixed_latent is None and self._fixed_latent_path is not None:
+            self._fixed_latent = torch.load(self._fixed_latent_path, weights_only=True)
+            logger.warning(
+                f"Loaded fixed latent from {self._fixed_latent_path}, "
+                f"shape={self._fixed_latent.shape}"
+            )
+        return self._fixed_latent
 
     @nvtx_range("_prepare_latents", color="blue")
     def _prepare_latents(

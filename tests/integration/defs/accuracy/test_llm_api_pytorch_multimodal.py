@@ -12,9 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
+from pathlib import Path
 from typing import ClassVar
 
+import numpy as np
 import pytest
+from PIL import Image
+from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate.post_processing import (
@@ -32,12 +38,20 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
+    get_sm_version,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
+)
 
 
 class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
@@ -150,11 +164,37 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             speculative_config=MTPDecodingConfig(
                 max_draft_len=3,
-                mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
+            )
+
+    def test_nvfp4_no_mtp(self):
+        # Same checkpoint without MTP drafting.
+        # SM121 (GB10) needs FlashInfer set explicitly; other GPUs use the model default.
+        extra_kwargs = {"attn_backend": "FLASHINFER"} if get_sm_version() == 121 else {}
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+            guided_decoding_backend="xgrammar",
+            **extra_kwargs,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert_guided_decoding_regex(llm)
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
                 llm,
@@ -162,21 +202,82 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
-    def test_nvfp4_no_mtp(self):
-        # Same checkpoint without MTP drafting.
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGemma4_31B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-31B-it"
+
+    def test_multi_image_encoder_budget(self, tmp_path: Path) -> None:
+        """A request spanning several encoder steps completes, and the executor keeps serving."""
+        # Raise every image to 1120 soft tokens (10,080 encoder patches) so 8 images need several
+        # encoder steps.
+        for name in os.listdir(self.MODEL_PATH):
+            if name != "processor_config.json":
+                os.symlink(os.path.join(self.MODEL_PATH, name), tmp_path / name)
+        with open(os.path.join(self.MODEL_PATH, "processor_config.json")) as f:
+            processor_config = json.load(f)
+        processor_config["image_processor"]["max_soft_tokens"] = 1120
+        with open(tmp_path / "processor_config.json", "w") as f:
+            json.dump(processor_config, f)
+        processor = AutoProcessor.from_pretrained(tmp_path)
+        assert processor.image_processor.max_soft_tokens == 1120
+
+        num_images = 8
+        prompt = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}] * num_images
+                    + [{"type": "text", "text": "Describe these images."}],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        rng = np.random.default_rng(0)
+        images = [
+            Image.fromarray(rng.integers(0, 256, (2000, 2000, 3), dtype=np.uint8))
+            for _ in range(num_images)
+        ]
+        sampling_params = SamplingParams(max_tokens=8)
+        with LLM(
+            str(tmp_path),
+            max_seq_len=65536,
+            max_batch_size=32,
+            max_num_tokens=2048,
+            enable_chunked_prefill=True,
+            attn_backend="FLASHINFER",
+            cuda_graph_config=None,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+        ) as llm:
+            output = llm.generate(
+                {"prompt": prompt, "multi_modal_data": {"image": images}}, sampling_params
+            )
+            # About 8.7k prompt tokens at 1120 soft tokens per image, about 2.1k at the default 280.
+            assert len(output.prompt_token_ids) > num_images * 1000
+            assert output.outputs[0].token_ids
+            output = llm.generate("Hello", sampling_params)
+            assert output.outputs[0].token_ids
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(40000)
+class TestGemma4Unified12B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
+
+    def test_guided_decoding(self):
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
         with LLM(
             self.MODEL_PATH,
-            max_batch_size=16,
-            kv_cache_config=self.kv_cache_config,
-            enable_chunked_prefill=True,
+            disable_mm_encoder=True,
+            max_batch_size=1,
+            max_seq_len=512,
+            max_num_tokens=512,
+            attn_backend="FLASHINFER",
+            guided_decoding_backend="xgrammar",
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                sampling_params=self.sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
+            assert_guided_decoding_regex(llm)
 
 
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
@@ -537,7 +638,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        registered in qa/functional/llm_function_multinode.yml and run by QA's weekly
         multinode pipeline (qualified on 4x4 GB300 nodes; reference in
         references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
         --task mmmu: the base eval_extra_llm_options.yaml serving config with
@@ -555,17 +656,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
-            # V2 cache-manager preference, but the qualified K3 MMMU
-            # configuration ran V1, and under V2 this test's long-generation
-            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
-            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
-            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
-            # qualified at this shape.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
-                use_kv_cache_manager_v2=False,
+                use_kv_cache_manager_v2=True,
             ),
         ) as llm:
             # Reference-key contract: the K3 checkpoint carries its
@@ -604,7 +698,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, max_num_tokens):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, use_kv_cache_manager_v2=True)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,

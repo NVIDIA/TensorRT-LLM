@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.7"
+EVENT_SCHEMA_VER = "0.8"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -100,10 +100,15 @@ class _LlmCounterSnapshot(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# Bucket lower bounds of the local consecutive startup failure count.
+PriorStartupFailures = Literal[0, 1, 2, 3, 10, 30, 100, 300, 1000]
+StartupStateStatus = Literal["", "persisted", "new", "unavailable"]
+
+
 class TrtllmInitialReport(_LlmCounterSnapshot):
     """TRT-LLM initial report event parameters.
 
-    Sent once at startup with full environment and configuration details.
+    Sent once after initialization, or as marked partial context on early exit.
     All fields are required by the SMS schema (GXT convention: every declared
     property must be in ``required``). Fields use sentinel defaults (empty
     string for strings, 0 for ints) when the actual value is unavailable.
@@ -187,6 +192,24 @@ class TrtllmInitialReport(_LlmCounterSnapshot):
         description="Identifier used to correlate a disaggregated deployment.",
     )
 
+    # Local consecutive startup failure count of this launch
+    prior_startup_failures: PriorStartupFailures = Field(
+        default=0,
+        alias="priorStartupFailures",
+        description=(
+            "Consecutive failed starts of the same launch before this session, as a "
+            "bucket lower bound."
+        ),
+    )
+    startup_state_status: StartupStateStatus = Field(
+        default="",
+        alias="startupStateStatus",
+        description=(
+            "persisted if the local startup state was read, new if it was missing or "
+            "corrupt, unavailable if it could not be read or written; empty if not consulted."
+        ),
+    )
+
     # Legacy feature summary and sanitized opt-in LLM API config capture.
     features_json: str = Field(default="{}", alias="featuresJson")
     llm_api_config_json: str = Field(default="{}", alias="llmApiConfigJson")
@@ -199,7 +222,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
     """TRT-LLM heartbeat event parameters.
 
     Sent periodically to signal the session is still alive.
-    Contains a monotonically increasing sequence counter, process correlation
+    Contains a sequence counter saturating at uint32 max, process correlation
     fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
@@ -208,7 +231,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
         ge=0,
         le=_UINT32_MAX,
         alias="seq",
-        description="Zero-based heartbeat sequence number for this session.",
+        description="Zero-based heartbeat sequence number, saturating at uint32 max.",
     )
     ingress_point: str = Field(
         default="",
@@ -255,6 +278,17 @@ TerminationComponent = Literal[
     "unknown",
 ]
 ReportingSource = Literal["self", "supervisor", "executor_proxy"]
+# Category of a startup failure, from ``tensorrt_llm._errors.ERROR_CATEGORIES``;
+# "" when the session did not fail during startup.
+ErrorCategory = Literal[
+    "",
+    "config_input",
+    "resource",
+    "unsupported",
+    "model_load",
+    "runtime_init",
+    "other",
+]
 
 
 class TrtllmExitReport(_LlmCounterSnapshot):
@@ -322,12 +356,36 @@ class TrtllmExitReport(_LlmCounterSnapshot):
         alias="deploymentId",
         description="Identifier used to correlate a disaggregated deployment.",
     )
+    error_category: ErrorCategory = Field(
+        default="",
+        alias="errorCategory",
+        description=(
+            "Category of the startup failure that ended the session; empty if the "
+            "session did not fail during startup."
+        ),
+    )
+    prior_startup_failures: PriorStartupFailures = Field(
+        default=0,
+        alias="priorStartupFailures",
+        description=(
+            "Consecutive failed starts of the same launch before this session, as a "
+            "bucket lower bound."
+        ),
+    )
+    startup_state_status: StartupStateStatus = Field(
+        default="",
+        alias="startupStateStatus",
+        description=(
+            "persisted if the local startup state was read, new if it was missing or "
+            "corrupt, unavailable if it could not be read or written; empty if not consulted."
+        ),
+    )
 
     model_config = {"populate_by_name": True}
 
 
 # ---------------------------------------------------------------------------
-# GXT Event Wrapper (single event in the events array)
+# GXT Event Wrapper (one entry in a potentially multi-event envelope)
 # ---------------------------------------------------------------------------
 
 

@@ -16,34 +16,46 @@ if TYPE_CHECKING:
 # function: they pull in ``trtllm`` and ``resource_manager``, which import
 # ``interface`` and would otherwise form an import cycle when this package is
 # loaded.
+# The cycle runs through ``backends`` alone: the ``tensorrt_llm._torch.attention``
+# package root resolves its exports lazily and takes no part in it, so these
+# imports have to stay local regardless of how the package root exports names.
 
 
 def get_sparse_attn_kv_cache_manager(
     sparse_attention_config: "SparseAttentionConfig",
     use_kv_cache_manager_v2: bool = False,
 ) -> type:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from .qsa import QSAMambaHybridCacheManagerV2
     from .rocket import RocketKVCacheManager
 
+    if getattr(sparse_attention_config, "uses_dense_kv_cache", False):
+        # The algorithm keeps the dense KV cache. get_kv_cache_manager_cls
+        # routes such models through the dense manager selection; this maps an
+        # already chosen version to its class.
+        return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
+    if sparse_attention_config.algorithm == "csa2":
+        from .csa2.cache_manager import CSA2CacheManager
+
+        return CSA2CacheManager
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
-    elif sparse_attention_config.algorithm == "skip_softmax":
-        return KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
     elif sparse_attention_config.algorithm == "qsa":
         if not use_kv_cache_manager_v2:
             raise ValueError("QSA sparse attention requires KV cache manager V2")
-        return QSAMambaHybridCacheManagerV2
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
+
+        return Qwen4ExpHybridCacheManager
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attention_config.algorithm}"
@@ -75,6 +87,10 @@ def get_vanilla_sparse_attn_attention_backend(
 
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
+    elif sparse_params.algorithm == "dsa":
+        from .dsa import DSAVanillaAttention
+
+        return DSAVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
     else:
@@ -93,6 +109,10 @@ def get_trtllm_sparse_attn_attention_backend(
     from .qsa import QSATrtllmAttention
     from .rocket import RocketTrtllmAttention
 
+    if sparse_params.algorithm == "csa2":
+        from .csa2.backend import get_csa2_backend
+
+        return get_csa2_backend(sparse_params)
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_params.algorithm == "qsa":
@@ -110,6 +130,15 @@ def get_trtllm_sparse_attn_attention_backend(
         # returns an instantiable AttentionBackend under the trtllm
         # attention backend slot.
         return _resolve_minimax_m3_backend_cls(sparse_params)
+    elif sparse_params.algorithm == "glm_kpool":
+        # GLM-5.3-Flash fully-NoPE pool-compressed sparse MLA: a narrow
+        # TrtllmAttention subclass beside the DSA branch (stock DSA assumes
+        # the 576-wide rope'd DeepSeek geometry). The model layer predicts the
+        # pool-expanded indices; the backend owns the metadata-derived paged
+        # latent/indexer cache path and the FlashMLA sparse-MLA core.
+        from .glm_kpool import GlmKpoolSparseAttention
+
+        return GlmKpoolSparseAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_params.algorithm}"

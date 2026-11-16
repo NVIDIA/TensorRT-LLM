@@ -98,9 +98,7 @@ def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
                         runtime_env=runtime_env,
                     ).remote(
                         async_llm_kwargs={
-                            "model": os.path.join(
-                                llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
-                            ),
+                            "model": os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
                             "kv_cache_config": {
                                 "free_gpu_memory_fraction": 0.1,
                             },

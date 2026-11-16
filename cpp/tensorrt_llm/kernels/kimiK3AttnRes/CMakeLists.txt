@@ -13,7 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_library(kimi_k3_attn_res_src OBJECT attnResFwd.cu)
+add_library(kimi_k3_attn_res_src OBJECT attnResFwd.cu
+                                        attnResFwdPersistentFused.cu)
 
 # The kernel is warp-specialized for the SM100 (datacenter Blackwell) family and
 # uses tcgen05/TMEM PTX instructions that ptxas rejects for other architectures

@@ -39,7 +39,7 @@ public:
 
     ~FuncGuard() noexcept
     {
-        terminateOnException("FuncGuard callback failed during destruction", [this]() { run(); });
+        KVCM2_POISON_ON_EXCEPT([this]() { run(); });
     }
 
     FuncGuard(FuncGuard&& other) noexcept

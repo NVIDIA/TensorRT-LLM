@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -372,6 +372,11 @@ def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> b
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
+    # Helix carries its parallelism in cp with tp_size=1, so a tp-only test
+    # never trips; the tower has no context-parallel form, so any cp > 1
+    # must replicate.
+    if mapping.cp_size > 1:
+        return True
     return (num_heads % mapping.tp_size) != 0
 
 
@@ -379,12 +384,18 @@ def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping
     if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
+    # Fold every parallel dimension (incl. helix cp) into pp so each rank
+    # runs the tower replicated; without cp the world size collapses below
+    # the rank range under helix.
+    attn_ranks = (
+        model_config.mapping.pp_size * model_config.mapping.tp_size * model_config.mapping.cp_size
+    )
     return Mapping(
-        world_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        world_size=attn_ranks,
         rank=model_config.mapping.rank,
         gpus_per_node=model_config.mapping.gpus_per_node,
         tp_size=1,
-        pp_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        pp_size=attn_ranks,
     )
 
 
@@ -787,9 +798,15 @@ class KimiK25VisionModel(nn.Module):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
+        self.model_config.attn_backend = model_config.get_encoder_attention_backend(
+            "vision", model_config.attn_backend
         )
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if self.model_config.attn_backend != model_config.attn_backend:
+            # The encoder keeps no KV cache, and FlashInfer rejects FP8
+            # KV-cache quantization without one.
+            kv_cache_quant_algo = None
+        self.model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -1458,18 +1475,20 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> DisaggPrefillMultimodalInputs:
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
-            mm_handles: List of multimodal embedding handles from the
-                context phase, each containing ``tensor_size``.
+            mm_handles: List of multimodal embedding handles, each
+                containing ``tensor_size``.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1517,11 +1536,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+        return expanded_ids.to(torch.int32).tolist(), MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_handles))],
+                output_embedding_lengths=[handle["tensor_size"][0] for handle in mm_handles],
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
             multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
             multimodal_run_positions=mm_token_offsets,
             multimodal_run_lengths=mm_token_length,
@@ -1557,6 +1580,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         mm_encoder: KimiK25VisionModel (native MoonViT3d + PatchMergerMLP)
         llm: DeepseekV3ForCausalLM (MLA + MoE, 61 layers)
     """
+
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
 
     _LANG_PREFIX = "language_model."
     # Vision tower class. Subclasses (Kimi K3) override this so the shared
@@ -1705,15 +1732,26 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         """Surface the in-vocab media placeholder to the model engine so
-        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        ``runners.prepare_multimodal_indices`` selects the ``torch.isin`` predicate
         instead of the OOV (``>= vocab_size``) fallback (which would miss
         Kimi's placeholder and force ``fuse_input_embeds`` through the
         ``torch.where`` host-sync path on GPU input_ids).
         """
         return self._mm_token_ids
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load vision + projector + LLM weights from checkpoint.
+
+        Raises:
+            RuntimeError: Dense DWDP is active on the text model; nothing is loaded.
+        """
+        if getattr(getattr(self, "model", None), "_dense_dwdp_active", False):
+            # The text model's dense weights are views of dense DWDP staging slots that several
+            # layers share; refuse before the vision tower is rebuilt or loaded.
+            raise RuntimeError(
+                f"{type(self).__name__} load_weights is not supported while dense DWDP is "
+                "active: the dense weights live in staging slots shared across layers"
+            )
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.
@@ -1769,7 +1807,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # ``runners.prepare_multimodal_indices`` now sees Kimi's
             # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
             # that match ``find_input_mm_embeds``'s active-chunk slice. The
             # previous ``(input_ids == placeholder).sum().item()`` guard was a

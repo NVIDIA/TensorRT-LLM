@@ -184,14 +184,6 @@ TEST(NativeColdPageCodecTest, UnownedLifecycleUsesLosslessFallback)
     RecordingCodec codec{{0}};
     std::array descs{makeAttentionDesc(), makeLosslessDesc(kv::PoolGroupIndex{1}, kv::LayerGroupId{1})};
 
-    if (kv::HostMem::shouldUseChunkedRegistration())
-    {
-        // Fallback lifecycles fail closed on host kernels with chunked pinned-memory
-        // registration until KVCM replaces the batched copies with kernels.
-        EXPECT_FALSE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
-        return;
-    }
-
     ASSERT_TRUE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
     EXPECT_EQ(codec.resolved.size(), 1U);
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 777U);

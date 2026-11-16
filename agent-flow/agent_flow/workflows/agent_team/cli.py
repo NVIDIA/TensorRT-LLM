@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
+
+from agent_flow.orchestration import IsolationProvider
 
 from .prompts import PromptBundle
 from .state import STATE_FILENAME
@@ -159,11 +162,71 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feedback is absent. Off by default.",
     )
     parser.set_defaults(trigger_replan_with_feedback=False)
+    parser.add_argument(
+        "--no-mcp-tools",
+        dest="use_in_process_tools",
+        action="store_false",
+        help="Disable the workflow's in-process MCP tools for every role, on "
+        "both the claude-code and codex backends. Progress and status then "
+        "flow through the backends' built-in file tools plus orchestrator "
+        "parsing/injection: the read tools are replaced by context inlined "
+        "into each prompt, and the `append_*_progress` / `update_status` "
+        "tools by a per-turn handoff file the orchestrator reads back. "
+        "`ask_human` is unavailable in this mode, so --plan-human-review and "
+        "--build-human-review are rejected. Use this on machines where a "
+        "dynamically configured MCP server is blocked (e.g. an enterprise "
+        "managed-mcp.json lockdown). On by default (MCP tools enabled).",
+    )
+    parser.set_defaults(use_in_process_tools=True)
+    parser.add_argument(
+        "--concurrent",
+        action="store_true",
+        help="Run the plan's `## Execution Graph` block through the concurrent "
+        "DAG scheduler instead of the linear coder/reviewer/qa build loop. "
+        "Independent graph nodes run in parallel (up to --max-parallel), each "
+        "in its own isolated workspace, and the run resumes from "
+        "`<workspace>/.graph_state.json` on a rerun. Requires a plan.md that "
+        "declares an `## Execution Graph`. Off by default — the linear "
+        "single-cursor build path runs unchanged.",
+    )
+    parser.set_defaults(concurrent=False)
+    parser.add_argument(
+        "--max-parallel",
+        dest="max_parallel",
+        type=int,
+        default=8,
+        help="Maximum number of graph nodes executing concurrently under "
+        "--concurrent. Ignored on the linear path.",
+    )
+    parser.add_argument(
+        "--max-replan-rounds",
+        dest="max_replan_rounds",
+        type=int,
+        default=3,
+        help="Under --concurrent + --replan-on-qa, the maximum number of "
+        "replan rounds: after a scheduler pass ends with FAILED nodes, the "
+        "PlanDrafter may revise the failed subtree's plan and the graph "
+        "re-runs, at most this many times, so a repeatedly-failing subtree "
+        "cannot loop forever. Ignored on the linear path.",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None, *, prompts: PromptBundle | None = None) -> None:
-    """Run the agent-team workflow as a CLI."""
+def main(
+    argv: list[str] | None = None,
+    *,
+    prompts: PromptBundle | None = None,
+    isolation: IsolationProvider | None = None,
+    policy_for_type: Callable[[str], object] | None = None,
+) -> None:
+    """Run the agent-team workflow as a CLI.
+
+    ``isolation`` and ``policy_for_type`` are injected by wrapping workflows
+    (e.g. modeling_bringup) to drive the ``--concurrent`` DAG path with a
+    concrete isolation provider and node-type policy; both default to ``None``,
+    in which case ``AgentTeamWorkflow`` supplies its workflow-agnostic defaults
+    when ``--concurrent`` is set and ignores them on the linear path.
+    """
     args = _parse_args(argv)
     with AgentTeamWorkflow(
         workspace=args.workspace,
@@ -180,6 +243,12 @@ def main(argv: list[str] | None = None, *, prompts: PromptBundle | None = None) 
         acceptance_criteria=args.acceptance_criteria,
         feedback=args.feedback,
         prompts=prompts,
+        use_in_process_tools=args.use_in_process_tools,
+        concurrent=args.concurrent,
+        isolation=isolation,
+        policy_for_type=policy_for_type,
+        max_parallel=args.max_parallel,
+        max_replan_rounds=args.max_replan_rounds,
     ) as workflow:
         workflow.run(args.task)
 

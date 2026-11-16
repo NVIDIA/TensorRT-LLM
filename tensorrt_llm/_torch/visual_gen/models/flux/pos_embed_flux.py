@@ -7,7 +7,7 @@ Key Components:
 - FluxPosEmbed: Multi-axis rotary position embeddings (FLUX.1: 3-axis, FLUX.2: 4-axis)
 - get_1d_rotary_pos_embed: 1D rotary position embedding computation
 
-RoPE application uses the shared apply_rotary_emb from modules/attention.py.
+RoPE application uses the shared apply_rotary_emb from attention/attention.py.
 """
 
 from typing import List, Tuple

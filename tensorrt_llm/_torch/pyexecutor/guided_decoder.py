@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from dataclasses import dataclass
-from queue import Queue
+from queue import Empty, Queue
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -11,7 +14,7 @@ from ..._utils import nvtx_range, prefer_pinned
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
-from ..hostfunc import hostfunc
+from ..hostfunc import drain_captured_hostfuncs, hostfunc
 from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
@@ -81,10 +84,9 @@ class GuidedRequest:
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
         return cls(
-            guided_decoding_params=request.guided_decoding_params,
+            guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
-            seq_slot=(request.py_target_seq_slot
-                      if request.py_is_draft else request.py_seq_slot),
+            seq_slot=request.py_seq_slot,
             prev_seq_slot=request.py_batch_idx,
             is_context_init_state=request.is_context_init_state,
             is_last_context_chunk=(request.is_context_init_state
@@ -97,7 +99,6 @@ class GuidedRequest:
                 and request.py_decoding_iter == 1
                 and request.py_batch_idx is None),
             new_token=request.get_last_tokens(0),
-            is_draft=request.py_is_draft,
             draft_tokens=request.py_draft_tokens,
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
 
@@ -112,6 +113,9 @@ class GuidedRequests:
     num_contexts: int
     num_generations: int
     max_num_draft_tokens: int
+    # Number given by CapturableGuidedDecoder.add_batch to the batch it hands
+    # to its host functions; 0 for a batch that never went through it.
+    batch_id: int = 0
 
     @classmethod
     def from_scheduled_requests(cls,
@@ -216,6 +220,12 @@ class GuidedDecoder:
         self.is_draft_terminated: List[bool] = [False] * self.max_num_sequences
 
         self.requests: Optional[GuidedRequests] = None
+        # (request_id, error_msg) of disagg gen requests whose grammar matcher
+        # failed to initialize; reported by the next build. Every
+        # init_disagg_gen_requests call must be followed by a build on the
+        # same batch before the next init: init resets this list, so an init
+        # that ran twice (a retry, a second microbatch) would drop failures.
+        self.init_failed_requests: List[Tuple[int, str]] = []
 
         self.stream = torch.cuda.Stream()
         self.token_event = torch.cuda.Event()
@@ -238,7 +248,8 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        failed_requests = []
+        failed_requests = self.init_failed_requests
+        self.init_failed_requests = []
         self.token_mask_host[:requests.num_bitmask_tokens].fill_(0)
 
         for req, offset in requests.valid_requests_with_offsets():
@@ -480,12 +491,30 @@ class GuidedDecoder:
 
     def _init_disagg_gen_requests(self, requests: GuidedRequests) -> None:
         """Initialize the grammar matchers for disagg gen requests.
+
+        A request whose matcher cannot be created keeps no matcher and is
+        reported as failed by the next build, like a context request whose
+        matcher creation fails in build.
         """
+        self.init_failed_requests = []
         for req in requests.valid_requests():
-            if req.is_generation_only_first_iteration:
+            if not req.is_generation_only_first_iteration:
+                continue
+            slot = req.seq_slot
+            try:
                 self.grammar_matchers[
-                    req.seq_slot] = self.grammar_matcher_factory.create(
+                    slot] = self.grammar_matcher_factory.create(
                         req.guided_decoding_params)
+            except Exception as e:
+                self.grammar_matchers[slot] = None
+                # Keep the rollback passes away from the missing matcher.
+                self.num_advanced_tokens[slot] = 0
+                self.num_advanced_draft_tokens[slot] = 0
+                error_msg = f"Guided decoding error: {str(e)}"
+                self.init_failed_requests.append((req.request_id, error_msg))
+                logger.error(
+                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
+                )
 
     @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
     def init_disagg_gen_requests(self) -> None:
@@ -509,6 +538,15 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
+        # The batches handed over through self.queue are numbered on the
+        # host thread (GuidedRequests.batch_id), and the build host function
+        # tags the failures it reports with that number; see
+        # take_failed_requests.
+        self._num_added_batches: int = 0
+        self._failed_requests_queue: Queue = Queue()
+        self._pending_failed_requests: List[Tuple[int, int, str]] = []
+        # Whether the current forward runs guided decoding; set by add_batch.
+        self.active = False
 
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
@@ -523,22 +561,88 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # See: https://github.com/pytorch/pytorch/issues/163061
         torch.compiler.set_stance("force_eager")
 
+    def _drain_host_functions(self) -> None:
+        """Wait until every host function enqueued by the caller has run.
+
+        Each host function is a Python callback that must take the GIL. If one
+        is still pending when the caller enters a native call that holds the
+        GIL while waiting on device progress (e.g. a drafter's flash-attn
+        forward, or the context-synchronizing lazy kernel-module load inside
+        it), the rank deadlocks: the callback waits for the GIL, the native
+        call waits for work only the callback can advance. The
+        ``set_stance("force_eager")`` mitigation above covers only
+        torch.compile kernels, not plain extension calls (pytorch#163061).
+
+        ``bitmask_event`` is recorded on the side stream after every host
+        function the callers enqueue, so synchronizing on it (which releases
+        the GIL) guarantees they have all run. Host-side ordering only — the
+        callers already order the bitmask consumer against the same event on
+        the device. Skipped while capturing: a host wait is illegal there,
+        and captured host nodes do not run until replay.
+        """
+        if not torch.cuda.is_current_stream_capturing():
+            self.bitmask_event.synchronize()
+
+    def reset_warmup_state(self) -> None:
+        """Discard abandoned dummy batches after an eager warmup failure.
+
+        Only call during warmup, with no live requests or graph capture. Wait
+        on the stream itself: a failed forward may have enqueued callbacks
+        without reaching the bitmask-event record. Once they finish, no
+        callback can consume or overwrite the cleared request snapshots.
+        Warmup dummies have no grammar matchers to roll back.
+        """
+        self.stream.synchronize()
+        self.queue = Queue()
+        self.requests = None
+        self.requests_hostfunc = None
+
+    def _skip_inactive(self) -> bool:
+        """Return True if the current forward has no guided work.
+
+        An inactive forward still waits for the host functions of a previously
+        replayed graph, so the caller does not enter a GIL-holding call while
+        they are pending. Capturing an inactive forward raises an error, since
+        the graph would replay without guided decoding.
+        """
+        if self.active:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Cannot capture a CUDA graph while guided decoding is "
+                "inactive; pass is_cuda_graph=True to add_batch.")
+        drain_captured_hostfuncs()
+        return True
+
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
                   new_tokens: Optional[torch.Tensor] = None,
-                  runtime_draft_len: Optional[int] = None) -> None:
+                  runtime_draft_len: Optional[int] = None,
+                  is_cuda_graph: bool = False) -> None:
         # See GuidedDecoder.add_batch: the layout must follow the runtime draft
         # length so the captured graph's bitmask matches the target logits.
         num_draft_tokens = (self.max_num_draft_tokens
                             if runtime_draft_len is None else runtime_draft_len)
         self.requests = GuidedRequests.from_scheduled_requests(
             scheduled_requests, num_draft_tokens)
+        # A CUDA graph replays its captured guided work for every batch, so
+        # graph forwards stay active. An eager forward skips guided decoding
+        # when no request is constrained.
+        self.active = is_cuda_graph or any(self.requests.valid_requests())
+        if not self.active:
+            return
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
-        self.queue.put((self.requests, new_tokens is not None))
+        self._hand_over_batch(has_new_tokens=new_tokens is not None)
         # self.token_event.record() should be called inside CUDA graph capturing;
-        # currently, it is in PyTorchModelEngine._preprocess_inputs.
+        # currently, it is in DecoderInputPreparer.preprocess_inputs.
+
+    def _hand_over_batch(self, has_new_tokens: bool) -> None:
+        """Queue self.requests for the host functions under the next batch number."""
+        self._num_added_batches += 1
+        self.requests.batch_id = self._num_added_batches
+        self.queue.put((self.requests, has_new_tokens))
 
     @hostfunc
     def fetch_batch(self) -> None:
@@ -557,24 +661,66 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                                )
 
     @hostfunc
-    def build(self) -> List[Tuple[int, str]]:
-        return self._build(self.requests_hostfunc)
+    def build(self) -> None:
+        requests = self.requests_hostfunc
+        for request_id, error_msg in self._build(requests):
+            self._failed_requests_queue.put(
+                (requests.batch_id, request_id, error_msg))
+
+    @property
+    def last_added_batch_id(self) -> int:
+        """Number of the batch most recently handed over by add_batch; 0 before the first."""
+        return self._num_added_batches
+
+    def take_failed_requests(self,
+                             completed_batch_id: int) -> List[Tuple[int, str]]:
+        """Return and clear the failures of the batches up to completed_batch_id.
+
+        Called by the executor on the main thread once it has synchronized
+        on the sampler event of that batch. The event is recorded after the
+        batch's host functions on the same stream, so their failures have
+        been queued by then. Failures of later batches stay pending: their
+        host functions may still be running, and consuming them now would
+        make the iteration in which a request fails depend on GPU progress,
+        which differs between ranks.
+        """
+        pending = self._pending_failed_requests
+        while True:
+            try:
+                pending.append(self._failed_requests_queue.get_nowait())
+            except Empty:
+                break
+        taken = [(request_id, error_msg)
+                 for batch_id, request_id, error_msg in pending
+                 if batch_id <= completed_batch_id]
+        self._pending_failed_requests = [
+            failure for failure in pending if failure[0] > completed_batch_id
+        ]
+        return taken
 
     def execute(self,
                 logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+                d2t: Optional[torch.Tensor] = None) -> None:
+        """Enqueue the guided decoding of one target step.
+
+        Unlike GuidedDecoder.execute, this returns no failed requests: the
+        build runs as a host function, and the executor collects its
+        failures with take_failed_requests.
+        """
+        if self._skip_inactive():
+            return
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
             self.init_disagg_gen_requests()
-            failed_requests = self.build()
+            self.build()
             self.copy_bitmask()
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         self.apply_bitmask(logits, d2t=d2t)
 
-        return failed_requests
+        self._drain_host_functions()
 
     @hostfunc
     def rollback_rejected_tokens(self) -> None:
@@ -593,6 +739,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
                         draft_step: int = 0) -> None:
+        if self._skip_inactive():
+            return
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
@@ -628,16 +776,74 @@ class CapturableGuidedDecoder(GuidedDecoder):
             else:
                 assert req.is_draft
 
+    @nvtx_range("GuidedDecoder.add_accepted_batch")
+    def add_accepted_batch(self, num_accepted_tokens: torch.Tensor) -> None:
+        """Copy verification counts, including the bonus token, to the host.
+
+        Args:
+            num_accepted_tokens: Int32 tensor of shape [batch_size].
+        """
+        batch_size = len(self.requests)
+        assert num_accepted_tokens.size(0) == batch_size
+        self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
+                                                    non_blocking=True)
+        self.token_event.record()
+
+    @hostfunc
+    def fetch_accepted_batch(self) -> None:
+        batch_size = len(self.requests_hostfunc)
+        num_accepted_tokens_list = self.num_accepted_tokens[:batch_size].tolist(
+        )
+        for i, req in enumerate(self.requests_hostfunc.requests):
+            if req.guided_decoding_params is None or (slot :=
+                                                      req.seq_slot) is None:
+                continue
+            # Verification can accept tokens beyond a terminal draft token,
+            # where the matcher stopped advancing (see fetch_draft_batch).
+            req.num_accepted_draft_tokens = min(
+                num_accepted_tokens_list[i], self.num_advanced_tokens[slot]) - 1
+
+    def rollback_rejected_batch(self,
+                                num_accepted_tokens: torch.Tensor) -> None:
+        """Restore the accepted grammar prefix for drafters without a logits loop.
+
+        Target masking advances matchers through the golden token and draft
+        tokens. SA, DFlash and PARD do not call execute_draft_batch, which
+        normally rolls back the rejected suffix before the next draft loop.
+
+        Call after drafting kernels have been enqueued: these host callbacks
+        need the GIL and must not precede native calls that synchronize the
+        stream while holding it.
+
+        Args:
+            num_accepted_tokens: Int32 tensor of shape [batch_size], including
+                the bonus token in each verification count.
+        """
+        if self._skip_inactive():
+            return
+        self.add_accepted_batch(num_accepted_tokens)
+        with torch.cuda.stream(self.stream):
+            torch.cuda.current_stream().wait_event(self.token_event)
+            self.fetch_accepted_batch()
+            self.rollback_rejected_tokens()
+            # CUDA graph capture requires every forked stream to be joined.
+            self.bitmask_event.record()
+        torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self._drain_host_functions()
+
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
-                            draft_step: int = 0) -> List[Tuple[int, str]]:
+                            draft_step: int = 0) -> None:
+        """Enqueue the guided decoding of one draft step; see execute."""
+        if self._skip_inactive():
+            return
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
             if draft_step == 0:
                 self.rollback_rejected_tokens()
-            failed_requests = self.build()
+            self.build()
             if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
@@ -650,4 +856,4 @@ class CapturableGuidedDecoder(GuidedDecoder):
                            d2t=d2t,
                            num_bitmask_tokens=len(self.requests))
 
-        return failed_requests
+        self._drain_host_functions()

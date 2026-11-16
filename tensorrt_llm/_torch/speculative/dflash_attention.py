@@ -21,8 +21,17 @@ from typing import Callable, Optional
 
 import torch
 
+from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+# Full non-causal blocks fold their query positions into the decode heads;
+# they use the generation kernel's shape constraints.
+DFLASH_FOLDED_DECODE_LOWERING = "non-causal folded decode"
+# Matching Q/KV dtypes and q_len=1 select a Q tile up to 128 in TRTLLM-Gen.
+# Keep each folded launch in that range; larger model blocks are split.
+# This is a selected launch range, not a native or model block-size limit.
+DFLASH_FOLDED_DECODE_MAX_RATIO_PER_LAUNCH = 128
 
 
 @dataclass(frozen=True)
@@ -46,8 +55,69 @@ def get_dflash_flash_attention() -> Callable[..., torch.Tensor]:
     return flash_attn_with_kvcache
 
 
-def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
-    """Return why the DFlash TRTLLM backend cannot be initialized."""
+@lru_cache(maxsize=1)
+def get_dflash_paged_append() -> Callable[..., None]:
+    """Load flashinfer's paged K/V append, shared by the paged backends.
+
+    Deliberately separate from :func:`get_dflash_trtllm_gen_ops`: the append is
+    a plain scatter into an HND page pool and works wherever flashinfer does,
+    while the TRTLLM-Gen FMHA kernels additionally require SM100/SM103.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        raise RuntimeError(
+            "DFlash paged context cache requires flashinfer, which is not installed."
+        )
+    import flashinfer
+
+    return flashinfer.page.append_paged_kv_cache
+
+
+@lru_cache(maxsize=1)
+def get_dflash_fa4_fwd() -> Callable[..., tuple]:
+    """Load the FlashAttention-4 (CuTe DSL) forward."""
+    try:
+        install_cutlass_dsl_compatibility()
+        from flash_attn.cute.interface import _flash_attn_fwd
+    except (ImportError, OSError, AttributeError) as error:
+        raise RuntimeError(
+            "DFlash FA4 attention requires a flash-attn build with the CuTe DSL "
+            "interface (flash_attn.cute)."
+        ) from error
+    return _flash_attn_fwd
+
+
+def validate_dflash_fa4_runtime(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    """Fail before cache allocation when DFlash's shape is unsupported by FA4."""
+    get_dflash_fa4_fwd()
+    get_dflash_paged_append()
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(f"DFlash FA4 attention does not support activation dtype {dtype}.")
+
+    # FA4 builds kernels for other archs too, but this backend has
+    # only been validated on SM90 (H100); SM120 and friends keep VANILLA.
+    sm = get_sm_version()
+    if sm != 90:
+        raise RuntimeError(
+            f"DFlash FA4 attention backend is supported on SM90 only, got SM{sm}. "
+            "Use attention_backend='VANILLA'."
+        )
+    # Mirrors flash_attn.cute.interface._validate_head_dims for SM90.
+    if not (8 <= head_dim <= 256) or head_dim % 8 != 0:
+        raise RuntimeError(f"DFlash FA4 attention does not support head_dim={head_dim} on SM90.")
+
+
+def dflash_trtllm_gen_unavailability_reason() -> Optional[str]:
+    """Return why the DFlash TRTLLM backend cannot be initialized, or None.
+
+    Public because ``attention_backend="AUTO"`` resolves through it: a
+    drafter that prefers TRTLLM has to know whether to fall back before it
+    commits, and ``get_dflash_trtllm_gen_ops`` only reports by raising.
+    """
     if not IS_FLASHINFER_AVAILABLE:
         return "flashinfer is not installed"
 
@@ -67,24 +137,50 @@ def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
 @lru_cache(maxsize=1)
 def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
     """Load TRTLLM-Gen operations after validating common prerequisites."""
-    unavailable_reason = _get_trtllm_gen_unavailability_reason()
+    unavailable_reason = dflash_trtllm_gen_unavailability_reason()
     if unavailable_reason is not None:
         raise RuntimeError(f"DFlash TRTLLM attention backend is unavailable: {unavailable_reason}.")
 
     import flashinfer
 
-    from ..attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-        _get_workspace_size,
-    )
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import _get_workspace_size
+    from ..attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 
     return DFlashTrtllmGenOps(
         append_paged_kv_cache=flashinfer.page.append_paged_kv_cache,
         batch_context_with_kv_cache=flashinfer.prefill.trtllm_batch_context_with_kv_cache,
         batch_decode_with_kv_cache=flashinfer.decode.trtllm_batch_decode_with_kv_cache,
-        get_multi_ctas_kv_counter_size=_get_multi_ctas_kv_counter_size,
+        get_multi_ctas_kv_counter_size=get_multi_ctas_kv_counter_size,
         get_workspace_size=_get_workspace_size,
     )
+
+
+def get_dflash_folded_decode_chunk_size(block_size: int, num_heads: int, num_kv_heads: int) -> int:
+    """Plan query chunks for matching-dtype, one-query GQA decode launches.
+
+    Ratios through 128 fit the selected native Q tile, so a block in that range
+    stays in one launch. Larger blocks are split without changing their mask;
+    every chunk still attends the complete context and draft block.
+    """
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+
+    if block_size <= 0:
+        raise RuntimeError(
+            f"DFlash folded decode requires a positive block size; got {block_size}."
+        )
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        raise RuntimeError(
+            "DFlash folded decode requires positive head counts with "
+            f"num_heads divisible by num_kv_heads; got {num_heads} and {num_kv_heads}."
+        )
+    group = num_heads // num_kv_heads
+    max_ratio = FlashInferTrtllmGenFmha.MAX_HEADS_RATIO_GENERATION
+    if group > max_ratio:
+        raise RuntimeError(
+            f"DFlash folded decode's base Q/KV head ratio {group} exceeds "
+            f"the validated generation ratio {max_ratio}."
+        )
+    return min(block_size, DFLASH_FOLDED_DECODE_MAX_RATIO_PER_LAUNCH // group)
 
 
 def validate_dflash_trtllm_gen_runtime(
@@ -94,7 +190,7 @@ def validate_dflash_trtllm_gen_runtime(
     num_kv_heads: int,
     head_dim: int,
     tokens_per_block: int,
-    has_context_attention: bool,
+    folded_block_size: Optional[int] = None,
 ) -> None:
     """Fail before cache allocation when DFlash's kernel shape is unsupported."""
     from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
@@ -115,13 +211,11 @@ def validate_dflash_trtllm_gen_runtime(
             f"{heads_ratio}; maximum is "
             f"{FlashInferTrtllmGenFmha.MAX_HEADS_RATIO_GENERATION}."
         )
+    if folded_block_size is not None:
+        get_dflash_folded_decode_chunk_size(folded_block_size, num_heads, num_kv_heads)
     if tokens_per_block not in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK:
         supported = sorted(FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK)
         raise RuntimeError(
             "DFlash TRTLLM attention does not support context-cache page size "
             f"{tokens_per_block}; supported sizes are {supported}."
-        )
-    if has_context_attention and head_dim in FlashInferTrtllmGenFmha.UNSUPPORTED_HEAD_SIZES_CONTEXT:
-        raise RuntimeError(
-            f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )

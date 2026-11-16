@@ -28,3 +28,20 @@ entirely.
 
 For flow, cache layout, threat model, and design rationale, see
 [fetch-cache.md](fetch-cache.md).
+
+## Co-develop third-party dependencies with TensorRT-LLM
+
+The automatic dependency management provided by cmake `FetchContent` is
+optimized for normal developers that use the dependencies as-is. If you need to
+develop a dependency alongside TensorRT-LLM, point CMake at your own
+checkout instead:
+
+```bash
+python scripts/build_wheel.py ... \
+  --extra-cmake-vars FETCHCONTENT_SOURCE_DIR_DEEPGEMM=/path/to/DeepGEMM
+```
+
+The variable name is `FETCHCONTENT_SOURCE_DIR_` followed by the upper-cased
+dependency `name`. CMake then skips the download, update and patch steps for that
+dependency and never touches your checkout, so you must apply the patches
+yourself, if there's one for the dependency you are working on.

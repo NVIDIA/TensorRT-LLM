@@ -24,6 +24,8 @@ infrastructure and is validated against accuracy criteria.
   CUDA graphs, CPU overlap, and chunked prefill.
 - Support various model-parallel strategies used by TensorRT-LLM.
 - Validate the implemented model's accuracy on datasets.
+- Qualify the model for ModelExpress (MX) checkpoint loading when the task asks
+  for it (see [ModelExpress (MX) qualification](#modelexpress-mx-qualification)).
 
 ### What it cannot do yet
 
@@ -190,6 +192,55 @@ you) to read when deciding whether and how to intervene.
 
 ![Human-in-the-loop operation](docs/human-in-the-loop.svg)
 
+## Running without MCP tools
+
+Some machines forbid an agent harness from registering MCP servers of its own:
+an enterprise-managed MCP config (`managed-mcp.json`) makes Claude Code abort
+when the SDK configures one, and a hardened runner may block dynamic tool
+registration outright. Because `modeling-bringup` normally hands every agent a
+set of in-process MCP tools (`append_*_progress`, `read_latest_progress`,
+`read_human_feedback`, `update_status`, `read_status`), the run fails at startup
+in those environments.
+
+Pass `--no-mcp-tools` to run without them:
+
+```bash
+modeling-bringup \
+    --task task.yaml \
+    --workspace workspace/modeling-bringup \
+    --no-mcp-tools
+```
+
+The switch is manual and applies to every agent at once, on both the
+Claude Code and Codex backends — there is no auto-detection, so a run behaves
+identically everywhere unless you ask for this mode. The workflow itself is
+unchanged: same plan-build-verify loop, same workspace files, same
+checkpoint/resume behavior. Only the transport changes. The orchestrator inlines
+the context the `read_*` tools used to return directly into each prompt, and
+each agent ends its turn by writing a small handoff file to
+`<workspace>/.turn/<role>.yaml` that the orchestrator validates and folds back
+into `progress.yaml`.
+
+The agents' system prompts follow the switch. Both the `agent_team` base
+prompts and the modeling-bringup `*_extra.py` overlays are transport-neutral —
+they say *record your progress entry*, not *call `append_coder_progress`*. The
+tool-level block is appended only when the tools are registered, so in this mode
+no prompt mentions a tool the agent does not have.
+
+Two things behave differently in this mode:
+
+- `ask_human` is unavailable, so `--no-mcp-tools` cannot be combined with
+  `--plan-human-review` or `--build-human-review`. The run aborts up front with
+  an explanatory error rather than silently dropping the human checkpoint.
+- If an agent ends a turn without a valid handoff file, the orchestrator
+  re-prompts it once and then fails the run. A crash with `HandoffError` in this
+  mode means the agent did not follow the recording protocol, not that the
+  bring-up itself failed — rerun to resume from the last checkpoint.
+
+For the protocol details and the per-role handoff schema, see
+[No-MCP mode](../agent_team/README.md#no-mcp-mode---no-mcp-tools) in the
+`agent_team` README.
+
 ## Task file
 
 The three required fields are `reference_code_path`, `checkpoint_path`, and
@@ -210,6 +261,34 @@ All flags from the generic `agent-team` CLI are accepted as-is. See the
 The workflow source lives in `agent_flow/workflows/modeling_bringup/`; import
 the bundle programmatically with
 `from agent_flow.workflows.modeling_bringup import MODELING_BRINGUP_PROMPTS`.
+
+### ModelExpress (MX) qualification
+
+MX qualification is opt-in per task. To ask for it, add a completion criterion
+that points at
+[`docs/source/features/model-express.md`](../../../../docs/source/features/model-express.md),
+which stays the single source of truth for eligibility and the qualification
+steps:
+
+```yaml
+completion_criteria:
+  - "If the model fits the ModelExpress constraints in
+     docs/source/features/model-express.md, MX checkpoint loading is qualified
+     as that doc describes, which includes a passing real donor/receiver test.
+     If that test cannot run here, final-report.md reports MX as pending until
+     the ModelExpress CI stages pass it. If the model does not fit,
+     final-report.md names the constraint that rules it out. Existing MX
+     profiles and constraints are not changed."
+```
+
+The PlanDrafter then plans the MX work from the start, and QA checks it like
+any other criterion. The donor/receiver test needs a ModelExpress server and
+twice as many GPUs as its TP size, because the donor and the receiver each hold
+one TP group: two GPUs for TP=1 and four for TP=2. Runs the bring-up host
+cannot do are left to the ModelExpress CI stages, and MX stays pending in
+`final-report.md` until those stages pass them. Every bring-up already keeps
+post-load work in the staged hooks MX relies on, so a model stays ready for MX
+even without this criterion.
 
 ## Environment
 

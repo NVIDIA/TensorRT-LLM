@@ -14,11 +14,16 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
+from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from .msa_utils import (
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
+from tensorrt_llm._utils import async_tensor_h2d
+
+from .kernels.msa_utils import (
+    MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     per_token_valid_blocks,
     require_msa_module,
@@ -155,6 +160,175 @@ def _proxy_max_score(
     return max_score
 
 
+# Longest segment of a split proxy plan: fmha_sm100 splits KV only on its 128-query tile.
+_PROXY_SEGMENT_LEN = 128
+# Below this cached prefix the split plan's longer GPU planner pass eats most of the saving.
+_PROXY_SPLIT_MIN_PREFIX = 4096
+# fmha_sm100 allocates about 2.6 MB of plan workspace per split.
+_PROXY_MAX_KV_SPLITS = 16
+
+
+def _proxy_kv_splits(qo_lens: list[int], qo_offsets: list[int], num_index_heads: int) -> int:
+    """KV splits filling about one SM wave with these rows' segments, or 0 to plan them unsplit."""
+    # If every row has <= 64 queries, segments select variants prewarm_split_proxy_variants skips.
+    if max(qo_offsets) < _PROXY_SPLIT_MIN_PREFIX or max(qo_lens) <= 64:
+        return 0
+    num_segments = sum((n + _PROXY_SEGMENT_LEN - 1) // _PROXY_SEGMENT_LEN for n in qo_lens)
+    num_sms = get_multi_processor_count_for_device(torch.cuda.current_device())
+    return min(_PROXY_MAX_KV_SPLITS, num_sms // (num_segments * num_index_heads))
+
+
+def _segmented_proxy_plan(
+    fmha_sm100: ModuleType,
+    qo_lens: list[int],
+    qo_offsets: list[int],
+    *,
+    num_index_heads: int,
+    page_size: int,
+    num_kv_splits: int,
+    kv_indices: torch.Tensor,
+) -> tuple[tuple, torch.Tensor]:
+    """Plan rows as segments of at most _PROXY_SEGMENT_LEN queries, split along KV.
+
+    Each segment keeps its row's causal window and writes each block max once, from the same
+    Q.K products: the scores are bitwise those of the unsplit plan.
+    """
+    seg_qo_lens, seg_kv_lens, seg_offsets = [], [], []
+    # seg_shifts: the row's first page in kv_indices minus the segment's first gathered slot.
+    seg_pages, seg_shifts = [], []
+    row_first_page = num_gathered = 0
+    for qo_len, prefix in zip(qo_lens, qo_offsets):
+        for first in range(0, qo_len, _PROXY_SEGMENT_LEN):
+            n = min(_PROXY_SEGMENT_LEN, qo_len - first)
+            kv_len = prefix + first + n
+            pages = (kv_len + page_size - 1) // page_size
+            seg_qo_lens.append(n)
+            seg_kv_lens.append(kv_len)
+            seg_offsets.append(prefix + first)
+            seg_pages.append(pages)
+            seg_shifts.append(row_first_page - num_gathered)
+            num_gathered += pages
+        row_first_page += (prefix + qo_len + page_size - 1) // page_size
+    plan = fmha_sm100.fmha_sm100_plan(
+        torch.tensor(seg_qo_lens, dtype=torch.int32),
+        torch.tensor(seg_kv_lens, dtype=torch.int32),
+        qo_offset=torch.tensor(seg_offsets, dtype=torch.int32),
+        page_size=page_size,
+        num_kv_splits=num_kv_splits,
+        causal=True,
+        num_qo_heads=num_index_heads,
+        num_kv_heads=1,
+        output_maxscore=True,
+    )
+    # fmha_sm100 sizes a request's page span by its kv_len, so each segment gets its own page copy.
+    staged = async_tensor_h2d([seg_shifts, seg_pages], torch.int64, kv_indices.device)
+    gather = torch.arange(num_gathered, device=kv_indices.device)
+    gather += torch.repeat_interleave(staged[0], staged[1], output_size=num_gathered)
+    return plan, kv_indices.index_select(0, gather)
+
+
+def segmented_proxy_plan(
+    fmha_sm100: ModuleType,
+    qo_lens_cpu: torch.Tensor,
+    qo_offset_cpu: torch.Tensor,
+    *,
+    num_index_heads: int,
+    page_size: int,
+    kv_indices: torch.Tensor,
+) -> Optional[tuple[tuple, torch.Tensor]]:
+    """KV-split proxy plan for these rows and the page table it reads, or None to plan them unsplit.
+
+    Run it over exactly these rows' query tokens: its per-split workspace is strided by that count.
+
+    Args:
+        fmha_sm100: The MSA kernel module.
+        qo_lens_cpu: [rows] host int32 query lengths.
+        qo_offset_cpu: [rows] host int32 cached prefix lengths.
+        num_index_heads: Index heads on this rank.
+        page_size: Tokens per page.
+        kv_indices: Device int32 flattened page table whose prefix holds these rows' pages.
+    """
+    qo_lens, qo_offsets = qo_lens_cpu.tolist(), qo_offset_cpu.tolist()
+    num_kv_splits = _proxy_kv_splits(qo_lens, qo_offsets, num_index_heads)
+    if num_kv_splits == 0:
+        return None
+    return _segmented_proxy_plan(
+        fmha_sm100,
+        qo_lens,
+        qo_offsets,
+        num_index_heads=num_index_heads,
+        page_size=page_size,
+        num_kv_splits=num_kv_splits,
+        kv_indices=kv_indices,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_size: int) -> None:
+    """Load, compiling where missing, the fmha_sm100 variants segmented proxy plans run.
+
+    Warmup never segments, and compiling a variant inline stalls every rank for over a minute.
+
+    Args:
+        dtype: Index-K cache dtype, which index Q is cast to.
+        num_index_heads: Index heads on this rank.
+        page_size: Tokens per page.
+    """
+    fmha_sm100 = require_msa_module()
+    idx_q = torch.zeros(
+        _PROXY_SEGMENT_LEN, num_index_heads, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda"
+    )
+    num_pages = (_PROXY_SEGMENT_LEN + page_size - 1) // page_size
+    idx_k = torch.zeros(num_pages, 1, page_size, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda")
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    for num_kv_splits in (1, 2):
+        plan, plan_kv_indices = _segmented_proxy_plan(
+            fmha_sm100,
+            [_PROXY_SEGMENT_LEN],
+            [0],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            num_kv_splits=num_kv_splits,
+            kv_indices=kv_indices,
+        )
+        fmha_sm100.fmha_sm100(
+            idx_q,
+            idx_k,
+            idx_k,
+            plan,
+            kv_indices=plan_kv_indices,
+            output_o=False,
+            output_maxscore=True,
+        )
+
+
+def _combined_topk_table(
+    ctx_table: torch.Tensor,
+    gen_table: torch.Tensor,
+    *,
+    head_major: bool,
+) -> torch.Tensor:
+    """Concatenate the context and generation top-k tables along the token axis.
+
+    Both halves are [tokens, num_kv_heads, topk]. `head_major` backs the result
+    the way select_blocks_from_maxscore backs its own output, so the combined
+    table permutes to a contiguous [num_kv_heads, total_q, topk] as an unsplit
+    one does.
+    """
+    ctx_tokens = int(ctx_table.shape[0])
+    total_q = ctx_tokens + int(gen_table.shape[0])
+    num_kv_heads, topk = int(ctx_table.shape[1]), int(ctx_table.shape[2])
+    shape = (num_kv_heads, total_q, topk) if head_major else (total_q, num_kv_heads, topk)
+    # Only a mixed step splits the table and a mixed step is never captured, so
+    # this allocation cannot land in a graph's memory pool.
+    out = torch.empty(shape, dtype=ctx_table.dtype, device=ctx_table.device)
+    if head_major:
+        out = out.transpose(0, 1)
+    out[:ctx_tokens].copy_(ctx_table)
+    out[ctx_tokens:].copy_(gen_table)
+    return out
+
+
 def _group_max_reduce(
     max_score: torch.Tensor,
     config: "MiniMaxM3SparseConfig",
@@ -202,20 +376,131 @@ class MsaIndexer:
         proxy_plan: Optional[tuple] = None,
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
-        head_major_output: bool = False,
+        block_table: Optional[torch.Tensor] = None,
+        seq_lens_cuda: Optional[torch.Tensor] = None,
+        decode_query_len: Optional[int] = None,
+        require_cutedsl: bool = False,
+        gen_token_first: int = 0,
+        ctx_rows: int = 0,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
-        Plan/run split, mirroring the sparse GQA. Both production paths pass a
-        prebuilt `proxy_plan` and a precomputed device `n_valid_blocks` (decode
-        from the graph-safe scratch, eager from the step-level device buffer);
-        decode additionally runs into the preallocated `max_score` buffer inside
-        the captured region.
-        """
-        config = self.config
+        Plan/run split, mirroring the sparse GQA: production passes a
+        precomputed device `n_valid_blocks`, a prebuilt `proxy_plan` wherever
+        any row is left to the proxy, and, on a pure-decode step, the
+        preallocated `max_score` the captured region runs into.
 
+        `block_table`, `seq_lens_cuda` and `decode_query_len` put the CuTe DSL
+        scorer on this step's generation span in place of the fmha_sm100 proxy
+        pass; leaving them unset (the standalone kernel tests) runs the proxy
+        over the whole batch. `require_cutedsl` says prepare() narrowed the
+        proxy plan to the context prefix, so a decline has no fallback.
+
+        `gen_token_first` and `ctx_rows` mark where that span starts: the
+        scorer takes query tokens [gen_token_first, total_q) and rows
+        [ctx_rows, batch), the proxy the context prefix ahead of both, and both
+        are 0 on a pure-decode step. The halves score into separate buffers,
+        since fmha_sm100 writes a contiguous [heads, k_tiles, tokens] block and
+        cannot fill a slice of the scorer's, then their tables are joined.
+        """
+        page_size = int(idx_k_paged.shape[2])
+        gen_first = int(gen_token_first)
+
+        scored = False
+        if (
+            max_score is not None
+            and block_table is not None
+            and seq_lens_cuda is not None
+            and decode_query_len is not None
+        ):
+            # The scorer emits raw Q.K rather than idx_sm_scale * Q.K, as the
+            # fmha_sm100 proxy does; ranking and the +inf init/local forcing in
+            # select_blocks_from_maxscore are invariant under a positive scale.
+            scored = _cutedsl_score(
+                idx_q[gen_first:],
+                idx_k_paged,
+                max_score,
+                block_table=block_table,
+                seq_lens_cuda=seq_lens_cuda,
+                decode_query_len=decode_query_len,
+            )
+
+        if require_cutedsl and not scored:
+            raise RuntimeError(
+                "MiniMax-M3 prepare() narrowed the fmha_sm100 proxy plan to this "
+                "step's context prefix, but the CuTe DSL indexer scorer declined "
+                "its generation span. There is no proxy pass left to score it; "
+                "the scorer's geometry is required up front by "
+                "_validate_decode_kernel_support, so this should not happen."
+            )
+
+        # The scorer took nothing, so the proxy runs every token under the
+        # whole-batch plan it was handed.
+        if not scored:
+            gen_first = 0
+            max_score = self._proxy_scores(
+                idx_q,
+                idx_k_paged,
+                proxy_plan=proxy_plan,
+                max_score=max_score,
+                qo_lens_cpu=qo_lens_cpu,
+                kv_lens_cpu=kv_lens_cpu,
+                qo_offset_cpu=qo_offset_cpu,
+                kv_indices=kv_indices,
+                idx_sm_scale=idx_sm_scale,
+            )
+
+        if n_valid_blocks is None:
+            n_valid_blocks = per_token_valid_blocks(
+                qo_lens_cpu,
+                kv_lens_cpu,
+                qo_offset_cpu,
+                causal=True,
+                block_size=page_size,
+            )
+
+        gen_table = self._select(max_score, n_valid_blocks[gen_first:])
+        if gen_first == 0:
+            return gen_table
+        # The proxy scores the context prefix into its own buffer, under the
+        # plan prepare() built over rows [0, ctx_rows). Context pages are the
+        # prefix of the flattened page table, so kv_indices needs no slice.
+        ctx_table = self._select(
+            self._proxy_scores(
+                idx_q[:gen_first],
+                idx_k_paged,
+                proxy_plan=proxy_plan,
+                max_score=None,
+                qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
+                kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
+                qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
+                kv_indices=kv_indices,
+                idx_sm_scale=idx_sm_scale,
+            ),
+            n_valid_blocks[:gen_first],
+        )
+        return _combined_topk_table(ctx_table, gen_table, head_major=True)
+
+    def _proxy_scores(
+        self,
+        idx_q: torch.Tensor,
+        idx_k_paged: torch.Tensor,
+        *,
+        proxy_plan: Optional[tuple],
+        max_score: Optional[torch.Tensor],
+        qo_lens_cpu: Optional[torch.Tensor],
+        kv_lens_cpu: Optional[torch.Tensor],
+        qo_offset_cpu: Optional[torch.Tensor],
+        kv_indices: torch.Tensor,
+        idx_sm_scale: float,
+    ) -> torch.Tensor:
+        """Run the fmha_sm100 proxy pass over `idx_q` and return its max score.
+
+        Uses the prebuilt plan when prepare() supplied one, and plans inline
+        from the host lengths otherwise (standalone callers that skip prepare).
+        """
         if proxy_plan is None:
-            max_score = _proxy_max_score(
+            return _proxy_max_score(
                 idx_q,
                 idx_k_paged,
                 qo_lens_cpu=qo_lens_cpu,
@@ -225,38 +510,44 @@ class MsaIndexer:
                 sm_scale=idx_sm_scale,
                 causal=True,
             )
-        else:
-            fmha_sm100 = require_msa_module()
-            _, max_score = fmha_sm100.fmha_sm100(
-                idx_q,
-                idx_k_paged,
-                idx_k_paged,
-                proxy_plan,
-                kv_indices=kv_indices,
-                output_o=False,
-                output_maxscore=True,
-                max_score=max_score,
-                sm_scale=idx_sm_scale,
-            )
+        fmha_sm100 = require_msa_module()
+        _, scores = fmha_sm100.fmha_sm100(
+            idx_q,
+            idx_k_paged,
+            idx_k_paged,
+            proxy_plan,
+            kv_indices=kv_indices,
+            output_o=False,
+            output_maxscore=True,
+            max_score=max_score,
+            sm_scale=idx_sm_scale,
+        )
+        return scores
 
-        max_score_kv = _group_max_reduce(max_score, config)
+    def _select(
+        self,
+        max_score: torch.Tensor,
+        n_valid_blocks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce scores to KV-head granularity and take the top-k blocks.
 
-        if n_valid_blocks is None:
-            n_valid_blocks = per_token_valid_blocks(
-                qo_lens_cpu,
-                kv_lens_cpu,
-                qo_offset_cpu,
-                causal=True,
-                block_size=int(idx_k_paged.shape[2]),
-            )
+        Always into a head-major backing, whatever the step: the Triton sparse
+        decode kernel reads the table head-major and takes every generation
+        row, while fmha_sm100 reads whatever strides it is handed.
+        """
         return select_blocks_from_maxscore(
-            max_score_kv,
+            _group_max_reduce(max_score, self.config),
             topk=MSA_REQUIRED_TOPK,
             n_valid_blocks=n_valid_blocks,
-            init_blocks=config.init_blocks,
-            local_blocks=config.local_blocks,
-            head_major_output=head_major_output,
+            init_blocks=self.config.init_blocks,
+            local_blocks=self.config.local_blocks,
+            head_major_output=True,
         )
 
 
-__all__ = ["MsaIndexer"]
+__all__ = [
+    "MsaIndexer",
+    "cutedsl_score_runner",
+    "prewarm_split_proxy_variants",
+    "segmented_proxy_plan",
+]

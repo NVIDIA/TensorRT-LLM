@@ -40,11 +40,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import tool
 from rich.markdown import Markdown
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.tools import tool
 
 EMPTY_STATUS_PLACEHOLDER = (
     "# (status.md is empty — no rolling state yet)\n"

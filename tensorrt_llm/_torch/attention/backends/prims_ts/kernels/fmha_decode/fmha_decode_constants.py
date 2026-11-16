@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integer constants shared by the FMHA decode TS implementation.
+"""Constants shared by the FMHA decode TS implementation.
 
-Keep non-obvious integer constants here with their rationale so config,
-resource, and reduction code can use named values without duplicating comments.
+Keep non-obvious constants here with their rationale so config, resource, and
+reduction code can use named values without duplicating comments.
 """
 
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
@@ -28,25 +28,45 @@ FALLBACK_SM_COUNT_B200 = 148
 TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
 BYTES_PER_KIB = 1024
+# Dynamic SMEM one CTA can use on the SM100 family: 228 KiB per SM minus the
+# 1 KiB the system reserves. The complete decode layout (pipelines, barriers,
+# metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
+# K/V pipelines below it.
+SMEM_CAPACITY_KIB = 227
 
-# The supported BF16 M64N256 profile uses a 64-KiB shared K/V stage. Three
-# stages occupy 192 KiB; its 16-KiB Q stage and small metadata/barrier
-# allocations fit in the remaining SM100 budget. Persistent direct-output tail
-# correction rotates a compact 35,840-byte exchange payload over one drained
-# 64-KiB stage in this ring; split-KV keeps its fixed full exchange allocation.
-# Keep this exact-profile override separate from the conservative,
-# topology-independent MAX_KV_STAGE_SMEM_KIB inference above.
+# The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
+# 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
+# exchange and the metadata fill the SM100 carveout. A byte-wide tile is
+# 32 KiB; with four stages every K load takes the slot the previous QK freed
+# instead of waiting for a V slot that its tile's PV still holds. Keep both
+# exact-profile depths separate from the conservative, topology-independent
+# MAX_KV_STAGE_SMEM_KIB inference above.
 KV_TILE_256_SHARED_FIFO_STAGES = 3
+KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4
 
-# The four semantic K64 atoms are stored in the physical K slots consumed by
-# the two interleaved QK instructions in this order.
+# The four semantic K64 atoms of a KV256 tile are staged in these physical K
+# slots. On the WS 2x2 datapath each TMEM lane half computes 128 contiguous QK
+# columns, while PV pairs KV64 blocks 2j and 2j+1 per K step; staging K as
+# (0, 2, 1, 3) lets P alias S unchanged with V in natural order. The score
+# column mapping undoes the permutation for masking and Sage scales.
 KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 
 # Keep the old maximum as the exponent reference while a new maximum is at
 # most eight log2 units larger. This avoids an output-correction round without
 # letting an intermediate probability exceed 2**8; the softmax identity is
-# unchanged apart from normal finite-precision rounding.
-KV_TILE_256_RESCALE_THRESHOLD_LOG2 = 8.0
+# unchanged apart from normal finite-precision rounding. As in the
+# FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
+# adversarial values outside the qualified probability bound. Keeps profiles
+# apply it; see ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+# ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
+# and is the block-sparse plans' default for every P dtype.
+SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
+
+# KV256 tiles run at most this many score pairs of a streamed K32 fragment as
+# FMA polynomials, below the share that KV128 tiles take on SM100: their
+# 16-bit fragment loops slow down with a larger share. See
+# ``FmhaDecodeConfig.fragment_ex2_emulated_pairs``.
+KV_TILE_256_MAX_EX2_EMULATED_PAIRS = 4
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements
@@ -80,8 +100,27 @@ MAX_CLUSTER_DIM_X = 16
 # overhead does not dominate tiny per-split K ranges.
 MIN_LOOP_ITERS_PER_SPLIT = 2
 
-# The maximum number of warp groups per CTA.
-MAX_WARP_GROUPS = 4
+# Grouped sparse attention may add two producer-only groups to the common
+# four-warpgroup decode topology.
+MAX_WARP_GROUPS = 6
+
+# Grouped sparse routes keep one membership byte per selected page in a table
+# separate from the plain Int32 locators. Four bytes share one Int32 word. Q1 does
+# not consume membership; Q2--Q8 use the packed table for their per-query
+# softmax mask. A byte supports all eight query positions without changing the ABI.
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS = 8
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK = (
+    1 << Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+) - 1
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD = (
+    32 // Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+)
+# Holding a complete locator window removes duplicate K/V metadata traffic,
+# but a graph-safe Q2/Q4 worst-case bound can otherwise reserve 8 KiB or more
+# of SMEM for rows that commonly use only three KV tiles. Beyond this crossover,
+# stage locators one tile at a time while retaining the compact packed
+# membership row separately.
+Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES = 8
 
 # Default used only when the launch helper has no resolved decode config.
 # Config-aware FMHA and block-sparse callers pass their selected KV tile.
@@ -109,6 +148,7 @@ WARP_THREADS = 32
 # TMEM column layout for staged SwapsMmaAb O. A TMEM row holds 256 columns, and
 # the tcgen05 descriptor encodes a 16-row jump in the high 16 bits.
 TMEM_COLUMNS_PER_ROW = 256
+TMEM_MAX_ALLOCATION_COLUMNS = 512
 TMEM_ROW_STRIDE = 16 << 16
 
 # Number of scalar softmax/output values packed in one register for the
@@ -116,6 +156,21 @@ TMEM_ROW_STRIDE = 16 << 16
 PACKED_REGISTER_BYTES = 4
 FP8_VALUES_PER_REG = 4
 FP16_VALUES_PER_REG = 2
+
+# Bytes of the K-major operand row one tcgen05 MMA instruction consumes: 32
+# one-byte or 16 two-byte K elements.
+MMA_K_STEP_BYTES = 32
+
+# FP8 probabilities are quantized as ``p * FmhaDecodeConfig.fp8_p_quant_scale``:
+# the E4M3 maximum, less the binades a deferred exponent anchor may lag the
+# row maximum (``FmhaDecodeConfig.softmax_anchor_headroom_log2``). Row sums
+# and sink terms share the scale, and the output normalization divides it out.
+E4M3_MAX = 448.0
+
+# tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
+# 128-byte swizzle atom spans one 128-byte row per K or MN index.
+SMEM_DESC_UNIT_BYTES = 16
+SWIZZLE_128B_ROW_BYTES = 128
 
 # Per-lane register ownership denominators for packed output fragments.
 FP8_OUTPUT_ELEMENTS_PER_REG_GROUP = 512
@@ -136,14 +191,21 @@ REDUCTION_BYTES_PER_SLICE = REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THRE
 
 # Clustered standalone reducer shape. One 128-thread CTA covers a contiguous
 # 2 KiB partial-O slice with one 16-byte vector per thread. Each cluster rank
-# owns a compile-time 2, 4, or 8 split slots. Loads are batched in groups of at
-# most four; padded split slots remain neutral and never form GMEM pointers.
+# owns a compile-time 2, 4, or 8 split slots. Padded and unpublished slots
+# remain neutral and never form GMEM pointers.
 PARALLEL_REDUCTION_THREADS_PER_CTA = 128
 PARALLEL_REDUCTION_BYTES_PER_SLICE = (
     PARALLEL_REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THREAD
 )
-PARALLEL_REDUCTION_LOAD_BATCH = 4
+# Batch independent published-slot loads before the serial fold.
+PARALLEL_REDUCTION_LOAD_BATCH = 16
 PARALLEL_REDUCTION_FINAL_REDUCERS = 4
+# Single-CTA reducer profiles spread one output fragment's split slots
+# over this many adjacent lanes and merge them with warp shuffles. The fold is
+# a serial chain of dependent FP32 instructions at very low occupancy, so more
+# lanes with fewer slots shorten that per-lane dependency chain. Must divide
+# the slots owned by each CTA.
+PARALLEL_REDUCTION_SLOT_LANES = 4
 
 # Each reduction thread produces an 8-element O vector backed by four packed
 # 16-bit registers.

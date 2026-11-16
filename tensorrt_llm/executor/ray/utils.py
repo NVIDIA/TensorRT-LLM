@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import os
+import tempfile
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -20,6 +22,29 @@ try:
     import ray
 except ImportError:
     import tensorrt_llm.executor.ray.stub as ray
+
+
+def _configure_deep_gemm_cache(rank: int, gpu: int) -> None:
+    if os.environ.get("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", "1") == "0":
+        return
+
+    cache_dir = os.environ.get("TRTLLM_CACHE_DIR")
+    if (cache_dir and os.environ.get("DG_JIT_CACHE_DIR") == os.path.join(
+            os.path.expanduser(cache_dir), "deep_gemm")):
+        from tensorrt_llm.logger import logger
+
+        logger.warning_once(
+            "TRTLLM_CACHE_DIR keeps DeepGEMM isolation enabled; set "
+            "TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0 for better cache "
+            "reuse at the risk of concurrent writes.",
+            key="deep_gemm_unified_cache_isolation")
+        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
+            os.environ["DG_JIT_CACHE_DIR"], f"deep_gemm_rank{rank}_gpu{gpu}")
+    else:
+        os.environ.setdefault(
+            "DG_JIT_CACHE_DIR",
+            os.path.join(tempfile.gettempdir(),
+                         f"deep_gemm_rank{rank}_gpu{gpu}"))
 
 
 @contextmanager

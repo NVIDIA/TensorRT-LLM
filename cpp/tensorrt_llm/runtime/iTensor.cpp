@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -189,11 +189,11 @@ void printTensor(ITensor const& tensor, std::ostream& out)
         BufferManager manager{streamPtr};
         host = manager.copyFrom(tensor, MemoryType::kCPU);
         streamPtr->synchronize();
-        hostData = bufferCast<T>(*host);
+        hostData = host->getBufferPtr<T>();
     }
     else
     {
-        hostData = bufferCast<T>(tensor);
+        hostData = tensor.getBufferPtr<T>();
     }
 
     if (shape.nbDims > 3)

@@ -54,7 +54,6 @@ def test_eagle3_one_model_kv_cache_reuse() -> None:
         speculative_config=Eagle3DecodingConfig(
             max_draft_len=4,
             speculative_model=eagle_model_dir,
-            eagle3_one_model=True,
         ),
     )
     prompt = ("The quick brown fox jumped over the lazy dog. " * 20).strip() + " Once upon a time,"

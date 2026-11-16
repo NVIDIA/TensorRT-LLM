@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 268" width="1000" height="268">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="268" fill="#f5f5f5"/>
+<rect x="20.0" y="20" width="172.8" height="84" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="30.0" y="36.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">SYSTEM</text>
+<text x="30.0" y="56.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Decode step ends</text>
+<text x="30.0" y="81.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">cache updated by the</text>
+<text x="30.0" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">KV cache manager</text>
+<path d="M194.8,62.0 L214.8,62.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="216.8" y="20" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="226.8" y="36.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">HOOK</text>
+<text x="226.8" y="56.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="600" fill="#2d3142" text-anchor="start">on_generation_step_end</text>
+<text x="226.8" y="81.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">due requests: beta new</text>
+<text x="226.8" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">tokens and over budget</text>
+<path d="M391.6,62.0 L411.6,62.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="413.6" y="20" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="423.6" y="36.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">TRITON</text>
+<text x="423.6" y="56.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Mean-phase gather</text>
+<text x="423.6" y="81.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">cos and sin rows for</text>
+<text x="423.6" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">each request</text>
+<path d="M588.4,62.0 L608.4,62.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="610.4" y="20" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="620.4" y="36.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">CUTE DSL</text>
+<text x="620.4" y="56.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused score kernel</text>
+<text x="620.4" y="81.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">per-head scores + stats</text>
+<text x="620.4" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">read from K pages</text>
+<path d="M785.2,62.0 L805.2,62.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="807.2" y="20" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="817.2" y="36.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">CUTE DSL / TRITON</text>
+<text x="817.2" y="56.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Selection rows</text>
+<text x="817.2" y="81.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">union: fused epilogue</text>
+<text x="817.2" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">per-head modes: Triton</text>
+<rect x="20.0" y="164" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="30.0" y="180.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">CUTE DSL</text>
+<text x="30.0" y="200.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Radix top-k</text>
+<text x="30.0" y="238.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">budget tokens per row</text>
+<path d="M194.8,206.0 L214.8,206.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="216.8" y="164" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="226.8" y="180.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">TRITON</text>
+<text x="226.8" y="200.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Settle ties</text>
+<text x="226.8" y="225.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">kept ordinals,</text>
+<text x="226.8" y="238.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">deterministic order</text>
+<path d="M391.6,206.0 L411.6,206.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="413.6" y="164" width="172.8" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="423.6" y="180.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">NATIVE CUDA</text>
+<text x="423.6" y="200.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compaction</text>
+<text x="423.6" y="238.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">K and V moved in place</text>
+<path d="M588.4,206.0 L608.4,206.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="610.4" y="164" width="172.8" height="84" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="620.4" y="180.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">SYSTEM · CACHE MANAGER</text>
+<text x="620.4" y="200.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">New cache length</text>
+<text x="620.4" y="238.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">freed pages returned</text>
+<path d="M893.6,106.0 L893.6,134.0 L106.4,134.0 L106.4,162.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+</svg>

@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 try:
     from transformers.modeling_attn_mask_utils import AttentionMaskConverter
@@ -804,6 +804,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 raise ValueError("Vanilla MLA requires a KV cache manager.")
             if forward_args.latent_cache is None:
                 raise ValueError("Vanilla MLA requires latent_cache.")
+            if self.sparse_params is not None:
+                raise NotImplementedError(
+                    f"{self.sparse_params.algorithm} requires its specialized "
+                    "Vanilla attention backend")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
                 return self._mla_forward_context(q, k, v, metadata,

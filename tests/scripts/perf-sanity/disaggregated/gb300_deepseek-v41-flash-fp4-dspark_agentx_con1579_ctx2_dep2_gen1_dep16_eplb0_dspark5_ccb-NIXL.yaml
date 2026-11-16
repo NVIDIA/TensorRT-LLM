@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4.1-Flash NVFP4, AgentX agentic trace replay, disaggregated (GB300).
+# The "middle" point of the AgentX Pareto (published row r28-mid):
+#   2 x DEP2 ctx + 1 x DEP16 gen (batch 16, DSpark k=5, MegaMoE CuTe DSL),
+#   20 GPUs, concurrency 1,579.
+# Carried over from the recipe: worker layouts, batch / token budgets, CUDA
+# graph list, KV cache, router and disagg-server options, and the forced
+# acceptance (2.51 of 5 drafts = acceptance length 3.51, DSpark k=5 golden
+# value with thinking on).
+# Not carried over: the recipe's static EPLB placement files, its KV disk
+# tier, its prompt-token cache, its autotuner / JIT cache paths, and its
+# env-only feature switches, none of which main reads; this lane therefore
+# measures main's default code paths.
+# The trace window is 1800 s with no per-lane warmup beyond the scenario's
+# primers (the published runs use 3600 s), so each lane fits a CI stage;
+# 1800 s is above the AgentX scenario's 900 s minimum.
+metadata:
+  # Cache-transceiver precheck hint, read only when no checkpoint is staged (the
+  # checkpoint's own DeepseekV41ForCausalLM takes precedence). DeepseekV41ForCausalLM
+  # inherits the KV-cache-manager and transceiver preferences of this base class.
+  architecture: DeepseekV4ForCausalLM
+  model_name: deepseek_v41_flash_nvfp4_dspark
+  precision: fp4
+  model_dir_name: DeepSeek-V4.1-Flash-NVFP4
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: agentx
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 04:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  benchmark_client: agentx
+  multi_round: 1
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: '1579'
+  input_length: 990016
+  output_length: 6579
+  dataset_file: semianalysis_cc_traces_weka_062126
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 2
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  client_env_var: AGENTX_MAX_CTX=996579 AGENTX_DURATION=1800 AGENTX_WARMUP_PER_LANE=0 AGENTX_TIMEOUT_GRACE=5400 AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_ARENA_RESERVE=0 OMP_NUM_THREADS=1 TLLM_NUMA_AWARE_WORKER_AFFINITY=1 TRTLLM_PINNED_WEIGHT_STAGING=1
+  ctx_worker_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET=1073741824 TRTLLM_CUTEDSL_FC2_N_TILE_SIZE=256 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51
+  gen_worker_env_var: TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+ctx_router_config:
+  type: conversation
+server_config_extra:
+  gen_strip_message_history: true
+  gen_tokids_ctxbytes: true
+  server_keep_alive_timeout: 3600
+  conversation_affinity_header_for_subagents: X-Dynamo-Parent-Session-ID
+  subagent_affinity_scope: context
+worker_config:
+  gen:
+    print_iter_log: true
+    max_batch_size: 16
+    max_num_tokens: 256
+    max_seq_len: 996595
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8, 16]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+      dtype: fp8
+      tokens_per_block: 128
+      event_buffer_max_size: 0
+      avg_seq_len: 160000
+      host_cache_size: 0
+    moe_config:
+      backend: MEGAMOE_CUTEDSL
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      backend: NIXL
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: DSpark
+      max_draft_len: 5
+      block_size: 5
+      speculative_model: DeepSeek-V4.1-Flash-NVFP4
+    custom_tokenizer: deepseek_v41
+    disable_mm_encoder: true
+    sparse_attention_config:
+      algorithm: csa2
+    num_serve_frontends: 4
+  ctx:
+    print_iter_log: true
+    max_batch_size: 256
+    max_num_tokens: 32768
+    max_seq_len: 990016
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 2
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: false
+    kv_cache_config:
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.8
+      dtype: fp8
+      tokens_per_block: 128
+      event_buffer_max_size: 0
+      avg_seq_len: 160000
+      block_reuse_config:
+        policy: per_conversation
+        max_num_turns: 5
+      host_cache_size: 85899345920
+    moe_config:
+      backend: CUTEDSL
+    cache_transceiver_config:
+      backend: NIXL
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    custom_tokenizer: deepseek_v41
+    disable_mm_encoder: true
+    sparse_attention_config:
+      algorithm: csa2
+    enable_chunked_prefill: true
+    attention_dp_config:
+      kv_cache_routing_conversation_affinity: true
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+    num_serve_frontends: 8

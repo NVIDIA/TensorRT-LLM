@@ -15,18 +15,26 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import apply_quant_config_exclude_modules
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivationSupport,
+    SiTuActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+# Nothing here allocates: the quant-config tests drive ``create_weights`` with
+# construction stubbed out, and the activation test only builds a carrier. The
+# marker is also what makes the file reachable: the CPU stage lists this
+# directory but collects only files that carry it.
+pytestmark = pytest.mark.cpu_only
 
 
 def _wrapper() -> ConfigurableMoE:
@@ -90,7 +98,8 @@ def _create_backend(
     wrapper: ConfigurableMoE,
     model_config: ModelConfig,
     override_quant_config: QuantConfig | None = None,
-) -> Mock:
+) -> tuple[Mock, ModelConfig]:
+    """Build a mock backend; returns it and the config it was built with."""
     backend = _backend_mock()
     with (
         patch(
@@ -100,14 +109,16 @@ def _create_backend(
         patch(
             "tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend",
             return_value=backend,
-        ),
+        ) as create_moe_backend,
     ):
-        wrapper._create_and_sync_backend(
+        backend_config = wrapper._create_and_sync_backend(
             model_config=model_config,
             routing_method=Mock(),
             override_quant_config=override_quant_config,
         )
-    return backend
+    # The wrapper reads its own settings from what it returns.
+    assert backend_config is create_moe_backend.call_args.kwargs["model_config"]
+    return backend, backend_config
 
 
 def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
@@ -120,7 +131,7 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
     wrapper = _wrapper()
     wrapper.quant_config = global_config
 
-    backend = _create_backend(wrapper, model_config)
+    backend, _ = _create_backend(wrapper, model_config)
 
     backend.create_weights.assert_not_called()
     wrapper.quant_config = layer_config
@@ -128,6 +139,24 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
 
     assert backend.quant_config is layer_config
     backend.create_weights.assert_called_once_with()
+
+
+def test_override_builds_the_backend_on_a_shallow_copy() -> None:
+    """The backend sees the override; the caller's config, and the per-weight
+    ``quant_config_dict`` every layer shares, are left as they were."""
+    global_config = QuantConfig()
+    override = QuantConfig(quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        quant_config=global_config,
+        quant_config_dict={"model.layers.0.mlp.experts": override},
+    )
+
+    _, backend_config = _create_backend(_wrapper(), model_config, override)
+
+    assert backend_config is not model_config
+    assert backend_config.quant_config is override
+    assert backend_config.quant_config_dict is model_config.quant_config_dict
+    assert model_config.quant_config is global_config
 
 
 def test_exclusions_only_recreate_matching_moe_weights() -> None:
@@ -139,7 +168,7 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     wrapper = _wrapper()
     wrapper.quant_config = quant_config
 
-    backend = _create_backend(wrapper, model_config)
+    backend, _ = _create_backend(wrapper, model_config)
 
     assert backend.quant_config is quant_config
     backend.create_weights.assert_called_once_with()
@@ -155,10 +184,26 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     )
     root.experts = wrapper
 
-    DecoderModelForCausalLM.apply_quant_config_exclude_modules(root)
+    apply_quant_config_exclude_modules(root.model_config, root.named_modules())
 
     assert not backend._weights_created
     wrapper.create_weights()
     assert wrapper.quant_config.quant_algo is None
     assert backend.quant_config.quant_algo is None
     backend.create_weights.assert_called_once_with()
+
+
+@pytest.mark.parametrize("missing", ["gate_softcap", "linear_softcap"])
+def test_situ_activation_rejects_a_missing_soft_cap(missing: str) -> None:
+    """Absence is a rejection for a soft cap, unlike for a clamp.
+
+    ``swiglu_limit`` has a value that encodes "unclamped", so omitting it is
+    how a caller asks for plain SwiGLU. A soft cap has no such value -- the
+    kernel divides by it -- so the two neighbouring constants cannot be given
+    one rule.
+    """
+    caps = {"gate_softcap": 1.0, "linear_softcap": 1.0}
+    caps[missing] = None
+
+    with pytest.raises(ValueError, match=f"SiTu {missing}"):
+        SiTuActivation(**caps)

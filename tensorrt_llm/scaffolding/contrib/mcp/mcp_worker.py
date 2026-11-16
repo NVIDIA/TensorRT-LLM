@@ -21,7 +21,7 @@ class MCPWorker(Worker):
         clients = []
         for url in urls:
             client = MCPClient()
-            await client.connect_to_sse_server(server_url=url)
+            await client.connect_to_streamable_http_server(server_url=url)
             clients.append(client)
         return cls(clients)
 

@@ -46,7 +46,7 @@ extern bool const gDebug; // true == debug mode (expensive assertions enabled)
 
 enum class PageStatus : int
 {
-    LOCKED = 0,    // Required in GPU. Eviction/dropping not allowed.
+    LOCKED = 0,    // Pinned at the current storage level. Eviction/dropping not allowed.
     HELD = 1,      // Allow eviction but not dropping.
     DROPPABLE = 2, // Allow eviction and dropping.
 };
@@ -56,6 +56,7 @@ enum class CacheTier : int
     GPU_MEM = 0,
     HOST_MEM = 1,
     DISK = 2,
+    REMOTE = 3,
 };
 
 // PageIndexMode — how converted page indices relate to layers within a layer group.
@@ -94,6 +95,12 @@ using LayerId = int;
 
 // Raw CUDA stream handle (CUstream cast to uintptr_t).
 using CudaStream = uintptr_t;
+
+// Row of a Batch: the seat a member occupies while it is stepped. Its arena lease and its
+// page table are both found by it, and it is the Batch's alone -- a row of one Batch names
+// nothing in another.
+using BatchRow = StrongIndex<int, struct BatchRowTag, -1>;
+inline constexpr BatchRow kNoBatchRow{};
 
 // Index of a beam in beam-search.
 using BeamIndex = StrongIndex<int, struct BeamIndexTag, 0>;

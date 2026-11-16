@@ -74,21 +74,22 @@ CachedCudaEvent CachedCudaEvent::makeNull() noexcept
 
 CachedCudaEvent::CachedCudaEvent(CudaStream stream) noexcept
 {
-    terminateOnException("Failed to create or record a cached CUDA event",
+    KVCM2_POISON_ON_EXCEPT(
         [&]()
         {
-            mEvent = std::make_shared<CudaEventPool::PoolItem>(CudaEventPool::instance().get());
-            cuCheck(cuEventRecord(mEvent->get(), reinterpret_cast<CUstream>(stream)));
+            mEvent = std::make_shared<PooledEvent>(CudaEventPool::instance().get());
+            cuCheck(cuEventRecord(mEvent->load(), reinterpret_cast<CUstream>(stream)));
         });
 }
 
-bool CachedCudaEvent::queryComplete()
+bool CachedCudaEvent::queryComplete() const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return true;
     }
-    CUresult result = cuEventQuery(mEvent->get());
+    CUresult result = cuEventQuery(event);
     if (result == CUDA_SUCCESS)
     {
         close();
@@ -101,30 +102,32 @@ bool CachedCudaEvent::queryComplete()
     throw CuError(result);
 }
 
-void CachedCudaEvent::synchronize()
+void CachedCudaEvent::synchronize() const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return;
     }
-    cuCheck(cuEventSynchronize(mEvent->get()));
+    cuCheck(cuEventSynchronize(event));
     close();
 }
 
 void CachedCudaEvent::waitInStream(CudaStream stream) const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return;
     }
-    cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), mEvent->get(), 0));
+    cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), event, 0));
 }
 
-void CachedCudaEvent::close() noexcept
+void CachedCudaEvent::close() const noexcept
 {
     if (mEvent)
     {
-        mEvent->reset();
+        mEvent->retire();
     }
 }
 
@@ -151,11 +154,11 @@ void CachedCudaStream::synchronize()
 // TemporaryCudaStream implementation
 // ---------------------------------------------------------------------------
 
-TemporaryCudaStream::TemporaryCudaStream(std::vector<CachedCudaEvent const*> const& priorEvents)
+TemporaryCudaStream::TemporaryCudaStream(std::vector<CUevent> priorEvents)
     : mStream()
 {
     CudaStream cs = reinterpret_cast<CudaStream>(mStream.handle());
-    streamWaitEvents(cs, priorEvents);
+    streamWaitEvents(cs, std::move(priorEvents));
 }
 
 // ---------------------------------------------------------------------------
@@ -163,25 +166,47 @@ TemporaryCudaStream::TemporaryCudaStream(std::vector<CachedCudaEvent const*> con
 // Mirrors Python's merge_events() in _utils.py.
 // ---------------------------------------------------------------------------
 
-CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events)
+CachedCudaEvent mergeEvents(CachedCudaEvent* events, size_t count)
 {
-    // Filter out closed events (optimization: skip cuStreamWaitEvent calls).
-    std::vector<CachedCudaEvent*> live;
-    for (auto& ev : events)
+    // A single live event is returned as is rather than merged, so track one live event and
+    // how many distinct ones there are.
+    CachedCudaEvent* onlyLive = nullptr;
+    size_t numLive = 0;
+    auto const countLive = [&]()
     {
-        if (!ev.isClosed())
-            live.push_back(&ev);
+        onlyLive = nullptr;
+        numLive = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            CUevent const handle = events[i].handle();
+            if (handle != nullptr
+                && std::none_of(events, events + i, [handle](auto const& prior) { return prior.handle() == handle; }))
+            {
+                ++numLive;
+                onlyLive = &events[i];
+            }
+        }
+    };
+    countLive();
+    if (numLive > 1)
+    {
+        // A merge costs a pooled stream, a wait per event and a record. Completed events order
+        // nothing: dropping them leaves a released page with its owner's finish event alone.
+        for (size_t i = 0; i < count; ++i)
+            (void) events[i].queryComplete();
+        countLive();
     }
-    if (live.empty())
+    if (numLive == 0)
         return CachedCudaEvent::makeNull();
-    if (live.size() == 1)
-        return std::move(*live[0]);
-    // Multiple live events: merge via TemporaryCudaStream.
-    std::vector<CachedCudaEvent const*> priors;
-    priors.reserve(live.size());
-    for (auto* ev : live)
-        priors.push_back(ev);
-    TemporaryCudaStream tempStream(priors);
+    if (numLive == 1)
+        return std::move(*onlyLive);
+    // Multiple live events: merge via TemporaryCudaStream. Closed events yield a null handle,
+    // which streamWaitEvents drops.
+    std::vector<CUevent> priors;
+    priors.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        priors.push_back(events[i].handle());
+    TemporaryCudaStream tempStream(std::move(priors));
     {
         auto scope = tempStream.enter();
     }

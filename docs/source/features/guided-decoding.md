@@ -3,7 +3,7 @@
 Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema, [regular expression](https://en.wikipedia.org/wiki/Regular_expression) or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) grammar).
 
 TensorRT LLM supports two grammar backends:
-* [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.32/python/xgrammar/compiler.py#L144-L290): Supports JSON schema, regular expression, EBNF and [structural tag](https://xgrammar.mlc.ai/docs/latest/structural_tag/structural_tag.html).
+* [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.2.8/python/xgrammar/compiler.py#L144-L335): Supports JSON schema, regular expression, EBNF and [structural tag](https://xgrammar.mlc.ai/docs/latest/structural_tag/structural_tag.html).
 * [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366): Supports JSON schema, regular expression, EBNF.
 
 
@@ -27,7 +27,7 @@ trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --config config.yaml
 
 You should see a log like the following, which indicates the grammar backend is successfully enabled.
 
-```txt
+```text
 ......
 [TRT-LLM] [I] Guided decoder initialized with backend: GuidedDecodingBackend.XGRAMMAR
 ......
@@ -83,7 +83,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 {
     "name": "Paris",
     "population": 2145200
@@ -127,7 +127,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 Paris
 ```
 
@@ -174,7 +174,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 Paris is the capital of France
 ```
 
@@ -310,7 +310,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```
@@ -370,7 +370,7 @@ if __name__ == "__main__":
 ```
 
 The output would look like:
-```txt
+```text
 {
   "name": "Paris",
   "population": 2145206
@@ -409,7 +409,7 @@ if __name__ == "__main__":
 ```
 
 The output would look like:
-```txt
+```text
 Paris
 ```
 
@@ -450,7 +450,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
 ```
 
 The output would look like:
-```txt
+```text
 Paris is the capital of France
 ```
 
@@ -583,7 +583,7 @@ You are a helpful assistant."""
 ```
 
 The output would look like:
-```txt
+```text
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```

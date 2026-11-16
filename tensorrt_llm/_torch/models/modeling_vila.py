@@ -1164,7 +1164,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
         (iii) later in LLM, we can slice-and-assign based on condition fused_embed[input_ids < vocab_size] = text_embed, fused_embed[inputI > vocab_size] = mm_embed.
 
-        (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
+        (3) The token IDs travel in the request tokens, and mm_embed travels in the Python multimodal data. Model input preparation passes the batched multimodal embeddings to the LLM.
         """
 
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
@@ -1206,6 +1206,10 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
+
+    # The vision encoder uses Hugging Face CLIP or SigLIP.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     config_class = VilaConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
@@ -1236,7 +1240,7 @@ class VilaModel(PreTrainedModel):
         self.llm.to(device=device, dtype=self.model_dtype)
 
         # Surface the in-vocab media token IDs (image, video, ...) to the
-        # model engine's ``_prepare_multimodal_indices``. ``init_llm`` populates
+        # ``runners.prepare_multimodal_indices``. ``init_llm`` populates
         # ``self.tokenizer.media_token_ids`` as ``{name: id}``.
         media_ids = list(self.tokenizer.media_token_ids.values())
         self._mm_token_ids = torch.tensor(media_ids, dtype=torch.int32)
@@ -1313,7 +1317,7 @@ class VilaModel(PreTrainedModel):
 
     @property
     def llm_checkpoint_dir(self):
-        """Return the directory of the LLM checkpoint. Workaround for multimodal models that config is in root directory but llm checkpoint is in subdirectory. Without this, PyTorchModelEngine will try to load LLM checkpoint from root."""
+        """Return the directory of the LLM checkpoint. Workaround for multimodal models that config is in root directory but llm checkpoint is in subdirectory. Without this, ModelEngine will try to load LLM checkpoint from root."""
         return self.llm_path
 
     def load_weights(self, weights):

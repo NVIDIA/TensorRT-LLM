@@ -353,6 +353,9 @@ struct KvCacheIterationStats
     SizeType32 secondaryPeakFreeNumBlocks{0};
     SizeType32 secondaryPeakUsedNumBlocks{0};
     SizeType32 secondaryPeakEvictableNumBlocks{0};
+    // Disk copies retained while their block also lives in a hotter tier (KV cache manager V2 disk options). Not
+    // counted in secondaryEvictableNumBlocks; reclaimable, so counted in secondaryFreeNumBlocks.
+    SizeType32 secondaryRetainedCopyNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
@@ -620,7 +623,7 @@ public:
                 = runtime::BufferManager::cpu(runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
                     runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value);
             auto cacheBlockIdsRange
-                = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices.at(windowSize));
+                = mCacheBlockIndices.at(windowSize)->getBufferRange<tensorrt_llm::kernels::KVCacheIndex>();
             std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
                 tensorrt_llm::kernels::KVCacheIndex{
                     std::numeric_limits<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>::max()});

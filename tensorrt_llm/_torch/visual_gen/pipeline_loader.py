@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Model loader for diffusion pipelines.
 
@@ -17,6 +32,7 @@ Dynamic Quantization:
 
 import os
 import time
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -26,17 +42,19 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     CUTE_AVAILABLE,
 )
-from tensorrt_llm.llmapi.utils import download_hf_model
+from tensorrt_llm.llmapi.utils import download_hf_model, download_hf_partial
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .models.ltx23.checkpoint import resolve_ltx23_checkpoint
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
+    from .sleep import SleepRestoreMode
 
 
 class PipelineLoader:
@@ -60,7 +78,7 @@ class PipelineLoader:
         args: VisualGenArgs,
         *,
         device: str = "cuda",
-    ):
+    ) -> None:
         """
         Initialize model loader.
 
@@ -74,24 +92,39 @@ class PipelineLoader:
         self.device = torch.device(device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
-        """Resolve checkpoint_dir to a local directory path.
+        """Resolve checkpoint_dir to a local checkpoint path.
 
-        If checkpoint_dir is an existing local path, returns it unchanged.
-        Otherwise, attempts to download from HuggingFace Hub using the
-        file-lock-protected ``download_hf_model`` utility (safe for
-        concurrent multi-process access).
+        LTX-2.3 directories and Hub IDs select one workflow-specific file.
+        Other existing local paths are returned unchanged. Hub downloads use
+        the file-lock-protected download utility. Pipelines may register an
+        allow-list so repositories with multiple checkpoint variants only
+        fetch the components supported by TRT-LLM.
 
         Args:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
 
         Returns:
-            Path to local directory containing the model.
+            Local checkpoint file or directory containing the model.
 
         Raises:
             ValueError: If the path cannot be resolved (invalid repo ID,
                 authentication failure, offline with no cache, etc.)
         """
         if os.path.exists(checkpoint_dir):
+            if os.path.isdir(checkpoint_dir):
+                try:
+                    class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+                except ValueError:
+                    return checkpoint_dir
+                if class_name in ("LTX23Pipeline", "LTX23RetakePipeline"):
+                    default_workflow = (
+                        "retake" if class_name == "LTX23RetakePipeline" else "generation"
+                    )
+                    return resolve_ltx23_checkpoint(
+                        checkpoint_dir,
+                        workflow=self.args.pipeline_config.get("workflow", default_workflow),
+                        revision=self.args.revision,
+                    )
             return checkpoint_dir
 
         revision = self.args.revision
@@ -100,7 +133,33 @@ class PipelineLoader:
             f"attempting HuggingFace Hub download (revision={revision})"
         )
         try:
-            local_dir = download_hf_model(checkpoint_dir, revision=revision)
+            entry = next(
+                (
+                    candidate
+                    for candidate in PIPELINE_REGISTRY.values()
+                    if checkpoint_dir in candidate.hf_ids
+                ),
+                None,
+            )
+            if entry is not None and entry.pipeline_cls.__name__ in (
+                "LTX23Pipeline",
+                "LTX23RetakePipeline",
+            ):
+                return resolve_ltx23_checkpoint(
+                    checkpoint_dir,
+                    workflow=self.args.pipeline_config.get(
+                        "workflow", entry.defaults.get("workflow", "generation")
+                    ),
+                    revision=revision,
+                )
+            if entry is not None and entry.download_patterns:
+                local_dir = download_hf_partial(
+                    checkpoint_dir,
+                    allow_patterns=entry.download_patterns,
+                    revision=revision,
+                )
+            else:
+                local_dir = download_hf_model(checkpoint_dir, revision=revision)
         except Exception as e:
             raise ValueError(
                 f"Could not resolve '{checkpoint_dir}' as a local path or "
@@ -169,6 +228,48 @@ class PipelineLoader:
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+        sleep_release_host_backup: bool = False,
+    ) -> "BasePipeline":
+        """Load a pipeline, optionally backing its persistent GPU state in host RAM.
+
+        Sleep support and configuration checks belong to the resolved pipeline.
+        Its loading context captures persistent allocations before weights are
+        materialized; warmup runs after that context exits. Ordinary loading
+        does not enter the sleep loading context.
+        ``sleep_release_host_backup=True`` frees host backups before wake returns.
+        This makes wake slower, and each subsequent sleep allocates a fresh backup.
+        """
+        if sleep_restore_mode is None:
+            if sleep_release_host_backup:
+                raise ValueError("sleep_release_host_backup requires sleep_restore_mode")
+            return self._load(checkpoint_dir, skip_warmup, skip_components)
+
+        with ExitStack() as loading_stack:
+            # Constructor capability checks must use the loader's target GPU.
+            loading_stack.enter_context(torch.cuda.device(self.device))
+            pipeline = self._load(
+                checkpoint_dir,
+                True,
+                skip_components,
+                sleep_restore_mode=sleep_restore_mode,
+                sleep_release_host_backup=sleep_release_host_backup,
+                loading_stack=loading_stack,
+            )
+        if not skip_warmup:
+            pipeline.warmup()
+        return pipeline
+
+    def _load(
+        self,
+        checkpoint_dir: Optional[str],
+        skip_warmup: bool,
+        skip_components: Optional[List[Union[str, PipelineComponent]]],
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+        sleep_release_host_backup: bool = False,
+        loading_stack: ExitStack | None = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -228,13 +329,22 @@ class PipelineLoader:
         _attn_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
         if (
-            _attn_backend == "CUTEDSL"
+            _attn_backend in ("CUTEDSL", "TRTLLM")
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         ):
-            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            if _attn_backend == "CUTEDSL":
+                kernel_path = (
+                    "CuTe DSL block-sparse when supported; dense SDPA fallback otherwise"
+                    if CUTE_AVAILABLE
+                    else "dense SDPA fallback"
+                )
+            else:
+                kernel_path = (
+                    "PrimTS block-sparse when supported; compact dense TRTLLM fallback otherwise"
+                )
             logger.info(
-                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"Attention backend: {_attn_backend} (algorithm=vsa, "
                 f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
             )
         else:
@@ -255,6 +365,17 @@ class PipelineLoader:
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
+        if sleep_restore_mode is not None:
+            if loading_stack is None:
+                raise RuntimeError("Sleep loading requires a loading context stack")
+            loading_stack.enter_context(
+                pipeline._sleep_loading_context(
+                    sleep_restore_mode,
+                    device=self.device,
+                    release_host_backup=sleep_release_host_backup,
+                )
+            )
+
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.
         cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
@@ -272,6 +393,7 @@ class PipelineLoader:
         # =====================================================================
         weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
+        del weights
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
@@ -307,7 +429,7 @@ class PipelineLoader:
         else:
             logger.info("torch.compile disabled by config")
 
-        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # Cache acceleration (TeaCache / Cache-DiT / SeaCache) is enabled AFTER torch.compile
         # on purpose: Cache-DiT captures references to the transformer block
         # modules at enable time, while torch_compile() replaces the block lists
         # with compiled copies. If Cache-DiT were enabled first, it would keep

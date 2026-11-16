@@ -45,9 +45,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import (
     generate_spec_decoding_position_offsets,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -167,7 +167,7 @@ class MhaGenerationInputs:
     q: torch.Tensor
     k_new: torch.Tensor
     v_new: torch.Tensor
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     request_ids: list[int]
     metadata: TrtllmAttentionMetadata
 
@@ -195,10 +195,9 @@ def fp8_qdq(tensor: torch.Tensor) -> torch.Tensor:
 
 def _create_kv_cache_manager(
     scenario: MhaGenerationScenario,
-    kv_cache: torch.Tensor,
-) -> KVCacheManager:
+) -> KVCacheManagerV2:
     kv_cache_config = KvCacheConfig(max_tokens=scenario.kv_pool_num_pages * scenario.page_size)
-    manager = KVCacheManager(
+    manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=scenario.num_layers,
@@ -211,7 +210,7 @@ def _create_kv_cache_manager(
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kvcache_dtype)),
     )
     for layer_idx in range(scenario.num_layers):
-        manager.get_buffers(layer_idx, kv_layout="HND").copy_(kv_cache[layer_idx])
+        manager.get_buffers(layer_idx, kv_layout="HND").zero_()
     return manager
 
 
@@ -244,11 +243,22 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
     ).to(scenario.kvcache_dtype)
 
     with ExitStack() as cleanup:
-        kv_cache_manager = _create_kv_cache_manager(scenario, kv_cache)
+        kv_cache_manager = _create_kv_cache_manager(scenario)
         cleanup.callback(kv_cache_manager.shutdown)
         request_ids = list(range(scenario.batch_size))
         token_nums = [past_kv_len + scenario.query_len for past_kv_len in scenario.past_kv_lens]
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        # Keep seeded request histories independent of physical page allocation.
+        for layer_idx in range(scenario.num_layers):
+            buffer = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+            page_tables = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
+            logical_page = 0
+            for pages, token_num in zip(page_tables, token_nums, strict=True):
+                num_pages = math.ceil(token_num / scenario.page_size)
+                assert len(pages) >= num_pages
+                for page in pages[:num_pages]:
+                    buffer[page].copy_(kv_cache[layer_idx, logical_page])
+                    logical_page += 1
         metadata = TrtllmAttentionMetadata(
             num_contexts=0,
             kv_cache_params=KVCacheParams(
@@ -261,7 +271,7 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=list(scenario.past_kv_lens),
-            num_heads_per_kv=1,
+            max_num_heads_per_kv=1,
             runtime_features=AttentionRuntimeFeatures(
                 has_speculative_draft_tokens=scenario.has_draft_tokens
             ),
@@ -285,7 +295,7 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
                 dtype=torch.int32,
                 device=device,
             )
-            metadata.update_position_offsets_for_cpp(scenario.max_query_len)
+            metadata.spec_decoding_query_len = scenario.max_query_len
             metadata.spec_decoding_param_prepare_for_blackwell()
         metadata.prepare()
         cleanup.pop_all()
@@ -340,7 +350,7 @@ def reference_generation_attention(
     sparse_attn_indices: torch.Tensor,
     scenario: MhaGenerationScenario,
 ) -> torch.Tensor:
-    """Compute page-sparse MHA from equivalent request-local token indices."""
+    """Compute page-sparse MHA in FP32 from request-local token indices."""
     outputs = []
     query_offset = 0
     for request_idx in range(scenario.batch_size):
@@ -354,7 +364,7 @@ def reference_generation_attention(
                 ),
             ],
             dim=0,
-        )
+        ).float()
         v_full = torch.cat(
             [
                 v_history,
@@ -363,10 +373,10 @@ def reference_generation_attention(
                 ),
             ],
             dim=0,
-        )
+        ).float()
         for query_idx in range(scenario.query_len):
             packed_query_idx = query_offset + query_idx
-            q_token = q[packed_query_idx].view(scenario.num_heads, scenario.head_dim)
+            q_token = q[packed_query_idx].view(scenario.num_heads, scenario.head_dim).float()
             head_outputs = []
             for head_idx in range(scenario.num_heads):
                 token_indices = sparse_attn_indices[head_idx, packed_query_idx]
@@ -378,7 +388,7 @@ def reference_generation_attention(
                 )
                 attention_probs = torch.nn.functional.softmax(
                     attention_scores, dim=-1, dtype=torch.float32
-                ).to(scenario.dtype)
+                )
                 head_outputs.append(torch.matmul(attention_probs, v_sparse))
             outputs.append(torch.cat(head_outputs, dim=0))
         query_offset += scenario.query_len
@@ -592,14 +602,13 @@ def _run_page_sparse_mha(scenario: PageSparseMhaScenario) -> None:
         uses_fp8 = (
             attention_scenario.kvcache_dtype == torch.float8_e4m3fn or attention_scenario.fp8_output
         )
-        output_for_comparison = output.float() if uses_fp8 else output
-        if attention_scenario.fp8_output:
-            reference_output = reference_output.to(torch.float8_e4m3fn)
-        reference_for_comparison = reference_output.float() if uses_fp8 else reference_output
+        # Keep the reference unquantized: rounding it to FP8 can amplify small
+        # kernel errors across a rounding boundary into a full FP8 step.
+        output_for_comparison = output.float()
         assert torch.isfinite(output_for_comparison).all()
         torch.testing.assert_close(
             output_for_comparison,
-            reference_for_comparison,
+            reference_output,
             atol=FP8_ATOL if uses_fp8 else ATOL,
             rtol=FP8_RTOL if uses_fp8 else RTOL,
         )

@@ -4,10 +4,10 @@ This folder contains test definition which is consumed by `trt-test-db` tool bas
 
 ## Installation
 
-Install `trt-test-db` using the following command:
+Install `trt-test-db` using the following command (substitute `TRT_TEST_DB_VERSION` with the version from `jenkins/ci_versions.properties`):
 
 ```bash
-pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
+pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==<TRT_TEST_DB_VERSION>
 ```
 
 ## Test Definition
@@ -31,8 +31,8 @@ l0_e2e:
           - '*h100*'
         linux_distribution_name: ubuntu*
     tests:
-      - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
-      - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+      - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
+      - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
 ```
 
 ## Generating Test Lists
@@ -57,6 +57,20 @@ pytest -v --test-list=/TensorRT-LLM/src/l0_e2e.txt --output-dir=/tmp/logs
 ```
 
 This command runs the tests specified in the test list and outputs the results to the specified directory.
+
+## Check Test List (CI)
+
+Jenkins **Check Test List** runs
+`scripts/check_test_list.py --l0 --qa --waive --validate --parity`.
+L0/QA/waive collection uses pure-Python stubs of the compiled modules
+(`tests/integration/defs/stubify_bindings.py`, loaded only via
+`-p stubify_bindings`), so no TensorRT-LLM wheel or C++
+compile or binary download is required. `--parity` asserts that statically
+verified parametrize IDs are a subset of what `pytest --co` collects.
+Pre-commit runs check_test_list.py with `--validate` and
+`--check-duplicate-waives`, plus `scripts/check_binding_stubs.py` to fail when
+`stubify_bindings.py` `_STUB_ROOTS` misses a compiled extension listed in
+`setup.py` `package_data`. That last check does not require stubs or a wheel.
 
 ## Additional Information
 - The `--context` parameter in the `trt-test-db` command specifies which context to search in the YAML files.

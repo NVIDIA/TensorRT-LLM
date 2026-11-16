@@ -1,11 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-import subprocess
+import re
 import tempfile
 
 import pytest
 import yaml
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
@@ -114,13 +129,13 @@ def test_trtllm_serve_multimodal_benchmark(server: RemoteOpenAIServer,
     for key, value in dataset_args.items():
         benchmark_cmd.extend([key, str(value)])
 
-    # CalledProcessError will be raised if any errors occur
-    result = subprocess.run(benchmark_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True)
+    result = run_command_with_output(benchmark_cmd, timeout=3600)
 
     # Basic validation that the benchmark ran successfully
     assert result.returncode == 0
-    assert "Serving Benchmark Result" in result.stdout
+    assert "Serving Benchmark Result" in result.stdout, result.stdout
+    # The exit code alone passes when --num-prompts is ignored.
+    completed = re.search(r"^Successful requests:\s+(\d+)\s*$", result.stdout,
+                          re.MULTILINE)
+    assert completed is not None, result.stdout
+    assert int(completed.group(1)) == 10, result.stdout

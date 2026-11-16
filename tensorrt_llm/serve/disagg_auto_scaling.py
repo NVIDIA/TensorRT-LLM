@@ -387,17 +387,25 @@ class DisaggClusterWorker:
                                          self._config.inactive_timeout_sec)
 
     async def _refresh_registration(self) -> bool:
-        """Refresh this worker's TTL, retrying while the window allows.
+        """Refresh this worker's TTL, retrying until the storage answers.
 
         A storage RPC is bounded only by the client's own timeout, which is as
         coarse as the heartbeat interval and half of inactive_timeout_sec, so
-        awaiting one stalled /expire burns the whole TTL window: a healthy
-        worker's registration expires, the coordinator evicts it from the
-        routers, and in-flight requests routed there fail. Bound each attempt
-        to a fraction of the time left and spend the rest of the window
-        retrying. Only a stall is retried; "not refreshed" is definitive and
-        returns immediately so the caller can re-register.
+        awaiting one stalled /expire burns the whole TTL window. Bound each
+        attempt to a fraction of the time left and spend the rest retrying.
+
+        A timeout means "no answer yet", not "expired": the storage stamps the
+        new TTL when it *receives* the request and reaps lapsed keys lazily, so
+        _registration_expires_at is only a conservative local bound and the
+        registration normally outlives it. Treating it as definitive tears down
+        a healthy worker whose coordinator was merely busy for one interval --
+        it re-registers, which the coordinator reads as a leave/join, evicting
+        it from the routers so requests routed there fail. So retry through a
+        grace period; only an explicit "not refreshed", or silence past the
+        grace, is definitive.
         """
+        grace_deadline = (self._registration_expires_at +
+                          self._config.inactive_timeout_sec)
         while not self._stop:
             attempt_start = key_time()
             remaining = self._registration_expires_at - attempt_start
@@ -407,12 +415,15 @@ class DisaggClusterWorker:
                         self.worker_key, self._config.inactive_timeout_sec),
                     timeout=max(self._MIN_REFRESH_TIMEOUT_SEC, remaining / 3))
             except asyncio.TimeoutError:
-                if key_time() >= self._registration_expires_at:
-                    return False
+                now = key_time()
+                lapsed = now >= grace_deadline
+                action = ("giving up past the grace period"
+                          if lapsed else "retrying")
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} heartbeat refresh "
-                    f"stalled, retrying before the registration expires "
-                    f"{key_time()}")
+                    f"stalled, {action} {now}")
+                if lapsed:
+                    return False
                 continue
             if refreshed:
                 self._stamp_registration_expiry(attempt_start)

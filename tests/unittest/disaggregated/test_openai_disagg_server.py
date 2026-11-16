@@ -49,6 +49,7 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     )
     server = object.__new__(OpenAIDisaggServer)
     server._config = config
+    server._coordinator = None
     server.app = object()
 
     uvicorn_config = object()
@@ -63,6 +64,38 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
     server_factory.assert_called_once_with(uvicorn_config)
     uvicorn_server.serve.assert_awaited_once_with(sockets=None)
+
+
+@pytest.mark.asyncio
+async def test_single_process_server_fails_seat_waiters_when_shutdown_begins(tmp_path, monkeypatch):
+    """Graceful shutdown waits for parked selects; they must fail at once, as in a fleet."""
+    import asyncio
+
+    from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
+
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_disagg_server(DisaggConfig())
+        fail = AsyncMock()
+        monkeypatch.setattr(server._coordinator, "fail_seat_waiters", fail)
+        uvicorn_server = SimpleNamespace(should_exit=False)
+
+        async def serve(sockets=None):
+            await asyncio.sleep(0.3)
+            assert fail.await_count == 0
+            uvicorn_server.should_exit = True  # what SIGINT / SIGTERM do
+            # uvicorn now drains the requests in flight, parked selects included.
+            for _ in range(100):
+                if fail.await_count:
+                    break
+                await asyncio.sleep(0.02)
+
+        uvicorn_server.serve = serve
+        monkeypatch.setattr(openai_disagg_server.uvicorn, "Config", Mock())
+        monkeypatch.setattr(
+            openai_disagg_server, "create_uvicorn_server", Mock(return_value=uvicorn_server)
+        )
+        await asyncio.wait_for(server(host="127.0.0.1", port=0), timeout=10)
+        fail.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -98,12 +131,17 @@ async def test_http_cluster_storage_request_is_proxied_to_coordinator():
     assert response.body == b'{"result":true}'
 
 
-def test_create_client_does_not_register_with_server_metrics_collector():
+@pytest.mark.parametrize("bounded_replay", [False, True])
+def test_create_client_does_not_register_with_server_metrics_collector(bounded_replay):
     server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
     server._coordinator = SimpleNamespace(get_disagg_request_id=AsyncMock(return_value=1))
     server._req_timeout_secs = 30
     server._collect_perf_metrics = True
-    server._config = SimpleNamespace(internal_request_auth_key="key")
+    server._config = SimpleNamespace(
+        internal_request_auth_key="key",
+        bounded_replay_on_generation=bounded_replay,
+        ctx_frontend_affinity=None,
+    )
     server._perf_metrics_collector = SimpleNamespace()
 
     with patch("tensorrt_llm.serve.openai_disagg_server.OpenAIHttpClient") as mock_client:
@@ -111,6 +149,7 @@ def test_create_client_does_not_register_with_server_metrics_collector():
 
     assert client is mock_client.return_value
     mock_client.assert_called_once()
+    assert mock_client.call_args.kwargs["bounded_replay_on_generation"] is bounded_replay
 
 
 def test_extract_conversation_id_from_headers():
@@ -201,6 +240,103 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     )
 
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
+
+
+# --- sub-agent conversation affinity (routing key, conversation_id NOT rewritten) ---
+
+_PARENT_HEADER = "X-Dynamo-Parent-Session-ID"
+
+
+def _routing_id(request):
+    from tensorrt_llm.serve.conversation_id import get_request_routing_id
+
+    return get_request_routing_id(request)
+
+
+def _affinity_id(request):
+    from tensorrt_llm.serve.conversation_id import get_request_subagent_affinity_id
+
+    return get_request_subagent_affinity_id(request)
+
+
+def test_subagent_affinity_sets_routing_key_without_rewriting_conversation_id():
+    # A sub-agent request keeps its OWN conversation_id (linear history for the
+    # worker's per-conversation KV bookkeeping); only the server-private routing
+    # key is set to the parent, so the ConversationRouter co-locates it.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="own-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({_PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+    )
+    assert request.conversation_params.conversation_id == "own-id"  # NOT rewritten
+    assert _affinity_id(request) == "parent-id"
+    assert _routing_id(request) == "parent-id"  # routes to the parent's instance
+
+
+def test_subagent_affinity_main_agent_has_no_routing_key():
+    # A main-agent request lacks the parent header -> no affinity; routes by its
+    # own id.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id"}),
+        _PARENT_HEADER,
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
+    assert _routing_id(request) == "own-id"
+
+
+def test_subagent_affinity_feature_off_ignores_parent_header():
+    # No configured header name -> the parent header is inert.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="own-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({_PARENT_HEADER: "parent-id"}), None
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
+
+
+def test_subagent_affinity_parent_only_synthesizes_own_id():
+    # No body id and no session header: synthesize a distinct own id so the
+    # worker's bookkeeping / gen fleet see a distinct linear session, while the
+    # routing key still pins to the parent.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({_PARENT_HEADER: "parent-id"}), _PARENT_HEADER
+    )
+    assert request.conversation_params.conversation_id.startswith("subagent:")
+    assert _affinity_id(request) == "parent-id"
+    assert _routing_id(request) == "parent-id"
+
+
+@pytest.mark.parametrize("header", [None, _PARENT_HEADER])
+def test_subagent_affinity_clears_client_supplied_routing_key(header):
+    # subagent_affinity_id is server-private: a client cannot enable affinity by
+    # putting it in the request body. With the feature OFF (header=None) it ends
+    # up None; with a configured header but no parent header present it is also
+    # cleared (only the trusted parent header re-sets it).
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="own-id", subagent_affinity_id="attacker-id"
+        ),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({"X-Session-ID": "own-id"}), header
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():

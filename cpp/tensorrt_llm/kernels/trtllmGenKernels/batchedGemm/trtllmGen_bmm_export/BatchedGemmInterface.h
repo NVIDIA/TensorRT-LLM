@@ -767,7 +767,8 @@ public:
         // Whether PDL can safely be enabled
         bool const pdlSafe = batchedGemmConfig.mOptions.mGridWaitForPrimaryRouting
             || batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit
-            || batchedGemmConfig.mOptions.mGridWaitForPrimaryA || batchedGemmConfig.mOptions.mGridWaitForPrimaryB;
+            || batchedGemmConfig.mOptions.mGridWaitForPrimaryA || batchedGemmConfig.mOptions.mGridWaitForPrimaryB
+            || batchedGemmConfig.mOptions.mFineGrainedConsumerA || batchedGemmConfig.mOptions.mFineGrainedConsumerB;
 
         // Run the kernel.
         auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, batchedGemmConfig.mSharedMemSize,

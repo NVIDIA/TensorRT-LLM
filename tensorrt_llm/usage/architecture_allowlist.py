@@ -12,31 +12,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Public architecture names that telemetry may report in plaintext.
+"""Public model architecture identifiers telemetry may report in plaintext.
 
-This checked-in allowlist is intentionally conservative. Add a name only after
-confirming that the architecture is publicly documented by TensorRT-LLM.
+An entry may be an architecture declared by a public model checkpoint or a
+registered TensorRT-LLM runtime architecture documented in the supported-models
+table. This privacy allowlist is intentionally conservative and is not limited
+to Hugging Face Transformers classes. Never add private, customer-specific, or
+arbitrary user-supplied names.
 """
 
-PUBLIC_HF_ARCHITECTURES = frozenset(
+PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
         "AfmoeForCausalLM",
+        "Apertus1p5ForConditionalGeneration",
+        "ApertusForCausalLM",
         "BartForConditionalGeneration",
         "BertForSequenceClassification",
         "CLIPVisionModel",
         "Cohere2ForCausalLM",
+        "Cosmos3EdgeForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
+        "DSparkMiniMaxDraftModel",
         "DeciLMForCausalLM",
         "DeepSeekV2ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV41ForCausalLM",
+        "DeepseekV41ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "EAGLE3LlamaForCausalLM",
         "Eagle3DeepSeekV3ForCausalLM",
         "Exaone4ForCausalLM",
         "Exaone4_5_ForConditionalGeneration",
         "ExaoneForCausalLM",
-        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Gemma3nForConditionalGeneration",
@@ -46,6 +55,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Gemma4UnifiedForConditionalGeneration",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
         "GraniteForCausalLM",
@@ -61,6 +71,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "KimiK3ForConditionalGeneration",
         "KimiLinearForCausalLM",
         "LagunaForCausalLM",
+        "LiLiCorrDraftModel",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "LlavaLlamaModel",
@@ -82,6 +93,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Nano_VL_V2",
+        "NemotronH_Omni_Reasoning_V3",
         "NemotronNASForCausalLM",
         "Olmo3ForCausalLM",
         "OpenELMForCausalLM",
@@ -89,6 +101,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Phi4MMForCausalLM",
         "PixtralForConditionalGeneration",
         "PixtralVisionModel",
+        "PplxDeciderForDecision",
         "Qwen2ForCausalLM",
         "Qwen2ForProcessRewardModel",
         "Qwen2ForRewardModel",
@@ -97,6 +110,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3ForTextEmbedding",
+        "Qwen3ForTextReranking",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLForConditionalGeneration",

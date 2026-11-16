@@ -201,8 +201,8 @@ defines its compressed format and implements the relevant APIs below.
 | [`KvCacheCompressionConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L3783) and [`create_kv_cache_compression_manager()`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/_util.py#L2830) | Method selection and supported-combination admission | Pages, kernels, or request mappings |
 | [`KVCacheCompressionManager`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L2775) | Algorithm cadence, request state, decisions, format metadata, and algorithm launches | KVCM allocation policy or Attention runtime state |
 | [`NativeColdPageCodec`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h#L61) | KVCM-layout resolution, provider routing, fallback routing, and Python/native lifetime bridge | Format-specific quantization policy |
-| [`KVCacheManagerV2`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py#L789) | Pages, Slots, pools, mappings, migration streams, events, publication, release, rollback, and cold storage | Algorithm scores or quantization decisions |
-| [`AttentionBackend`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/interface.py#L1001) | Consumption of the published active GPU representation | Cold storage and migration |
+| [`KVCacheManagerV2`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py#L936) | Pages, Slots, pools, mappings, migration streams, events, publication, release, rollback, and cold storage | Algorithm scores or quantization decisions |
+| [`AttentionBackend`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/backends/interface.py#L1008) | Consumption of the published active GPU representation | Cold storage and migration |
 
 Before physical mutation, a method may reject, defer, or perform a legal no-op.
 After it submits work or moves bytes, it must follow the framework's completion
@@ -291,6 +291,45 @@ framework contract.
 The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.
+
+#### Which numbers of a K or V vector become NVFP4
+
+The hot KV cache stores, for every token and KV head, one K vector and one V
+vector of `head_dim` numbers; the kernel calls each vector a row and places rows
+`raw_row_stride_elements` numbers apart. For each row the kernel turns one
+contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
+copies everything before and after that piece unchanged. A compressed buffer
+records the piece as `quantized_range_start` and `quantized_range_elements`.
+
+- `skip_rope_quantization: false` (default): the piece is the whole vector. DeepSeek-V4
+  compressed rows use single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
+  values. Set `nvfp4_residual_dim: 0` for single NVFP4 throughout; the default
+  `64` selects 2FP4 for the 64 RoPE values. Other widths are rejected.
+- `skip_rope_quantization: true`: the piece is the NoPE part of the K vector, so the
+  RoPE numbers are copied unchanged into the cold page, right after that buffer's
+  scales. The codec finds the RoPE part in the model config: the last
+  `qk_rope_head_dim` numbers of the single 576-number vector an MLA layer stores
+  per token (its only buffer is the key), the first
+  `head_dim * partial_rotary_factor` numbers of a GQA head that rotates only its
+  leading numbers (Qwen3.5), or the last 64 of the 512 numbers of a DeepSeek-V4
+  compressed entry. V vectors carry
+  no position and always become NVFP4 in full.
+
+The codec refuses what the kernel cannot express: a K vector that is entirely
+RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
+or a piece whose start or length is not a multiple of 16 numbers (the scale
+group). The switch only takes effect for the model types in
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES`, whose RoPE layout the codec knows; other
+models log a warning and quantize whole vectors. To add a model, first verify
+its physical cache layout: a key-only buffer is assumed to be an MLA latent
+with trailing RoPE; separate key and value buffers are assumed to be
+partial-rotary GQA with leading RoPE. Adding a `model_type` alone is not enough
+for interleaved rotated dimensions or an MLA cache that also exposes a value
+buffer; implement an explicit placement rule and test it before adding that
+model to the supported-model list. RoPE widths come from rotary-width fields or partial
+rotary factors, never from theta or `rotary_emb_base`.
+
+Draft-model cold pages ignore both RoPE options and use single NVFP4.
 
 ### 4. Add method-specific kernels
 

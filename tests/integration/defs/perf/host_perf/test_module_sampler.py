@@ -192,7 +192,7 @@ STOP_WORD_SCENARIOS = [
 
 
 def register_requests_with_sampler(sampler: TorchSampler, requests: List[LlmRequest]):
-    """Register requests with the sampler's FinishReasonsHandler.
+    """Register requests with the sampler's FinishReasonsHandler and sampling params.
 
     In production, setup_sampler_step() is called with context requests to
     initialize the FinishReasonsHandler store (max_lengths, end_ids, stop words).
@@ -202,7 +202,6 @@ def register_requests_with_sampler(sampler: TorchSampler, requests: List[LlmRequ
     sampler._finish_reasons_handler.setup_new_request_handling()
     for req in requests:
         sampler._finish_reasons_handler.prepare_for_new_request(req)
-        sampler._request_grouper.prepare_for_new_request(req, req.py_seq_slot)
 
     # Flush the temp data into the FinishReasonsHandler stores
     seq_slots = [req.py_seq_slot for req in requests]
@@ -219,6 +218,8 @@ def register_requests_with_sampler(sampler: TorchSampler, requests: List[LlmRequ
         store = sampler._finish_reasons_handler.store
         store.max_lengths_cuda[seq_slots_t] = max_lens_t
         store.end_ids_cuda[seq_slots_t] = end_ids_t
+
+        sampler._slot_params.admit(requests, seq_slots_t.long())
 
 
 @pytest.mark.parametrize(

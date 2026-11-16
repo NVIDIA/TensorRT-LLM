@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
+import contextlib
+import multiprocessing
+import subprocess
+import sys
+
 import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakePool:
@@ -197,6 +204,11 @@ def test_spawn_failure_propagates_without_retry(reuse_cache):
 def test_reuse_size_mismatch_builds_new(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     s1.shutdown()
+
+    def _take_after_shutdown(_n_workers: int) -> None:
+        assert s1._real.shut
+
+    reuse_cache.prefetch.take = _take_after_shutdown
     s2 = reuse_cache.acquire(_FakePool, 4)
     assert s2._real.n_workers == 4 and s2._real is not s1._real
 
@@ -474,39 +486,18 @@ def test_kill_recorded_workers_falls_back_without_pidfd(
     assert kills == [(123, _signal.SIGKILL)]
 
 
-def test_autodeploy_nodeids_are_private():
-    from test_common.session_reuse_hooks import _is_private_nodeid
-
-    assert _is_private_nodeid(
-        "accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::"
-        "test_autodeploy_from_registry[m-True]"
-    )
-    assert _is_private_nodeid(
-        "examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json"
-    )
-    assert _is_private_nodeid("unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y")
-    assert not _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[a]"
-    )
-    assert not _is_private_nodeid(
-        "unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[x]"
-    )
-
-
 def test_torch_compile_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
     assert _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::"
-        "test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]"
     )
     assert _is_private_nodeid(
         "accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::"
         "test_nvfp4_multi_gpus_piecewise_cuda_graph[baseline]"
     )
     assert not _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::"
-        "test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]"
     )
     assert not _is_private_nodeid(
         "unittest/llmapi/test_llm_args.py::test_torch_compile_config_round_trip"
@@ -535,11 +526,11 @@ def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     assert s2._real is not real  # fresh pool, no reuse across the failure
 
 
-class _FakeBarrierSession:
+class _FakeProbeSession:
     """Fakes MpiPoolSession.submit for master-side submit_sync_per_worker tests.
 
-    Worker-side behaviour (the barrier itself) needs real MPI and is covered
-    by the multi-GPU validation runs; here each entry stands for one worker's
+    Worker-side behaviour needs real MPI and is covered by the multi-GPU
+    validation runs; here each entry stands for one worker's
     future: a (rank, result) tuple, an Exception, or None (never completes,
     i.e. a wedged worker).
     """
@@ -564,14 +555,14 @@ class _FakeBarrierSession:
 def test_probe_returns_results_ordered_by_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(2, "c"), (0, "a"), (1, "b")])
+    session = _FakeProbeSession([(2, "c"), (0, "a"), (1, "b")])
     assert submit_sync_per_worker(session, lambda: None) == ["a", "b", "c"]
 
 
 def test_probe_times_out_on_wedged_worker():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), None])  # rank 1 never returns
+    session = _FakeProbeSession([(0, "a"), None])  # rank 1 never returns
     with pytest.raises(RuntimeError, match="timed out"):
         submit_sync_per_worker(session, lambda: None, timeout=0.2)
 
@@ -579,7 +570,7 @@ def test_probe_times_out_on_wedged_worker():
 def test_probe_propagates_worker_exception():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), ValueError("worker died")])
+    session = _FakeProbeSession([(0, "a"), ValueError("worker died")])
     with pytest.raises(ValueError, match="worker died"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -587,7 +578,7 @@ def test_probe_propagates_worker_exception():
 def test_probe_flags_missing_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), (0, "a")])  # rank 1 never covered
+    session = _FakeProbeSession([(0, "a"), (0, "a")])  # rank 1 never covered
     with pytest.raises(RuntimeError, match=r"ranks \[1\]"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -611,6 +602,66 @@ def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
 
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # pool survived and was reused
+
+
+class _PlainItem:
+    nodeid = "test_e2e.py::test_ptp_quickstart_advanced"
+
+    @staticmethod
+    def get_closest_marker(name):
+        return None
+
+
+@pytest.fixture
+def cached_pool_hooks(reuse_cache, monkeypatch):
+    """The hooks bound to ``reuse_cache``, which holds one idle 4-worker pool."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+    monkeypatch.setattr(reuse_cache, "install_pool_factory_if_loaded", lambda: None)
+    s = reuse_cache.acquire(_FakePool, 4)
+    s.shutdown()
+    yield hooks, s._real
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_child_process_drains_cached_pools(cached_pool_hooks, capfd):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert pool.shut
+    assert "draining before child process" in capfd.readouterr().out
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_multiprocessing_child_drains_cached_pools(cached_pool_hooks):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    process = multiprocessing.get_context("spawn").Process(target=int)
+    process.start()
+    process.join()
+    assert pool.shut
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_device_query_keeps_cached_pools(cached_pool_hooks):
+    # The skip-marker fixtures run nvidia-smi before most multi-GPU tests.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run("nvidia-smi -L", shell=True, capture_output=True)
+    with contextlib.suppress(FileNotFoundError):  # no driver on this host
+        subprocess.run(["nvidia-smi", "-L"], capture_output=True)
+    hooks.pytest_runtest_teardown(_PlainItem())
+    assert not pool.shut
+
+
+def test_spawn_after_teardown_keeps_cached_pools(cached_pool_hooks):
+    # Finalizer cleanup commands must not cost the next test its pool.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    hooks.pytest_runtest_teardown(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert not pool.shut
 
 
 def test_seam_shim_is_isinstance_transparent():

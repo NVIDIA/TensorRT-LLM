@@ -4,10 +4,9 @@
 #
 # DEP8 does not fit. The parameters alone exceed a 288 GB GB300 at EP8: the
 # per-rank footprint is NOT checkpoint_bytes / 8, because enable_attention_dp
-# replicates every non-routed weight on every rank, and Kimi K3 converts the
-# checkpoint's FP8 attention to BF16 online (KIMI_K3_FP8_WEIGHT_READ is off by
-# default), doubling it. Halving the routed-expert share is what buys the
-# headroom back. See Phase 3 for making the attention weights read as FP8.
+# replicates every non-routed weight on every rank. This estimate predates
+# checkpoint-native FP8 attention loading, which avoids BF16 projection
+# allocations. Memory headroom must be measured with the current loader.
 #
 # max_batch_size is 8, not the template's 32. The V2 Mamba cache reserves a
 # full recurrent-state slot per resident sequence (69 KDA layers, fp32 state,

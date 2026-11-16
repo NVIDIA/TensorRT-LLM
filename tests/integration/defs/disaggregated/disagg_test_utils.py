@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -133,6 +133,13 @@ def _run_worker(
             env = os.environ.copy()
         else:
             env = env.copy()
+        # Every KVCacheManagerV2 worker prefaults a pinned host tier at startup.
+        # With transparent huge pages, a fragmented page cache on CI nodes turns
+        # each 2 MiB fault into direct compaction, and populating the tiers of
+        # several co-located workers can outlast the readiness budget
+        # (nvbugs/6888251). Tests only need the tier to exist, so use 4 KiB
+        # pages unless the caller asks for THP.
+        env.setdefault("TLLM_KV_CACHE_MANAGER_V2_THP", "0")
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack
@@ -209,7 +216,9 @@ def run_gen_worker(
     )
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
+def run_disagg_server(
+    disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None, report_addr=None
+):
     """Launch the disaggregated server.
 
     Args:
@@ -218,6 +227,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
         port: Port number
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
+        report_addr: If set, passed as --report_addr: the server writes the
+            host:port it bound to this file (read it with wait_for_reported_addr)
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -227,6 +238,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
+    if report_addr:
+        cmds += ["--report_addr", report_addr]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).

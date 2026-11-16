@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -434,53 +434,5 @@ inline std::ostream& operator<<(std::ostream& output, ITensor::Shape const& dims
 
 //! \brief Utility function to print a tensor with its shape.
 std::ostream& operator<<(std::ostream& output, ITensor const& tensor);
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the tensor pointed to by the tensorPtr, or
-/// nullptr if the tensorPtr is null.
-/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
-/// @tparam T The type of the underlying data.
-/// @param tensorPtr A possibly null shared ptr.
-/// @return A pointer to T const, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(ITensor::SharedConstPtr const& tensorPtr)
-{
-    return bufferCastOrNull<T>(static_cast<IBuffer::SharedConstPtr>(tensorPtr));
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the tensorPtr, or nullptr if
-/// the tensorPtr is null.
-/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
-/// @tparam T The type of the underlying data.
-/// @param tensorPtr A possibly null shared ptr.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(ITensor::SharedPtr const& tensorPtr)
-{
-    return bufferCastOrNull<T>(static_cast<IBuffer::SharedPtr>(tensorPtr));
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the tensor pointed to by the tensor pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(std::optional<ITensor::SharedPtr> const& optionalTensorPtr)
-{
-    return bufferCastOrNull<T>(static_cast<std::optional<IBuffer::SharedPtr>>(optionalTensorPtr));
-}
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the tensor pointed to by the tensor pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to const T, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(std::optional<ITensor::SharedConstPtr> const& optionalTensorPtr)
-{
-    return bufferCastOrNull<T>(static_cast<std::optional<IBuffer::SharedConstPtr>>(optionalTensorPtr));
-}
 
 } // namespace tensorrt_llm::runtime

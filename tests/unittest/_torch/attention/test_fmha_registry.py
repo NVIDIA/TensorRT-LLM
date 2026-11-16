@@ -16,8 +16,11 @@
 import pytest
 
 from tensorrt_llm._torch.attention.backends.fmha import registry
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
 
 PRIMS_TS = "prims_ts"
+PRIMS_TS_BLOCK_SPARSE = "prims_ts_block_sparse"
+PRIMS_TS_SPARSE_MLA = "prims_ts_sparse_mla"
 
 
 def _canonical_names() -> tuple[str, ...]:
@@ -33,14 +36,24 @@ def _enabled_names() -> tuple[str, ...]:
 def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
     names = _canonical_names()
     assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
+    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("flashinfer_trtllm_gen")
+    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("fallback")
 
 
 def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
     assert PRIMS_TS not in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS_SPARSE_MLA in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS_BLOCK_SPARSE in registry.DEFAULT_FMHA_LIBS
     assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
+
+
+def test_only_the_block_sparse_fmha_declares_block_sparse_support() -> None:
+    assert Fmha.supports_block_sparse_inputs is False
+    for name, fmha_cls in registry.FMHA_LIBS.items():
+        assert fmha_cls.supports_block_sparse_inputs is (name == PRIMS_TS_BLOCK_SPARSE), name
 
 
 @pytest.mark.parametrize("value", ["", "   ", ", ,"])

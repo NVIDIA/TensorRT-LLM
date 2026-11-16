@@ -21,10 +21,7 @@ import tempfile
 
 import pytest
 
-from .test_list_parser import (CorrectionMode, get_test_name_corrections_v2,
-                               handle_corrections)
-from .trt_test_alternative import (SessionDataWriter, check_call, check_output,
-                                   print_info)
+from .trt_test_alternative import check_call, check_output, print_info
 
 
 def find_repo_root():
@@ -71,12 +68,6 @@ def trt_performance_cache_name():
     return "performance.cache"
 
 
-@pytest.fixture(scope="session")
-def trt_performance_cache_fpath(trt_config, trt_performance_cache_name):
-    fpath = os.path.join(trt_config["workspace"], trt_performance_cache_name)
-    return fpath
-
-
 # Get the executing test case name
 @pytest.fixture(autouse=True)
 def test_case_name(request):
@@ -90,33 +81,6 @@ def llm_backend_root():
     assert os.path.isabs(backend_root), "LLM backend path must be absolute"
     assert os.path.exists(backend_root), f"{backend_root} does not exist"
     return backend_root
-
-
-@pytest.fixture(scope="session")
-def llm_session_data_writer(trt_config, trt_gpu_clock_lock,
-                            versions_from_infer_device, output_dir):
-    """
-    Fixture for the SessionDataWriter, used to write session data to output directory.
-    """
-
-    # Attempt to see if we can run infer_device to get the necessary tags for perf_runner
-    perf_tag_data = trt_config["perf_trt_tag"]
-
-    if versions_from_infer_device:
-        for k, v in versions_from_infer_device.items():
-            if k not in perf_tag_data or perf_tag_data[k] is None:
-                perf_tag_data[k] = v
-
-    session_data_writer = SessionDataWriter(
-        perf_trt_tag=perf_tag_data,
-        log_output_directory=output_dir,
-        output_formats=trt_config["perf_log_formats"],
-        gpu_clock_lock=trt_gpu_clock_lock,
-    )
-
-    yield session_data_writer
-
-    session_data_writer.teardown()
 
 
 @pytest.fixture(scope="session")
@@ -284,59 +248,13 @@ def models_root():
 
 
 @pytest.fixture(scope="session")
-def llama_v2_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_v2_tokenizer_model_root = os.path.join(models_root, "llama-models-v2")
-
-    assert os.path.exists(
-        llama_v2_tokenizer_model_root
-    ), f"{llama_v2_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_v2_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gptj_tokenizer_model_root(llm_backend_venv):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gptj_tokenizer_model_root = os.path.join(models_root, "gpt-j-6b")
-
-    assert os.path.exists(
-        gptj_tokenizer_model_root
-    ), f"{gptj_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gptj_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt_next_ptuning_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_next_ptuning_model_root = os.path.join(models_root, "email_composition")
-
-    assert os.path.exists(
-        gpt_next_ptuning_model_root
-    ), f"{gpt_next_ptuning_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_next_ptuning_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt_2b_lora_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_2b_lora_model_root = os.path.join(models_root, "lora", "gpt-next-2b")
-
-    assert os.path.exists(
-        gpt_2b_lora_model_root
-    ), f"{gpt_2b_lora_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_2b_lora_model_root
-
-
-@pytest.fixture(scope="session")
 def tiny_llama_lora_model_root():
     """HF-format LoRA adapter for TinyLlama-1.1B-Chat-v1.0.
 
     Used by the llmapi triton backend's E2E LoRA test
-    (`test_llmapi_lora`). Same base model as `tiny_llama_model_root`.
+    (`test_llmapi_lora`), together with an inlined TinyLlama-1.1B-Chat-v1.0
+    base-model path lookup at the call site — the adapter is fine-tuned
+    specifically for that base model and has no Qwen3-0.6B equivalent.
     """
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -348,144 +266,6 @@ def tiny_llama_lora_model_root():
         tiny_llama_lora_model_root
     ), f"{tiny_llama_lora_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return tiny_llama_lora_model_root
-
-
-@pytest.fixture(scope="session")
-def blip2_opt_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    blip2_opt_model_root = os.path.join(models_root, "blip2-opt-2.7b")
-
-    assert os.path.exists(
-        blip2_opt_model_root
-    ), f"{blip2_opt_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return blip2_opt_model_root
-
-
-@pytest.fixture(scope="session")
-def test_video_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    test_video = os.path.join(models_root, "video-neva", "test_video")
-
-    assert os.path.exists(
-        test_video
-    ), f"{test_video} does not exist under NFS LLM_MODELS_ROOT dir"
-    return test_video
-
-
-@pytest.fixture(scope="session")
-def llava_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_model_root = os.path.join(models_root, "llava-1.5-7b-hf")
-
-    assert os.path.exists(
-        llava_model_root
-    ), f"{llava_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_model_root
-
-
-@pytest.fixture(scope="session")
-def mllama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mllama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                     "Llama-3.2-11B-Vision")
-
-    assert os.path.exists(
-        mllama_model_root
-    ), f"{mllama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mllama_model_root
-
-
-@pytest.fixture(scope="session")
-def vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    vicuna_7b_model_root = os.path.join(models_root, "vicuna-7b-v1.3")
-
-    assert os.path.exists(
-        vicuna_7b_model_root
-    ), f"{vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def medusa_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    medusa_vicuna_7b_model_root = os.path.join(models_root,
-                                               "medusa-vicuna-7b-v1.3")
-
-    assert os.path.exists(
-        medusa_vicuna_7b_model_root
-    ), f"{medusa_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return medusa_vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def eagle_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    eagle_vicuna_7b_model_root = os.path.join(models_root,
-                                              "EAGLE-Vicuna-7B-v1.3")
-
-    assert os.path.exists(
-        eagle_vicuna_7b_model_root
-    ), f"{eagle_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return eagle_vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def t5_small_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    t5_small_model_root = os.path.join(models_root, "t5-small")
-
-    assert os.path.exists(
-        t5_small_model_root
-    ), f"{t5_small_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return t5_small_model_root
-
-
-@pytest.fixture(scope="session")
-def whisper_large_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    whisper_large_model_root = os.path.join(models_root, "whisper-models",
-                                            "large-v3")
-
-    assert os.path.exists(
-        whisper_large_model_root
-    ), f"{whisper_large_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return whisper_large_model_root
-
-
-@pytest.fixture(scope="session")
-def tiny_llama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    tiny_llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                         "TinyLlama-1.1B-Chat-v1.0")
-
-    assert os.path.exists(
-        tiny_llama_model_root
-    ), f"{tiny_llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return tiny_llama_model_root
-
-
-@pytest.fixture(scope="session")
-def mistral_small_3_1_24b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    model_root = os.path.join(models_root,
-                              "Mistral-Small-3.1-24B-Instruct-2503")
-
-    assert os.path.exists(
-        model_root
-    ), f"{model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return model_root
 
 
 # Returns an array of total memory for each available device
@@ -570,36 +350,3 @@ def output_dir(request):
     if output:
         os.makedirs(str(output), exist_ok=True)
     return output
-
-
-def deselect_by_regex(regexp, items, test_prefix, config):
-    """Filter out tests based on the patterns specified in the given list of regular expressions.
-        If a test matches *any* of the expressions in the list it is considered selected."""
-    compiled_regexes = []
-    regex_list = []
-    r = re.compile(regexp)
-    compiled_regexes.append(r)
-    regex_list.append(regexp)
-
-    selected = []
-    deselected = []
-
-    corrections = get_test_name_corrections_v2(set(regex_list),
-                                               set(it.nodeid for it in items),
-                                               CorrectionMode.REGEX)
-    handle_corrections(corrections, test_prefix)
-
-    for item in items:
-        found = False
-        for regex in compiled_regexes:
-            if regex.search(item.nodeid):
-                found = True
-                break
-        if found:
-            selected.append(item)
-        else:
-            deselected.append(item)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = selected

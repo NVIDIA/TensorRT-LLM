@@ -203,7 +203,7 @@ __global__ void computeSlidingBlockTablesWithScratchKernel(int32_t const* __rest
     int32_t const activeContexts = numContexts[0];
     bool const canUseScratch = isValidPool && tableId < scratchCapacity && tableId < activeContexts;
 
-    if (!canUseScratch)
+    if (basePageIndex != kBadPageIndex || !canUseScratch)
     {
         output[linearIdx] = basePageIndex;
         return;
@@ -249,7 +249,8 @@ __global__ void computeSlidingBlockTablesWithScratchRowsKernel(int32_t const* __
     int32_t const attnTypeId = layerAttnIdx % numAttnTypes;
     int32_t const layerId = layerAttnIdx / numAttnTypes;
     int32_t const layerAttnOffset = layerId * numAttnTypes + attnTypeId;
-    int32_t const outputOffset = rowIdx * maxBlocksPerSeq;
+    // The full layer/role/table layout can exceed INT32_MAX elements even for a single active request.
+    int64_t const outputOffset = static_cast<int64_t>(rowIdx) * maxBlocksPerSeq;
 
     int64_t const poolId64 = poolIds[layerAttnOffset];
     bool const isValidPool = validPool[layerAttnOffset] && poolId64 >= 0 && poolId64 < numPools;
@@ -279,7 +280,9 @@ __global__ void computeSlidingBlockTablesWithScratchRowsKernel(int32_t const* __
 
     for (int32_t blockId = threadIdx.x; blockId < maxBlocksPerSeq; blockId += blockDim.x)
     {
-        bool const inScratchRange = canUseScratch && blockId >= scratchBeg && blockId < scratchEnd;
+        int32_t const base = isValidTable ? blockOffsets[blockOffsetsOffset + blockId] : kBadPageIndex;
+        bool const inScratchRange
+            = base == kBadPageIndex && canUseScratch && blockId >= scratchBeg && blockId < scratchEnd;
         if (inScratchRange)
         {
             int32_t const rangeIndex = blockId - scratchBeg;
@@ -297,14 +300,7 @@ __global__ void computeSlidingBlockTablesWithScratchRowsKernel(int32_t const* __
             continue;
         }
 
-        if (!isValidTable)
-        {
-            output[outputOffset + blockId] = kBadPageIndex;
-            continue;
-        }
-
-        int32_t const base = blockOffsets[blockOffsetsOffset + blockId];
-        output[outputOffset + blockId] = base == kBadPageIndex ? kBadPageIndex : base * scale + layerOffset;
+        output[outputOffset + blockId] = applyScaleAndOffset(base, scale, layerOffset);
     }
 }
 

@@ -140,6 +140,39 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
     assert (fmha / "__init__.py").is_file()
 
 
+@pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
+def test_precompiled_preserves_source_schemas(
+    extract_from_precompiled, build_tree, tmp_path, monkeypatch, source_kind
+):
+    import zipfile
+
+    paths = (
+        "tensorrt_llm/schemas/trtllm-serve-config.schema.json",
+        "tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json",
+    )
+    for name in paths:
+        path = Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("current-checkout")
+        old = build_tree / name
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("old-precompiled-build")
+    source = build_tree
+    if source_kind == "wheel":
+        source = tmp_path / "precompiled.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+            for name in paths:
+                archive.writestr(name, "old-precompiled-build")
+    monkeypatch.setenv("TRTLLM_PRECOMPILED_LINK", "1" if source_kind == "link" else "0")
+    extract_from_precompiled(
+        str(source), PACKAGE_DATA + ["schemas/*.json", "usage/schemas/*.json"], str(tmp_path)
+    )
+    for name in paths:
+        assert Path(name).read_text() == "current-checkout"
+        assert not Path(name).is_symlink()
+
+
 def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_path):
     """There is no build tree to point at, so fail instead of copying."""
     from setuptools.errors import SetupError
@@ -149,6 +182,30 @@ def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_pat
 
     with pytest.raises(SetupError, match="TRTLLM_PRECOMPILED_LINK"):
         _run(extract_from_precompiled, wheel, tmp_path, link=True)
+
+
+def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, monkeypatch):
+    """Wheel inputs stage NCCL-EP below 3rdparty for repackaging."""
+    import zipfile
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+    (checkout / "3rdparty" / "nccl_extensions").mkdir(parents=True)
+    (checkout / "3rdparty" / "nccl_extensions" / "stale").write_text("stale")
+    wheel = tmp_path / "tensorrt_llm-0.0.0.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("fmha_sm100/__init__.py", "")
+        archive.writestr("nccl/ep/__init__.py", "")
+        archive.writestr("nccl/ep/lib/libnccl_ep.so", "ep")
+        archive.writestr("nccl/_extensions/bindings/binding.so", "binding")
+
+    _run(extract_from_precompiled, wheel, tmp_path, link=False)
+
+    package_root = checkout / "3rdparty" / "nccl_extensions"
+    assert not (package_root / "stale").exists()
+    assert (package_root / "nccl" / "ep" / "lib" / "libnccl_ep.so").read_text() == "ep"
+    assert (package_root / "nccl" / "_extensions" / "bindings" / "binding.so").is_file()
 
 
 # --------------------------------------------------------------------------

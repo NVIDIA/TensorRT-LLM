@@ -21,6 +21,12 @@ import torch
 from tensorrt_llm._torch.custom_ops import torch_custom_ops
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 
+# Tactic selection only: the runner is built without ``__init__``, its kernel
+# runner is a mock, and the SM version is monkeypatched. The marker is also
+# what makes the file reachable: the CPU stage collects only files that carry
+# it.
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_runner(x_dtype: torch.dtype, weight_dtype: torch.dtype) -> MoERunner:
     runner = MoERunner.__new__(MoERunner)

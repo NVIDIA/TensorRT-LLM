@@ -47,18 +47,19 @@ Options:
 ### Range Replay
 
 ```bash
-ncu --replay-mode range --profile-from-start off ...
+ncu --replay-mode range ...                                     # cudaProfilerStart/Stop ranges
+ncu --replay-mode range --nvtx --nvtx-include "region/" ...     # NVTX ranges
 ```
 
-Replays CUDA API call ranges between `cudaProfilerStart()` and `cudaProfilerStop()`. Good for profiling specific regions of complex applications.
+Replays CUDA API call ranges between `cudaProfilerStart()` and `cudaProfilerStop()`, or NVTX ranges selected with `--nvtx-include`. Good for profiling specific regions of complex applications. Range replay rejects `--profile-from-start off`.
 
 ### Application Range Replay
 
 ```bash
-ncu --replay-mode app-range --profile-from-start off ...
+ncu --replay-mode app-range ...
 ```
 
-Reruns the application to collect metrics for specified ranges. Combines application replay with range markers.
+Reruns the application to collect metrics for the same ranges. Combines application replay with range markers.
 
 ### Choosing a Replay Mode
 
@@ -67,7 +68,7 @@ Reruns the application to collect metrics for specified ranges. Combines applica
 | Standard kernel profiling | `kernel` (default) |
 | Kernels with global side effects | `application` |
 | Specific code regions | `range` with profiler markers |
-| Framework/JIT kernels | `range` or `kernel` with `--profile-from-start off` |
+| Framework/JIT kernels | `kernel` with `--profile-from-start off`, or `range` |
 
 ## Profiling JIT-Compiled Kernels (Triton/cuTile/CuTeDSL)
 
@@ -104,7 +105,10 @@ ncu --launch-skip 10 --launch-count 3 \
     -- python script.py
 ```
 
-Skip enough launches to pass autotuning. The exact skip count depends on the framework.
+Skip enough launches to pass autotuning. The exact skip count depends on the framework:
+Triton's autotuner launches every config many times, and `--launch-skip 10` still profiled
+an autotuning launch in testing. Check the profiled grid and block size against the chosen
+config, or use Method 1.
 
 ### Method 3: NVTX Ranges
 
@@ -157,20 +161,46 @@ mpirun -np 4 ncu -o report_%q{OMPI_COMM_WORLD_RANK} app
 For dependent kernels across ranks that must be profiled together:
 
 ```bash
-mpirun -np 4 ncu --communicator=tcp --communicator-num-peers=4 \
+mpirun -np 4 ncu --communicator=tcp --communicator-tcp-num-peers=4 \
     --lockstep-kernel-launch -o report app
 ```
 
-Restrict synchronization to specific NVTX ranges:
+Restrict synchronization to specific NVTX ranges; `--lockstep-nvtx-include` is rejected
+without `--lockstep-kernel-launch`:
 
 ```bash
-mpirun -np 4 ncu --communicator=tcp --communicator-num-peers=4 \
+mpirun -np 4 ncu --communicator=tcp --communicator-tcp-num-peers=4 --lockstep-kernel-launch \
     --lockstep-nvtx-include "nccl/" -o report app
 ```
 
+With the TCP communicator, ncu appends the rank to the `-o` name (`report0`, `report1`, ...), so
+`%q{OMPI_COMM_WORLD_RANK}` is not needed. In testing with Nsight Compute 2026.3.1 and Open MPI,
+the reports were complete once written, but the `ncu` processes did not always exit cleanly
+afterwards (some hung, some returned non-zero), and a leftover one held the communicator port
+(default 49217) so the next run waited for peers forever. Check for the reports rather than the
+exit code, kill leftover `ncu` processes, or pass a free `--communicator-tcp-port`.
+
+When one `ncu` launches every rank on one node (`torchrun`, or `mpirun` under `ncu`),
+`--communicator shmem` (Nsight Compute 2026.1+) synchronizes them without TCP and writes one
+report. It supports kernel and range replay only:
+
+```bash
+ncu --communicator shmem --communicator-shmem-num-peers 2 -k regex:nccl -o report \
+    torchrun --nnodes=1 --nproc_per_node=2 app.py
+```
+
+Without a communicator, profiling a kernel that waits on another rank hangs. On NVLink systems
+where NCCL uses NVLS (NVLink SHARP), kernel replay of NCCL kernels fails with `Failed to save
+memory for replay`: set `NCCL_NVLS_ENABLE=0` for the profiling run. `--replay-mode application`
+with the TCP communicator also works, but reruns the whole job once per pass. Range replay
+fails when NCCL's `cuMem*` allocation calls fall inside the range (unsupported during capture).
+
 ## PM Sampling
 
-Lower-overhead alternative to full section profiling. Periodically samples metrics instead of replaying.
+Samples performance-monitor metrics at a fixed interval while the kernel runs, giving a
+timeline of how its behavior changes over its runtime (for example a tail where SMs go
+idle). It is not a cheaper substitute for the other sections: the `PmSampling` section is
+collected over several replay passes like they are.
 
 ```bash
 ncu --section PmSampling --pm-sampling-interval 0 ...
@@ -179,35 +209,44 @@ ncu --section PmSampling --pm-sampling-interval 0 ...
 - `--pm-sampling-interval 0` — auto interval
 - `--pm-sampling-buffer-size 0` — auto buffer
 - `--pm-sampling-max-passes 0` — auto passes
+- `--warp-samples-per-interval 0` — auto warp samples per interval; `--disable-pm-warp-sampling` turns
+  off the sampled warp stall reasons that `PmSampling` shows next to the metrics
 
 ### Warp State Sampling
 
 ```bash
-ncu --warp-sampling-interval auto --warp-sampling-max-passes 5 ...
+ncu --section SourceCounters --warp-sampling-interval auto --warp-sampling-max-passes 5 ...
 ```
 
-Captures periodic warp state snapshots. Lower overhead than `WarpStateStats` section.
+These options tune warp state sampling: the per-instruction stall samples of `SourceCounters`
+and, from Nsight Compute 2026.2, the per-warp-slot samples that `WarpStateStats` shows next to
+its counter-based stall breakdown. On their own they collect nothing. `PmSampling` has its own
+warp sampling options (above).
 
 ## Profile Series
 
-Automated profiling with varying parameters to find optimal configurations:
+Profile Series, which profiles one kernel repeatedly with varying parameters,
+is a feature of the Nsight Compute UI's Interactive Profile activity; the CLI
+has no equivalent. From the CLI, profile each variant of a sweep and compare
+the results:
 
 ```bash
 ncu --section SpeedOfLight --kernel-name regex:"kernel" \
     --launch-count 10 -- python sweep.py
 ```
 
-Useful for comparing different block sizes, shared memory configs, or algorithm variants.
-
 ## Customization
 
 ### Custom Section Files
 
-Section files (`.section` format, Protocol Buffer) define what metrics to collect and how to display them. Located in the `sections/` folder of the installation.
+Section files (`.section` format, Protocol Buffer) define what metrics to collect and how to display them. The stock files ship in the `sections/` folder of the installation; ncu copies them to `~/Documents/NVIDIA Nsight Compute/<version>/Sections` and loads that copy.
+
+`--section-folder` replaces the default search path: pass it again for the stock folder to keep
+the stock sections and rules.
 
 ```bash
-ncu --section-folder /path/to/custom/sections ...
-ncu --list-sections ...   # Verify custom sections are discovered
+ncu --section-folder /path/to/custom/sections --list-sections    # Verify custom sections are discovered
+ncu --section-folder /path/to/stock/sections --section-folder /path/to/custom/sections ...
 ```
 
 ### Derived Metrics
@@ -219,19 +258,35 @@ Compose new metrics from existing ones using math expressions (addition, subtrac
 Rules implement automated analysis logic:
 
 ```python
+import NvRules
+
 def get_identifier():
     return "my_custom_rule"
 
 def get_name():
     return "My Custom Analysis"
 
+def get_description():
+    return "What the rule checks"
+
+def get_section_identifier():
+    return "SpeedOfLight"    # Runs when this section is collected
+
 def apply(handle):
+    ctx = NvRules.get_context(handle)
     # Access metrics and add recommendations
-    pass
+    ctx.frontend().message("Printed under the section")
 ```
 
+Declare `get_section_identifier()`: in testing with Nsight Compute 2026.3.1, rules without it
+were listed by `--list-rules` but printed nothing when profiling, even with `--rule`. The
+optional `evaluate(handle)` declares metrics the rule needs. NVIDIA's templates are in
+`extras/RuleTemplates/` of the installation. From 2026.3, rules run in an embedded Python that
+ignores the user's packages and Python environment variables such as `PYTHONPATH`;
+`NV_NSIGHT_PYTHON_ISOLATED=0` turns that off.
+
 ```bash
-ncu --list-rules ...   # Verify custom rules are discovered
+ncu --section-folder /path/to/rules --list-rules   # Verify custom rules are discovered
 ```
 
 ## Occupancy Calculator (Python)
@@ -241,20 +296,26 @@ The `ncu_occupancy` module (in `extras/python/`) calculates theoretical occupanc
 ```python
 import ncu_occupancy as occ
 
-calc = occ.OccupancyCalculator(major=8, minor=0)  # SM 8.0 (A100)
+calc = occ.OccupancyCalculator(8, 0)  # compute capability 8.0 (A100)
 
 params = occ.OccupancyParameters(
     threads_per_block=256,
     registers_per_thread=32,
-    shared_mem_per_block=2048
+    shared_mem_per_block=2048,
+    shared_mem_size=32768,  # shared memory carveout, bytes
 )
 
-occupancy = calc.get_sm_occupancy()
-limiters = calc.get_occupancy_limiters()
-# Returns: [OccupancyLimiter.REGISTERS, ...]
+occupancy = calc.get_sm_occupancy(params)
+limiters = calc.get_occupancy_limiters(params)
+utilization = calc.get_resource_utilization(params)
 
-optimal = calc.get_optimal_occupancy()  # Finds best config
+# Best config found by varying the listed variables, others held fixed
+optimal = calc.get_optimal_occupancy(params, [occ.OccupancyVariable.THREADS_PER_BLOCK])
 ```
+
+Set `shared_mem_size` to the kernel's shared memory carveout, the `Shared Memory Configuration
+Size` in LaunchStats; `occ.get_gpu_data(...)["shared_mem_size_configs"]` lists the valid values.
+It defaults to 0, and with 0 this example reports 25% occupancy and no limiter instead of 100%.
 
 ### OccupancyVariable Enum
 
@@ -268,7 +329,8 @@ Variables that can be swept for optimization:
 
 ```python
 gpu_data = occ.get_gpu_data(major=8, minor=0)
-# Returns: SM count, register limits, warp sizes, memory constraints
+# Returns per-architecture limits (no SM count): registers, warps, threads and blocks per SM,
+# shared memory size configs, allocation granularities
 ```
 
 ## Reproducibility
@@ -276,11 +338,13 @@ gpu_data = occ.get_gpu_data(major=8, minor=0)
 ### Clock Control
 
 ```bash
-ncu --clock-control base ...    # Lock to base frequency (default)
-ncu --clock-control boost ...   # Lock to boost frequency
+ncu --clock-control base ...    # Lock to base frequency (default before 2026.1)
+ncu --clock-control boost ...   # Lock to boost frequency (default from 2026.1)
+ncu --clock-control none ...    # Leave clocks alone, e.g. when locked with nvidia-smi
 ```
 
-Fixed-frequency profiling produces more reproducible results.
+Fixed-frequency profiling produces more reproducible results. `--pipeline-boost-state stable`
+(the default) also holds the Tensor Core boost state steady across runs.
 
 ### Cache Control
 

@@ -25,9 +25,13 @@ from unittest.mock import patch
 import click
 import pytest
 
+from tensorrt_llm._errors import ERROR_HINTS, ConfigInputError
 from tensorrt_llm.commands import _telemetry
+from tensorrt_llm.logger import logger
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import UsageContext
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_cli(callback=None):
@@ -67,8 +71,7 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._REPORTER_LOCK = threading.Lock()
-    usage_lib._REPORTER_STOP = threading.Event()
-    usage_lib._PENDING_TERMINAL = None
+    usage_lib._HEARTBEAT_STOP = threading.Event()
     usage_lib._PROCESS_PID = os.getpid()
 
     payloads = []
@@ -76,12 +79,66 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     monkeypatch.setattr(usage_lib, "_is_reporting_rank", lambda: True)
     yield payloads
 
-    usage_lib._REPORTER_STOP.set()
+    usage_lib._HEARTBEAT_STOP.set()
     usage_lib._SESSION = None
     usage_lib._SESSION_DISABLED = False
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
-    usage_lib._PENDING_TERMINAL = None
+
+
+@pytest.mark.parametrize(
+    "command", ["throughput", "latency", "prepare-dataset", "visual-gen", "invalid"]
+)
+def test_bench_startup_context_command_scope(captured_exit_payloads, command):
+    from tensorrt_llm.bench.benchmark.low_latency import latency_command
+    from tensorrt_llm.bench.benchmark.throughput import throughput_command
+
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+    cli.add_command(throughput_command)
+    cli.add_command(latency_command)
+    for name in ("prepare-dataset", "visual-gen"):
+        cli.add_command(click.Command(name))
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=[command, "--invalid-option"])
+    assert exc.value.code == 2
+    expected = ["trtllm_exit_report"]
+    if command in ("throughput", "latency"):
+        expected.insert(0, "trtllm_initial_report")
+    assert [event["name"] for event in captured_exit_payloads[0]["events"]] == expected
+    assert collect.called is (command in ("throughput", "latency"))
+
+
+@pytest.mark.parametrize("name", ["throughput", "renamed-benchmark"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("option", ["--invalid-option", "--help", "--no-telemetry"])
+def test_startup_command_metadata(captured_exit_payloads, name, startup, option):
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+
+    @cli.command(name=name, cls=_telemetry.TelemetryCommand, telemetry_llm_startup=startup)
+    @click.option("--telemetry/--no-telemetry", default=True)
+    def command(telemetry):
+        pytest.fail("The command callback must not run before argument validation")
+
+    args = [name, option]
+    if option == "--no-telemetry":
+        args.append("--invalid-option")
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=args)
+    assert exc.value.code == (0 if option == "--help" else 2)
+    events = [event["name"] for payload in captured_exit_payloads for event in payload["events"]]
+    expected = []
+    if option == "--invalid-option":
+        expected = ["trtllm_exit_report"]
+        if startup:
+            expected.insert(0, "trtllm_initial_report")
+    assert events == expected
+    assert collect.called is (startup and option == "--invalid-option")
 
 
 @pytest.fixture
@@ -109,7 +166,7 @@ def _captured_terminal_parameters(payloads):
     """Return the parameters from one fully serialized terminal event."""
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["eventSchemaVer"] == "0.7"
+    assert payload["eventSchemaVer"] == "0.8"
     assert len(payload["events"]) == 1
     event = payload["events"][0]
     assert event["name"] == "trtllm_exit_report"
@@ -271,6 +328,7 @@ class TestTelemetryGroup:
             ],
             check=False,
             env=os.environ.copy(),
+            timeout=60,
         )
         assert child.returncode == 0
 
@@ -400,6 +458,50 @@ class TestSerializedTerminationKinds:
         assert captured_exit_payloads == []
 
     @pytest.mark.parametrize(
+        "assignment",
+        [
+            "telemetry_config.disabled=false",
+            "unknown_config.enabled=true",
+            "max_batch_size=[",
+        ],
+    )
+    @pytest.mark.parametrize("opt_out_source", [None, "cli", "yaml"])
+    def test_serve_opt_out_precedes_invalid_set(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+        assignment,
+        opt_out_source,
+    ):
+        """Invalid overrides emit an error report unless CLI or YAML opts out."""
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        opt_out_args = ["--no-telemetry"] if opt_out_source == "cli" else []
+        if opt_out_source == "yaml":
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text("telemetry_config:\n  disabled: true\n", encoding="utf-8")
+            opt_out_args = ["--config", str(config_path)]
+        with (
+            patch(
+                "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                return_value=False,
+            ),
+            pytest.raises(SystemExit) as raised,
+        ):
+            serve_main(
+                args=["dummy/model", *opt_out_args, "--set", assignment],
+                prog_name="trtllm-serve",
+            )
+
+        assert raised.value.code == 2
+        if opt_out_source is None:
+            params = _captured_terminal_parameters(captured_exit_payloads)
+            assert params["terminationKind"] == "exception"
+            assert params["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
         ("args", "expected"),
         [
             pytest.param(
@@ -477,3 +579,175 @@ class TestSerializedTerminationKinds:
         assert params["signalNumber"] == 9
         assert params["component"] == "engine_worker"
         assert params["reportingSource"] == "supervisor"
+
+
+class TestStartupErrorCategory:
+    """The CLI boundary records the category of startup failures for the exit report."""
+
+    @pytest.fixture(autouse=True)
+    def _no_llm_initialized(self, monkeypatch):
+        # Other tests in the same process may have initialized an LLM.
+        monkeypatch.setattr(_telemetry, "llm_initialized", lambda: False)
+
+    @staticmethod
+    def _run(callback=None, args=("run",)):
+        cli = _make_cli(callback)
+        with pytest.raises((SystemExit, Exception)):
+            cli.main(args=list(args), prog_name="test-cli")
+
+    @staticmethod
+    def _restart_process():
+        usage_lib._HEARTBEAT_STOP.set()
+        usage_lib._SESSION = None
+        usage_lib._SESSION_DISABLED = False
+        usage_lib._HEARTBEAT_STOP = threading.Event()
+
+    def test_click_usage_error_is_config_input(self, captured_exit_payloads):
+        self._run(args=["--invalid-option"])
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["lifecyclePhase"] == "cli_parsing"
+        assert params["errorCategory"] == "config_input"
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (0, "new")
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # serve() rejects --grpc-protocol without --grpc before the model is inspected.
+            ["dummy/model", "--enable_visual_gen", "--grpc-protocol", "openengine"],
+            # Click rejects the port before serve() runs.
+            ["dummy/model", "--enable_visual_gen", "--port", "invalid"],
+            ["serve", "dummy/model", "--visual_gen_args=vg.yaml", "--port", "invalid"],
+        ],
+    )
+    def test_explicit_visual_gen_usage_error_reports_no_startup_fields(
+        self, captured_exit_payloads, isolated_startup_state_dir, args
+    ):
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        with pytest.raises(SystemExit) as exc:
+            serve_main(args=args)
+        assert exc.value.code == 2
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["errorCategory"] == ""
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (0, "")
+        assert not isolated_startup_state_dir.exists()
+
+    @pytest.mark.parametrize(
+        ("error", "category"),
+        [
+            (
+                lambda: ConfigInputError("Configuration file root must be a mapping."),
+                "config_input",
+            ),
+            (lambda: RuntimeError("unrecognized"), "other"),
+        ],
+    )
+    def test_uncaught_startup_exception(self, captured_exit_payloads, error, category):
+        def fail():
+            raise error()
+
+        self._run(fail)
+        assert _captured_terminal_parameters(captured_exit_payloads)["errorCategory"] == category
+
+    @pytest.mark.parametrize("command", ["serve", "disaggregated", "eval", "bench"])
+    def test_missing_config_file_is_config_input(
+        self, tmp_path, monkeypatch, captured_exit_payloads, command
+    ):
+        """A config file that does not exist is invalid input and gets the config hint."""
+        from tensorrt_llm.bench.benchmark.utils.general import get_settings
+        from tensorrt_llm.commands.eval import main as eval_main
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        missing = str(tmp_path / "missing.yaml")
+        run = {
+            "serve": lambda: serve_main(args=["dummy/model", "--config", missing]),
+            "disaggregated": lambda: serve_main(args=["disaggregated", "-c", missing]),
+            "eval": lambda: eval_main(
+                args=["--model", "dummy/model", "--config", missing, "gsm8k"]
+            ),
+            # trtllm-bench reads the file in get_settings, once the dataset is loaded.
+            "bench": lambda: _make_cli(
+                lambda: get_settings({"extra_llm_api_options": missing}, None, "dummy/model", None)
+            ).main(args=["run"]),
+        }[command]
+        # The disaggregated command creates its Prometheus directory before reading the file.
+        monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+        with (
+            patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
+            patch.object(logger, "error") as log_error,
+            pytest.raises(FileNotFoundError),
+        ):
+            run()
+
+        (line,) = [
+            str(call.args[0])
+            for call in log_error.call_args_list
+            if str(call.args[0]).startswith("Command failed")
+        ]
+        assert line.startswith(
+            "Command failed [config_input]: FileNotFoundError: [Errno 2] No such file or directory: "
+        )
+        assert missing in line
+        assert line.endswith(f"Hint: {ERROR_HINTS['config']}")
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["errorCategory"] == "config_input"
+
+    def test_llm_category_takes_precedence(self, captured_exit_payloads):
+        def llm_failed_then_wrapped():
+            usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+            usage_lib.record_llm_initialization_failure("resource")
+            raise RuntimeError("serve failed")
+
+        self._run(llm_failed_then_wrapped)
+        (payload,) = captured_exit_payloads
+        assert payload["events"][-1]["parameters"]["errorCategory"] == "resource"
+
+    def test_failure_after_llm_initialized_resets_the_count(
+        self, captured_exit_payloads, isolated_startup_state_dir
+    ):
+        def fail_after_success():
+            usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+            usage_lib.record_llm_initialized()
+            raise RuntimeError("benchmark failed")
+
+        self._run(fail_after_success)
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["errorCategory"] == ""
+        (state_file,) = isolated_startup_state_dir.iterdir()
+        assert '"streak": 0' in state_file.read_text()
+
+    @pytest.mark.parametrize("suppress_context", [False, True])
+    def test_failing_system_exit_uses_its_cause(self, captured_exit_payloads, suppress_context):
+        def exit_after_error():
+            try:
+                raise ConfigInputError("bad option")
+            except ConfigInputError:
+                if suppress_context:
+                    raise SystemExit(1) from None
+                sys.exit(1)
+
+        self._run(exit_after_error)
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["terminationKind"] == "exception"
+        assert params["errorCategory"] == ("other" if suppress_context else "config_input")
+
+    def test_signal_reports_no_category_and_keeps_the_count(self, captured_exit_payloads):
+        def stopped():
+            raise _telemetry.SignalExit(signal.SIGTERM)
+
+        self._run(stopped)
+        params = _captured_terminal_parameters(captured_exit_payloads)
+        assert params["terminationKind"] == "signal"
+        assert params["errorCategory"] == ""
+
+    def test_restart_loop_counts_failed_starts(self, captured_exit_payloads):
+        def fail():
+            raise ConfigInputError("bad option")
+
+        priors = []
+        for _ in range(4):
+            self._run(fail)
+            priors.append(captured_exit_payloads.pop()["events"][-1]["parameters"])
+            self._restart_process()
+        assert [p["priorStartupFailures"] for p in priors] == [0, 1, 2, 3]
+        assert [p["startupStateStatus"] for p in priors] == ["new"] + ["persisted"] * 3

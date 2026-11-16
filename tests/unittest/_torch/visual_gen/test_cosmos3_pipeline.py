@@ -18,10 +18,6 @@ Run audio only:
 
 Run prompt metadata unit tests (no GPU):
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -k FormatPromptWithMetadata
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -s
 """
 
 import gc
@@ -37,6 +33,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
@@ -58,14 +55,17 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
+    Cosmos3SamplingPolicy,
+    SamplingSchedule,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.media.decoding import video_stream_info
-from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import CompilationConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -86,24 +86,6 @@ def _cleanup_gpu():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
 
 PROMPT = "A serene mountain lake at sunrise with mist rising from the water."
 NUM_STEPS = 4
@@ -128,11 +110,9 @@ COSMOS3_FP8_QUANT_CONFIG = {
 
 
 def _require_checkpoint() -> str:
-    if not COSMOS3_NANO_PATH or not os.path.exists(COSMOS3_NANO_PATH):
-        pytest.skip(f"Checkpoint not found: {COSMOS3_NANO_PATH}")
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    return COSMOS3_NANO_PATH
+    return get_checkpoint("Cosmos3-Nano")
 
 
 def _load_pipeline(checkpoint_path: str, **visual_gen_kwargs):
@@ -232,14 +212,14 @@ def _assert_valid_audio(
 
 def _require_audio_pipeline(pipeline) -> None:
     if not getattr(pipeline, "audio_gen", False):
-        pytest.skip("Checkpoint does not enable audio generation")
+        pytest.fail("Checkpoint does not enable audio generation")
     if not hasattr(pipeline, "audio_tokenizer"):
-        pytest.skip("Audio tokenizer was not loaded for this pipeline")
+        pytest.fail("Audio tokenizer was not loaded for this pipeline")
 
 
 def _require_action_pipeline(pipeline) -> None:
     if not getattr(pipeline, "action_gen", False):
-        pytest.skip("Checkpoint does not enable action generation")
+        pytest.fail("Checkpoint does not enable action generation")
 
 
 def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_size: int):
@@ -352,7 +332,7 @@ class TestFormatPromptWithMetadataPlainText:
             duration_template=None,
             resolution_template=None,
         )
-        assert result == "Plain prompt."
+        assert result == "Plain prompt"
 
     def test_empty_prompt_with_templates(self, cosmos3_format_pipeline):
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, "")
@@ -433,6 +413,27 @@ class TestTokenizePrompt:
 
 
 class TestFormatPromptWithMetadataJson:
+    def test_templates_disabled_preserves_structured_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        """Disabling templates makes a structured prompt an exact pass-through."""
+        prompt = (
+            ' \n{"aspect_ratio":"16,9", "actions": ['
+            '{"description":"A full backflip","time":"0:03-0:05"}],'
+            ' "duration":"7s", "fps":24, "resolution":{"W":1280,"H":720}} \n'
+        )
+
+        result = _format_prompt_with_metadata(
+            cosmos3_format_pipeline,
+            prompt,
+            duration_template=None,
+            resolution_template=None,
+        )
+
+        assert result == prompt
+        assert json.loads(result)["duration"] == "7s"
+        assert json.loads(result)["fps"] == 24
+
     def test_injects_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "A foundry pour", "subjects": []})
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
@@ -447,7 +448,7 @@ class TestFormatPromptWithMetadataJson:
         assert data["aspect_ratio"] == "16,9"
         assert '"resolution": {"H": 720, "W": 1280}' in result
 
-    def test_overwrites_existing_metadata_fields(self, cosmos3_format_pipeline):
+    def test_preserves_existing_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps(
             {
                 "prompt": "test",
@@ -457,10 +458,22 @@ class TestFormatPromptWithMetadataJson:
                 "aspect_ratio": "3,4",
             }
         )
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
+        assert result == prompt
+        assert json.loads(result) == json.loads(prompt)
+
+    def test_fills_only_missing_metadata_fields(self, cosmos3_format_pipeline):
+        prompt = json.dumps(
+            {
+                "prompt": "test",
+                "duration": "5s",
+                "resolution": {"W": 640, "H": 480},
+            }
+        )
         data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, prompt))
-        assert data["duration"] == "7s"
+        assert data["duration"] == "5s"
         assert data["fps"] == 24.0
-        assert data["resolution"] == {"H": 720, "W": 1280}
+        assert data["resolution"] == {"W": 640, "H": 480}
         assert data["aspect_ratio"] == "16,9"
 
     def test_single_frame_skips_duration_by_default(self, cosmos3_format_pipeline):
@@ -488,8 +501,7 @@ class TestFormatPromptWithMetadataJson:
         )
         assert data["duration"] == "0s"
 
-    def test_still_drops_stale_duration_and_fps(self, cosmos3_format_pipeline):
-        """A caller's JSON may already declare a duration; a still must not keep it."""
+    def test_single_frame_preserves_user_duration_and_fps(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "still life", "duration": "7s", "fps": 24.0})
         data = json.loads(
             _format_prompt_with_metadata(
@@ -499,8 +511,9 @@ class TestFormatPromptWithMetadataJson:
                 resolution_template=COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
             )
         )
-        assert "duration" not in data
-        assert "fps" not in data
+        assert data["duration"] == "7s"
+        assert data["fps"] == 24.0
+        assert data["resolution"] == {"W": 1280, "H": 720}
 
     def test_non_ascii_is_escaped(self, cosmos3_format_pipeline):
         """The reference serializes with the json default (``ensure_ascii=True``)."""
@@ -568,7 +581,14 @@ class TestNegativePromptMetadata:
 
     NEGATIVE = json.dumps({"subjects": [{"description": "Blurry, poorly defined subjects."}]})
 
-    def _negative(self, pipeline, **kwargs):
+    def _negative(
+        self,
+        pipeline,
+        *,
+        duration_template=COSMOS3_DURATION_TEMPLATE,
+        resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        **kwargs,
+    ):
         """Format a negative prompt the way ``forward`` does."""
         return pipeline._apply_metadata_templates(
             self.NEGATIVE,
@@ -576,10 +596,20 @@ class TestNegativePromptMetadata:
             width=WIDTH,
             num_frames=189,
             frame_rate=FRAME_RATE,
-            duration_template=COSMOS3_DURATION_TEMPLATE,
-            resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+            duration_template=duration_template,
+            resolution_template=resolution_template,
             **kwargs,
         )
+
+    def test_templates_disabled_preserves_negative_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        result = self._negative(
+            cosmos3_format_pipeline,
+            duration_template=None,
+            resolution_template=None,
+        )
+        assert result == self.NEGATIVE
 
     def test_json_negative_keeps_object_and_appends_sentences(self, cosmos3_format_pipeline):
         result = self._negative(cosmos3_format_pipeline)
@@ -896,6 +926,8 @@ class TestCosmos3V2V:
             """
 
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -904,7 +936,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((target, use_karras_sigmas))
                 return scheduler
 
@@ -958,6 +991,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -966,7 +1001,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1022,6 +1058,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1030,7 +1068,7 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
                 return scheduler
 
         def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
@@ -1061,9 +1099,9 @@ class TestCosmos3V2V:
         assert token_calls[0] is False
 
     def test_action_restores_the_checkpoint_flow_shift(self):
-        """set_flow_shift is a no-op when both knobs are None, and the pipeline
-        instance outlives the request. An action request that followed a V2V one
-        would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
+        """The pipeline instance outlives the request, so an action request that
+        follows a V2V one must rebuild its schedulers for the checkpoint's Karras
+        grid and shift rather than keep V2V's uniform sigmas."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
@@ -1080,6 +1118,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = {"use_karras_sigmas": True, "use_flow_sigmas": True}
             checkpoint_flow_shift = 7.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1088,7 +1128,8 @@ class TestCosmos3V2V:
             def generation_default_overrides(self):
                 return {}
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1118,11 +1159,11 @@ class TestCosmos3V2V:
                 action_chunk_size=NUM_FRAMES - 1,
             )
 
-        assert calls == [("video", 7.0, None), ("action", 7.0, None)]
+        assert calls == [("video", 7.0, True), ("action", 7.0, True)]
 
     def test_scheduler_for_serves_every_stream(self):
         """Video, audio and action denoise in lockstep, so one resolved
-        (shift, karras) configuration must yield a scheduler per stream --
+        schedule must yield a scheduler per stream --
         separate instances (schedulers mutate state on every .step()) built
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
@@ -1132,7 +1173,8 @@ class TestCosmos3V2V:
         class FakeSampling:
             checkpoint_flow_shift = 1.0
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1142,7 +1184,9 @@ class TestCosmos3V2V:
         pipeline.action_scheduler = SimpleNamespace(name="action")
 
         for stream in ("video", "audio", "action"):
-            pipeline._scheduler_for(10.0, False, stream=stream)
+            pipeline._scheduler_for(
+                SamplingSchedule(grid="diffusers", flow_shift=10.0), stream=stream
+            )
 
         assert rebuilt == [
             ("video", 10.0, False),
@@ -1187,6 +1231,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1242,6 +1288,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1694,3 +1742,88 @@ class TestErrorClassificationIsOptIn:
         # Unclassified stays unclassified: an internal fault is not the
         # caller's fault.
         assert pipeline.classify_request_failure(RuntimeError("internal")) is None
+
+
+class TestStepPrecisionSelection:
+    """The pipeline hands every step to the transformer's step selection."""
+
+    @staticmethod
+    def _pipeline(transformer):
+        pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = transformer
+        pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(5))
+        return pipeline
+
+    def test_request_selects_every_step_against_the_full_schedule(self):
+        calls = []
+        transformer = SimpleNamespace(
+            set_denoising_step=lambda step_index, num_steps: calls.append((step_index, num_steps))
+        )
+        pipeline = self._pipeline(transformer)
+        for step in range(5):
+            pipeline._select_step_precision(step)
+        assert calls == [(step, 5) for step in range(5)]
+
+    def test_transformer_without_a_policy_is_left_alone(self):
+        self._pipeline(SimpleNamespace())._select_step_precision(0)
+
+
+def _framework_native_timesteps(num_steps: int, flow_shift: float) -> list[int]:
+    """Integer timesteps of the Cosmos framework's shifted-linear flow grid."""
+    import numpy as np
+
+    base = np.linspace(float(np.float32(1.0 - 1.0 / 1000)), 0.0, num_steps + 1)[:-1]
+    shifted = flow_shift * base / (1.0 + (flow_shift - 1.0) * base)
+    return torch.from_numpy(shifted * 1000).to(torch.int64).tolist()
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_t2v
+@pytest.mark.high_cuda_memory
+class TestCosmos3SigmaGrid:
+    """Per-request sigma grid selection on a warmed-up pipeline."""
+
+    @pytest.mark.parametrize("compile_enabled", [False, True], ids=["eager", "compile"])
+    def test_karras_native_karras_requests(self, compile_enabled: bool) -> None:
+        """Warm up on the checkpoint's Karras grid, serve a native-grid request,
+        then return to Karras. Each request samples its own grid, and the
+        repeated Karras request reproduces the first exactly (no settings or
+        solver state carried over)."""
+        checkpoint = _require_checkpoint()
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
+            args = VisualGenArgs(
+                model=checkpoint,
+                torch_compile_config=TorchCompileConfig(enable=compile_enabled),
+                compilation_config=CompilationConfig(
+                    resolutions=[(HEIGHT, WIDTH)], num_frames=[NUM_FRAMES]
+                ),
+            )
+            pipeline = PipelineLoader(args).load(skip_warmup=False)
+            try:
+                reference = type(pipeline.scheduler).from_config(
+                    pipeline.sampling.unipc_base_config
+                )
+                reference.set_timesteps(NUM_STEPS, device="cpu")
+                karras_timesteps = reference.timesteps.tolist()
+
+                first = _run_forward(pipeline, num_frames=NUM_FRAMES)
+                first_timesteps = pipeline.scheduler.timesteps.tolist()
+                native = _run_forward(
+                    pipeline, num_frames=NUM_FRAMES, sigma_grid="native", flow_shift=10.0
+                )
+                native_timesteps = pipeline.scheduler.timesteps.tolist()
+                again = _run_forward(pipeline, num_frames=NUM_FRAMES)
+                again_timesteps = pipeline.scheduler.timesteps.tolist()
+
+                assert first_timesteps == karras_timesteps
+                assert native_timesteps == _framework_native_timesteps(NUM_STEPS, 10.0)
+                assert again_timesteps == karras_timesteps
+                _assert_valid_video(native.video, num_frames=NUM_FRAMES)
+                assert not torch.equal(first.video, native.video)
+                assert torch.equal(first.video, again.video)
+                assert pipeline.sampling.unipc_base_config["use_karras_sigmas"] is True
+            finally:
+                del pipeline
+                gc.collect()
+                torch.cuda.empty_cache()

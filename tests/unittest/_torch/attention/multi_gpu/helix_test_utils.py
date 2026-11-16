@@ -14,7 +14,10 @@
 # limitations under the License.
 """Shared utilities for Helix context-parallelism unit tests (MHA & MLA)."""
 
+import sys
 import traceback
+from functools import partial
+from types import SimpleNamespace
 
 import torch
 from mpi4py.futures import MPIPoolExecutor
@@ -22,12 +25,12 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 # Convenient aliases for the two KV-cache types used by MHA and MLA tests.
 CACHE_TYPE_SELF = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
@@ -37,6 +40,21 @@ CACHE_TYPE_SELFKONLY = tensorrt_llm.bindings.internal.batch_manager.CacheType.SE
 # ---------------------------------------------------------------------------
 # Weight helpers
 # ---------------------------------------------------------------------------
+
+
+def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
+    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    module = SimpleNamespace(
+        num_heads_tp=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        helix_v_b_proj_full=v_full,
+        use_cute_dsl_bf16_bmm=False,
+    )
+    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
+    return module
 
 
 def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
@@ -156,7 +174,7 @@ def setup_kv_and_metadata(
     num_kv_heads: int,
     head_dim: int,
 ):
-    """Create a :class:`KVCacheManager` and context-phase attention metadata.
+    """Create a :class:`KVCacheManagerV2` and context-phase attention metadata.
 
     The caller supplies the KV-cache geometry that differs between MHA and MLA:
     *cache_type*, *num_kv_heads*, and *head_dim*.  Everything else is read from
@@ -174,36 +192,32 @@ def setup_kv_and_metadata(
         * scenario.kv_cache_tokens_per_block
         * scenario.batch
     )
-    kv_cache_manager = KVCacheManager(
+    # HELIX's V2 ledger measures global tokens; the kernels below consume
+    # rank-local lengths and need one generation slot on every rank.
+    cache_token_scale = mapping.cp_size if mapping.has_cp_helix() else 1
+    cache_seq_len = (ctx_len_per_gpu + 1) * cache_token_scale
+    kv_cache_manager = KVCacheManagerV2(
         KvCacheConfig(
-            max_tokens=max_tokens,
+            max_tokens=max_tokens * cache_token_scale,
             enable_block_reuse=False,
+            host_cache_size=0,
         ),
         cache_type,
         num_layers=scenario.num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         tokens_per_block=scenario.kv_cache_tokens_per_block,
-        max_seq_len=ctx_len_per_gpu + 1,
+        max_seq_len=cache_seq_len,
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
     )
-    requests = []
-    request_infos = []
-    for req_id in range(scenario.batch):
-        req = LlmRequest(
-            request_id=req_id,
-            max_new_tokens=1,
-            input_tokens=[1] * ctx_len_per_gpu,
-            sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-            is_streaming=False,
-        )
-        req.is_dummy_request = True
-        req.paged_kv_block_ids = []
-        requests.append(req)
-        request_infos.append((req_id, ctx_len_per_gpu, 1))
-    kv_cache_manager.impl.add_sequence_batch(request_infos, requests)
+    # The attention test bypasses scheduling and uses rank-local dummy caches.
+    # Reserve the context plus the generation token written by this test.
+    requests = kv_cache_manager.add_dummy_requests(
+        list(range(scenario.batch)), [cache_seq_len] * scenario.batch
+    )
+    assert requests is not None
     for req in requests:
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
@@ -297,6 +311,17 @@ def run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
+def run_in_nccl_window_tensor_scope(rank, func, *args, **kwargs):
+    """Call ``func(rank, ...)`` inside an NCCL window-tensor scope.
+
+    The NCCL collectives may return NCCL-window tensors, whose leases must end in
+    a tensor scope (the model engine opens one around every forward). The scope
+    only becomes active with a CUDA tensor among its inputs.
+    """
+    with discard_nccl_window_tensor_outputs(torch.empty(1, device="cuda")):
+        return func(rank, *args, **kwargs)
+
+
 def parse_comms_medium(comms_medium: str):
     """Return ``(use_nccl_for_alltoall, fifo_version)`` for *comms_medium*."""
     if comms_medium == "nccl":
@@ -319,12 +344,14 @@ def run_helix_test(
     """Parse *comms_medium*, launch MPI workers, and assert mismatch ratio."""
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     print(f"Testing with comms_medium={comms_medium}.")
-    with MPIPoolExecutor(max_workers=world_size) as executor:
+    # Workers import the shared test helpers through the same paths as pytest.
+    with MPIPoolExecutor(max_workers=world_size, path=sys.path) as executor:
         results = executor.map(
             run_single_rank,
             *zip(
                 *[
                     (
+                        run_in_nccl_window_tensor_scope,
                         full_test_func,
                         world_size,
                         scenario,

@@ -1,18 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import subprocess
-from contextlib import asynccontextmanager
+import sys
+import tempfile
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
 import claude_agent_sdk
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    PermissionResultAllow,
+    SdkMcpTool,
+    ToolAnnotations,
     create_sdk_mcp_server,
 )
 from claude_agent_sdk.types import (
@@ -28,6 +37,7 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 
+from ..tools import normalize_tool, tool_result_to_claude
 from ..types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -141,7 +151,15 @@ def _session_init_event_from_data(data: dict[str, Any]) -> SessionInitEvent:
     plugins = [
         p["name"] for p in plugins_raw if isinstance(p, dict) and isinstance(p.get("name"), str)
     ]
-    return SessionInitEvent(skills=skills, plugins=plugins, agents=agents)
+    return SessionInitEvent(
+        skills=skills,
+        plugins=plugins,
+        agents=agents,
+        backend="claude-code",
+        model=data.get("model"),
+        reasoning_effort=data.get("effort"),
+        session_id=data.get("session_id"),
+    )
 
 
 def _compact_boundary_event_from_data(data: dict[str, Any]) -> CompactBoundaryEvent:
@@ -298,6 +316,7 @@ class ClaudeCodeClient(BackendClient):
                         is_error=bool(sdk_message.is_error),
                         errors=list(sdk_message.errors or []),
                         permission_denials=list(sdk_message.permission_denials or []),
+                        session_id=sdk_message.session_id,
                     )
         except Exception:
             if not got_result:
@@ -364,13 +383,76 @@ def _claude_sdk_version() -> str:
         return ""
 
 
-def _find_claude_cli() -> str | None:
-    """Locate the ``claude`` CLI binary the SDK would actually launch.
+#: A ``claude`` binary every layer launches instead of the SDK's own choice.
+CLI_PATH_ENV = "AGENT_FLOW_CLAUDE_CLI"
 
-    Mirrors the SDK's lookup order — bundled binary first, then ``PATH``.
-    Returns ``None`` when nothing is found so the caller can simply omit
-    the CLI version from the rendered string.
+
+def _cli_override() -> str | None:
+    """Explicit CLI selection only; otherwise leave runtime resolution to the SDK."""
+    return os.environ.get(CLI_PATH_ENV, "").strip() or None
+
+
+def launched_cli() -> tuple[str, str]:
+    """The ``claude`` binary a layer launches here, and its version; ``""`` for what is unknown."""
+    return _find_claude_cli() or "", _claude_cli_version()
+
+
+#: Given each line a CLI started in this context writes to stderr; see :func:`cli_stderr_to`.
+_CLI_STDERR_LISTENER: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "claude_cli_stderr_listener", default=None
+)
+
+
+@contextmanager
+def cli_stderr_to(listener: Callable[[str], None]) -> Iterator[None]:
+    """Hand ``listener`` every stderr line of a CLI started inside the block, too.
+
+    The lines still reach this process's stderr, and a listener set by an
+    enclosing block still gets them. A layer called in the block's thread
+    starts its CLI in the block's context, so the lines of one turn reach the
+    listener of that turn and of no other running beside it. A listener that
+    raises does not stop the CLI's stderr from being read.
     """
+    outer = _CLI_STDERR_LISTENER.get()
+
+    def both(line: str) -> None:
+        if outer is not None:
+            _tell(outer, line)
+        _tell(listener, line)
+
+    token = _CLI_STDERR_LISTENER.set(both)
+    try:
+        yield
+    finally:
+        _CLI_STDERR_LISTENER.reset(token)
+
+
+def _tell(listener: Callable[[str], None], line: str) -> None:
+    try:
+        listener(line)
+    except Exception:  # noqa: BLE001 - an observer cannot fail the CLI it reads
+        pass
+
+
+def _forward_stderr(line: str) -> None:
+    """Print a CLI stderr line, so a start-up failure is diagnosable, and pass it to the listener."""
+    print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True)
+    listener = _CLI_STDERR_LISTENER.get()
+    if listener is not None:
+        _tell(listener, line)
+
+
+def _find_claude_cli() -> str | None:
+    """Locate the ``claude`` CLI binary the SDK will actually launch.
+
+    The override (:func:`_cli_override`) first, then the SDK's own lookup
+    order — bundled binary first, then ``PATH``. Returns ``None`` when
+    nothing is found so the caller can simply omit the CLI version from
+    the rendered string.
+    """
+    override = _cli_override()
+    if override:
+        return override
     bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
     if bundled.is_file():
         return str(bundled)
@@ -420,12 +502,110 @@ def _claude_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 
+def _sdk_tools(tools: list) -> list[SdkMcpTool]:
+    """Translate framework or legacy tool definitions at the SDK boundary."""
+    result = []
+    for original in tools:
+        definition = normalize_tool(original)
+
+        async def handler(arguments, definition=definition):
+            return tool_result_to_claude(await definition.handler(arguments))
+
+        result.append(
+            SdkMcpTool(
+                name=definition.name,
+                description=definition.description,
+                input_schema=definition.input_schema,
+                handler=handler,
+                annotations=ToolAnnotations(**definition.annotations)
+                if definition.annotations
+                else None,
+            )
+        )
+    return result
+
+
+# The Agent SDK passes the system prompt to the ``claude`` binary as a single
+# argv string, and Linux caps one argv string at 128 KiB (MAX_ARG_STRLEN), so
+# a long prompt kills the CLI at exec with ``[Errno 7] Argument list too
+# long``. Above the threshold the full prompt is written to a file under the
+# working directory and the argv prompt becomes a short pointer telling the
+# model to read it first. The pointer is deliberately plain: no SDK feature
+# is involved.
+_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD = 64 * 1024
+
+
+def _system_prompt_file_threshold() -> int:
+    raw = os.environ.get("AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD")
+    if raw is None:
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[agent-flow] ignoring invalid AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD={raw!r}; "
+            f"falling back to {_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+
+
+SYSTEM_PROMPT_FILE_THRESHOLD = _system_prompt_file_threshold()
+
+
+def spill_system_prompt(system_prompt: str, cwd: Path, threshold: int | None = None) -> str:
+    """Return the prompt to pass on argv; spill the full text to a file if large.
+
+    Files are content-addressed (``.agent-flow/system-prompt-<sha12>.md``) so
+    every role/session with the same prompt shares one file and a changed
+    prompt never overwrites a file a live session may still be reading.
+    """
+    limit = SYSTEM_PROMPT_FILE_THRESHOLD if threshold is None else threshold
+    data = system_prompt.encode("utf-8")
+    if len(data) <= limit:
+        return system_prompt
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    target_dir = Path(cwd) / ".agent-flow"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"system-prompt-{digest}.md"
+    if not target.exists():
+        # Use a unique temp file per writer so concurrent sessions spilling
+        # the same prompt can't truncate or unlink each other's in-progress
+        # file before os.replace runs.
+        fd, tmp_name = tempfile.mkstemp(dir=target_dir, prefix=target.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_name, target)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    kb = (len(data) + 1023) // 1024
+    return (
+        "Your full system instructions could not be passed inline and were written to "
+        f"this file: {target}\n\n"
+        f"Before doing anything else, read that file IN FULL with the Read tool ({kb} KB; "
+        "if a single read stops short of the end, continue with offset until you have read "
+        "the last line) and follow it as your system prompt for the whole session. "
+        "Everything it says applies unchanged; the human's task and all rules are in it."
+    )
+
+
 class ClaudeCodeBackend(Backend):
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
+
     def version(self) -> str:
         return _claude_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     @asynccontextmanager
     async def create_client(
@@ -437,6 +617,7 @@ class ClaudeCodeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
         # External MCP server configs (e.g. ``{"knowledge-base": {"type":
         # "http", "url": ...}}``) are layered alongside the in-process
@@ -453,11 +634,11 @@ class ClaudeCodeBackend(Backend):
         if tools:
             mcp_servers["agent-tools"] = create_sdk_mcp_server(
                 name="agent-tools",
-                tools=tools,
+                tools=_sdk_tools(tools),
             )
 
-        async def _approve_tool(tool_name, tool_input, context):
-            return PermissionResultAllow()
+        work_dir = cwd or Path.cwd()
+        system_prompt = spill_system_prompt(system_prompt, work_dir)
 
         options = ClaudeAgentOptions(
             tools=ToolsPreset(type="preset", preset="claude_code"),
@@ -468,13 +649,21 @@ class ClaudeCodeBackend(Backend):
             ),
             mcp_servers=mcp_servers,
             model=model,
-            effort=_REASONING_EFFORT,
-            cwd=cwd or Path.cwd(),
-            sandbox={"enabled": False},
-            permission_mode="bypassPermissions",
-            can_use_tool=_approve_tool,
+            effort=self._reasoning_effort,
+            cwd=work_dir,
+            cli_path=_cli_override(),
             hooks=hooks,
-            disallowed_tools=list(disallowed_tools or []),
+            disallowed_tools=[
+                *(disallowed_tools or []),
+                *(f"Skill({name})" for name in self._disabled_skills),
+            ],
+            # Forward the CLI's stderr so startup failures are diagnosable
+            # instead of vanishing with the subprocess.
+            stderr=_forward_stderr,
+            # A fork may run in another cwd than the session it copies: the
+            # CLI finds that session by id and writes the fork under its own cwd.
+            resume=fork_from,
+            fork_session=fork_from is not None,
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:

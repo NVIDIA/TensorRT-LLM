@@ -17,6 +17,7 @@
 import os
 from contextlib import contextmanager
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
@@ -30,10 +31,6 @@ class MoEDep(str, Enum):
     #: ``import flashinfer`` succeeds. Gates the SM120/SM121 NVFP4 decode
     #: backend (``CuteDslB12xFusedMoE``).
     FLASHINFER = "flashinfer"
-    #: FlashInfer additionally exposes ``trtllm_bf16_moe`` /
-    #: ``trtllm_bf16_routed_moe``. Strictly stronger than :attr:`FLASHINFER`
-    #: and gates the TRTLLM-Gen unquantized BF16 path.
-    FLASHINFER_BF16_MOE = "flashinfer_bf16_moe"
     #: The bundled DeepGEMM build exposes the ``fp8_fp4_mega_moe`` kernel.
     DEEPGEMM_MEGAMOE = "deepgemm_megamoe"
     #: ``nvidia-cutlass-dsl[cu13]`` is new enough for the MegaMoE CuteDSL ABI.
@@ -51,9 +48,11 @@ class MoEDep(str, Enum):
 class MoEEnvFlag(str, Enum):
     """Environment variables that MoE selection is allowed to read."""
 
-    #: Opt-in to the FlashInfer provider for quantized TRTLLM-Gen. Changes the
-    #: routing split, which is why load-balancer eligibility depends on it.
-    TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
+    #: Opt-in to folding the shared experts into the routed grouped GEMM.
+    #: Collected rather than read from ``os.environ`` because it changes how
+    #: many expert slots the GEMM builds: two ranks disagreeing on it would
+    #: otherwise share a fingerprint while building differently shaped layers.
+    SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
 
 
 # Probe details are logged but excluded from the stable fingerprint.
@@ -65,21 +64,6 @@ def _probe_flashinfer() -> Tuple[bool, str]:
         import flashinfer  # noqa: F401
     except Exception as exc:  # noqa: BLE001 - any import failure means absent
         return False, f"import flashinfer failed: {exc}"
-    return True, ""
-
-
-def _probe_flashinfer_bf16_moe() -> Tuple[bool, str]:
-    try:
-        from flashinfer.fused_moe import core as _core
-    except Exception as exc:  # noqa: BLE001 - any import failure means absent
-        return False, f"import flashinfer.fused_moe.core failed: {exc}"
-    missing = [
-        symbol
-        for symbol in ("trtllm_bf16_moe", "trtllm_bf16_routed_moe")
-        if not hasattr(_core, symbol)
-    ]
-    if missing:
-        return False, f"flashinfer.fused_moe.core lacks {', '.join(missing)}"
     return True, ""
 
 
@@ -127,7 +111,6 @@ def _probe_megamoe_cutedsl_op() -> Tuple[bool, str]:
 
 _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.FLASHINFER: _probe_flashinfer,
-    MoEDep.FLASHINFER_BF16_MOE: _probe_flashinfer_bf16_moe,
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
@@ -137,11 +120,24 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
-    MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
+    MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
 }
+
+#: Removed in 1.4 (TRTLLM-17328); kept only to warn deployments that still
+#: export it, since setting it no longer changes which TRTLLM-Gen leaf runs.
+_REMOVED_TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
 
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None
 _OVERRIDE_ENVIRONMENT: Optional[MoEEnvironment] = None
+
+
+def _warn_on_removed_env_flags() -> None:
+    if _REMOVED_TRTLLM_GEN_USE_FLASHINFER in os.environ:
+        logger.warning_once(
+            f"{_REMOVED_TRTLLM_GEN_USE_FLASHINFER} was removed and has no effect: "
+            "TRTLLM-Gen MoE always runs the native TRT-LLM kernels.",
+            key=f"removed_env_{_REMOVED_TRTLLM_GEN_USE_FLASHINFER}",
+        )
 
 
 def _run_probe(dep: MoEDep, probe: DepProbe) -> bool:
@@ -156,6 +152,19 @@ def _run_probe(dep: MoEDep, probe: DepProbe) -> bool:
     return available
 
 
+@lru_cache(maxsize=1)
+def _is_oss_cutlass_moe() -> bool:
+    """Query the native build mode, preserving the default for older libraries."""
+    import torch
+
+    try:
+        query = torch.ops.trtllm.is_oss_cutlass_moe
+    except AttributeError:
+        logger.debug("CUTLASS MoE build-mode query is unavailable; assuming OSS kernels")
+        return True
+    return bool(query())
+
+
 def collect_moe_environment(force: bool = False) -> MoEEnvironment:
     """Collect and cache the frozen MoE selection environment."""
     global _CACHED_ENVIRONMENT
@@ -166,6 +175,7 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
 
     from tensorrt_llm._utils import get_sm_version
 
+    _warn_on_removed_env_flags()
     available = tuple(
         sorted(dep.value for dep, probe in _DEP_PROBES.items() if _run_probe(dep, probe))
     )
@@ -175,7 +185,14 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
             for flag, default in _ENV_FLAG_DEFAULTS.items()
         )
     )
-    environment = MoEEnvironment(sm=get_sm_version(), available_deps=available, env_flags=env_flags)
+    if force:
+        _is_oss_cutlass_moe.cache_clear()
+    environment = MoEEnvironment(
+        sm=get_sm_version(),
+        available_deps=available,
+        env_flags=env_flags,
+        oss_cutlass_moe=_is_oss_cutlass_moe(),
+    )
     logger.debug(
         f"collected MoE environment: sm={environment.sm} deps={available} "
         f"flags={env_flags} ({environment.fingerprint()})"
@@ -188,6 +205,7 @@ def reset_moe_environment_cache() -> None:
     """Drop the cached probe result. For tests that change probe outcomes."""
     global _CACHED_ENVIRONMENT
     _CACHED_ENVIRONMENT = None
+    _is_oss_cutlass_moe.cache_clear()
 
 
 @contextmanager

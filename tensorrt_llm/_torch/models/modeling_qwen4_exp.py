@@ -15,7 +15,7 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -42,16 +42,17 @@ from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.qwen4_exp.cache_manager import get_qwen4_exp_ple_layer_mask
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_exp_ple_layer_mask
+from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules, _normalize_qwen35_quant_config_dict
-from .modeling_qwen3_next import Qwen3NextSparseMoeBlock
+from .modeling_qwen3_next import Qwen3NextSparseMoeBlock, _DeferredSharedExpertFinalize
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
     Qwen3VisionModelBase,
@@ -65,6 +66,9 @@ from .modeling_utils import (
     register_vision_encoder,
     remove_weights,
 )
+
+_PendingBlockOutput = torch.Tensor | _DeferredSharedExpertFinalize
+_PendingCombine = tuple[_PendingBlockOutput, HCResidual]
 
 
 def _qwen4_exp_tp_output_reduction_enabled(mapping) -> bool:
@@ -288,10 +292,10 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         ple_state: Optional[tuple] = None,
         spec_metadata=None,
         lora_params: Optional[dict] = None,
-        pending_combine: Optional[Tuple[torch.Tensor, HCResidual]] = None,
+        pending_combine: Optional[_PendingCombine] = None,
         defer_combine: bool = False,
         **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, HCResidual]]]:
+    ) -> tuple[Optional[torch.Tensor], Optional[_PendingCombine]]:
         """Run one decoder layer, returning ``(bundle, pending_combine)``.
 
         ``pending_combine`` carries a preceding layer's MoE output and residual
@@ -305,9 +309,21 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             # The preceding layer's MoE combine and this layer's grouped norm
             # form one exact fusion boundary, the same one combine_and_mix
             # already exploits between attention and MLP.
-            hidden_states, mixed, residual = self.attn_hyper_connection.combine_and_mix(
-                *pending_combine
-            )
+            block_output, previous_residual = pending_combine
+            if isinstance(block_output, _DeferredSharedExpertFinalize):
+                hidden_states, mixed, residual = (
+                    self.attn_hyper_connection.combine_deferred_moe_and_mix(
+                        block_output.routed_output,
+                        block_output.shared_output,
+                        block_output.shared_gate_logits,
+                        previous_residual,
+                    )
+                )
+            else:
+                hidden_states, mixed, residual = self.attn_hyper_connection.combine_and_mix(
+                    block_output,
+                    previous_residual,
+                )
         else:
             # Expand a token embedding into the configured Hyper-Connection
             # residual streams. Later layers already receive the widened bundle.
@@ -361,6 +377,11 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=self.enable_tp_output_reduction),
             lora_params=lora_params,
+            # The next layer's attn_hyper_connection consumes these operands;
+            # it re-checks eligibility and falls back on its own.
+            defer_shared_expert_finalize=(
+                defer_combine and self.mlp_hyper_connection.can_fuse_deferred_moe(mixed)
+            ),
         )
         if defer_combine:
             return None, (moe_out, residual)
@@ -371,9 +392,9 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        pending_combine: Optional[Tuple[torch.Tensor, HCResidual]] = None,
+        pending_combine: Optional[_PendingCombine] = None,
         **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, HCResidual]]]:
+    ) -> tuple[Optional[torch.Tensor], Optional[_PendingCombine]]:
         """Pipeline-parallel no-op, in this layer's two-value return contract."""
         return hidden_states, pending_combine
 
@@ -473,7 +494,7 @@ class Qwen4ExpModel(DecoderModel):
         # allocated to the cache slot count and carried in place across the
         # prefill->decode boundary, mirroring the GDN conv/ssm per-slot pools and
         # indexed by the SAME mamba ``state_indices`` (see ``_prepare_ple_state``).
-        # Shapes match ``config_utils.extract_qwen4_exp_ple_cache_params``
+        # Shapes match the model-owned ``extract_qwen4_exp_ple_cache_params``.
         # (conv_state_shape / ngram_context_len).
         self._ple_conv_state: Optional[torch.Tensor] = None
         self._ple_ngram_context: Optional[torch.Tensor] = None
@@ -891,16 +912,21 @@ class Qwen4ExpLogitsProcessor(nn.Module):
         lm_head: nn.Module,
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
+        *,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
         if not self.model_config.mapping.is_last_pp_rank():
-            return lm_head(hidden_states).float()
+            logits = lm_head(hidden_states)
+            return logits if keep_lm_head_dtype else logits.float()
         if not return_context_logits:
             if attn_metadata is not None:
                 last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
                 hidden_states = hidden_states[last_tokens]
             else:
                 hidden_states = hidden_states[-1]
-        return lm_head(self._collapse(hidden_states)).float()
+        logits = lm_head(self._collapse(hidden_states))
+        return logits if keep_lm_head_dtype else logits.float()
 
 
 class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):
@@ -1229,6 +1255,8 @@ _QWEN4_EXP_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     """Composite model using the production Qwen3-VL vision stack."""
+
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
 

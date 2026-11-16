@@ -45,7 +45,6 @@
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
-#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"

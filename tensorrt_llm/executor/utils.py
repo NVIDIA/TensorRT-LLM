@@ -42,9 +42,6 @@ class LlmLauncherEnvs(StrEnum):
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
     TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
 
-    # Whether to use periodical responses handler in await_responses
-    TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
-
 
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -136,6 +133,40 @@ def has_event_loop() -> bool:
 
 class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
+
+
+# Machine-readable error code the OpenAI-compatible server attaches to
+# over-length-prompt rejections (mirrors OpenAI's "context_length_exceeded").
+CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
+
+
+def context_length_exceeded_message(max_context_length: int,
+                                    num_prompt_tokens: int) -> str:
+    """Client-facing message for a prompt that exceeds the model context.
+
+    Mirrors OpenAI's wording so agent frameworks that pattern-match it (to
+    trigger context compaction) work unchanged. Keep in sync with
+    ``is_context_length_exceeded_message``.
+    """
+    return (
+        f"This model's maximum context length is {max_context_length} tokens. "
+        f"However, your messages resulted in {num_prompt_tokens} tokens. "
+        "Please reduce the length of the messages.")
+
+
+_CONTEXT_LENGTH_EXCEEDED_RE = re.compile(
+    r"This model's maximum context length is \d+ tokens\. "
+    r"However, your messages resulted in \d+ tokens\.")
+
+
+def is_context_length_exceeded_message(message: str) -> bool:
+    """True if ``message`` contains a ``context_length_exceeded_message``.
+
+    Substring search rather than equality: the message crosses the executor
+    IPC boundary as a plain string (``RequestError``) and may arrive wrapped
+    in extra context.
+    """
+    return bool(_CONTEXT_LENGTH_EXCEEDED_RE.search(message))
 
 
 class EngineDeadError(RuntimeError):
@@ -234,6 +265,12 @@ class WorkerCommIpcAddrs(NamedTuple):
     # these lanes; result_queue_addr then aliases lane 0 (the launcher).
     frontend_result_queue_addrs: Optional[list[tuple[str,
                                                      Optional[bytes]]]] = None
+    # Worker -> proxy ack channel for synchronous control requests
+    # (currently: StartProfileRequest, StopProfileRequest). Lets the
+    # HTTP /start_profile and /stop_profile handlers wait for the worker
+    # to actually finish processing the request before returning, so the
+    # documented "trace is on disk by the time /stop_profile returns
+    # 200" contract holds in the IPC-proxy deployment too.
 
 
 # Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id

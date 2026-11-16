@@ -62,6 +62,7 @@ struct XQAParams
     int32_t spec_decoding_max_generation_length;       // max possible input length
     int64_t* spec_decoding_bl_tree_mask_offset;        // for blackwell spec-dec tree mask offset
     uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
+    int64_t spec_decoding_bl_tree_mask_capacity = 0;   // uint32 elements in spec_decoding_bl_tree_mask
     int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
     bool force_prepare_spec_dec_tree_mask = false;
     int32_t const* mrope_position_deltas = nullptr;
@@ -176,6 +177,7 @@ struct XQAParams
            << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
            << "spec_decoding_bl_tree_mask_offset: " << spec_decoding_bl_tree_mask_offset << std::endl
            << "spec_decoding_bl_tree_mask: " << spec_decoding_bl_tree_mask << std::endl
+           << "spec_decoding_bl_tree_mask_capacity: " << spec_decoding_bl_tree_mask_capacity << std::endl
            << "spec_bl_tree_first_sparse_mask_offset_kv: " << spec_bl_tree_first_sparse_mask_offset_kv << std::endl
            << "mrope_position_deltas: " << mrope_position_deltas << std::endl
            << "helix_position_offsets: " << helix_position_offsets << std::endl

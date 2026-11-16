@@ -1,9 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import random
 import re
 import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +38,26 @@ DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
 # Sampling configuration
 MAX_SAMPLES = 10  # Small number for efficient testing
 MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
+
+
+@pytest.mark.parametrize('suffix', ['', '-{split}_of_8'])
+def test_generated_stage_mapping(tmp_path: Path, suffix: str) -> None:
+    """The mapping follows the actual split count rather than the eight-build cadence."""
+    groovy = tmp_path / 'L0_Test.groovy'
+    groovy.write_text(
+        'SBSASlurmTestConfigs += buildStageConfigs(\n'
+        f'    "GB300-PerfSanity-Post-Merge{suffix}", "auto:gb300-x4", "perf_context",\n'
+        '    3, 4, 1, true, false\n'
+        ')\n'
+        '// SBSASlurmTestConfigs += buildStageConfigs("Disabled", "x", "disabled", 1, 4, 1)\n'
+    )
+    stages, contexts = StageQuery._parse_stage_mapping(groovy)
+    expected = [
+        f'GB300-PerfSanity-Post-Merge-{k}' + ('_of_8' if suffix else '')
+        for k in range(1, 4)
+    ]
+    assert stages == dict.fromkeys(expected, 'perf_context.yml')
+    assert contexts == {'perf_context.yml': expected}
 
 
 def _stage_backed_tests(stage_query: StageQuery) -> list[str]:
@@ -154,7 +190,8 @@ def test_unknown_stage_reports_a_diagnostic(stage_query):
     script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
     proc = subprocess.run([sys.executable, script, '--stages', bogus],
                           stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          stderr=subprocess.PIPE,
+                          timeout=60)
     assert not proc.stdout.strip(), 'Unknown stage should map to no tests'
     assert f'unknown stage: {bogus}' in proc.stderr.decode()
 
@@ -181,7 +218,8 @@ def test_known_stage_without_tests_is_reported(tmp_path):
         str(tmp_path), '--stages', 'Empty-PyTorch-1', 'Filled-PyTorch-1'
     ],
                           stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          stderr=subprocess.PIPE,
+                          timeout=60)
     assert proc.stdout.decode().split() == ['unittest/l0_filled.py']
     assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
 
