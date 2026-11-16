@@ -52,6 +52,10 @@ SNAPSHOT_INTERVAL = 256
 HELIX_TOKENS_PER_BLOCK = 64
 HELIX_CP_SIZE = 2
 LEDGER_TOKENS = HELIX_TOKENS_PER_BLOCK * HELIX_CP_SIZE
+# Compares every CP rank's schedule each iteration. Workers read it when the
+# executor is built, so it travels as an LLM env override to reach the ranks
+# that trtllm-llmapi-launch started on other nodes.
+HELIX_SCHEDULE_CHECK_ENV = {"TLLM_HELIX_AGG_CHECK_SCHEDULE": "1"}
 
 
 def _assert_helix_reuse_blocks(
@@ -84,46 +88,82 @@ def _assert_helix_reuse_blocks(
     )
 
 
-def _assert_drafter_reads_reused_prefix(
-    llm: LLM, snapshot_interval: int, ledger_tokens: int
-) -> None:
-    """Cold-then-warm run of a recall prompt; the warm run must keep its acceptance length.
+RECALL_MAX_TOKENS = 128
 
-    The prompt lists facts and asks for them back, so the answer copies text
-    that lies inside the reused prefix. A drafter that cannot read the reused
-    prefix's K/V drafts that copy blind and its acceptance length drops, while
-    the target's output is unaffected because verification is lossless.
-    Repeated filler text would not show this: the recomputed tail alone lets
-    a drafter predict a repetition.
+
+def _recall_prompt(llm: LLM) -> list:
+    """Random facts followed by a request to repeat them.
+
+    The answer copies text that lies inside the prompt's prefix, and the
+    random codes cannot be predicted any other way. Repeated filler text would
+    not do: the recomputed tail alone lets a drafter predict a repetition.
     """
     rng = random.Random(17645)
     facts = " ".join(
         f"Fact {i}: the access code for locker {i} is {rng.randrange(100000, 1000000)}."
         for i in range(1, 91)
     )
-    prompt = llm.tokenizer.encode(
+    return llm.tokenizer.encode(
         f"{facts}\nRepeat every fact above exactly, starting from Fact 1.\nFact 1:"
     )
+
+
+def _run_recall(llm: LLM, prompt: list) -> tuple:
+    """Reused blocks and acceptance length of one greedy run of the recall prompt."""
     sampling_params = SamplingParams(
-        max_tokens=128, temperature=0, ignore_eos=True, return_perf_metrics=True
+        max_tokens=RECALL_MAX_TOKENS, temperature=0, ignore_eos=True, return_perf_metrics=True
     )
-    results = [
-        llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
-        for _ in range(2)  # cold, then warm
-    ]
-    reused = [r.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks for r in results]
-    cold_al, warm_al = (float(r.avg_decoded_tokens_per_iter) for r in results)
+    out = llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
+    reused = out.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks
+    return reused, float(out.avg_decoded_tokens_per_iter)
+
+
+def _assert_warm_al(cold_al: float, warm_al: float) -> None:
+    """A warm recall run must keep the cold run's acceptance length.
+
+    A drafter that cannot read the reused prefix's K/V drafts the copy blind
+    and its acceptance length drops, while the target's output is unaffected
+    because verification is lossless. Greedy decoding is not run-to-run
+    deterministic here, so the warm run may take one decode step more than the
+    cold run (about 0.34 AL at 128 tokens).
+    """
+    cold_steps, warm_steps = (round(RECALL_MAX_TOKENS / al) for al in (cold_al, warm_al))
+    assert cold_al > 1.0, f"cold AL {cold_al:.3f}: the drafter accepted nothing"
+    assert warm_steps <= cold_steps + 1, (
+        f"warm AL {warm_al:.3f} ({warm_steps} steps) vs cold {cold_al:.3f} "
+        f"({cold_steps} steps): the drafter does not read the reused prefix's K/V"
+    )
+
+
+def _tier_moves(stats: list) -> dict:
+    """Blocks offloaded to and onboarded from host, per life-cycle kind ("attention", "ssm")."""
+    kind_of = {}
+    for s in stats:
+        for lc in (s.get("kvCacheIterationStatsByLifecycle") or {}).values():
+            kind_of[str(lc["poolGroupId"])] = lc["kind"]
+    moves = {}
+    for s in stats:
+        for pg, w in (s.get("kvCacheIterationStatsByPoolGroup") or {}).items():
+            m = moves.setdefault(kind_of.get(pg, pg), {"offload": 0, "onboard": 0})
+            m["offload"] += w.get("iterOffloadBlocks", 0)
+            m["onboard"] += w.get("iterOnboardBlocks", 0)
+    return moves
+
+
+def _assert_drafter_reads_reused_prefix(
+    llm: LLM, snapshot_interval: int, ledger_tokens: int
+) -> None:
+    """Cold-then-warm run of the recall prompt; the warm run reuses its prefix and keeps its AL."""
+    prompt = _recall_prompt(llm)
+    (cold_reused, cold_al), (warm_reused, warm_al) = (_run_recall(llm, prompt) for _ in range(2))
+    reused = [cold_reused, warm_reused]
     expected = (len(prompt) - 1) // snapshot_interval * (snapshot_interval // ledger_tokens)
     print(
         f"[reuse] recall prompt_len = {len(prompt)}, reused blocks (cold, warm) = {reused}, "
         f"AL cold = {cold_al:.3f}, warm = {warm_al:.3f}"
     )
     assert reused == [0, expected], f"reused blocks (cold, warm) {reused}, expected [0, {expected}]"
-    assert cold_al > 1.0, f"cold AL {cold_al:.3f}: the drafter accepted nothing"
-    assert warm_al >= cold_al - 0.2, (
-        f"warm AL {warm_al:.3f} < cold AL {cold_al:.3f} - 0.2: the drafter does not "
-        "read the reused prefix's K/V"
-    )
+    _assert_warm_al(cold_al, warm_al)
 
 
 @pytest.mark.timeout(10800)
@@ -445,6 +485,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             llm_kwargs["max_seq_len"] = 8192
         with LLM(
             self.NVFP4_MODEL_PATH,
+            env_overrides=HELIX_SCHEDULE_CHECK_ENV,
             tensor_parallel_size=4,
             context_parallel_size=2,
             moe_expert_parallel_size=8,
@@ -815,6 +856,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
         )
         with LLM(
             self.MODEL_PATH,
+            env_overrides=HELIX_SCHEDULE_CHECK_ENV,
             tensor_parallel_size=4,
             context_parallel_size=2,
             moe_expert_parallel_size=8,
@@ -857,4 +899,79 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 "TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp4cp2]",
                 acceptance_length,
+            )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_nvfp4_helix_fp8kv_reuse_kv_pressure(self):
+        """test_gsm8k_nvfp4_helix_fp8kv_kv_pressure with block reuse on.
+
+        A recall prompt is cached, a burst of long prompts pushes its attention
+        blocks and KDA snapshots to the host tier, and the recall prompt runs
+        again: it must reuse its prefix through host onboard and keep its
+        acceptance length. GSM8K accuracy and acceptance length then run on
+        the same engine.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=0.20,
+            max_tokens=12288,
+            avg_seq_len=1024,
+            tokens_per_block=HELIX_TOKENS_PER_BLOCK,
+            use_kv_cache_manager_v2=True,
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=SNAPSHOT_INTERVAL),
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.INFERACT_DSPARK_MODEL_PATH
+        )
+        with LLM(
+            self.MODEL_PATH,
+            env_overrides=HELIX_SCHEDULE_CHECK_ENV,
+            tensor_parallel_size=4,
+            context_parallel_size=2,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": HELIX_TOKENS_PER_BLOCK},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=3072,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            prompt = _recall_prompt(llm)
+            _, cold_al = _run_recall(llm, prompt)
+            llm.get_stats(timeout=2)
+            rng = random.Random(17645)
+            # 2600 + 256 tokens each: eight overflow the pool even with the
+            # recall prompt's cached blocks evictable.
+            burst = [[rng.randrange(1000, 100000) for _ in range(2600)] for _ in range(8)]
+            burst_params = SamplingParams(max_tokens=256, temperature=0, ignore_eos=True)
+            outputs = llm.generate(burst, sampling_params=burst_params, use_tqdm=False)
+            assert all(len(o.outputs[0].token_ids) == 256 for o in outputs)
+            burst_stats = llm.get_stats(timeout=2)
+            burst_moves = _tier_moves(burst_stats)
+            warm_reused, warm_al = _run_recall(llm, prompt)
+            warm_moves = _tier_moves(llm.get_stats(timeout=2))
+            print(
+                f"[reuse_kv_pressure] burst moves = {burst_moves}, warm moves = {warm_moves}, "
+                f"warm reused = {warm_reused}, AL cold = {cold_al:.3f}, warm = {warm_al:.3f}"
+            )
+            assert sum(s.get("iterSuspendedRequests", 0) for s in burst_stats) > 0
+            for kind in ("attention", "ssm"):
+                assert burst_moves[kind]["offload"] > 0, f"no {kind} block went to host"
+                assert warm_moves[kind]["onboard"] > 0, f"no {kind} block came back from host"
+            assert warm_reused > 0, "the recall prompt reused nothing after host onboard"
+            _assert_warm_al(cold_al, warm_al)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length(
+                "TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp4cp2]",
+                acceptance_length_from_iteration_stats(llm.get_stats(timeout=2)),
             )
