@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -29,6 +29,45 @@ _KV_CACHE_MAP = {
 }
 
 ALL_SUPPORTED_BACKENDS = ["pytorch"]
+
+
+def _tuning_model_configs(model: str, model_path: Union[Path, None],
+                          checkpoint_format: Union[str, None]):
+    """Read the model configurations the tuning heuristic needs.
+
+    A Mistral-native checkpoint is read the way the runtime loads it: params.json
+    and the consolidated safetensors files. When those cannot be read, its
+    config.json is read instead.
+
+    Returns:
+        The benchmark model configuration and the runtime model configuration.
+
+    Raises:
+        ValueError: When a local Mistral-native checkpoint can be read neither
+            from its native files nor from a config.json.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+    checkpoint = model_path or model
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        try:
+            return (get_model_config(model, model_path, checkpoint_format),
+                    MistralConfigLoader().load(checkpoint))
+        except (ValueError, RuntimeError) as e:
+            if (Path(checkpoint).is_dir()
+                    and not (Path(checkpoint) / "config.json").is_file()):
+                raise ValueError(
+                    f"checkpoint_format={checkpoint_format}: the tuning heuristic "
+                    f"cannot read {checkpoint} ({e}), and it has no config.json; "
+                    "pass --max_batch_size and --max_num_tokens") from e
+            logger.warning(
+                f"checkpoint_format={checkpoint_format}: the tuning heuristic "
+                f"cannot read the native files of {checkpoint} ({e}); reading "
+                "its config.json instead")
+    return (get_model_config(model, model_path),
+            ModelConfig.from_pretrained(checkpoint, trust_remote_code=True))
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
@@ -87,23 +126,13 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
             f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
-        if checkpoint_format in (CheckpointFormat.MISTRAL,
-                                 CheckpointFormat.MISTRAL_LARGE_3):
-            raise ValueError(
-                f"checkpoint_format={checkpoint_format}: pass --max_batch_size "
-                "and --max_num_tokens; the tuning heuristic reads HF checkpoints "
-                "only")
-        model_config = get_model_config(model, model_path)
+        model_config, tllm_model_config = _tuning_model_configs(
+            model, model_path, checkpoint_format)
 
         if isinstance(model_config,
                       (NemotronHybridConfig, Qwen3HybridConfig
                        )) and mamba_ssm_cache_dtype not in (None, "auto"):
             model_config.set_mamba_ssm_cache_dtype(mamba_ssm_cache_dtype)
-
-        from tensorrt_llm._torch.model_config import ModelConfig
-        model = model_path or model
-        tllm_model_config = ModelConfig.from_pretrained(model,
-                                                        trust_remote_code=True)
 
         if (kv_cache_dtype is None
                 and tllm_model_config.quant_config.kv_cache_quant_algo is None):
