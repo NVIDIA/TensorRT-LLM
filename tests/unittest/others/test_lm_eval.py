@@ -1873,98 +1873,80 @@ def test_stop_strings_cli_rejects_non_list_of_strings(value):
 # Mistral-native checkpoints: mistral-common renders the chat with its images
 # ===========================================================================
 
+_P = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
+_IMAGE0, _IMAGE1 = ({"type": "image", "media_index": i} for i in range(2))
 
-def _render_deferred_native_chat(wrapper, history, images):
-    """Run generate_until on a deferred native chat; return the render kwargs and prompt."""
+
+@pytest.mark.parametrize(
+    "force_single,history,sizes,parts,counts",
+    [
+        (
+            False,
+            [
+                {"role": "user", "content": f"Before {_P} between {_P} after"},
+                {"role": "assistant", "content": "Two pictures."},
+                {"role": "user", "content": f"Compare to {_P} again."},
+            ],
+            [(84, 56), (56, 112), (84, 56)],
+            ["Before ", _IMAGE0, " between ", _IMAGE1, " after"],
+            [{"[IMG]": 2}, {}, {"[IMG]": 1}],
+        ),
+        # is_force_single_image keeps the first placeholder for the one image it passes.
+        (
+            True,
+            [{"role": "user", "content": f"{_P} and {_P}: which is red?"}],
+            [(84, 56), (56, 112)],
+            [_IMAGE0, " and ", ": which is red?"],
+            [{"[IMG]": 1}],
+        ),
+        # An image without a placeholder follows the text.
+        (
+            False,
+            [{"role": "user", "content": "What is this?"}],
+            [(84, 56)],
+            ["What is this?", _IMAGE0],
+            [{"[IMG]": 1}],
+        ),
+    ],
+    ids=["in_place", "forced_single", "no_placeholder"],
+)
+def test_native_mistral_eval_renders_the_chat_with_its_images(
+    force_single, history, sizes, parts, counts
+):
+    """The chat is rendered once its images are loaded.
+
+    mistral-common sees their pixels and the original turn and image order.
+    """
     import json
 
+    from PIL import Image
+
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.is_force_single_image = force_single
+    wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
     deferred = wrapper.apply_chat_template(history)
     assert json.loads(deferred)["conversation"] == history
-    captured = {}
-
-    def render(**kwargs):
-        captured.update(kwargs)
-        return [1, 100, 10, 13, 200]
-
     future = MagicMock()
     future.result.return_value.outputs = [MagicMock(text="A")]
     wrapper.llm.generate_async.return_value = future
     request = MagicMock()
-    request.args = (deferred, {}, {"visual": images})
-    with patch("tensorrt_llm.evaluate.lm_eval.trtllm_apply_chat_template", side_effect=render):
+    request.args = (deferred, {}, {"visual": [Image.new("RGB", size) for size in sizes]})
+    with patch(
+        "tensorrt_llm.evaluate.lm_eval.trtllm_apply_chat_template", return_value=[1, 100, 200]
+    ) as render:
         assert wrapper.generate_until([request], disable_tqdm=True) == ["A"]
-    return captured, wrapper.llm.generate_async.call_args.args[0]
 
-
-def test_native_mistral_eval_defers_chat_until_image_geometry_is_available():
-    """The native tokenizer sees real pixels and the original turn/image order."""
-    from PIL import Image
-
-    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
-    wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
-    placeholder = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
-    history = [
-        {"role": "user", "content": f"Before {placeholder} between {placeholder} after"},
-        {"role": "assistant", "content": "Two pictures."},
-        {"role": "user", "content": f"Compare to {placeholder} again."},
-    ]
-    images = [Image.new("RGB", size) for size in ((84, 56), (56, 112), (84, 56))]
-    captured, submitted = _render_deferred_native_chat(wrapper, history, images)
-    assert captured["model_type"] == "mistral_common"
-    assert [message["role"] for message in captured["conversation"]] == [
-        "user",
-        "assistant",
-        "user",
-    ]
-    assert captured["conversation"][0]["content_parts"] == [
-        "Before ",
-        {"type": "image", "media_index": 0},
-        " between ",
-        {"type": "image", "media_index": 1},
-        " after",
-    ]
-    assert captured["mm_placeholder_counts"] == [{"[IMG]": 2}, {}, {"[IMG]": 1}]
-    assert [image.size for image in captured["mm_data"]["image"]] == [
-        image.size for image in images
-    ]
-    assert captured["chat_template_kwargs"] == {"reasoning_effort": "none"}
-    assert submitted["prompt_token_ids"] == [1, 100, 10, 13, 200]
-    assert "prompt" not in submitted
-    assert len(submitted["multi_modal_data"]["image"]) == 3
-
-
-def test_native_mistral_eval_with_a_single_forced_image():
-    """is_force_single_image keeps the first placeholder for the one image it passes."""
-    from PIL import Image
-
-    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
-    wrapper.is_force_single_image = True
-    placeholder = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
-    history = [{"role": "user", "content": f"{placeholder} and {placeholder}: which is red?"}]
-    images = [Image.new("RGB", (84, 56)), Image.new("RGB", (56, 112))]
-    captured, submitted = _render_deferred_native_chat(wrapper, history, images)
-    assert captured["conversation"][0]["content_parts"] == [
-        {"type": "image", "media_index": 0},
-        " and ",
-        ": which is red?",
-    ]
-    assert captured["mm_placeholder_counts"] == [{"[IMG]": 1}]
-    assert [image.size for image in captured["mm_data"]["image"]] == [(84, 56)]
-    assert len(submitted["multi_modal_data"]["image"]) == 1
-
-
-def test_native_mistral_eval_places_images_without_a_placeholder_after_the_text():
-    from PIL import Image
-
-    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
-    captured, _ = _render_deferred_native_chat(
-        wrapper, [{"role": "user", "content": "What is this?"}], [Image.new("RGB", (84, 56))]
-    )
-    assert captured["conversation"][0]["content_parts"] == [
-        "What is this?",
-        {"type": "image", "media_index": 0},
-    ]
-    assert captured["mm_placeholder_counts"] == [{"[IMG]": 1}]
+    rendered = render.call_args.kwargs
+    loaded = sizes[:1] if force_single else sizes
+    assert rendered["model_type"] == "mistral_common"
+    assert [m["role"] for m in rendered["conversation"]] == [m["role"] for m in history]
+    assert rendered["conversation"][0]["content_parts"] == parts
+    assert rendered["mm_placeholder_counts"] == counts
+    assert [image.size for image in rendered["mm_data"]["image"]] == loaded
+    assert rendered["chat_template_kwargs"] == {"reasoning_effort": "none"}
+    submitted = wrapper.llm.generate_async.call_args.args[0]
+    assert submitted["prompt_token_ids"] == [1, 100, 200] and "prompt" not in submitted
+    assert len(submitted["multi_modal_data"]["image"]) == len(loaded)
 
 
 @pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])
@@ -1972,11 +1954,10 @@ def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
     """A token-id prompt dumps the ids the engine received; a text prompt is re-encoded."""
     import json
     from types import SimpleNamespace
-    from unittest.mock import Mock
 
     from tensorrt_llm.evaluate.interface import dump_inference_results
 
-    tokenizer = Mock()
+    tokenizer = MagicMock()
     tokenizer.decode.return_value = "[INST][IMG][IMG_END][/INST]"
     tokenizer.encode.return_value = [7, 8]
     result = SimpleNamespace(
@@ -1987,9 +1968,6 @@ def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
     dump_inference_results(str(tmp_path), [result], tokenizer)
     record = json.loads((tmp_path / "dumped_ids.json").read_text())
     assert record["output_ids"] == [99, 2]
-    if prompt is None:
-        assert record["input_ids"] == [1, 3, 10, 13, 4]
-        tokenizer.encode.assert_not_called()
-    else:
-        assert record["input_ids"] == [7, 8]
+    assert record["input_ids"] == ([1, 3, 10, 13, 4] if prompt is None else [7, 8])
+    if prompt is not None:
         tokenizer.encode.assert_called_once_with(prompt)
