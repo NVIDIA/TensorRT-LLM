@@ -333,7 +333,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6c7c242ec 100644
+index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd8317c22b 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -341,7 +341,7 @@ index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1455,8 +1456,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1454,8 +1455,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -350,7 +350,7 @@ index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1479,8 +1478,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1478,8 +1477,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -359,7 +359,7 @@ index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1567,13 +1564,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1566,13 +1563,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -373,7 +373,7 @@ index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -7823,3 +7816,13 @@ class GmemOResource(MemoryResource):
+@@ -7822,3 +7815,13 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -388,7 +388,7 @@ index 9331e71f98c72ea88b04f26657a09f640747c751..37bab63cbc93210b510b1e8a364a4ca6
 +    _load_runtime_seq_len_kv,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index 3b499bd5497d384701af6def6e968bccd63632cc..a4eaf59b44061b718f1f5edeac566256ad54b630 100644
+index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6bb70da119 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -396,10 +396,10 @@ index 3b499bd5497d384701af6def6e968bccd63632cc..a4eaf59b44061b718f1f5edeac566256
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -37,7 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
+@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
+     producer_work,
  )
  
- from ...task_compat import consumer_work_stage
 -from ......cute_dsl.availability import is_rubin_cute_dsl_available
 +from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
  from ..fmha_decode_config import FmhaDecodeConfig
@@ -419,10 +419,10 @@ index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2788a2af7 100644
+index c084dde7ed8feacb1423a2ff9a6571a907883be4..980419545032202e5e346b80cc2440a90387630c 100644
 --- a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
 +++ b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-@@ -353,17 +353,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
+@@ -415,17 +415,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                      cutlass.const_expr(lane_slot_i == 0)
                      or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
                  ):
@@ -443,8 +443,64 @@ index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2
                          ] = stats_weight
  
      prims.barrier_cta_sync(
+diff --git a/kernels/mla_decode/throughput_latency_1cta/tasks.py b/kernels/mla_decode/throughput_latency_1cta/tasks.py
+index 5276885bbeda5941d3edb1eb10cd5131ae656890..b7ef6d64c4bf768b39363ed2219d00d4609c8412 100644
+--- a/kernels/mla_decode/throughput_latency_1cta/tasks.py
++++ b/kernels/mla_decode/throughput_latency_1cta/tasks.py
+@@ -120,10 +120,9 @@ class MlaDecodeTask(Task):
+         else:
+             return Int32(pointer.load())
+ 
++    @cute.jit
+     def make_task_cache(self):
+-        """Snapshot the compact task state at the tracing call site."""
+-        # get_domain updates _seq_len_kv in Python; under FrontendNext a jitted
+-        # getter can read the old staged slot before that mutation is committed.
++        """Return the compact tuple of cached per-task thread values."""
+         return (
+             self._tmem_base_offset,
+             self._warp_grp_thread_idx,
+@@ -135,9 +134,10 @@ class MlaDecodeTask(Task):
+             Int32(0),
+         )
+ 
++    @cute.jit
+     def get_domain(self, tile_coord):
+         """Return the runtime loop domain for the current 1CTA work tile."""
+-        if self.cfg is None:
++        if cutlass.const_expr(self.cfg is None):
+             return self.domain
+         if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
+             # Padding and scheduler tasks have no K/V metadata or mainloop.
+@@ -145,14 +145,14 @@ class MlaDecodeTask(Task):
+ 
+         # Persistent 1CTA coordinates combine batch and head tile in z;
+         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
+-        if isinstance(tile_coord[2], int):
+-            if self.cfg.use_persistent_scheduler == 1:
++        if cutlass.const_expr(isinstance(tile_coord[2], int)):
++            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
+                 batch_idx = tile_coord[2] // self.cfg.num_ctas_for_all_heads
+             else:
+                 batch_idx = tile_coord[2]
+         else:
+             batch_idx = Int32(tile_coord[2])
+-            if self.cfg.use_persistent_scheduler == 1:
++            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
+                 batch_idx = batch_idx // Int32(self.cfg.num_ctas_for_all_heads)
+ 
+         # Task-domain ownership must match K/V, softmax, and reduction: dense
+@@ -193,7 +193,7 @@ class MlaDecodeTask(Task):
+             self.cu_seqlens_q,
+             batch_idx,
+         )
+-        if self.cfg.fixed_sparse_kv_tiles > 0:
++        if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
+             return Int32(self.domain_bias)
+         total_kv_tiles = runtime_local_kv_tiles(
+             self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
 diff --git a/mla_decode.py b/mla_decode.py
-index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7bf4e50862 100644
+index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27ec76f56cb 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -466,12 +522,15 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  
  
  from .decode import (
-@@ -1196,8 +1193,34 @@ def _make_mla_decode_compile_spec(
+@@ -1196,11 +1193,35 @@ def _make_mla_decode_compile_spec(
  _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
  
  
 -@functools.cache
 -def _get_compiled_mla_decode(
+-    compile_spec: _MLADecodeCompileSpec,
+-):
+-    """Compile and cache one batch-dynamic TS MLA topology."""
 +_COMPILED_MLA_DECODE: dict = {}
 +
 +
@@ -499,11 +558,12 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
 +    return is_placeholder(compiled)
 +
 +
-+def _compile_mla_decode(
-     compile_spec: _MLADecodeCompileSpec,
- ):
-     """Compile and cache one batch-dynamic TS MLA topology."""
-@@ -1897,7 +1920,7 @@ class BatchMLADecodePagedTSWrapper:
++def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
++    """Build (or load from the on-disk cache) one batch-dynamic TS MLA topology."""
+ 
+     import cutlass
+     import cutlass.cute as cute
+@@ -1897,7 +1918,7 @@ class BatchMLADecodePagedTSWrapper:
              softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
          )
  
@@ -512,7 +572,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
      def run(
          self,
          query: torch.Tensor,
-@@ -2013,7 +2036,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2013,7 +2034,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -521,7 +581,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2379,6 +2402,7 @@ def _prepare_sparse_output_quant(
+@@ -2379,6 +2400,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -529,7 +589,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2411,17 +2435,17 @@ def _resolve_sparse_mla_plan(
+@@ -2411,17 +2433,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass
@@ -551,228 +611,8 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          MlaDecodeTs,
      )
  
-@@ -2809,6 +2833,9 @@ def resolve_sparse_d576_reload_plan(
-     return device, profile, spec, sections, byte_end, capacity, None
- 
- 
-+_PREPARED_LAUNCH_LIMIT = 256
-+
-+
- class BatchSparseMLADecodePagedTSWrapper:
-     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
- 
-@@ -2859,6 +2886,7 @@ class BatchSparseMLADecodePagedTSWrapper:
-     def __init__(self, workspace_buffer=None):
-         self._workspace_buffer = workspace_buffer
-         self._state = None
-+        self._prepared: dict[tuple, dict] = {}
-         self.workspace_size_bytes = 0
- 
-     def plan(
-@@ -3041,6 +3069,7 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 kernel_signature=_mla_kernel_compile_signature(kernel),
-             )
-         compiled = _get_compiled_mla_decode(spec)
-+        self._prepared.clear()
-         self._state = dict(
-             reload_d576=reload_d576,
-             device=device,
-@@ -3276,6 +3305,49 @@ class BatchSparseMLADecodePagedTSWrapper:
-         state = self._state
-         if state is None:
-             raise RuntimeError("plan() must be called before run()")
-+        softmax_scale = resolve_scale(
-+            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
-+        )
-+        output_scale = resolve_scale(
-+            output_scale, state["output_scale"], "output_scale", state["device"]
-+        )
-+        kv_cache_scale = resolve_scale(
-+            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
-+        )
-+        lse_arg = lse
-+        prepared_key = (
-+            kv_cache.data_ptr(),
-+            kv_cache.shape,
-+            kv_cache.stride(),
-+            kv_cache.dtype,
-+            None
-+            if extra_kv_cache is None
-+            else (
-+                extra_kv_cache.data_ptr(),
-+                extra_kv_cache.shape,
-+                extra_kv_cache.stride(),
-+                extra_kv_cache.dtype,
-+            ),
-+            None if attention_sinks is None else attention_sinks.data_ptr(),
-+            softmax_scale,
-+            output_scale,
-+        )
-+        if (
-+            not validate
-+            and out is not None
-+            and lse is None
-+            and qo_indptr is None
-+            and token_positions is None
-+            and cos_sin_cache is None
-+            and out_scale is None
-+            and type(kv_cache_scale) in (int, float)
-+            and kv_cache_scale == 1.0
-+        ):
-+            prepared = self._prepared.get(prepared_key)
-+            if prepared is not None:
-+                return self._run_prepared(
-+                    prepared, query, indices, lengths, extra_indices, extra_lengths, out
-+                )
-         _validate_query(
-             query,
-             packed_query=state["packed_query"],
-@@ -3344,15 +3416,6 @@ class BatchSparseMLADecodePagedTSWrapper:
-             raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
-         if validate and torch.isnan(attention_sinks).any().item():
-             raise ValueError("attention_sinks must not contain NaN")
--        softmax_scale = resolve_scale(
--            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
--        )
--        output_scale = resolve_scale(
--            output_scale, state["output_scale"], "output_scale", state["device"]
--        )
--        kv_cache_scale = resolve_scale(
--            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
--        )
-         if state["kv_cache_format"] != "fp8" and (
-             isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
-         ):
-@@ -3479,10 +3542,127 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 compiled=state["compiled"],
-                 max_q_len=1,
-             )
-+        if (
-+            rows
-+            and quant is None
-+            and not state["packed_query"]
-+            and not state["return_lse"]
-+            and state["max_q_len"] == 1
-+            and state["query_dim"] == 512
-+            and state["kv_cache_format"] == "native"
-+            and state["extra_kv_cache_format"] == "native"
-+            and lse_arg is None
-+        ):
-+            # Static for this (plan, pools, scales): pool views, scalars, sinks, split,
-+            # workspace. The next validate=False launch with the same pools re-forms
-+            # only the query / index / output views (see _run_prepared).
-+            if len(self._prepared) >= _PREPARED_LAUNCH_LIMIT:
-+                self._prepared.clear()
-+            self._prepared[prepared_key] = dict(
-+                primary=primary,
-+                extra=extra,
-+                primary_rows=primary.shape[0],
-+                c_latent=primary.permute(1, 2, 0),
-+                c_rope=extra.permute(1, 2, 0),
-+                sinks=attention_sinks,
-+                bmm=(softmax_scale, output_scale),
-+                ks=state["max_topk"],
-+                kc=state["max_extra_topk"],
-+                dummy_indices=state["dummy_indices"],
-+                default_cl=state["default_cl"],
-+            )
-         if quant is not None:
-             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
-         return (out, lse) if state["return_lse"] else out
- 
-+    def _run_prepared(self, prepared, query, indices, lengths, extra_indices, extra_lengths, out):
-+        """Launch with the static arguments recorded by the last full run().
-+
-+        Only the per-call tensors are checked and viewed: query and output
-+        geometry, index/length shapes, dtypes and strides. Pool geometry,
-+        scales and sinks were validated by the full path that prepared this
-+        launch, and the caller passed validate=False. Byte-identical to the
-+        full path for the same arguments.
-+        """
-+        state = self._state
-+        rows, heads, device = state["batch_size"], state["num_qo_heads"], state["device"]
-+        if (
-+            query.shape != (rows, 1, heads, 512)
-+            or query.dtype != state["q_dtype"]
-+            or query.device != device
-+            or not query.is_contiguous()
-+            or query.data_ptr() % 16
-+        ):
-+            raise ValueError(
-+                "prepared launch: query must be a contiguous, 16-byte aligned "
-+                "[batch, 1, heads, 512] tensor of the planned dtype on the planned device"
-+            )
-+        if (
-+            out.numel() != rows * heads * 512
-+            or out.dtype != torch.bfloat16
-+            or out.device != device
-+            or not out.is_contiguous()
-+            or out.data_ptr() % 16
-+        ):
-+            raise ValueError(
-+                "prepared launch: out must be a contiguous, 16-byte aligned BF16 tensor "
-+                "holding one 512-wide row per query head"
-+            )
-+        if (
-+            indices.shape != (rows, prepared["ks"])
-+            or indices.dtype != torch.int32
-+            or indices.device != device
-+            or indices.stride(-1) != 1
-+            or lengths.shape != (rows,)
-+            or lengths.dtype != torch.int32
-+            or lengths.device != device
-+            or not lengths.is_contiguous()
-+        ):
-+            raise ValueError("prepared launch: invalid primary indices/lengths")
-+        if prepared["kc"]:
-+            if (
-+                not isinstance(extra_indices, torch.Tensor)
-+                or not isinstance(extra_lengths, torch.Tensor)
-+                or extra_indices.shape != (rows, prepared["kc"])
-+                or extra_indices.dtype != torch.int32
-+                or extra_indices.device != device
-+                or extra_indices.stride(-1) != 1
-+                or extra_lengths.shape != (rows,)
-+                or extra_lengths.dtype != torch.int32
-+                or extra_lengths.device != device
-+                or not extra_lengths.is_contiguous()
-+            ):
-+                raise ValueError("prepared launch: invalid extra indices/lengths")
-+            ci, cl = extra_indices, extra_lengths
-+        else:
-+            if extra_indices is not None or extra_lengths is not None:
-+                raise ValueError("prepared launch: extra indices without a planned extra pool")
-+            ci, cl = prepared["dummy_indices"][:rows], prepared["default_cl"][:rows]
-+        buffers = state["buffers"]
-+        sinks = prepared["sinks"]
-+        q_kernel = query.permute(2, 3, 1, 0)
-+        lse_kernel = buffers["public_lse"][:rows].view(rows, 1, heads).permute(2, 1, 0)
-+        bmm1, bmm2 = prepared["bmm"]
-+        state["compiled"](
-+            q_kernel,
-+            q_kernel,
-+            prepared["c_latent"],
-+            prepared["c_rope"],
-+            indices.transpose(0, 1),
-+            out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),
-+            lse_kernel,
-+            buffers["core"] if buffers["core"].numel() else None,
-+            state["requested_splits"],
-+            lengths,
-+            None,
-+            (indices, ci, lengths, cl, sinks, 1.0),
-+            bmm1,
-+            bmm2,
-+            None,
-+            1,
-+        )
-+        return out
-+
- 
- def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
-     """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index 71a2c78067204c2eab2f3db0b7f4a7a62890c1a0..df026748317dba0c23fbb520285f1684b2c2d6a5 100644
+index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..c8748c231c2f47c763d6235f76fbd0f7fd5a150d 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
@@ -801,3 +641,83 @@ index 71a2c78067204c2eab2f3db0b7f4a7a62890c1a0..df026748317dba0c23fbb520285f1684
  
      return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
  
+@@ -276,9 +277,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
+                 self.sparse_block_size,
+                 self.max_seq_len_kv,
+                 self.release_attention_pdl,
+-                self.locator_head_multiplier,
+-                self.count_current_block_in_topk,
+-                self.fixed_query_len,
+             )
+         else:
+             self.metadata_run(
+@@ -294,9 +292,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
+                 self.sparse_block_size,
+                 self.max_seq_len_kv,
+                 self.release_attention_pdl,
+-                self.locator_head_multiplier,
+-                self.count_current_block_in_topk,
+-                self.fixed_query_len,
+             )
+ 
+ 
+@@ -1133,13 +1128,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+         split_kv,
+         share_pattern_across_kv_heads,
+     )
+-    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+-    # Other profiles and the standalone metadata API retain page-byte masks.
+-    query_major_memberships = (
+-        sparse_block_size == 4
+-        and spec.config.use_fp8_qkv
+-        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
+-    )
++    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
++    # run_*_query_major entry points, so every profile keeps page-byte masks.
++    query_major_memberships = False
+     if query_major_memberships:
+         page_capacity = (page_capacity + 31) // 32 * 32
+     membership_words = (
+@@ -1510,9 +1501,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
+             sparse_block_size,
+             max_seq_len_kv,
+             release_attention_pdl,
+-            1,
+-            count_current_block_in_topk,
+-            0,
+         )
+     else:
+         metadata_module.run_fixed(
+@@ -1528,9 +1516,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
+             sparse_block_size,
+             max_seq_len_kv,
+             release_attention_pdl,
+-            1,
+-            count_current_block_in_topk,
+-            0,
+         )
+     return outputs
+ 
+@@ -1929,7 +1914,9 @@ def _prepare_q_token_kv_block_sparse_attention(
+         ),
+         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
+         direct_q1_fixed_query_len=fixed_query_len,
+-        allow_head_aware_locators=group_size > 1,
++        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
++        # locator_head_multiplier argument and head-stride-1 locators only.
++        allow_head_aware_locators=False,
+         softmax_scale=scale_qk,
+         output_scale=scale_v,
+     )
+@@ -2300,6 +2287,11 @@ def _validate_inputs(
+     fixed_query_len: int = 0,
+ ) -> None:
+     """Validate tensor structure without copying live metadata values to the host."""
++    if count_current_block_in_topk is not True or fixed_query_len != 0:
++        raise ValueError(
++            "The installed metadata extension requires count_current_block_in_topk=True "
++            "and explicit token_to_request/query_positions tensors"
++        )
+     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+     for name, tensor in (
+         ("block_indices", block_indices),

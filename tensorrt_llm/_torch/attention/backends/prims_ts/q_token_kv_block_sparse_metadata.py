@@ -277,9 +277,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
-                self.locator_head_multiplier,
-                self.count_current_block_in_topk,
-                self.fixed_query_len,
             )
         else:
             self.metadata_run(
@@ -295,9 +292,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
-                self.locator_head_multiplier,
-                self.count_current_block_in_topk,
-                self.fixed_query_len,
             )
 
 
@@ -375,32 +369,6 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         _validate_16byte_alignment(query, "query")
         _validate_16byte_alignment(out, "out")
 
-        scale_qk = resolve_scale(sm_scale, self._bmm1_scale, "sm_scale", query.device)
-        scale_v = resolve_scale(v_scale, self._bmm2_scale, "v_scale", query.device)
-        return self.run_unchecked(
-            query,
-            block_indices,
-            block_table,
-            token_to_request,
-            query_positions,
-            out=out,
-            sm_scale=scale_qk,
-            v_scale=scale_v,
-        )
-
-    def run_unchecked(
-        self,
-        query: torch.Tensor,
-        block_indices: torch.Tensor,
-        block_table: torch.Tensor,
-        token_to_request: Optional[torch.Tensor],
-        query_positions: torch.Tensor,
-        *,
-        out: torch.Tensor,
-        sm_scale: GlobalScale,
-        v_scale: GlobalScale,
-    ) -> torch.Tensor:
-        """Launch tensors and scales that satisfy the prepared plan's ABI."""
         direct_q1_inputs = None
         if self._attention_plan._direct_q1_inputs:
             direct_q1_inputs = (
@@ -422,11 +390,13 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         attention_out = _flatten_fixed_q_token_kv_block_sparse_groups(
             out, self._fixed_query_group_size
         )
+        scale_qk = resolve_scale(sm_scale, self._bmm1_scale, "sm_scale", query.device)
+        scale_v = resolve_scale(v_scale, self._bmm2_scale, "v_scale", query.device)
         self._attention_plan._run_unchecked(
             attention_query,
             attention_out,
-            sm_scale,
-            v_scale,
+            scale_qk,
+            scale_v,
             direct_q1_inputs,
         )
         return out
@@ -692,7 +662,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
         sm_scale: Optional[GlobalScale] = None,
         v_scale: Optional[GlobalScale] = None,
         out: Optional[torch.Tensor] = None,
-        validate: bool = True,
     ) -> torch.Tensor:
         """Build live routes and launch the current QToken attention plan.
 
@@ -778,15 +747,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
             dtype. When omitted, the wrapper retains and reuses its output.
             Must not overlap any input or workspace storage; this is not checked.
 
-        validate : bool, optional
-            Validate tensor metadata and prepare changed bindings (default True).
-            Set False only after a successful validated run with the same plan.
-            All tensors must preserve their validated shapes, strides, devices,
-            dtypes and alignment; K/V and qo_indptr must also retain their storage.
-            Contents may change, and Q, indexer, table, per-token metadata and out
-            may use replacement storage with the same ABI. Scale overrides are
-            still checked. Revalidate after changing bindings or calling plan().
-
         Returns
         -------
         torch.Tensor
@@ -796,30 +756,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
         config = self._require_config()
         sm_scale = resolve_scale(sm_scale, config.sm_scale, "sm_scale", config.device)
         v_scale = resolve_scale(v_scale, config.v_scale, "v_scale", config.device)
-        if not validate:
-            if self._prepared_plan is None:
-                raise RuntimeError(
-                    "run with validate=True after plan() before validate=False"
-                )
-            if out is None:
-                out = self._default_out
-                if out is None:
-                    raise RuntimeError(
-                        "supply out or first run with validate=True and out=None"
-                    )
-                _validate_q_token_kv_block_sparse_plan_tensor(
-                    out, "out", self._prepared_plan._out
-                )
-            return self._prepared_plan.run_unchecked(
-                q,
-                indexer_block_ids,
-                block_table,
-                token_to_request,
-                seq_lens if seq_lens is not None else query_positions,
-                out=out,
-                sm_scale=sm_scale,
-                v_scale=v_scale,
-            )
         if not isinstance(q, torch.Tensor):
             raise TypeError("q must be a torch.Tensor")
         if q.device != config.device or q.dtype != config.q_dtype:
@@ -1192,12 +1128,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # Eligible Keeps G2..G8/page-4 profiles consume one bit-plane per query.
-    # Other profiles and the standalone metadata API retain page-byte masks.
-    query_major_memberships = (
-        sparse_block_size == 4
-        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
-    )
+    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
+    # run_*_query_major entry points, so every profile keeps page-byte masks.
+    query_major_memberships = False
     if query_major_memberships:
         page_capacity = (page_capacity + 31) // 32 * 32
     membership_words = (
@@ -1568,9 +1501,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
-            1,
-            count_current_block_in_topk,
-            0,
         )
     else:
         metadata_module.run_fixed(
@@ -1586,9 +1516,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
-            1,
-            count_current_block_in_topk,
-            0,
         )
     return outputs
 
@@ -1987,7 +1914,9 @@ def _prepare_q_token_kv_block_sparse_attention(
         ),
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
         direct_q1_fixed_query_len=fixed_query_len,
-        allow_head_aware_locators=group_size > 1,
+        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
+        # locator_head_multiplier argument and head-stride-1 locators only.
+        allow_head_aware_locators=False,
         softmax_scale=scale_qk,
         output_scale=scale_v,
     )
@@ -2358,6 +2287,11 @@ def _validate_inputs(
     fixed_query_len: int = 0,
 ) -> None:
     """Validate tensor structure without copying live metadata values to the host."""
+    if count_current_block_in_topk is not True or fixed_query_len != 0:
+        raise ValueError(
+            "The installed metadata extension requires count_current_block_in_topk=True "
+            "and explicit token_to_request/query_positions tensors"
+        )
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     for name, tensor in (
         ("block_indices", block_indices),

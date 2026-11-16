@@ -31,7 +31,6 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ....task_compat import RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE
 from ...helpers.constants import (
     SMEM_WORD_BYTE_SHIFT,
     SMEM_WORD_BYTES,
@@ -138,10 +137,7 @@ class SmemPResource(MlaResource):
         captured_schedule: cutlass.Constexpr[bool] = False,
     ) -> None:
         """Initialize pipeline state and CTA-wide P-order barriers."""
-        if cutlass.const_expr(RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE):
-            super().initialize_runtime_state_internal(context, captured_schedule)
-        else:
-            super().initialize_runtime_state_internal(context)
+        super().initialize_runtime_state_internal(context, captured_schedule)
         self._init_smem_state_from_context(context)
         if cutlass.const_expr(
             self.owns_order_p01_alloc

@@ -196,7 +196,6 @@ from .sage_scales import validate_context_sage_layout
 from ...sage.layout import _SageScaleLayout
 from ...sage.modes import SageKTransport
 from .fmha_tasks import (
-    ContextTask,
     PackedContextWorkQueue,
     create_correction_task,
     create_epilogue_task,
@@ -256,7 +255,7 @@ def _init_task_with_domain(
     task: Task,
     kwargs: dict[str, Any],
     domain: int | None,
-    task_init: Callable[..., None] = ContextTask.__init__,
+    task_init: Callable[..., None] = Task.__init__,
 ) -> None:
     """Initialize a captured Task with its static validation loop domain."""
     schedule = kwargs.get("schedule")
@@ -285,7 +284,7 @@ def _init_causal_domain_state(
     window_size_left: int,
     packed_window: bool,
     kwargs: dict[str, Any],
-    task_init: Callable[..., None] = ContextTask.__init__,
+    task_init: Callable[..., None] = Task.__init__,
 ) -> None:
     """Initialize causal-domain fields and the static validation domain."""
     static_domain = None
@@ -340,7 +339,7 @@ def _init_causal_domain_state(
     task._packed_window = packed_window
 
 
-class CausalDomainTask(ContextTask):
+class CausalDomainTask(Task):
     """Task with causal and optional left-window masking domain.
 
     For causal FMHA, each Q tile only attends to K tiles where k <= q.
@@ -564,7 +563,7 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         )
 
 
-class VariableWindowDomainTask(ContextTask):
+class VariableWindowDomainTask(Task):
     """Task whose K-loop domain comes from packed-Q window endpoints."""
 
     def __init__(

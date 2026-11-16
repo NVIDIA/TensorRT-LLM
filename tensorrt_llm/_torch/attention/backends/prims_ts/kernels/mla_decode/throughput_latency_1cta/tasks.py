@@ -27,6 +27,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
+from ...task_compat import task_context_kwargs
 from ..helpers.constants import (
     WARP_LANES,
     WARP_LANE_MASK,
@@ -44,7 +45,6 @@ from ..helpers.schedule import (
     schedule_token_throttle_tail,
     work_tile_schedule_loop,
 )
-from ...task_compat import TaskCacheStageInfoMixin, runtime_domain_end
 from ..helpers.stage import MlaStage
 from ..helpers.tile import (
     runtime_split_count,
@@ -54,14 +54,8 @@ from ..helpers.tile import (
 )
 
 
-class MlaDecodeTask(TaskCacheStageInfoMixin, Task):
+class MlaDecodeTask(Task):
     """MLA decode task with cached thread state and Q-aware KV domain logic."""
-
-    # HEAD/TAIL work reads the K loop state from ``StageInfo``.
-    restore_loop_state_outside_loop = True
-    # ``_resolve_domain`` caches the KV length that ``make_task_cache`` reports,
-    # including for the short merged tasks whose loop bounds are static.
-    resolve_domain_every_tile = True
 
     def __init__(self, **kwargs):
         """Initialize MLA-specific task parameters and cached thread indices."""
@@ -77,8 +71,17 @@ class MlaDecodeTask(TaskCacheStageInfoMixin, Task):
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
         self._local_kv_tiles = Int32(1)
+        self._runtime_body_active = None
 
     @cute.jit
+    def run_body(self, context=None):
+        """Guard data work only, after TaskManager initializes every task."""
+        if cutlass.const_expr(self._runtime_body_active is not None):
+            if self._runtime_body_active:
+                super().run_body(**task_context_kwargs(context))
+        else:
+            super().run_body(**task_context_kwargs(context))
+
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
         super().init_variables(context)
@@ -131,18 +134,14 @@ class MlaDecodeTask(TaskCacheStageInfoMixin, Task):
             Int32(0),
         )
 
+    @cute.jit
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
-        return self._resolve_domain(tile_coord, self.domain)
-
-    @cute.jit
-    def _resolve_domain(self, tile_coord, static_domain):
-        """Resolve one tile's loop domain, falling back to the schedule's ``static_domain``."""
         if cutlass.const_expr(self.cfg is None):
-            return static_domain
+            return self.domain
         if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
             # Padding and scheduler tasks have no K/V metadata or mainloop.
-            return static_domain
+            return self.domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
@@ -247,7 +246,8 @@ def create_throughput_latency_softmax_task_impl(
             local_sum_arr,
             s_arr,
         ) = tmem_s.init_softmax_state()
-        if store_stats_before_p:
+        if store_stats_before_p and hasattr(p_resource, "init_materialize_state"):
+            # SMEM P prepares its stage view here; TMEM P needs no setup.
             p_resource.init_materialize_state()
 
         def store_stats(inst_idx: int):
@@ -279,7 +279,7 @@ def create_throughput_latency_softmax_task_impl(
                     local_sum_arr,
                     s_arr,
                 ) = work_tile_state
-            with domain_loop(0, runtime_domain_end(domain), 1) as d:
+            with domain_loop(0, domain, 1) as d:
                 tmem_s.wait()
                 (
                     old_max_arr,
@@ -426,7 +426,14 @@ def create_keeps_mma_ab_softmax_task(
     task_class=MlaDecodeTask,
     **kw,
 ) -> Task:
-    """Create the single-pipe softmax/P task for the keeps-MMA-AB path."""
+    """Create the single-pipe softmax/P task for the keeps-MMA-AB path.
+
+    Loop correction rescales O from the old/new maxima only, which are final
+    once update_softmax returns, so publish them before materializing P: the
+    correction then overlaps P materialization instead of following it, and
+    PV no longer waits for both in sequence. The running sum still updates
+    after P, before the tail stats that normalize the output.
+    """
     return create_throughput_latency_softmax_task_impl(
         tmem_s,
         tmem_softmax_local,
@@ -436,7 +443,7 @@ def create_keeps_mma_ab_softmax_task(
         cfg,
         inst_id=0,
         domain=domain,
-        store_stats_before_p=False,
+        store_stats_before_p=True,
         task_name="SoftmaxTask",
         task_class=task_class,
         **kw,
@@ -615,6 +622,23 @@ def create_keeps_mma_ab_correction_task(
                 inst_idx=0,
                 is_tail=True,
             )
+            if cfg.ws_tail_staged_stripes:
+                # Read O, release it to the next tile's PV, then finish the tail.
+                tmem_corr.correct_tail_and_stage(
+                    old_max_arr=old_max_arr,
+                    new_max_arr=new_max_arr,
+                    sum_arr=sum_arr,
+                    inst0_new_max_arr=inst0_new_max_arr,
+                    inst0_sum_arr=inst0_sum_arr,
+                    inst1_new_max_arr=inst1_new_max_arr,
+                    inst1_sum_arr=inst1_sum_arr,
+                    o_stage_idx=o_stage_idx,
+                    tail_o_stage_idx_0=tail_o_stage_idx_0,
+                    tail_o_stage_idx_1=tail_o_stage_idx_1,
+                )
+                tmem_o.release()
+                tmem_corr.store_staged_tail()
+                return local_state, tail_o_stage_idx_0, tail_o_stage_idx_1
             tmem_corr.correct_tail_and_store(
                 old_max_arr=old_max_arr,
                 new_max_arr=new_max_arr,
@@ -652,8 +676,10 @@ def create_keeps_mma_ab_correction_task(
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
                 ) = work_tile_state
+            # Tail-only global inputs load before the first stats wait.
+            tmem_corr.prefetch_tail_inputs()
             local_state = load_initial_local_stats(local_state)
-            with domain_loop(0, runtime_domain_end(domain), 1):
+            with domain_loop(0, domain, 1):
                 (
                     local_state,
                     tail_o_stage_idx_0,
@@ -665,6 +691,8 @@ def create_keeps_mma_ab_correction_task(
                 tail_o_stage_idx_0,
                 tail_o_stage_idx_1,
             ) = correct_tail_o(local_state, tail_o_stage_idx_0, tail_o_stage_idx_1)
+        if cfg.ws_tma_output:
+            tmem_corr.drain_output_stores()
 
     schedule_result = (
         correction_schedule(tmem_softmax_local, tmem_o, tmem_corr)
@@ -945,7 +973,7 @@ def create_throughput_latency_correction_task(
                     tmem_softmax_local1, local1_state
                 )
 
-            with domain_loop(0, runtime_domain_end(domain), 1):
+            with domain_loop(0, domain, 1):
                 (
                     local0_state,
                     tail_o_stage_idx_0,
@@ -1131,7 +1159,7 @@ def create_load_page_offsets_task(
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
                 )
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
@@ -1147,7 +1175,7 @@ def create_load_page_offsets_task(
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
                 )
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k1", section=MlaStage.Loop
                     )
@@ -1165,7 +1193,7 @@ def create_load_page_offsets_task(
                     smem_page_offsets, "load_k1", section=MlaStage.Head
                 )
 
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
@@ -1306,8 +1334,17 @@ def create_throughput_latency_load_task(
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             schedule_token_throttle_head(schedule_token_throttle)
             smem_q.acquire()
-            smem_q.load_q()
-            smem_q.commit()
+            if cfg.q_in_kv:
+                # The Q pipeline hands the tile over without bytes; its Q lands
+                # in the next two K/V ring slices, ahead of the tile's K.
+                smem_q.commit()
+                for half in range(2):
+                    smem_kv.acquire()
+                    smem_kv.load_q_half(half=half)
+                    smem_kv.commit()
+            else:
+                smem_q.load_q()
+                smem_q.commit()
             if cfg.serial_swap_reuse:
                 load_kv(
                     head_dim_stages=cfg.qk_head_dim_stages,
@@ -1315,7 +1352,7 @@ def create_throughput_latency_load_task(
                     section=MlaStage.Head,
                     page_id_slot=0,
                 )
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     load_kv(
                         head_dim_stages=cfg.qk_head_dim_stages,
                         producer_label="load_k1",
@@ -1349,7 +1386,7 @@ def create_throughput_latency_load_task(
                         page_id_slot=1,
                     )
 
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     if cfg.single_kv_pipe:
                         load_kv(
                             head_dim_stages=cfg.qk_head_dim_stages,
@@ -1692,7 +1729,7 @@ def create_throughput_latency_mma_task(
                     consumer_label="k_desc_0",
                     release_k=False,
                 )
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     staged_pv_mma(
                         smem_kv,
                         smem_p0,
@@ -1769,7 +1806,7 @@ def create_throughput_latency_mma_task(
                     consumer_label="k_desc_1",
                     release_k=not cfg.sparse_reuse_kv,
                 )
-                with domain_loop(0, runtime_domain_end(domain), 1):
+                with domain_loop(0, domain, 1):
                     tmem_s0.acquire()
                     staged_pv_mma(
                         smem_kv,
@@ -1937,7 +1974,13 @@ def create_single_kv_pipe_mma_task(
                 if not swap:
                     p_resource.init_stage_work_tile_state()
             smem_q.wait()
-            q_desc, q_desc_rope = smem_q.q_desc()
+            if cfg.q_in_kv:
+                # Both K/V ring slices of the tile's Q, then the copy to TMEM.
+                smem_kv.wait()
+                smem_kv.wait()
+                q_desc, q_desc_rope = smem_kv.q_desc_from_kv()
+            else:
+                q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
             staged_qk_mma(
                 smem_kv,
@@ -1947,7 +1990,17 @@ def create_single_kv_pipe_mma_task(
                 consumer_label="k_desc_0",
                 release_k=not cfg.sparse_reuse_kv,
             )
-            with domain_loop(0, runtime_domain_end(domain), 1):
+            if cfg.q_tmem_mma_copy:
+                # QK reads Q from TMEM, so the commit-based release arrives after
+                # the copy and the first QK; the loader prefetches the next Q
+                # during the rest of this tile.
+                smem_q.release()
+                if cfg.q_in_kv:
+                    # The oldest unreleased ring slices are Q's: release them
+                    # before any of the K slices QK retains for PV.
+                    smem_kv.release()
+                    smem_kv.release()
+            with domain_loop(0, domain, 1):
                 if pv_before_qk:
                     pv_mma(
                         smem_kv,
@@ -1991,7 +2044,8 @@ def create_single_kv_pipe_mma_task(
                 producer_label=pv_tail,
                 **pv_kwargs,
             )
-            smem_q.release()
+            if not cfg.q_tmem_mma_copy:
+                smem_q.release()
 
     schedule_result = (
         mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o)
