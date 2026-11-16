@@ -341,6 +341,104 @@ def record_kda_replay_acceptance(
         )
 
 
+@triton.jit(do_not_specialize=["num_requests"])
+def _build_kda_mtp_replay_work_items_kernel(
+    work_items_ptr,
+    state_indices_ptr,
+    replay_indices_ptr,
+    history_len_ptr,
+    history_len_stride,
+    num_requests,
+    POSITION: tl.constexpr,
+    CACHE_SLOT: tl.constexpr,
+    HISTORY_LEN: tl.constexpr,
+    UNUSED: tl.constexpr,
+    REPLAY_SLOT: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = rows < num_requests
+    slots = tl.load(state_indices_ptr + rows, mask=mask, other=0).to(tl.int32)
+    replay_slots = tl.load(replay_indices_ptr + rows, mask=mask, other=0).to(tl.int32)
+    lengths = tl.load(
+        history_len_ptr + replay_slots.to(tl.int64) * history_len_stride, mask=mask, other=0
+    )
+    row = work_items_ptr + rows * WIDTH
+    tl.store(row + POSITION, rows, mask=mask)
+    tl.store(row + CACHE_SLOT, slots, mask=mask)
+    tl.store(row + HISTORY_LEN, lengths, mask=mask)
+    tl.store(row + UNUSED, tl.zeros_like(rows), mask=mask)
+    tl.store(row + REPLAY_SLOT, replay_slots, mask=mask)
+
+
+def build_kda_mtp_replay_work_items(
+    state_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    history_len: torch.Tensor,
+    work_items: torch.Tensor,
+) -> None:
+    """Snapshot the rows the KDA MTP commit processes, in one launch.
+
+    Row ``i`` of ``work_items`` becomes (decode position ``i``, recurrent-state
+    slot, accepted history length at replay, 0, replay slot), the columns of
+    ``mamba2_metadata.REPLAY_WORK_*``. The launch shape depends only on the
+    host-side length, so the call is CUDA-graph capturable.
+
+    Args:
+        state_indices: ``[batch]`` int32/int64 recurrent-state slots, contiguous.
+        replay_indices: ``[batch]`` int32/int64 replay slots, contiguous.
+        history_len: ``[replay_slots]`` int32, may be strided (a column of the
+            per-slot replay count rows).
+        work_items: ``[>= batch, REPLAY_WORK_ITEM_WIDTH]`` contiguous int32.
+    """
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+        REPLAY_WORK_CACHE_BUF_IDX,
+        REPLAY_WORK_CACHE_SLOT,
+        REPLAY_WORK_ITEM_WIDTH,
+        REPLAY_WORK_PNAT,
+        REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+        REPLAY_WORK_REPLAY_SLOT,
+    )
+
+    device = history_len.device
+    num_requests = state_indices.numel()
+    if not (
+        _is_dense_vector(state_indices, device, _KDA_ACCEPTANCE_INDEX_DTYPES)
+        and _is_dense_vector(replay_indices, device, _KDA_ACCEPTANCE_INDEX_DTYPES)
+        and replay_indices.numel() == num_requests
+        and history_len.dtype == torch.int32
+        and history_len.dim() == 1
+        and work_items.device == device
+        and work_items.dtype == torch.int32
+        and work_items.dim() == 2
+        and work_items.shape[0] >= num_requests
+        and work_items.shape[1] == REPLAY_WORK_ITEM_WIDTH
+        and work_items.is_contiguous()
+    ):
+        raise ValueError("build_kda_mtp_replay_work_items: unsupported tensor layout")
+    if num_requests == 0:
+        return
+    with torch.cuda.device(device.index):
+        _build_kda_mtp_replay_work_items_kernel[
+            (triton.cdiv(num_requests, _KDA_ACCEPTANCE_BLOCK),)
+        ](
+            work_items,
+            state_indices,
+            replay_indices,
+            history_len,
+            history_len.stride(0),
+            num_requests,
+            POSITION=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+            CACHE_SLOT=REPLAY_WORK_CACHE_SLOT,
+            HISTORY_LEN=REPLAY_WORK_PNAT,
+            UNUSED=REPLAY_WORK_CACHE_BUF_IDX,
+            REPLAY_SLOT=REPLAY_WORK_REPLAY_SLOT,
+            WIDTH=REPLAY_WORK_ITEM_WIDTH,
+            BLOCK=_KDA_ACCEPTANCE_BLOCK,
+        )
+
+
 def _load_prefill_module() -> ModuleType:
     """Import the in-tree prefill custom-op module (registers the op)."""
     global _PREFILL_MODULE, _PREFILL_IMPORT_ERROR

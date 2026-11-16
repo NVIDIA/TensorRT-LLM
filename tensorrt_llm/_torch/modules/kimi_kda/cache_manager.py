@@ -627,6 +627,25 @@ class KDAReplayState:
             and params.mamba_ssm_cache_dtype == torch.float16,
         )
         state = cls(num_spec, draft_records=kwargs.get("kda_draft_records", False))
+        if kwargs.get("kda_mtp_replay", False):
+            num_heads = params.num_heads // tp_size
+            reason = kda_mtp_replay_unsupported_reason(
+                tokens_per_gen_step=num_spec + 1,
+                decoding_type=getattr(spec_config, "decoding_type", None),
+                num_heads=num_heads,
+                head_k_dim=params.state_size,
+                head_v_dim=params.head_dim,
+                conv_window=params.conv_kernel - 1,
+                model_dtype=params.dtype,
+                # Kimi K3 keeps an fp32 recurrent state unless the cache
+                # configuration opts in to bf16 (resolve_kimi_ssm_cache_dtype).
+                ssm_cache_dtype=params.mamba_ssm_cache_dtype or torch.float32,
+                stochastic_rounding=stochastic_rounding,
+                draft_records=state.draft_records,
+            )
+            if reason is None:
+                layout = _kda_mtp_replay_layout(num_spec + 1, num_heads, params.head_dim)
+                return layout, local_layers, False
         layout = _kda_replay_layout(
             num_spec,
             params.num_heads // tp_size,
@@ -988,6 +1007,375 @@ class KDAReplayState:
         self.rand_seed = None
 
 
+# Per-layer planes of the KDA MTP replay (KDAMtpReplayState): one
+# [heads, capacity, head_dim] history per replay slot, holding the accepted
+# window followed by the step's candidates: normalized K and the delta-rule
+# update U in BF16, the cumulative per-channel decay G in FP32.
+_KDA_MTP_HISTORY_ROLES = ("kda_mtp_k", "kda_mtp_u", "kda_mtp_g")
+KDA_MTP_REPLAY_HISTORY_SIZE = 16
+
+
+def _kda_mtp_replay_layout(
+    tokens_per_gen_step: int, num_heads: int, head_dim: int
+) -> dict[str, tuple[torch.dtype, list[int]]]:
+    shape = [num_heads, KDA_MTP_REPLAY_HISTORY_SIZE + tokens_per_gen_step, head_dim]
+    return {
+        "kda_mtp_k": (torch.bfloat16, shape),
+        "kda_mtp_u": (torch.bfloat16, shape),
+        "kda_mtp_g": (torch.float32, shape),
+    }
+
+
+@dataclass(frozen=True, kw_only=True)
+class KDAMtpReplayLayerCache(MambaLayerCache):
+    """Per-layer KDA MTP replay histories and candidate Conv inputs."""
+
+    # Accepted history length per replay slot, shared by every layer.
+    prev_num_accepted_tokens: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+    # [replay_slots, heads, capacity, head_dim]
+    history_k: torch.Tensor | None = None
+    history_u: torch.Tensor | None = None
+    history_G: torch.Tensor | None = None
+    # [max_batch_size, tokens_per_gen_step, 3 * heads * head_dim] raw q|k|v rows
+    candidate_x: torch.Tensor | None = None
+
+    @property
+    def has_kda_replay_caches(self) -> bool:
+        return False
+
+    @property
+    def has_kda_mtp_replay(self) -> bool:
+        return self.history_k is not None
+
+
+class KDAMtpReplayState(KDAReplayState):
+    """KDA MTP replay: Conv4 fused into a history replay, one all-layer commit.
+
+    Every layer keeps one history per replay slot: the accepted window of
+    ``KDA_MTP_REPLAY_HISTORY_SIZE`` rows followed by the step's candidate rows.
+    The replay-count row holds the accepted history length. Verification
+    (``kda_mtp_replay``) rebuilds each request's state from its recurrent
+    checkpoint and history without changing either checkpoint, and keeps the
+    raw candidate Conv inputs. After sampling, one ``kda_mtp_commit`` launch
+    advances every layer's Conv window and history length and, when the
+    history fills, folds it into the recurrent checkpoint.
+    """
+
+    def __init__(self, num_speculative_tokens: int) -> None:
+        super().__init__(num_speculative_tokens)
+        self.replay_history_size = KDA_MTP_REPLAY_HISTORY_SIZE
+        self.replay_step_width = num_speculative_tokens + 1
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
+        self._num_heads = 0
+        self._owns_history = False
+        self.candidate_x: torch.Tensor | None = None
+        self._work_items: torch.Tensor | None = None
+        self._history_descriptors: torch.Tensor | None = None
+        self._state_descriptors: torch.Tensor | None = None
+        self._conv_descriptors: torch.Tensor | None = None
+
+    @override
+    def pool_layout(self, context: MambaStateLayout) -> dict[str, tuple[torch.dtype, list[int]]]:
+        if not context.mamba_pp_layers:
+            return {}
+        num_heads, _, head_dim = context.ssm_state_shape
+        return _kda_mtp_replay_layout(self.replay_step_width, num_heads, head_dim)
+
+    @override
+    def bytes_per_slot(self, context: MambaStateLayout, layer_id: int) -> int:
+        if not context.mamba_pp_layers:
+            return 0
+        shared_bytes = _KDA_REPLAY_COUNT_BYTES if layer_id == context.mamba_pp_layers[0] else 0
+        return shared_bytes + sum(
+            dtype.itemsize * math.prod(shape) for dtype, shape in self.pool_layout(context).values()
+        )
+
+    @override
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        self._ssm_states = tuple(ssm_states)
+        if ssm_states and self._pool_views is None and self.pool_layers is None:
+            self._allocate_history(context, ssm_states[0].device)
+        super().bind(context, ssm_states, conv_states)
+        if not ssm_states:
+            return
+        device = ssm_states[0].device
+        self._num_heads = context.ssm_state_shape[0]
+        self.candidate_x = torch.zeros(
+            [
+                len(context.mamba_pp_layers),
+                context.max_batch_size,
+                self.replay_step_width,
+                context.conv_state_shape[0],
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        from tensorrt_llm._torch.modules.mamba.mamba2_metadata import REPLAY_WORK_ITEM_WIDTH
+
+        self._work_items = torch.zeros(
+            [context.max_batch_size, REPLAY_WORK_ITEM_WIDTH], dtype=torch.int32, device=device
+        )
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import (
+            build_kda_mtp_history_descriptors,
+        )
+
+        self._history_descriptors = build_kda_mtp_history_descriptors(
+            *([layer[role] for layer in self.pool_layers] for role in _KDA_MTP_HISTORY_ROLES)
+        )
+        self._state_descriptors = _kda_mtp_state_descriptors(
+            self._ssm_states, tuple(context.ssm_state_shape), "SSM state"
+        )
+        self._conv_descriptors = _kda_mtp_state_descriptors(
+            self._conv_states, tuple(context.conv_state_shape), "Conv state"
+        )
+        logger.info_once(
+            "Configured KDA MTP replay: fused Conv4 replay and all-layer commit",
+            key="kda_mtp_replay_layout",
+        )
+
+    def _allocate_history(self, context: MambaStateLayout, device: torch.device) -> None:
+        """Allocate standalone histories with one replay slot per recurrent-state slot."""
+        cache_size = context.slot_capacity
+        if cache_size is None:
+            raise RuntimeError("KDA replay requires the allocated V2 slot capacity")
+        layout = self.pool_layout(context)
+        self.pool_layers = [
+            {
+                role: torch.zeros([cache_size, *shape], dtype=dtype, device=device)
+                for role, (dtype, shape) in layout.items()
+            }
+            for _ in context.mamba_pp_layers
+        ]
+        self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        self._owns_history = True
+
+    @override
+    def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
+        layer = self.pool_layers[layer_offset]
+        return {
+            "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
+            "history_k": layer["kda_mtp_k"],
+            "history_u": layer["kda_mtp_u"],
+            "history_G": layer["kda_mtp_g"],
+            "candidate_x": None if self.candidate_x is None else self.candidate_x[layer_offset],
+        }
+
+    @override
+    def make_layer_cache(
+        self,
+        layer_offset: int,
+        conv: torch.Tensor,
+        temporal: torch.Tensor,
+    ) -> MambaLayerCache:
+        return KDAMtpReplayLayerCache(
+            conv=conv,
+            temporal=temporal,
+            **self._layer_cache_fields(layer_offset),
+        )
+
+    @override
+    def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
+        """Move standalone histories after the requests' state slots changed.
+
+        Views of the manager's replay pool follow their requests on their own.
+        """
+        if not self._owns_history or self.prev_num_accepted_tokens is None:
+            return
+        moves = [(old, new) for old, new in zip(old_slots, new_slots) if old >= 0 and old != new]
+        if not moves:
+            return
+        device = self.prev_num_accepted_tokens.device
+        source = _host_slots_to_device([old for old, _ in moves], device)
+        destination = _host_slots_to_device([new for _, new in moves], device)
+        for buffer in (
+            self.prev_num_accepted_tokens,
+            *(layer[role] for layer in self.pool_layers for role in _KDA_MTP_HISTORY_ROLES),
+        ):
+            buffer.index_copy_(0, destination, buffer.index_select(0, source))
+
+    @override
+    @torch.inference_mode()
+    def seed_transferred_slots(
+        self, state_indices: torch.Tensor, replay_indices: torch.Tensor | None = None
+    ) -> None:
+        """Start transferred requests' replay from their transferred checkpoints.
+
+        The transferred Conv and recurrent checkpoints are current, so only the
+        history length is cleared.
+        """
+        if self.prev_num_accepted_tokens is None or state_indices.numel() == 0:
+            return
+        self.reset_replay_slots(state_indices if replay_indices is None else replay_indices)
+
+    @override
+    def record_acceptance(
+        self,
+        replay_indices: torch.Tensor,
+        num_accepted_draft_tokens: torch.Tensor,
+        is_dummy_request: torch.Tensor | None,
+    ) -> None:
+        raise NotImplementedError("KDA MTP replay commits acceptance in update()")
+
+    @override
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Commit the accepted Conv windows and histories of every layer in one launch.
+
+        Args:
+            batch: The generation rows' acceptance.
+            replay_slots: ``[num_generations]`` replay slots of the generation rows;
+                ``batch.destination_state_indices`` when ``None``.
+        """
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import kda_mtp_commit
+
+        from ._kda_kernels import build_kda_mtp_replay_work_items
+
+        num_generations = batch.num_generations
+        if num_generations == 0 or not self._ssm_states:
+            return
+        if self._history_descriptors is None or self._work_items is None:
+            raise RuntimeError("KDA MTP replay buffers are not bound")
+        if batch.is_dummy_request is None:
+            raise RuntimeError("KDA MTP replay commit requires the dummy-request mask")
+        state_slots = batch.destination_state_indices
+        if replay_slots is None:
+            replay_slots = state_slots
+        work_items = self._work_items[:num_generations]
+        build_kda_mtp_replay_work_items(
+            state_slots, replay_slots, self.prev_num_accepted_tokens, work_items
+        )
+        kda_mtp_commit(
+            ssm_states=self._ssm_states[0],
+            conv_states=self._conv_states[0],
+            candidate_x=self.candidate_x,
+            history_descriptors=self._history_descriptors,
+            history_len=self.prev_num_accepted_tokens,
+            replay_work_items=work_items,
+            accepted_tokens=batch.num_accepted_tokens.to(torch.int32),
+            is_dummy=batch.is_dummy_request,
+            heads=self._num_heads,
+            history_window=self.replay_history_size,
+            ssm_state_descriptors=self._state_descriptors,
+            conv_state_descriptors=self._conv_descriptors,
+        )
+
+    @override
+    def shutdown(self) -> None:
+        super().shutdown()
+        self._ssm_states = ()
+        self._owns_history = False
+        self.candidate_x = None
+        self._work_items = None
+        self._history_descriptors = None
+        self._state_descriptors = None
+        self._conv_descriptors = None
+
+
+def _kda_mtp_state_descriptors(
+    states: tuple[torch.Tensor, ...], inner_shape: tuple[int, ...], name: str
+) -> torch.Tensor:
+    """``[L, 2]`` int64 rows (base address, slot stride), both in bytes, of the layer views."""
+    reference = states[0]
+    dense = tuple(math.prod(inner_shape[i + 1 :]) for i in range(len(inner_shape)))
+    for state in states:
+        if (
+            state.dtype != reference.dtype
+            or state.device != reference.device
+            or tuple(state.shape[1:]) != inner_shape
+            or state.stride()[1:] != dense
+        ):
+            raise RuntimeError(
+                f"KDA MTP replay requires {name} layers with matching dtype, device, "
+                "shape and dense inner dimensions"
+            )
+    return torch.tensor(
+        [(state.data_ptr(), state.stride(0) * state.element_size()) for state in states],
+        dtype=torch.int64,
+        device=reference.device,
+    )
+
+
+def kda_mtp_replay_unsupported_reason(
+    *,
+    tokens_per_gen_step: int,
+    decoding_type: str | None,
+    num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    conv_window: int,
+    model_dtype: torch.dtype,
+    ssm_cache_dtype: torch.dtype,
+    stochastic_rounding: bool,
+    draft_records: bool,
+) -> str | None:
+    """Why the KDA MTP replay kernels cannot serve this configuration, or None."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+    if draft_records:
+        return "does not keep the drafts' records"
+    if decoding_type == "NGram":
+        return "requires a one-model drafter"
+    if not is_sm_100f(get_sm_version()):
+        return "requires an SM100/SM103 GPU"
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return "requires CUTLASS DSL"
+    if model_dtype != torch.bfloat16:
+        return "requires a bf16 model"
+    if ssm_cache_dtype not in (torch.bfloat16, torch.float32):
+        return "requires a bf16 or fp32 recurrent state"
+    if stochastic_rounding:
+        return "rounds the committed state to nearest"
+    if head_k_dim != 128 or head_v_dim != 128:
+        return "requires key and value head size 128"
+    if num_heads <= 0:
+        return "requires KDA heads on this rank"
+    if conv_window != 3:
+        return "requires a 4-tap convolution"
+    if not 1 <= tokens_per_gen_step <= 8:
+        return "supports at most 8 tokens per generation step"
+    return None
+
+
+def create_kda_replay_state(
+    num_spec: int,
+    layout: MambaStateLayout,
+    *,
+    kda_mtp_replay: bool,
+    stochastic_rounding: bool = False,
+    draft_records: bool = False,
+) -> KDAReplayState:
+    """The KDA MTP replay when the model and configuration allow it, else the fused verify."""
+    if kda_mtp_replay:
+        num_heads, head_v_dim, head_k_dim = layout.ssm_state_shape
+        reason = kda_mtp_replay_unsupported_reason(
+            tokens_per_gen_step=num_spec + 1,
+            decoding_type=getattr(layout.spec_config, "decoding_type", None),
+            num_heads=num_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            conv_window=layout.conv_state_shape[1],
+            model_dtype=layout.conv_state_dtype,
+            ssm_cache_dtype=layout.ssm_state_dtype,
+            stochastic_rounding=stochastic_rounding,
+            draft_records=draft_records,
+        )
+        if reason is None:
+            logger.info("KDA replay kernel: KDA MTP replay")
+            return KDAMtpReplayState(num_spec)
+        logger.info(f"KDA MTP replay {reason}; using the fused verify")
+    return KDAReplayState(
+        num_spec, stochastic_rounding=stochastic_rounding, draft_records=draft_records
+    )
+
+
 def select_kda_replay_state(
     *,
     spec_config: object | None,
@@ -1083,6 +1471,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
+    _kda_mtp_replay = False
 
     @classmethod
     @override
@@ -1096,6 +1485,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         *args,
         kda_replay_num_spec: int | None = None,
         kda_draft_records: bool = False,
+        kda_mtp_replay: bool = False,
         use_replay_state_update: bool = False,
         layer_specs: Sequence[KVCacheLayerSpec] | None = None,
         **kwargs,
@@ -1111,6 +1501,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             layer_specs: Draft-owned attention layers a standalone drafter
                 keeps in this manager, appended after the target layers that
                 the mask arguments describe (see ``_append_draft_layers``).
+            kda_mtp_replay: Whether the model's KDA layers can verify drafts
+                with the KDA MTP replay kernels instead of the fused verify.
         """
         if use_replay_state_update:
             raise ValueError("KDA replay and Mamba2 replay are mutually exclusive")
@@ -1119,6 +1511,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
+        self._kda_mtp_replay = kda_mtp_replay
         self._kda_replay: KDAReplayState | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -1319,8 +1712,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if self.kda_context_only:
             return None
         if num_spec is not None:
-            self._kda_replay = KDAReplayState(
+            self._kda_replay = create_kda_replay_state(
                 num_spec,
+                self._state_layout,
+                kda_mtp_replay=self._kda_mtp_replay,
                 stochastic_rounding=self._mamba_ssm_stochastic_rounding,
                 draft_records=self._requested_draft_records,
             )
@@ -1331,6 +1726,17 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    def get_replay_dummy_request_mask(self) -> torch.Tensor | None:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        The KDA MTP replay skips dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
+    @property
+    def use_kda_mtp_replay(self) -> bool:
+        return isinstance(self._kda_replay, KDAMtpReplayState)
 
     @property
     def keeps_kda_draft_records(self) -> bool:
@@ -1806,10 +2212,13 @@ def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
 __all__ = [
     "KDAIntermediateLayerCache",
     "KDAIntermediateState",
+    "KDAMtpReplayLayerCache",
+    "KDAMtpReplayState",
     "KDAReplayState",
     "KDAReplayLayerCache",
     "KimiK3HybridCacheManager",
     "allocate_kda_replay_fields",
+    "create_kda_replay_state",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
     "resolve_kimi_ssm_cache_dtype",

@@ -121,6 +121,23 @@ def _writeback_state_rows(
     ssm_pool.index_copy_(0, slot_indices.long(), rows.to(ssm_pool.dtype))
 
 
+def _packed_qkv_rows(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``[..., 3 * D]`` raw q|k|v rows: a view when the sections are adjacent
+    column blocks of one projection, otherwise a concatenated copy."""
+    width = q.shape[-1]
+    step = width * q.element_size()
+    if (
+        k.shape == q.shape
+        and v.shape == q.shape
+        and q.stride() == k.stride() == v.stride()
+        and q.stride(-1) == 1
+        and k.data_ptr() == q.data_ptr() + step
+        and v.data_ptr() == q.data_ptr() + 2 * step
+    ):
+        return q.as_strided((*q.shape[:-1], 3 * width), q.stride())
+    return torch.cat((q, k, v), dim=-1)
+
+
 def _kda_split_conv_sections(
     conv_state: torch.Tensor, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -604,7 +621,11 @@ class KimiKDALinearAttention(nn.Module):
                 cores.append(prefill_core)
         if num_decodes > 0:
             decode_rows = num_tokens - num_ctx_tokens
-            if decode_rows == num_decodes:
+            # The KDA MTP replay's recurrent checkpoint lags its accepted
+            # history, so every generation row, including a draft-free step,
+            # goes through the replay.
+            use_mtp_replay = self._has_kda_mtp_replay(layer_cache)
+            if decode_rows == num_decodes and not use_mtp_replay:
                 decode_core = self.forward_decode(
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
@@ -630,6 +651,12 @@ class KimiKDALinearAttention(nn.Module):
                 assert decode_rows % num_decodes == 0, (
                     f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
+                replay_kwargs = {}
+                if use_mtp_replay:
+                    dummy_mask = attn_metadata.kv_cache_manager.get_replay_dummy_request_mask()
+                    if dummy_mask is None:
+                        raise RuntimeError("KDA MTP replay requires the dummy-request mask")
+                    replay_kwargs["replay_is_dummy"] = dummy_mask[num_prefills:batch_size]
                 verify_core = self.forward_verify(
                     hidden_states[num_ctx_tokens:num_tokens],
                     decode_rows // num_decodes,
@@ -648,6 +675,7 @@ class KimiKDALinearAttention(nn.Module):
                         if self.takes_prequantized_input(hidden_states.shape[0], attn_metadata)
                         else None
                     ),
+                    **replay_kwargs,
                 )
                 if output is None:
                     cores.append(verify_core)
@@ -670,6 +698,10 @@ class KimiKDALinearAttention(nn.Module):
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
         return bool(getattr(layer_cache, "has_kda_replay_caches", False))
+
+    def _has_kda_mtp_replay(self, layer_cache) -> bool:
+        """True when the manager keeps the KDA MTP replay histories."""
+        return bool(getattr(layer_cache, "has_kda_mtp_replay", False))
 
     def _sync_kda_replay_conv_window(
         self, layer_cache, slot_indices, conv_pool, replay_slot_indices=None
@@ -1323,6 +1355,7 @@ class KimiKDALinearAttention(nn.Module):
         allow_prequantized_output: bool = False,
         replay_slot_indices: Optional[torch.Tensor] = None,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        replay_is_dummy: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
@@ -1331,8 +1364,14 @@ class KimiKDALinearAttention(nn.Module):
         ``replay_slot_indices`` their slots in the KDA replay caches
         (``slot_indices`` when ``None``).
 
-        Two paths:
+        Three paths:
 
+        * MTP replay (``kda_mtp_replay``, when the manager keeps the KDA MTP
+          replay histories): one launch per layer runs the Conv4 update and
+          rebuilds each request's state from its recurrent checkpoint and
+          accepted history, leaving both checkpoints untouched;
+          ``update_mamba_states()`` afterwards commits every layer in one
+          launch. ``replay_is_dummy`` marks the padding rows it skips.
         * Fused (``trtllm::kda_mtp_decode``, when the manager allocated the
           KDA replay caches): one kernel launch replays the previous
           round's accepted drafts from the per-slot replay caches, then
@@ -1345,6 +1384,19 @@ class KimiKDALinearAttention(nn.Module):
           ``update_mamba_states()`` promotes the accepted step's state
           after sampling.
         """
+        if self._has_kda_mtp_replay(layer_cache):
+            return self.forward_verify_replay(
+                x2d,
+                num_steps,
+                layer_cache,
+                conv_pool,
+                ssm_pool,
+                slot_indices,
+                replay_slot_indices,
+                replay_is_dummy,
+                output=output,
+                prequantized_input=prequantized_input,
+            )
         if self._has_kda_replay_caches(layer_cache):
             assert self._dispatch.verify_kernel_path == "optimized", (
                 "KDA replay caches are allocated but the fused verify "
@@ -1591,6 +1643,83 @@ class KimiKDALinearAttention(nn.Module):
         o = out.view(num_generations, num_steps, H, self.head_dim)
         core = self._output_gate(x, o, onorm_g)
         # Can be removed once attention writes the core in place.
+        return self._store_core(core, output)
+
+    def forward_verify_replay(
+        self,
+        x2d: torch.Tensor,
+        num_steps: int,
+        layer_cache,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        slot_indices: torch.Tensor,
+        replay_slot_indices: Optional[torch.Tensor],
+        is_dummy: Optional[torch.Tensor],
+        output: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Verify through ``kda_mtp_replay``; returns the post-o_norm core.
+
+        The kernel reads the raw q|k|v rows of the fused projection in place,
+        addresses the recurrent checkpoint and Conv window by ``slot_indices``
+        and the histories by ``replay_slot_indices`` (``slot_indices`` when
+        ``None``). ``num_steps`` may be smaller than the width the histories
+        were sized for.
+        """
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
+
+        from .cache_manager import KDA_MTP_REPLAY_HISTORY_SIZE
+
+        if replay_slot_indices is None:
+            replay_slot_indices = slot_indices
+        if is_dummy is None:
+            raise RuntimeError("KDA MTP replay requires the dummy-request mask")
+        if self.conv_size != 4 or self.gate_lower_bound != -5.0:
+            raise RuntimeError("KDA MTP replay requires Conv4 and gate_lower_bound=-5")
+        if self._packed_conv_weight is None or self._A_log_f32 is None:
+            raise RuntimeError("KDA MTP replay constants were not finalized")
+        num_generations = x2d.shape[0] // num_steps
+        H = self.num_heads
+        x = x2d.view(num_generations, num_steps, -1)
+        projections = self._project_verify_inputs(
+            x,
+            num_generations * num_steps,
+            preserve_section_strides=True,
+            prequantized_input=prequantized_input,
+        )
+        if projections is None:
+            q_proj, k_proj, v_proj = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+            forget_gate = self.f_b_proj(self.f_a_proj(x))
+            beta_proj = self.b_proj(x)
+            onorm_g = None
+        else:
+            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections
+        if output is None:
+            replay_output = x2d.new_empty(num_generations, num_steps, H, self.head_dim)
+        else:
+            replay_output = output.view(num_generations, num_steps, H, self.head_dim)
+        kda_mtp_replay(
+            raw_x=_packed_qkv_rows(q_proj, k_proj, v_proj),
+            conv_weight=self._packed_conv_weight,
+            conv_state=conv_pool,
+            raw_g=forget_gate.reshape(num_generations, num_steps, H, self.head_k_dim).contiguous(),
+            raw_beta=beta_proj.reshape(num_generations, num_steps, H),
+            checkpoint=ssm_pool,
+            state_indices=slot_indices,
+            replay_indices=replay_slot_indices,
+            is_dummy=is_dummy,
+            history_k=layer_cache.history_k,
+            history_u=layer_cache.history_u,
+            history_G=layer_cache.history_G,
+            history_len=layer_cache.prev_num_accepted_tokens,
+            A_log=self._A_log_f32,
+            dt_bias=self._dt_bias_f32,
+            output=replay_output,
+            candidate_x=layer_cache.candidate_x,
+            history_window=KDA_MTP_REPLAY_HISTORY_SIZE,
+        )
+        core = self._output_gate(x, replay_output, onorm_g)
+        # Can be removed once the replay writes the core in place.
         return self._store_core(core, output)
 
     def _build_mtp_conv_weights(self) -> None:
