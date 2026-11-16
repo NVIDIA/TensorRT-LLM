@@ -136,7 +136,6 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     record = {
         "index": index,
         "id": request.get("id", str(index)),
-        "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
         "prompt_tokens": len(prompt_ids) if prompt_ids is not None else None,
         "cached_tokens": reuse_probe.cached_tokens(output),
         **first,

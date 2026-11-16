@@ -17,7 +17,7 @@ from agent_flow.console import print_message
 from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, disagg, gate_records, serve
+from ...checks import check_config, disagg, serve
 from ...checks import verdict as check_result
 from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
@@ -347,9 +347,8 @@ class CheckRunner:
             return lambda runner: self._anchored_accuracy(check, env, spec, workdir, runner)
         if gate == "acceptance":
             return lambda runner: acceptance_checks.run_acceptance_gate(
-                env, features=features, workdir=workdir,
-                records=gate_records.records_for(self.workspace), **common(runner),
-            )  # fmt: skip
+                env, features=features, workdir=workdir, **common(runner)
+            )
         if gate == disagg.GATE_NAME:
             return lambda runner: disagg.run_disagg_gate(
                 env, workdir=workdir, task_data=self._with_dataset(spec, gate), runner=runner,

@@ -75,8 +75,7 @@ SPECULATIVE = FeatureEvidence(
     "speculative decoding",
     ("speculative",),
     "accepted draft tokens per iteration, per prompt (the acceptance gate)",
-    "the stock speculator on the same prompts; without one, the same target one draft depth "
-    "shallower, which each depth must beat",
+    "1.0, and the floor the unit declares in `accuracy.acceptance`",
     _ENGINE,
 )
 

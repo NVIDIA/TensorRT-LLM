@@ -270,7 +270,6 @@ def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32
         record = {
             "index": n,
             "id": f"d{n}",
-            "prompt_sha": f"p{n}",
             "tokens": accepted,
             "iterations": iterations,
             "token_ids": list(range(accepted)),

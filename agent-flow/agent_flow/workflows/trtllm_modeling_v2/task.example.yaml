@@ -219,10 +219,10 @@ accuracy:
   #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 
-  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt
-  # against built-in modeling (`=off`; fails under a 0.95 ratio when a paired test finds the drop
-  # significant), against the previous tree's verdict, and against 1.0. With no `=off` path, declare
-  # `measured_reference` (floor 0.95 x it) or `min_absolute` with its `floor_source`, per unit.
+  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration over the
+  # workload, in one load, held to 1.0 (every draft rejected) and to the floor the unit declares:
+  # `measured_reference` (floor 0.95 x it) or `min_absolute`, with its `floor_source`. A unit that
+  # declares none is held to 1.0 alone, and its verdict says so.
   # acceptance:
   #   # Default: the first `num_prompts` questions of the accuracy dataset, from the local cache.
   #   # Each workload key below also works inside a unit's entry, for that unit alone.
@@ -232,8 +232,6 @@ accuracy:
   #   # prompts: [...]              # or the prompts outright, or prompts_file: a YAML/JSON list
   #   max_tokens: 256               # default
   #   min_draft_iterations: 32      # default; fewer fails as "workload too short"
-  #   min_prompts: 32               # default; fewer fails as "workload too small"
-  #   regression: {alpha: 0.05, min_effect: 0.1}   # the defaults
   #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
   #   dspark: {measured_reference: 3.32}   # floor 3.15
 

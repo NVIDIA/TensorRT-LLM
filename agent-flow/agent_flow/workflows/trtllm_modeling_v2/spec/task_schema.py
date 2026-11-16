@@ -117,16 +117,10 @@ ACCEPTANCE_WORKLOAD_KEYS: tuple[str, ...] = (
     "dataset_config",
     "max_tokens",
     "min_draft_iterations",
-    "min_prompts",
 )
-# The paired t-test against the previous tree's verdict, at the block's top
-# level only: `alpha` (one-sided, default 0.05), `min_effect` (accepted tokens
-# per iteration, default 0.1). A drop must be both significant and at least
-# `min_effect` to fail.
-ACCEPTANCE_REGRESSION_KEYS: tuple[str, ...] = ("alpha", "min_effect")
-ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "regression", "timeout")
+ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "timeout")
 # What one unit's entry in `accuracy.acceptance` may carry:
-#   min_absolute        the absolute floor used when the `=off` leg cannot run
+#   min_absolute        the absolute floor its acceptance is held to
 #   measured_reference  what a reference drafter measured on this workload; the
 #                       floor is this x 0.95 when `min_absolute` is not given
 #   floor_source        where that measurement was taken. A floor with neither
@@ -214,9 +208,8 @@ TARGET_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 TARGET_NAME_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 
 ACCURACY_KEYS: tuple[str, ...] = (
-    # The absolute `acceptance_length` floor a unit falls back to when the
-    # `=off` leg cannot exist. Also the acceptance gate's declared workload;
-    # see `ACCEPTANCE_WORKLOAD_KEYS`.
+    # The `acceptance_length` floor a unit is held to, and the acceptance
+    # gate's declared workload; see `ACCEPTANCE_WORKLOAD_KEYS`.
     "acceptance",
     "benchmark",
     "reference_yaml",
@@ -828,26 +821,12 @@ def _validate_acceptance_workload(entry: Mapping[str, Any], errors: list[str], w
     _validate_fields(
         entry,
         dict.fromkeys(
-            ("max_tokens", "min_draft_iterations", "num_prompts", "min_prompts", GATE_TIMEOUT_KEY),
+            ("max_tokens", "min_draft_iterations", "num_prompts", GATE_TIMEOUT_KEY),
             _POS_INT,
         ),
         errors,
         where,
     )
-
-
-def _validate_acceptance_regression(block: Any, errors: list[str], where: str) -> None:
-    """Validate ``accuracy.acceptance.regression``."""
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping with keys {list(ACCEPTANCE_REGRESSION_KEYS)}")
-        return
-    reject_unknown_keys(block, ACCEPTANCE_REGRESSION_KEYS, errors, where=where)
-    alpha = block.get("alpha")
-    if alpha is not None and (not _number(alpha) or not 0 < alpha < 1):
-        errors.append(f"'{where}.alpha' must be a probability in (0, 1), got {alpha!r}")
-    effect = block.get("min_effect")
-    if effect is not None and (not _number(effect) or effect < 0):
-        errors.append(f"'{where}.min_effect' must be a number >= 0, got {effect!r}")
 
 
 def _validate_acceptance(block: Any, errors: list[str]) -> None:
@@ -865,8 +844,6 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
         )
         return
     _validate_acceptance_workload(block, errors, where)
-    if block.get("regression") is not None:
-        _validate_acceptance_regression(block["regression"], errors, f"{where}.regression")
     for unit, entry in block.items():
         if unit in ACCEPTANCE_BLOCK_KEYS:
             continue

@@ -21,7 +21,6 @@ resolves from the local cache or fails; nothing is downloaded.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -101,11 +100,6 @@ def parse_marked(output: str, marker: str) -> list[dict[str, Any]]:
         if isinstance(data, dict):
             records.append(data)
     return records
-
-
-def prompt_digest(text: str) -> str:
-    """A short, stable name for a prompt, for pairing records across runs."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 # ------------------------------------------------------------------- datasets
@@ -332,7 +326,6 @@ __all__ = [
     "is_lfs_pointer",
     "load_rows",
     "parse_marked",
-    "prompt_digest",
     "normalize_requests",
     "normalize_file",
     "select_prompts",

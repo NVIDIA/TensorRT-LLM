@@ -36,10 +36,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import DeliveryReport
-from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
-    KIND_STOCK_UNAVAILABLE,
-    GateRecords,
-)
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
     reuse_probe,
     serve_driver,
@@ -628,7 +624,7 @@ def _acceptance_gate_env():
     )
 
 
-def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
+def _acceptance_gate_driver_output(rates, *, iterations=100):
     """What the engine driver prints for prompts accepting at ``rates``.
 
     ``iterations`` is every prompt's, or a list with one per prompt.
@@ -640,7 +636,6 @@ def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
         workload_io_line = {
             "index": n,
             "id": f"d{n}",
-            "prompt_sha": (prompts or [f"p{i}" for i in range(len(rates))])[n],
             "tokens": tokens,
             "iterations": steps,
             "token_ids": [],
@@ -648,22 +643,6 @@ def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
         }
         lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(workload_io_line)}")
     return "\n".join(lines) + "\n"
-
-
-def _acceptance_gate_legs(require, off=None):
-    """A runner: the require leg prints ``require``; the off leg ``off`` or cannot load."""
-    seen = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        if "TRTLLM_MODELING_V2=off" in command:
-            if off is None:
-                return CommandResult(returncode=1, stderr="Unknown model architecture: X")
-            return CommandResult(returncode=0, stdout=off)
-        return CommandResult(returncode=0, stdout=require)
-
-    run.seen = seen
-    return run
 
 
 def _acceptance_gate_task(**acceptance):
@@ -676,47 +655,53 @@ def _acceptance_gate_task(**acceptance):
 _BASE = [2.6 + 0.5 * math.sin(i) for i in range(32)]
 
 
-@pytest.fixture
-def tree(monkeypatch):
-    """Pin the tree a gate believes it measured, so a baseline can come from another."""
-    current = {"name": "treeA"}
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: current["name"])
-    return current
+def _acceptance(tmp_path, monkeypatch, rates, *, iterations=100, **acceptance):
+    """The acceptance gate's verdict on a load whose prompts accept at ``rates``."""
+    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
+    seen = []
 
+    def run(command, env=None, timeout=0):
+        seen.append(command)
+        output = _acceptance_gate_driver_output(rates, iterations=iterations)
+        return CommandResult(returncode=0, stdout=output)
 
-def test_a_significant_drop_against_the_previous_tree_fails(tmp_path, tree):
-    records = GateRecords(tmp_path / "r.jsonl")
-    common = dict(
-        task_data=_acceptance_gate_task(), member="tep4", records=records, workdir=tmp_path / "w"
-    )
-    acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    tree["name"] = "treeB"
-    dropped = [r - 0.3 for r in _BASE]
     result = acceptance_checks.run_acceptance_gate(
         _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(dropped), _acceptance_gate_driver_output(dropped)
-        ),
-        **common,
+        task_data=_acceptance_gate_task(**acceptance),
+        runner=run,
+        unit="dspark",
+        member="tep4",
+        workdir=tmp_path / "w",
     )
+    return result, seen
+
+
+def test_acceptance_is_one_load_held_to_one_and_to_the_declared_floor(tmp_path, monkeypatch):
+    # With no floor declared the verdict stands on 1.0 alone, and says so.
+    result, seen = _acceptance(tmp_path, monkeypatch, _BASE)
+    assert result.passed, result.detail
+    assert len(seen) == 1 and "TRTLLM_MODELING_V2=require" in seen[0]
+    assert "held to 1.0 alone" in result.detail and "held to 1.0 alone" in result.warnings[0]
+    # Every draft rejected is the draft path computing the wrong thing.
+    result, _ = _acceptance(tmp_path, monkeypatch, [1.0] * 32)
+    assert not result.passed and "at or below 1.0" in result.detail
+    # A declared floor is met or not; one derived from a measured reference keeps 0.95 of it.
+    floor = {"min_absolute": 1.5, "floor_source": "a measured drafter"}
+    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark=floor)
+    assert result.passed and result.reference == 1.5
+    assert "vs declared floor 1.5000 (from a measured drafter): met" in result.detail
+    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark={"measured_reference": 3.32})
+    assert not result.passed and "vs declared floor 3.1540: NOT met" in result.detail
+
+
+def test_a_workload_too_short_to_measure_fails_as_the_workload_not_the_target(
+    tmp_path, monkeypatch
+):
+    # Each request's first iteration is its context step: 4 prompts x 2 leave 4 to count.
+    result, _ = _acceptance(tmp_path, monkeypatch, [2.5] * 4, iterations=2)
     assert not result.passed
-    assert "against tree treeA: REGRESSED" in result.detail
-    # A failed verdict is recorded, but is not the next tree's baseline.
-    tree["name"] = "treeC"
-    again = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    assert again.passed and "against tree treeA" in again.detail
+    assert "workload too short to measure acceptance: 4 generation iteration(s)" in result.detail
+    assert "a property of the workload, not of the target" in result.detail
 
 
 _SNAPSHOTS = {
@@ -835,16 +820,12 @@ def _boot_runner(*outputs: str):
     return run
 
 
-def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):
+def test_the_acceptance_gate_holds_its_engine_to_what_it_declared(tmp_path):
     task = _engine_attestation_task(tmp_path, features=["mtp"])
     options = {**_OPTIONS, "speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}}
     Path(task["accuracy"]["llm_api_options"]["core"]).write_text(yaml.safe_dump(options))
     mtp = {"algorithm": "MTP", "max_draft_len": 3}
-    legs = [
-        _engine_line(_engine_config(speculative=mtp)),
-        _engine_line(_engine_config(speculative=mtp, modeling_v2="require")),
-    ]
-    run = _boot_runner(*legs)
+    run = _boot_runner(_engine_line(_engine_config(speculative=mtp, modeling_v2="off")))
     result = acceptance_checks.run_acceptance_gate(
         _engine_attestation_env(),
         task_data=task,
@@ -853,13 +834,11 @@ def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):
         member="tp1",
         workdir=tmp_path,
     )
-    assert len(run.seen) == 2 and not result.passed
-    assert result.detail.startswith("the engine of the off leg did not run the declared")
-    assert "modeling_v2: declared off, engine require" in result.detail
-    assert [r["leg"] for r in result.engine] == ["require", "off"]
+    assert len(run.seen) == 1 and not result.passed
+    assert "modeling_v2: declared require, engine off" in result.detail
 
-    # A prompt the engine refuses for its length fails the workload, not the target; a leg
-    # waits as long as the spec gives a slow load.
+    # A prompt the engine refuses for its length fails the workload, not the target; the
+    # load waits as long as the spec gives it.
     task["accuracy"]["acceptance"] = {**(task["accuracy"].get("acceptance") or {}), "timeout": 3600}
     waited = []
 
@@ -1301,23 +1280,6 @@ def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
         "max_batch_size": 32,
         "batch_sizes": [1, 2, 4, 8, 16, 24, 32],
     }
-
-
-def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
-    task = _acceptance_gate_task(dspark={"min_absolute": 1.5, "floor_source": "a measured drafter"})
-    rates = [2.6 + 0.5 * math.sin(i) for i in range(32)]
-    records = GateRecords(tmp_path / "gate_results.jsonl")
-    common = dict(task_data=task, records=records, unit="dspark", workdir=tmp_path / "w")
-    first = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    ran = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=first, **common)
-    assert ran.passed, ran.detail
-    assert any("=off" in cmd for cmd in first.seen)
-    assert records.all(KIND_STOCK_UNAVAILABLE)
-    again = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    result = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=again, **common)
-    assert result.passed and not any("=off" in cmd for cmd in again.seen)
-    assert "not run again" in result.detail
 
 
 class _Delivery:

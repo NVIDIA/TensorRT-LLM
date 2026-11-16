@@ -507,17 +507,15 @@ from the iteration statistics.
 
 **Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` owe the
 acceptance gate (`checks/acceptance.py`; `gate acceptance --unit <feature>
---member <m>`): accepted tokens per iteration, iteration-weighted per prompt
-(32 prompts and 32 draft iterations by default), held against
-`TRTLLM_MODELING_V2=off` on the same prompts (fails under a 0.95 ratio when a
-paired test finds the drop significant), against the previous tree, and above
-1.0. Without a stock path the unit declares `measured_reference` or
-`min_absolute` with its `floor_source`. Each rank also reports the algorithm and
-draft depth it runs.
+--member <m>`): accepted tokens per iteration, iteration-weighted over the
+workload (32 prompts and 32 draft iterations by default), in one load, held
+above 1.0 and to the floor the unit declares (`measured_reference` or
+`min_absolute`, with its `floor_source`). A unit that declares none is held to
+1.0 alone. Each rank also reports the algorithm and draft depth it runs.
 
 **Blind spots.** Boot and accuracy: rejection sampling preserves the output
-distribution, so a wrong draft path yields correct text, slower. For a new architecture the floor is a number the
-run declares.
+distribution, so a wrong draft path yields correct text, slower. The floor is
+a number the run declares: without one, a drafter that accepts little passes.
 
 ## 8. Attention DP, TP and EP where they meet these features
 
