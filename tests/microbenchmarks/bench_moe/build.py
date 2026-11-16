@@ -295,6 +295,8 @@ class _MusePostNormMoE(torch.nn.Module):
         self.expert_hidden_size = hidden_size
         self.top_k = top_k
         self.post_expert_norm_eps = eps
+        # Reuse the production finalize callback without its fused AllReduce workspace.
+        self._reduce_in_finalize = False
         # Zero-centered gamma: this is the identity checkpoint gain, not zero output.
         self.post_expert_norm_weight = torch.nn.Parameter(
             torch.zeros(hidden_size, dtype=dtype, device=device), requires_grad=False
