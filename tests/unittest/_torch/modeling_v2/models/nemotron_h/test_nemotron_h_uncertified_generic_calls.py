@@ -27,8 +27,9 @@ _FAMILY_DIR = (
 
 #: tensorrt_llm imports that compute nothing, so a target need not declare them: types and configs
 #: it reads, enums and activation descriptors it passes, the metadata it is handed, the switches it
-#: reads from the environment and its logger, the engine's breakable-graph switch and the
-#: accessor that hands a graph break the step's metadata.
+#: reads from the environment and its logger, the engine's breakable-graph switch, the
+#: accessor that hands a graph break the step's metadata, and the class decorator that keeps a
+#: target opt-in under the "auto" modeling_v2 default.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "ActivationType",
@@ -40,6 +41,7 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "MoEWeightLoadingMode",
         "SimpleActivation",
         "TrtllmAttentionMetadata",
+        "disable_v2_by_default",
         "get_env_enable_pdl",
         "get_model_extra_attrs",
         "is_in_breakable_cuda_graph",
