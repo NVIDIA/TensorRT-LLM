@@ -589,7 +589,7 @@ def _provision_kv_cache_pool(llm_args: dict,
 
 
 def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
-    """Bind the Unix socket attached frontends forward launcher-owned routes to.
+    """Listen on the launcher Unix socket before starting attached frontends.
 
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed, socket file included, when the executor proxy shuts down.
@@ -604,6 +604,7 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.bind(path)
+        sock.listen(socket.SOMAXCONN)
     except OSError:
         sock.close()
         raise

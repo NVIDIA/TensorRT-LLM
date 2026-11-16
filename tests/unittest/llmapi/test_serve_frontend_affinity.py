@@ -100,6 +100,10 @@ def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
 
     def fake_spawn(llm, num_frontends, *, extra_env, report_failure, affinity_sockets):
         handed_off.update({i: s.getsockname()[1] for i, s in affinity_sockets.items()})
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as frontend:
+            frontend.settimeout(5)
+            frontend.connect(extra_env[serve.LAUNCHER_UDS_ENV])
+            frontend.sendall(b"queued startup request")
         return []
 
     served = {}
@@ -112,6 +116,13 @@ def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
         def __call__(self, host, port, sockets):
             served["ports"] = [s.getsockname()[1] for s in sockets if s.family != socket.AF_UNIX]
             served["uds"] = [s.getsockname() for s in sockets if s.family == socket.AF_UNIX]
+            launcher_socket = next(
+                listener for listener in sockets if listener.family == socket.AF_UNIX
+            )
+            launcher_socket.settimeout(5)
+            connection, _ = launcher_socket.accept()
+            with connection:
+                assert connection.recv(128) == b"queued startup request"
 
     monkeypatch.setattr(serve, "_spawn_attached_frontends", fake_spawn)
     monkeypatch.setattr(serve, "OpenAIServer", FakeServer)
