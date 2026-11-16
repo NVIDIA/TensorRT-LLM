@@ -214,7 +214,7 @@ def schedule_reserving(
 ) -> bool:
     """One scheduling pass that first reserves completion headroom, as the V2 scheduler does.
 
-    A deferred first chunk is rolled back like ``release_context_admission``.
+    A deferred first chunk is rolled back like `release_context_admission`.
     """
     if manager.completion_admission_blocked(request):
         return False
@@ -1052,7 +1052,7 @@ def test_connector_prefill_admission_preserves_full_restore_under_pressure(
 ) -> None:
     """Two first chunks fit, but both stored prefixes do not fit at once.
 
-    The control, whose worker does not declare ``requires_completion_reservation``, keeps
+    The control, whose worker does not declare `requires_completion_reservation`, keeps
     unreserved admission and shows a truncated restore against real device pools. The reservation
     must defer the second request before the connector is asked, hold later requests behind it,
     and honor the full offer once the first request releases its KV.

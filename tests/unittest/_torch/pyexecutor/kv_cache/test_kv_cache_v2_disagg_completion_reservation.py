@@ -15,13 +15,13 @@
 """Disaggregated completion reservation in KVCacheManagerV2.
 
 With no eviction tier and a KV connector whose worker declares
-``requires_completion_reservation``, or ``kv_cache_config.enable_disagg_completion_reservation``
+`requires_completion_reservation`, or `kv_cache_config.enable_disagg_completion_reservation`
 set, a full-attention disaggregated server reserves the pages an admitted request still needs to
 finish: a decode request its output growth, a connector prefill its remaining prompt. A new
 request is admitted only if the reservation of every admitted request still fits. Without either
 opt-in the server keeps its existing admission.
 
-Tests that build a manager without ``__init__`` assign both reservation dicts whenever they
+Tests that build a manager without `__init__` assign both reservation dicts whenever they
 assign either, so each test owns its reservation state.
 """
 
@@ -49,7 +49,7 @@ class _ConnectorDouble:
     """The KV connector surface the manager touches on the paths these tests take.
 
     It never offers a prefix and holds no load, so freeing a request only resets state.
-    ``declares`` is what the worker sets ``requires_completion_reservation`` to.
+    `declares` is what the worker sets `requires_completion_reservation` to.
     """
 
     def __init__(self, declares: object = True, capacity_only: bool = False) -> None:
@@ -321,7 +321,7 @@ def test_failed_first_chunk_resize_releases_its_bound(first_chunk: bool) -> None
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("reported", [False, True])
 def test_revert_without_capacity_growth_returns_an_unconsumed_bound(reported: bool) -> None:
-    """The release comes before every early return of ``revert_allocate_context``.
+    """The release comes before every early return of `revert_allocate_context`.
 
     A first chunk whose resize grew no capacity keeps its cache, but an unconsumed bound must
     still go back so that the next admission checks it again.
@@ -478,7 +478,7 @@ def _real_manager(
 ) -> KVCacheManagerV2:
     """A one-layer manager whose tiny GPU pool makes page pressure reachable.
 
-    Its connector declares the reservation unless ``kv_connector_manager`` is overridden.
+    Its connector declares the reservation unless `kv_connector_manager` is overridden.
     """
     if kv_cache_config is None:
         kv_cache_config = KvCacheConfig(
@@ -648,7 +648,7 @@ def test_completion_reservation_gate_on_a_real_manager(
     A target manager whose configuration asks for the reservation where it cannot apply says so;
     a draft manager, which never reserves, stays quiet, and so does the estimation manager, which
     is built without the connector. Pipeline parallelism needs one process per rank;
-    ``test_completion_reservation_gate`` covers that clause.
+    `test_completion_reservation_gate` covers that clause.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -777,7 +777,7 @@ def test_config_opt_in_reserves_decode_headroom_without_a_connector() -> None:
 def test_reverted_gen_init_releases_its_completion_bound() -> None:
     """A generation-init admission that the coordinator reverts leaves no bound behind.
 
-    This mirrors DisaggTransferCoordinator.revert_deferred_gen_init, which reaches
+    This follows DisaggTransferCoordinator.revert_deferred_gen_init, which reaches
     revert_allocate_context through PyExecutor._revert_ctx_alloc. A fresh gen-init holds
     history past its pre-resize capacity of zero, so revert frees its cache outright; the
     test pins that no bound leaks and that the request is admitted again afterwards.
