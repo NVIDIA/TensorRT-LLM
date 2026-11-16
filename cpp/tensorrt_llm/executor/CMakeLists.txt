@@ -73,6 +73,13 @@ target_link_libraries(
 set_target_properties(tllm_executor_serialization
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_executor_socket_serialization STATIC
+            socketStateSerialization.cpp)
+add_library(tllm::executor_socket_serialization ALIAS
+            tllm_executor_socket_serialization)
+target_link_libraries(tllm_executor_socket_serialization
+                      PUBLIC tllm::common_error)
+
 add_library(
   tllm_executor_values STATIC
   contextPhaseParams.cpp
@@ -84,8 +91,10 @@ add_library(
   serialization.cpp
   tensor.cpp)
 add_library(tllm::executor_values ALIAS tllm_executor_values)
-target_link_libraries(tllm_executor_values PUBLIC tllm::executor_serialization
-                                                  tllm::runtime_buffers)
+target_link_libraries(
+  tllm_executor_values
+  PUBLIC tllm::executor_serialization tllm::executor_socket_serialization
+         tllm::runtime_buffers)
 
 add_library(tllm_executor_cache_routing STATIC
             cache_transmission/cacheRouting.cpp)
@@ -131,8 +140,12 @@ target_link_libraries(
 
 foreach(
   component
-  tllm_executor_values tllm_executor_transfer_agent tllm_executor_agent_name
-  tllm_executor_memory_desc tllm_executor_cache_routing
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_executor_agent_name
+  tllm_executor_memory_desc
+  tllm_executor_cache_routing
+  tllm_executor_socket_serialization
   tllm_executor_agent_connection)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
