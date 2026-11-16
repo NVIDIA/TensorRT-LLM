@@ -104,7 +104,7 @@
 /tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
-/tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
+/tests/integration/test_lists/qa/functional/ @NVIDIA/trt-llm-qa-function
 
 # ===== RUNTIME =====
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
