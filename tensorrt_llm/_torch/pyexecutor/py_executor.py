@@ -8743,8 +8743,9 @@ class PyExecutor:
         # Without a transceiver there is no vote to run: a stale ID then waits
         # for the next batch's post-sampler cleanup instead of busy-polling.
         pending_retirement = self.disagg.has_retiring_gen_receives
-        pending_cancel_holds_vote = (self.canceled_req_ids
-                                     and self.kv_cache_transceiver is not None)
+        pending_cancel_holds_vote = (
+            self.canceled_req_ids and self.kv_cache_transceiver is not None
+            and self.disagg.requires_gen_cancellation_consensus)
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not pending_cancel_holds_vote and not self.is_shutdown
                 and not self._has_pending_connector_transfers()

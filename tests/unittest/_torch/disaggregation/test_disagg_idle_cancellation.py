@@ -2433,3 +2433,56 @@ def test_legacy_tp_cancel_with_capacity_connector_completes_consensus(
     assert all(request.is_finished_due_to_cancellation for request in requests)
     assert all(engine.active_requests == [] for engine in engines)
     assert all(engine.canceled_req_ids == [] for engine in engines)
+
+
+@pytest.mark.parametrize("overlap_disabled", [False, True])
+def test_pending_cancel_idle_hold_needs_the_consensus_vote(
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch, overlap_disabled: bool
+) -> None:
+    """A pending cancel ID holds idle only when the loop-head vote can clear it.
+
+    With the consensus disabled (e.g. TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1),
+    no loop-head path clears a late cancel ID without a batch, so a non-idle
+    hold would busy-poll the queue until the next request arrives; the fetch
+    keeps its normal idle behavior instead. With the consensus enabled, the
+    pending ID keeps the rank awake for the loop-head vote.
+    """
+    if overlap_disabled:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+    executor.canceled_req_ids = [9]
+    executor.control_requests = []
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = MagicMock()
+    broadcast = Mock(return_value=[])
+    executor.request_broadcaster = SimpleNamespace(broadcast=broadcast)
+
+    def fetch_probe(timeout, *, wait_for_batch=True):
+        # A busy-poll regression shows up as an endless timeout=0 wait; the idle
+        # path parks with no timeout at all. Record the first queue read the
+        # fetch makes instead of parking this test on the real wait.
+        if fetch_probe.last_timeout == "unset":
+            fetch_probe.last_timeout = timeout
+        return []
+
+    fetch_probe.last_timeout = "unset"
+    monkeypatch.setattr(executor.executor_request_queue, "get_from_request_queue", fetch_probe)
+    executor.disagg.request_cancellation = Mock(return_value=True)
+
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, 0)
+
+    consensus = (
+        executor.kv_cache_transceiver.consumes_transfer_buffer is False
+        and executor.disagg.requires_gen_cancellation_consensus
+    )
+    if not consensus:
+        # The vote cannot clear this ID without a batch; the fetch stays idle so
+        # the worker parks rather than burning a zero-timeout poll loop.
+        broadcast.assert_called_once_with([], prefer_cpu=True)
+        assert fetch_probe.last_timeout is None
+    else:
+        broadcast.assert_called_once_with([], prefer_cpu=False)
+        assert fetch_probe.last_timeout == timedelta(0)
