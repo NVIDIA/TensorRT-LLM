@@ -25,8 +25,9 @@ to the lowest global index). The selected ids are therefore bit-identical to
 Consumers:
 
 * :meth:`VocabParallelHead.argmax` -- greedy target tokens.
-* :func:`shard_argmax` -- greedy target tokens of the stock one-model
-  speculative workers where the TP key exchange cannot take the rows.
+* :func:`sharded_greedy_argmax` -- greedy target tokens of the stock
+  one-model speculative workers: the TP key exchange where it takes the rows,
+  else :func:`shard_argmax`.
 * :meth:`VocabParallelHead.sample` -- temperature-only sampling through the
   Gumbel-max trick: ``argmax(logits / T + G)`` with standard Gumbel noise ``G``
   is a draw from ``softmax(logits / T)``, exact up to the 23-bit uniform
@@ -50,7 +51,7 @@ host, so every path is CUDA-graph capturable.
 """
 
 import os
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -64,6 +65,9 @@ from ..distributed import AllReduce, AllReduceStrategy, allgather
 from ..modules.embedding import LMHead
 from ..modules.linear import TensorParallelMode
 from ..pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+
+if TYPE_CHECKING:
+    from ..distributed.ll_exchange import TPKeyExchange
 
 _INT32_MAX = tl.constexpr(2**31 - 1)
 # Index published by a split without valid columns: exact in float32 and above
@@ -605,6 +609,40 @@ def shard_argmax(
     (unit vocab stride) whose column 0 is global vocab id ``col_base``: the
     ids ``torch.argmax`` gives on the gathered logits."""
     return _select_tokens(_local_argmax_kernel, local, (), col_base, exchange, out_dtype)
+
+
+def key_exchange_takes(key_exchange: Optional["TPKeyExchange"], rows: int) -> bool:
+    """Whether ``key_exchange`` (the TP group's ``ll_exchange.TPKeyExchange``,
+    or None) takes a launch of ``rows`` rows."""
+    return key_exchange is not None and 1 <= rows <= key_exchange.MAX_ROWS
+
+
+def sharded_greedy_argmax(
+    logits: torch.Tensor,
+    vocab_offset: int,
+    key_exchange: Optional["TPKeyExchange"],
+    pair_exchange: Optional[_PairExchange],
+    *,
+    channel: int,
+) -> torch.Tensor:
+    """Global greedy tokens (int32) of this rank's vocab shard ``logits``
+    ``[rows, V / tp]`` (unit vocab stride) whose column 0 is global vocab id
+    ``vocab_offset``: for logits without NaN, the ids ``torch.argmax`` gives on
+    the gathered logits (equal maxima go to the lowest global id); the key
+    exchange orders NaN by its bit pattern.
+
+    Collective over the TP group. The key exchange takes the rows where
+    :func:`key_exchange_takes` holds (local first maximum, key packing and the
+    exchange in one launch on ``channel``); the NCCL pair exchange
+    ``pair_exchange`` takes the others and must be given where the key
+    exchange cannot take the rows. The choice depends only on the row count
+    and on whether the group has a key exchange, which
+    ``ll_exchange.create_tp_key_exchange`` makes agree across the group, so
+    every rank takes the same path.
+    """
+    if key_exchange_takes(key_exchange, logits.shape[0]):
+        return key_exchange.argmax_logits(logits, vocab_offset=vocab_offset, channel=channel)
+    return shard_argmax(logits, vocab_offset, pair_exchange, torch.int32)
 
 
 def markov_chain_logits(

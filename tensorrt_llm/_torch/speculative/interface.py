@@ -61,8 +61,8 @@ from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import (VocabParallelHead, VocabShardedLogits,
-                             is_vocab_sharded_lm_head, shard_argmax,
-                             tp_pair_exchange)
+                             is_vocab_sharded_lm_head, key_exchange_takes,
+                             sharded_greedy_argmax, tp_pair_exchange)
 
 
 def _watermark_active(spec_metadata) -> bool:
@@ -2202,7 +2202,7 @@ class SpecWorkerBase(nn.Module, ABC):
             rows = hidden_states.shape[0]
             self._log_shard_path_once(
                 ("target", spec_metadata.is_all_greedy_sample,
-                 self._key_exchange_takes(rows)), lambda:
+                 key_exchange_takes(self.key_exchange, rows)), lambda:
                 (f"target tokens of "
                  f"{'greedy' if spec_metadata.is_all_greedy_sample else 'temperature-only'}"
                  " batches selected vocab-parallel from the LM head "
@@ -2287,11 +2287,11 @@ class SpecWorkerBase(nn.Module, ABC):
         if (type(logits_processor) is not LogitsProcessor
                 or not is_vocab_sharded_lm_head(lm_head)):
             return False
-        if not spec_metadata.is_all_greedy_sample:
-            # The Gumbel-max draw runs in the key exchange only.
-            return self._key_exchange_takes(rows)
-        return self._key_exchange_takes(rows) or (
-            rows >= 1 and self._target_pair_exchange is not None)
+        if key_exchange_takes(self.key_exchange, rows):
+            return True
+        # The Gumbel-max draw runs in the key exchange only.
+        return (spec_metadata.is_all_greedy_sample and rows >= 1
+                and self._target_pair_exchange is not None)
 
     def _log_shard_path_once(self, key: tuple, message) -> None:
         """Log ``message()`` the first time this worker takes the shard path
@@ -2300,28 +2300,21 @@ class SpecWorkerBase(nn.Module, ABC):
             self._logged_shard_paths.add(key)
             logger.info(f"{type(self).__name__}: {message()}")
 
-    def _key_exchange_takes(self, rows: int) -> bool:
-        return (self.key_exchange is not None
-                and 1 <= rows <= self.key_exchange.MAX_ROWS)
-
     def _shard_exchange_name(self, rows: int) -> str:
-        if self._key_exchange_takes(rows):
+        if key_exchange_takes(self.key_exchange, rows):
             return f"key exchange ({self.key_exchange.transport})"
         return "NCCL pair exchange"
 
     def _sharded_argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """Global greedy tokens (int32) of this rank's vocab shard ``logits``
-        [rows, V / tp]: for logits without NaN, the ids ``torch.argmax`` gives
-        on the gathered logits (equal maxima go to the lowest global id). The
-        key exchange orders NaN by its bit pattern."""
-        vocab_offset = self._target_head_mapping.tp_rank * logits.shape[-1]
-        if self._key_exchange_takes(logits.shape[0]):
-            # Local first maximum, key packing and the exchange in one launch.
-            return self.key_exchange.argmax_logits(logits,
-                                                   vocab_offset=vocab_offset,
-                                                   channel=1)
-        return shard_argmax(logits, vocab_offset, self._target_pair_exchange,
-                            torch.int32)
+        [rows, V / tp] of the target LM head (see
+        ``vocab_parallel.sharded_greedy_argmax``)."""
+        return sharded_greedy_argmax(logits,
+                                     self._target_head_mapping.tp_rank *
+                                     logits.shape[-1],
+                                     self.key_exchange,
+                                     self._target_pair_exchange,
+                                     channel=1)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.
