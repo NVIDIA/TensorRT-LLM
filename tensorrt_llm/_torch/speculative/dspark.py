@@ -1288,7 +1288,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         num_gens = spec_metadata.num_generations
         width = spec_metadata.runtime_draft_len + 1
         if (
-            width <= 1
+            # The draft step back-fills max_draft_len rows per request, so only
+            # a full-length window projects exactly the rows it takes.
+            spec_metadata.runtime_draft_len != self.max_draft_len
             or spec_metadata.is_ragged_verify
             or spec_metadata.request_ids is None
             or len(spec_metadata.request_ids) != num_gens

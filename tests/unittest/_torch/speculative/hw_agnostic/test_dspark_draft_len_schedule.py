@@ -20,10 +20,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
+    DecoderInputPreparer,
+    dspark_schedules_draft_len,
+)
+from tensorrt_llm._torch.speculative import dspark as dspark_module
 from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_draft_len
-from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, MTPDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -143,6 +148,64 @@ def test_schedule_trims_the_verified_part_of_the_block(batch_size, expected):
 def test_max_concurrency_becomes_a_speculation_cutoff():
     config = DSparkDecodingConfig(max_draft_len=BLOCK, max_concurrency=8)
     assert config.draft_len_schedule == {8: BLOCK}
+
+
+def test_only_a_dspark_schedule_publishes_the_step_window_to_attention():
+    assert dspark_schedules_draft_len(
+        DSparkDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3, 4: 2})
+    )
+    assert dspark_schedules_draft_len(DSparkDecodingConfig(max_draft_len=BLOCK, max_concurrency=8))
+    assert not dspark_schedules_draft_len(DSparkDecodingConfig(max_draft_len=BLOCK))
+    assert not dspark_schedules_draft_len(
+        MTPDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3})
+    )
+    assert not dspark_schedules_draft_len(None)
+
+
+@pytest.mark.parametrize("runtime_draft_len", [0, 2, BLOCK])
+def test_schedule_publishes_a_uniform_window_of_the_step_draft_length(runtime_draft_len):
+    """Sparse attention sizes its generation rows by the window the step submits."""
+    config = DSparkDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3, 4: 2})
+    preparer = object.__new__(DecoderInputPreparer)
+    preparer._dspark_trims_submitted_tokens = False
+    preparer._dspark_device_windows = False
+    preparer.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    # Left over from a step of another shape.
+    metadata = SimpleNamespace(
+        runtime_tokens_per_gen_step=0, ragged_verify_lens=[2], device_windows_mode=True
+    )
+
+    preparer._publish_gen_token_layout(metadata, [], runtime_draft_len=runtime_draft_len)
+
+    assert metadata.runtime_tokens_per_gen_step == runtime_draft_len + 1
+    assert metadata.ragged_verify_lens is None
+    assert not metadata.device_windows_mode
+
+
+@pytest.mark.parametrize("runtime_draft_len, forks", [(BLOCK, True), (2, False), (0, False)])
+def test_backfill_projection_forks_only_at_the_full_draft_length(
+    monkeypatch, runtime_draft_len, forks
+):
+    """The fork projects one row per verified token; the draft step takes ``max_draft_len``."""
+    monkeypatch.setattr(dspark_module, "do_multi_stream", lambda: True)
+    worker = _worker()
+    worker._forks_backfill = True
+    # Declining keeps the test off the side stream; being asked is the signal.
+    model = SimpleNamespace(forks_backfill=Mock(return_value=False))
+    worker._prep_fork_model = (model,)
+    num_tokens = 2 * (runtime_draft_len + 1)
+    metadata = _metadata(
+        torch.zeros(num_tokens, 2),
+        runtime_draft_len=runtime_draft_len,
+        num_generations=2,
+        is_ragged_verify=False,
+        request_ids=[7, 8],
+    )
+
+    worker._fork_backfill_projection(metadata, num_tokens)
+
+    assert model.forks_backfill.call_count == (1 if forks else 0)
+    assert worker._prep_fork is None
 
 
 def test_step_without_speculation_follows_the_target_in_the_windows():
