@@ -3370,9 +3370,11 @@ class SpecWorkerBase(nn.Module, ABC):
         sampling, so the deploy-time ``advanced_sampling_mode`` must disable both
         filters (``no_topk_no_topp``; the reference path ignores per-request
         top-k / top-p in that mode too). They also need a shared draft/target
-        vocabulary, full-vocab fp32 logits, no synthetic acceptance override
-        and no guided decoding (not validated with the fused path). Host-side
-        checks only, so the decision is CUDA-graph safe. With the flag off
+        vocabulary, full-vocab fp32 logits, no synthetic acceptance override,
+        no guided decoding (not validated with the fused path) and no text
+        watermark (the reference verify redraws the emitted token under the
+        watermark key and commits the watermark state; the kernels do not).
+        Host-side checks only, so the decision is CUDA-graph safe. With the flag off
         nothing else is read, so the reference dispatch is unchanged. The first
         decision of each call site (``site``) is logged once per worker, so a
         run's log shows which path the opt-in took.
@@ -3382,6 +3384,7 @@ class SpecWorkerBase(nn.Module, ABC):
         mode = spec_metadata.advanced_sampling_mode
         applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
                    and self.guided_decoder is None
+                   and not _watermark_active(spec_metadata)
                    and self.force_num_accepted_tokens == 0.0
                    and not isinstance(logits, VocabShardedLogits)
                    and fast_rs_supported(logits, spec_metadata.draft_probs,
@@ -3399,7 +3402,8 @@ class SpecWorkerBase(nn.Module, ABC):
                     "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
                     f"not cover this step ({site}; it needs advanced_sampling_"
                     "mode=no_topk_no_topp, a shared draft/target vocabulary, "
-                    "full-vocab fp32 logits and no guided decoding; mode="
+                    "full-vocab fp32 logits, no guided decoding and no "
+                    "watermark; mode="
                     f"{mode.name}); using the reference path.")
         return applies
 
