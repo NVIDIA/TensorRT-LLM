@@ -1119,6 +1119,7 @@ def reset_phase_interleaved_cursors_for_owner(
     mapping_state.fc1_cursor = _make_phase_cursor(mapping_state.fc1_cursor.blocks_per_token_block)
     mapping_state.fc2_cursor = _make_phase_cursor(mapping_state.fc2_cursor.blocks_per_token_block)
     mapping_state.owner_index = Int32(owner_index)
+    return mapping_state
 
 
 @cute.jit
@@ -1290,7 +1291,24 @@ def map_phase_interleaved_fc12_work_id(
     fc1_cursor = mapping_state.fc1_cursor
     fc2_cursor = mapping_state.fc2_cursor
 
-    if phase == Int32(BlockPhase.Linear1):
+    if cutlass.const_expr(mapping_state.owner_count > 1):
+        # Die-aware owners enumerate their own share of the experts, which the stream extent over all
+        # local experts does not bound: the seeked cursor's end does.
+        if phase == Int32(BlockPhase.Linear1):
+            fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
+            if linear_work_id < fc1_cursor.expert_tile_end:
+                work_tile = _decode_phase_work_id(
+                    linear_work_id, phase, cta_id_in_mapping_cluster, fc1_cursor, mapping_state
+                )
+                stream_has_work = Boolean(True)
+        else:
+            fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
+            if linear_work_id < fc2_cursor.expert_tile_end:
+                work_tile = _decode_phase_work_id(
+                    linear_work_id, phase, cta_id_in_mapping_cluster, fc2_cursor, mapping_state
+                )
+                stream_has_work = Boolean(True)
+    elif phase == Int32(BlockPhase.Linear1):
         if linear_work_id < mapping_state.stream_tiles(mapping_state.num_fc1_intermediate_blocks):
             fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
             work_tile = _decode_phase_work_id(
