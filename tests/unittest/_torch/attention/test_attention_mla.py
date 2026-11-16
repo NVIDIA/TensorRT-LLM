@@ -557,9 +557,12 @@ def test_mla_helix_fp4_rejected_before_context_dispatch(cached_tokens) -> None:
                          ids=lambda x: f"num_generation_steps: {x}")
 @pytest.mark.parametrize("v2_kv_cache", [True, False],
                          ids=["v2_kv_cache", "v1_kv_cache"])
-def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
+def test_attention_mla(scenario: Scenario,
+                       context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
-                       num_generation_steps: List[int], v2_kv_cache: bool):
+                       num_generation_steps: List[int],
+                       v2_kv_cache: bool,
+                       compact_v: bool = False):
     """Test MLA computation for both context and generation phases"""
 
     num_heads = scenario.num_heads
@@ -597,13 +600,25 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
         f"--------------------------------Test for scenario: {scenario} start--------------------------------"
     )
 
-    _run_test_for_backend("TRTLLM", num_heads, num_kv_heads, num_layers,
-                          q_lora_rank, kv_lora_rank, qk_nope_head_dim,
-                          qk_rope_head_dim, v_head_dim, rope_config,
-                          kv_cache_tokens_per_block, device, dtype,
-                          kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps,
-                          v2_kv_cache)
+    _run_test_for_backend("TRTLLM",
+                          num_heads,
+                          num_kv_heads,
+                          num_layers,
+                          q_lora_rank,
+                          kv_lora_rank,
+                          qk_nope_head_dim,
+                          qk_rope_head_dim,
+                          v_head_dim,
+                          rope_config,
+                          kv_cache_tokens_per_block,
+                          device,
+                          dtype,
+                          kv_cache_dtype,
+                          context_sequence_lengths,
+                          generation_seq_len_q,
+                          num_generation_steps,
+                          v2_kv_cache,
+                          compact_v=compact_v)
 
 
 @pytest.mark.parametrize(
@@ -919,7 +934,8 @@ def _run_test_for_backend(backend_name,
                           generation_seq_len_q,
                           num_generation_steps,
                           v2_kv_cache,
-                          skip_correction_threshold: float = 0.0):
+                          skip_correction_threshold: float = 0.0,
+                          compact_v: bool = False):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -1024,7 +1040,7 @@ def _run_test_for_backend(backend_name,
         print(f"context sequence lengths: {context_sequence_lengths}")
         for key, val in inputs.items():
             if key.endswith("_list"):
-                print(f"{key}: [{val[0].shape}] * {len(val)}")
+                print(f"{key}: [{val[0].shape if val else None}] * {len(val)}")
             else:
                 print(f"{key}: {val.shape}")
 
@@ -1214,7 +1230,9 @@ def _run_test_for_backend(backend_name,
                     k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
                     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                     # q/k will be modified in the forward pass, so we need to clone them
-                    # we should not clone v because we need to keep the stride of v
+                    if compact_v:
+                        v = v.contiguous()
+                    # Exercise both the joint-projection stride and independently owned V.
                     if backend_name == "FLASHINFER":
                         # FlashInfer MLA does not fuse RoPE; pre-apply it here.
                         ctx_positions = [
@@ -1620,6 +1638,10 @@ def _context_projection(device: str,
         mla_module.MLA._use_kvbproj_strided_out, model)
     model._get_kvbproj_head_weights = types.MethodType(
         mla_module.MLA._get_kvbproj_head_weights, model)
+    model._project_context_kv_strided = types.MethodType(
+        mla_module.MLA._project_context_kv_strided, model)
+    model._expand_context_kv = types.MethodType(
+        mla_module.MLA._expand_context_kv, model)
     model._project_context_kv = types.MethodType(
         mla_module.MLA._project_context_kv, model)
     return model
@@ -1705,14 +1727,72 @@ def test_kvb_context_layout(monkeypatch, device, num_tokens, case,
     if apply_rope:
         torch.testing.assert_close(k[..., 16:], k_pe[:,
                                                      None, :].expand(-1, 4, -1))
-    # The FP8 consumer assumes the original KV token stride, including the unused K half.
+    # Eligible projections own only V; fallback projections retain the joint KV storage.
     assert captured["k"].stride() == (96, 1)
     assert k[..., :16].transpose(0, 1).stride() == (24, 96, 1)
-    assert captured["v"].stride() == (128, 1)
+    v_stride = 64 if use_strided else 128
+    assert captured["v"].stride() == (v_stride, 1)
+    assert captured["v"].untyped_storage().nbytes() == num_tokens * v_stride * 2
     # Unflatten may normalize the stride of a singleton token dimension.
-    v_out_token_stride = 64 if num_tokens == 1 else 128
+    v_out_token_stride = 64 if num_tokens == 1 else v_stride
     v_out = captured["v"].unflatten(-1, (4, 16)).transpose(0, 1)
     assert v_out.stride() == (16, v_out_token_stride, 1)
     assert captured["latent"] is latent_cache
     assert result is output
     assert projection.call_count == (0 if use_strided else 1)
+
+
+@pytest.mark.parametrize(
+    "device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("num_tokens", [1, 4095, 4096])
+@pytest.mark.parametrize("cp_rank", [None, 0, 1])
+@pytest.mark.parametrize("eligible", [False, True])
+def test_expand_context_kv_storage(monkeypatch, device, num_tokens, cp_rank,
+                                   eligible):
+    """Cached expansion preserves head shards and owns no unused K storage on the fast path."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(7)
+    monkeypatch.setattr(mla_module, "is_sm_100f", lambda: eligible)
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    if device == "cpu":
+        monkeypatch.setattr(torch.ops.trtllm, "bmm_out",
+                            lambda a, b, out: out.copy_(torch.bmm(a, b)))
+    model = _context_projection(device, torch.bfloat16)
+    if cp_rank is not None:
+        model.num_context_heads = 2
+        model.mapping = types.SimpleNamespace(cp_rank=cp_rank)
+        model.kv_b_proj.forward_slice = lambda x, start, end: torch.nn.functional.linear(
+            x, model.kv_b_proj.weight[start:end])
+    heads = model.num_context_heads
+    # Both gathered cache and latent-cache slices are valid inputs.
+    latent = torch.randn(num_tokens, 40, dtype=torch.bfloat16, device=device)
+    ckv, k_pe = latent[:, :32], latent[:, 32:]
+    wide = model.kv_b_proj(ckv)
+    k_ref = wide[:, :64].reshape(num_tokens, 4, 16)
+    v_ref = wide[:, 64:].reshape(num_tokens, 4, 16)
+    if cp_rank is not None:
+        k_ref = k_ref[:, cp_rank * heads:(cp_rank + 1) * heads]
+        v_ref = v_ref[:, cp_rank * heads:(cp_rank + 1) * heads]
+    k, v = model._expand_context_kv(ckv, k_pe)
+    k = k.reshape(num_tokens, heads, 24)
+    torch.testing.assert_close(k[..., :16], k_ref, atol=0.0625, rtol=0.01)
+    torch.testing.assert_close(k[..., 16:], k_pe[:, None].expand(-1, heads, -1))
+    torch.testing.assert_close(v.reshape(num_tokens, heads, 16),
+                               v_ref,
+                               atol=0.0625,
+                               rtol=0.01)
+    if eligible and num_tokens >= 4096:
+        assert v.is_contiguous()
+        assert v.untyped_storage().nbytes() == num_tokens * heads * 16 * 2
+        assert k.untyped_storage().data_ptr() != v.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("kv_cache_dtype",
+                         [torch.bfloat16, torch.float8_e4m3fn])
+def test_attention_mla_compact_v(kv_cache_dtype):
+    """The native attention consumer must honor a compact V token stride."""
+    scenario = Scenario(kv_cache_dtype=kv_cache_dtype,
+                        num_layers=1,
+                        kv_cache_tokens_per_block=32)
+    test_attention_mla(scenario, [17, 31], 1, 0, True, compact_v=True)
