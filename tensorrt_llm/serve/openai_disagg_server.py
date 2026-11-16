@@ -502,15 +502,15 @@ class OpenAIDisaggServer:
         A worker that fails before its first chunk then raises here and becomes an
         HTTP error response instead of a 200 whose body is cut off. The returned
         relay is already started, so closing it before its first chunk still closes
-        ``stream`` and releases the request's routing state.
+        `stream` and releases the request's routing state.
 
         Args:
             stream: The relayed response stream from the disaggregated service.
             raw_request: The client request whose disconnect cancels the wait.
 
         Returns:
-            ``stream`` itself when it is already exhausted; otherwise a started
-            relay that yields the first chunk and then the rest of ``stream``.
+            `stream` itself when it is already exhausted; otherwise a started
+            relay that yields the first chunk and then the rest of `stream`.
         """
         async def wait_for_disconnect() -> None:
             while True:
