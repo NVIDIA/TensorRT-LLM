@@ -92,6 +92,10 @@ async def test_disabled_input_metrics_do_not_read_clock(serve_env):
         clock.assert_not_called()
 
 
+# threadleak is off: the client's portal thread is still alive when the leak
+# check runs; the serve_env fixture closes it in its teardown, after that check
+# (as in tests/unittest/serve/api/ops/system/test_system_endpoints.py).
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("enabled", [False, True])
 def test_mm_encoder_prometheus_route_is_optional(enabled, serve_env):
     server = serve_env.build_openai_server(
