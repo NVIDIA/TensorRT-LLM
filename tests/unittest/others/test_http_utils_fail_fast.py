@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-fast + log-tail-dump behavior of wait_for_endpoint_ready (no GPU, no server)."""
+"""Fail-fast endpoint readiness and shutdown waits (no GPU, no server)."""
 
 import subprocess
 from pathlib import Path
@@ -71,6 +71,19 @@ def test_error_keyword_in_server_log_fails_fast(tmp_path):
     assert "engine exploded" in msg
 
 
+def test_additional_server_proc_fails_readiness_wait_fast(tmp_path) -> None:
+    log = _server_log(tmp_path, "context worker failed\n")
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    with pytest.raises(RuntimeError, match="Context worker.*exited unexpectedly"):
+        wait_for_endpoint_ready(
+            DEAD_URL,
+            timeout=30,
+            check_files=[log],
+            additional_server_procs=[(proc, "Context worker")],
+        )
+
+
 def test_ready_timeout_dumps_log_tail(tmp_path):
     log = _server_log(tmp_path, "clean init so far, no error keywords\n")
     with pytest.raises(RuntimeError) as e:
@@ -115,13 +128,12 @@ def test_fail_if_proc_died_noop_when_alive_or_none(tmp_path):
         proc.wait()
 
 
-def test_endpoint_down_requires_consecutive_failed_probes(monkeypatch):
+def test_endpoint_down_requires_default_consecutive_failed_probes(monkeypatch) -> None:
     probes = iter(
         [
-            requests.ConnectTimeout("slow probe"),
+            requests.ReadTimeout("slow probe"),
             SimpleNamespace(status_code=200),
-            requests.ConnectionError("router stopped"),
-            requests.ConnectionError("router still stopped"),
+            *[requests.ConnectionError("router stopped") for _ in range(10)],
         ]
     )
     probe_count = 0
@@ -137,9 +149,22 @@ def test_endpoint_down_requires_consecutive_failed_probes(monkeypatch):
     monkeypatch.setattr("test_common.http_utils.requests.get", get)
     monkeypatch.setattr("test_common.http_utils.time.sleep", lambda _: None)
 
-    wait_for_endpoint_down(DEAD_URL, timeout=30, required_failures=2)
+    wait_for_endpoint_down(DEAD_URL, timeout=30)
 
-    assert probe_count == 4
+    assert probe_count == 12
+
+
+def test_endpoint_down_times_out_while_endpoint_responds(monkeypatch) -> None:
+    monotonic_values = iter([0.0, 0.0, 2.0, 2.0])
+    monkeypatch.setattr(
+        "test_common.http_utils.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=503),
+    )
+    monkeypatch.setattr("test_common.http_utils.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("test_common.http_utils.time.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="did not fail 10 consecutive probes within 2 seconds"):
+        wait_for_endpoint_down(DEAD_URL, timeout=2)
 
 
 def test_report_error_keyword_scan_fires(tmp_path):

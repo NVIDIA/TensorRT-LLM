@@ -53,13 +53,14 @@ def wait_for_endpoint_ready(
     check_files: list[str] | None = None,
     server_proc: subprocess.Popen | None = None,
     check_interval: float = 30.0,
+    additional_server_procs: list[tuple[subprocess.Popen | None, str]] | None = None,
 ):
     """Poll ``url`` until it returns 200, failing fast and loudly otherwise.
 
     Fail-fast paths (all of which dump the tails of ``check_files`` so the
     server-side story lands in the CI log):
-      - ``server_proc`` exited -> no point polling a dead server for the
-        remaining timeout;
+      - ``server_proc`` or an ``additional_server_procs`` entry exited ->
+        no point polling when a required server is dead;
       - an error keyword appears in a ``check_files`` log (scanned every
         ``check_interval`` seconds; time-based rather than iteration-based);
       - ``timeout`` elapses without the endpoint becoming ready.
@@ -68,8 +69,9 @@ def wait_for_endpoint_ready(
     next_file_check = start + check_interval
     missing_warned: set[str] = set()
     while time.monotonic() - start < timeout:
-        # Check server_proc if provided (singular)
         fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
+        for additional_proc, what in additional_server_procs or []:
+            fail_if_proc_died(additional_proc, what, check_files)
 
         if check_files and time.monotonic() >= next_file_check:
             next_file_check = time.monotonic() + check_interval
@@ -103,8 +105,15 @@ def wait_for_endpoint_ready(
     )
 
 
-def wait_for_endpoint_down(url: str, timeout: int = 300, required_failures: int = 10):
-    """Wait until ``url`` fails ``required_failures`` consecutive probes."""
+def wait_for_endpoint_down(url: str, timeout: int = 300, required_failures: int = 10) -> None:
+    """Wait until ``url`` fails ``required_failures`` consecutive probes.
+
+    Only ``requests.RequestException`` counts as a failed probe. Any HTTP
+    response, including an error response, means that the endpoint is still
+    reachable and resets the failure streak. A single missed probe therefore
+    cannot be mistaken for shutdown. Because probes are one second apart, the
+    timeout must allow at least ``required_failures`` probes.
+    """
     deadline = time.monotonic() + timeout
     consecutive_failures = 0
     while time.monotonic() < deadline:
@@ -118,4 +127,7 @@ def wait_for_endpoint_down(url: str, timeout: int = 300, required_failures: int 
                 print(f"endpoint {url} is down, with exception: {err}")
                 return
         time.sleep(1)
-    raise RuntimeError(f"Endpoint {url} did not become down within {timeout} seconds")
+    raise RuntimeError(
+        f"Endpoint {url} did not fail {required_failures} consecutive probes "
+        f"within {timeout} seconds"
+    )
