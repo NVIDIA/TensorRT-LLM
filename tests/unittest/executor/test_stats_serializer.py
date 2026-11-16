@@ -125,7 +125,9 @@ def _make_mock_kv_iter_stats(
 
 
 class TestStatsSerializer:
-    def test_native_json_is_not_decoded_for_transport(self, monkeypatch):
+    def test_native_json_is_not_decoded_for_transport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from tensorrt_llm._torch.pyexecutor import iteration_stats
 
         native = _make_mock_iteration_stats()
