@@ -61,10 +61,9 @@ so their `trt-test-db` queries do not scan launch YAML.
 Keep only versioned `trt-test-db` YAML files directly in `qa/`. The pinned
 `trt-test-db` reader scans `qa/*.yml` without recursion and parses every file
 before selecting a context; a case list there prevents performance list generation.
-Consumers must use the new functional-list paths. Text-list discovery must include
-`functional/*.txt`; Spark database queries must use `functional/test-db/` so they
-do not scan the incompatible multinode launch YAML. No compatibility links remain
-in the top-level QA directory.
+Both QA validators recursively discover text and YAML lists under `functional/`.
+Spark database queries must use `functional/test-db/` so they do not scan the
+incompatible multinode launch YAML. No compatibility links remain in `qa/`.
 
 ### Multi-node Launch Parameters
 
