@@ -323,9 +323,13 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, draft = forward()
-    for end in (17, 65, 127, 128, 129, 193, 255):
+    ends = (17, 65, 127, 128, 129, 193, 255)
+    if page_size == 128:
+        ends += tuple(range(256, 384))
+    for end in ends:
         inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
-        inputs["valid_lengths"].copy_(torch.tensor([127, 1, 128] * batch_repeats, device="cuda"))
+        lengths = [128 if end >= 256 else 127, 1, 128]
+        inputs["valid_lengths"].copy_(torch.tensor(lengths * batch_repeats, device="cuda"))
         inputs["block_tables"][:2].copy_(inputs["block_tables"][:2].roll(1, dims=1))
         inputs["kv_pages"].normal_()
         block_x.normal_()

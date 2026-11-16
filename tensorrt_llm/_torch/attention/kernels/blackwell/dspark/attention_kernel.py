@@ -1298,6 +1298,140 @@ class DSparkAttentionKernel:
         kv_stage: cutlass.Int32,
         tma_bar_ptr: cute.Pointer,
         is_k_load: cutlass.Constexpr,
+    ) -> None:
+        """Partition full 128-row windows directly at their single page boundary."""
+        full_window = (common_params.valid_start <= common_params.position - 128) & (
+            common_params.valid_end >= common_params.position
+        )
+        if cutlass.const_expr(self.history_page_size == 128):
+            if full_window:
+                first_page = common_params.sPT[row_base, page_table_stage]
+                last_page = common_params.sPT[row_base + 63, page_table_stage]
+                if first_page == last_page:
+                    self.load_history_partition(
+                        common_params,
+                        atoms,
+                        gmem,
+                        smem,
+                        row_base,
+                        0,
+                        first_page,
+                        head_tile,
+                        kv_stage,
+                        tma_bar_ptr,
+                        is_k_load,
+                        tile=len(self.history_tile_sizes) - 1,
+                    )
+                else:
+                    split = common_params.window_end - row_base
+                    for tile in cutlass.range_constexpr(len(self.history_tile_sizes) - 1):
+                        rows = self.history_tile_sizes[tile]
+                        extent = self.history_tile_sizes[tile + 1]
+                        left_tiles = split % extent // rows
+                        right_tiles = (64 - split) % extent // rows
+                        # Decompose each side into the available aligned TMA tile sizes.
+                        for chunk in cutlass.range(left_tiles):
+                            row = split // extent * extent + chunk * rows
+                            self.load_history_partition(
+                                common_params,
+                                atoms,
+                                gmem,
+                                smem,
+                                row_base,
+                                row,
+                                first_page,
+                                head_tile,
+                                kv_stage,
+                                tma_bar_ptr,
+                                is_k_load,
+                                tile=tile,
+                            )
+                        for chunk in cutlass.range(right_tiles):
+                            row = (split + rows - 1) // rows * rows + chunk * rows
+                            self.load_history_partition(
+                                common_params,
+                                atoms,
+                                gmem,
+                                smem,
+                                row_base,
+                                row,
+                                last_page,
+                                head_tile,
+                                kv_stage,
+                                tma_bar_ptr,
+                                is_k_load,
+                                tile=tile,
+                            )
+            else:
+                self.load_history_subdivided(
+                    common_params,
+                    page_table_stage,
+                    atoms,
+                    gmem,
+                    smem,
+                    row_base,
+                    head_tile,
+                    kv_stage,
+                    tma_bar_ptr,
+                    is_k_load,
+                )
+        else:
+            self.load_history_subdivided(
+                common_params,
+                page_table_stage,
+                atoms,
+                gmem,
+                smem,
+                row_base,
+                head_tile,
+                kv_stage,
+                tma_bar_ptr,
+                is_k_load,
+            )
+
+    @cute.jit
+    def load_history_partition(
+        self,
+        common_params: SimpleNamespace,
+        atoms: tuple,
+        gmem: tuple,
+        smem: tuple,
+        row_base: cutlass.Int32,
+        row: cutlass.Int32,
+        page: cutlass.Int32,
+        head_tile: cutlass.Int32,
+        kv_stage: cutlass.Int32,
+        tma_bar_ptr: cute.Pointer,
+        is_k_load: cutlass.Constexpr,
+        tile: cutlass.Constexpr,
+    ) -> None:
+        rows = self.history_tile_sizes[tile]
+        context_row = row_base + row
+        position = (
+            common_params.position - 1 - (common_params.position - 1 - context_row + 128) % 128
+        )
+        offset = position % self.history_page_size // rows
+        if cutlass.const_expr(is_k_load):
+            src = gmem[tile][None, offset, head_tile, page]
+            dst = smem[tile][None, row // rows, 0, kv_stage]
+        else:
+            src = gmem[tile][None, head_tile, offset, page]
+            dst = smem[tile][None, 0, row // rows, kv_stage]
+        cute.copy(atoms[tile], src, dst, tma_bar_ptr=tma_bar_ptr)
+
+    @cute.jit
+    def load_history_subdivided(
+        self,
+        common_params: SimpleNamespace,
+        page_table_stage: cutlass.Int32,
+        atoms: tuple,
+        gmem: tuple,
+        smem: tuple,
+        row_base: cutlass.Int32,
+        head_tile: cutlass.Int32,
+        kv_stage: cutlass.Int32,
+        tma_bar_ptr: cute.Pointer,
+        is_k_load: cutlass.Constexpr,
         tile: cutlass.Constexpr = None,
         start_row: cutlass.Int32 = 0,
     ) -> None:
@@ -1345,17 +1479,23 @@ class DSparkAttentionKernel:
                     )
                     legal = not (has_valid | has_wrapped_valid)
             if legal:
-                offset = position % self.history_page_size // rows
-                if cutlass.const_expr(is_k_load):
-                    src = gmem[tile][None, offset, head_tile, page]
-                    dst = smem[tile][None, row // rows, 0, kv_stage]
-                else:
-                    src = gmem[tile][None, head_tile, offset, page]
-                    dst = smem[tile][None, 0, row // rows, kv_stage]
-                cute.copy(atoms[tile], src, dst, tma_bar_ptr=tma_bar_ptr)
+                self.load_history_partition(
+                    common_params,
+                    atoms,
+                    gmem,
+                    smem,
+                    row_base,
+                    row,
+                    page,
+                    head_tile,
+                    kv_stage,
+                    tma_bar_ptr,
+                    is_k_load,
+                    tile=tile,
+                )
             else:
                 if cutlass.const_expr(tile > 0):
-                    self.load_history(
+                    self.load_history_subdivided(
                         common_params,
                         page_table_stage,
                         atoms,
