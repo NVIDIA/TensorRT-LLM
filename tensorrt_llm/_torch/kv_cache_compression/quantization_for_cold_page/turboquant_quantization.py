@@ -36,7 +36,7 @@ _MAX_INSTANCE_WIDTH = 512
 _INSTANCE_WIDTH = 256
 _BIT_PLANES = {1: (1, 0), 2: (2, 0), 3: (2, 1), 4: (4, 0)}
 _LUT_STRIDE = 16  # fp32 entries per codebook in the kernels' centroid table (LUT_STRIDE)
-_MODES = {"mse": 0, "prod": 1, "fractional": 2}
+_MODES = {"mse": 0, "fractional": 1}
 # A 64-bit stand-in for the KVCM addresses when kernels are compiled ahead of use.
 _ADDRESS = 1 << 40
 
@@ -103,21 +103,19 @@ class _TurboQuantGeometry:
     tokens_per_page: int
 
     @property
-    def blocked(self) -> int:
-        """How a row wider than 512 is split into independent TurboQuant instances.
+    def blocked(self) -> bool:
+        """Whether an mse row wider than 512 is split into independent TurboQuant instances.
 
         Decoding accumulates every output value of an instance on chip (at most 512 fp32
-        columns of tensor memory, shared with the staged operand). 1 (prod): the first 512 values
-        and the rest. 2 (mse): pieces of 256 values and the rest, decoded on tensor cores.
+        columns of tensor memory, shared with the staged operand), so such a row is coded as
+        pieces of 256 values and the rest, decoded on tensor cores.
         """
-        if self.mode == "fractional" or self.width <= _MAX_INSTANCE_WIDTH:
-            return 0
-        return 1 if self.mode == "prod" else 2
+        return self.mode == "mse" and self.width > _MAX_INSTANCE_WIDTH
 
     @property
     def pieces(self) -> tuple[int, ...]:
-        """Power-of-two widths in which the kernels load a row (and, if blocked == 2, encode it)."""
-        if self.blocked == 2:
+        """Power-of-two widths in which the kernels load a row (and, if blocked, encode it)."""
+        if self.blocked:
             full, rest = divmod(self.width, _INSTANCE_WIDTH)
             return (_INSTANCE_WIDTH,) * full + ((rest,) if rest else ())
         return _power_of_two_pieces(self.width)
@@ -127,16 +125,13 @@ class _TurboQuantGeometry:
         """(width, bits) of every coded group of a row, in coordinate order."""
         if self.mode == "fractional":
             return tuple((self.width // 2, bits) for bits in self.group_bits)
-        if self.blocked == 1:
-            first = _power_of_two_pieces(self.width)[0]
-            return ((first, self.group_bits[0]), (self.width - first, self.group_bits[0]))
-        # One set of bit planes; with blocked == 2 the instances own consecutive chunks of it.
+        # One set of bit planes; blocked instances own consecutive chunks of it.
         return ((self.width, self.group_bits[0]),)
 
     @property
     def instances(self) -> tuple[int, ...]:
         """Width of every TurboQuant instance of a row (each has its own scale)."""
-        if self.blocked == 2:
+        if self.blocked:
             return self.pieces
         return tuple(width for width, _ in self.groups)
 
@@ -156,13 +151,9 @@ class _TurboQuantGeometry:
             for plane, plane_bits in enumerate(_BIT_PLANES[bits]):
                 offsets[f"{group}{plane}"] = cursor
                 cursor += _align(self.rows * width * plane_bits // 8)
-        if self.mode == "prod":
-            offsets["qjl"] = cursor
-            cursor += _align(self.rows * self.width // 8)
-        # BF16 scalars per row and instance: the scale, and for prod the residual norm.
+        # One BF16 scale per row and instance.
         offsets["scale"] = cursor
-        scalars = len(self.instances) * (2 if self.mode == "prod" else 1)
-        cursor += _align(self.rows * 2 * scalars)
+        cursor += _align(self.rows * 2 * len(self.instances))
         if self.mode == "fractional":
             offsets["mask"] = cursor
             cursor += _align(self.rows // self.tokens_per_page * self.width // 8)
@@ -192,14 +183,10 @@ class _TurboQuantGeometry:
             tile_rows = self.tokens_per_page
         else:
             # Tensor-core tiles of 64+ rows accumulate in tensor memory: 512 fp32 columns shared
-            # by the accumulators and the staged operand. Decoding accumulates a whole instance
-            # and prod encoding its whole QJL projection; wider ones use 32-row tiles, whose
-            # accumulators live in registers.
+            # by the accumulators and the staged operand. Decoding accumulates a whole instance;
+            # wider ones use 32-row tiles, whose accumulators live in registers.
             accumulated = max(self.instances)
-            if encode and self.mode == "prod":
-                # The QJL projection accumulates the whole instance next to the rotated chunk.
-                block_m = 64 if accumulated <= 128 else 32
-            elif encode and self.width == 128:
+            if encode and self.width == 128:
                 # Small tiles keep more programs in flight; encoding is bound by the host link.
                 block_m = 32
             elif encode or accumulated <= 128:
@@ -219,7 +206,7 @@ class _TurboQuantGeometry:
         planes_a = _BIT_PLANES[groups[0][1]]
         planes_b = _BIT_PLANES[groups[-1][1]] if len(groups) > 1 else (0, 0)
         codebooks = {}
-        if self.blocked == 2:  # instance 0 and those of its width use CB0, the last one CB1
+        if self.blocked:  # instance 0 and those of its width use CB0, the last one CB1
             coded = ((pieces[0], groups[0][1]), (pieces[-1], groups[0][1]))
         else:
             coded = (groups[0], groups[-1])
@@ -264,14 +251,13 @@ class _TurboQuantGeometry:
             W_B0=planes_b[0],
             OFF_B1=regions.get("B1", 0),
             W_B1=planes_b[1],
-            OFF_QJL=regions.get("qjl", 0),
             OFF_SCALE=regions["scale"],
             OFF_MASK=regions.get("mask", 0),
             OFF_RAW=regions["raw"],
             RAW=self.raw_elements,
             RAW_BLOCK=_next_power_of_two(max(self.raw_elements, 1)),
             **{
-                "num_warps": 4 if block_m * self.width <= 4096 and self.mode != "prod" else 8,
+                "num_warps": 4 if block_m * self.width <= 4096 else 8,
                 # Wide rows keep their pieces resident; pipelining their matrix tiles would not fit.
                 "num_stages": 1 if self.width > 256 else 2,
                 **launch,
@@ -297,10 +283,10 @@ class _TurboQuantGeometry:
             passes = range(len(self.instances))
         else:
             passes = (-1,)
-        single = self.blocked == 2 or (self.blocked == 0 and len(self.pieces) == 1)
+        single = self.blocked or len(self.pieces) == 1
         out = []
         for decode_pass in passes:
-            width = self.pieces[decode_pass] if self.blocked == 2 else self.width
+            width = self.pieces[decode_pass] if self.blocked else self.width
             blocks = 1
             if cols and single and self.mode == "mse" and width > cols:
                 blocks = width // cols
@@ -323,12 +309,12 @@ class _TurboQuantGeometry:
         if self.mode != "mse" or self.width <= 256 or capability[0] != 10:
             return {}
         if encode:
-            if self.blocked == 2:
+            if self.blocked:
                 return dict(block_m=64, num_warps=8, num_stages=2, maxnreg=128)
             if accumulated <= 448:
                 return dict(block_m=64, num_warps=8, num_stages=1, maxnreg=128)
             return {}
-        if self.blocked == 2:
+        if self.blocked:
             return dict(block_m=128, num_warps=4, num_stages=1)
         if accumulated <= 448:
             return dict(block_m=128, num_warps=8, num_stages=1)
@@ -383,7 +369,7 @@ class _TurboQuantColdPageCodecState:
 
 
 class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression):
-    """TurboQuant cold pages (arXiv 2504.19874): rotation, Lloyd-Max codebooks, optional QJL."""
+    """TurboQuant cold pages (arXiv 2504.19874): rotation and Lloyd-Max codebooks (mse)."""
 
     _FORMAT_NAME = "TurboQuant"
     _RANGE_ALIGNMENT = 16
@@ -409,17 +395,13 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             )
             self._skip_rope_quantization = False
         bits = float(config.turboquant_bits)
-        self._mode = config.turboquant_mode
         self._seed = int(config.turboquant_seed)
         if bits != int(bits):
-            if self._mode != "mse":
-                raise ValueError("Fractional TurboQuant bit widths support only mode 'mse'")
             # Outlier channels get the next bit width up, regular channels the one below.
             self._mode = "fractional"
             self._group_bits = (math.ceil(bits), math.floor(bits))
-        elif self._mode == "prod":
-            self._group_bits = (int(bits) - 1,)
         else:
+            self._mode = "mse"
             self._group_bits = (int(bits),)
         self._parameters: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
@@ -524,7 +506,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             )
         if width >= 2 * _MAX_INSTANCE_WIDTH:
             raise NotImplementedError(
-                f"TurboQuant cold pages support up to {2 * _MAX_INSTANCE_WIDTH - 16} quantized "
+                f"TurboQuant cold pages support fewer than {2 * _MAX_INSTANCE_WIDTH} quantized "
                 f"elements per vector; layer {layer_id} {role} has {width}"
             )
         rest = width % _INSTANCE_WIDTH
@@ -668,16 +650,9 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         else:
             rotation = torch.block_diag(*(tq_math.haar_rotation(self._seed, w) for w in widths))
             encode, decode = rotation.T, rotation
-        if self._mode == "prod":
-            projection = torch.block_diag(*(tq_math.qjl_projection(self._seed, w) for w in widths))
-            qjl_encode, qjl_decode = projection.T, projection @ rotation
-        else:
-            qjl_encode, qjl_decode = encode, decode
         parameters = (
             encode.to(device=device, dtype=torch.float16).contiguous(),
             decode.to(device=device, dtype=torch.bfloat16).contiguous(),
-            qjl_encode.to(device=device, dtype=torch.float16).contiguous(),
-            qjl_decode.to(device=device, dtype=torch.bfloat16).contiguous(),
         )
         self._parameters[key] = parameters
         return parameters
@@ -690,7 +665,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
     ) -> _TurboQuantLaunch:
         from . import turboquant_kernels as kernels
 
-        encode_w, decode_w, encode_s, decode_s = self._group_parameters(geometry, device)
+        encode_w, decode_w = self._group_parameters(geometry, device)
         element_bytes = geometry.element_bytes
         hot_base = min(base for base, _, _ in entries)
         table = torch.tensor(
@@ -711,8 +686,8 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         launch = _TurboQuantLaunch(
             num_buffers=len(entries),
             table=table,
-            encode_args=(table, encode_w, encode_s, centroids),
-            decode_args=(table, decode_w, decode_s, centroids),
+            encode_args=(table, encode_w, centroids),
+            decode_args=(table, decode_w, centroids),
             encode_constants=encode_constants,
             decode_constants=decode_constants,
             hot_base=hot_base,

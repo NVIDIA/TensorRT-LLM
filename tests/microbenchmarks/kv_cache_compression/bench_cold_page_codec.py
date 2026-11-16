@@ -17,7 +17,6 @@ lifecycles (no model weights needed):
                                                              x {512, 34}, 128-token Pages
     dsv4-csa-skiprope-bf16-mse4  bf16  mse 4-bit   256       as dsv4-csa, skip_rope_quantization
     llama8b-bf16-mse4          bf16  mse 4-bit   256         Llama-3.1-8B GQA: 32 x {K, V} x 8 x 32 x 128
-    llama8b-bf16-prod4         bf16  prod 4-bit  256         as llama8b
     gqa-hd64-bf16-mse4         bf16  mse 4-bit   256         GQA: 36 x {K, V} x 8 x 32 x 64
     glm5-bf16-mse4-8pages      bf16  mse 4-bit   8           as glm5; a latency case
 
@@ -51,7 +50,7 @@ Correctness. After timing, each decoded slot is compared with its source slot: n
 ||x - x_hat||^2 / ||x||^2, averaged over the K/V vectors of the case and of each (layer, buffer).
 A format FAILS when an nMSE is not finite or one buffer's nMSE is above four times the case-wide
 nMSE (a layer that decodes to zeros has nMSE 1, which a case-wide mean over many layers would
-hide); TurboQuant mse also FAILS when its case-wide nMSE is above twice the paper's distortion
+hide); TurboQuant also FAILS when its case-wide nMSE is above twice the paper's distortion
 (0.0094, 0.034, 0.117 at 4, 3, 2 bits). Results that fail do not count. Cases with an FP8
 active KV cache are skipped on GPUs below compute capability 8.9, where TurboQuant does not admit
 it. Non-finite values are written to --json as null.
@@ -111,7 +110,6 @@ class Case:
     kv_heads: int
     head_dim: int
     runtime: str
-    mode: str
     bits: int
     pages: int
     latency: bool = False
@@ -189,36 +187,32 @@ _GQA_64 = {
 CASES = {
     case.name: case
     for case in (
-        Case("glm5-bf16-mse4", **_GLM_5, runtime="bf16", mode="mse", bits=4, pages=256),
-        Case("glm5-bf16-mse3", **_GLM_5, runtime="bf16", mode="mse", bits=3, pages=256),
+        Case("glm5-bf16-mse4", **_GLM_5, runtime="bf16", bits=4, pages=256),
+        Case("glm5-bf16-mse3", **_GLM_5, runtime="bf16", bits=3, pages=256),
         Case(
             "glm5-skiprope-bf16-mse4",
             **_GLM_5,
             runtime="bf16",
-            mode="mse",
             bits=4,
             pages=256,
             skip_rope=True,
         ),
-        Case("mla-fp8-mse4", **_MLA, runtime="fp8", mode="mse", bits=4, pages=256),
-        Case("dsv4-csa-bf16-mse4", **_DSV4_CSA, runtime="bf16", mode="mse", bits=4, pages=256),
+        Case("mla-fp8-mse4", **_MLA, runtime="fp8", bits=4, pages=256),
+        Case("dsv4-csa-bf16-mse4", **_DSV4_CSA, runtime="bf16", bits=4, pages=256),
         Case(
             "dsv4-csa-skiprope-bf16-mse4",
             **_DSV4_CSA,
             runtime="bf16",
-            mode="mse",
             bits=4,
             pages=256,
             skip_rope=True,
         ),
-        Case("llama8b-bf16-mse4", **_LLAMA_8B, runtime="bf16", mode="mse", bits=4, pages=256),
-        Case("llama8b-bf16-prod4", **_LLAMA_8B, runtime="bf16", mode="prod", bits=4, pages=256),
-        Case("gqa-hd64-bf16-mse4", **_GQA_64, runtime="bf16", mode="mse", bits=4, pages=256),
+        Case("llama8b-bf16-mse4", **_LLAMA_8B, runtime="bf16", bits=4, pages=256),
+        Case("gqa-hd64-bf16-mse4", **_GQA_64, runtime="bf16", bits=4, pages=256),
         Case(
             "glm5-bf16-mse4-8pages",
             **_GLM_5,
             runtime="bf16",
-            mode="mse",
             bits=4,
             pages=8,
             latency=True,
@@ -292,7 +286,7 @@ class _Codec:
 
 def _build_codec(case: Case, fmt: str, source: dict, perm: torch.Tensor) -> _Codec:
     """Build and configure ``fmt``'s provider over fresh hot buffers holding ``source``."""
-    options = {"turboquant_bits": case.bits, "turboquant_mode": case.mode}
+    options = {"turboquant_bits": case.bits}
     manager = create_kv_cache_compression_manager(
         ColdPageQuantizationCompressionConfig(
             quant=fmt,
@@ -474,8 +468,7 @@ def _run_case(
     print(
         f"\n{case.name}: {case.model}, {case.layers} layers x {{{buffers}}} {case.runtime}"
         f" ({case.hot_page_bytes / 2**20:.2f} MiB/page), {case.pages} pages/call;"
-        f" TurboQuant {case.mode} {case.bits}-bit"
-        + (", skip_rope_quantization" if case.skip_rope else "")
+        f" TurboQuant {case.bits}-bit" + (", skip_rope_quantization" if case.skip_rope else "")
     )
     source = _make_source(case)
     perm = torch.randperm(case.pages, generator=torch.Generator().manual_seed(SEED)).to(torch.int32)
@@ -510,7 +503,7 @@ def _run_case(
             "decode": max(cold_bytes / bandwidth["host_read"], hot_bytes / bandwidth["hbm_write"]),
         }
         nmse, per_buffer = _nmse(codec, source, perm_device, case.pages)
-        bound = 2 * PAPER_MSE[case.bits] if fmt == "turboquant" and case.mode == "mse" else None
+        bound = 2 * PAPER_MSE[case.bits] if fmt == "turboquant" else None
         finite = all(math.isfinite(value) for value in (nmse, *per_buffer.values()))
         worst = max(  # a non-finite buffer first
             per_buffer,

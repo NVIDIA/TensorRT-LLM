@@ -5478,11 +5478,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
 
 _TURBOQUANT_BITS = (2, 2.5, 3, 3.5, 4)
-_TURBOQUANT_PROD_BITS = (2, 3, 4)
 _NVFP4_COLD_PAGE_OPTIONS = frozenset(
     {"nvfp4_residual_dim", "scale_checkpoint_path"})
 _TURBOQUANT_COLD_PAGE_OPTIONS = frozenset(
-    {"turboquant_bits", "turboquant_mode", "turboquant_seed"})
+    {"turboquant_bits", "turboquant_seed"})
 
 
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
@@ -5543,23 +5542,16 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         status="prototype",
         json_schema_extra={"enum": list(_TURBOQUANT_BITS)},
         description=
-        "TurboQuant average bits per quantized value: codebook indices plus "
-        "QJL sign bits, excluding per-vector scales. One of 2, 2.5, 3, 3.5, "
-        "or 4; prod mode supports 2, 3, and 4.")
-    turboquant_mode: Literal["mse", "prod"] = Field(
-        default="mse",
-        status="prototype",
-        description=
-        "TurboQuant mode. mse (default): minimize the reconstruction error. "
-        "prod: spend one of the bits on a QJL sign of the residual so that "
-        "inner products with decoded vectors are unbiased.")
+        "TurboQuant average bits per quantized value (codebook indices), "
+        "excluding per-vector scales: one of 2, 2.5, 3, 3.5, or 4. TurboQuant "
+        "minimizes the reconstruction error (the paper's TurboQuant-mse).")
     turboquant_seed: NonNegativeInt = Field(
         default=5,
         status="prototype",
         telemetry=False,
         description=
-        "TurboQuant seed of the random rotation and QJL projection matrices; "
-        "equal seeds give equal matrices in every process. Every seed has the "
+        "TurboQuant seed of the random rotation matrices; equal seeds give "
+        "equal matrices in every process. Every seed has the "
         "same expected distortion; the default is one under which the "
         "all-equal vector, a common structured input, also gets a typical "
         "distortion.")
@@ -5584,7 +5576,7 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     @model_validator(mode="after")
     def _validate_format_options(
             self) -> "ColdPageQuantizationCompressionConfig":
-        """Reject options of the other format and prod with fractional bits."""
+        """Reject the options of the format not selected."""
         if self.quant == "turboquant":
             owner, unused = "nvfp4", _NVFP4_COLD_PAGE_OPTIONS
         else:
@@ -5594,12 +5586,6 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
             verb = "applies" if len(misplaced) == 1 else "apply"
             raise ValueError(f"{', '.join(misplaced)} {verb} only to "
                              f"quant={owner!r}, not quant={self.quant!r}")
-        if (self.turboquant_mode == "prod"
-                and self.turboquant_bits not in _TURBOQUANT_PROD_BITS):
-            raise ValueError(
-                "turboquant_mode='prod' supports turboquant_bits 2, 3, and 4, "
-                f"not {self.turboquant_bits:g}; fractional bit widths require "
-                "turboquant_mode='mse'")
         return self
 
     @model_serializer(mode="wrap")

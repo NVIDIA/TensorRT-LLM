@@ -34,19 +34,24 @@ rotated coordinate with the index of the nearest value of a Lloyd-Max codebook,
 and stores one BF16 scale for the vector. The decoder looks up the codebook
 values, applies the scale, and rotates back.
 
-| Setting | Algorithm | Use it for |
+| `turboquant_bits` | Algorithm | Use it for |
 | --- | --- | --- |
-| `turboquant_mode: mse`, 2, 3, or 4 bits | The paper's Algorithm 1: the smallest reconstruction error for the bit width | The default; K and V reconstruction |
-| `turboquant_mode: mse`, 2.5 or 3.5 bits | Two Algorithm 1 instances per vector: in each group of vectors that share a page, layer, buffer, and KV head, half of the channels use one bit more than the other half; channels with more than four times the median channel energy are always in that half | Bit widths between the integer settings, with outlier channels kept more precise |
-| `turboquant_mode: prod`, 2, 3, or 4 bits | The paper's Algorithm 2: `mse` with one bit fewer, plus a 1-bit QJL sign of the residual and the residual norm | Unbiased estimates of the inner products between queries and decoded keys, at a larger reconstruction error |
+| 2, 3, or 4 | The paper's TurboQuant-mse (Algorithm 1): the smallest reconstruction error for the bit width | The default (4 bits); K and V reconstruction |
+| 2.5 or 3.5 | Two Algorithm 1 instances per vector: in each group of vectors that share a page, layer, buffer, and KV head, half of the channels use one bit more than the other half; channels with more than four times the median channel energy are always in that half | Bit widths between the integer settings, with outlier channels kept more precise |
 
 The fractional settings choose the high-bit half from the channel energies in
 the Page being encoded: the outlier channels, whose energy exceeds four times
 the median channel energy, and then the lowest-numbered other channels until
 half of the channels are chosen. The split adapts to every Page without
-calibration. The rotation
-and QJL matrices are fixed by `turboquant_seed` and generated identically in
-every process.
+calibration. The rotation matrices are fixed by `turboquant_seed` and generated
+identically in every process.
+
+The paper's TurboQuant-prod (Algorithm 2), which spends one bit on a QJL sign
+of the residual so that inner products with decoded keys are unbiased, is not
+offered. KVCacheManagerV2 re-encodes a Page each time it offloads the Page
+again after an onboard, and the QJL error of `prod` compounds over these round
+trips, whereas the error of TurboQuant-mse stays the same or settles after a few
+round trips (see [Reconstruction Quality](#reconstruction-quality)).
 
 Each cold Page is one compact storage blob. For conventional MHA, MQA, and GQA,
 the K and V buffers are encoded; for key-only MLA, the latent Attention key is
@@ -60,13 +65,12 @@ the default lossless cold-page codec.
 Disk migration uses pinned Host staging, exactly as for NVFP4: the Host and
 Disk tiers share one TurboQuant representation.
 
-| `turboquant_mode` | `turboquant_bits` | Bits per stored value, head dimension 128[^bits] | BF16 Page compression |
-| --- | --- | --- | --- |
-| `mse` | `2`, `2.5`, `3`, `3.5`, `4` | 2.125, 2.78, 3.125, 3.78, 4.125 | 7.5x, 5.8x, 5.1x, 4.2x, 3.9x |
-| `prod` | `2`, `3`, `4` | 2.25, 3.25, 4.25 | 7.1x, 4.9x, 3.8x |
-| NVFP4, for comparison | | 4.5 | 3.6x |
+| `turboquant_bits` | Bits per stored value, head dimension 128[^bits] | BF16 Page compression |
+| --- | --- | --- |
+| `2`, `2.5`, `3`, `3.5`, `4` | 2.125, 2.78, 3.125, 3.78, 4.125 | 7.5x, 5.8x, 5.1x, 4.2x, 3.9x |
+| NVFP4, for comparison | 4.5 | 3.6x |
 
-[^bits]: Including per-vector scales and residual norms and, for 2.5 and 3.5
+[^bits]: Including per-vector scales and, for 2.5 and 3.5
     bits, the channel masks at the default 32 tokens per Page. The cold-page
     size formula is in the
     [feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#turboquant-cold-pages).
@@ -136,7 +140,6 @@ with LLM(
     kv_cache_compression_config=ColdPageQuantizationCompressionConfig(
         quant="turboquant",
         turboquant_bits=3,
-        turboquant_mode="mse",
     ),
 ) as llm:
     outputs = llm.generate(
@@ -161,7 +164,6 @@ kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: turboquant
   turboquant_bits: 3     # 2, 2.5, 3, 3.5, or 4
-  turboquant_mode: mse   # mse or prod; prod supports 2, 3, and 4 bits
 ```
 
 ```bash
@@ -174,8 +176,7 @@ The same configuration is available from the LLM API example script:
 python examples/llm-api/llm_kv_cache_compression.py \
   --compression-method turboquant-cold-page \
   --model Qwen/Qwen3-8B \
-  --turboquant-bits 3 \
-  --turboquant-mode mse
+  --turboquant-bits 3
 ```
 
 This smoke test disables block reuse and covers basic inference and
@@ -333,7 +334,7 @@ FP8 `fp8_ds_mla` footer-scale KV layout.
 
 ## Accuracy and Performance
 
-TurboQuant is lossy, and its error depends on the bit width and mode. Measure
+TurboQuant is lossy, and its error depends on the bit width. Measure
 the accuracy effect on your model and workload before deployment, and compare
 it with NVFP4 cold pages at the same cold-tier quota.
 
@@ -341,39 +342,34 @@ it with NVFP4 cold pages at the same cold-tier quota.
 
 `tests/microbenchmarks/kv_cache_compression/turboquant_quality.py` measures the normalized MSE
 `||x - x_hat||^2 / ||x||^2` of BF16 K/V vectors with head dimension 128 on structured inputs
-("outlier channels" has two channels 10-25x larger than the rest, like real K), and the bias and
-variance of inner products with unit query vectors:
+("outlier channels" has two channels 10-25x larger than the rest, like real K):
 
-| Setting | Paper (d = 128) | Gaussian | Outlier channels | Sparse | One-hot | All-equal | Norms 1e-6..1e6 | Inner-product bias / variance x d |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `mse` 2 | 0.117 | 0.115 | 0.110 | 0.116 | 0.115 | 0.127 | 0.115 | |
-| `mse` 2.5 | between | 0.073 | 0.045 | 0.041 | 0.032 | 0.055 | 0.073 | |
-| `mse` 3 | 0.034 | 0.034 | 0.032 | 0.034 | 0.034 | 0.035 | 0.033 | |
-| `mse` 3.5 | between | 0.021 | 0.012 | 0.011 | 0.009 | 0.017 | 0.021 | |
-| `mse` 4 | 0.0094 | 0.0092 | 0.0086 | 0.0092 | 0.0092 | 0.0094 | 0.0091 | |
-| `prod` 2 | var 0.56 / d | 0.57 | 0.55 | 0.57 | 0.58 | 0.54 | 0.58 | -2e-3 / 0.56 |
-| `prod` 3 | var 0.18 / d | 0.18 | 0.18 | 0.18 | 0.18 | 0.21 | 0.18 | -1e-3 / 0.17 |
-| `prod` 4 | var 0.047 / d | 0.053 | 0.051 | 0.054 | 0.054 | 0.072 | 0.053 | -5e-4 / 0.051 |
-| NVFP4 | | 0.0091 | 0.0084 | 0.0014 | 0 | 0 | 0.51 | |
+| Bits | Paper (d = 128) | Gaussian | Outlier channels | Sparse | One-hot | All-equal | Norms 1e-6..1e6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2 | 0.117 | 0.115 | 0.110 | 0.116 | 0.115 | 0.127 | 0.115 |
+| 2.5 | between | 0.073 | 0.045 | 0.041 | 0.032 | 0.055 | 0.073 |
+| 3 | 0.034 | 0.034 | 0.032 | 0.034 | 0.034 | 0.035 | 0.033 |
+| 3.5 | between | 0.021 | 0.012 | 0.011 | 0.009 | 0.017 | 0.021 |
+| 4 | 0.0094 | 0.0092 | 0.0086 | 0.0092 | 0.0092 | 0.0094 | 0.0091 |
+| NVFP4 | | 0.0091 | 0.0084 | 0.0014 | 0 | 0 | 0.51 |
 
-The per-vector least-squares scale makes `mse` slightly better than the paper's bound. `prod`
-trades reconstruction error (about `pi/2` times the residual of the `b - 1`-bit `mse` part) for
-unbiased inner products; its inner-product variance matches the paper's Theorem 2.
+The per-vector least-squares scale makes TurboQuant slightly better than the paper's bound.
 
-Repeated offload and onboard of the same Page re-encodes the decoded values every time
-(same tool, outlier-channel input, error after one and after four round trips):
+KVCacheManagerV2 re-encodes a Page each time it offloads the Page again after an onboard. The
+same tool repeats the round trip on the outlier-channel input, each time re-encoding the decoded
+Page:
 
-| Setting | 1 round trip | 4 round trips |
-| --- | --- | --- |
-| `mse` 4 / 3 / 2 | 0.0086 / 0.0314 / 0.1092 | 0.0086 / 0.0314 / 0.1092 |
-| `mse` 3.5 / 2.5 | 0.0123 / 0.0448 | 0.0137 / 0.0497 |
-| `prod` 4 / 3 / 2 | 0.051 / 0.18 / 0.55 | 0.31 / 1.9 / 16.8 |
+| Bits | 1 round trip | 4 round trips | 16 round trips |
+| --- | --- | --- | --- |
+| 4 / 3 / 2 | 0.0086 / 0.0314 / 0.1092 | 0.0086 / 0.0314 / 0.1092 | 0.0086 / 0.0314 / 0.1092 |
+| 3.5 / 2.5 | 0.0123 / 0.0448 | 0.0137 / 0.0497 | 0.0137 / 0.0497 |
+| NVFP4 | 0.0084 | 0.0084 | 0.0084 |
 
-Integer-bit `mse` reproduces its codes, so the error does not grow. Fractional bits choose the
-outlier channels from the decoded data again and mostly keep them. `prod` is unbiased for one
-encoding (in expectation over the QJL projection); a re-encoding adds QJL error again, with the
-same seeded projection, so its error grows quickly with the number of round trips. Prefer `mse`
-when Pages migrate repeatedly.
+Integer bit widths reproduce their codes, so the error does not grow. Fractional bits choose the
+outlier channels from the decoded data again: the error grows by 10-20% (depending on the input)
+over the first round trips and then stays. The paper's TurboQuant-prod is not offered because its error compounds
+instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips at 2 bits, and
+0.051, 0.31, and 7.0 at 4 bits.
 
 ### Encode and Decode Time
 
@@ -385,20 +381,18 @@ writes it at 193 GB/s) and on the other socket (125 GB/s and 122 GB/s):
 
 | Case | Geometry and TurboQuant setting | Cold Page KiB, TurboQuant / NVFP4 | Own socket: encode / decode us (vs NVFP4) | Other socket: encode / decode us (vs NVFP4) |
 | --- | --- | --- | --- | --- |
-| `glm5-bf16-mse4` | GLM-5 MLA latent, 78 x {K} x 1 x 32 x 576, BF16, `mse` 4 | 717 / 790 | 1076 / 1106 (0.98x / 1.11x) | 1601 / 1575 (0.92x / 0.94x) |
-| `glm5-bf16-mse3` | same, `mse` 3 | 541 / 790 | 848 / 1213 (0.77x / 1.22x) | 1229 / 1522 (0.72x / 0.91x) |
-| `glm5-skiprope-bf16-mse4` | same, `mse` 4, `skip_rope_quantization` (512 values quantized) | 941 / 1014 | 1788 / 1908 (1.28x / 1.50x) | 2049 / 3198 (0.93x / 1.50x) |
-| `mla-fp8-mse4` | DeepSeek-V3.2 / Kimi-K3 MLA latent, 61 x {K} x 1 x 32 x 576, FP8, `mse` 4 | 560 / 618 | 799 / 857 (0.94x / 1.10x) | 1242 / 1230 (0.93x / 0.94x) |
-| `dsv4-csa-bf16-mse4` | DeepSeek-V4 CSA, 18 x {compressed, indexer} x 1 x 32 x {512, 34}, BF16, `mse` 4 | 237 / 220 | 366 / 375 (0.53x / 1.19x) | 547 / 532 (0.53x / 0.98x) |
+| `glm5-bf16-mse4` | GLM-5 MLA latent, 78 x {K} x 1 x 32 x 576, BF16, 4 bits | 717 / 790 | 1076 / 1106 (0.98x / 1.11x) | 1601 / 1575 (0.92x / 0.94x) |
+| `glm5-bf16-mse3` | same, 3 bits | 541 / 790 | 848 / 1213 (0.77x / 1.22x) | 1229 / 1522 (0.72x / 0.91x) |
+| `glm5-skiprope-bf16-mse4` | same, 4 bits, `skip_rope_quantization` (512 values quantized) | 941 / 1014 | 1788 / 1908 (1.28x / 1.50x) | 2049 / 3198 (0.93x / 1.50x) |
+| `mla-fp8-mse4` | DeepSeek-V3.2 / Kimi-K3 MLA latent, 61 x {K} x 1 x 32 x 576, FP8, 4 bits | 560 / 618 | 799 / 857 (0.94x / 1.10x) | 1242 / 1230 (0.93x / 0.94x) |
+| `dsv4-csa-bf16-mse4` | DeepSeek-V4 CSA, 18 x {compressed, indexer} x 1 x 32 x {512, 34}, BF16, 4 bits | 237 / 220 | 366 / 375 (0.53x / 1.19x) | 547 / 532 (0.53x / 0.98x) |
 | `dsv4-csa-skiprope-bf16-mse4` | same, `skip_rope_quantization` (NVFP4 also keeps RoPE) | 237 / 252 | 365 / 383 (1.03x / 1.17x) | 549 / 536 (1.00x / 0.99x) |
-| `llama8b-bf16-mse4` | Llama-3.1-8B GQA, 32 x {K, V} x 8 x 32 x 128, BF16, `mse` 4 | 1056 / 1152 | 1455 / 1334 (0.92x / 0.92x) | 2286 / 2244 (0.92x / 0.93x) |
-| `llama8b-bf16-prod4` | same, `prod` 4 | 1088 / 1152 | 1854 / 1380 (1.17x / 0.95x) | 2340 / 2310 (0.94x / 0.96x) |
-| `gqa-hd64-bf16-mse4` | GQA, 36 x {K, V} x 8 x 32 x 64, BF16, `mse` 4 | 612 / 648 | 851 / 786 (0.94x / 0.96x) | 1329 / 1320 (0.94x / 0.96x) |
+| `llama8b-bf16-mse4` | Llama-3.1-8B GQA, 32 x {K, V} x 8 x 32 x 128, BF16, 4 bits | 1056 / 1152 | 1455 / 1334 (0.92x / 0.92x) | 2286 / 2244 (0.92x / 0.93x) |
+| `gqa-hd64-bf16-mse4` | GQA, 36 x {K, V} x 8 x 32 x 64, BF16, 4 bits | 612 / 648 | 851 / 786 (0.94x / 0.96x) | 1329 / 1320 (0.94x / 0.96x) |
 | `glm5-bf16-mse4-8pages` | as `glm5-bf16-mse4`, 8 Pages per call | 717 / 790 | 64 / 83 (1.24x / 1.76x) | 73 / 100 (1.03x / 1.47x) |
 
 Conventional K/V Pages are bound by the host link in both formats (96-100% of SOL), so
-TurboQuant takes about the NVFP4 time scaled by the cold-page size; only the `prod` encode, which
-also projects the residual, is compute bound on the faster link. MLA latents and DeepSeek-V4
+TurboQuant takes about the NVFP4 time scaled by the cold-page size. MLA latents and DeepSeek-V4
 CSA rows need more decode work per byte, because every instance (256 or 448 values) is rotated
 back on tensor cores: on the faster link their decode takes 1.1-1.2x the NVFP4 time, while
 encode stays at or below it; on the slower link both are link bound and TurboQuant is faster.
@@ -420,10 +414,10 @@ the iteration statistics of its question phase show Attention Pages reused from 
 With TP4/EP4 on four
 GB300 GPUs, greedy decoding, two 6144-token prefixes, and 400 questions:
 
-| Model | none | NVFP4 | TQ `mse` 4 | TQ `mse` 3.5 | TQ `mse` 3 | TQ `mse` 2.5 | TQ `prod` 4 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.8-Flash-Next-FP8 | 400/400 | 400/400 | 400/400 | 400/400 | 400/400 | 395/400 | 398/400 |
-| GLM-5.3-Flash | not run | not run | 400/400 | not run | 397/400 | not run | not run |
+| Model | none | NVFP4 | TurboQuant 4 | TurboQuant 3.5 | TurboQuant 3 | TurboQuant 2.5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.8-Flash-Next-FP8 | 400/400 | 400/400 | 400/400 | 400/400 | 400/400 | 395/400 |
+| GLM-5.3-Flash | not run | not run | 400/400 | not run | 397/400 | not run |
 
 ## Enablement Checklist
 
@@ -437,7 +431,7 @@ GB300 GPUs, greedy decoding, two 6144-token prefixes, and 400 questions:
    directory.
 5. Set `kv_cache_compression_config.algorithm` to
    `quantization_for_cold_page`, `quant` to `turboquant`, and choose
-   `turboquant_bits` and `turboquant_mode`.
+   `turboquant_bits`.
 6. Apply both cache configurations to every worker that owns a local cold tier.
 7. Verify nonzero offload and onboard bytes, and a cold slot size smaller than
    the hot Page, under a workload that creates real KV pressure.

@@ -64,19 +64,15 @@ def _nvfp4_cold_pages(**options: object) -> dict:
     return {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page", **options}}
 
 
-# (config, valid) pairs that the runtime model accepts or rejects for its cross-field rules: the
-# options of the format not selected, and prod with fractional bits.
+# (config, valid) pairs that the runtime model accepts or rejects for its cross-field rule: the
+# options of the format not selected.
 _COLD_PAGE_FORMAT_CASES = [
-    (_turboquant_cold_pages(turboquant_mode="prod", turboquant_bits=2.5), False),
-    (_turboquant_cold_pages(turboquant_mode="prod", turboquant_bits=3.5), False),
-    (_turboquant_cold_pages(turboquant_mode="prod"), True),
-    (_turboquant_cold_pages(turboquant_bits=3.5, turboquant_mode="mse"), True),
+    (_turboquant_cold_pages(turboquant_bits=3.5, turboquant_seed=7), True),
     (_turboquant_cold_pages(nvfp4_residual_dim=0), False),
     (_turboquant_cold_pages(scale_checkpoint_path="/ckpt"), False),
     (_nvfp4_cold_pages(quant="nvfp4", nvfp4_residual_dim=0, scale_checkpoint_path="/ckpt"), True),
     (_nvfp4_cold_pages(quant="nvfp4", turboquant_bits=4), False),
-    (_nvfp4_cold_pages(turboquant_mode="mse"), False),  # quant defaults to nvfp4
-    (_nvfp4_cold_pages(turboquant_seed=1), False),
+    (_nvfp4_cold_pages(turboquant_seed=1), False),  # quant defaults to nvfp4
 ]
 
 
@@ -289,12 +285,12 @@ _COLD_PAGE_FORMAT_CASES = [
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2.5), True),
         (
             generator.DISAGG_SCHEMA,
-            _turboquant_cold_pages(turboquant_bits=3, turboquant_mode="prod", turboquant_seed=7),
+            _turboquant_cold_pages(turboquant_bits=3, turboquant_seed=7),
             True,
         ),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=5), False),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits="4"), False),
-        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_mode="lloyd"), False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_mode="prod"), False),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_seed=-1), False),
         # Cross-field rules of ColdPageQuantizationCompressionConfig, in both serving schemas.
         *(

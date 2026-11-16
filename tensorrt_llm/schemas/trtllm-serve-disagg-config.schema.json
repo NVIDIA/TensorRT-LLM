@@ -781,81 +781,33 @@
     },
     "ColdPageQuantizationCompressionConfig": {
       "additionalProperties": false,
-      "allOf": [
-        {
-          "else": {
-            "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "turboquant_bits"
-                  ]
-                },
-                {
-                  "required": [
-                    "turboquant_mode"
-                  ]
-                },
-                {
-                  "required": [
-                    "turboquant_seed"
-                  ]
-                }
+      "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "turboquant_bits"
               ]
-            }
-          },
-          "if": {
-            "properties": {
-              "quant": {
-                "const": "turboquant"
-              }
             },
-            "required": [
-              "quant"
-            ]
-          },
-          "then": {
-            "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "nvfp4_residual_dim"
-                  ]
-                },
-                {
-                  "required": [
-                    "scale_checkpoint_path"
-                  ]
-                }
+            {
+              "required": [
+                "turboquant_seed"
               ]
             }
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "quant": {
+            "const": "turboquant"
           }
         },
-        {
-          "if": {
-            "properties": {
-              "turboquant_mode": {
-                "const": "prod"
-              }
-            },
-            "required": [
-              "turboquant_mode"
-            ]
-          },
-          "then": {
-            "properties": {
-              "turboquant_bits": {
-                "enum": [
-                  2,
-                  3,
-                  4
-                ]
-              }
-            }
-          }
-        }
-      ],
-      "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
+        "required": [
+          "quant"
+        ]
+      },
       "properties": {
         "algorithm": {
           "const": "quantization_for_cold_page",
@@ -926,7 +878,7 @@
         },
         "turboquant_bits": {
           "default": 4.0,
-          "description": "TurboQuant average bits per quantized value: codebook indices plus QJL sign bits, excluding per-vector scales. One of 2, 2.5, 3, 3.5, or 4; prod mode supports 2, 3, and 4.",
+          "description": "TurboQuant average bits per quantized value (codebook indices), excluding per-vector scales: one of 2, 2.5, 3, 3.5, or 4. TurboQuant minimizes the reconstruction error (the paper's TurboQuant-mse).",
           "enum": [
             2,
             2.5,
@@ -938,20 +890,9 @@
           "title": "Turboquant Bits",
           "type": "number"
         },
-        "turboquant_mode": {
-          "default": "mse",
-          "description": "TurboQuant mode. mse (default): minimize the reconstruction error. prod: spend one of the bits on a QJL sign of the residual so that inner products with decoded vectors are unbiased.",
-          "enum": [
-            "mse",
-            "prod"
-          ],
-          "status": "prototype",
-          "title": "Turboquant Mode",
-          "type": "string"
-        },
         "turboquant_seed": {
           "default": 5,
-          "description": "TurboQuant seed of the random rotation and QJL projection matrices; equal seeds give equal matrices in every process. Every seed has the same expected distortion; the default is one under which the all-equal vector, a common structured input, also gets a typical distortion.",
+          "description": "TurboQuant seed of the random rotation matrices; equal seeds give equal matrices in every process. Every seed has the same expected distortion; the default is one under which the all-equal vector, a common structured input, also gets a typical distortion.",
           "minimum": 0,
           "status": "prototype",
           "telemetry": {
@@ -959,6 +900,22 @@
           },
           "title": "Turboquant Seed",
           "type": "integer"
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "nvfp4_residual_dim"
+              ]
+            },
+            {
+              "required": [
+                "scale_checkpoint_path"
+              ]
+            }
+          ]
         }
       },
       "title": "ColdPageQuantizationCompressionConfig",
