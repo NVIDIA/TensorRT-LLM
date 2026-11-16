@@ -854,7 +854,7 @@ class PyExecutor:
         self._uses_torch_compile = model_engine.uses_torch_compile
 
         model = self.model_engine.model
-        if model is not None:
+        if model is not None and hasattr(model, "lm_head"):
             self._num_embeddings: int | None = cast(
                 int, model.lm_head.num_embeddings)
         else:
