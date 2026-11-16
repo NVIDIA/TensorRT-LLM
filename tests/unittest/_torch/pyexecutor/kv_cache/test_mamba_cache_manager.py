@@ -30,6 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -84,6 +85,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
 )
@@ -137,6 +140,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MambaStateConfig,
     MTPDecodingConfig,
+    SkipSoftmaxAttentionConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.llm_utils import (
@@ -763,6 +767,35 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     )
 
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("use_v2", "num_mamba_layers", "variable_geometry", "expected"),
+    [
+        (True, 1, False, Qwen35HybridCacheManager),
+        (False, 1, False, CppMambaHybridCacheManager),
+        (True, 0, False, KVCacheManagerV2),
+        (False, 0, False, KVCacheManager),
+        (False, 0, True, KVCacheManagerV2),
+    ],
+)
+def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
+    monkeypatch, use_v2, num_mamba_layers, variable_geometry, expected
+):
+    """Skip Softmax changes only attention kernels, not the cache manager."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    model_config = _hybrid_model_config()
+    model_config.get_num_mamba_layers = lambda: num_mamba_layers
+    if variable_geometry:
+        model_config.kv_cache_layer_specs = tuple(
+            KVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
+            for head_dim in (256, 512)
+        )
+    model_config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
+
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is expected
 
 
 def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
@@ -2864,8 +2897,11 @@ def _build_v2_hybrid_fp4_mla(
     enable_block_reuse: bool = False,
     periodic_snapshot_interval: int = 0,
     additional_snapshot_offsets_from_end: tuple[int, ...] = (),
+    layer_specs=None,
+    pool_ratio=None,
 ) -> MambaHybridCacheManagerV2:
-    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1."""
+    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1, then any
+    appended draft layers."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     return MambaHybridCacheManagerV2(
@@ -2883,6 +2919,7 @@ def _build_v2_hybrid_fp4_mla(
             dtype="nvfp4",
             enable_block_reuse=enable_block_reuse,
             enable_partial_reuse=False,
+            pool_ratio=pool_ratio,
             mamba_state_config=MambaStateConfig(
                 periodic_snapshot_interval=periodic_snapshot_interval,
                 additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end),
@@ -2903,6 +2940,7 @@ def _build_v2_hybrid_fp4_mla(
             num_hidden_layers=2, kv_lora_rank=32, qk_rope_head_dim=64
         ),
         is_disagg=is_disagg,
+        layer_specs=layer_specs,
     )
 
 
@@ -2941,6 +2979,72 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         }
         paged_ids = sorted(ll.global_layer_id for lg in paged_groups for ll in lg.local_layers)
         assert paged_ids == [2, 3]
+    finally:
+        mgr.shutdown()
+
+
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
+    return KVCacheLayerSpec(
+        global_layer_id=global_layer_id,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.FP8,
+        num_kv_heads=1,
+        head_dim=96,
+        buffer_roles=(Role.KEY,),
+    )
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_hosts_fp8_draft_layers_in_their_own_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch, is_disagg=True, layer_specs=(_fp8_draft_layer_spec(2),)
+    )
+    try:
+        assert mgr.get_draft_kv_cache_view() is mgr
+        assert mgr.draft_layer_ids == (2,)
+        assert mgr.get_kv_cache_dtype(2) == DataType.FP8
+        draft_pool = int(mgr.kv_cache_pool_mapping[2][0])
+        assert draft_pool not in {int(mgr.kv_cache_pool_mapping[1][0])}
+        assert mgr._draft_manager_layer_ids == [LayerId(2)]
+        view = mgr.get_buffers(2, kv_layout="HND")
+        assert view.dtype == torch.float8_e4m3fn
+        assert tuple(view.shape[1:]) == (1, 1, FP4_MLA_TOKENS_PER_BLOCK, 96)
+
+        page_table = build_page_table_from_manager(mgr)
+        draft_groups = [
+            lg
+            for lg in page_table.layer_groups
+            if isinstance(lg, AttentionLayerGroup)
+            and [ll.global_layer_id for ll in lg.local_layers] == [4]
+        ]
+        # FP4 MLA transfer ids: draft layer 2 travels as 2 * 2.
+        assert len(draft_groups) == 1
+        assert [view.pool_role for view in draft_groups[0].pool_views] == [
+            frozenset({str(Role.KEY)})
+        ]
+
+        # The warmup scrub reaches the draft pool as well as the target pools.
+        view.view(torch.uint8).fill_(0x3C)
+        mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
+        assert int(view.view(torch.uint8).count_nonzero()) == 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_target_pool_ratio_gains_the_draft_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lifecycles: KDA state, FP4 MLA, draft, HP ring; the ratio lists the three targets.
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch, layer_specs=(_fp8_draft_layer_spec(2),), pool_ratio=[0.3, 0.6, 0.1]
+    )
+    try:
+        # The native manager takes one ratio per lifecycle; the draft share was inserted.
+        assert len(mgr.impl.layer_grouping) == 4
+        assert mgr.draft_layer_ids == (2,)
     finally:
         mgr.shutdown()
 
@@ -3841,6 +3945,8 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    is_draft: bool = False,
+    joint_kv_cache_reuse: bool = False,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -3939,6 +4045,8 @@ def _build_v2_hybrid_with_mamba_layer(
         conv_state_layout=conv_state_layout,
         is_disagg=is_disagg,
         enable_stats=enable_stats,
+        is_draft=is_draft,
+        joint_kv_cache_reuse=joint_kv_cache_reuse,
         **(
             {"kda_draft_records": kda_draft_records}
             if issubclass(model_cls, KimiK3HybridCacheManager)
@@ -4024,6 +4132,34 @@ def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
         sampling_config=SamplingConfig(),
         is_streaming=False,
     )
+
+
+@skip_no_cuda
+def test_v2_paired_draft_pool_publishes_its_blocks():
+    """A paired draft pool commits its context blocks, so a later request reuses them.
+
+    The draft pool holds no recurrent state, so it commits on the base class's
+    block cadence rather than at the target's snapshot points.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=0,
+        enable_block_reuse=True,
+        is_draft=True,
+        joint_kv_cache_reuse=True,
+    )
+    prompt_len = 2 * mgr.tokens_per_block
+    request = _make_v2_prompt_request(1, list(range(prompt_len)))
+    probe = _make_v2_prompt_request(2, list(range(prompt_len + 1)))
+    try:
+        _run_v2_hybrid_context(mgr, request)
+        mgr.free_resources(request)
+
+        mgr.prepare_expect_snapshot_points([probe])
+        assert mgr.prepare_context(probe)
+        assert probe.prepopulated_prompt_len == prompt_len
+        mgr.free_resources(probe)
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda
@@ -4769,6 +4905,7 @@ def _branch_snapshot_manager(
         ),
     )
     mgr._branch_snapshot_points = {}
+    mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
     mgr._branch_snapshots_taken_total = 0
@@ -4860,6 +4997,44 @@ def test_branch_snapshot_skipped_when_reuse_already_reached_the_fork():
     assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
 
 
+def test_branch_snapshot_uses_a_paired_fork_hidden_by_the_claim():
+    """A paired claim at the last snapshot ends the lookup before the fork.
+
+    The capped lookup matched all 64 tokens it was given, which on its own
+    reads as no fork. The attention-only draft pool matched through 192, where
+    the prompt leaves the tree, so that is where a sibling can resume.
+    """
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    kv_cache = _fake_reuse_match(divergence=64, reused=64)
+
+    mgr.note_context_fork(request, 192)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=64)
+
+    assert mgr._branch_snapshot_points == {1: 192}
+    assert request.expect_snapshot_points == [192, 256]
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {}
+
+
+def test_branch_snapshot_ignores_a_paired_fork_within_a_block_of_the_reuse():
+    """An append resumes from the end-offset snapshot of the turn it extends.
+
+    Its fork, where that turn's prompt ended, lies less than a block past the
+    snapshot, so a point there would add a prefill chunk for almost no reuse.
+    """
+    mgr = _branch_snapshot_manager(tokens_per_block=64)
+    request = _fake_context_request(prompt_len=512, context_current_position=392)
+    kv_cache = _fake_reuse_match(divergence=392, reused=392)
+
+    mgr.note_context_fork(request, 450)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=392)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {"no_divergence": 1}
+
+
 def test_branch_snapshot_uses_cache_depth_before_request_cursor_is_rewound():
     """A shallower retry must apply points hidden by the stale request cursor."""
     mgr = _branch_snapshot_manager()
@@ -4933,10 +5108,12 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     request = _fake_context_request(prompt_len=256)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
+    mgr.note_context_fork(request, 192)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
     mgr.prepare_expect_snapshot_points([request])
 
     assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0

@@ -218,6 +218,9 @@ class RuntimeHooks:
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
+    # Under multi-rank MPI attention DP, rank 0 sends each admitted request's prompt only to the rank
+    # that owns it instead of broadcasting every prompt to every rank (RequestBroadcaster).
+    prompts_to_owners: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
@@ -237,13 +240,18 @@ class RuntimeHooks:
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
     # Stage the one-model speculative sampler's per-step Philox seed and offset
-    # uploads into the step-input pack (pack_step_inputs), so they ride its one
-    # upload instead of each being a copy the next graph waits for.
+    # uploads into the step-input pack (pack_step_inputs), or into the steady MTP
+    # stager's slab on the steps it prepares, instead of four separate copies.
     pack_spec_rng_uploads: bool = False
     # The one-model speculative step's small per-step uploads: the accepted-draft
     # counts join the step-input pack, and the spec sampler keeps its slot ids in
     # a device buffer it re-uploads only when they change.
     spec_small_h2d: bool = False
+    # Stage a decode step's inputs in fewer launches: attention metadata through a
+    # private copy stream; a graph replay's ids, positions and speculative inputs in one launch each.
+    stage_decode_inputs: bool = False
+    # Capture the decode CUDA graphs (at most 256 tokens per step) on a high-priority stream.
+    prioritize_decode_graphs: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side
@@ -253,6 +261,9 @@ class RuntimeHooks:
     # stream that waits for the current stream, instead of an end and a start event back to back on the
     # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
     iteration_timing_one_event: bool = False
+    # Record the per-request perf-metrics timing events (return_perf_metrics) on a side stream that waits for
+    # the current stream, so a timing record does not cost the current stream. The elapsed times are unchanged.
+    perf_metrics_timing_side_stream: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
 

@@ -27,8 +27,8 @@ import torch
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -60,11 +60,11 @@ SUPPORTED_SM = [120, 121]
 # (leaf, the one quantization format it admits). Both leaves run the mixin's
 # ``can_implement``, so the gates other than the format are tested on one leaf.
 B12X_LEAVES = [
-    (CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4),
-    (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
+    (FlashinferCutedslNvfp4Impl, QuantAlgo.NVFP4),
+    (FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.W4A16_NVFP4),
 ]
 LEAF_IDS = [leaf.__name__ for leaf, _ in B12X_LEAVES]
-NVFP4_LEAF = CuteDslB12xNvfp4FusedMoE
+NVFP4_LEAF = FlashinferCutedslNvfp4Impl
 
 
 def _deployment(
@@ -132,10 +132,10 @@ def test_can_implement_accepts_supported_sm(leaf, quant_algo, sm_version):
 @pytest.mark.parametrize(
     "leaf,rejected_algo",
     [
-        (CuteDslB12xNvfp4FusedMoE, None),
-        (CuteDslB12xNvfp4FusedMoE, QuantAlgo.FP8_BLOCK_SCALES),
-        (CuteDslB12xNvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
-        (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.NVFP4),
+        (FlashinferCutedslNvfp4Impl, None),
+        (FlashinferCutedslNvfp4Impl, QuantAlgo.FP8_BLOCK_SCALES),
+        (FlashinferCutedslNvfp4Impl, QuantAlgo.W4A16_NVFP4),
+        (FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.NVFP4),
     ],
 )
 def test_can_implement_rejects_foreign_quant(leaf, rejected_algo):
@@ -150,7 +150,7 @@ def test_family_name_is_not_an_implementation():
     points at them instead of failing on the format it does not carry."""
     verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120))
     assert verdict.reject_reason is MoERejectReason.NOT_AN_IMPL
-    assert CuteDslB12xNvfp4FusedMoE.__name__ in verdict.detail
+    assert FlashinferCutedslNvfp4Impl.__name__ in verdict.detail
 
 
 @pytest.mark.parametrize("alias", [QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC])
@@ -199,8 +199,8 @@ def test_can_implement_rejects_eplb():
 @pytest.mark.parametrize(
     "leaf,quant_algo,eligible",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4, False, id="nvfp4"),
-        pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4, True, id="w4a16"),
+        pytest.param(FlashinferCutedslNvfp4Impl, QuantAlgo.NVFP4, False, id="nvfp4"),
+        pytest.param(FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.W4A16_NVFP4, True, id="w4a16"),
     ],
 )
 def test_can_implement_declines_forced_dynamic_quantization(
@@ -255,8 +255,8 @@ def test_can_implement_rejects_unaligned_nvfp4_fc1_shard(
 def test_nvfp4_decode_applies_the_awq_pre_quant_scale():
     """b12x has no operand for an NVFP4_AWQ pre-quant scale, so a decode chunk
     is scaled before it is handed over, as the CUTLASS prefill path does."""
-    moe = object.__new__(CuteDslB12xNvfp4FusedMoE)
-    x = torch.ones(CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 4)
+    moe = object.__new__(FlashinferCutedslNvfp4Impl)
+    x = torch.ones(FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 4)
 
     moe.fc31_act_scale = None
     out, out_sf = moe.quantize_input(x)
@@ -285,7 +285,7 @@ def test_w4a16_applies_the_awq_pre_quant_scale(has_pre_quant_scale):
     the broadcast shape are the production ones.
     """
     hidden_size = 8
-    moe = CuteDslB12xW4a16Nvfp4FusedMoE.__new__(CuteDslB12xW4a16Nvfp4FusedMoE)
+    moe = FlashinferCutedslW4a16Nvfp4Impl.__new__(FlashinferCutedslW4a16Nvfp4Impl)
     torch.nn.Module.__init__(moe)
     moe.register_parameter("fc31_act_scale", None)
     pre_quant_scale = None
@@ -400,7 +400,7 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
 def test_dispatch_rejects_non_tensor():
     """Non-tensor inputs (e.g. Fp4QuantizedTensor) stay on the b12x path
     so the existing ValueError surfaces in quantize_input."""
-    moe = object.__new__(CuteDslB12xNvfp4FusedMoE)
+    moe = object.__new__(FlashinferCutedslNvfp4Impl)
     assert moe._route_to_cutlass(object()) is False
 
 
@@ -408,15 +408,15 @@ def test_dispatch_rejects_non_tensor():
 # run_moe call boundary: each MoERunContext field is honoured or refused
 # ---------------------------------------------------------------------------
 
-_DECODE_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD - 1
-_PREFILL_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+_DECODE_TOKENS = FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD - 1
+_PREFILL_TOKENS = FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD
 
 # (leaf, chunk size, the kernel that chunk reaches): both routes of the NVFP4
 # leaf, and the W4A16 leaf, which has only the b12x one.
 B12X_ROUTES = [
-    pytest.param(CuteDslB12xNvfp4FusedMoE, _DECODE_TOKENS, "b12x", id="nvfp4-decode"),
-    pytest.param(CuteDslB12xNvfp4FusedMoE, _PREFILL_TOKENS, "cutlass", id="nvfp4-prefill"),
-    pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, _PREFILL_TOKENS, "b12x", id="w4a16"),
+    pytest.param(FlashinferCutedslNvfp4Impl, _DECODE_TOKENS, "b12x", id="nvfp4-decode"),
+    pytest.param(FlashinferCutedslNvfp4Impl, _PREFILL_TOKENS, "cutlass", id="nvfp4-prefill"),
+    pytest.param(FlashinferCutedslW4a16Nvfp4Impl, _PREFILL_TOKENS, "b12x", id="w4a16"),
 ]
 B12X_KERNEL_ROUTES = [route for route in B12X_ROUTES if route.values[2] == "b12x"]
 
@@ -622,7 +622,7 @@ def test_cutlass_route_writes_the_requested_output_dtype(monkeypatch):
     """The NVFP4 prefill route is the CUTLASS op, which writes any
     high-precision dtype; only the b12x route is bound to bfloat16."""
     log = []
-    leaf = _leaf_with_recorded_kernels(CuteDslB12xNvfp4FusedMoE, log, monkeypatch)
+    leaf = _leaf_with_recorded_kernels(FlashinferCutedslNvfp4Impl, log, monkeypatch)
 
     out = leaf.run_moe(_run_context(_PREFILL_TOKENS, output_dtype=torch.float16))
 

@@ -216,7 +216,9 @@ def _batch(seed, ctx_lens, num_gens, draft_len, accept_depths, greedy=True):
 
 def _run_stock(batch, draft_len):
     spec_config = MTPDecodingConfig(max_draft_len=draft_len)
-    worker = get_spec_worker(spec_config, SimpleNamespace(mapping=Mapping()), Mapping())
+    worker = get_spec_worker(
+        spec_config, SimpleNamespace(mapping=Mapping(), extra_attrs={}), Mapping()
+    )
     return worker(resource_manager=None, **batch)
 
 
