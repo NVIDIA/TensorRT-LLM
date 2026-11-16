@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Literal, Optional
 from unittest import mock
 
-import allure
 import pytest
 import torch
 import torch._inductor.config as inductor_config
@@ -6154,6 +6153,8 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
         measures one question repeatedly and does not estimate GPQA accuracy.
         Passing means the experiment completed, not that accuracy was verified.
         """
+        import allure
+
         assert "LLM_MODELS_ROOT" in os.environ, "Set LLM_MODELS_ROOT to the model cache"
         model_root = Path(llm_models_root())
         model_path = Path(self.MODEL_PATH)
