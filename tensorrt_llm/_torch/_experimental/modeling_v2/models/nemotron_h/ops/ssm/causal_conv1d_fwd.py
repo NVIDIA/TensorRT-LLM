@@ -118,7 +118,10 @@ class CausalConv1dFwd(OpWrapper):
     the token axis is channel-major (in place allowed; `out`, if given, must
     have `x`'s exact strides); unit stride on the channel axis with a token
     stride > 1, `dim > 1` and at least one token is channel-last (`out`
-    required, channel-last, disjoint from `x`). The two agree bitwise.
+    required, channel-last, disjoint from `x`). Their published states agree
+    bitwise; their activations agree to bf16 rounding, since the channel-major
+    kernel takes the tanh form of SiLU above its cutoff (#20916) where the
+    channel-last default keeps the exact form.
     """
 
     ARCHS = frozenset({Arch.SM_100})
@@ -558,14 +561,11 @@ class CausalConv1dFwd(OpWrapper):
             and x.shape[l_axis] > 0
         )
         if not channel_last:
-            # The channel-major kernel walks the token axis and the state's last
-            # axis contiguously, ignoring both strides: token stride 2 landed
-            # 16.3 off; a state last-dim stride 2 landed 7.9 off (5.4 in the
-            # published state). The channel-last kernel honours every stride.
-            assert x.shape[l_axis] == 0 or x.stride(l_axis) == 1, (
-                "the channel-major kernel loads the token axis contiguously; "
-                "x must have stride 1 along it"
-            )
+            # The channel-major kernel walks the state's last axis contiguously,
+            # ignoring its stride: a state last-dim stride 2 landed 7.9 off (5.4
+            # in the published state). It honours x's token stride since #20916
+            # (stride 2 had landed 16.3 off), and the channel-last kernel honours
+            # every stride.
             assert conv_states is None or conv_states.stride(-1) == 1, (
                 "the channel-major kernel ignores conv_states' last-dim stride; it must be 1"
             )

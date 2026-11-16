@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the causal_conv1d_fwd family op."""
 
-import os
 import zlib
 from typing import Optional
 
@@ -188,29 +187,24 @@ def test_in_place_and_out_of_place_are_bitwise_identical() -> None:
     assert torch.equal(in_place, out_of_place) and torch.equal(pool_a, pool_b)
 
 
-def _default_silu() -> bool:
-    return os.environ.get("TRTLLM_CAUSAL_CONV1D_SILU_MODE", "") in ("", "0", "1")
-
-
-def test_channel_last_and_channel_major_are_bitwise_identical() -> None:
-    """The two kernels agree bitwise under the default SiLU form only."""
+def test_channel_last_and_channel_major_agree() -> None:
+    """The two kernels publish bitwise the same state. Their activations agree to
+    bf16 rounding: the channel-major kernel takes the tanh form of SiLU above its
+    cutoff (#20916), the channel-last default the exact form."""
     spec = dict(
         dim=10240, lengths=(37, 1, 128), pool_slots=8, slots=(3, 0, 5), initial=(True, False, True)
     )
     major, pool_a, _ = _run(_build(spec, seed=11))
     last, pool_b, _ = _run(_build(dict(spec, layout="channel_last"), seed=11))
     assert torch.equal(pool_a, pool_b)
-    if _default_silu():
-        assert torch.equal(major, last)
-    else:
-        torch.testing.assert_close(major, last)
+    torch.testing.assert_close(major, last)
 
 
-def test_projection_slice_and_a_channel_major_copy_are_bitwise_identical() -> None:
+def test_projection_slice_and_a_channel_major_copy_agree() -> None:
     """The Mamba2 call reads xBC in place from the projection (token stride
     8768) through the channel-last kernel; the same columns copied
-    channel-major through the other kernel give the same activation and the
-    same published state."""
+    channel-major through the other kernel publish the same state and give the
+    activation to bf16 rounding (the SiLU forms differ, see above)."""
     spec = next(c.spec for c in op.CELLS if c.why.startswith("Mamba2 tep4 prefill: 4 seq"))
     args = _build(spec, seed=21)
     proj_result, proj_pool, _ = _run(args)
@@ -220,10 +214,7 @@ def test_projection_slice_and_a_channel_major_copy_are_bitwise_identical() -> No
     dense[9] = None  # channel-major, in place
     major_result, major_pool, _ = _run(dense)
     assert torch.equal(proj_pool, major_pool)
-    if _default_silu():
-        assert torch.equal(proj_result, major_result)
-    else:
-        torch.testing.assert_close(proj_result, major_result)
+    torch.testing.assert_close(proj_result, major_result)
 
 
 def test_the_published_state_is_the_raw_input_tail() -> None:
@@ -365,8 +356,7 @@ def _guard_case(case: str):
 
 @pytest.mark.parametrize(
     "case",
-    ["width_one", "width_five", "weight_dtype", "token_stride", "state_stride"]
-    + list(_METADATA_STRIDE_CASES),
+    ["width_one", "width_five", "weight_dtype", "state_stride"] + list(_METADATA_STRIDE_CASES),
 )
 def test_guard_refuses_what_the_op_answers_silently_wrong(case: str) -> None:
     """First the hazard, unguarded: the op returns without raising and its
@@ -380,3 +370,14 @@ def test_guard_refuses_what_the_op_answers_silently_wrong(case: str) -> None:
     with pytest.raises(AssertionError):
         with validating(op):
             op(*_guard_case(case))
+
+
+def test_a_token_strided_channel_major_input_is_answered() -> None:
+    """Since #20916 the channel-major kernel honours x's token stride (it had read
+    the token axis contiguously, 16.3 off at stride 2), so the op answers a
+    stride-2 view and the guard lets the call through."""
+    ref = op.reference(*_guard_case("token_stride"))
+    args = _guard_case("token_stride")
+    with validating(op):
+        returned = op(*args)
+    _compare((returned, args[3]), ref)
