@@ -270,7 +270,6 @@ class MnnvlMemory:
     initialized: bool = False
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
-    force_fabric_handle: bool = False
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -479,7 +478,7 @@ class MnnvlMemory:
         # May need to find a better way to handle this.
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
-        if cls.force_fabric_handle or is_on_aarch64:
+        if is_on_aarch64:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -1104,12 +1103,6 @@ class MnnvlMemory:
         return support_nvlink_and_all_up
 
 
-class CftMnnvlMemory(MnnvlMemory):
-    """MNNVL memory with FABRIC handles so CFT logical endpoints can bind it."""
-
-    force_fabric_handle: bool = True
-
-
 class HelixCpMnnvlMemory(MnnvlMemory):
     """MNNVL memory management for Helix context parallel (CP) operations.
 
@@ -1129,6 +1122,26 @@ class HelixCpMnnvlMemory(MnnvlMemory):
         return (
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
+        )
+
+
+class TpMnnvlMemory(MnnvlMemory):
+    """MNNVL memory shared by the ranks of a tensor-parallel group (ordered by TP rank).
+
+    Per-class state is separate from MnnvlMemory's, as for HelixCpMnnvlMemory.
+    """
+
+    @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.tp_group_pg
+
+    @classmethod
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+CP, ordering each group by TP rank."""
+        return (
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank,
         )
 
 

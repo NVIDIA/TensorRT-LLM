@@ -56,7 +56,7 @@ DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIO
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
-AttentionReusePolicy = _cpp.AttentionReusePolicy
+ReusePolicy = _cpp.ReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -91,6 +91,8 @@ GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+HostMemBackingConfig = _cpp.HostMemBackingConfig
+live_slab_bytes = _cpp.live_slab_bytes
 HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
@@ -100,6 +102,7 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingAllBlocksClearedData = _cpp.StreamingAllBlocksClearedData
 StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
 StreamingBlockStoredData = _cpp.StreamingBlockStoredData
 StreamingEventSink = _cpp.StreamingEventSink
@@ -138,6 +141,8 @@ class _KVCacheManagerConfigFieldSpec:
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     host_sparse_pool_quota: object = None
+    regions: object = None
+    host_mem_backing: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -151,6 +156,10 @@ KvCacheStatus = _cpp.KvCacheStatus
 LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
+RemoteMemError = _cpp.RemoteMemError
+RemoteCacheTierConfig = _cpp.RemoteCacheTierConfig
+RemoteTransferConfig = _cpp.RemoteTransferConfig
+RemoteTransport = _cpp.RemoteTransport
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
@@ -159,12 +168,14 @@ PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
 PoolRebalanceConfig = _cpp.PoolRebalanceConfig
+RegionAllocationUnit = _cpp.RegionAllocationUnit
+RegionBuffer = _cpp.RegionBuffer
+RegionConfig = _cpp.RegionConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 Batch = _cpp.Batch
 IndexTableSpec = _cpp.IndexTableSpec
-ScratchDesc = _cpp.ScratchDesc
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -183,8 +194,11 @@ sequence_to_blockchain_keys = _cpp.sequence_to_blockchain_keys
 take_poison = _cpp.take_poison
 
 BeamIndex = int
+CacheGroupId = int
 CacheLevel = int
-CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
+CacheTierConfig = Union[
+    GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig, RemoteCacheTierConfig
+]
 BatchRow = int
 CudaStream = int
 DataRole = str
@@ -219,7 +233,7 @@ def typed_range(*args: int) -> range:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
-    "AttentionReusePolicy",
+    "ReusePolicy",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
@@ -228,6 +242,7 @@ __all__ = [
     "SparseCacheConfig",
     "BufferId",
     "CoalescedBuffer",
+    "CacheGroupId",
     "CacheLevel",
     "CacheTier",
     "CacheTierConfig",
@@ -241,6 +256,8 @@ __all__ = [
     "GpuCacheTierConfig",
     "HalfOpenRange",
     "HostCacheTierConfig",
+    "HostMemBackingConfig",
+    "live_slab_bytes",
     "IKvCacheColdPageCodec",
     "KVCacheDesc",
     "KVCacheCreatedData",
@@ -263,6 +280,10 @@ __all__ = [
     "MmItemContext",
     "NDEBUG",
     "OutOfPagesError",
+    "RemoteMemError",
+    "RemoteCacheTierConfig",
+    "RemoteTransferConfig",
+    "RemoteTransport",
     "PageIndexConverter",
     "PlannedDropHandle",
     "PoolGroupPeakBlockStats",
@@ -275,7 +296,6 @@ __all__ = [
     "Priority",
     "ReuseGroupStatus",
     "ReuseScope",
-    "ScratchDesc",
     "Batch",
     "IndexTableSpec",
     "KVCacheIterationStatsDelta",
@@ -286,9 +306,13 @@ __all__ = [
     "SlotDesc",
     "SlotDescVariant",
     "PoolRebalanceConfig",
+    "RegionAllocationUnit",
+    "RegionBuffer",
+    "RegionConfig",
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
+    "StreamingAllBlocksClearedData",
     "StreamingEventSink",
     "StreamingEventStats",
     "SwaScratchReuseConfig",

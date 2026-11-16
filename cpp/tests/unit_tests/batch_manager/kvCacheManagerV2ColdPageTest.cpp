@@ -61,7 +61,7 @@ KVCacheManagerConfig makeOptionalDiskConfig(bool hostTier)
         auto layer = std::get<AttentionLayerConfig>(config.layers.front());
         layer.layerId = i;
         layer.slidingWindowSize = i == 1 ? 4 : 2;
-        layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
+        layer.reusePolicy = ReusePolicy::OPTIONAL;
         // Unequal buffer sizes exercise multiple physical pools per page.
         layer.buffers.push_back(BufferConfig{"score", 1024, std::nullopt});
         config.layers.emplace_back(std::move(layer));
@@ -227,6 +227,13 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
 
     auto reader = manager->createKvCache({}, span, 2);
     ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    auto reservations
+        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
+    for (auto const& slot : reservations)
+    {
+        // Offload can still be reading the recycled GPU slots on another stream.
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+    }
     // Poison the entire hot Encoder group: a false restore cannot pass using
     // stale bytes from the original slot after it was offloaded to disk.
     for (int p = 0; p < sizes.size().value(); ++p)
@@ -237,8 +244,6 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
             cudaSuccess);
     }
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    auto reservations
-        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
     EXPECT_FALSE(reader->resume(stream, std::vector<LifeCycleId>{encoder, peer}));
     EXPECT_FALSE(reader->isActive());
     EXPECT_EQ(reader->numCommittedTokens(), 8);
@@ -940,6 +945,31 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGroupingIsIndependentOfHotGrouping)
     }
 }
 
+TEST(KvCacheManagerV2ColdPageTest, SinkRequiredOnlyWindowSharesTheRequiredColdPoolGroup)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    // Three life cycles of one page shape. The cold tier groups them like the GPU tier: the
+    // SINK_REQUIRED_ONLY window shares the REQUIRED layer's pool group, and OPTIONAL keeps its own.
+    auto config = makeSplitColdGroupingConfig();
+    std::get<AttentionLayerConfig>(config.layers[0]).slidingWindowSize = std::nullopt;
+    auto& sinkOnly = std::get<AttentionLayerConfig>(config.layers[1]);
+    sinkOnly.slidingWindowSize = 128;
+    sinkOnly.numSinkTokens = 4;
+    sinkOnly.reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY;
+    auto optionalWindow = sinkOnly;
+    optionalWindow.layerId = 2;
+    optionalWindow.reusePolicy = ReusePolicy::OPTIONAL;
+    config.layers.emplace_back(std::move(optionalWindow));
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+
+    // Life cycles are registered in layer order.
+    auto const coldGroups = manager->getLifeCyclePoolGroupIndices(CacheLevel{1});
+    ASSERT_EQ(coldGroups.size(), LifeCycleId{3});
+    EXPECT_EQ(manager->storage().numPoolGroups(CacheLevel{1}), PoolGroupIndex{2});
+    EXPECT_EQ(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{1}]);
+    EXPECT_NE(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{2}]);
+}
+
 TEST(KvCacheManagerV2ColdPageTest, MigrationStatsUseColdPageBytes)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -1096,7 +1126,7 @@ TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
         config.cacheTiers[1] = HostCacheTierConfig{kOneUnit, maxQuota};
         return config;
     };
-    // Cold pool groups are keyed by (reuse policy, cold page bytes), so the split
+    // Cold pool groups are keyed by (effectivePoolReusePolicy, cold page bytes), so the split
     // comes from the codec reporting different page sizes, not from the config
     // alone. Without it both lifecycles share one group and one unit suffices.
     auto build = [&makeConfig](std::optional<size_t> maxQuota) {

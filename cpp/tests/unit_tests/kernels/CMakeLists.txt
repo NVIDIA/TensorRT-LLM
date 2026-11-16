@@ -40,6 +40,7 @@ add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_link_libraries(mixtureOfExpertsTest PRIVATE moe_gemm_src)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
@@ -71,8 +72,6 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
@@ -121,35 +120,6 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;kernels;moe-communication;gpu")
-
-add_gtest(
-  gemmSwigluRunnerTest
-  fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
-  NO_GTEST_MAIN)
-add_gtest(gemmSwigluKernelTestSm90Fp8
-          fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
-          NO_TLLM_LINKAGE)
-
-foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
-  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    # No kernels should be parsed, unless hopper is specified. This is a build
-    # time improvement
-    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
-    target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
-  endif()
-
-  # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
-  # changed in GCC 4.6 This note appears for kernels using TMA and clutters the
-  # compilation output.
-  if(NOT WIN32)
-    target_compile_options(
-      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
-  endif()
-endforeach()
 
 set(ROUTING_KERNEL_TEST_SRC
     moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
@@ -228,6 +198,41 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+set(fmha_test_sources ../../../tensorrt_llm/kernels/fmhaDispatcher.cpp)
+set(fmha_test_libraries context_attention_src trtllm_gen_fmha ${CUDA_DRV_LIB}
+                        tllm::common_environment tllm::common_logging)
+if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
+  add_library(tllm_test_fmha SHARED EXCLUDE_FROM_ALL ${fmha_test_sources})
+  target_compile_features(tllm_test_fmha PRIVATE cxx_std_20)
+  target_link_libraries(
+    tllm_test_fmha
+    PRIVATE ${fmha_test_libraries}
+    PUBLIC trtllm_gen_fmha_interface CUDA::cudart)
+  set(fmha_test_sources)
+  set(fmha_test_libraries tllm_test_fmha)
+endif()
+add_tllm_gtest(
+  fmhaHead104Test
+  OWNER
+  kernel
+  SOURCES
+  fmhaHead104Test.cpp
+  ${fmha_test_sources}
+  LINK_LIBRARIES
+  ${fmha_test_libraries}
+  LABELS
+  "unit;kernels;fmha;gpu")
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  ${fmha_test_sources}
+  LINK_LIBRARIES
+  ${fmha_test_libraries}
+  LABELS
+  "unit;kernel;host")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

@@ -15,7 +15,7 @@ class KdaDecode(OpWrapper):
     """Writes the decode output into ``output`` [B, 1, HV, 128] bf16; updates ``state`` at ``ssm_state_indices``
     and, with ``update_conv_cache``, the conv pools there. Returns None."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=(

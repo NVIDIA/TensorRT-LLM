@@ -233,6 +233,9 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     PLAN_CACHE_KEY = "prims_ts_block_sparse"
 
     supports_block_sparse_inputs = True
+    # VC-Attention is a dense recipe. The block-sparse library must not claim it, or the
+    # VisualGen layer would accept the recipe without the dense PrimTS library enabled.
+    supports_vc_attention = False
 
     def _is_supported(
         self,

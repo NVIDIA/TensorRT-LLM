@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
+#include "kv_cache_manager_v2/storagePolicy.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -156,8 +157,8 @@ private:
 // pages[beamIdx][lcId] tracks who holds/locks each page.
 // treeBlock: non-null only for committed blocks (strong ref in rare cases).
 // ---------------------------------------------------------------------------
-using LifeCycleBlockPages = TypedVec<LifeCycleId, BlockPage>;
-using BeamBlockPages = TypedVec<BeamIndex, LifeCycleBlockPages>;
+using LifeCycleBlockPages = LifeCycleVec<BlockPage>;
+using BeamBlockPages = BeamVec<LifeCycleBlockPages>;
 
 struct SeqBlock
 {
@@ -243,7 +244,7 @@ struct ReuseGroupStatus
     // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
     LayerGroupId groupId;
     // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
-    AttentionReusePolicy policy;
+    ReusePolicy policy;
     // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
     int endpoint;
     // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
@@ -421,6 +422,12 @@ public:
         return mBlocks.size();
     }
 
+    //! Changes whenever the page indices, block count, beam width or history block of this cache change.
+    uint64_t pageStorageVersion() const noexcept
+    {
+        return mPageStorageVersion;
+    }
+
     TypedVec<BlockOrdinal, SeqBlock> const& blocks() const noexcept
     {
         return mBlocks;
@@ -481,6 +488,9 @@ public:
     {
         return mCommittedTokens;
     }
+
+    // Return the existing key at a complete committed block boundary.
+    std::optional<BlockKey> committedPrefixKey(int numTokens) const;
 
     ReuseScope const& reuseScope() const noexcept
     {
@@ -670,7 +680,8 @@ private:
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
     // raw input tokens in scope.
     std::vector<TokenIdExt> _getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const;
-    void _clearBlocks();
+    // keepPageIndices leaves the released locks' page indices for the caller to invalidate.
+    void _clearBlocks(bool keepPageIndices);
     // Copy `srcPage` into a new committed page attached to `treeBlock` for lifecycle
     // `lcIdx`, recording `numTokensInBlock` as the page's token count. Returns the page
     // now in the slot, or nullptr on OOM in all levels. No-op (returning the existing
@@ -767,8 +778,7 @@ private:
 
     // Extract uncommitted pages from a SeqBlock, resetting block page entries.
     // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
-    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(
-        SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
+    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(SeqBlock& sb, BeamIndex beamIdx);
 
     // Get and validate the tree block at a committed ordinal.
     // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
@@ -809,6 +819,16 @@ private:
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
+    // Set the first numBlocks entries of every page-index table to BAD.
+    void _invalidateBasePageIndices(BlockOrdinal numBlocks);
+
+    void _onPageStorageChanged() noexcept
+    {
+        ++mPageStorageVersion;
+    }
+
+    // Sets mHistoryLength; a move into another block changes which blocks the window holds.
+    void _publishHistoryLength(int historyLength) noexcept;
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
@@ -821,7 +841,9 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    uint64_t mPageStorageVersion = 0;
     std::optional<int> mExpectedPromptLength;
+    int mNumLookupTokens = 0;
     bool mGenerationAllocReady = false;
 
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.
@@ -865,7 +887,7 @@ private:
     std::vector<LifeCycleId> mSelectedOptionalGroups;
     void _collectReuseCandidates();
     void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
-    // PRIVATE and unselected OPTIONAL groups need fresh pages for the claimed prefix.
+    // PRIVATE and unselected OPTIONAL attention groups need fresh pages for the claimed prefix.
     bool _needsFreshPrefixPages(LifeCycleId lc) const;
 
     // SWA scratch slot support.

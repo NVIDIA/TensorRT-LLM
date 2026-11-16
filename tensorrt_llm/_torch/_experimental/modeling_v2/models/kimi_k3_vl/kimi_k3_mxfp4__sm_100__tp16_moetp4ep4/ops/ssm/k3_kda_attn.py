@@ -29,7 +29,7 @@ class K3KdaAttn(OpWrapper):
     [8, 7168]: the projection ``x w^T`` and the verify of ``ssm/k3_kda_verify`` on it, in one launch. Updates the
     slot's conv caches, state and per-draft states in place; advances ``buffers`` by one launch."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS = (
         Cell(
             why="TP16 golden token plus seven drafts: two successive requests, two layers, pending through 0..7",

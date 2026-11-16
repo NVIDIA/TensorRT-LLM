@@ -17,7 +17,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     the result is quantized to float8_e4m3fn in the same kernel. A new tensor.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

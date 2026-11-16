@@ -30,7 +30,7 @@ class K3SandwichPlain(OpWrapper):
     (with ``swiglu``, of ``silu_and_mul(x) @ weight^T``), ``normed = RMSNorm(updated) * norm_weight``. Advances
     ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{tokens} decode tokens, swiglu={swiglu}, draw {draw}: drafter "

@@ -93,6 +93,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import ANY_MOE_IMPL
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
@@ -156,6 +158,8 @@ from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .ops.ssm.k3_kda_attn import k3_kda_attn
 from .ops.ssm.k3_kda_verify import k3_kda_verify
+
+native_ops = load_family_ops(__name__)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -226,8 +230,7 @@ REQUIRED_ENGINE_FIELDS = {
 }
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes. An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
@@ -640,13 +643,9 @@ def _apply_attn_res_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_rmsnorm_op = torch.ops.trtllm.k3_attn_res_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output = attn_res_rmsnorm_op(
+    output = native_ops.k3_attn_res_rmsnorm_fwd(
         layer_kernel,
         block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -714,14 +713,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_add_rmsnorm_op = torch.ops.trtllm.k3_attn_res_add_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+    updated_prefix_sum, output = native_ops.k3_attn_res_add_rmsnorm_fwd(
         layer_kernel,
         addend_kernel,
         block_kernel,
@@ -2301,6 +2296,11 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = getattr(mamba_metadata, "generation_state_indices", None)
         if slots is None:
             slots = mamba_metadata.state_indices[: x.shape[0]]
+        # The replay caches' slots, which differ from the state slots when the cache manager keeps them in a pool of
+        # their own.
+        replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
+        if replay_slots is None:
+            replay_slots = mamba_metadata.replay_state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(
@@ -2322,7 +2322,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             float(self.o_norm.eps),
         )
         # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
-        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
+        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv, replay_slots)
         return core
 
     def forward_verify(
@@ -2335,15 +2335,36 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        replay_slot_indices: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
+        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'.
+
+        ``replay_slot_indices`` are the requests' slots in the replay caches (``slot_indices`` when ``None``). The
+        decode kernels address the replay caches by the state slot, so the cache manager keeps the per-token states
+        in the recurrent-state slot (see ``KDAReplayState.replay_shares_state_slot``). ``prequantized_input`` (the
+        MXFP8 form of ``x2d``) goes to the built-in verify; the decode kernels read ``x2d``.
+        """
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
-                x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                conv_pool,
+                ssm_pool,
+                slot_indices,
+                output=output,
+                replay_slot_indices=replay_slot_indices,
+                prequantized_input=prequantized_input,
             )
         assert self.takes_k3_kernels and self.k3_buffers is not None, (
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
             "the decode kernels write, and this layer has no fused projection weight or buffers"
+        )
+        assert (
+            replay_slot_indices is None or replay_slot_indices.data_ptr() == slot_indices.data_ptr()
+        ), (
+            f"Kimi K3 KDA layer {self.layer_idx}: the decode kernels address the replay caches by the state slot"
         )
         core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
         return self._store_core(core, output)
@@ -3295,6 +3316,12 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
     weights.py, the KDA metadata class, the model defaults), which walk the model by its module names; the text model
     keeps the built-in one's.
     """
+
+    # Decode steps run k3_moe over the routed experts' TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers
+    # (decode_moe.py). Any draft comes from the inherited one-engine construction, whose
+    # draft config the draft tactic selects; the drafter fast path has dense MLPs only.
+    moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8"})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

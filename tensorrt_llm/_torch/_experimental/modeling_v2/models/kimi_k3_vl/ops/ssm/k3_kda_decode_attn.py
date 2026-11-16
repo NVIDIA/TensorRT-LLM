@@ -26,7 +26,7 @@ class K3KdaDecodeAttn(OpWrapper):
     [R, 7168]: the projection ``x w^T`` and the plain decode of ``ssm/kda_decode`` on it, in one launch. Updates the
     slots' conv and state pools in place; advances ``buffers`` by one launch."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS = tuple(
         Cell(
             why=f"{requests} active TP16 decode rows and {8 - requests} zero-padded rows on three manager layers",

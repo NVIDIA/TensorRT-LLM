@@ -215,9 +215,17 @@ def aiperf_is_usable() -> bool:
         f"if int(datasets.__version__.split('.')[0]) < {MIN_DATASETS_MAJOR}:\n"
         f"    sys.exit(f'datasets {{datasets.__version__}} < {MIN_DATASETS_MAJOR}')\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        _log(f"aiperf stack not usable: import probe timed out after {error.timeout}s")
+        return False
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
         _log(f"aiperf stack not usable: {lines[-1] if lines else f'exit {result.returncode}'}")

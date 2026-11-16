@@ -12,15 +12,16 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.cpasync.copy import (
-    TMA_DESC_PTR_FIELD_NAME,
-    TMA_MBAR_PTR_FIELD_NAME,
-    TMA_MCAST_MASK_FIELD_NAME,
     CopyBulkTensorTileG2SMulticastNonExecTrait,
     CopyBulkTensorTileG2SMulticastTrait,
     CopyBulkTensorTileG2SNonExecTrait,
     CopyBulkTensorTileG2STrait,
+    TMA_DESC_PTR_FIELD_NAME,
+    TMA_MBAR_PTR_FIELD_NAME,
+    TMA_MCAST_MASK_FIELD_NAME,
 )
 from cutlass.cutlass_dsl import Boolean, Int16, Int32
+
 
 TmaAtomOrPair = Union[cute.CopyAtom, Tuple[cute.CopyAtom, cute.CopyAtom]]
 
@@ -42,17 +43,12 @@ def make_executable_tma_atom(atom: cute.CopyAtom) -> cute.CopyAtom:
 def make_executable_tma_atom_or_pair(atom_or_pair: TmaAtomOrPair) -> TmaAtomOrPair:
     """Materialize one executable atom or a preferred/fallback executable pair."""
     if cutlass.const_expr(isinstance(atom_or_pair, tuple)):
-        return (
-            make_executable_tma_atom(atom_or_pair[0]),
-            make_executable_tma_atom(atom_or_pair[1]),
-        )
+        return (make_executable_tma_atom(atom_or_pair[0]), make_executable_tma_atom(atom_or_pair[1]))
     return make_executable_tma_atom(atom_or_pair)
 
 
 @cute.jit
-def select_tma_atom_for_cluster(
-    atom_or_pair: TmaAtomOrPair, is_fallback_cluster: Boolean
-) -> cute.CopyAtom:
+def select_tma_atom_for_cluster(atom_or_pair: TmaAtomOrPair, is_fallback_cluster: Boolean) -> cute.CopyAtom:
     """Select one preferred/fallback atom after both candidates are materialized."""
     if cutlass.const_expr(isinstance(atom_or_pair, tuple)):
         atom = atom_or_pair[0]
@@ -64,34 +60,18 @@ def select_tma_atom_for_cluster(
 
 @cute.jit
 def bind_executable_tma_load_fields(
-    atom: cute.CopyAtom,
-    *,
-    tma_bar_ptr: cute.Pointer,
-    tma_desc_ptr: Optional[cute.Pointer],
-    mcast_mask: Optional[Int32],
+    atom: cute.CopyAtom, *, tma_bar_ptr: cute.Pointer, tma_desc_ptr: Optional[cute.Pointer], mcast_mask: Optional[Int32]
 ) -> cute.CopyAtom:
     """Bind per-issue fields to an already executable TMA load atom."""
     executable_value = atom._trait.value
     if cutlass.const_expr(mcast_mask is not None):
-        mcast_attr = ir.Attribute.parse(
-            f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_MCAST_MASK_FIELD_NAME}>"
-        )
-        executable_value = _cute_nvgpu_ir.atom_set_value(
-            executable_value, mcast_attr, Int16(mcast_mask).ir_value()
-        )
+        mcast_attr = ir.Attribute.parse(f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_MCAST_MASK_FIELD_NAME}>")
+        executable_value = _cute_nvgpu_ir.atom_set_value(executable_value, mcast_attr, Int16(mcast_mask).ir_value())
     if cutlass.const_expr(tma_desc_ptr is not None):
-        descriptor_attr = ir.Attribute.parse(
-            f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_DESC_PTR_FIELD_NAME}>"
-        )
-        executable_value = _cute_nvgpu_ir.atom_set_value(
-            executable_value, descriptor_attr, tma_desc_ptr.value
-        )
-    barrier_attr = ir.Attribute.parse(
-        f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_MBAR_PTR_FIELD_NAME}>"
-    )
-    executable_value = _cute_nvgpu_ir.atom_set_value(
-        executable_value, barrier_attr, tma_bar_ptr.value
-    )
+        descriptor_attr = ir.Attribute.parse(f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_DESC_PTR_FIELD_NAME}>")
+        executable_value = _cute_nvgpu_ir.atom_set_value(executable_value, descriptor_attr, tma_desc_ptr.value)
+    barrier_attr = ir.Attribute.parse(f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_MBAR_PTR_FIELD_NAME}>")
+    executable_value = _cute_nvgpu_ir.atom_set_value(executable_value, barrier_attr, tma_bar_ptr.value)
     return cute.CopyAtom(atom.op, atom._trait.__class__(executable_value))
 
 
@@ -102,9 +82,7 @@ def _static_vmnk_shape(cta_layout_vmnk: cute.Layout) -> Tuple[int, int, int, int
     return shape
 
 
-def _multicast_group_count(
-    shape_vmnk: Tuple[int, int, int, int], mcast_mode_mn: Tuple[int, int]
-) -> int:
+def _multicast_group_count(shape_vmnk: Tuple[int, int, int, int], mcast_mode_mn: Tuple[int, int]) -> int:
     mcast_a_count = shape_vmnk[2] if mcast_mode_mn[0] else 0
     mcast_b_count = shape_vmnk[1] if mcast_mode_mn[1] else 0
     overlap = 1 if mcast_mode_mn[0] and mcast_mode_mn[1] else 0
@@ -116,10 +94,7 @@ def _multicast_group_count(
 
 @cute.jit
 def _reader_mask(
-    cta_layout_vmnk: cute.Layout,
-    cta_coord_vmnk: cute.Coord,
-    mcast_mode_mn: Tuple[int, int],
-    mma_cta_count: int,
+    cta_layout_vmnk: cute.Layout, cta_coord_vmnk: cute.Coord, mcast_mode_mn: Tuple[int, int], mma_cta_count: int
 ) -> Int32:
     """Build the general reader union for non-single-sided cluster layouts.
 
@@ -127,23 +102,15 @@ def _reader_mask(
     """
     mask = Int32(0)
     if cutlass.const_expr(mcast_mode_mn[0]):
-        mask = mask | Int32(
-            cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_coord_vmnk, mcast_mode=2)
-        )
+        mask = mask | Int32(cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_coord_vmnk, mcast_mode=2))
     if cutlass.const_expr(mcast_mode_mn[1]):
-        mask = mask | Int32(
-            cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_coord_vmnk, mcast_mode=1)
-        )
+        mask = mask | Int32(cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_coord_vmnk, mcast_mode=1))
     if cutlass.const_expr(mma_cta_count == 2):
         peer_coord_vmnk = (cta_coord_vmnk[0] ^ Int32(1), *cta_coord_vmnk[1:])
         if cutlass.const_expr(mcast_mode_mn[0]):
-            mask = mask | Int32(
-                cpasync.create_tma_multicast_mask(cta_layout_vmnk, peer_coord_vmnk, mcast_mode=2)
-            )
+            mask = mask | Int32(cpasync.create_tma_multicast_mask(cta_layout_vmnk, peer_coord_vmnk, mcast_mode=2))
         if cutlass.const_expr(mcast_mode_mn[1]):
-            mask = mask | Int32(
-                cpasync.create_tma_multicast_mask(cta_layout_vmnk, peer_coord_vmnk, mcast_mode=1)
-            )
+            mask = mask | Int32(cpasync.create_tma_multicast_mask(cta_layout_vmnk, peer_coord_vmnk, mcast_mode=1))
     return mask
 
 
@@ -156,9 +123,7 @@ def _active_cluster_uses_cluster_sync(
     preferred_uses_cluster = preferred_cluster_shape_mn[0] * preferred_cluster_shape_mn[1] > 1
     fallback_uses_cluster = fallback_cluster_shape_mn[0] * fallback_cluster_shape_mn[1] > 1
     cluster_sync_behavior_differs = preferred_uses_cluster != fallback_uses_cluster
-    return Boolean(preferred_uses_cluster) ^ (
-        is_fallback_cluster & Boolean(cluster_sync_behavior_differs)
-    )
+    return Boolean(preferred_uses_cluster) ^ (is_fallback_cluster & Boolean(cluster_sync_behavior_differs))
 
 
 @cute.jit
@@ -233,17 +198,11 @@ class PipelineTmaUmmaMixedCga(pipeline.PipelineAsync):
             or num_mma_consumer_warps <= 0
         ):
             raise ValueError("num_mma_consumer_warps must be a positive Python int.")
-        if cutlass.const_expr(
-            len(mcast_mode_mn) != 2 or any(mode not in (0, 1) for mode in mcast_mode_mn)
-        ):
+        if cutlass.const_expr(len(mcast_mode_mn) != 2 or any(mode not in (0, 1) for mode in mcast_mode_mn)):
             raise ValueError("mcast_mode_mn must contain two zero-or-one values.")
 
         preferred_shape_vmnk = _static_vmnk_shape(preferred_cta_layout_vmnk)
-        fallback_layout = (
-            preferred_cta_layout_vmnk
-            if fallback_cta_layout_vmnk is None
-            else fallback_cta_layout_vmnk
-        )
+        fallback_layout = preferred_cta_layout_vmnk if fallback_cta_layout_vmnk is None else fallback_cta_layout_vmnk
         fallback_shape_vmnk = _static_vmnk_shape(fallback_layout)
         if cutlass.const_expr(preferred_shape_vmnk[0] != fallback_shape_vmnk[0]):
             raise ValueError("Preferred and fallback layouts must use the same MMA V extent.")
@@ -256,21 +215,15 @@ class PipelineTmaUmmaMixedCga(pipeline.PipelineAsync):
         cta_group = tcgen05.CtaGroup.TWO if mma_cta_count == 2 else tcgen05.CtaGroup.ONE
         is_true_mixed = preferred_shape_vmnk != fallback_shape_vmnk
         if cutlass.const_expr(is_true_mixed and is_fallback_cluster is None):
-            raise ValueError(
-                "is_fallback_cluster is required when preferred and fallback layouts differ."
-            )
+            raise ValueError("is_fallback_cluster is required when preferred and fallback layouts differ.")
 
         preferred_group_count = _multicast_group_count(preferred_shape_vmnk, mcast_mode_mn)
         fallback_group_count = _multicast_group_count(fallback_shape_vmnk, mcast_mode_mn)
         preferred_arrival_count = preferred_group_count * num_mma_consumer_warps
         fallback_arrival_count = fallback_group_count * num_mma_consumer_warps
 
-        preferred_cluster_size = (
-            preferred_shape_vmnk[0] * preferred_shape_vmnk[1] * preferred_shape_vmnk[2]
-        )
-        fallback_cluster_size = (
-            fallback_shape_vmnk[0] * fallback_shape_vmnk[1] * fallback_shape_vmnk[2]
-        )
+        preferred_cluster_size = preferred_shape_vmnk[0] * preferred_shape_vmnk[1] * preferred_shape_vmnk[2]
+        fallback_cluster_size = fallback_shape_vmnk[0] * fallback_shape_vmnk[1] * fallback_shape_vmnk[2]
         tracks_both_operand_families = mcast_mode_mn == (1, 1)
         is_single_sided = tracks_both_operand_families and (
             (preferred_shape_vmnk[1] == fallback_shape_vmnk[1] == 1)
@@ -285,9 +238,7 @@ class PipelineTmaUmmaMixedCga(pipeline.PipelineAsync):
                 if cutlass.const_expr(is_single_sided):
                     consumer_mask = Int32((1 << fallback_cluster_size) - 1)
                 else:
-                    consumer_mask = _reader_mask(
-                        fallback_layout, cta_coord_vmnk, mcast_mode_mn, mma_cta_count
-                    )
+                    consumer_mask = _reader_mask(fallback_layout, cta_coord_vmnk, mcast_mode_mn, mma_cta_count)
             else:
                 active_arrival_count = Int32(preferred_arrival_count)
                 if cutlass.const_expr(is_single_sided):
@@ -297,9 +248,7 @@ class PipelineTmaUmmaMixedCga(pipeline.PipelineAsync):
                         preferred_cta_layout_vmnk, cta_coord_vmnk, mcast_mode_mn, mma_cta_count
                     )
         elif cutlass.const_expr(not is_single_sided):
-            consumer_mask = _reader_mask(
-                preferred_cta_layout_vmnk, cta_coord_vmnk, mcast_mode_mn, mma_cta_count
-            )
+            consumer_mask = _reader_mask(preferred_cta_layout_vmnk, cta_coord_vmnk, mcast_mode_mn, mma_cta_count)
 
         full_sync_object = pipeline.MbarrierArray(
             barrier_storage=barrier_storage.align(min_align=8),

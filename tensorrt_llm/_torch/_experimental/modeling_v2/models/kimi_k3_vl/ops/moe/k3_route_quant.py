@@ -27,7 +27,7 @@ class K3RouteQuant(OpWrapper):
     grid-dependency wait, before the outputs are written; for a dependent that waits for this whole grid before
     reading them, as ``trtllm::k3_moe`` does."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
@@ -76,7 +76,7 @@ class K3RouteQuant(OpWrapper):
     kimi_k3_noaux_tc_mxfp8_quant, with and without early trigger,
     including tied/saturated routing and zero/large/denormal latent
     rows. Reruns and each M's rows agree bitwise with the M=64 call.
-    The kernel test also compares noaux_tc_op plus mxfp8_quantize.
+    The tests also match noaux_tc_op plus mxfp8_quantize bit for bit.
     Router and latent-down GEMMs, expert execution and combine remain
     outside the fusion. k3_moe consumes the outputs; k3_moe_front fuses
     the GEMMs, head all-gather and this op's device code.
@@ -94,7 +94,7 @@ class K3RouteQuant(OpWrapper):
     with interleaved eager calls and retain the isolated calls' bits.
     Invalid shapes, dtypes, layouts and token counts raise ValueError;
     the tests retain those refusals and both cold-capture refusals.
-    Certification is SM100 only; the stock comparator requires SM10.x.
+    The stock comparator requires SM10.x.
     """
 
     def __call__(

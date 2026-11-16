@@ -23,7 +23,7 @@ class K3KdaVerify(OpWrapper):
     """Return the gated-norm core output bf16 [N (1 + num_spec), H, 128] of the verify tokens whose fused
     projection rows are ``proj``; updates the slots' conv caches, state and per-draft states in place."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS = (
         Cell(
             why="one TP16 request, seven drafts and six rounds of accepted-draft replay",

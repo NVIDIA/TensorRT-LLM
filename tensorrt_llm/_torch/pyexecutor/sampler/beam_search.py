@@ -42,7 +42,7 @@ from tensorrt_llm.executor.result import Logprob
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
-from .ops.flashinfer import radix_topk_op
+from .ops.flashinfer import radix_topk_op, topk_module_ready
 from .ops.triton import reorder_compact_stop_word_history
 from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
@@ -110,12 +110,14 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     follows flashinfer's own guidance (``flashinfer.top_k`` docstring).
 
     Beam search is not a flashinfer-gated feature, so fall back to torch.topk
-    when flashinfer is missing: real vocabularies are always past the crossover,
-    which would otherwise make the whole default beam path require it. The two
-    kernels agree on values and on descending order; only the index order among
-    equal values may differ, which torch.topk leaves unspecified anyway.
+    when flashinfer is missing or its topk module is not built yet (a cold
+    build takes ~10 minutes, see ``warmup_topk_module``): real vocabularies are
+    always past the crossover, which would otherwise make the whole default
+    beam path require it. The two kernels agree on values and on descending
+    order; only the index order among equal values may differ, which torch.topk
+    leaves unspecified anyway.
     """
-    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000:
+    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000 and topk_module_ready():
         return radix_topk_op(values, k)
     return torch.topk(values, k=k, dim=-1, sorted=True)
 
@@ -322,8 +324,8 @@ class PendingBeamHistories:
     """Live beam histories whose device-to-host copy may still be running.
 
     Made by ``BeamSearchHandler.start_beam_histories``. ``paths`` holds, for each
-    request, the tokens of every beam from the smallest prompt length in the
-    group onwards; it is None when no request has generated a token yet.
+    request, the generated tokens of every beam, starting at the request's own
+    prompt length; it is None when no request has generated a token yet.
     """
 
     paths: torch.Tensor | None
@@ -343,9 +345,8 @@ class PendingBeamHistories:
             return [[[] for _ in range(width)] for width in self.widths]
         assert self.copied is not None
         self.copied.synchronize()
-        start = min(self.prompt_lens)
         return [
-            self.paths[i, :width, prompt_len - start : length - start].tolist()
+            self.paths[i, :width, : max(length - prompt_len, 0)].tolist()
             for i, (width, prompt_len, length) in enumerate(
                 zip(self.widths, self.prompt_lens, self.num_tokens)
             )
@@ -1666,7 +1667,9 @@ class BeamSearchHandler:
         hypotheses mid-flight with the gather finalization uses:
         ``original_tokens`` read through ``cache_indirection`` over the
         generated positions. One gather for all requests, one device-to-host
-        copy.
+        copy, both sized by the most tokens any request has generated, so
+        requests with very different prompt lengths cost no more than requests
+        with equal ones.
 
         The copy is queued without waiting, so that a caller can start it before
         launching the forward pass and only wait for the copy, not the forward,
@@ -1675,7 +1678,11 @@ class BeamSearchHandler:
         widths = [request.get_beam_width_by_iter(for_next_iteration=False) for request in requests]
         prompt_lens = [request.py_prompt_len for request in requests]
         num_tokens = [request.max_beam_num_tokens for request in requests]
-        if not requests or max(num_tokens) <= min(prompt_lens):
+        max_generated = max(
+            (length - prompt_len for length, prompt_len in zip(num_tokens, prompt_lens)),
+            default=0,
+        )
+        if max_generated <= 0:
             return PendingBeamHistories(
                 paths=None,
                 copied=None,
@@ -1687,23 +1694,27 @@ class BeamSearchHandler:
         assert store is not None
         slots = [request.py_seq_slot for request in requests]
         assert all(slot is not None for slot in slots), "beam-search requests must have seq slots"
-        start = min(prompt_lens)
-        end = max(num_tokens)
-        slots_cuda = torch.tensor(slots, dtype=torch.int64, pin_memory=prefer_pinned()).to(
-            device="cuda", non_blocking=True
-        )
+        slots_cuda, prompt_lens_cuda = torch.tensor(
+            [slots, prompt_lens], dtype=torch.int64, pin_memory=prefer_pinned()
+        ).to(device="cuda", non_blocking=True)
+        # Position t of row i is the request's t-th generated token. Rows of
+        # requests that generated fewer tokens are padded with later positions,
+        # which wait() drops; the clamp keeps that padding inside the buffer.
+        positions = prompt_lens_cuda[:, None] + torch.arange(max_generated, device="cuda")
+        positions.clamp_(max=store.original_tokens.size(2) - 1)
+        slot_index = slots_cuda[:, None, None]
+        position_index = positions[:, None, :]
+        beam_index = torch.arange(max(widths), device="cuda")[None, :, None]
         # Only the live rows of cache_indirection are written each step; the rows
         # above a request's beam width hold whatever the buffer held before, and
-        # a stray value there would trip gather's index check. Read only the rows
-        # the widest request needs and clamp them. A live row never points past
-        # the buffer, so clamping leaves real histories alone. The source keeps
-        # every row: after a width shrink, a live row may point to a row above
-        # the current width.
-        index = store.cache_indirection[slots_cuda, : max(widths), start:end].long()
+        # a stray value there would trip the indexing's bounds check. Read only
+        # the rows the widest request needs and clamp them. A live row never
+        # points past the buffer, so clamping leaves real histories alone. The
+        # source keeps every row: after a width shrink, a live row may point to a
+        # row above the current width.
+        index = store.cache_indirection[slot_index, beam_index, position_index].long()
         index.clamp_(0, store.original_tokens.size(1) - 1)
-        paths_cuda = torch.gather(
-            store.original_tokens[slots_cuda, :, start:end], dim=1, index=index
-        )
+        paths_cuda = store.original_tokens[slot_index, index, position_index]
         paths = torch.empty_like(paths_cuda, device="cpu", pin_memory=prefer_pinned())
         paths.copy_(paths_cuda, non_blocking=True)
         copied = torch.cuda.Event()

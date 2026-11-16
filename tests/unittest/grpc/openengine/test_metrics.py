@@ -285,7 +285,20 @@ async def _multiprocess(attached: bool) -> None:
     def get_stats(timeout):
         del timeout
         assert not attached, "attached frontend consumed shared engine stats"
-        return [{"numActiveRequests": 7, "numCompletedRequests": 2}]
+        return [
+            {
+                "attentionDpRank": 0,
+                "numActiveRequests": 7,
+                "numCompletedRequests": 2,
+                "kvCacheStats": {"maxNumBlocks": 10, "usedNumBlocks": 3, "reusedBlocks": 2},
+            },
+            {
+                "attentionDpRank": 1,
+                "numActiveRequests": 7,
+                "numCompletedRequests": 0,
+                "kvCacheStats": {"maxNumBlocks": 10, "usedNumBlocks": 7, "reusedBlocks": 5},
+            },
+        ]
 
     llm = SimpleNamespace(args=_args(), get_stats=get_stats)
     metrics = OpenEngineMetrics(llm, "test-model", "127.0.0.1", 0, owner=not attached)
@@ -295,16 +308,25 @@ async def _multiprocess(attached: bool) -> None:
         if attached:
             return
         _run_worker("attached")
+        expected_kv = (("0", 3, 2), ("1", 7, 5))
         deadline = time.monotonic() + 5
         while True:
             text = await _scrape(metrics.port)
-            if _sample(text, "trtllm_num_requests_running") == 7:
+            if all(
+                _sample(text, "trtllm_kv_cache_used_blocks", dp_rank=rank) == used
+                and _sample(text, "trtllm_kv_cache_reused_blocks_total", dp_rank=rank) == reused
+                for rank, used, reused in expected_kv
+            ):
                 break
             assert time.monotonic() < deadline
             await asyncio.sleep(0.01)
         assert _sample(text, "trtllm_request_success_total") == 2
         assert _sample(text, "trtllm_prompt_tokens_total") == 4
+        assert _sample(text, "trtllm_num_requests_running") == 7
         assert _sample(text, "trtllm_num_requests_completed_total") == 2
+        for rank, used, reused in expected_kv:
+            assert _sample(text, "trtllm_kv_cache_used_blocks", dp_rank=rank) == used
+            assert _sample(text, "trtllm_kv_cache_reused_blocks_total", dp_rank=rank) == reused
         assert "pid=" not in text
         # Another live group using the same parent cannot see these counters.
         _run_worker("isolated")

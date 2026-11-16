@@ -39,7 +39,7 @@ class K3MoeFront(OpWrapper):
     ``publish``: also release the workspace's per-token ready words, which the next ``moe/k3_moe`` call on a head_flags
     state (``head=workspace``) acquires; every publishing call is followed by exactly one such call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="four-rank gathered head and TP16-width shared activation, every decode row count",
@@ -90,6 +90,8 @@ class K3MoeFront(OpWrapper):
     shared activation's 2e-2 relative gate for fast tanh/sigmoid. General
     payload sums can differ from another GEMM: kernel tests bound changed
     routing to a 16th/17th-key gap <=1e-4 and >99.9% equal MXFP8 bytes.
+    Kernel tests also cover fabric handles and a quantization CTA held
+    while head-flags k3_moe advances the epoch (publish order).
     Routed experts, shared-down/rank reduction, routed reduction and latent-
     up remain outside this front; its producer owns x.
 

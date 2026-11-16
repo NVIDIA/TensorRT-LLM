@@ -222,7 +222,8 @@ registration alone.
 CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
 compression and shared KV/index sources; per-phase query tiles feed selected
 rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
-for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+for SM90, SM100-family and SM120/121 routing (candidate-consumer layers need
+SM100-family GPUs), persistent cache formats, and replay.
 
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
@@ -232,6 +233,11 @@ BSR routes or an exact packed bitmask. Optional K/V summaries enable proxy
 routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
+
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block, excluding padding in a partial final block. The kernel
+weights each proxy by its represented token count; do not pass V sums or
+pre-weight the summaries.
 
 The contiguous block-sparse path also consumes the SageAttention recipe in
 `AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
@@ -323,17 +329,24 @@ NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
 
-CSA2 also gathers the complete compressed prefix during index prefill and
-declares a conservative gather rate even with chunked prefill. Its native
+CSA2 also gathers the complete compressed prefix during index prefill, even
+with chunked prefill: on the native SM100 path 69 bytes per gathered key (E2M1
+data, scale word, validity) for each query piece a request splits into, and a
+conservative 512 bytes per key on the decoded fallback. Its native
 index descriptor/radix arena follows maximum batch, draft width and sequence
 length, so it declares a separate fixed reserve for an eager arena and, when
 enabled, a shared CUDA graph arena. The estimator conservatively reserves the
 full arena capacity alongside the profiled peak: a decode arena may first be
 allocated after peak prefill, so its final retained bytes cannot safely be
-subtracted from that earlier peak.
+subtracted from that earlier peak. The fixed reserve also covers one prefill
+indexer group's FP32 logits, whose width follows the attended prefix; the MQA
+logits element budget and the step's query rows bound them.
 The attended-KV admission cap applies to the prefix gather, independently of
-the fixed graph arena. Projection, native/provider scratch and transient logits
-still require representative peak-memory profiling.
+the fixed graph arena. The attention-DP minimum-KV-split scratch of
+`fmha/gqa_decode.py` needs no declaration: it is sized by the largest
+generation CUDA-graph batch, which graph warmup runs before KV-cache sizing,
+and larger eager batches keep FlashInfer's split heuristic. Projection and
+native/provider scratch still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -352,6 +365,10 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
+A CUDA graph runner that keys its decode graphs by KV regime hands the
+regime ceiling to the graph's metadata through `set_decode_kv_regime`; only a
+backend whose decode path depends on the KV length keeps it (the FP4 MLA
+2x | 4x | two-stream dispatcher), the default ignores it.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
 
@@ -475,6 +492,17 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
+`Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
+from `FmhaPrewarmConfig`; it does not replace request-level selection.
+Under pipeline parallelism, decoder warmup finds backend attributes on modules
+with retained projection weights, including MLA's `mqa`/`mha` and cross-attention,
+and asks each manager to prewarm its eligible libraries. A shared set limits
+each library to one attempt across the rank's layers. Failures are logged and
+deferred to first use, and all TP peers synchronize before the first forward.
+FlashInfer's decode, prefill and MLA getters load the same `fmha_gen` JIT spec,
+so its prewarm invokes one getter to build the shared library.
+
 `FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
 `thop.run_generation`; the native carrier behind them is per host thread and
 never visible to Python. Generated nanobind readers
@@ -501,7 +529,8 @@ preserve its routing semantics. The PrimTS sparse MLA library
 (`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
 generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
 decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-removes it. Delta entries update the
+removes it. With sparse KV cache offload, it reads the compress-ratio-4
+layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
@@ -512,14 +541,39 @@ leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both f
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can
-silently drop the routing semantics.
+silently drop the routing semantics. Likewise a generation call whose
+QK-norm / RoPE / KV-append prologue the attention module deferred
+(`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
+libraries that declare `supports_deferred_prologue`.
+
+Two per-forward arguments and one layer field let a library return less than
+a full BF16 `output`; callers that set them must read the result accordingly:
+
+- `output_gate`: a library that multiplies `sigmoid(gate)` into the output sets
+  `output_gate_applied`; otherwise the caller applies the gate.
+- `gated_out_scale` / `output_fp8` (offered only with `output_gate`): a library
+  that applies the gate may write the gated output as E4M3 at o_proj's static
+  input scale into `output_fp8` and leave `output` unwritten. The caller then
+  feeds `output_fp8` to o_proj; `output` holds stale data.
+- `context_last_rows_only` (a `TrtllmAttention` field the model sets, e.g. the
+  Qwen3.5 MTP layer): in a context-only step `FlashInferTrtllmGenFmha` computes
+  only each request's last output row, against the full KV, and writes zeros to
+  the other rows; every row's K / V is still appended. Mixed steps run the full
+  call.
+
+`trtllm::fmha_paged_context_fp8` (the stage-KV context path of
+`FlashInferTrtllmGenFmha`, `context_fmha_head_dim_per_stage_kv > 0`) runs only
+a precompiled kernel: when the config the runner selects for the call has no
+cubin, the op returns `False` without launching and the library runs
+FlashInfer's kernel, so no step compiles with NVRTC.
+
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
 class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
-and `supports_fp4_mla`, and override only
+`supports_fp4_mla` and `supports_deferred_prologue`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -571,13 +625,19 @@ The FMHA package is split by role:
   attends every partition through `Fp4MlaFmha.forward_context_partition`;
   non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
   keeps by rounding them to the 128-token chunk unit. A prefix reused from
-  the block cache is attended the same way, so FP4 MLA block reuse requires
-  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
-  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
-  holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
-  FP4 MLA, whose reuse match can back off into a tile by the one-model
-  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  the block cache is attended the same way, with or without chunked prefill;
+  without it, each partition holds up to `max_num_tokens` cached tokens, the
+  size of the FP8 context scratch. The cached-KV path
+  (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
+  resume on a full FP4 tile. Hybrid linear-attention models resume on a
+  recurrent-state snapshot that the hybrid manager aligns to a cache block,
+  and keep block reuse tied to chunked prefill. The dense manager claims
+  whole cache blocks only, without the reuse-match backoff of one-model
+  drafts, and keeps its HP ring request-private
+  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short. With reuse
+  on, a context step repacks the packed V of every page it reads, reused
+  pages included, and a dense manager's generation steps write packed V
+  directly, since they append to pages their request allocated.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
@@ -586,7 +646,9 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
+  generation warmup shapes. A one-model MTP drafter on such a worker must
+  draft a single token (`max_draft_len: 1`), because its later draft steps
+  are generation steps; the generation worker fills in the drafts it lacks. Hybrid
   linear-attention models (Kimi K3)
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
@@ -634,7 +696,8 @@ The FMHA package is split by role:
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-  removes it.
+  removes it. For compress-ratio-4 layers under KV-cache offload, its extra
+  source is the layer's sparse cache arena (§3.2.5).
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
@@ -650,6 +713,17 @@ The FMHA package is split by role:
   MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
+- `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
+  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
+  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_split_kv` and `gqa_segmented` take the generation calls their
+  `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
+  size conditions are evaluated at the upper bound of the selection-cache
+  cell (`generation_selection_cell`). The segment attention of
+  `gqa_kv_replica` and `gqa_segmented` requests the LSE, for which FlashInfer
+  takes softmax stats off the front of the FMHA workspace: these calls run on
+  the trtllm-gen slice extended in place, and `GqaDecodeFmha.prepare_workspace`
+  sizes the attention workspace for the layer's largest such call.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased
@@ -685,7 +759,66 @@ See `attention/backends/sparse/` and the
 [Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
 for details.
 
-#### 3.2.5 Paged-context FMHA requires a fused kernel
+#### 3.2.5 Sparse KV cache offload
+
+With `enable_kv_cache_offload`, DSA layers and DeepSeek-V4 compress-ratio-4
+layers keep their sparse latent history in host-backed KVCacheManagerV2 pools.
+Each request reads it through a fixed-size GPU cache in the sparse cell arena,
+whose layout is described in
+[`SPARSE_ATTENTION_DESIGN.md`](../../../cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/SPARSE_ATTENTION_DESIGN.md).
+Offload serves single-beam generation-only batches on the SM100 family. The
+attention metadata carries the per-step state as `sparse_offload_state`
+(`attention/backends/sparse/offload.py`). It is `None` when offload is off.
+
+Each offloaded layer runs three steps in a generation step:
+
+1. **Write.** The new latent row goes to the request's reserved arena row, not
+   to the paged cache. DSA passes an `MlaLatentWriteTarget`
+   (`backends/trtllm.py`) to `mla_rope_generation`. Pool 0 starts at the
+   arena, each request owns a one-token page whose block offset is its row,
+   and `write_slots` is -1 for padding tokens. An NVFP4 latent's pointers also
+   name the scale arena. The DeepSeek-V4 compressor writes compressed rows
+   through the state's write indices. Attention raises unless
+   `sparse_offload_state.write_layer` is the current layer.
+2. **Fetch.** `fetch_sparse_indices` makes the selected history resident in
+   the arena and returns arena rows. These rows, merged with the row written
+   this step, replace the global KV-pool indices that the predictor would
+   otherwise hand to attention.
+3. **Attend.** `sparse_runtime_params.aux_kv_cache_pool_ptr` names the arena
+   base of the layer's data buffer, so the sparse MLA kernel reads arena rows
+   instead of paged-pool rows. An NVFP4 latent is first dequantized by
+   `nvfp4_mla_kv_cache_gather_direct` into an FP8 scratch, and
+   `aux_kv_cache_pool_ptr` names that scratch instead. The TRTLLM-Gen sparse
+   MLA kernels can read up to one 128-row KV tile past the last indexed row,
+   so the scratch ends in `NVFP4_SCRATCH_TAIL_ROWS` zeroed rows and every
+   arena pool ends in a matching zeroed tail.
+
+For an offloaded layer, the KV-cache manager's block tables and pool pointers
+do not describe where the history is. The arena-row indices are relative to
+the base of the layer's data arena, and a library must read through that base.
+`FallbackFmha` (TRTLLM-Gen through `thop.run_generation`) uses
+`aux_kv_cache_pool_ptr`. `prims_ts_sparse_mla` passes the DeepSeek-V4
+manager's cached view, `get_sparse_compress_buffers(layer_idx)[0]`, as its
+extra pool. A library must branch on the offload state in both its
+per-forward check and its launch, as `prims_ts_sparse_mla` does:
+
+```python
+def _reads_sparse_arena(self, metadata) -> bool:
+    return (
+        int(self.attn.compress_ratio) == 4
+        and getattr(metadata, "sparse_offload_state", None) is not None
+    )
+```
+
+Read the attribute with `getattr`: only the DSA and DeepSeek-V4 metadata
+define it. Scope the check to the layers that actually offload. For
+DeepSeek-V4, that is compress ratio 4 only; its other layers keep their
+compress pool. A library that reads offloaded layers must also mask -1 holes
+inside the live prefix, which offload produces, and over-read by no more than
+the arena tail. A library that cannot meet these requirements must decline
+offloaded layers in its per-forward check.
+
+#### 3.2.6 Paged-context FMHA requires a fused kernel
 
 `TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
 prefill, KV block reuse or speculative draft tokens are configured. Those

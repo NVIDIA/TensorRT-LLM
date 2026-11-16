@@ -333,6 +333,7 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
     logprob_chunks: List[float] = []
 
     finish_reason_counter = 0
+    delta = None
     finish_reason: str = None
     async for chunk in stream:
         choice = chunk.choices[0]

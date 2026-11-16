@@ -140,10 +140,15 @@ def _msgpack_response(status, body):
     return context
 
 
-def _delegating_router():
-    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
-    return CoordinatorDelegatingRouter("http://coordinator", local_router,
-                                       "generation")
+def _delegating_router(
+        content_required: bool = False) -> CoordinatorDelegatingRouter:
+    """Build a delegated stateful router with an optional content-key roundtrip."""
+    # Only stateful routers implement the coordinator's routing-key contract.
+    router_type = ConversationRouter if content_required else LoadBalancingRouter
+    local_router = router_type(server_role=None, servers=["server1"])
+    return CoordinatorDelegatingRouter(
+        "http://coordinator", local_router,
+        "context" if content_required else "generation")
 
 
 @pytest.mark.asyncio
@@ -209,6 +214,111 @@ async def test_coordinator_select_does_not_retry_error_status():
         await router._post_select({"role": "generation"})
 
     assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection_error",
+                         [None, asyncio.TimeoutError, ValueError])
+@pytest.mark.parametrize("content_required", [False, True])
+async def test_cancelled_selection_finishes_once_after_settlement(
+        selection_error: type[Exception] | None,
+        content_required: bool) -> None:
+    """Repeated cancellation cannot orphan selection or replace its routing ID."""
+    router = _delegating_router(content_required)
+    entered, release = asyncio.Event(), asyncio.Event()
+    selection_tasks = []
+
+    async def select(payload: dict) -> dict:
+        if content_required and not isinstance(payload["routing_key"], dict):
+            return {"server": None, "info": {ROUTING_CONTENT_REQUIRED: True}}
+        selection_tasks.append(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        if selection_error is not None:
+            raise selection_error("selection failed during cleanup")
+        return {"server": "server1", "info": {}}
+
+    router._post_select = mock.AsyncMock(side_effect=select)
+    router.finish_request = mock.AsyncMock()
+    request = CompletionRequest(
+        model="m",
+        prompt="hi",
+        conversation_params=ConversationParams(conversation_id="conv-a"),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only"
+            if content_required else "generation_only",
+            disagg_request_id=123,
+            ctx_request_id=123))
+    pending = asyncio.create_task(router.get_next_server(request))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        pending.cancel("original cancellation")
+        await asyncio.sleep(0)
+        pending.cancel("second cancellation")
+        await asyncio.sleep(0)
+        assert not pending.done()
+        assert not selection_tasks[0].done()
+        router.finish_request.assert_not_awaited()
+        # Cleanup must use the ID sent to /select, not mutable request state.
+        request.disaggregated_params.ctx_request_id = 456
+        request.disaggregated_params.disagg_request_id = 456
+        release.set()
+        done, _ = await asyncio.wait([pending], timeout=1)
+        assert pending in done
+        with pytest.raises(asyncio.CancelledError,
+                           match="original cancellation"):
+            await pending
+        assert selection_tasks[0].done()
+        assert not selection_tasks[0].cancelled()
+        assert router._post_select.await_count == (2 if content_required else 1)
+        router.finish_request.assert_awaited_once_with(request,
+                                                       success=False,
+                                                       req_id=123)
+    finally:
+        release.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_on_completion", [False, True])
+@pytest.mark.parametrize("content_required", [False, True])
+async def test_coordinator_selection_hands_off_or_cleans_up(
+        cancel_on_completion: bool, content_required: bool) -> None:
+    """Cancellation at completion releases placement; success hands it off."""
+    router = _delegating_router(content_required)
+    router.finish_request = mock.AsyncMock()
+
+    async def select(payload: dict) -> dict:
+        if content_required and not isinstance(payload["routing_key"], dict):
+            return {"server": None, "info": {ROUTING_CONTENT_REQUIRED: True}}
+        if cancel_on_completion:
+            pending.cancel("cancel at completion")
+        return {"server": "server1", "info": {}}
+
+    router._post_select = mock.AsyncMock(side_effect=select)
+    request = CompletionRequest(
+        model="m",
+        prompt="hi",
+        conversation_params=ConversationParams(conversation_id="conv-a"))
+    pending = asyncio.create_task(router.get_next_server(request, req_id=123))
+    try:
+        done, _ = await asyncio.wait([pending], timeout=1)
+        assert pending in done
+        assert router._post_select.await_count == (2 if content_required else 1)
+        if cancel_on_completion:
+            with pytest.raises(asyncio.CancelledError,
+                               match="cancel at completion"):
+                await pending
+            router.finish_request.assert_awaited_once_with(request,
+                                                           success=False,
+                                                           req_id=123)
+        else:
+            assert await pending == ("server1", {})
+            router.finish_request.assert_not_awaited()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio

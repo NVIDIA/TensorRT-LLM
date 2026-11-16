@@ -13,7 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "k3AttnResDecode.h"
+#include "kimi_k3_vl/csrc/k3AttnResDecode.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 
 #include <ATen/Functions.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -25,7 +27,7 @@
 #include <optional>
 #include <tuple>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -200,9 +202,9 @@ std::tuple<at::Tensor, at::Tensor> k3_attn_res_add_rmsnorm_fwd(at::Tensor layer_
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "k3_attn_res_rmsnorm_fwd(Tensor layer_residual, Tensor block_residual, "
@@ -214,8 +216,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float rms_eps, float output_rms_eps, bool early_trigger=False) -> (Tensor, Tensor)");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("k3_attn_res_rmsnorm_fwd", &tensorrt_llm::torch_ext::k3_attn_res_rmsnorm_fwd);
-    m.impl("k3_attn_res_add_rmsnorm_fwd", &tensorrt_llm::torch_ext::k3_attn_res_add_rmsnorm_fwd);
+    m.impl("k3_attn_res_rmsnorm_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_rmsnorm_fwd);
+    m.impl("k3_attn_res_add_rmsnorm_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_add_rmsnorm_fwd);
 }

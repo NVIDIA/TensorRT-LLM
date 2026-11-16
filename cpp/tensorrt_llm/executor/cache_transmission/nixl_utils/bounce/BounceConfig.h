@@ -131,20 +131,19 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 }
 
 /// POD config for the bounce v2 pipeline. There is no `enabled` field: the on/off switch is
-/// CacheTransceiverConfig's agent_bounce_buffer_enable + kv_cache_bounce_size_mb (which the Python
-/// frontend folds into the agent's arena size in MiB: 0 = off, >0 = arena size), and at runtime
-/// "bounce on" simply means the owning agent built its bounce state (mBounce != nullptr).
-/// `arenaSizeBytes` is NOT env-backed either — the owning agent sets it from the same knob. The
-/// expert knobs resolve as: agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in
-/// default (`fromEnv()` reads the env, `fromParams()` layers the dict on top). Byte-valued knobs
-/// accept an optional case-insensitive binary suffix such as "256MB", "1gb", or "512KiB"
-/// (K/M/G == KiB/MiB/GiB, powers of two).
+/// CacheTransceiverConfig's kv_cache_bounce_size_mb (which the Python frontend passes as the
+/// agent's arena size in MiB: 0 = off, >0 = arena size), and at runtime "bounce on" simply means
+/// the owning agent built its bounce state (mBounce != nullptr). `arenaSizeBytes` is NOT env-backed
+/// either — the owning agent sets it from the same knob. The expert knobs resolve as:
+/// agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default (`fromEnv()` reads
+/// the env, `fromParams()` layers the dict on top). Byte-valued knobs accept an optional
+/// case-insensitive binary suffix such as "256MB", "1gb", or "512KiB" (K/M/G == KiB/MiB/GiB, powers
+/// of two).
 struct BounceConfig
 {
-    // Overwritten with the agent arena size (MiB << 20, derived from CacheTransceiverConfig's
-    // kv_cache_bounce_size_mb + agent_bounce_buffer_enable) on every production path
-    // (maybeInitBounce); the
-    // default only serves unit tests that construct a BounceConfig{} directly.
+    // Overwritten with the agent arena size (CacheTransceiverConfig's kv_cache_bounce_size_mb << 20)
+    // on every production path (maybeInitBounce); the default only serves unit tests that construct a
+    // BounceConfig{} directly.
     std::size_t arenaSizeBytes{512ULL << 20};
     std::size_t arenaAllocationGranularityBytes{1ULL << 20}; // arena_allocation_granularity
     std::size_t maxChunkSizeBytes{32ULL << 20};              // max_chunk_size
@@ -159,7 +158,7 @@ struct BounceConfig
     // min_descriptor_count lowered. max_average_descriptor_size = 0 routes EVERY write to standard
     // NIXL (an outbound gate off switch, not "no limit") — it disables OUTBOUND routing only: the arena is still
     // allocated and registered, the handshake still advertised, and inbound grants/scatter still
-    // served; to turn the feature off use agent_bounce_buffer_enable=false. min_descriptor_count = 0
+    // served; to turn the feature off set kv_cache_bounce_size_mb=0. min_descriptor_count = 0
     // means no minimum.
     std::size_t minDescriptorCount{1024};                   // min_descriptor_count
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10}; // max_average_descriptor_size
@@ -338,7 +337,7 @@ struct BounceConfig
 
     /// Defaults overridden by any set TRTLLM_NIXL_BOUNCE_* env var. Each call reads the current
     /// environment. The on/off switch and the arena size are NOT read here — they only come from
-    /// CacheTransceiverConfig (agent_bounce_buffer_enable + kv_cache_bounce_size_mb).
+    /// CacheTransceiverConfig (kv_cache_bounce_size_mb).
     [[nodiscard]] static BounceConfig fromEnv()
     {
         // paramKey -> env var name. Byte-valued knobs keep the historical _BYTES env suffix.

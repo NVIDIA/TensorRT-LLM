@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 
@@ -80,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -91,6 +99,7 @@ class PageIndexMode(enum.IntEnum):
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
+CacheGroupId: TypeAlias = LifeCycleId
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
@@ -100,21 +109,21 @@ class AttnLifeCycle:
         self,
         window_size: int | None,
         num_sink_blocks: int,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> None: ...
     @staticmethod
     def make(
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
     @property
-    def reuse_policy(self) -> AttentionReusePolicy: ...
+    def reuse_policy(self) -> ReusePolicy: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -172,6 +181,8 @@ class StorageStatistics:
     def free(self) -> int: ...
     @property
     def evictable(self) -> int: ...
+    @property
+    def retained_copies(self) -> int: ...
     @property
     def available(self) -> int: ...
     @property
@@ -265,6 +276,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
@@ -274,6 +286,30 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
+    protected_copy_fraction: float = 1.0
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = ...  # how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = ...
+    expected_donors: int = 0  # 0: unknown
+    pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -281,6 +317,11 @@ class DiskCacheTierConfig:
 @dataclass(slots=True, frozen=True)
 class BufferConfig:
     """One buffer of a layer's KV cache.
+
+    ``reuse_policy`` of ``None`` uses the layer's policy. Attention and SSM
+    buffers can override the layer's policy; the buffer then belongs to the
+    layer group for its effective policy and lifecycle properties while keeping
+    its layer ID, so one layer can span several layer groups.
 
     ``is_sparse`` marks a buffer whose history is too large for device memory and is read
     through a per-request device cache rather than directly (see
@@ -344,6 +385,7 @@ class BufferConfig:
     ``sparse_cache.unit_tokens`` and the page being densely packed, so a padded page is not
     expressible.
     """
+    reuse_policy: ReusePolicy | None = None
 
 @dataclass(slots=True)
 class SparseCacheConfig:
@@ -362,6 +404,11 @@ class SparseCacheConfig:
     the rounded cache capacity and selection width against the resolve kernel's available
     shared memory on the current device.
     """
+
+    @property
+    def max_unit_ordinal(self) -> int:
+        """Largest zero-based unit ordinal supported by the sparse probe index."""
+        ...
 
     num_selected_blocks: int
     """Selection width: units a sparse-attention step selects for this layer."""
@@ -402,10 +449,11 @@ class SparseCacheConfig:
     ``max_cached_units`` and ``unit_tokens``.
     """
 
-class AttentionReusePolicy(enum.IntEnum):
+class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
+    SINK_REQUIRED_ONLY = 3
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -421,7 +469,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     sparse_cache: SparseCacheConfig | None = None
     """The sparse fetch path for this layer's sparse buffers, if it has one.
@@ -433,10 +481,51 @@ class AttentionLayerConfig:
 
 @dataclass(slots=True)
 class SsmLayerConfig:
+    """Recurrent buffers with a layer-level default reuse policy.
+
+    A buffer's ``reuse_policy`` overrides the default for that buffer.
+    OPTIONAL state is restored only when selected on first resume at the exact
+    matched endpoint. The caller initializes or reconstructs all fresh state.
+    """
+
     layer_id: LayerId
     buffers: list[BufferConfig]
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+class RegionAllocationUnit(enum.IntEnum):
+    # One slot per KV cache and beam, held for the cache's lifetime.
+    REQUEST = 0
+    # One page per token block. Not supported yet.
+    TOKEN_BLOCK = 1
+
+@dataclass(slots=True)
+class RegionBuffer:
+    """One buffer of a region; the layer id places it in the per-layer address space."""
+
+    layer_id: LayerId
+    buffer: BufferConfig
+
+@dataclass(slots=True)
+class RegionConfig:
+    """Buffers that share a life cycle of the region's own, never merged with another one.
+
+    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
+    KV cache and beam, never published for reuse, returned when the cache closes. Each
+    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+
+    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
+    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    """
+
+    name: str
+    buffers: list[RegionBuffer]
+    allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
+    reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
+    fixed_slot_count: int | None = None
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class KVCacheDesc:
@@ -461,6 +550,16 @@ class PoolRebalanceConfig:
     target_ratio_update_interval: int = 100
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
+
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:
@@ -494,6 +593,10 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Regions, each with a life cycle of its own, numbered after every layer life cycle in
+    # declaration order. A (layer, role) pair belongs to one layer config or one region.
+    regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -570,6 +673,8 @@ class StreamingBlockRemovedData:
     @property
     def block_hashes(self) -> list[int]: ...
 
+class StreamingAllBlocksClearedData: ...
+
 class StreamingEventStats:
     @property
     def stored_blocks(self) -> int: ...
@@ -591,7 +696,9 @@ class StreamingEventSink:
     def set_target_life_cycle(self, life_cycle_id: int) -> None: ...
     def drain_iteration_events(
         self,
-    ) -> list[StreamingBlockStoredData | StreamingBlockRemovedData]: ...
+    ) -> list[
+        StreamingBlockStoredData | StreamingBlockRemovedData | StreamingAllBlocksClearedData
+    ]: ...
     @property
     def stats(self) -> StreamingEventStats: ...
 
@@ -668,7 +775,7 @@ class ReuseGroupStatus:
     def group_id(self) -> LayerGroupId: ...
     # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
     @property
-    def policy(self) -> AttentionReusePolicy: ...
+    def policy(self) -> ReusePolicy: ...
     # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
     @property
     def endpoint(self) -> int: ...
@@ -716,6 +823,9 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
     @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
@@ -809,7 +919,6 @@ class _KVCache:
     def resume(
         self,
         cuda_stream: CudaStream | None = None,
-        is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
@@ -820,10 +929,6 @@ class _KVCache:
 
         Takes no sparse cache arena lease: that follows membership, so a request receiving
         its history costs the GPU cache nothing until it is seated.
-
-        ``is_decoding`` is accepted and ignored. Resuming no longer distinguishes a decoding
-        request; the parameter is kept so callers that still pass it keep working, and goes
-        with the full sparse attention support.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:
@@ -938,11 +1043,6 @@ class HalfOpenRange:
     def __len__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
 
-class ScratchDesc:
-    range: HalfOpenRange
-    slot_ids: Sequence[int]
-    def __bool__(self) -> bool: ...
-
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
@@ -954,7 +1054,7 @@ class PageIndexConverter:
         self,
         base_indices: Sequence[int],
         index_mode: PageIndexMode | None = None,
-        scratch_range: HalfOpenRange | ScratchDesc | None = None,
+        scratch_range: HalfOpenRange | None = None,
         scratch_slots: Sequence[int] = (),
     ) -> list[int]: ...
 
@@ -1300,10 +1400,17 @@ class Batch:
         after**: a block must be in its host page before it can be selected, and
         :meth:`_KVCache.resize` refuses a history this has not covered.
 
-        Bounded by the capacity each row started from, not by how far history travels, so
-        a resumed request moving history across a whole prompt writes back nothing -- its
-        units reached their host pages directly rather than through a cell. A move wider
-        than the in-flight headroom is refused.
+        Only flush a history that is final -- one the row is going to take up. A history
+        past the row's capacity is refused: those units were never written, so they have
+        no cell to write back from.
+
+        Bounded by what was in flight, not by how far history travels, so a resumed request
+        moving history across a whole prompt writes back nothing -- its units reached their
+        host pages directly rather than through a cell. The bound is aggregate: the units
+        crossed, summed over rows, must fit the per-layer write-back list, which is sized
+        from ``max_total_input_tokens``. One prefilling row may therefore use the budget
+        several decoding rows leave unspent, and a batch that exceeds it is refused before
+        any work is issued.
 
         Reads the index table as of the last :meth:`publish`, which covers the blocks in
         range because they were allocated by an earlier step.
@@ -1519,10 +1626,12 @@ class Batch:
         which member is passed makes no difference -- but it must still be a whole
         layer's sparse buffers, as :meth:`fetch_sparse_pages` requires.
 
-        The miss list this leaves behind is read by every :meth:`fetch_resolved_pages`
-        that follows and is overwritten by the next resolve of the same selection, so
-        fetch each member layer before resolving the selection again. Both run on
-        ``stream``, so that ordering is the caller's only across streams.
+        The miss list and per-slot cell mapping this leaves behind are read by every
+        :meth:`fetch_resolved_pages` that follows, and they belong to the life cycle rather
+        than to the selection: the next resolve of *any* selection in the same life cycle
+        overwrites them. Fetch every member layer before resolving another selection there,
+        or those fetches copy the later selection's units. Both run on ``stream``, so that
+        ordering is the caller's only across streams.
         """
 
     def fetch_resolved_pages(
@@ -1821,6 +1930,10 @@ class KVCacheManager:
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote level failed on this rank (a transfer, or its donor went away). Lock-free."""
+        ...
+    @property
     def tokens_per_block(self) -> int: ...
     @property
     def event_manager(self) -> Any | None: ...
@@ -1856,9 +1969,18 @@ class KVCacheManager:
     def num_layers(self) -> int: ...
     @property
     def layer_ids(self) -> Iterator[LayerId]: ...
+    # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
+    def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Raises IndexError for a name no region declares.
+    def get_region_group_id(self, name: str) -> CacheGroupId: ...
+    # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
+    @property
+    def buffer_grouping(self) -> Sequence[Sequence[BufferId]]:
+        """Buffer membership indexed by CacheGroupId."""
+        ...
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...

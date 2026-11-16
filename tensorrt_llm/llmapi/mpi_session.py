@@ -36,8 +36,13 @@ T = TypeVar("T")
 
 # Environment that MpiPoolSession forwards from the parent to its workers.
 _FORWARDED_ENV_PREFIXES = ("TRTLLM", "TLLM")
-_FORWARDED_ENV_NAMES = (*_UNIFIED_CACHE_ENV_VARS, "FLASHINFER_CUBIN_DIR",
-                        "MASTER_ADDR", "MASTER_PORT")
+_FORWARDED_ENV_NAMES = (
+    *_UNIFIED_CACHE_ENV_VARS,
+    "FLASHINFER_CUBIN_DIR",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    # MPI may use an environment snapshot from MPI_Init.
+    "CUDA_SCALE_LAUNCH_QUEUES")
 
 
 def _is_forwarded_env(name: str) -> bool:
@@ -656,6 +661,18 @@ class MpiPoolSession(MpiSession):
                         f"alive after {timeout}s; not waiting further")
                     return
                 time.sleep(0.05)
+
+    def check_worker_error(self) -> Optional[BaseException]:
+        """Detect a dead pool manager thread, e.g. after a failed spawn.
+
+        mpi4py leaves the futures pending forever in that case.
+        """
+        pool = self.mpi_pool
+        thread = getattr(getattr(pool, '_pool', None), 'thread', None)
+        if thread is None or thread.is_alive() or pool._shutdown:
+            return None
+        return RuntimeError(
+            "MPI pool manager thread died (worker spawn failed?)")
 
     def release_exit_joins(self):
         if self.mpi_pool is not None:

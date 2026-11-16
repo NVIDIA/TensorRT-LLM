@@ -29,7 +29,7 @@ class K3HeadGemv(OpWrapper):
     ``workspace``, whose schedule and ``chunk_tiles`` the call takes. The calls that share a workspace must be ordered
     on one stream."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="TP16 LM-head shard, stream-K workspace across all decode row counts",

@@ -202,6 +202,7 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
             SimpleNamespace(endpoint=256, complete=False),
         ],
         get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
+        is_active=False,
     )
     manager = SimpleNamespace(
         enable_block_reuse=True, tokens_per_block=128, kv_cache_map={0: cache}
@@ -591,6 +592,8 @@ class TestAdapterBlockOrdinals:
 
     def test_v2_reports_stale_as_holes_via_valid_only_false(self):
         class _KvCache:
+            is_active = False
+
             def __init__(self):
                 self.valid_only = None
 

@@ -80,7 +80,7 @@ class K3Moe(OpWrapper):
     counters before its grid-dependency wait. Between the two, some kernel must wait for its predecessor before it
     triggers its dependents (``griddepcontrol.wait``, then ``launch_dependents``), or the stream is synchronized."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="M<=8 random routing over the TP4 x EP4 expert window",
