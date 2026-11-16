@@ -16,7 +16,8 @@ import time
 import openai
 import pytest
 from test_common import cluster_env
-from test_common.http_utils import wait_for_endpoint_down, wait_for_endpoint_ready
+from test_common.http_utils import (wait_for_endpoint_down,
+                                    wait_for_endpoint_ready)
 
 from tensorrt_llm._utils import get_sm_version
 
@@ -72,11 +73,9 @@ def require_supported_slurm_topology() -> None:
                          if "SLURM_PROCID" in missing_variables else "")
         pytest.fail("This test must run as a two-node srun step; "
                     f"missing: {', '.join(missing_variables)}.{launcher_hint}")
-    if (
-        os.environ["SLURM_STEP_NUM_NODES"] != "2"
-        or os.environ["SLURM_STEP_NUM_TASKS"] != "2"
-        or len(NODE_LIST) != 2
-    ):
+    if (os.environ["SLURM_STEP_NUM_NODES"] != "2"
+            or os.environ["SLURM_STEP_NUM_TASKS"] != "2"
+            or len(NODE_LIST) != 2):
         pytest.fail(
             "Launch one pytest task per node with srun, for example "
             "srun --kill-on-bad-exit=1 --nodes=2 --ntasks-per-node=1 "
@@ -132,8 +131,7 @@ def wait_for_gen_task_handshake(test_id: str) -> None:
                         raise RuntimeError(
                             "Generation task did not complete its handshake on port "
                             f"{GEN_TASK_HANDSHAKE_PORT} within "
-                            f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s"
-                        ) from error
+                            f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -145,14 +143,12 @@ def wait_for_gen_task_handshake(test_id: str) -> None:
             if ready_signal != expected_signal:
                 raise RuntimeError(
                     "Generation task handshake is for a different test: "
-                    f"expected {expected_signal!r}, got {ready_signal!r}"
-                )
+                    f"expected {expected_signal!r}, got {ready_signal!r}")
             return
     raise RuntimeError(
         "Generation task did not complete a valid handshake on port "
         f"{GEN_TASK_HANDSHAKE_PORT} within {GEN_TASK_HANDSHAKE_TIMEOUT_S}s; "
-        f"ignored {empty_connections} empty connection(s)"
-    )
+        f"ignored {empty_connections} empty connection(s)")
 
 
 def send_gen_task_handshake(host: str, test_id: str) -> None:
@@ -254,32 +250,34 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         model_path = get_model_path(model_name)
         tp_size, pp_size = ctx_tp_pp_size
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
-        with RemoteOpenAIServer(model_path,
-                                port=CTX_SERVER_PORT,
-                                cli_args=args,
-                                host="0.0.0.0",
-                                env=env(),
-                                llmapi_launch=False,
-                                # Poll /health; the default Slurm rank on node 1
-                                # would sleep for the full startup budget.
-                                rank=0,
-                                extra_config=extra_config) as server:
+        with RemoteOpenAIServer(
+                model_path,
+                port=CTX_SERVER_PORT,
+                cli_args=args,
+                host="0.0.0.0",
+                env=env(),
+                llmapi_launch=False,
+                # Poll /health; the default Slurm rank on node 1
+                # would sleep for the full startup budget.
+                rank=0,
+                extra_config=extra_config) as server:
             yield server
     elif is_gen_node():
         print(f"starting gen_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = gen_tp_pp_size
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
-        with RemoteOpenAIServer(model_path,
-                                port=GEN_SERVER_PORT,
-                                cli_args=args,
-                                host="0.0.0.0",
-                                env=env(),
-                                llmapi_launch=False,
-                                # Poll /health; the default Slurm rank on node 1
-                                # would sleep for the full startup budget.
-                                rank=0,
-                                extra_config=extra_config) as server:
+        with RemoteOpenAIServer(
+                model_path,
+                port=GEN_SERVER_PORT,
+                cli_args=args,
+                host="0.0.0.0",
+                env=env(),
+                llmapi_launch=False,
+                # Poll /health; the default Slurm rank on node 1
+                # would sleep for the full startup budget.
+                rank=0,
+                extra_config=extra_config) as server:
             yield server
     else:
         raise AssertionError(f"Unexpected Slurm node rank: {NODE_RANK}")
