@@ -16,7 +16,7 @@
 
 #include "cutlass/numeric_conversion.h"
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
+#include "tensorrt_llm/kernels/cudaCoreGemm/cudaCoreGemm.h"
 #include <cub/cub.cuh>
 
 TRTLLM_NAMESPACE_BEGIN

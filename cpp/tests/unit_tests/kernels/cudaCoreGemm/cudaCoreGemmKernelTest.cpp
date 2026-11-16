@@ -24,7 +24,7 @@
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
+#include "tensorrt_llm/kernels/cudaCoreGemm/cudaCoreGemm.h"
 
 #include <algorithm>
 #include <cstdint>
