@@ -4222,5 +4222,12 @@ def test_offload_capacity_report_names_the_binding_limit() -> None:
 if __name__ == "__main__":
     tester = TestDeepseekV4CacheManager()
     print("=== FP8, prompt_lens=[1024, 2048, 4096], steps=100 ===")
-    tester.test_write_read_cache([1, 4, 128], [1024, 2048, 4096], 100, DataType.FP8, DataType.FLOAT)
+    tester.test_write_read_cache(
+        [1, 4, 128],
+        [1024, 2048, 4096],
+        100,
+        DataType.FP8,
+        DataType.FLOAT,
+        scratch_reuse_enabled=True,
+    )
     print("Test passed")

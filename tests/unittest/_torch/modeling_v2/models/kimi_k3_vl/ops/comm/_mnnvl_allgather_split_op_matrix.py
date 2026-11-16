@@ -32,6 +32,7 @@ import random
 import sys
 import zlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -39,7 +40,10 @@ from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_op
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
-import _lockstep as ls  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "mnnvl_allgather_split requires CUDA devices"
 

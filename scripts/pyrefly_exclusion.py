@@ -13,10 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Apply path and third-party symbol exclusions to Pyrefly JSON reports."""
+"""Apply path and symbol filters to Pyrefly JSON reports."""
 
 import argparse
 import ast
+import importlib.util
 import json
 import os
 import re
@@ -30,6 +31,72 @@ except ModuleNotFoundError:
 
 NAME_PATTERN = re.compile(r"`([^`]+)`|\"([^\"]+)\"")
 SYMBOL_PATTERN = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?")
+
+
+def uninstalled_dependencies(project_root: Path) -> set[str]:
+    """Find declared dependency roots unavailable in a lightweight lint environment."""
+    names = set()
+    for filename in ("requirements.txt", "requirements-dev.txt"):
+        path = project_root / filename
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[|[<>=!~;\s]|$)", line)
+            if match:
+                names.add(match[1].lower().replace("-", "_"))
+    aliases = {
+        "_pytest": "pytest",
+        "yaml": "pyyaml",
+        "PIL": "pillow",
+        "sklearn": "scikit_learn",
+        "pynvml": "nvidia_ml_py",
+    }
+    names.update(module for module, distribution in aliases.items() if distribution in names)
+    missing = set()
+    for name in names:
+        try:
+            installed = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            installed = False
+        if not installed:
+            missing.add(name)
+    return missing
+
+
+def is_uninstalled_dependency(error: dict, missing: set[str], project_root: Path) -> bool:
+    """Suppress missing optional distributions in test file-list checks, not local modules."""
+    if error.get("name") != "missing-import":
+        return False
+    match = re.fullmatch(r"Cannot find module `([^`]+)`", error.get("concise_description", ""))
+    if match is None:
+        return False
+    root = match[1].split(".")[0]
+    if root not in missing:
+        return False
+    # Fallback search also finds sibling helpers and packages in ancestor directories.
+    diagnostic_path = project_root / error.get("path", "")
+    for parent in diagnostic_path.resolve().parents:
+        if not parent.is_relative_to(project_root.resolve()):
+            break
+        candidate = parent / root
+        if (
+            candidate.is_dir()
+            or candidate.with_suffix(".py").exists()
+            or candidate.with_suffix(".pyi").exists()
+        ):
+            return False
+    config = tomllib.loads((project_root / "pyproject.toml").read_text())
+    for section in ("pyrefly", "pyrefly-tests"):
+        native = config.get("tool", {}).get(section, {})
+        for entry in native.get("search-path", []):
+            candidate = project_root / entry / root
+            if (
+                candidate.is_dir()
+                or candidate.with_suffix(".py").exists()
+                or candidate.with_suffix(".pyi").exists()
+            ):
+                return False
+    return True
 
 
 def load_exclusions(config_path: Path) -> tuple[str, ...]:
@@ -240,6 +307,7 @@ def filter_report(
     project_root: Path,
     pyrefly_exit_code: int,
     stderr_path: Path | None,
+    ignore_uninstalled_dependencies: bool = False,
 ) -> int:
     """Filter excluded diagnostics and save a deterministic JSON report."""
     output = input_path.read_text(errors="replace")
@@ -251,6 +319,9 @@ def filter_report(
         symbols = load_exclusions(config_path)
         excluded_paths = load_excluded_paths(config_path)
         scopes_by_path: dict[str, ImportScope | None] = {}
+        missing_dependencies = (
+            uninstalled_dependencies(project_root) if ignore_uninstalled_dependencies else set()
+        )
         filtered_errors = []
         excluded_count = 0
         for error in result["errors"]:
@@ -259,7 +330,11 @@ def filter_report(
             excluded_path = is_excluded_path(
                 str(error.get("path", "")), project_root, excluded_paths
             )
-            if excluded_path or is_excluded_symbol(error, symbols, project_root, scopes_by_path):
+            if (
+                excluded_path
+                or is_excluded_symbol(error, symbols, project_root, scopes_by_path)
+                or is_uninstalled_dependency(error, missing_dependencies, project_root)
+            ):
                 excluded_count += 1
             else:
                 filtered_errors.append(error)
@@ -304,6 +379,7 @@ def main() -> int:
     report_parser.add_argument("--project-root", type=Path, required=True)
     report_parser.add_argument("--pyrefly-exit-code", type=int, required=True)
     report_parser.add_argument("--stderr", type=Path)
+    report_parser.add_argument("--ignore-uninstalled-dependencies", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "matches":
@@ -319,6 +395,7 @@ def main() -> int:
             args.project_root,
             args.pyrefly_exit_code,
             args.stderr,
+            args.ignore_uninstalled_dependencies,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

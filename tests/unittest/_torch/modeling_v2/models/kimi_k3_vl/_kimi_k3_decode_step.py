@@ -243,7 +243,9 @@ def check_spec_accept_uses_current_slot_buffer(monkeypatch, spec_worker, request
         num_contexts=0,
         kv_cache_manager=manager,
         draft_kv_cache_block_offsets=torch.zeros(3, 1),
-        mamba_metadata=types.SimpleNamespace(state_indices=torch.arange(3)),
+        mamba_metadata=types.SimpleNamespace(
+            state_indices=torch.arange(3), replay_state_indices=torch.arange(3)
+        ),
         kv_lens_cuda=torch.ones(3, dtype=torch.int32),
     )
     spec = types.SimpleNamespace(

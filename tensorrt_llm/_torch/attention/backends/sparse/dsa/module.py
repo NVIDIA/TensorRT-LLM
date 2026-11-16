@@ -77,16 +77,15 @@ def forward_context_sparse_attn(
     position_ids: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
-    if getattr(self.mqa, "has_fp4_kv_cache", False):
+    if getattr(self.mqa, "has_fp4_kv_cache", False) or attn_metadata.has_mixed_precision_high_rows:
         if latent_cache is None:
-            raise ValueError("NVFP4 DSA context requires latent_cache")
-        # Append every uncached context token before sparse prediction. The
-        # predictor then dequantizes the union of selected TopK rows into a
-        # compact FP8 pool, while the attention op skips its normal KV append.
+            raise ValueError("DSA context with a separate KV append requires latent_cache")
+        # Append every uncached context token before sparse prediction (the attention op
+        # skips its own append); the mixed-precision high pool is written right after.
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )
-        # The append kernel wrote the NVFP4 pool; also write the mixed-precision high pool.
+        # The append kernel wrote the pool; also write the mixed-precision high pool.
         if attn_metadata.has_mixed_precision_high_rows:
             store_mixed_precision_high_rows(
                 self.mqa, attn_metadata, latent_cache, position_ids, is_generation=False
