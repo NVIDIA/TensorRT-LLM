@@ -30,7 +30,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .sparse_attention import (
     SkipSoftmaxAttentionConfig,
@@ -50,12 +49,6 @@ CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 
 
 IgnoredStep = Annotated[int, Field(ge=0, strict=True)]
-_LOAD_TIME_QUANT_ALGOS = (
-    QuantAlgo.FP8,
-    QuantAlgo.FP8_BLOCK_SCALES,
-    QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
-    QuantAlgo.NVFP4,
-)
 
 
 class DiffusionQuantConfig(QuantConfig):
@@ -76,10 +69,6 @@ class DiffusionQuantConfig(QuantConfig):
     def _validate_step_quant_algo(self) -> "DiffusionQuantConfig":
         if self.ignored_steps and self.quant_algo is None:
             raise ValueError("ignored_steps requires an explicit quant_algo")
-        if self.ignored_steps and self.quant_algo not in _LOAD_TIME_QUANT_ALGOS:
-            raise ValueError(
-                f"ignored_steps requires load-time quantization; {self.quant_algo} is not supported"
-            )
         return self
 
 

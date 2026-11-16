@@ -574,7 +574,10 @@ def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, atten
         ({"quant_algo": "NVFP4", "ignored_steps": [0]}, False, True),
         ({"quant_algo": "NVFP4", "dynamic": False, "ignored_steps": [0]}, False, False),
         ({"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "W4A16_AWQ", "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "W4A16_AWQ", "dynamic": True, "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "W4A8_AWQ", "dynamic": True, "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "W8A8_SQ_PER_CHANNEL", "dynamic": True, "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "W4A16_AWQ", "dynamic": False, "ignored_steps": [0]}, False, False),
         ({"quant_algo": "FP8_BLOCK_SCALES", "ignored_steps": [0]}, False, True),
         ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignored_steps": [0]}, False, True),
         (
@@ -589,6 +592,8 @@ def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, atten
         ),
         ({"ignored_steps": [0]}, False, False),
         ({"quant_algo": None, "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "", "ignored_steps": [0]}, False, False),
+        ({"quant_algo": 1, "ignored_steps": [0]}, False, False),
     ],
 )
 def test_visual_gen_linear_steps_require_quant_and_reject_lora(schemas, quant, lora, valid):

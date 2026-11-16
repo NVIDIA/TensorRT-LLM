@@ -595,7 +595,7 @@ def generate_disagg_schema() -> dict:
 
 def generate_visual_gen_schema() -> dict:
     """Describe the separate VisualGen engine-args YAML file."""
-    from tensorrt_llm.visual_gen.args import _LOAD_TIME_QUANT_ALGOS, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     schema = _schema_for(VisualGenArgs)
     # ModelOpt dictionaries remain extensible, but their diffusion step selector
@@ -657,9 +657,7 @@ def generate_visual_gen_schema() -> dict:
                     "runtime_lora_config": {"type": "null"},
                     "quant_config": {
                         "required": ["quant_algo"],
-                        "properties": {
-                            "quant_algo": {"enum": [algo.value for algo in _LOAD_TIME_QUANT_ALGOS]}
-                        },
+                        "properties": {"quant_algo": {"type": "string", "minLength": 1}},
                         "allOf": [
                             {
                                 "if": {"properties": {"config_groups": {"maxProperties": 0}}},
