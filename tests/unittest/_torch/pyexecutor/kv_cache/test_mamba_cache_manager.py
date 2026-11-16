@@ -30,7 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
-from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -793,7 +793,7 @@ def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
     model_config.get_num_mamba_layers = lambda: num_mamba_layers
     if variable_geometry:
         model_config.kv_cache_layer_specs = tuple(
-            KVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
+            ModelKVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
             for head_dim in (256, 512)
         )
     model_config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
