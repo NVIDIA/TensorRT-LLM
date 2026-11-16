@@ -24,6 +24,7 @@ RoutingMethods, etc.).
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from importlib import import_module
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm._torch.moe.fused_moe.routing import (
@@ -60,9 +61,6 @@ _ACTIVATIONS: Dict[str, ActivationType] = {
     "RELU2": ActivationType.Relu2,
 }
 
-_ROUTING_NAME_BY_CLS: Dict[type, str] = {
-    cls: name for name, cls in _ROUTING_METHODS.items() if isinstance(cls, type)
-}
 _ALL_BACKENDS: List[str] = [b.value for b in MoeBackendType]
 _COMM_METHODS: Tuple[str, ...] = (
     "AUTO",
@@ -129,16 +127,23 @@ class ModelSpec:
     shared_expert_mode: Literal["fused", "unfused"] = "fused"
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
+    # Finite values select GPT-OSS/OAI SwiGLU, including its default FC biases.
     swiglu_limit: float = float("inf")
     activation_type: str = "SWIGLU"
     # FC1/FC2 linear biases; None follows the custom SwiGLU activation style.
-    expert_bias: Optional[bool] = None
+    expert_bias: bool | None = None
+    # Clamp for plain SwiGLU; distinct from the GPT-OSS/OAI swiglu_limit.
     swiglu_clamp: float | None = None
+    # Applied by DeepSeek V3/V4 or MiniMax M3 routing, or after combine below.
     routed_scaling_factor: float = 1.0
+    # Apply routed scaling to the aggregated output instead of routing weights.
     routed_scale_after_combine: bool = False
+    # FP32 router logits and correction bias; some routing methods require FP32 independently.
     router_fp32: bool = False
-    routing_renorm_eps: Optional[float] = None
-    post_expert_norm_eps: Optional[float] = None
+    # Muse routing's denominator epsilon before weights are cast to the output dtype.
+    routing_renorm_eps: float | None = None
+    # Enables the Muse per-expert norm wrapper and its layout/capability restrictions.
+    post_expert_norm_eps: float | None = None
     # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
     # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
     # changes; backends take it through their own parameters (see build.py).
@@ -152,22 +157,71 @@ class ModelSpec:
             and self.shared_expert_mode == "fused"
         ):
             raise ValueError("Output routed scaling cannot also scale fused shared experts.")
-        if self.post_expert_norm_eps is not None:
-            if self.post_expert_norm_eps <= 0 or self.routing_method != "MUSE_SPARK_OPEN":
+        if self.routing_method == "MUSE_SPARK_OPEN":
+            if self.routing_renorm_eps is None or not self.routing_renorm_eps > 0:
                 raise ValueError(
-                    "Per-expert post-norm requires Muse routing and a positive epsilon."
+                    "MUSE_SPARK_OPEN requires routing_renorm_eps > 0, "
+                    f"got {self.routing_renorm_eps!r}."
                 )
-            if self.routing_renorm_eps is None or self.routing_renorm_eps <= 0:
-                raise ValueError("Muse routing requires a positive normalization epsilon.")
-            if self.n_shared_experts or self.situ_beta is not None or self.swiglu_gptoss_style:
+            if self.post_expert_norm_eps is None or not self.post_expert_norm_eps > 0:
                 raise ValueError(
-                    "Muse routed-expert post-norm requires its native plain SwiGLU path."
+                    "MUSE_SPARK_OPEN requires post_expert_norm_eps > 0, "
+                    f"got {self.post_expert_norm_eps!r}."
                 )
+            if self.activation_type != "SWIGLU":
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires activation_type='SWIGLU', got {self.activation_type!r}."
+                )
+            if self.n_shared_experts:
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires n_shared_experts=0, got {self.n_shared_experts!r}."
+                )
+            if self.situ_beta is not None:
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires situ_beta=None, got {self.situ_beta!r}."
+                )
+            if self.swiglu_alpha != 1.0:
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires swiglu_alpha=1.0, got {self.swiglu_alpha!r}."
+                )
+            if self.swiglu_beta != 0.0:
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires swiglu_beta=0.0, got {self.swiglu_beta!r}."
+                )
+            if self.swiglu_limit != float("inf"):
+                raise ValueError(
+                    f"MUSE_SPARK_OPEN requires swiglu_limit=inf, got {self.swiglu_limit!r}."
+                )
+        elif self.post_expert_norm_eps is not None:
+            raise ValueError(
+                f"post_expert_norm_eps={self.post_expert_norm_eps!r} requires "
+                f"routing_method='MUSE_SPARK_OPEN', got {self.routing_method!r}."
+            )
+        if self.routing_renorm_eps is not None and self.routing_method != "MUSE_SPARK_OPEN":
+            raise ValueError(
+                f"routing_renorm_eps={self.routing_renorm_eps!r} requires "
+                f"routing_method='MUSE_SPARK_OPEN', got {self.routing_method!r}."
+            )
         if (
-            self.swiglu_gptoss_style
-            and self.expert_bias is False
-            and self.activation_type != "SWIGLU"
+            self.routed_scaling_factor != 1.0
+            and not self.routed_scale_after_combine
+            and self.routing_method not in ("DEEPSEEK_V3", "DEEPSEEK_V4", "MINIMAX_M3")
         ):
+            raise ValueError(
+                f"routing_method={self.routing_method!r} does not apply "
+                f"routed_scaling_factor={self.routed_scaling_factor!r}; "
+                "use routed_scale_after_combine=True to scale the aggregated output."
+            )
+        if self.routing_method == "DEEPSEEK_V4" and (self.num_experts, self.top_k) not in (
+            (256, 6),
+            (384, 6),
+            (128, 3),
+        ):
+            raise ValueError(
+                "DEEPSEEK_V4 requires (num_experts, top_k) to be (256, 6), (384, 6), or (128, 3), "
+                f"got ({self.num_experts!r}, {self.top_k!r})."
+            )
+        if self.swiglu_gptoss_style and self.activation_type != "SWIGLU":
             raise ValueError("Custom SwiGLU parameters require activation_type=SWIGLU.")
         if self.swiglu_clamp is not None:
             if self.swiglu_clamp <= 0:
@@ -198,12 +252,10 @@ class ModelSpec:
     def routing_method_cls(self) -> type:
         cls = _ROUTING_METHODS[self.routing_method]
         if isinstance(cls, str):
-            from importlib import import_module
-
+            # Keep model imports lazy so other presets do not depend on this model module.
             module, name = cls.split(":")
             cls = getattr(import_module(module), name)
             _ROUTING_METHODS[self.routing_method] = cls
-            _ROUTING_NAME_BY_CLS[cls] = self.routing_method
         return cls
 
     @property
@@ -451,6 +503,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
     ),
+    # deepseek-ai/DeepSeek-V4.1-Flash: text_config.swiglu_limit / routed_scaling_factor.
     "deepseek_v4_1_flash": ModelSpec(
         name="deepseek_v4_1_flash",
         num_experts=384,
@@ -504,6 +557,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,  # text_config.activation_situ_beta
         situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
     ),
+    # thinkingmachines/Inkling-2-Small: text_config.route_scale / mlp_gate_softcap / mlp_up_softcap.
     "inkling_2_small": ModelSpec(
         name="inkling_2_small",
         num_experts=384,
@@ -519,6 +573,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,
         situ_linear_beta=25.0,
     ),
+    # moonshotai/Kimi-K3.1-Pro: routed_expert_hidden_size and activation_situ_* in text_config.
     "kimi_k3_1_pro": ModelSpec(
         name="kimi_k3_1_pro",
         num_experts=896,
@@ -532,6 +587,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,
         situ_linear_beta=25.0,
     ),
+    # zai-org/GLM-5.3-Flash: text_config.swiglu_limit / routed_scaling_factor.
     "glm_5_3_flash": ModelSpec(
         name="glm_5_3_flash",
         num_experts=288,
@@ -544,7 +600,9 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         topk_group=1,
         swiglu_clamp=10.0,
         routed_scaling_factor=2.5,
+        router_fp32=True,
     ),
+    # MiniMaxAI/MiniMax-M3.1-Flash: routed_scaling_factor and swiglu_alpha/beta/limit.
     "minimax_m3_1_flash": ModelSpec(
         name="minimax_m3_1_flash",
         num_experts=128,
@@ -559,6 +617,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         swiglu_limit=7.0,
         expert_bias=False,
     ),
+    # zai-org/GLM-5.3: routed_scaling_factor; same routed geometry as glm_5.
     "glm_5_3": ModelSpec(
         name="glm_5_3",
         num_experts=256,
@@ -571,6 +630,8 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         topk_group=1,
         routed_scaling_factor=2.5,
     ),
+    # Released config: tests/unittest/_torch/modeling/test_musespark_open_config.py.
+    # moe_hidden_size / post_norm_eps; routing epsilon follows MuseSparkOpenConfig's default.
     "muse_spark_open": ModelSpec(
         name="muse_spark_open",
         num_experts=256,
@@ -583,6 +644,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         routing_renorm_eps=1e-15,
         post_expert_norm_eps=1e-8,
     ),
+    # mistralai/Mistral-Large-4-1T-A52B: routed-expert shape in text_config.
     "mistral_large_4": ModelSpec(
         name="mistral_large_4",
         num_experts=128,
@@ -592,9 +654,11 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
         router_fp32=True,
+        # Unused by RENORMALIZE; retained to keep the preset's serialized input seed stable.
         n_group=1,
         topk_group=1,
     ),
+    # reflection/Beam-1.0-501B-A23B: n_group / topk_group / routed_scaling_factor.
     "reflection_beam": ModelSpec(
         name="reflection_beam",
         num_experts=256,

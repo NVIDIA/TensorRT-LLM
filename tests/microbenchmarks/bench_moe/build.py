@@ -25,6 +25,7 @@ small set of introspection helpers (``actual_backend`` / ``scheduler_kind``
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
@@ -87,7 +88,7 @@ def _comm_method_name(moe) -> str:
 
 
 def _epilogue_activation_name(moe) -> str:
-    """Return the resolved epilogue kind, including SiTU and custom SwiGLU.
+    """Return the resolved epilogue kind: ``swiglu``, ``swiglu_bias``, or ``situ``.
 
     The SiTU request can be dropped for reasons the spec cannot see (wrong
     backend, wrong quant, upstream fallback), so read it back rather than
@@ -245,7 +246,7 @@ class _UnfusedSharedMoE(torch.nn.Module):
 class _OutputScaledMoE(torch.nn.Module):
     """Apply checkpoint routed scaling after expert aggregation and reduction."""
 
-    def __init__(self, moe: torch.nn.Module, scale: float):
+    def __init__(self, moe: torch.nn.Module, scale: float) -> None:
         super().__init__()
         self.moe = moe
         self.scale = float(scale)
@@ -256,7 +257,10 @@ class _OutputScaledMoE(torch.nn.Module):
         except AttributeError:
             return getattr(super().__getattr__("moe"), name)
 
-    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs):
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        # HF BeamMoE.forward scales after expert aggregation; this separate
+        # multiply is included in the benchmark's timed forward.
+        # https://github.com/huggingface/transformers/blob/863d2620210d72fc0a9a03fdfe200bc9699154f6/src/transformers/models/beam/modeling_beam.py#L383-L389
         return self.moe(x, router_logits, **kwargs) * self.scale
 
 
@@ -300,7 +304,7 @@ class _MusePostNormMoE(torch.nn.Module):
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Reject counts that the NCCL wrapper cannot represent."""
-        if self.mapping.tp_size > 1 and x.numel() > 2**31 - 1:
+        if self.mapping.tp_size > 1 and x.numel() > torch.iinfo(torch.int32).max:
             raise RuntimeError(
                 f"MuseSparkOpen benchmark refused NCCL AllReduce with {x.numel()} elements: "
                 "this TensorRT-LLM path uses a signed int32 element count."
@@ -308,14 +312,10 @@ class _MusePostNormMoE(torch.nn.Module):
         return self._all_reduce(x)
 
     def finalize_callback(self) -> Callable[..., torch.Tensor]:
-        import weakref
-        from functools import partial
-
+        # Import lazily so other presets do not require the Muse model module.
         from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
 
-        # A strong bound callback would make wrapper -> experts -> wrapper a cycle,
-        # delaying release of large case allocations between candidates.
-        return partial(MuseSparkOpenMoE.finalize, weakref.proxy(self))
+        return partial(MuseSparkOpenMoE.finalize, self)
 
     def attach_experts(self, moe: torch.nn.Module) -> "_MusePostNormMoE":
         assert "moe" not in self._modules

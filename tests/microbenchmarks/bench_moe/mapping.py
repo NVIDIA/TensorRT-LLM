@@ -216,7 +216,7 @@ def _create_routing_method(
     routed_scaling_factor: float = 1.0,
     renorm_eps: Optional[float] = None,
 ):
-    """Create a routing-method instance mirroring ``test_moe_module._create_routing_method``."""
+    """Create a routing-method instance with the benchmark model's parameters."""
     if routing_method_cls in (RenormalizeMoeRoutingMethod, DefaultMoeRoutingMethod):
         return routing_method_cls(top_k=top_k, force_enable_pytorch_op=True)
 
@@ -248,7 +248,10 @@ def _create_routing_method(
         )
 
     if routing_method_cls.__name__ == "MuseSparkOpenRoutingMethod":
-        assert renorm_eps is not None and renorm_eps > 0
+        if renorm_eps is None or not renorm_eps > 0:
+            raise ValueError(
+                f"MUSE_SPARK_OPEN requires routing_renorm_eps > 0, got {renorm_eps!r}."
+            )
         e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
         return routing_method_cls(
             top_k=top_k,

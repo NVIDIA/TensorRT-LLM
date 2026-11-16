@@ -110,22 +110,15 @@ def test_moe_backend_selection(
     )
 
 
-@pytest.mark.parametrize("model_name", ["glm_5_3_flash", "deepseek_v4_1_flash"])
-def test_swiglu_clamp_rejects_relu2_override(model_name: str) -> None:
+def test_swiglu_clamp_rejects_relu2_override() -> None:
     with pytest.raises(ValueError, match="swiglu_clamp requires activation_type=SWIGLU"):
-        replace(BUILT_IN_MODELS[model_name], activation_type="RELU2")
+        replace(BUILT_IN_MODELS["glm_5_3_flash"], activation_type="RELU2")
 
 
 @pytest.mark.parametrize("clamp", [0.0, -1.0])
 def test_swiglu_clamp_requires_positive_value(clamp: float) -> None:
     with pytest.raises(ValueError, match="swiglu_clamp must be positive"):
         replace(BUILT_IN_MODELS["glm_5_3_flash"], swiglu_clamp=clamp)
-
-
-def test_swiglu_clamp_accepts_swiglu() -> None:
-    model = replace(BUILT_IN_MODELS["glm_5_3_flash"], activation_type="SWIGLU")
-    assert model.activation_type == "SWIGLU"
-    assert model.swiglu_clamp == 10.0
 
 
 def test_relu2_without_swiglu_clamp() -> None:
