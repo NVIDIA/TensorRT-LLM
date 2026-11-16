@@ -707,12 +707,13 @@ is narrowed to the formats the MoE experts run as
 `quant_config_dict` experts module, read as model code reads it
 (`layerwise_moe_quant_config`), else the format model code runs experts
 without an entry as, which is `KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO` on Kimi K3
-whatever its global format, and the global format elsewhere. DeepSeek-V4 and
-V4.1 leave their MTP layers' entries out first (`ModelConfig._without_mtp_layers`),
-since those layers select for themselves. So DeepSeek-V4's
+whatever its global format, and the global format elsewhere. So DeepSeek-V4's
 FP8 block-scale attention does not keep `deepgemm` from settling on
 `MEGAMOE_DEEPGEMM` for its MXFP4 experts, and `mega_moe` settles on it for Kimi
-K3's W4A16_MXFP4-parsed checkpoint too. `mega_moe` is `MEGAMOE_CUTEDSL` on
+K3's W4A16_MXFP4-parsed checkpoint too. For DeepSeek-V4 and V4.1,
+`from_pretrained` leaves the MTP layers' entries out before it applies a
+tactic (`ModelConfig._without_mtp_layers`), since those layers select for
+themselves. `mega_moe` is `MEGAMOE_CUTEDSL` on
 an NVFP4 checkpoint and `MEGAMOE_DEEPGEMM` on an MXFP4 one; a full id always
 qualifies; a tactic still naming several families (`grouped_gemm.nvfp4` names
 a CUTLASS and a CuteDSL leaf, or `mega_moe` over NVFP4 and MXFP4 experts) is
@@ -771,8 +772,9 @@ not read the SM; an `AUTO` literal not resolved yet (`llm_utils`) names no
 implementation and takes the SM's first choice. `OVERRIDE_QUANT_ALGO` still
 takes precedence. Checkpoint parsing writes the target selection's format for
 the MTP layers too (DeepSeek-V4 MTP experts stored in a layout of their own get
-the format an unpinned request picks, since a target's tactic need not run
-them), so an MTP copy that selects for itself picks the format
+the format the target's literal picks, or the SM's first choice when the
+target pins a tactic, which need not run them), so an MTP copy that selects
+for itself picks the format
 again (`_mxfp4_run_quant_config`) in a `quant_config_dict` of its own. The
 embedded DSpark draft loads the target checkpoint, whose expert map describes
 the main layers, so `external_drafter_config_kwargs` loads it without the

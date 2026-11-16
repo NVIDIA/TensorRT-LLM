@@ -924,6 +924,13 @@ def test_deepseek_v4_mtp_routed_experts_detected_separately(
 ):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
     _write_deepseek_v4_mtp_checkpoint(tmp_path, dense_dtype, mtp_dtype)
+    # A probe that misses falls back to the dense layout with a warning, so
+    # no warning shows the MTP layout was read, not assumed.
+    messages = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.logger.warning_once",
+        lambda msg, *args, key: messages.append(msg % args),
+    )
 
     num_hidden_layers = 2
     num_mtp = 3
@@ -944,6 +951,7 @@ def test_deepseek_v4_mtp_routed_experts_detected_separately(
         mtp_config = layer_quant_config[f"model.layers.{num_hidden_layers + i}.mlp.experts"]
         assert mtp_config.quant_algo == mtp_algo
         assert mtp_config.group_size == mtp_group
+    assert messages == []
 
 
 def test_deepseek_v4_mtp_routed_experts_warn_when_probe_missing(tmp_path, monkeypatch):
@@ -981,8 +989,9 @@ def test_deepseek_v4_mtp_routed_experts_warn_when_probe_missing(tmp_path, monkey
 def test_deepseek_v4_mtp_routed_experts_wait_for_a_layer_count(tmp_path, monkeypatch):
     """An unset MTP layer count writes no MTP entries and does not fail.
 
-    The loader builds the config once before it reads the count from the
-    checkpoint, and V4.1 rejects one-model MTP only when the model is built.
+    V4's from_pretrained reads the count before it gets here; V4.1's does
+    not, so its first config load arrives with the count unset, and V4.1
+    rejects one-model MTP only when the model is built.
     """
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
     _write_deepseek_v4_mtp_checkpoint(tmp_path, "U8", "I8")
@@ -1082,6 +1091,20 @@ def test_deepseek_v4_mtp_routed_experts_do_not_take_the_target_tactic(
     mtp_config = mtp_model_config.quant_config_dict[f"model.layers.{num_hidden_layers}.mlp.experts"]
     assert mtp_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
     assert mtp_config.group_size == 32
+
+    # The entry parsed above is only a placeholder: a draft tactic naming
+    # another MXFP4 format rewrites the copy's entry, not the target's.
+    selection = _draft_moe_selection(
+        model_config,
+        MTPDecodingConfig(max_draft_len=1, moe_tactic="trtllm.trtllm_gen.fused_moe.w4a16_mxfp4"),
+        load_balancer=model_config.moe_load_balancer,
+    )
+    mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+        model_config, selection, num_hidden_layers
+    )
+    mtp_key = f"model.layers.{num_hidden_layers}.mlp.experts"
+    assert mtp_model_config.quant_config_dict[mtp_key].quant_algo == QuantAlgo.W4A16_MXFP4
+    assert layer_quant_config[mtp_key].quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
 
 
 def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
