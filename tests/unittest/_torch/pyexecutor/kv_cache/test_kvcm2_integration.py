@@ -1625,6 +1625,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         context_current_position=6,
         is_first_context_chunk=True,
         is_disagg_generation_init_state=False,
+        is_context_only_request=False,
     )
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)

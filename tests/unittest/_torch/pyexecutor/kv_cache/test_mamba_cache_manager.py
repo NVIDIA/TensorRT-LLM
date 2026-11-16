@@ -8967,6 +8967,10 @@ def _assert_gdn_replay_slot_reset(mgr, replay_slot):
 
 
 @skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision KV requires Blackwell",
+)
 def test_v2_gdn_replay_manager_builds_the_cold_page_window():
     """With MTP replay each GDN layer keeps its replay history in a layer group of its own, so its
     buffers sit in two groups. The cold-page first/last-N window of the attention layer still
