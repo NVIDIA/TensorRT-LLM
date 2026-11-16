@@ -478,9 +478,28 @@ class S4WorkerMixin:
                 f"on rank {self.mapping.tp_rank}"
             )
 
-    def sample_draft_tokens(self, logits, spec_metadata, batch_size, **kwargs):
+    def sample_draft_tokens(
+        self,
+        logits,
+        spec_metadata,
+        batch_size,
+        *,
+        num_contexts=0,
+        draft_step=None,
+        mapping_lm_head_tp=None,
+        out=None,
+    ):
+        # The chain's tokens answer the block form only; ``out`` belongs to the step form.
         tokens = self._s4_tokens
         if tokens is not None and logits.dim() == 3 and tokens.shape == logits.shape[:2]:
             self._s4_tokens = None
             return tokens if tokens.dtype == torch.int32 else tokens.to(torch.int32)
-        return super().sample_draft_tokens(logits, spec_metadata, batch_size, **kwargs)
+        return super().sample_draft_tokens(
+            logits,
+            spec_metadata,
+            batch_size,
+            num_contexts=num_contexts,
+            draft_step=draft_step,
+            mapping_lm_head_tp=mapping_lm_head_tp,
+            out=out,
+        )
