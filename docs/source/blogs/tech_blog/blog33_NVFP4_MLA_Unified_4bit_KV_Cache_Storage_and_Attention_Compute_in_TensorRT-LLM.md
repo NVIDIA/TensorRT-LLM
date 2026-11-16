@@ -61,8 +61,6 @@ The results, for DeepSeek-R1 on NVIDIA Rubin GPUs unless noted otherwise:
 
 NVFP4 MLA complements the [NVFP4 cold-page compression](blog30_KV_Cache_Compression_in_TensorRT-LLM.md#nvfp4-cold-page-compression) described in our previous blog. Cold-page compression keeps KV pages in NVFP4 only while they sit off the GPU, and attention still sees the model's normal KV format. NVFP4 MLA keeps the active cache on the GPU in NVFP4 and computes attention on it directly.
 
-<!-- TODO(before publishing): link the NVFP4 MLA paper once it is public. -->
-
 ## Why MLA Needs 4-bit Compute, Not Just 4-bit Storage
 
 ### One Latent, Two BMMs
@@ -387,8 +385,6 @@ The gap comes from a decode step that grows more slowly with load. As the load r
 
 DEP16 gives both precisions their highest throughput up to about 250 tokens/s/user, and TEP8 at higher per-user rates. DEP8 never does, largely because its context workers take a larger share of the GPUs. At the highest per-user rates, which only TEP8 reaches, the FP8 MLA envelope lies above that of NVFP4 MLA in these measurements; see [Limitations and Future Work](#limitations-and-future-work).
 
-<!-- TODO(before publishing): re-measure TEP8 on main. These TEP8 runs predate packed decode (#20576), with which the kernel pads the 64 [query token, head] rows of each request to 128 instead of padding the 16 heads of every query token to 128. -->
-
 At the same number of requests in flight, from 256 to 2,048 with DEP16, NVFP4 MLA raises both throughput and per-user generation rate. Throughput per GPU rises by 13.2% to 19.7% on MLPerf and by 20.3% to 45.8% on 8K/16K Reasoning, and DEP8 shows the same pattern from 16 requests per generation GPU, with gains of 11% to 19% and 18% to 46%. With DEP16, both precisions accept 2.75 to 2.83 tokens per MTP step on 8K/16K Reasoning, so the gains come from shorter decode steps, not from different MTP acceptance.
 
 | Workload | KV cache | In flight | tok/s/user | tok/s/GPU | Gain | TPOT p50 / p99 (ms) | MTP acceptance |
@@ -428,8 +424,6 @@ Kimi-K3 shows the same effect. Its context servers hold 47.4 GiB of KV cache mem
 
 <p align="center"><sub><em>AgentX multi-turn replay with prefix reuse: DeepSeek-R1 with MTP=3, and Kimi-K3 context serving on 16 GPUs. The KV cache budget per context GPU is the same for both precisions. Each DeepSeek-R1 context GPU also has 8 GiB of host memory; the Kimi-K3 budget also holds the KDA state, and Kimi-K3 uses no host cache. Sessions is the number of agent sessions kept alive. The cache hit rate is the server-reported share of prompt tokens served from the prefix cache, which the traces cap at about 94% to 96%.</em></sub></p>
 
-<!-- TODO(before publishing): the DeepSeek-R1 runs used the dense FP4 MLA block-reuse branch; re-validate on main once #21313 is merged. -->
-
 ## Limitations and Future Work
 
 **Short contexts and few requests.** The advantage of FP4 attention grows with the context length and the load. At 2K tokens of context, the attention kernel is 1.3x to 1.5x faster, the smallest gain of the sweep, and with few requests per GPU, attention is a small share of the generation step, so NVFP4 MLA and FP8 MLA perform about the same there. NVFP4 MLA pays off most for long reasoning traces, high concurrency and agentic sessions.
@@ -441,8 +435,6 @@ Kimi-K3 shows the same effect. Its context servers hold 47.4 GiB of KV cache mem
 **Future work.** We plan to extend NVFP4 MLA to more models with MLA layers and to reduce the cost of writing the FP4 cache in the context phase.
 
 ## Acknowledgements
-
-<!-- TODO(before publishing): list the contributors and teams. -->
 
 NVFP4 MLA is a joint effort across NVIDIA, spanning the quantization recipe, the CuTe DSL attention kernels, the TensorRT LLM runtime and the serving evaluation. We thank everyone who contributed to its design, implementation and evaluation.
 
