@@ -92,6 +92,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds_mla_sparse_decode import (
     cute_dsl_ds_mla_sparse_decode,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_mqa_logits import (
+    build as build_ix_logits,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_mqa_logits import (
+    cute_dsl_fp8_mqa_logits,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_paged_mqa_logits import (
     cute_dsl_fp8_paged_mqa_logits,
 )
@@ -306,7 +312,7 @@ _MOE_ACT_SWIGLU = 0
 # multiples, and silently wrong there.
 _NVFP4_SF_VEC = 16
 _NVFP4_SF_LINEAR = False
-# triton_fp8_mqa_logits allocates a `[q_rows, kv_rows]` fp32 score matrix per call; the context
+# The prefill scorer allocates a `[q_rows, kv_rows]` fp32 score matrix per call; the context
 # queries are tiled to keep it under the engine's budget (`_prefill_logits_budget`). Context
 # steps are not captured.
 # capacity: fixed: the budget's ceiling, one 1 GiB fp32 tile (256 rows at 1048576 keys).
@@ -343,6 +349,11 @@ _TOPK_VERIFY_ROWS = (4, 8, 16)
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
+# The indexer's prefill scorer: cute_dsl_fp8_mqa_logits, the tensor-core kernel that scores only
+# the key blocks each 4-row query block's windows reach. TRTLLM_MODELING_V2_TRITON_PREFILL_LOGITS=1
+# in every rank's environment at launch selects triton_fp8_mqa_logits instead (the same logits up
+# to FP32 summation order); off by default.
+_TRITON_PREFILL_LOGITS = os.environ.get("TRTLLM_MODELING_V2_TRITON_PREFILL_LOGITS", "0") == "1"
 # A generation step's shared expert on the main stream after the routed experts, instead of on
 # the decode target's side stream beside the router, the NVFP4 quantization and the runner.
 # Both orders compute the same bits. The side stream is used only under CUDA-graph capture
@@ -765,6 +776,8 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         self.ctx_workspace_rows = 0
         # The decode top-k's handle, built on the first step at a scorer width it serves.
         self._ix_topk = None
+        # The prefill scorer's handle, built on the first step; None selects the Triton scorer.
+        self._ix_logits = None
         self._ix_topk_verify = None
         self._prefill = self._decode = None
 
@@ -855,6 +868,8 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             self._ix_topk = None
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
+        if self._ix_logits is None and not _TRITON_PREFILL_LOGITS:
+            self._ix_logits = build_ix_logits(dev)
         lo, hi = _TOPK_VERIFY_COLUMNS
         if not (_TOPK_DECODE_CUTE_DSL and lo <= self._max_ctx_len <= hi and self.idx_topk == 2048):
             self._ix_topk_verify = None
@@ -1119,7 +1134,7 @@ class PrefillTarget:
     def _select_ctx(self, step, k_pool, q_fp8, weights, topk_buf) -> None:
         """Select window-local top-k keys for the context rows assigned to this rank.
 
-        Gather each block's FP8 keys, score each query tile with the Triton MQA
+        Gather each block's FP8 keys, score each query tile with the MQA
         scorer, and pass its aligned logits to GVR top-k. Empty blocks retain
         -1 indices. Only one tile's logits are live at a time."""
         core = self.core
@@ -1152,7 +1167,12 @@ class PrefillTarget:
             )  # fmt: skip
             cs = torch.reshape(cs, [-1])
             for lo, hi, ks, ke in block.tiles:
-                logits = triton_fp8_mqa_logits(q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke)
+                if core._ix_logits is None:
+                    logits = triton_fp8_mqa_logits(q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke)
+                else:
+                    logits = cute_dsl_fp8_mqa_logits(
+                        q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke, compiled=core._ix_logits
+                    )
                 cute_dsl_gvr_topk_prefill(
                     logits, ks, ke, topk_buf[lo:hi], core.idx_topk, self._gvr_ws
                 )
