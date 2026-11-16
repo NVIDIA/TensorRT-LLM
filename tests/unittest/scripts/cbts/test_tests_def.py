@@ -1114,7 +1114,7 @@ def test_modeling_v2_association_paths_and_ci_registration(
 ) -> None:
     from cbts.rules._helpers import lookup_paths_into_block_filters
     from cbts.rules.modeling_v2 import _EXTRA_SOURCE_UNIT_TESTS, _is_whole_tree_test
-    from cbts.rules.modeling_v2_test_groups import MODELING_V2_TEST_GROUPS
+    from cbts.rules.tests_def import MODELING_V2_TEST_GROUPS
 
     repo = Path(__file__).resolve().parents[4]
     index = modeling_v2_cohort_real_rule.yaml_index

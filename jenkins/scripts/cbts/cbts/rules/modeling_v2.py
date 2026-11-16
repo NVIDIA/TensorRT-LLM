@@ -132,7 +132,6 @@ from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 from .modeling_v2_source import PACKAGE, imported_names, package_names, routed_targets
-from .modeling_v2_test_groups import M3_UNIT_DIR
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -146,7 +145,7 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 _PKG_MODULE = PACKAGE
-_M3_UNIT_ROOT = M3_UNIT_DIR
+_M3_UNIT_ROOT = f"{_UNIT_ROOT}/models/minimax_m3"
 _M3_OPS_SOURCE_ROOT = f"{_MV2_SRC_PREFIXES[0]}models/minimax_m3/ops"
 _M3_SM103_MOE_TESTS = {
     f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/ops/moe/test_modeling_v2_m3_{name}.py"

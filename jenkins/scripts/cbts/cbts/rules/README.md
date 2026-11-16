@@ -628,9 +628,10 @@ and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 | `stages_by_yaml_stem` | all rules | Builds `{yaml_stem: [Stage, ...]}` index from the parsed Groovy stages. |
 
 
-ModelingV2 test-side cross-directory associations are declared in
-`modeling_v2_test_groups.py`. They preserve the existing component selection
-scope while related tests occupy both category and ops/category directories.
+ModelingV2 test-side cross-directory associations are declared in the
+`MODELING_V2_TEST_GROUPS` table in `tests_def.py`. They preserve the existing
+component selection scope while related tests occupy both category and
+ops/category directories.
 Whole-file associations add to the ordinary walk-up anchors; function/class
 changes retain precise selection. The shared FP4 MoE helper explicitly selects
 the ModelingV2 unit root, including its model-family consumers and CPU guard.
