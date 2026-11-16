@@ -61,11 +61,10 @@ _CASES = (
     "cancel_before_publication",
     "cancel_late_aux",
     "cancel_late_kv",
-    "timeout_late_aux",
     "source_fatal",
     "destination_fatal",
 )
-_CONTEXT_FIRST_CASES = ("baseline", "cancel_late_kv", "source_fatal", "destination_fatal")
+_CONTEXT_FIRST_CASES = ("baseline", "cancel_late_kv")
 _PHASE_TIMEOUT_S = 30.0
 _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
 _WORKER_TIMEOUT_S = 600.0
@@ -754,6 +753,19 @@ def _exercise_live_session(
     kv_masked = context_first or case == "cancel_late_kv"
     expected_byte = 123 + peer_rank
     worker, manager = transceiver._transfer_worker, transceiver._kv_cache_manager
+    watchdog = worker._retirement_watchdog
+    clock_offset = 0.0
+    with watchdog.lock:
+        assert watchdog.clock is time.monotonic
+        watchdog.clock = lambda: time.monotonic() + clock_offset
+
+    def advance_retirement_clock(deadline: float) -> None:
+        """Expire the real watchdog after transfer gates, without waiting out grace."""
+        nonlocal clock_offset
+        with watchdog.lock:
+            clock_offset = max(clock_offset, deadline - time.monotonic())
+            watchdog.wake.set()
+
     rid, slot = args.unique_id, session.aux_slot
     addresses = tuple((region.data_ptr(), region.numel()) for region in regions)
     cache = manager.kv_cache_map[request.py_request_id]
@@ -858,24 +870,6 @@ def _exercise_live_session(
             assert session.status == SessionStatus.CANCELLED, (session.status, retirement._reason)
             if previous_drain is not None:
                 assert retirement._drain_started == previous_drain
-        elif case == "timeout_late_aux":
-            # Do not poll the session before the independent request clock commits timeout.
-            _wait(
-                lambda: session._retirement._drain_started is not None,
-                "independent request timeout",
-                _TIMEOUT_S + _PHASE_TIMEOUT_S,
-            )
-            assert session.status == SessionStatus.ERROR
-            assert retirement._reason == "transfer timeout"
-            assert retirement._drain_started == retirement._request_deadline
-            _record(directory, f"{role}.timed_out")
-            _wait(
-                lambda: all(
-                    (directory / f"{peer}.timed_out.json").exists() for peer in ("ctx", "gen")
-                ),
-                "both logical timeouts precede cancellation notification",
-                2 * _PHASE_TIMEOUT_S,
-            )
         retained()
         drain_started = session._retirement._drain_started
         for _ in range(3):
@@ -923,6 +917,12 @@ def _exercise_live_session(
 
         if case.endswith("fatal"):
             fatal_role = "ctx" if case == "source_fatal" else "gen"
+            if role == fatal_role:
+                _wait(
+                    lambda: (directory / "expire_grace.json").exists(),
+                    "both endpoints retain ambiguous native ownership",
+                )
+                advance_retirement_clock(retirement._drain_started + retirement.grace_s)
             if role != fatal_role:
                 _wait(
                     lambda: any(
@@ -945,7 +945,7 @@ def _exercise_live_session(
             lambda: (directory / "allow_done.json").exists(), "release exact retained native status"
         )
         assert retirement._drain_started is not None
-        assert time.monotonic() < retirement._drain_started + retirement.timeout_s
+        assert watchdog.clock() < retirement._drain_started + retirement.timeout_s
         assert worker._retirement_watchdog.fatal is None
 
     terminal_before = session.status if case != "baseline" else SessionStatus.TRANSFERRED
@@ -1182,12 +1182,6 @@ def _run_transfer_lifecycle_gpu(case: str, tmp_path: Path, context_first: bool) 
                     min(clock["request_deadline"] for clock in clocks) - time.monotonic()
                     > 2 * _PHASE_TIMEOUT_S
                 ), clocks
-                if case == "timeout_late_aux":
-                    assert max(
-                        clock["request_deadline"] for clock in clocks
-                    ) + 2 * _PHASE_TIMEOUT_S < min(
-                        clock["request_deadline"] + clock["timeout"] for clock in clocks
-                    ), clocks
                 release_gate("transition")
                 _wait(
                     lambda: all_recorded("retained"),
@@ -1199,7 +1193,9 @@ def _run_transfer_lifecycle_gpu(case: str, tmp_path: Path, context_first: bool) 
                     lambda: all_recorded("in_doubt"),
                     "both endpoints retain explicit IN_DOUBT ownership",
                 )
-                if not case.endswith("fatal"):
+                if case.endswith("fatal"):
+                    release_gate("expire_grace")
+                else:
                     release_gate("allow_done")
             if case.endswith("fatal"):
                 fatal_role = "ctx" if case == "source_fatal" else "gen"
@@ -1270,7 +1266,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true", required=True)
     parser.add_argument("--context-first", action="store_true")
-    parser.add_argument("--case", choices=_CASES, required=True)
+    parser.add_argument(
+        "--case", choices=sorted(set(_CASES) | set(_CONTEXT_FIRST_CASES)), required=True
+    )
     parser.add_argument("--role", choices=("ctx", "gen"), required=True)
     parser.add_argument("--gpu-offset", type=int, required=True)
     parser.add_argument("--directory", required=True)

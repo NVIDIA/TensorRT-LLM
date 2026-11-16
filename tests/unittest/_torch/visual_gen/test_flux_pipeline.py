@@ -8,7 +8,6 @@ Tests cover:
 - Quantization (FP8, FP8_BLOCK_SCALES)
 - Single-layer numerical correctness (F.linear reference)
 - Full transformer E2E numerical correctness
-- Memory usage comparison
 - Attention backend comparison (VANILLA vs TRTLLM)
 - Multi-GPU parallelism (Ulysses sequence parallelism, 2+ GPUs)
 """
@@ -125,122 +124,31 @@ def _find_first_quantizable_linear(transformer):
 
 
 # =============================================================================
-# Pipeline Loading Tests
-# =============================================================================
-
-
-class TestFluxPipelineLoading:
-    """Integration tests for FLUX pipeline loading."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux1_pipeline_basic(self):
-        """Test loading FLUX.1 pipeline."""
-        args = VisualGenArgs(
-            model=_flux1_path(),
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-
-        assert pipeline is not None
-        assert hasattr(pipeline, "transformer")
-        assert pipeline.transformer is not None
-        assert pipeline.pipeline_config.attention.backend == "VANILLA"
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux2_pipeline_basic(self):
-        """Test loading FLUX.2 pipeline."""
-        args = VisualGenArgs(
-            model=_flux2_path(),
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-
-        assert pipeline is not None
-        assert hasattr(pipeline, "transformer")
-        assert pipeline.transformer is not None
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
-    def test_load_flux1_with_attention_backend(self, backend: str):
-        """Test loading FLUX.1 with different attention backends."""
-        args = VisualGenArgs(
-            model=_flux1_path(),
-            attention_config=AttentionConfig(backend=backend),
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-
-        assert pipeline.pipeline_config.attention.backend == backend
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
-# =============================================================================
 # Quantization Tests
 # =============================================================================
 
 
+def _assert_quantized_block_linears(transformer, quant_algo):
+    checked = 0
+    for name, module in transformer.named_modules():
+        if (
+            isinstance(module, Linear)
+            and module.quant_config
+            and module.quant_config.quant_algo
+            and "blocks" in name
+            and getattr(module, "weight", None) is not None
+        ):
+            assert module.weight.dtype == torch.float8_e4m3fn, name
+            assert hasattr(module, "weight_scale"), name
+            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+                assert module.weight_scale.dim() == 1, name
+                assert module.weight_scale.shape[0] == module.weight.shape[0], name
+            checked += 1
+    assert checked > 0, f"No FP8 Linear modules found in blocks for {quant_algo}"
+
+
 class TestFluxQuantization:
     """Test FLUX quantization loading and FP8 weight verification."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_load_flux1_with_quantization(self, quant_algo: str):
-        """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
-        args = VisualGenArgs(
-            model=_flux1_path(),
-            quant_config={"quant_algo": quant_algo, "dynamic": True},
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-
-        assert pipeline.pipeline_config.quant_config.quant_algo is not None
-
-        # Count quantized Linear layers and verify FP8 weights
-        quant_count = 0
-        found_fp8 = False
-        for name, module in pipeline.transformer.named_modules():
-            if isinstance(module, Linear):
-                if module.quant_config and module.quant_config.quant_algo:
-                    quant_count += 1
-                    if "blocks" in name and hasattr(module, "weight") and module.weight is not None:
-                        if not found_fp8:
-                            assert module.weight.dtype == torch.float8_e4m3fn, (
-                                f"Linear {name} should have FP8 weight, got {module.weight.dtype}"
-                            )
-                            assert hasattr(module, "weight_scale"), (
-                                f"Linear {name} missing weight_scale"
-                            )
-                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
-                                assert module.weight_scale.dim() == 1, (
-                                    f"Linear {name} rowwise weight_scale should be 1-D, "
-                                    f"got shape {tuple(module.weight_scale.shape)}"
-                                )
-                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
-                                    f"Linear {name} weight_scale length mismatch"
-                                )
-                            found_fp8 = True
-                            print(
-                                f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
-                            )
-
-        print(f"[{quant_algo}] Quantized {quant_count} Linear layers")
-        assert quant_count > 0, "No layers were quantized"
-        assert found_fp8, f"No FP8 Linear modules found in blocks for {quant_algo}"
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
@@ -255,36 +163,7 @@ class TestFluxQuantization:
 
         assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
-        quant_count = 0
-        found_fp8 = False
-        for name, module in pipeline.transformer.named_modules():
-            if isinstance(module, Linear):
-                if module.quant_config and module.quant_config.quant_algo:
-                    quant_count += 1
-                    if "blocks" in name and hasattr(module, "weight") and module.weight is not None:
-                        if not found_fp8:
-                            assert module.weight.dtype == torch.float8_e4m3fn, (
-                                f"Linear {name} should have FP8 weight, got {module.weight.dtype}"
-                            )
-                            assert hasattr(module, "weight_scale"), (
-                                f"Linear {name} missing weight_scale"
-                            )
-                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
-                                assert module.weight_scale.dim() == 1, (
-                                    f"Linear {name} rowwise weight_scale should be 1-D, "
-                                    f"got shape {tuple(module.weight_scale.shape)}"
-                                )
-                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
-                                    f"Linear {name} weight_scale length mismatch"
-                                )
-                            found_fp8 = True
-                            print(
-                                f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
-                            )
-
-        print(f"[{quant_algo}] Quantized {quant_count} Linear layers")
-        assert quant_count > 0, "No layers were quantized"
-        assert found_fp8, f"No FP8 Linear modules found in blocks for {quant_algo}"
+        _assert_quantized_block_linears(pipeline.transformer, quant_algo)
 
         del pipeline
         gc.collect()
@@ -299,36 +178,8 @@ class TestFluxQuantization:
 class TestFluxFP8NumericalCorrectness:
     """Test FP8 vs BF16 numerical accuracy at single-layer and full-transformer levels."""
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_fp8_vs_bf16_single_layer(self, quant_algo: str):
-        """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
-
-        Pattern (matching Wan test_fp8_vs_bf16_numerical_correctness):
-        1. Use F.linear() with BF16 weights as ground truth reference
-        2. Verify BF16 layer matches F.linear exactly
-        3. Compare FP8 layer output against reference
-        4. Check max_diff, cosine_similarity, mse_loss
-        """
-        # Load BF16 pipeline (reference)
-        print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
-        args_bf16 = VisualGenArgs(
-            model=_flux1_path(),
-        )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        # Load FP8 pipeline
-        print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
-        args_fp8 = VisualGenArgs(
-            model=_flux1_path(),
-            quant_config={"quant_algo": quant_algo, "dynamic": True},
-        )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
+    def _assert_fp8_vs_bf16_single_layer(self, pipeline_bf16, pipeline_fp8):
+        """Check the same real checkpoint layer against an independent F.linear reference."""
         # Get matching Linear layers from both pipelines
         linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
         linear_fp8, _ = _find_first_quantizable_linear(pipeline_fp8.transformer)
@@ -379,9 +230,6 @@ class TestFluxFP8NumericalCorrectness:
         assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim.item()}"
         assert mse < 1.0, f"MSE too high: {mse.item()}"
 
-        del pipeline_bf16, pipeline_fp8
-        torch.cuda.empty_cache()
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_fp8_vs_bf16_full_transformer_e2e(self, quant_algo: str):
@@ -410,6 +258,15 @@ class TestFluxFP8NumericalCorrectness:
             skip_warmup=True, skip_components=SKIP_COMPONENTS
         )
         transformer_fp8 = pipeline_fp8.transformer
+        assert pipeline_fp8.pipeline_config.quant_config.quant_algo is not None
+        _assert_quantized_block_linears(transformer_fp8, quant_algo)
+        if quant_algo == "FP8":
+            bf16_bytes = sum(p.numel() * p.element_size() for p in transformer_bf16.parameters())
+            fp8_bytes = sum(p.numel() * p.element_size() for p in transformer_fp8.parameters())
+            model_mem_ratio = bf16_bytes / fp8_bytes
+            assert model_mem_ratio > 1.8, (
+                f"FP8 parameter storage should use ~2x less memory, got {model_mem_ratio:.2f}x"
+            )
 
         # Create test inputs
         inputs = _get_flux_transformer_inputs(transformer_bf16)
@@ -482,73 +339,9 @@ class TestFluxFP8NumericalCorrectness:
         print(f"  Cosine similarity: {cos_sim:.4f} (>0.95)")
         print(f"  Relative error: {rel_error:.4f} (<0.15)")
 
+        self._assert_fp8_vs_bf16_single_layer(pipeline_bf16, pipeline_fp8)
+
         del pipeline_bf16, pipeline_fp8, transformer_bf16, transformer_fp8
-        torch.cuda.empty_cache()
-
-
-# =============================================================================
-# FP8 Memory Comparison Tests
-# =============================================================================
-
-
-class TestFluxFP8Memory:
-    """Test FP8 memory reduction for FLUX models."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fp8_vs_bf16_memory_comparison(self):
-        """Test FP8 uses ~2x less memory than BF16 (matching Wan test)."""
-
-        def get_module_memory_gb(module):
-            return sum(p.numel() * p.element_size() for p in module.parameters()) / 1024**3
-
-        # Load BF16
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        args_bf16 = VisualGenArgs(
-            model=_flux1_path(),
-        )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
-        bf16_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-
-        print(f"\n[BF16] Transformer memory: {bf16_model_mem:.2f} GB")
-        print(f"[BF16] Peak memory: {bf16_peak_mem:.2f} GB")
-
-        del pipeline_bf16
-        torch.cuda.empty_cache()
-
-        # Load FP8
-        torch.cuda.reset_peak_memory_stats()
-
-        args_fp8 = VisualGenArgs(
-            model=_flux1_path(),
-            quant_config={"quant_algo": "FP8", "dynamic": True},
-        )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
-        fp8_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-
-        print(f"\n[FP8] Transformer memory: {fp8_model_mem:.2f} GB")
-        print(f"[FP8] Peak memory: {fp8_peak_mem:.2f} GB")
-
-        # Verify memory savings
-        model_mem_ratio = bf16_model_mem / fp8_model_mem
-        peak_mem_ratio = bf16_peak_mem / fp8_peak_mem
-
-        print(f"\n[Comparison] Model memory ratio (BF16/FP8): {model_mem_ratio:.2f}x")
-        print(f"[Comparison] Peak memory ratio (BF16/FP8): {peak_mem_ratio:.2f}x")
-
-        # FP8 should use ~2x less memory
-        assert model_mem_ratio > 1.8, f"FP8 should use ~2x less memory, got {model_mem_ratio:.2f}x"
-
-        del pipeline_fp8
         torch.cuda.empty_cache()
 
 
@@ -578,6 +371,7 @@ class TestFluxAttentionBackend:
         pipeline_baseline = PipelineLoader(args_baseline).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
         )
+        assert pipeline_baseline.pipeline_config.attention.backend == "VANILLA"
         transformer_baseline = pipeline_baseline.transformer
 
         inputs = _get_flux_transformer_inputs(transformer_baseline)
@@ -600,6 +394,7 @@ class TestFluxAttentionBackend:
         pipeline_trtllm = PipelineLoader(args_trtllm).load(
             skip_warmup=True, skip_components=SKIP_COMPONENTS
         )
+        assert pipeline_trtllm.pipeline_config.attention.backend == "TRTLLM"
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
@@ -682,6 +477,9 @@ class TestFluxE2E:
             model=_flux1_path(),
         )
         pipeline = PipelineLoader(args).load()
+        assert pipeline is not None
+        assert pipeline.transformer is not None
+        assert pipeline.pipeline_config.attention.backend == "VANILLA"
 
         # 3. Generate native image
         result = pipeline.forward(
@@ -732,6 +530,8 @@ class TestFluxE2E:
             model=_flux2_path(),
         )
         pipeline = PipelineLoader(args).load()
+        assert pipeline is not None
+        assert pipeline.transformer is not None
 
         # 3. Generate native image
         result = pipeline.forward(

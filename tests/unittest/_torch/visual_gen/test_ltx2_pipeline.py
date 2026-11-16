@@ -174,188 +174,6 @@ def ltx2_fp8_checkpoint_exists():
 
 
 # ============================================================================
-# Quantization Tests
-# ============================================================================
-
-
-class TestLTX2Quantization:
-    """Test LTX2 quantization loading and FP8 weight verification."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
-        """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
-        args = VisualGenArgs(
-            model=ltx2_bf16_checkpoint_exists,
-            quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-
-        assert pipeline.pipeline_config.quant_config.quant_algo is not None
-
-        quant_count = 0
-        found_fp8 = False
-        for name, module in pipeline.transformer.named_modules():
-            if isinstance(module, Linear):
-                if module.quant_config and module.quant_config.quant_algo:
-                    quant_count += 1
-                    if "blocks" in name and hasattr(module, "weight") and module.weight is not None:
-                        if not found_fp8:
-                            assert module.weight.dtype == torch.float8_e4m3fn, (
-                                f"Linear {name} should have FP8 weight, got {module.weight.dtype}"
-                            )
-                            assert hasattr(module, "weight_scale"), (
-                                f"Linear {name} missing weight_scale"
-                            )
-                            found_fp8 = True
-                            print(
-                                f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
-                            )
-
-        print(f"[{quant_algo}] Quantized {quant_count} Linear layers")
-        assert quant_count > 0, "No layers were quantized"
-        assert found_fp8, f"No FP8 Linear modules found in blocks for {quant_algo}"
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
-# ============================================================================
-# FP8 Numerical Correctness Tests
-# ============================================================================
-
-
-class TestLTX2FP8NumericalCorrectness:
-    """Test FP8 vs BF16 numerical accuracy at single-layer level."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
-    def test_fp8_vs_bf16_single_layer(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
-        """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
-
-        1. Use F.linear() with BF16 weights as ground truth reference
-        2. Verify BF16 layer matches F.linear exactly
-        3. Compare FP8 layer output against reference
-        """
-        print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
-        args_bf16 = VisualGenArgs(
-            model=ltx2_bf16_checkpoint_exists,
-            pipeline_config=_ltx2_pipeline_config(),
-        )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
-        args_fp8 = VisualGenArgs(
-            model=ltx2_bf16_checkpoint_exists,
-            quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
-        )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
-        linear_fp8, _ = _find_first_quantizable_linear(pipeline_fp8.transformer)
-
-        assert linear_bf16 is not None, "Could not find a Linear layer in BF16 transformer"
-        assert linear_fp8 is not None, "Could not find a Linear layer in FP8 transformer"
-
-        weight_bf16 = linear_bf16.weight.data.clone()
-        bias_bf16 = linear_bf16.bias.data.clone() if linear_bf16.bias is not None else None
-
-        torch.manual_seed(42)
-        hidden_size = linear_bf16.in_features
-        batch_seq_len = 1024
-        input_tensor = torch.randn(batch_seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")
-        print(f"[Compare] Layer: {layer_name}, Input shape: {input_tensor.shape}")
-
-        with torch.no_grad():
-            expected = F.linear(input_tensor, weight_bf16, bias_bf16)
-            result_bf16 = linear_bf16(input_tensor)
-            result_fp8 = linear_fp8(input_tensor)
-
-        assert torch.allclose(result_bf16, expected, rtol=1e-5, atol=1e-6), (
-            "BF16 layer should match F.linear reference exactly"
-        )
-
-        max_diff = torch.max(torch.abs(result_fp8 - expected)).item()
-        cos_sim = F.cosine_similarity(
-            result_fp8.flatten().float(), expected.flatten().float(), dim=0
-        )
-        mse = F.mse_loss(result_fp8.flatten().float(), expected.flatten().float())
-
-        print(
-            f"\n[{layer_name}] max_diff={max_diff:.6f}, cos_sim={cos_sim.item():.6f}, mse={mse.item():.6f}"
-        )
-
-        assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim.item()}"
-        assert mse < 1.0, f"MSE too high: {mse.item()}"
-
-        del pipeline_bf16, pipeline_fp8
-        torch.cuda.empty_cache()
-
-
-# ============================================================================
-# FP8 Memory Comparison Tests
-# ============================================================================
-
-
-class TestLTX2FP8Memory:
-    """Test FP8 memory reduction for LTX2."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fp8_vs_bf16_memory_comparison(self, ltx2_bf16_checkpoint_exists):
-        """Test FP8 uses ~2x less memory than BF16."""
-
-        def get_module_memory_gb(module):
-            return sum(p.numel() * p.element_size() for p in module.parameters()) / 1024**3
-
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        args_bf16 = VisualGenArgs(
-            model=ltx2_bf16_checkpoint_exists,
-            pipeline_config=_ltx2_pipeline_config(),
-        )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
-        print(f"\n[BF16] Transformer memory: {bf16_model_mem:.2f} GB")
-
-        del pipeline_bf16
-        torch.cuda.empty_cache()
-
-        torch.cuda.reset_peak_memory_stats()
-
-        args_fp8 = VisualGenArgs(
-            model=ltx2_bf16_checkpoint_exists,
-            quant_config={"quant_algo": "FP8", "dynamic": True},
-            pipeline_config=_ltx2_pipeline_config(),
-        )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
-
-        fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
-        print(f"[FP8] Transformer memory: {fp8_model_mem:.2f} GB")
-
-        model_mem_ratio = bf16_model_mem / fp8_model_mem
-        print(f"\n[Comparison] Model memory ratio (BF16/FP8): {model_mem_ratio:.2f}x")
-
-        assert model_mem_ratio > 1.8, f"FP8 should use ~2x less memory, got {model_mem_ratio:.2f}x"
-
-        del pipeline_fp8
-        torch.cuda.empty_cache()
-
-
-# ============================================================================
 # Attention Backend Comparison Tests
 # ============================================================================
 
@@ -1700,40 +1518,28 @@ class TestLTX2TwoStageLoRAHelpers:
         assert torch.equal(module.good, original_good)
 
 
+@pytest.fixture(scope="class")
+def ltx2_bf16_reference_layer():
+    """Retain a reference layer and parameter-byte count, releasing the rest of the model."""
+    args = VisualGenArgs(
+        model=get_checkpoint(_LTX2_BF16_SUBDIR),
+        pipeline_config=_ltx2_pipeline_config(),
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
+    layer, name = _find_first_quantizable_linear(pipeline.transformer)
+    assert layer is not None, "Could not find a Linear layer in BF16 transformer"
+    parameter_bytes = sum(p.numel() * p.element_size() for p in pipeline.transformer.parameters())
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+    yield layer, name, parameter_bytes
+    del layer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 class TestLTX2TwoStagePipelineLoading:
     """Test two-stage pipeline loading via PipelineLoader."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_loads_as_two_stage_pipeline(self, ltx2_two_stage_assets_exist):
-        """When upsampler + LoRA paths are set, PipelineLoader yields LTX2TwoStagesPipeline."""
-        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
-            LTX2TwoStagesPipeline,
-        )
-
-        args = VisualGenArgs(
-            model=ltx2_two_stage_assets_exist.checkpoint,
-            pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=ltx2_two_stage_assets_exist.upsampler,
-                distilled_lora_path=ltx2_two_stage_assets_exist.lora,
-            ),
-        )
-
-        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
-        try:
-            assert isinstance(pipeline, LTX2TwoStagesPipeline), (
-                f"Expected LTX2TwoStagesPipeline, got {type(pipeline).__name__}"
-            )
-            assert pipeline.spatial_upsampler is not None, "Spatial upsampler should be loaded"
-            assert len(pipeline._distilled_lora_deltas) > 0, (
-                "Distilled LoRA deltas should be loaded"
-            )
-
-            print(f"\n[Two-Stage] Loaded {len(pipeline._distilled_lora_deltas)} LoRA deltas")
-            print(f"[Two-Stage] Upsampler type: {type(pipeline.spatial_upsampler).__name__}")
-        finally:
-            del pipeline
-            gc.collect()
-            torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_two_stage_lora_deltas_match_transformer(self, ltx2_two_stage_assets_exist):
@@ -1753,6 +1559,9 @@ class TestLTX2TwoStagePipelineLoading:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
+            assert isinstance(pipeline, ltx2_two_stages.LTX2TwoStagesPipeline)
+            assert pipeline.spatial_upsampler is not None
+            assert len(pipeline._distilled_lora_deltas) > 0
             applied, saved_state, snapshot_required = _apply_lora_deltas(
                 pipeline.transformer,
                 pipeline._distilled_lora_deltas,
@@ -1783,7 +1592,9 @@ class TestLTX2TwoStagePipelineLoading:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_two_stage_with_quantization(self, ltx2_two_stage_assets_exist, quant_algo: str):
+    def test_two_stage_with_quantization(
+        self, ltx2_two_stage_assets_exist, ltx2_bf16_reference_layer, quant_algo: str
+    ):
         """Two-stage pipeline loads correctly with FP8 quantization."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             LTX2TwoStagesPipeline,
@@ -1810,6 +1621,67 @@ class TestLTX2TwoStagePipelineLoading:
             )
             print(f"\n[Two-Stage {quant_algo}] Quantized {quant_count} Linear layers")
             assert quant_count > 0, "No layers were quantized"
+            checked_blocks = 0
+            for name, module in pipeline.transformer.named_modules():
+                if (
+                    isinstance(module, Linear)
+                    and module.quant_config
+                    and module.quant_config.quant_algo
+                    and "blocks" in name
+                    and getattr(module, "weight", None) is not None
+                ):
+                    assert module.weight.dtype == torch.float8_e4m3fn, name
+                    assert hasattr(module, "weight_scale"), name
+                    checked_blocks += 1
+            assert checked_blocks > 0, f"No FP8 Linear modules found in blocks for {quant_algo}"
+
+            if quant_algo == "FP8":
+                fp8_bytes = sum(
+                    p.numel() * p.element_size() for p in pipeline.transformer.parameters()
+                )
+                model_mem_ratio = ltx2_bf16_reference_layer[2] / fp8_bytes
+                assert model_mem_ratio > 1.8, (
+                    f"FP8 parameter storage should use ~2x less memory, got {model_mem_ratio:.2f}x"
+                )
+            if quant_algo not in ("FP8", "FP8_BLOCK_SCALES"):
+                return
+            linear_bf16, layer_name, _ = ltx2_bf16_reference_layer
+            linear_fp8, quantized_layer_name = _find_first_quantizable_linear(pipeline.transformer)
+            assert linear_fp8 is not None, "Could not find a Linear layer in FP8 transformer"
+            assert quantized_layer_name == layer_name
+            weight_bf16 = linear_bf16.weight.data.clone()
+            bias_bf16 = linear_bf16.bias.data.clone() if linear_bf16.bias is not None else None
+
+            torch.manual_seed(42)
+            hidden_size = linear_bf16.in_features
+            batch_seq_len = 1024
+            input_tensor = torch.randn(
+                batch_seq_len, hidden_size, dtype=torch.bfloat16, device="cuda"
+            )
+            print(f"[Compare] Layer: {layer_name}, Input shape: {input_tensor.shape}")
+
+            with torch.no_grad():
+                expected = F.linear(input_tensor, weight_bf16, bias_bf16)
+                result_bf16 = linear_bf16(input_tensor)
+                result_fp8 = linear_fp8(input_tensor)
+
+            assert torch.allclose(result_bf16, expected, rtol=1e-5, atol=1e-6), (
+                "BF16 layer should match F.linear reference exactly"
+            )
+
+            max_diff = torch.max(torch.abs(result_fp8 - expected)).item()
+            cos_sim = F.cosine_similarity(
+                result_fp8.flatten().float(), expected.flatten().float(), dim=0
+            )
+            mse = F.mse_loss(result_fp8.flatten().float(), expected.flatten().float())
+
+            print(
+                f"\n[{layer_name}] max_diff={max_diff:.6f}, cos_sim={cos_sim.item():.6f}, mse={mse.item():.6f}"
+            )
+
+            assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim.item()}"
+            assert mse < 1.0, f"MSE too high: {mse.item()}"
+
         finally:
             del pipeline
             gc.collect()

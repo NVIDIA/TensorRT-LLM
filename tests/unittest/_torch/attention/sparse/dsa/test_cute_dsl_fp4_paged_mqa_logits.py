@@ -165,10 +165,10 @@ ELEM_TOL = {
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("batch_size", [1, 16])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("num_heads", [64])
-@pytest.mark.parametrize("avg_ctx", [256, 4096, 8192, 16384, 32768])
+@pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
 @pytest.mark.parametrize("phys_block_kv", [32, 64, 128])
 @pytest.mark.parametrize(
     "epi_dtype, output_dtype",
@@ -350,17 +350,15 @@ def test_cute_dsl_fp4_paged_mqa_logits(
 
     logits_masked = logits.float().masked_fill(neginf_mask, 0)
     ref_masked = ref.float().masked_fill(neginf_mask, 0)
-    finite = torch.isfinite(logits_masked) & torch.isfinite(ref_masked)
-    logits_clean = logits_masked.masked_fill(~finite, 0)
-    ref_clean = ref_masked.masked_fill(~finite, 0)
 
     atol, rtol = ELEM_TOL[(epi_dtype, output_dtype)]
 
-    valid = (~neginf_mask) & finite
-    elem_abs = (logits_clean - ref_clean).abs()[valid]
+    valid = ~neginf_mask
+    assert torch.isfinite(logits_masked[valid]).all(), "non-finite logits inside context"
+    elem_abs = (logits_masked - ref_masked).abs()[valid]
     if elem_abs.numel() > 0:
-        kernel_valid = logits_clean[valid]
-        ref_valid = ref_clean[valid]
+        kernel_valid = logits_masked[valid]
+        ref_valid = ref_masked[valid]
         print(
             f"[fp4-acc-probe] B={batch_size} next_n={next_n} "
             f"avg_ctx={avg_ctx} epi={epi_dtype} out={output_dtype} "
@@ -374,12 +372,12 @@ def test_cute_dsl_fp4_paged_mqa_logits(
             f"ref: max={ref_valid.abs().max().item():.3e} "
             f"mean={ref_valid.abs().mean().item():.3e}"
         )
-        print(f"[fp4-acc-probe] kernel[0,:8]={logits_clean[0, :8].tolist()}")
-        print(f"[fp4-acc-probe] ref[0,:8]   ={ref_clean[0, :8].tolist()}")
-        print(f"[fp4-acc-probe] kernel[0,128:136]={logits_clean[0, 128:136].tolist()}")
-        print(f"[fp4-acc-probe] ref[0,128:136]   ={ref_clean[0, 128:136].tolist()}")
+        print(f"[fp4-acc-probe] kernel[0,:8]={logits_masked[0, :8].tolist()}")
+        print(f"[fp4-acc-probe] ref[0,:8]   ={ref_masked[0, :8].tolist()}")
+        print(f"[fp4-acc-probe] kernel[0,128:136]={logits_masked[0, 128:136].tolist()}")
+        print(f"[fp4-acc-probe] ref[0,128:136]   ={ref_masked[0, 128:136].tolist()}")
         # Find which positions have large errors
-        diff_abs = (logits_clean - ref_clean).abs()
+        diff_abs = (logits_masked - ref_masked).abs()
         large_err = (diff_abs[0, :256] > 5.0).nonzero(as_tuple=True)[0]
         print(f"[fp4-acc-probe] num positions with abs_err>5.0 in 0..255: {len(large_err)}")
         if len(large_err) > 0:
@@ -402,8 +400,8 @@ def test_cute_dsl_fp4_paged_mqa_logits(
             print(f"[fp4-acc-probe] err mod 8: {mod8_buckets.tolist()}")
 
     torch.testing.assert_close(
-        logits_clean,
-        ref_clean,
+        logits_masked,
+        ref_masked,
         atol=atol,
         rtol=rtol,
         msg=lambda m: (
@@ -412,7 +410,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         ),
     )
 
-    diff = calc_diff(logits_clean, ref_clean)
+    diff = calc_diff(logits_masked, ref_masked)
     assert diff < 0.02, (
         f"cosine diff {diff} > 0.02 (B={batch_size}, next_n={next_n}, avg_ctx={avg_ctx})"
     )

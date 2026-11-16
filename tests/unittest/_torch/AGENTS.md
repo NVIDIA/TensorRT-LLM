@@ -21,6 +21,15 @@ Scope: this directory and its descendants. Supplements `../../AGENTS.md`.
 
 ## GPU test cost and coverage
 
+- Distinct parameters are not by themselves a reason to keep every cross-product
+  combination. State the extra regression a costly case protects, check existing
+  lower-level and integration coverage, and retain representatives for independent
+  mechanisms and known interactions. Record the combinations deliberately removed.
+- Merge related assertions into an existing model load when they share the same
+  setup. Keep real checkpoint and numerical checks; avoid loading a complete model
+  again to recheck a derived dtype/parameter-size property. Preserve useful scalar
+  summaries when merging checks, and keep a small reference tensor or layer
+  rather than retaining an otherwise unused full model.
 - Separate setup, compilation, reference computation and device execution when
   profiling a test. Use the stage's effective worker count and allocation; serial
   timings alone do not establish the cost of a parallel CI batch.
@@ -29,6 +38,9 @@ Scope: this directory and its descendants. Supplements `../../AGENTS.md`.
   ordering, dtypes and tolerances. Keep the reference independent of the operation
   under test, and retain device, aliasing or stream checks when those are part of
   its contract.
+- Exclude only positions that the test contract masks. Do not drop non-finite
+  values from both actual and reference tensors: that can turn invalid outputs
+  into a passing comparison. Check the required finite domain explicitly.
 - Put validation readbacks after the required completion point and outside the
   timed or no-synchronization region. Optimizing the checker must not weaken an
   asynchronous-execution assertion or add synchronization to the operation being

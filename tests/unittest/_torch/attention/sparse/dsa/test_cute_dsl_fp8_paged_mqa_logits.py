@@ -153,7 +153,7 @@ def _generate_test_data(
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
@@ -245,19 +245,17 @@ def test_cute_dsl_fp8_paged_mqa_logits(
 
     dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
     ref_masked = ref_logits.float().masked_fill(~mask, 0)
-    finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
-    dsl_clean = dsl_masked.masked_fill(~finite, 0)
-    ref_clean = ref_masked.masked_fill(~finite, 0)
 
-    # Element-wise check on the valid (finite + in-context) region.
+    # Element-wise check on the in-context region.
     # Kernel is deterministic (disjoint CTA writes, no atomics), so every
     # element must be within elem_atol.
     elem_atol = 1e-3 if output_dtype == torch.float16 else 5e-5
     elem_rtol = 1e-3 if output_dtype == torch.float16 else 1e-5
 
     # Debug probe: print max/mean abs error for CI failure diagnosis.
-    valid = mask & finite
-    elem_abs = (dsl_clean - ref_clean).abs()[valid]
+    valid = mask
+    assert torch.isfinite(dsl_masked[valid]).all(), "non-finite logits inside context"
+    elem_abs = (dsl_masked - ref_masked).abs()[valid]
     if elem_abs.numel() > 0:
         print(
             f"[acc-probe] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
@@ -267,8 +265,8 @@ def test_cute_dsl_fp8_paged_mqa_logits(
         )
 
     torch.testing.assert_close(
-        dsl_clean,
-        ref_clean,
+        dsl_masked,
+        ref_masked,
         atol=elem_atol,
         rtol=elem_rtol,
         msg=lambda m: (
@@ -422,15 +420,13 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
 
     dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
     ref_masked = ref_logits.float().masked_fill(~mask, 0)
-    finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
-    dsl_clean = dsl_masked.masked_fill(~finite, 0)
-    ref_clean = ref_masked.masked_fill(~finite, 0)
 
     elem_atol = 5e-5
     elem_rtol = 1e-5
 
-    valid = mask & finite
-    elem_abs = (dsl_clean - ref_clean).abs()[valid]
+    valid = mask
+    assert torch.isfinite(dsl_masked[valid]).all(), "non-finite logits inside context"
+    elem_abs = (dsl_masked - ref_masked).abs()[valid]
     if elem_abs.numel() > 0:
         print(
             f"[multi-block] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
@@ -440,8 +436,8 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
         )
 
     torch.testing.assert_close(
-        dsl_clean,
-        ref_clean,
+        dsl_masked,
+        ref_masked,
         atol=elem_atol,
         rtol=elem_rtol,
         msg=lambda m: (

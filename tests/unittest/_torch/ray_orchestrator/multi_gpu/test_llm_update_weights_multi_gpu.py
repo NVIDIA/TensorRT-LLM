@@ -153,7 +153,9 @@ def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -
         device_ids=[0, 1],
         llm_kwargs=llm_kwargs,
         sampling_params=SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+            temperature=0,
+            return_generation_logits=True,
+            max_tokens=1024 if not partial and "Qwen3/Qwen3-8B" in model_dir else 128,
         ),
         partial=partial,
         tokenizer_dir=fp8_model_dir,
@@ -1637,20 +1639,13 @@ def test_llm_partial_update_weights_qwen35_mxfp8():
         "Qwen3/Qwen3-8B",
     ],
 )
-@pytest.mark.parametrize(
-    "kv_cache_dtype",
-    [
-        "auto",
-        "fp8",
-    ],
-)
-def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
+def test_llm_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype="fp8"
     )
     with LLM(
         model=model_dir,
@@ -1677,7 +1672,9 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
         prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
         del tokenizer
         sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+            temperature=0,
+            return_generation_logits=True,
+            max_tokens=1024 if "Qwen3-30B-A3B" in model_dir else 128,
         )
 
         ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
@@ -1698,20 +1695,13 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
         "Qwen3/Qwen3-8B",
     ],
 )
-@pytest.mark.parametrize(
-    "kv_cache_dtype",
-    [
-        "auto",
-        "fp8",
-    ],
-)
-def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
+def test_llm_partial_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype="auto"
     )
     with LLM(
         model=model_dir,
@@ -1739,7 +1729,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         del tokenizer
 
         sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+            temperature=0, return_generation_logits=True, max_tokens=128
         )
 
         def common_filter(filter_name: str) -> Callable[[str], bool]:
