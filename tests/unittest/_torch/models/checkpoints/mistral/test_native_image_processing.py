@@ -18,8 +18,7 @@
 ``MistralCommonImageProcessor`` encodes each image for mistral-common. The media loaders
 deliver a PIL image, a float ``(C, H, W)`` tensor in [0, 1] or a uint8 array; each is
 converted losslessly. The server renders a chat to token ids with the image grids in
-place; the processor checks those grids against the images, or expands one ``[IMG]`` per
-image to its grid, without re-encoding the text.
+place; the processor checks those grids against the images without re-encoding the text.
 
 The processor tests read Mistral-Small-4's native files under LLM_MODELS_ROOT and need
 OpenCV, which mistral-common's image encoder resizes with.
@@ -209,7 +208,7 @@ def test_raw_text_places_images_at_its_markers(native_processor):
         native_processor({"prompt": prompt, "multi_modal_data": {"image": images[:1]}}, None)
 
 
-def test_token_ids_expand_one_marker_per_image_without_reencoding(native_processor):
+def test_token_ids_carry_whole_image_grids_without_reencoding(native_processor):
     processor = native_processor.processor
     img, img_break, img_end = (
         processor.image_token_id,
@@ -226,13 +225,13 @@ def test_token_ids_expand_one_marker_per_image_without_reencoding(native_process
     assert native_processor({"prompt_token_ids": [1, 1000]}, None) == ([1, 1000], None)
     with pytest.raises(ValueError, match="require image data"):
         native_processor({"prompt_token_ids": [1, img, img_end]}, None)
-    actual, _ = process([1, 1000, img, 2000, img, 3000])
-    blocks = native_processor._image_blocks(actual)
-    assert actual[: blocks[0][0]] == [1, 1000]
-    assert actual[blocks[0][1] : blocks[1][0]] == [2000]
-    assert actual[blocks[1][1] :] == [3000]
-    assert process(actual)[0] == actual  # expanded ids are checked, not expanded again
-    for invalid in (actual[:-2], actual + [img_end], [1, img], [1, img_break]):
+    encoded = processor("", images=images)["input_ids"][0].tolist()
+    first, second = (encoded[a:b] for a, b in native_processor._image_blocks(encoded))
+    actual = [1, 1000, *first, 2000, *second, 3000]
+    assert process(actual)[0] == actual
+    # One [IMG] per image is not a grid: the ids are checked, never expanded.
+    one_marker_each = [1, 1000, img, 2000, img, 3000]
+    for invalid in (one_marker_each, actual[:-2], actual + [img_end], [1, img], [1, img_break]):
         with pytest.raises(ValueError, match="[Ii]mage"):
             process(invalid)
     with pytest.raises(ValueError, match="sizes and order"):
