@@ -15,6 +15,7 @@
 """CPU tests for trtllm-serve multi-frontend serving, against a fake launcher."""
 
 import asyncio
+import http.client
 import os
 import signal
 import socket
@@ -227,12 +228,16 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
 
     Once uvicorn begins its shutdown, the launcher stops its attached frontends. Its /health
     stays truthful until they exit, so their watchdogs still see an engine that fails during
-    the drain. Only then does the launcher shut the engine down. A SIGINT reaches the HTTP
-    server first and, once both servers stop, the handler installed before serving.
+    the drain. The HTTP server finishes a request still in flight, which the attached
+    frontends' drain releases. Only then does the launcher shut the engine down. A SIGINT
+    reaches the HTTP server first and, once both servers stop, the handler installed before
+    serving.
     """
     launcher_path = str(tmp_path / "launcher.sock")
     engine = SimpleNamespace(healthy=True)
-    events, deaths, servers = [], [], []
+    events, deaths, servers, statuses = [], [], [], []
+    request_in_flight = threading.Event()
+    release_request = asyncio.Event()
     create_uvicorn_server = openai_server.create_uvicorn_server
 
     def create_server(config):
@@ -242,6 +247,15 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
     async def stop_attached_frontends(force_exit) -> None:
         events.append("attached frontends stopping")
         forwarder = LauncherForwarder(launcher_path)
+        get_status = forwarder.get_status
+        launcher_answered = asyncio.Event()
+
+        async def watchdog_get_status(path: str) -> int | None:
+            status = await get_status(path)
+            if status == 200:
+                launcher_answered.set()
+            return status
+
         watchdog = AttachedFrontendWatchdog(
             forwarder,
             os.getppid(),
@@ -251,14 +265,25 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
             health_failures=2,
         )
         try:
+            # The HTTP server stopped listening and waits for a request in flight.
+            await _wait_for(lambda: not any(s.is_serving() for s in servers[0].servers))
+            assert request_in_flight.is_set() and not statuses
             assert await forwarder.get_status("/health") == 200
+            release_request.set()
+            forwarder.get_status = watchdog_get_status
             task = asyncio.create_task(watchdog.run())
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(launcher_answered.wait(), timeout=5)
             engine.healthy = False
             await asyncio.wait_for(task, timeout=5)
         finally:
             await forwarder.close()
         events.append("attached frontends exited")
+
+    async def in_flight_request() -> dict:
+        request_in_flight.set()
+        await release_request.wait()
+        events.append("request in flight answered")
+        return {}
 
     monkeypatch.setattr(openai_server, "create_uvicorn_server", create_server)
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
@@ -276,11 +301,22 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
             metadata_server_cfg=None,
             stop_attached_frontends=stop_attached_frontends,
         )
-    listeners = []
-    for path in (str(tmp_path / "http.sock"), launcher_path):
-        listeners.append(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
-        listeners[-1].bind(path)
-        listeners[-1].listen()
+    server.app.add_api_route("/in_flight", in_flight_request, methods=["GET"])
+    http_listener = socket.create_server(("127.0.0.1", 0))
+    launcher_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    launcher_listener.bind(launcher_path)
+    launcher_listener.listen()
+    listeners = [http_listener, launcher_listener]
+
+    def request_over_http() -> None:
+        connection = http.client.HTTPConnection(*http_listener.getsockname(), timeout=30)
+        try:
+            connection.request("GET", "/in_flight")
+            statuses.append(connection.getresponse().status)
+        finally:
+            connection.close()
+
+    client = threading.Thread(target=request_over_http)
     serve = server("localhost", 0, sockets=listeners)
     if by_signal:
         signals = []
@@ -288,6 +324,9 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
 
         async def interrupt_once_started() -> None:
             while not (servers and servers[0].started):
+                await asyncio.sleep(0.01)
+            client.start()
+            while not request_in_flight.is_set():
                 await asyncio.sleep(0.01)
             signal.raise_signal(signal.SIGINT)
 
@@ -314,6 +353,8 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
                     "the server did not start"
                 )
                 time.sleep(0.01)
+            client.start()
+            assert request_in_flight.wait(30), "the request did not reach the server"
             assert not events
             servers[0].should_exit = True
             serving.join(30)
@@ -322,12 +363,12 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
                 listener.close()
         assert not serving.is_alive()
 
+    client.join(30)
+    assert statuses == [200]
     assert len(deaths) == 1 and "failed 2 consecutive" in str(deaths[0])
-    assert events == [
-        "attached frontends stopping",
-        "attached frontends exited",
-        "engine shut down",
-    ]
+    assert events[0] == "attached frontends stopping"
+    assert sorted(events[1:3]) == ["attached frontends exited", "request in flight answered"]
+    assert events[3:] == ["engine shut down"]
 
 
 def test_launcher_socket_server_keeps_the_graceful_shutdown_timeout(tmp_path, monkeypatch) -> None:
@@ -368,6 +409,59 @@ def test_launcher_socket_server_keeps_the_graceful_shutdown_timeout(tmp_path, mo
     sockets = [SimpleNamespace(family=socket.AF_INET), SimpleNamespace(family=socket.AF_UNIX)]
     asyncio.run(server("localhost", 0, sockets=sockets))
     assert [config.timeout_graceful_shutdown for config in configs] == [7, 7]
+
+
+def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(monkeypatch) -> None:
+    """Check that frontends still running the timeout plus 10 s after SIGTERM are killed.
+
+    Every frontend is reaped, including one that exited on SIGTERM.
+    """
+    clock = SimpleNamespace(now=100.0)
+
+    async def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    class _FakeFrontend:
+        def __init__(self, exits_after_s: float | None) -> None:
+            self.exits_after_s = exits_after_s
+            self.terminated_at = self.killed_at = self.returncode = None
+            self.waits = 0
+
+        def terminate(self) -> None:
+            self.terminated_at = clock.now
+
+        def kill(self) -> None:
+            if self.returncode is None:
+                self.killed_at = clock.now
+                self.returncode = -signal.SIGKILL
+
+        def poll(self) -> int | None:
+            if (
+                self.returncode is None
+                and self.exits_after_s is not None
+                and clock.now >= self.terminated_at + self.exits_after_s
+            ):
+                self.returncode = 0
+            return self.returncode
+
+        def wait(self) -> int:
+            assert self.returncode is not None, "wait() blocks on a running process"
+            self.waits += 1
+            return self.returncode
+
+    monkeypatch.setattr(_frontend_processes, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(_frontend_processes, "asyncio", SimpleNamespace(sleep=sleep))
+    exits, ignores_sigterm = _FakeFrontend(exits_after_s=2.0), _FakeFrontend(exits_after_s=None)
+
+    asyncio.run(
+        _frontend_processes._drain_attached_frontends([exits, ignores_sigterm], 30, lambda: False)
+    )
+
+    assert exits.terminated_at == ignores_sigterm.terminated_at == 100.0
+    assert (exits.killed_at, exits.returncode) == (None, 0)
+    assert 140.0 <= ignores_sigterm.killed_at < 140.2
+    assert ignores_sigterm.returncode == -signal.SIGKILL
+    assert exits.waits == ignores_sigterm.waits == 1
 
 
 def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
