@@ -3,7 +3,6 @@
 
 import functools
 import hashlib
-import json
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
@@ -20,7 +19,6 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     import llguidance
-    from mistral_common.guidance.grammar_factory import GrammarFactory
 
 
 # Adapted from:
@@ -161,42 +159,6 @@ class MistralTokenizer(TransformersTokenizer):
             n_vocab=n_vocab,
             eos_token=self.eos_token_id,
         )
-
-    def llguidance_json_schema_lark(self, json_schema: str) -> str:
-        """The Lark grammar of a JSON response, as mistral-common's grammar factory writes it.
-
-        With the ``[THINK]`` and ``[/THINK]`` control tokens in the vocabulary, the
-        response may open with one reasoning section, ``[THINK]`` text ``[/THINK]``,
-        before the JSON: the model reasons there when the request turns reasoning on.
-        Otherwise the response is the JSON alone.
-
-        Args:
-            json_schema: The JSON schema of the response, serialized.
-
-        Returns:
-            The Lark grammar an llguidance matcher compiles against
-            `llguidance_tokenizer`, which references the control tokens by id.
-        """
-        factory, template = self._grammar_factory
-        return factory.get_lark_for_json_schema(template, json.loads(json_schema))
-
-    @functools.cached_property
-    def renders_grammars(self) -> bool:
-        """Whether mistral-common's grammar factory supports this tokenizer."""
-        from mistral_common.guidance.grammar_factory import GrammarFactory
-
-        return GrammarFactory.is_supported(self.mistral)
-
-    @functools.cached_property
-    def _grammar_factory(self) -> tuple["GrammarFactory", str]:
-        from mistral_common.guidance.grammar_factory import GrammarFactory
-
-        if not self.renders_grammars:
-            raise ValueError(
-                f"mistral-common renders no grammars for this tokenizer (version v{self.version})."
-            )
-        factory = GrammarFactory(self.mistral)
-        return factory, factory.select_jinja_template()
 
     def _get_special_token_ids(self) -> list[int]:
         from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer

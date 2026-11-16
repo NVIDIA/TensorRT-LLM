@@ -760,8 +760,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
 
     The server renders a chat to token ids with mistral-common, image grids
     included (``tensorrt_llm.inputs.utils.apply_chat_template``); token ids
-    with images are checked against, or expanded to, the grids mistral-common
-    makes of the images.
+    with images are checked against the grids mistral-common makes of the
+    images.
     """
 
     supports_token_id_mm_expansion = True
@@ -859,8 +859,7 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         """No caller-side check: this processor checks the images against the prompt.
 
         Text places the images at its ``[IMG]`` markers, or after itself without
-        markers; token ids carry one ``[IMG]`` control token or a whole image grid
-        per image.
+        markers; token ids carry a whole image grid per image.
         """
         return False
 
@@ -882,27 +881,10 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         if len(expected) != len(images):
             raise ValueError(
                 "Native tokenizer image grid count does not match images")
-        delimiters = (self.processor.image_break_id,
-                      self.processor.image_end_id)
-        if not any(token in delimiters for token in token_ids):
-            if token_ids.count(self.processor.image_token_id) != len(images):
-                raise ValueError(
-                    "Image placeholder count does not match images")
-            expanded = []
-            image_index = 0
-            for token in token_ids:
-                if token == self.processor.image_token_id:
-                    expanded.extend(expected[image_index])
-                    image_index += 1
-                else:
-                    expanded.append(token)
-            token_ids = expanded
-        else:
-            blocks = self._image_blocks(token_ids)
-            actual = [token_ids[a:b] for a, b in blocks]
-            if actual != expected:
-                raise ValueError(
-                    "Image token grids do not match image sizes and order")
+        actual = [token_ids[a:b] for a, b in self._image_blocks(token_ids)]
+        if actual != expected:
+            raise ValueError(
+                "Image token grids do not match image sizes and order")
         return token_ids, self._image_payload(processed)
 
     @torch.inference_mode()
