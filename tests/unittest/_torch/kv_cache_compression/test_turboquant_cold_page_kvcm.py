@@ -8,7 +8,7 @@ with a pressure request that needs every GPU slot, brings them back, and compare
 codec's own round trip of the same Pages, which they must match bit for bit.
 """
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -366,19 +366,22 @@ def test_repeated_migration_keeps_the_error_of_one_round_trip(bits):
 
 def test_target_and_draft_managers_build_independent_codec_states():
     provider = _provider(skip_rope=True)
-    with (
-        patch.object(
-            provider, "create_cold_page_codec", wraps=provider.create_cold_page_codec
-        ) as create_codec,
-        patch.object(
-            native_kvcc,
-            "create_python_cold_page_codec",
-            wraps=native_kvcc.create_python_cold_page_codec,
-        ) as create_native_codec,
-    ):
+    with ExitStack() as cleanup:
+        create_codec = cleanup.enter_context(
+            patch.object(provider, "create_cold_page_codec", wraps=provider.create_cold_page_codec)
+        )
+        create_native_codec = cleanup.enter_context(
+            patch.object(
+                native_kvcc,
+                "create_python_cold_page_codec",
+                wraps=native_kvcc.create_python_cold_page_codec,
+            )
+        )
+        # Each manager is shut down even if a later construction or assertion fails.
         target = _manager(provider)
+        cleanup.callback(target.shutdown)
         draft = _manager(provider, num_layers=1, is_draft=True)
-    try:
+        cleanup.callback(draft.shutdown)
         assert [call.kwargs["is_draft"] for call in create_codec.call_args_list] == [False, True]
         target_state, draft_state = (call.args[1] for call in create_native_codec.call_args_list)
         assert (target_state.layer_ids, draft_state.layer_ids) == ((0, 1), (0,))
@@ -392,22 +395,22 @@ def test_target_and_draft_managers_build_independent_codec_states():
         assert _offload(target, request) == [0, NUM_PAGES]
         _restore(target, request)
         _assert_restored(provider, _read(target, request), kv, 0.02, ROPE_DIM)
-    finally:
-        draft.shutdown()
-        target.shutdown()
 
 
 @skip_pre_blackwell
-def test_deepseek_v4_csa_hca_lifecycle_migrates_through_host():
-    """CSA rows quantize 448 NoPE values; RoPE, the indexer cache, and HCA rows stay as is."""
+@pytest.mark.parametrize("skip_rope", [False, True])
+def test_deepseek_v4_csa_hca_lifecycle_migrates_through_host(skip_rope):
+    """CSA rows are quantized whole, or only their 448 NoPE values with skip_rope_quantization;
+    the indexer cache and HCA rows stay as is."""
     suite = dsv4.TestDeepseekV4CacheManager()
     tokens_per_block = suite.tokens_per_block
     prompt_len, pressure_len = 64 * tokens_per_block, 65 * tokens_per_block
     compress_ratios = [4, 128]
     provider = TurboQuantColdPageQuantizationCompression(
-        ColdPageQuantizationCompressionConfig(quant="turboquant"),
+        ColdPageQuantizationCompressionConfig(quant="turboquant", skip_rope_quantization=skip_rope),
         pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
     )
+    quantized_width = 448 if skip_rope else 512
     with (
         patch.object(
             native_kvcc,
@@ -440,16 +443,16 @@ def test_deepseek_v4_csa_hca_lifecycle_migrates_through_host():
                 for buffer in state.layer_layouts[layer_id].buffers
             }
             assert quantized == {
-                (csa, COMPRESS.role): 448,
+                (csa, COMPRESS.role): quantized_width,
                 (csa, INDEXER.role): 0,
                 (hca, COMPRESS.role): 0,
             }
             rows = tokens_per_block // 4
             (metadata,) = state.lifecycle_metadata
             assert metadata.cold_page_bytes == (
-                rows * 448 // 2  # 4-bit NoPE codes
+                rows * quantized_width // 2  # 4-bit codes
                 + rows * 2  # one BF16 scale per row
-                + rows * 64 * 2  # BF16 RoPE
+                + rows * (512 - quantized_width) * 2  # BF16 RoPE kept as is
                 + rows * (suite.index_head_dim // 2 + suite.index_head_dim // 32)  # FP4 indexer
                 + tokens_per_block // 128 * suite.head_dim * 2  # BF16 HCA row
             )
@@ -499,12 +502,12 @@ def test_deepseek_v4_csa_hca_lifecycle_migrates_through_host():
             manager.shutdown()
 
     actual_csa = actual[0, COMPRESS][0]
-    nope, restored_nope = expected_csa[:, :448], actual_csa[:, :448]
+    quantized, restored = expected_csa[:, :quantized_width], actual_csa[:, :quantized_width]
     # Exactly the rows of the Pages that went through the Host tier changed.
-    migrated = (restored_nope != nope).any(-1)
+    migrated = (restored != quantized).any(-1)
     assert int(migrated.sum()) == encoded * rows
-    assert _nmse(restored_nope[migrated], nope[migrated]) < 0.02
-    assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
+    assert _nmse(restored[migrated], quantized[migrated]) < 0.02
+    assert torch.equal(actual_csa[:, quantized_width:], expected_csa[:, quantized_width:])
     for want, got in zip(expected[0, INDEXER], actual[0, INDEXER]):
         assert torch.equal(got, want)
     assert torch.equal(actual[1, COMPRESS][0], expected[1, COMPRESS][0])

@@ -90,12 +90,13 @@ layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded with TurboQuant |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 CSA cache | Supported; the 448 NoPE values of each row are encoded with TurboQuant, and the 64 RoPE values and the indexer cache are preserved losslessly |
+| DeepSeek-V4 CSA cache | Supported; each 512-value row is encoded with TurboQuant (only its 448 NoPE values with `skip_rope_quantization`), and the indexer cache is preserved losslessly |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, the native C++
-KVCacheManagerV2, and a GPU with compute capability 8.0 or newer; its kernels
-are written in Triton. Hot Attention KV can use FP16, BF16, or FP8. KV-cache
+KVCacheManagerV2, and a GPU with compute capability 8.0 or newer (8.9 or newer
+for an FP8 active KV cache); its kernels are written in Triton. Hot Attention KV
+can use FP16, BF16, or FP8. KV-cache
 block reuse remains supported because Page and token identity are unchanged.
 One-model MTP-EAGLE and EAGLE3 are supported: target and draft KVCMs encode
 their cold Pages independently, and draft cold Pages always quantize whole
@@ -325,10 +326,11 @@ kv_cache_compression_config:
   skip_rope_quantization: true
 ```
 
-DeepSeek-V4 compressed (CSA) rows always keep their 64 RoPE values lossless with
-TurboQuant and quantize the 448 NoPE values, whatever `skip_rope_quantization`
-says; there is no TurboQuant counterpart of the NVFP4 2FP4 RoPE format, and
-`nvfp4_residual_dim` is rejected with `quant: turboquant`. DeepSeek-V4 requires
+DeepSeek-V4 compressed (CSA) rows follow the option too: by default TurboQuant
+encodes all 512 values of a row as one instance, and with
+`skip_rope_quantization: true` it copies the 64 RoPE values and encodes the 448
+NoPE values. There is no TurboQuant counterpart of the NVFP4 2FP4 RoPE format,
+and `nvfp4_residual_dim` is rejected with `quant: turboquant`. DeepSeek-V4 requires
 `tokens_per_block` of 128 or 256, and cold-page compression does not cover the
 FP8 `fp8_ds_mla` footer-scale KV layout.
 
@@ -365,11 +367,32 @@ Page:
 | 3.5 / 2.5 | 0.0123 / 0.0448 | 0.0137 / 0.0497 | 0.0137 / 0.0497 |
 | NVFP4 | 0.0084 | 0.0084 | 0.0084 |
 
-Integer bit widths reproduce their codes, so the error does not grow. Fractional bits choose the
-outlier channels from the decoded data again: the error grows by 10-20% (depending on the input)
-over the first round trips and then stays. The paper's TurboQuant-prod is not offered because its error compounds
-instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips at 2 bits, and
-0.051, 0.31, and 7.0 at 4 bits.
+The cold bytes settle after a few round trips and then repeat with period 1 or 2: most vectors
+reproduce their codes, and a few alternate between two codes (on GB300 every setting tested
+settled within 17 round trips; the unit tests check 32). At integer bit widths the error stays
+where one round trip leaves it (within 1.5% with an FP8 KV cache, whose decoded values are rounded
+again). Fractional bits also choose the outlier channels from the decoded data again, so channels
+move between the two groups before a Page settles: the error grows by 10-20% on these 128-value
+heads, and by more on MLA latents (below). The paper's TurboQuant-prod is not offered because its
+error compounds instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips
+at 2 bits, and 0.051, 0.31, and 7.0 at 4 bits.
+
+With `--vectors FILE --rope 64`, the tool runs the same round trips on real vectors. On 6,144 MLA
+latents of GLM-5.3 (BF16, 512 NoPE + 64 RoPE values; 48 layers x 128 tokens read from the KV cache
+of an end-to-end run), the normalized MSE of the whole latent is:
+
+| Bits | 1 / 4 / 16 round trips | 1 / 4 / 16 round trips with `skip_rope_quantization` |
+| --- | --- | --- |
+| 2 | 0.1148 / 0.1148 / 0.1148 | 0.0213 / 0.0213 / 0.0213 |
+| 2.5 | 0.0427 / 0.0701 / 0.0736 | 0.0136 / 0.0148 / 0.0148 |
+| 3 | 0.0328 / 0.0328 / 0.0328 | 0.0062 / 0.0062 / 0.0062 |
+| 3.5 | 0.0120 / 0.0172 / 0.0178 | 0.0039 / 0.0045 / 0.0045 |
+| 4 | 0.0089 / 0.0089 / 0.0089 | 0.0017 / 0.0017 / 0.0017 |
+
+The 64 RoPE values carry most of a latent's energy (median norm 13.5, against 4.2 for the 512 NoPE
+values), so keeping them lossless lowers the error of the whole latent. On whole latents the
+error of fractional bit widths grows by 50-70% over repeated round trips, so prefer an integer bit
+width when Pages migrate repeatedly.
 
 ### Encode and Decode Time
 
@@ -377,42 +400,44 @@ instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round tri
 decode call (256 Pages per call unless noted, cold Pages in pinned host memory, median of 20)
 for TurboQuant and NVFP4 on the same GPU, and the speed of light (SOL) of the same transfer. On
 one GB300, with the pinned memory on the GPU's own CPU socket (the GPU reads it at 211 GB/s and
-writes it at 193 GB/s) and on the other socket (125 GB/s and 122 GB/s):
+writes it at 193 GB/s) and on the other socket (126 GB/s and 122 GB/s):
 
 | Case | Geometry and TurboQuant setting | Cold Page KiB, TurboQuant / NVFP4 | Own socket: encode / decode us (vs NVFP4) | Other socket: encode / decode us (vs NVFP4) |
 | --- | --- | --- | --- | --- |
-| `glm5-bf16-mse4` | GLM-5 MLA latent, 78 x {K} x 1 x 32 x 576, BF16, 4 bits | 717 / 790 | 1076 / 1106 (0.98x / 1.11x) | 1601 / 1575 (0.92x / 0.94x) |
-| `glm5-bf16-mse3` | same, 3 bits | 541 / 790 | 848 / 1213 (0.77x / 1.22x) | 1229 / 1522 (0.72x / 0.91x) |
-| `glm5-skiprope-bf16-mse4` | same, 4 bits, `skip_rope_quantization` (512 values quantized) | 941 / 1014 | 1788 / 1908 (1.28x / 1.50x) | 2049 / 3198 (0.93x / 1.50x) |
-| `mla-fp8-mse4` | DeepSeek-V3.2 / Kimi-K3 MLA latent, 61 x {K} x 1 x 32 x 576, FP8, 4 bits | 560 / 618 | 799 / 857 (0.94x / 1.10x) | 1242 / 1230 (0.93x / 0.94x) |
-| `dsv4-csa-bf16-mse4` | DeepSeek-V4 CSA, 18 x {compressed, indexer} x 1 x 32 x {512, 34}, BF16, 4 bits | 237 / 220 | 366 / 375 (0.53x / 1.19x) | 547 / 532 (0.53x / 0.98x) |
-| `dsv4-csa-skiprope-bf16-mse4` | same, `skip_rope_quantization` (NVFP4 also keeps RoPE) | 237 / 252 | 365 / 383 (1.03x / 1.17x) | 549 / 536 (1.00x / 0.99x) |
-| `llama8b-bf16-mse4` | Llama-3.1-8B GQA, 32 x {K, V} x 8 x 32 x 128, BF16, 4 bits | 1056 / 1152 | 1455 / 1334 (0.92x / 0.92x) | 2286 / 2244 (0.92x / 0.93x) |
-| `gqa-hd64-bf16-mse4` | GQA, 36 x {K, V} x 8 x 32 x 64, BF16, 4 bits | 612 / 648 | 851 / 786 (0.94x / 0.96x) | 1329 / 1320 (0.94x / 0.96x) |
-| `glm5-bf16-mse4-8pages` | as `glm5-bf16-mse4`, 8 Pages per call | 717 / 790 | 64 / 83 (1.24x / 1.76x) | 73 / 100 (1.03x / 1.47x) |
+| `glm5-bf16-mse4` | GLM-5 MLA latent, 78 x {K} x 1 x 32 x 576, BF16, 4 bits | 717 / 790 | 1078 / 1200 (0.98x / 1.20x) | 1591 / 1566 (0.92x / 0.94x) |
+| `glm5-bf16-mse3` | same, 3 bits | 541 / 790 | 847 / 1248 (0.77x / 1.25x) | 1227 / 1541 (0.71x / 0.93x) |
+| `glm5-skiprope-bf16-mse4` | same, 4 bits, `skip_rope_quantization` (512 values quantized) | 941 / 1014 | 1782 / 1403 (1.27x / 1.10x) | 2045 / 2037 (0.93x / 0.96x) |
+| `mla-fp8-mse4` | DeepSeek-V3.2 / Kimi-K3 MLA latent, 61 x {K} x 1 x 32 x 576, FP8, 4 bits | 560 / 618 | 796 / 920 (0.94x / 1.18x) | 1240 / 1230 (0.93x / 0.94x) |
+| `dsv4-csa-bf16-mse4` | DeepSeek-V4 CSA, 18 x {compressed, indexer} x 1 x 32 x {512, 34}, BF16, 4 bits | 183 / 220 | 449 / 380 (0.63x / 1.19x) | 482 / 450 (0.47x / 0.83x) |
+| `dsv4-csa-skiprope-bf16-mse4` | same, `skip_rope_quantization` (both formats keep RoPE) | 237 / 252 | 364 / 392 (1.03x / 1.20x) | 548 / 537 (1.00x / 0.99x) |
+| `llama8b-bf16-mse4` | Llama-3.1-8B GQA, 32 x {K, V} x 8 x 32 x 128, BF16, 4 bits | 1056 / 1152 | 1458 / 1334 (0.92x / 0.92x) | 2292 / 2247 (0.92x / 0.93x) |
+| `gqa-hd64-bf16-mse4` | GQA, 36 x {K, V} x 8 x 32 x 64, BF16, 4 bits | 612 / 648 | 849 / 784 (0.94x / 0.96x) | 1333 / 1322 (0.94x / 0.96x) |
+| `glm5-bf16-mse4-8pages` | as `glm5-bf16-mse4`, 8 Pages per call | 717 / 790 | 64 / 84 (1.25x / 1.75x) | 74 / 102 (1.04x / 1.50x) |
 
 Conventional K/V Pages are bound by the host link in both formats (96-100% of SOL), so
 TurboQuant takes about the NVFP4 time scaled by the cold-page size. MLA latents and DeepSeek-V4
-CSA rows need more decode work per byte, because every instance (256 or 448 values) is rotated
-back on tensor cores: on the faster link their decode takes 1.1-1.2x the NVFP4 time, while
+CSA rows need more decode work per byte, because every instance (256 to 512 values) is rotated
+back on tensor cores: on the faster link their decode takes 1.1-1.25x the NVFP4 time, while
 encode stays at or below it; on the slower link both are link bound and TurboQuant is faster.
-With `skip_rope_quantization` the GLM-5 latent is a single 512-value instance, whose decode
-accumulates its output in two blocks and reads the codes twice; it takes 1.5x the NVFP4 time.
-NVFP4's default DeepSeek-V4 format quantizes RoPE as two FP4 components, which makes its encode
-slow; `dsv4-csa-skiprope-bf16-mse4` compares like with like. Small calls are bound by fixed
-costs, such as the one decode launch per instance of a 576-value latent. The launch shapes of
-rows wider than 256 values were measured on GB300 (SM103) and apply to SM100-family GPUs; other
-GPUs use generic shapes. Run the benchmark on your system before relying on these numbers.
+With `skip_rope_quantization` the GLM-5 latent is a single 512-value instance, whose encode takes
+1.27x the NVFP4 time; its decode accumulates the output in two halves from codes read once.
+DeepSeek-V4 CSA rows are one 512-value instance by default; NVFP4's default format quantizes
+their RoPE as two FP4 components, which makes its encode slow, so `dsv4-csa-skiprope-bf16-mse4`
+compares like with like. Small calls are bound by fixed costs, such as the one decode launch per
+instance of a 576-value latent. The launch shapes of rows wider than 256 values were measured on
+GB300 (SM103) and apply to SM100-family GPUs; other GPUs use generic shapes. Run the benchmark on
+your system before relying on these numbers.
 
-### End-to-End Accuracy
+### End-to-End Smoke Test
 
-`examples/kv_cache_compression/cold_tier_accuracy.py` prefills synthetic prefixes of
+`examples/kv_cache_compression/cold_tier_accuracy.py` checks that a model still answers through
+decoded cold Pages; it is a smoke test, not accuracy evidence. It prefills synthetic prefixes of
 name-and-code facts, pushes their Pages to the Host tier with unrelated prompts, and then asks
-exact-match questions whose prefixes must be onboarded and decoded again. A run counts only if
-the iteration statistics of its question phase show Attention Pages reused from the cold tier
-(Disk with `--disk`) and bytes onboarded; they do not show which questions those Pages served.
-With TP4/EP4 on four
-GB300 GPUs, greedy decoding, two 6144-token prefixes, and 400 questions:
+easy exact-match questions whose prefixes must be onboarded and decoded again. A run counts only
+if the iteration statistics of its question phase show Attention Pages reused from the cold tier
+(Disk with `--disk`) and bytes onboarded; they do not show which questions those Pages served,
+and each Page goes to the cold tier and back once. With TP4/EP4 on four GB300 GPUs, greedy
+decoding, two 6144-token prefixes, and 400 questions:
 
 | Model | none | NVFP4 | TurboQuant 4 | TurboQuant 3.5 | TurboQuant 3 | TurboQuant 2.5 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -421,7 +446,8 @@ GB300 GPUs, greedy decoding, two 6144-token prefixes, and 400 questions:
 
 ## Enablement Checklist
 
-1. Run the PyTorch backend on a GPU with compute capability 8.0 or newer.
+1. Run the PyTorch backend on a GPU with compute capability 8.0 or newer, or
+   8.9 or newer with an FP8 active KV cache.
 2. Select the native C++ KVCacheManagerV2 with
    `use_kv_cache_manager_v2: true`.
 3. Keep `kv_cache_config.dtype` at the model's intended runtime KV type:

@@ -6,13 +6,12 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config,
     read_modelopt_quant_config,
@@ -25,8 +24,11 @@ from .quantization_for_cold_page import (
     _DEEPSEEK_V4_HCA_ROLES,
     _DEEPSEEK_V4_NOPE_DIM,
     _DEEPSEEK_V4_ROW_STRIDE,
-    _SKIP_ROPE_QUANTIZATION_MODEL_TYPES,
+    _RUNTIME_TYPES,
     ColdPageQuantizationCompression,
+    _ColdPageBufferLayout,
+    _ColdPageCodecState,
+    _ColdPageLayerLayout,
 )
 
 if TYPE_CHECKING:
@@ -66,23 +68,11 @@ class _Nvfp4Scales:
 
 
 @dataclass(frozen=True)
-class _Nvfp4BufferLayout:
-    """One hot buffer; ``quantized_range_*`` picks which numbers of each K/V vector become NVFP4."""
+class _Nvfp4BufferLayout(_ColdPageBufferLayout):
+    """A hot buffer with NVFP4 scales; a buffer without scales is stored unchanged."""
 
-    role: str
     scales: _Nvfp4Scales | None = None
-    quantized_range_start: int = 0
-    quantized_range_elements: int = 0
     rope_residual_elements: int = 0
-
-
-@dataclass(frozen=True)
-class _Nvfp4LayerLayout:
-    layer_id: int
-    num_kv_heads: int
-    tokens_per_page: int
-    raw_row_stride_elements: int
-    buffers: tuple[_Nvfp4BufferLayout, ...]
 
 
 @dataclass(frozen=True)
@@ -95,16 +85,6 @@ class _Nvfp4ColdPageMetadata:
     num_buffers: int
     max_half_groups_per_tile: int
     cold_page_bytes: int
-
-
-@dataclass
-class _Nvfp4ColdPageCodecState:
-    """NVFP4 state owned by one target, draft, or retry codec."""
-
-    layer_layouts: dict[int, _Nvfp4LayerLayout]
-    layer_ids: tuple[int, ...]
-    runtime_type: int
-    lifecycle_metadata: tuple[_Nvfp4ColdPageMetadata, ...] = field(init=False)
 
 
 def _load_modelopt_nvfp4_scales(
@@ -179,6 +159,10 @@ def _load_modelopt_nvfp4_scales(
 class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     """NVFP4 layout, calibration metadata, and CUDA dispatch."""
 
+    _FORMAT_NAME = "NVFP4"
+    _RANGE_ALIGNMENT = _ELEMENTS_PER_SCALE
+    _RANGE_ALIGNMENT_UNIT = "NVFP4 scale groups"
+
     def __init__(
         self,
         config: "ColdPageQuantizationCompressionConfig",
@@ -187,19 +171,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     ) -> None:
         super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
-        self._skip_rope_quantization = bool(config.skip_rope_quantization)
         self._nvfp4_residual_dim = config.nvfp4_residual_dim
-        model_type = getattr(pretrained_config, "model_type", None)
-        architectures = getattr(pretrained_config, "architectures", None) or []
-        if architectures and architectures[0] == "GlmMoeDsaForCausalLM":
-            model_type = "glm_moe_dsa"
-        if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
-            logger.warning(
-                "skip_rope_quantization is supported for model types "
-                f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
-                f"{model_type!r} and turning whole K and V vectors into NVFP4."
-            )
-            self._skip_rope_quantization = False
 
     def _build_deepseek_v4_layer_layouts(
         self,
@@ -210,13 +182,13 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         runtime_type: int,
         is_draft: bool,
         skip_rope: bool,
-    ) -> dict[int, _Nvfp4LayerLayout | None]:
+    ) -> dict[int, _ColdPageLayerLayout | None]:
         """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
 
         roles_by_layer, has_csa_cache, model_layers = self._deepseek_v4_model_layers(
             attention_layers, pp_layers
         )
-        layouts: dict[int, _Nvfp4LayerLayout | None] = {}
+        layouts: dict[int, _ColdPageLayerLayout | None] = {}
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
             buffer_roles = roles_by_layer.get(layer_id)
@@ -225,7 +197,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             if buffer_roles != _DEEPSEEK_V4_CSA_ROLES:
                 layout = None
                 if has_csa_cache and buffer_roles == _DEEPSEEK_V4_HCA_ROLES:
-                    layout = _Nvfp4LayerLayout(
+                    layout = _ColdPageLayerLayout(
                         layer_id=layer_id,
                         num_kv_heads=0,
                         tokens_per_page=0,
@@ -259,7 +231,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 rope=(_DEEPSEEK_V4_NOPE_DIM, _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM),
                 buffer_name=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
             )
-            layouts[layer_id] = _Nvfp4LayerLayout(
+            layouts[layer_id] = _ColdPageLayerLayout(
                 layer_id=layer_id,
                 num_kv_heads=1,
                 tokens_per_page=tokens_per_page,
@@ -291,14 +263,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-    ) -> _Nvfp4ColdPageCodecState:
+    ) -> _ColdPageCodecState:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
-        runtime_type = {
-            DataType.HALF: 0,
-            DataType.BF16: 1,
-            DataType.FP8: 2,
-        }.get(runtime_dtype)
+        runtime_type = _RUNTIME_TYPES.get(runtime_dtype)
         attention_layers = [
             layer for layer in cache_config.layers if isinstance(layer, AttentionLayerConfig)
         ]
@@ -308,14 +276,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"Attention KV, not {runtime_dtype}"
             )
 
-        # The codec holds only the target model's config, so it cannot locate RoPE
-        # in a draft model's K vectors: draft KVCMs always quantize whole vectors.
-        skip_rope = self._skip_rope_quantization
-        if skip_rope and is_draft:
-            logger.warning(
-                "skip_rope_quantization: draft-model K and V vectors become NVFP4 in full."
-            )
-            skip_rope = False
+        skip_rope = self._skip_rope(is_draft)
 
         deepseek_v4_layouts = {}
         if self.pretrained_config.model_type == "deepseek_v4":
@@ -382,7 +343,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     buffer_layouts.append(_Nvfp4BufferLayout(role=role))
 
             layer_layouts.append(
-                _Nvfp4LayerLayout(
+                _ColdPageLayerLayout(
                     layer_id=layer_id,
                     num_kv_heads=num_kv_heads,
                     tokens_per_page=tokens_per_page,
@@ -392,14 +353,14 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             )
 
         layouts_by_layer = {layout.layer_id: layout for layout in layer_layouts}
-        return _Nvfp4ColdPageCodecState(
+        return _ColdPageCodecState(
             layer_layouts=layouts_by_layer,
             layer_ids=tuple(sorted(layouts_by_layer)),
             runtime_type=runtime_type if runtime_type is not None else 0,
         )
 
     def build_lifecycle_metadata(
-        self, codec_state: _Nvfp4ColdPageCodecState, lifecycle: object
+        self, codec_state: _ColdPageCodecState, lifecycle: object
     ) -> _Nvfp4ColdPageMetadata:
         wide_rows: list[list[int]] = []
         integer_rows: list[list[int]] = []
@@ -538,7 +499,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
     def encode_cold_pages(
         self,
-        codec_state: _Nvfp4ColdPageCodecState,
+        codec_state: _ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
@@ -564,7 +525,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
     def decode_cold_pages(
         self,
-        codec_state: _Nvfp4ColdPageCodecState,
+        codec_state: _ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,

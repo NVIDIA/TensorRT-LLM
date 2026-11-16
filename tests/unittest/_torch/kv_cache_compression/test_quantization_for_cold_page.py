@@ -1604,7 +1604,7 @@ def test_skip_rope_quantization_quantizes_draft_kv_rows_whole() -> None:
     native, _ = _native()
     with patch(
         "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-        "nvfp4_quantization.logger"
+        "quantization_for_cold_page.logger"
     ) as mock_logger:
         layout = _create_kv(native, _partial_rotary_config(), 256, is_draft=True)
     mock_logger.warning.assert_called_once()
@@ -1622,7 +1622,7 @@ def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_supported_
         config.architectures = ["DeepseekV32ForCausalLM"]
     with patch(
         "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-        "nvfp4_quantization.logger"
+        "quantization_for_cold_page.logger"
     ) as mock_logger:
         layout = _create_kv(native, config, 576, roles=("key",))
     mock_logger.warning.assert_called_once()
