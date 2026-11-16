@@ -1405,15 +1405,15 @@ standard-no-fastapi-cloud-cli = ["email-validator (>=2.0.0)", "fastapi-cli[stand
 
 [[package]]
 name = "fastapi"
-version = "0.163.0"
+version = "0.163.1"
 description = "FastAPI framework, high performance, easy to learn, fast to code, ready for production"
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version >= \"3.11\""
 files = [
-    {file = "fastapi-0.163.0-py3-none-any.whl", hash = "sha256:7572550ab4935e3ff373dc0191aea410d6c48127cc5477bc290b992fe539e345"},
-    {file = "fastapi-0.163.0.tar.gz", hash = "sha256:ef55fa066d74b922aac7231af7869c4469b88ca00cac5d0421e42ceee213a902"},
+    {file = "fastapi-0.163.1-py3-none-any.whl", hash = "sha256:68f2d8050f5c3583121c0d203046cc7def5c16a7d6c43a0e7707a8ea610fe2d3"},
+    {file = "fastapi-0.163.1.tar.gz", hash = "sha256:3d364b02a68b67292e833ff2dfed3b8dc3aeadf73e271c15316c6c166668792f"},
 ]
 
 [package.dependencies]
@@ -6588,18 +6588,18 @@ files = [
 
 [[package]]
 name = "sympy"
-version = "1.14.0rc1"
+version = "1.15.0rc2"
 description = "Computer algebra system (CAS) in Python"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sympy-1.14.0rc1-py3-none-any.whl", hash = "sha256:e6dae8bb9a8f3aedd4dd4af9d2b51f6be00641d577dcce32ed6e0c25b1dcfcc1"},
-    {file = "sympy-1.14.0rc1.tar.gz", hash = "sha256:c0de81525d0fe6f4c1ef41a5519229e1d7b36cdc94de716527aca8cadaf21dde"},
+    {file = "sympy-1.15.0rc2-py3-none-any.whl", hash = "sha256:79d4d7f865276061dab8152c61a7f824f0e5838535113f9a5755ae27e76cc529"},
+    {file = "sympy-1.15.0rc2.tar.gz", hash = "sha256:401cbfa76b6edccd67395c5b2020b6f839369a5cf7647e3daffd69bac4f1ad53"},
 ]
 
 [package.dependencies]
-mpmath = ">=1.1.0"
+mpmath = ">=1.1.0,<1.5"
 
 [package.extras]
 dev = ["hypothesis (>=6.70.0)", "pytest (>=7.1.0)"]
