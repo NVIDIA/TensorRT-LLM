@@ -54,7 +54,7 @@ if(ENABLE_UCX)
     PRIVATE tllm::common_cuda
             tllm::common_environment
             tllm::runtime_distributed
-            tllm::executor_values
+            tllm::executor_socket_serialization
             pg_utils
             ${Python3_LIBRARIES}
             Threads::Threads)

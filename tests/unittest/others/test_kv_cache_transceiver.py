@@ -4,6 +4,7 @@
 import gc
 import multiprocessing
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -236,6 +237,24 @@ def ctx_gen_kv_cache_dtype(request):
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend_runtime):
     backend, transceiver_runtime = backend_runtime
+    if backend == "UCX":
+        # Run static destructors in a child so allocator failures fail this test.
+        library_dir = os.path.join(os.path.dirname(tensorrt_llm.__file__),
+                                   "libs")
+        result = subprocess.run([
+            sys.executable,
+            "-c",
+            "import ctypes, os, resource, sys; "
+            "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+            "host = ctypes.CDLL(sys.argv[1], mode=os.RTLD_GLOBAL | os.RTLD_NOW); "
+            "wrapper = ctypes.CDLL(sys.argv[2], mode=os.RTLD_LOCAL | os.RTLD_NOW)",
+            os.path.join(library_dir, "libtensorrt_llm.so"),
+            os.path.join(library_dir, "libtensorrt_llm_ucx_wrapper.so"),
+        ],
+                                capture_output=True,
+                                text=True,
+                                timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
     tensorrt_llm.logger.set_level("info")
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
