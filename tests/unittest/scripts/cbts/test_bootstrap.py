@@ -286,7 +286,7 @@ def test_build_and_ray_processes_opt_out(cbts_env):
         "import os, subprocess, sys\n"
         "print(os.environ.get('CBTS_COVERAGE_CONFIG', '<unset>'))\n"
         "subprocess.run([sys.executable, '-c', "
-        "\"import os; print(os.environ.get('CBTS_COVERAGE_CONFIG', '<unset>'))\"], check=True)\n"
+        "\"import os; print(os.environ.get('CBTS_COVERAGE_CONFIG', '<unset>'))\"], check=True, timeout=45)\n"
     )
     result = subprocess.run(
         [sys.executable, str(agent)],
@@ -295,6 +295,7 @@ def test_build_and_ray_processes_opt_out(cbts_env):
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout.splitlines() == ["<unset>", "<unset>"]
 
