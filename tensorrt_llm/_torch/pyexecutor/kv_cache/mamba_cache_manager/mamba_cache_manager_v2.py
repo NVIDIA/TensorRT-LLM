@@ -126,8 +126,10 @@ GB = 1 << 30
 # requests per batch that can take the path, at most max_batch_size and
 # _INFORWARD_SNAPSHOT_MAX_ROWS, within _INFORWARD_SNAPSHOT_STAGING_BYTES) are
 # allocated after the pools, outside the GPU cache quota.
-# TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS and TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB
-# override the two caps. Requests beyond the rows run their tails a step later.
+# TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS (rows) and TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB
+# (MiB) override the two caps. Requests beyond the rows run their tails a step later.
+# Every rank schedules on its own and the scheduler budgets split rows from these
+# caps, so both must be set identically on every rank of a server.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
 _INFORWARD_SNAPSHOT_MAX_ROWS_ENV = "TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS"
@@ -136,9 +138,15 @@ _INFORWARD_SNAPSHOT_STAGING_MIB_ENV = "TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB"
 
 def _env_positive_int(name: str, default: int) -> int:
     """A positive int from the environment, or `default` when unset."""
-    value = int(os.environ.get(name) or default)
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from err
     if value <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value}")
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
     return value
 
 
@@ -1080,11 +1088,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         One typical request with ``cold_tier_states_per_request`` states, instead of the GPU
         split's live state plus every retained snapshot: a released conversation mostly comes
         back through its latest endpoint, so the rest of the cold quota goes to attention pages.
+        An explicit ``pool_ratio`` wins: the cold tiers keep its slot-count ratios.
         """
         if num_cache_tiers < 2:
             return None
         num_states = kv_cache_config.mamba_state_config.cold_tier_states_per_request
         if num_states is None or not kv_cache_config.enable_block_reuse:
+            return None
+        if kv_cache_config.pool_ratio is not None:
+            logger.info(
+                "[MambaHybridCacheManagerV2] kv_cache_config.pool_ratio is set, so the cold "
+                "cache tiers keep its slot-count ratios and cold_tier_states_per_request is unused"
+            )
             return None
         capacity = self._get_typical_request_capacity(kv_cache_config)
         logger.info(

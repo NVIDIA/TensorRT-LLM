@@ -2339,23 +2339,26 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
 
 
 @pytest.mark.parametrize(
-    "states, num_tiers, reuse, expected",
+    "states, num_tiers, reuse, pool_ratio, expected",
     [
-        (None, 2, True, None),
-        (1, 1, True, None),
-        (1, 2, False, None),
-        (1, 2, True, [128]),
-        (2, 3, True, [64, 64]),
-        (3, 2, True, [43, 43, 42]),
+        (None, 2, True, None, None),
+        (1, 1, True, None, None),
+        (1, 2, False, None, None),
+        (1, 2, True, None, [128]),
+        (2, 3, True, None, [64, 64]),
+        (3, 2, True, None, [43, 43, 42]),
+        # An explicit pool_ratio keeps its slot-count ratios in the cold tiers too.
+        (2, 2, True, [0.5, 0.5], None),
     ],
 )
-def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, expected) -> None:
+def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, pool_ratio, expected) -> None:
     """cold_tier_states_per_request sizes the cold tiers from that many states per typical request."""
     config = KvCacheConfig(
         max_gpu_total_bytes=32 << 20,
         host_cache_size=0,
         avg_seq_len=128,
         enable_block_reuse=reuse,
+        pool_ratio=pool_ratio,
         mamba_state_config=MambaStateConfig(
             additional_snapshot_offsets_from_start=[32, 64],
             additional_snapshot_offsets_from_end=[2],
