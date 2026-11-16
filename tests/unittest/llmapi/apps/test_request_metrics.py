@@ -601,3 +601,71 @@ class TestJsonlWriterSurvival:
             release.set()
 
         assert task.cancelled(), "close() must still be able to cancel a stuck writer task"
+
+
+@pytest.fixture()
+def logged():
+    """Capture the warnings and errors the TRT-LLM logger emits, as (level, message) pairs."""
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append((record.levelname, record.getMessage()))
+
+    handler = Capture(level=logging.WARNING)
+    stdlib_logger = logger._logger
+    previous_level = stdlib_logger.level
+    previous_min_severity = logger._min_severity
+    stdlib_logger.addHandler(handler)
+    stdlib_logger.setLevel(logging.WARNING)
+    logger._min_severity = "warning"
+    try:
+        yield messages
+    finally:
+        logger._min_severity = previous_min_severity
+        stdlib_logger.setLevel(previous_level)
+        stdlib_logger.removeHandler(handler)
+
+
+class TestPerfMetricsJsonlWriterConfiguration:
+    """PerfMetricsJsonlWriter is a configuration of the shared JSONL record writer.
+
+    These pin what it configures: which errors mean a malformed record, and the queue and
+    batch sizes it hands the shared writer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_the_phases_the_schema_needs_is_malformed(
+        self, tmp_path, logged
+    ):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        writer.submit({"phases": {}})  # _jsonl_record raises KeyError('server')
+        writer.submit(_record())
+        await writer.close()
+
+        assert _written_request_ids(tmp_path) == [42]
+        assert writer.dropped_records == 1
+        assert [level for level, _ in logged] == ["WARNING"], (
+            "a record the schema cannot shape is malformed: a warning, not an error with a traceback"
+        )
+        assert "Dropped malformed performance metrics record: 'server'" in logged[0][1]
+
+    @pytest.mark.asyncio
+    async def test_sixty_four_records_are_appended_per_write(self, tmp_path, monkeypatch):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        appends = []
+        real_write = writer._write
+
+        def counting_write(data):
+            appends.append(data.count("\n"))
+            real_write(data)
+
+        monkeypatch.setattr(writer, "_write", counting_write)
+        for _ in range(65):  # all queued before the drain task first runs: 64 + 1
+            writer.submit(_record())
+        await writer.close()
+
+        assert appends == [64, 1]
+        assert _written_request_ids(tmp_path) == [42] * 65
