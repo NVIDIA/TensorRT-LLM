@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import weakref
 
 import torch
@@ -28,49 +29,48 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.utils import model_extra_attrs
 
-
-@torch.no_grad()
-def test_unified_text_forward_matches_hf(monkeypatch):
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
-    text_config = {
-        "vocab_size": 64,
-        "pad_token_id": 0,
-        "bos_token_id": 1,
-        "eos_token_id": 2,
-        "hidden_size": 256,
-        "intermediate_size": 512,
-        "num_hidden_layers": 1,
-        "layer_types": ["full_attention"],
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 64,
-        "global_head_dim": 128,
-        "num_global_key_value_heads": 1,
-        "hidden_activation": "gelu_pytorch_tanh",
-        "max_position_embeddings": 128,
-        "rms_norm_eps": 1e-6,
-        "sliding_window": 4,
-        "attention_k_eq_v": False,
-        "enable_moe_block": False,
-        "num_kv_shared_layers": 0,
-        "hidden_size_per_layer_input": 0,
-        "use_double_wide_mlp": False,
-        "final_logit_softcapping": 30.0,
-        "use_bidirectional_attention": None,
-        "attention_bias": False,
-        "attention_dropout": 0.0,
-        "rope_parameters": {
-            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
-            "full_attention": {
-                "rope_type": "proportional",
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-            },
+TEXT_CONFIG = {
+    "vocab_size": 64,
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "num_hidden_layers": 1,
+    "layer_types": ["full_attention"],
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "global_head_dim": 128,
+    "num_global_key_value_heads": 1,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 128,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 4,
+    "attention_k_eq_v": False,
+    "enable_moe_block": False,
+    "num_kv_shared_layers": 0,
+    "hidden_size_per_layer_input": 0,
+    "use_double_wide_mlp": False,
+    "final_logit_softcapping": 30.0,
+    "use_bidirectional_attention": None,
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {
+            "rope_type": "proportional",
+            "partial_rotary_factor": 1.0,
+            "rope_theta": 10000.0,
         },
-        "torch_dtype": "bfloat16",
-        "tie_word_embeddings": True,
-    }
-    config = Gemma4UnifiedConfig(
+    },
+    "torch_dtype": "bfloat16",
+    "tie_word_embeddings": True,
+}
+
+
+def _unified_config(text_config):
+    return Gemma4UnifiedConfig(
         architectures=["Gemma4UnifiedForConditionalGeneration"],
         text_config=text_config,
         vision_config=None,
@@ -83,6 +83,13 @@ def test_unified_text_forward_matches_hf(monkeypatch):
         eos_token_id=2,
         torch_dtype="bfloat16",
     )
+
+
+@torch.no_grad()
+def test_unified_text_forward_matches_hf(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    text_config = copy.deepcopy(TEXT_CONFIG)
+    config = _unified_config(text_config)
     model_class = get_registered_model_class("Gemma4UnifiedForConditionalGeneration")
     assert model_class is Gemma4UnifiedForConditionalGeneration
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
@@ -147,3 +154,55 @@ def test_unified_text_forward_matches_hf(monkeypatch):
             return_context_logits=True,
         )
     torch.testing.assert_close(graph_logits, logits, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_unified_ple_decoder_replays_breakable_prefill_graph(monkeypatch):
+    """A one-layer random-weight PLE decoder captures once, then replays new token ids,
+    embeddings and per-layer token ids exactly as eager runs them."""
+    from _torch.helpers import check_breakable_prefill_replay
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    text_config = {
+        **copy.deepcopy(TEXT_CONFIG),
+        "hidden_size_per_layer_input": 16,
+        "vocab_size_per_layer_input": 64,
+    }
+    model_config = ModelConfig(
+        pretrained_config=_unified_config(text_config), attn_backend="TRTLLM"
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        model = Gemma4UnifiedForConditionalGeneration(model_config).cuda().eval()
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1.0)
+            else:
+                parameter.normal_(mean=0.0, std=0.02)
+        embeds = torch.randn((4, 256), device="cuda").bfloat16()
+    llm = model.llm
+    assert llm.model.hidden_size_per_layer_input == 16
+    metadata = TrtllmAttentionMetadata(
+        seq_lens=torch.tensor([4], dtype=torch.int),
+        num_contexts=1,
+        max_num_requests=1,
+        max_num_tokens=4,
+        request_ids=[0],
+    )
+    metadata.max_seq_len = 128
+
+    def forward(inputs):
+        metadata.prepare()
+        return llm(attn_metadata=metadata, return_context_logits=True, **inputs)
+
+    ids = torch.arange(4, dtype=torch.int32, device="cuda")
+    positions = ids.unsqueeze(0)
+    steps = [
+        {"input_ids": ids + 3, "position_ids": positions},
+        {"input_ids": ids + 9, "position_ids": positions},
+        # Fused multimodal embeddings come with their own per-layer token ids.
+        {"inputs_embeds": embeds, "ple_input_ids": ids + 9, "position_ids": positions},
+        {"inputs_embeds": embeds, "ple_input_ids": ids + 20, "position_ids": positions},
+    ]
+    attrs = {**model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+    check_breakable_prefill_replay(model, attrs, forward, steps, num_tokens=4)

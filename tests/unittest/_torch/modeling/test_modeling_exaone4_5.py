@@ -3,7 +3,9 @@
 
 import copy
 import os
+import weakref
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -112,16 +114,12 @@ EXAONE_4_5_TEST_CONFIG = {
 _EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@torch.inference_mode()
-def test_exaone4_construction_and_forward() -> None:
-    """Check EXAONE 4 construction, BF16 weights, and forward behavior."""
+def _make_exaone4_model():
+    """Build a two-layer EXAONE 4 decoder with random weights and its ModelConfig."""
     from transformers import Exaone4Config
 
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_exaone4 import Exaone4ForCausalLM
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 
     config = Exaone4Config(
         architectures=["Exaone4ForCausalLM"],
@@ -141,25 +139,49 @@ def test_exaone4_construction_and_forward() -> None:
         pad_token_id=None,
         tie_word_embeddings=False,
     )
-    model_class = MODEL_CLASS_MAPPING["Exaone4ForCausalLM"]
-    assert model_class is Exaone4ForCausalLM
+    model_config = ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        max_num_tokens=4,
+        max_seq_len=32,
+    )
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(42)
         with torch.device("cuda"):
-            model = model_class(
-                ModelConfig(
-                    pretrained_config=config,
-                    attn_backend="TRTLLM",
-                    max_num_tokens=4,
-                    max_seq_len=32,
-                )
-            ).eval()
+            model = Exaone4ForCausalLM(model_config).eval()
         for parameter in model.parameters():
             if parameter.ndim == 1:
                 parameter.fill_(1.0)
             else:
                 parameter.normal_(mean=0.0, std=0.02)
+    return model_config, model
 
+
+def _make_exaone4_metadata():
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=4,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        num_contexts=1,
+        request_ids=[0],
+    )
+    metadata.max_seq_len = 32
+    return metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_exaone4_construction_and_forward() -> None:
+    """Check EXAONE 4 construction, BF16 weights, and forward behavior."""
+    from tensorrt_llm._torch.models.modeling_exaone4 import Exaone4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    model_config, model = _make_exaone4_model()
+    config = model_config.pretrained_config
+
+    assert MODEL_CLASS_MAPPING["Exaone4ForCausalLM"] is Exaone4ForCausalLM
     assert isinstance(model, Exaone4ForCausalLM)
     assert model.config.torch_dtype == torch.bfloat16
     assert model.model.embed_tokens.weight.dtype == torch.bfloat16
@@ -169,14 +191,7 @@ def test_exaone4_construction_and_forward() -> None:
 
     input_ids = torch.tensor([1, 5, 7, 9], dtype=torch.int32, device="cuda")
     position_ids = torch.arange(4, dtype=torch.int32, device="cuda")
-    metadata = TrtllmAttentionMetadata(
-        max_num_requests=1,
-        max_num_tokens=4,
-        seq_lens=torch.tensor([4], dtype=torch.int32),
-        num_contexts=1,
-        request_ids=[0],
-    )
-    metadata.max_seq_len = 32
+    metadata = _make_exaone4_metadata()
     metadata.prepare()
     embeddings = model.model.embed_tokens(input_ids)
     logits = model(
@@ -255,6 +270,37 @@ def test_exaone4_5_language_model_shares_attention_registry(monkeypatch) -> None
 
     (llm_model_config,) = built
     assert llm_model_config.extra_attrs is model_config.extra_attrs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_exaone4_5_language_model_replays_breakable_prefill_graph() -> None:
+    """The real decoder body captures once, then replays new embeddings and token ids
+    exactly as eager runs them."""
+    from _torch.helpers import check_breakable_prefill_replay
+
+    model_config, llm = _make_exaone4_model()
+    model = object.__new__(Exaone4_5_ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.llm = llm
+    model.model_config = SimpleNamespace(disable_mm_encoder=False)
+    metadata = _make_exaone4_metadata()
+
+    def forward(inputs):
+        metadata.prepare()
+        return llm(attn_metadata=metadata, return_context_logits=True, **inputs)
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    embeds = torch.randn((2, 4, 256), generator=generator, device="cuda").bfloat16()
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    steps = [
+        {"inputs_embeds": embeds[0], "position_ids": positions},
+        {"inputs_embeds": embeds[1], "position_ids": positions},
+        # A text batch replays the same graph on the wrapper's token embeddings.
+        {"input_ids": positions + 3, "position_ids": positions},
+    ]
+    attrs = {**model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+    check_breakable_prefill_replay(model, attrs, forward, steps, num_tokens=4)
 
 
 @dataclass(repr=False)
