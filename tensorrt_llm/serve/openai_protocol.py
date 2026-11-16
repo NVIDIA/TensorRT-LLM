@@ -114,8 +114,7 @@ def _logit_bias_to_embedding_bias(
     elif vocab_size <= 0:
         raise ValueError("vocab_size must be positive when logit_bias is used")
 
-    # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
-    embedding_bias_list = []
+    embedding_bias_dict = {}
 
     # Apply biases for specified token IDs
     for token_str, bias in logit_bias.items():
@@ -144,10 +143,12 @@ def _logit_bias_to_embedding_bias(
             raise ValueError(
                 f"logit_bias value for token ID {token_id} must be in "
                 f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
-        embedding_bias_list.append((token_id, bias_value))
+        embedding_bias_dict[
+            token_id] = bias_value  # if several keys resolve to same token_id, last one wins
 
     return tuple(
-        sorted(embedding_bias_list, key=lambda idx_and_val: idx_and_val[0]))
+        sorted(embedding_bias_dict.items(),
+               key=lambda idx_and_val: idx_and_val[0]))
 
 
 class OpenAIBaseModel(BaseModel):
