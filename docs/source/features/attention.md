@@ -34,6 +34,36 @@ The TRT-LLM backend, `TrtllmAttention`, serves as the default backend and suppor
 1. **Fused QKV Input**: It can accept a single QKV tensor as input, which is more efficient compared to using separate Q, K, and V tensors.
 2. **FP8 Output**: It supports outputting the attention result in FP8 format, fusing quantization into the attention computation process.
 
+## Deterministic prefill and decode
+
+Set `FORCE_ATTENTION_KERNEL_DETERMINISTIC=1` before constructing the model to
+enable fixed-reduction attention in the TRT-LLM backend. `FORCE_DETERMINISTIC=1`
+also enables this path. The same query and cached keys and values use the same
+arithmetic in prefill, chunked prefill, and decode, independent of neighboring
+requests. This is an attention-level guarantee; projections, normalization,
+MoE, and communication can introduce differences elsewhere in a model.
+
+The deterministic FMHA library supports BF16 causal MHA/GQA with BF16 paged KV
+caches, head dimensions 64, 128, and 256, page sizes 32 and 64, beam width 1,
+and at most 32 query heads per KV head on SM100/SM103. Sliding windows,
+attention sinks, cross attention, MLA, and speculative decoding are not
+supported. Unsupported layers or batches emit a warning and use the existing
+fallback, which does not provide this arithmetic guarantee. An explicit
+`TLLM_FMHA_LIBS` override must include `deterministic` to select this library;
+if it leaves out `fallback`, an unsupported layer or batch raises a
+`RuntimeError` instead.
+
+The kernel uses Tensor Cores and rounds the attention probabilities to BF16
+before the value product, so its accuracy against an exact reference is that of
+ordinary BF16 attention. Keys are reduced in fixed 1024-key segments. Decode
+evaluates the segments in parallel when the attention workspace can hold their
+partial results (up to 256 MiB is requested) and serially otherwise; both
+layouts produce the same bits.
+
+This opt-in path favors reproducibility over throughput. Measure prefill and
+decode separately for the intended workload; enabling the flag is not a
+promise of unchanged latency or equivalence to another framework's attention.
+
 ## Implement a New Attention Backend
 
 You can implement a new attention backend to integrate other attention libraries.

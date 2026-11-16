@@ -256,6 +256,9 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         FlashInferTrtllmGenFmha._run_generation_preprocess, fmha
     )
     fmha._run_generation_decode = MethodType(FlashInferTrtllmGenFmha._run_generation_decode, fmha)
+    # _run_generation_decode launches the kernel through the instance's
+    # _run_attention hook; bind the real one so the call reaches flashinfer.decode.
+    fmha._run_attention = MethodType(FlashInferTrtllmGenFmha._run_attention, fmha)
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 
