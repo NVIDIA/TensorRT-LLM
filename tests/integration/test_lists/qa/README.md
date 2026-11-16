@@ -49,16 +49,22 @@ pip3 install -r ${TensorRT-LLM_PATH}/requirements-dev.txt
 This directory contains various test configuration files:
 
 ### Functional Test Lists
-- `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
+- `functional/llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
 - `functional/llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
-- `llm_function_rtx6k.txt` - RTX 6000 series specific tests
-- `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
+- `functional/llm_function_rtx6k.txt` - RTX 6000 series specific tests
+- `functional/llm_function_stress.txt` - Functional stress test cases
 
-YAML case lists with `defaults` and `tests[].case` belong in `functional/`.
+All functional test lists belong in `functional/`. Launch YAML with `defaults`
+and `tests[].case` and plain-text lists live directly in that folder. Versioned
+functional databases, such as `llm_spark_func.yml`, live in `functional/test-db/`
+so their `trt-test-db` queries do not scan launch YAML.
 Keep only versioned `trt-test-db` YAML files directly in `qa/`. The pinned
 `trt-test-db` reader scans `qa/*.yml` without recursion and parses every file
 before selecting a context; a case list there prevents performance list generation.
-Both QA validators include `functional/*.yml`.
+Consumers must use the new functional-list paths. Text-list discovery must include
+`functional/*.txt`; Spark database queries must use `functional/test-db/` so they
+do not scan the incompatible multinode launch YAML. No compatibility links remain
+in the top-level QA directory.
 
 ### Multi-node Launch Parameters
 
@@ -107,10 +113,10 @@ Do not pass this case list to `trt-test-db`; performance selectors continue to u
 - `llm_trt_integration_perf_sanity.yml` - Integration performance sanity checks
 
 ### Triton Backend Tests
-- `llm_triton_integration.txt` - Triton backend integration tests
+- `functional/llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
-- `llm_spark_func.txt` - Functional tests for DGX-Spark release
+- `functional/test-db/llm_spark_func.yml` - Functional tests for DGX-Spark release
 - `llm_spark_perf.yml` - Performance tests for DGX-Spark release
 
 ## Test Execution Schedule
@@ -133,7 +139,7 @@ To run specific test categories:
 # direct to defs folder
 cd tests/integration/defs
 # Run all fp8 functional test
-pytest --no-header -vs --test-list=../test_lists/qa/llm_function_full.txt -k fp8
+pytest --no-header -vs --test-list=../test_lists/qa/functional/llm_function_core.txt -k fp8
 # Run a single test case
 pytest -vs accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 ```
@@ -149,6 +155,6 @@ QA tests are typically executed through CI/CD pipelines with appropriate test se
 ## Test Guidelines
 
 ### Adding New Test Cases
-- **Primary Location**: For functional testing, new test cases should be added to `llm_function_full.txt` first
+- **Primary Location**: For functional testing, new test cases should be added to `functional/llm_function_core.txt` first
 - **Categorization**: Test cases should be categorized based on their scope and execution time
 - **Validation**: Ensure test cases are properly validated before adding to any test list
