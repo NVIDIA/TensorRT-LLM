@@ -2030,11 +2030,20 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/distributed/",
+        // GQA KV-replica decode and the MNNVL / TP2 all-reduce + norm kernels: their tests run only in
+        // l0_gb300's 4-GPU pre-merge block.
+        "tensorrt_llm/_torch/attention/backends/fmha/gqa_",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
+        "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
+        // KVCM2 remote tier: its fabric-transport tests run only on GB300 (l0_gb300).
+        "tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
@@ -2082,8 +2091,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/serving_extensions.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/defs/model_express/",
-        "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
-        "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300_efa_multi_nodes.yml",
@@ -2092,25 +2099,18 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/scripts/perf-sanity/disaggregated/b300_qwen3_0.6b_efa_functional.yaml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
-        "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
+        "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/kv_cache_manager_v2_tests/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -2159,28 +2159,33 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
         return ""
     }
+    // Any prefix or suffix can match a file (OR); all changed files must match the group.
     def groupFileMap = [
         "Docs": [
-            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
-            "docs/",
+            prefixes: ["docs/"],
+            suffixes: [".md"],
         ],
         "PyTorch": [
-            "tensorrt_llm/_torch/",
-            "tensorrt_llm/scaffolding/",
-            "tests/unittest/_torch/",
-            "tests/unittest/scaffolding/",
-            "tests/unittest/llmapi/test_llm_pytorch.py",
-            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-            "tests/integration/defs/disaggregated/",
-            "examples/disaggregated",
-            "examples/pytorch/",
-            "examples/scaffolding/",
-            "docs/",
+            prefixes: [
+                "tensorrt_llm/_torch/",
+                "tensorrt_llm/scaffolding/",
+                "tests/unittest/_torch/",
+                "tests/unittest/scaffolding/",
+                "tests/unittest/llmapi/test_llm_pytorch.py",
+                "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+                "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+                "tests/integration/defs/disaggregated/",
+                "examples/disaggregated",
+                "examples/pytorch/",
+                "examples/scaffolding/",
+                "docs/",
+            ],
         ],
         "Triton": [
-            "tests/integration/defs/triton_server/",
-            "triton_backend/",
+            prefixes: [
+                "tests/integration/defs/triton_server/",
+                "triton_backend/",
+            ],
         ],
     ]
 
@@ -2190,13 +2195,10 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     }
 
     for (group in groupFileMap.keySet()) {
-        def groupPrefixes = groupFileMap[group]
+        def groupRules = groupFileMap[group]
         def matchesGroup = { file ->
-            // Any *.md file, anywhere in the repo, counts as Docs-only.
-            if (group == "Docs" && file.endsWith(".md")) {
-                return true
-            }
-            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            return groupRules.prefixes?.any { prefix -> file.startsWith(prefix) } ||
+                groupRules.suffixes?.any { suffix -> file.endsWith(suffix) }
         }
         def allFilesInGroup = changedFileList.every(matchesGroup)
 
@@ -2689,14 +2691,23 @@ def getCommonParameters()
     ]
 }
 
+// Nightly release passes its Slack thread down so PLC notifications reply in it.
+// Read via env: callers build a local `params` list that shadows the build params.
+def getPLCSlackParameters()
+{
+    return [
+        string(name: 'slack_thread_id', value: env.slack_thread_id ?: ''),
+    ]
+}
+
 def getPLCRepoUrlKey()
 {
     def repoUrlKey = "tensorrt_llm_github_sync"
+    def normalizedRepo = LLM_REPO.replaceFirst(/\.git$/, "")
     withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-        if (LLM_REPO == DEFAULT_LLM_REPO) {
+        if (normalizedRepo == DEFAULT_LLM_REPO.replaceFirst(/\.git$/, "")) {
             repoUrlKey = "tensorrt_llm_internal"
-        } else if (LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM.git" ||
-                   LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM") {
+        } else if (normalizedRepo == "https://github.com/NVIDIA/TensorRT-LLM") {
             repoUrlKey = "tensorrt_llm_github"
         }
     }
@@ -2876,7 +2887,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'runContainerOssScanning', value: 'false'),
                                 string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
-                            ]
+                            ] + getPLCSlackParameters()
                             def handle = build(
                                 job: "/LLM/helpers/PLCScanningSetup",
                                 parameters: params,
@@ -3431,7 +3442,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(name: 'runContainerOssScanning', value: 'true'),
                             string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
-                        ]
+                        ] + getPLCSlackParameters()
                         def logger = new Logger(pipeline)
                         def handle = build(
                             job: "/LLM/helpers/PLCScanningSetup",

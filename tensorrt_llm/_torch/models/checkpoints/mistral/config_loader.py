@@ -20,6 +20,7 @@ from typing import Any
 import torch
 from transformers import PretrainedConfig, WhisperConfig
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
@@ -205,7 +206,7 @@ def _remap_mistral_quantization_args(config: dict) -> dict:
                 "activation_scheme": "dynamic" if is_dynamic else "static",
             }
         else:
-            raise ValueError(f"Found unknown quantization='{quantization}' in config")
+            raise UnsupportedError(f"Found unknown quantization='{quantization}' in config")
 
     return config
 
@@ -382,6 +383,17 @@ class MistralConfigLoader(BaseConfigLoader):
             )
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
+        if kwargs.get("moe_tactic") is not None:
+            # As from_pretrained does: build the model for the family the tactic implies.
+            # The literal model code is built for, derived from the tactic as
+            # ModelConfig.from_pretrained derives it (see MoEImplRequest.backend_for).
+            architectures = pretrained_config.architectures
+            kwargs["moe_backend"] = ModelConfig.pinned_moe_backend(
+                kwargs["moe_tactic"],
+                quant_config,
+                layer_quant_config,
+                architecture=architectures[0] if architectures else "",
+            )
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
             quant_config=quant_config,

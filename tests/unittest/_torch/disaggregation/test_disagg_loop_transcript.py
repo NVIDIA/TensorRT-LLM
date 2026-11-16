@@ -21,6 +21,7 @@ executed-batch and lifecycle transcripts, which do not exist yet.
 
 import inspect
 import queue
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -58,6 +59,7 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "poll_progress_when_idle",  # ctx transfer status consensus
     "align_gen_admission_across_cp",  # cp_allgather of the admitted gen-init ids
     "receive_gen_init",  # async receive polls gen status consensus
+    "start_deferred_gen_receives",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
 }
@@ -114,7 +116,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
 
     executor = object.__new__(PyExecutor)
     executor._disagg_coordinator = _recording_coordinator(calls)
-    executor._flush_pending_transfer_responses = lambda: calls.append(
+    executor._flush_pending_transfer_responses = lambda **kwargs: calls.append(
         ("flush_pending_transfer_responses",)
     )
     executor.kv_cache_transceiver = Mock()
@@ -146,6 +148,8 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.waiting_queue = []
     executor.inflight_req_ids = set()
     executor.is_shutdown = False
+    executor._intake_window = threading.Event()
+    executor._intake_window_started = 0.0
 
     def fetch_new_requests():
         if fetch_new_requests.called:
@@ -167,7 +171,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         "_pad_empty_attention_dp_batch",
         "_terminate_requests",
         "_pause_requests",
-        "_revert_gen_alloc",
+        "_revert_unexecuted_alloc",
         "_finalize_adp_dummy_allocation",
         "_wait_for_model_engine_input_copy",
         "_enqueue_responses",
@@ -220,12 +224,14 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
 
 _SCHEDULE_HEAD = [
     ("handle_errors_synced",),
+    ("start_deferred_gen_receives",),
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
     ("admit", []),
     ("align_gen_admission_across_cp", []),
-    ("receive_gen_init", []),
+    # No step is in flight in an idle iteration, so no receive is deferred.
+    ("receive_gen_init", [], "defer=False"),
     ("poll_progress_when_idle",),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
@@ -261,12 +267,84 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     PyExecutor._executor_loop_overlap(executor)
 
     idle_pass = _SCHEDULE_HEAD + [
+        ("start_deferred_gen_receives", "wait_all=False"),
         ("flush_pending_transfer_responses",),
         ("handle_timeouts_synced",),
         ("check_transfer_timeouts", "only_with_context_sends=True"),
         ("pace_idle",),
     ]
     assert calls == idle_pass + _SHUTDOWN_PASS
+
+
+def _deferred_close_executor(monkeypatch, calls: list) -> PyExecutor:
+    """Idle overlap executor with kv_cache_config.defer_generation_only_release, recording the manager's
+    deferred-close calls among the coordinator calls."""
+    executor = _idle_executor(monkeypatch, calls)
+    executor.dist = Mock(tp_size=1, world_size=1)
+    executor._defer_generation_only_release = True
+    executor.kv_cache_manager = SimpleNamespace(
+        enable_deferred_close=lambda enabled: calls.append(("enable_deferred_close", enabled)),
+        flush_deferred_closes=lambda: calls.append(("flush_deferred_closes",)),
+    )
+    return executor
+
+
+def test_executor_loop_overlap_flushes_deferred_closes(monkeypatch) -> None:
+    """The overlap loop turns the deferred close on before its first iteration. An idle iteration closes what
+    earlier iterations left, then again once no request is active, and again after the timeout checks, so an idle
+    server holds no deferred pages while its next fetch may block."""
+    calls = []
+    PyExecutor._executor_loop_overlap(_deferred_close_executor(monkeypatch, calls))
+
+    idle_pass = _SCHEDULE_HEAD + [
+        ("flush_deferred_closes",),
+        ("start_deferred_gen_receives", "wait_all=False"),
+        ("flush_pending_transfer_responses",),
+        ("flush_deferred_closes",),
+        ("handle_timeouts_synced",),
+        ("check_transfer_timeouts", "only_with_context_sends=True"),
+        ("flush_deferred_closes",),
+        ("pace_idle",),
+    ]
+    assert calls == [("enable_deferred_close", True)] + idle_pass + _SHUTDOWN_PASS
+
+
+def test_executor_loop_overlap_flushes_deferred_closes_on_a_retried_iteration(monkeypatch) -> None:
+    """An iteration the benchmark gate retries skips the forward and the flushes after it, so it closes the
+    deferred caches before it starts over."""
+    calls = []
+    executor = _deferred_close_executor(monkeypatch, calls)
+    executor._check_benchmark_disagg_gate = Mock(return_value=(True, True))
+    executor._release_unused_connector_reservations = Mock()
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    retried_pass = _SCHEDULE_HEAD + [
+        ("flush_pending_transfer_responses",),
+        ("flush_deferred_closes",),
+    ]
+    assert calls == [("enable_deferred_close", True)] + retried_pass + _SHUTDOWN_PASS
+
+
+@pytest.mark.parametrize("defer", [False, True], ids=["release_now", "defer_release"])
+def test_kv_pool_rebalance_flushes_deferred_closes_before_adjust(defer: bool) -> None:
+    """adjust() moves pages, so a deferred close must not hold any: the rebalance closes them before it suspends
+    the active requests and adjusts."""
+    executor = object.__new__(PyExecutor)
+    executor._defer_generation_only_release = defer
+    manager = Mock()
+    manager.is_request_active.return_value = True
+    executor.kv_cache_manager = manager
+    executor.active_requests = [SimpleNamespace(py_request_id=3)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+    executor._read_kv_cache_capacity = Mock(return_value=0)
+
+    PyExecutor._rebalance_kv_pools_now(executor)
+
+    names = [name for name, _, _ in manager.mock_calls]
+    head = ["is_request_active", "suspend_request", "impl.adjust", "resume_request"]
+    assert names == (["flush_deferred_closes"] if defer else []) + head
 
 
 @pytest.mark.parametrize(
@@ -365,7 +443,13 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
             executor.resource_manager.update_resources.assert_not_called()
 
         collective_names = _COLLECTIVE_SENSITIVE | {"enqueue_responses", "kv_event_allgather"}
-        transcript = [call for call in iteration_calls if call[0] in collective_names]
+        # receive_gen_init's defer follows the rank's step in flight; with nothing admitted
+        # it makes no collective call either way.
+        transcript = [
+            tuple(arg for arg in call if not str(arg).startswith("defer="))
+            for call in iteration_calls
+            if call[0] in collective_names
+        ]
         assert transcript[-4:] == [
             ("flush_pending_transfer_responses",),
             ("enqueue_responses",),
@@ -486,7 +570,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             effects=PyExecutorEffects(executor),
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
-            force_terminate_ctx_for_partial_reuse=False,
         )
     return executor
 
