@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
 
+from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
 from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
@@ -74,7 +75,8 @@ class ModelLoader:
         quant_config = self.llm_args.quant_config
         hf_quant_algo = hf_quant_config.pop("quant_algo", None)
         if hf_quant_algo is None:
-            raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+            raise ModelLoadError(
+                "Pre-quantized checkpoint must have quant_algo.")
         reject_checkpoint_nvfp4_plus(hf_quant_algo,
                                      "The checkpoint quantization config")
         hf_quant_algo = QuantAlgo(hf_quant_algo)
@@ -83,9 +85,10 @@ class ModelLoader:
                 f"Setting quant_algo={hf_quant_algo} from HF quant config.")
             quant_config.quant_algo = hf_quant_algo
         elif quant_config.quant_algo != hf_quant_algo:
-            raise ValueError(
-                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-            )
+            raise ConfigInputError(
+                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config.",
+                hint="Remove quant_config.quant_algo; the quantization of a "
+                "pre-quantized checkpoint is read from the checkpoint.")
 
         hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
                                                      None)
@@ -103,14 +106,15 @@ class ModelLoader:
                 )
                 quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
             elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                raise ValueError(
-                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                )
+                raise ConfigInputError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config.",
+                    hint="Set the KV cache format with kv_cache_config.dtype, "
+                    "which overrides the checkpoint's.")
         else:
             if quant_config.kv_cache_quant_algo not in [
                     None, QuantAlgo.FP8, QuantAlgo.NVFP4
             ]:
-                raise ValueError(
+                raise UnsupportedError(
                     f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                 )
 
@@ -173,7 +177,7 @@ class ModelLoader:
                         "falling back to config.json or model_kwargs for global "
                         "quantization.")
                 else:
-                    raise ValueError(
+                    raise ModelLoadError(
                         "Pre-quantized checkpoint must have quant_algo.")
             else:
                 self._apply_modelopt_quant_config(normalized,
@@ -201,7 +205,7 @@ class ModelLoader:
             )
 
         if requires_global_quant_config_fallback and hf_quant_config is None:
-            raise ValueError(
+            raise ModelLoadError(
                 "hf_quant_config.json does not set a global quant_algo and no "
                 "quantization_config fallback was found.")
 
@@ -225,7 +229,8 @@ class ModelLoader:
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                    self.llm_args.moe_config.backend)
+                    self.llm_args.moe_config.backend,
+                    moe_tactic=self.llm_args.moe_config.tactic)
                 quant_config.group_size = 32
                 quant_config.exclude_modules = [
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
@@ -532,8 +537,29 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
+
+    # A user's ``moe_config.tactic`` already names the implementation, so a
+    # model's preferred ``moe_config.backend`` yields to it instead of being
+    # merged into a combination that MoeConfig rejects.
+    user_moe_config = user_overrides.get("moe_config")
+    default_moe_config = model_defaults_dict.get("moe_config")
+    if (isinstance(user_moe_config, dict)
+            and user_moe_config.get("tactic") is not None
+            and isinstance(default_moe_config, dict)
+            and "backend" in default_moe_config):
+        model_defaults_dict = {
+            **model_defaults_dict,
+            "moe_config": {
+                key: value
+                for key, value in default_moe_config.items() if key != "backend"
+            },
+        }
+
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+    # Model defaults cannot change this config; retain its private launcher state,
+    # which is intentionally excluded from model_dump().
+    merged_state["cache_transceiver_config"] = llm_args.cache_transceiver_config
 
     new_args = llm_args.__class__(**merged_state)
 

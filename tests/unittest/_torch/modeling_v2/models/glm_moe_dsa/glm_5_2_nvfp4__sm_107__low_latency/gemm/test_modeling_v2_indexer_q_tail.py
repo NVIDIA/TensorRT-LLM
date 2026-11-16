@@ -7,9 +7,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.indexer_q_tail import (  # noqa: E501
-    indexer_q_tail as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.indexer_q_tail import (  # noqa: E501
+        indexer_q_tail as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]

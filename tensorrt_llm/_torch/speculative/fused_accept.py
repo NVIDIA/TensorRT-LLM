@@ -37,7 +37,8 @@ import triton.language as tl
 MAX_DRAFT_LEN = 31  # columns of the accept tile (k + 1 <= 32)
 
 
-@triton.jit
+# The counts change every step: keep them out of the cache key.
+@triton.jit(do_not_specialize=["num_contexts", "num_gens"])
 def _strict_accept_kernel(
     target_ptr,  # [num_contexts + num_gens * (K + 1)] sampled target tokens (any int dtype)
     draft_ptr,  # [num_gens, K] draft tokens of the previous step
@@ -139,7 +140,8 @@ def fused_strict_accept(
             pool = counter = num_accepted  # unused in mode 1
         pool_mask = pool_size - 1
     draft = draft_tokens.contiguous() if num_gens > 0 else num_accepted
-    block_b = max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1))))
+    # One tile for every batch: the kernel loops over row blocks.
+    block_b = 64
     _strict_accept_kernel[(1,)](
         target_tokens,
         draft,
@@ -165,7 +167,9 @@ def fused_strict_accept(
     return accepted, num_accepted
 
 
-@triton.jit
+# The counts change every step, and so does pos_row_stride (the token count) under MRoPE: keep them out of
+# the cache key.
+@triton.jit(do_not_specialize=["pos_row_stride", "num_contexts", "num_ctx_tokens", "batch_size"])
 def _step0_epilogue_kernel(
     seq_lens_ptr,
     num_accepted_ptr,
@@ -194,10 +198,14 @@ def _step0_epilogue_kernel(
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
     is_ctx = i < num_contexts
-    offs = tl.arange(0, BLOCK_C)
-    lens = tl.load(seq_lens_ptr + offs, mask=(offs <= i) & is_ctx, other=0).to(tl.int64)
     acc = tl.load(num_accepted_ptr + i).to(tl.int64)
-    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token); generations: last accepted token of the block
+    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token), summed in BLOCK_C tiles so that the tile does not
+    # follow the context count; generations: last accepted token of the block
+    ctx_end = tl.where(is_ctx, i + 1, 0)
+    lens = tl.zeros([BLOCK_C], dtype=tl.int64)
+    for c0 in range(0, ctx_end, BLOCK_C):
+        offs = c0 + tl.arange(0, BLOCK_C)
+        lens += tl.load(seq_lens_ptr + offs, mask=offs < ctx_end, other=0).to(tl.int64)
     gid = tl.where(
         is_ctx,
         tl.sum(lens, axis=0) - 1,
@@ -308,7 +316,8 @@ def step0_epilogue(
         K=draft_len,
         R=rows,
         H=h,
-        BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
+        # One tile for every context count: the kernel loops over context blocks.
+        BLOCK_C=64,
         BLOCK_H=triton.next_power_of_2(h),
         LAST=last,
         num_warps=4,

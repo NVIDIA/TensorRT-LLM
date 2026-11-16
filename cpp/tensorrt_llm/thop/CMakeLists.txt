@@ -68,7 +68,9 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  trtllmGenQKVProcessOp.cpp
+  csa2SparseContextOp.cpp
+  csa2SparseDecodeOp.cpp)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 
@@ -176,10 +178,6 @@ add_th_common_family(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
-
-# GLM bindings keep their existing family targets; source lists live with the
-# model.
-add_subdirectory(glmMoeDsaRubin)
 
 add_library(
   th_common SHARED

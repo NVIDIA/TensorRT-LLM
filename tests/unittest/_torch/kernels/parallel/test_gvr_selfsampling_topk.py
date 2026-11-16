@@ -30,6 +30,8 @@ Checks per case:
     values — any kernel read past ``n_valid`` fails the value comparison.
 """
 
+import itertools
+
 import pytest
 import torch
 from utils.util import getSMVersion
@@ -463,13 +465,100 @@ def test_selfsampling_topk_varlen_values():
         (16, 40000, 977, 1024),  # R=9 SPLIT + per-row TSH runtime gate (tsh_en=1)
         (200, 6000, 64, 512),  # BLK=512, SPLIT=False, non-big launch mode
     ],
-    ids=["b16_tsh_split", "b200_blk512_nonsplit"],
+    ids=["b16_tsh_split", "b200_nonsplit"],
 )
 def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
     """Exercise the varlen kernel's other launch modes: the SPLIT + per-row
     TSH-floor runtime gate domain (16 <= b <= 74, k <= 1024) and the
-    BLK=512 non-split wide-batch plan."""
+    non-split wide-batch plan."""
     _run_varlen_case([base + step * i for i in range(rows)], 1, 1, top_k, seed=rows)
+
+
+_WIDE_K = 512
+_WIDE_WIDTH = 262144  # n / 4 > 32768: the streaming families, as in the decode arenas
+
+
+def _wide_batch(rows, kind, seed):
+    """Rows of mixed lengths (plain, spiky or tied scores), poisoned past each row's length."""
+    gen = torch.Generator().manual_seed(seed)
+    lengths = torch.randint(_WIDE_K // 2, _WIDE_WIDTH, (rows,), generator=gen)
+    lengths[::7] = _WIDE_WIDTH
+    lengths[3::11] = _WIDE_K
+    x = torch.randn((rows, _WIDE_WIDTH), generator=gen) * 0.1
+    for r in range(rows):
+        n = int(lengths[r])
+        if kind == "spiky" and r % 3 == 0 and n > 4 * _WIDE_K:
+            pick = torch.randperm(n, generator=gen)[:300]
+            x[r, pick] = 10.0 + torch.rand(300, generator=gen)
+        elif kind == "spiky" and r % 3 == 1 and n > 16 * _WIDE_K:
+            pick = torch.randperm(n, generator=gen)[:6000]
+            x[r, pick] = 10.0 + torch.rand(6000, generator=gen)
+        elif kind == "ties" and r % 2 == 0:
+            x[r, :n] = torch.round(x[r, :n] * 16) / 16
+        x[r, n:] = 3e38
+    return x.to(_DEV), lengths.to(torch.int32).to(_DEV)
+
+
+def _check_wide(logits, lengths, out):
+    for r in range(logits.shape[0]):
+        n = int(lengths[r])
+        got = out[r][out[r] >= 0]
+        assert got.numel() == min(_WIDE_K, n), r
+        assert int(got.min()) >= 0 and int(got.max()) < n and got.unique().numel() == got.numel(), r
+        want = torch.topk(logits[r, :n], min(_WIDE_K, n)).values.sort().values
+        assert torch.equal(logits[r, got.long()].sort().values, want), r
+
+
+@pytest.mark.parametrize("rows", [296])
+@pytest.mark.parametrize("kind", ["spiky", "ties"])
+def test_selfsampling_topk_varlen_wide_cta(monkeypatch, rows, kind):
+    """With wide_cta_rows, 149..296 varlen rows run gvr_main as one 1,024-thread CTA per row and
+    select the exact Top-K, as the default 512-thread plan does (eager and CUDA-graph replay)."""
+    from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as ss_dev
+
+    logits, lengths = _wide_batch(rows, kind, seed=rows)
+    blocks = []
+    compiled = ss_dev.get_compiled
+
+    def spy(tpl, *args, **kwargs):
+        blocks.append(tpl[0])
+        return compiled(tpl, *args, **kwargs)
+
+    monkeypatch.setattr(ss_dev, "get_compiled", spy)
+    for wide_cta_rows in (False, True):
+        ss_host._VARLEN_CACHE.clear()
+        blocks.clear()
+        out = torch.full((rows, _WIDE_K), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            logits,
+            lengths,
+            out,
+            next_n=1,
+            compress_ratio=1,
+            max_seq_len=_WIDE_WIDTH,
+            wide_cta_rows=wide_cta_rows,
+        )
+        torch.cuda.synchronize()
+        assert blocks == ([1024] if wide_cta_rows else [512]), (wide_cta_rows, blocks)
+        _check_wide(logits, lengths, out)
+    graph = torch.cuda.CUDAGraph()
+    out = torch.empty((rows, _WIDE_K), dtype=torch.int32, device=_DEV)
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(
+            logits,
+            lengths,
+            out,
+            next_n=1,
+            compress_ratio=1,
+            max_seq_len=_WIDE_WIDTH,
+            wide_cta_rows=True,
+        )
+    fresh, _ = _wide_batch(rows, kind, seed=rows + 1)
+    logits.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_wide(logits, lengths, out)
+    ss_host._VARLEN_CACHE.clear()
 
 
 def test_selfsampling_topk_varlen_zero_kv_slot():
@@ -3193,6 +3282,204 @@ def test_selfsampling_topk_varlen_bf16_unpadded_single_row(pattern: str, monkeyp
     )
     torch.cuda.synchronize()
     _check_low_varlen_exact(logits, indices, lengths, values)
+
+
+class _CompileRequests:
+    """Device-module stand-in for the router: records compile requests instead of compiling."""
+
+    STATIC_BYTES = 512
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def __getattr__(self, name: str):
+        if not name.startswith("get_compiled"):
+            raise AttributeError(name)
+
+        def record(*args, **kwargs):
+            self.requests.append((name, args, kwargs))
+            return name
+
+        return record
+
+
+def _row_window_envelopes(top_k: int) -> list[int]:
+    """Envelopes past every single-CTA 16-bit row window 4 * BLK * VPT + BLK up to 34K (the
+    register plans) and around the FP16 cluster code-radix envelopes."""
+    bounds = {4 * blk * vpt + blk for blk in (128, 256, 512, 1024) for vpt in range(1, 17)}
+    envelopes = {
+        bound + delta
+        for bound in bounds
+        if bound <= 34000
+        for delta in (1, 3, 64, 127, 128, 255, 256, 511, 512)
+    }
+    envelopes |= {
+        base + delta
+        for base in (8192, 16384, 32768, 65536, 131072, 163840, 262144)
+        for delta in (-127, -1, 0, 1, 64, 255, 256, 257, 511, 512)
+    }
+    return sorted(n for n in envelopes if n > top_k + 3)
+
+
+def _device_row_window(blk: int, vpt: int, clus: int = 1, vector: int = 4) -> int:
+    """Scores per row a 16-bit register plan classifies, written out from the device kernels
+    rather than taken from the router: ``clus * blk * vpt`` vectors of ``vector`` scores, then a
+    scalar tail that only threads ``tid < tail`` read (the ``n4`` / ``ntail`` row window of
+    GvrTopkRegKernel.kern_cr, kern_cr2 and kern_crc; GvrRegClusKernel loads eight-score vectors).
+    """
+    return vector * clus * blk * vpt + blk
+
+
+def _register_window(name: str, args: tuple, kwargs: dict) -> tuple[str, int] | None:
+    """(build, scores per row) of one recorded 16-bit register compile request, else None."""
+    if name == "get_compiled__regclus":
+        blk, vpt, clus = args[0][:3]
+        return "reg_clus", _device_row_window(blk, vpt, clus, vector=8)
+    if name != "get_compiled__reg":
+        return None
+    blk, vpt = args[0][:2]
+    clus = kwargs.get("clus", 1)
+    if clus > 1:
+        build = "cluster"
+    elif kwargs.get("cr2"):
+        build = "cr2"
+    elif kwargs.get("code_radix"):
+        build = "radix"
+    else:
+        build = "bracket"
+    return build, _device_row_window(blk, vpt, clus)
+
+
+def test_selfsampling_16bit_register_row_window_covers_envelope(monkeypatch) -> None:
+    """Every 16-bit register plan the varlen router compiles classifies the whole envelope.
+
+    The 16-bit register kernels classify ``clus * BLK * VPT`` four-score vectors and a scalar tail
+    of at most BLK scores per row (``_device_row_window``; reg_clus: eight-score vectors), so no
+    plan may hold fewer scores than the clamped envelope. Host only: the router's compile requests
+    are recorded, nothing compiles or launches.
+    """
+    recorder = _CompileRequests()
+    monkeypatch.setattr(ss_host, "_device", lambda: recorder)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+    profiles = ((148, 100), (148, 103), (132, 90), (78, 90))
+    base_rows = (1, 8, 65, 75, 96, 132, 148, 160, 256, 300, 512, 600, 1024, 2048, *range(149, 157))
+    builds = set()
+    for (num_sms, sm_version), dtype, top_k in itertools.product(
+        profiles, _DTYPES_16BIT, (512, 1024, 2048)
+    ):
+        # the router's SM-relative row bands: half a wave and around one, two and four waves
+        row_counts = sorted(
+            {*base_rows, num_sms // 2 + 1}
+            | {waves * num_sms + d for waves in (1, 2, 4) for d in (-1, 0, 1)}
+        )
+        compress_ratio = 1 if top_k == 2048 else 4
+        for n_env, rows, next_n in itertools.product(
+            _row_window_envelopes(top_k), row_counts, (1, 2)
+        ):
+            if rows % next_n:
+                continue
+            for npad in {(n_env + 7) // 8 * 8, (n_env + 63) // 64 * 64}:
+                ss_host._VARLEN_CACHE_BF16.clear()
+                ss_host._VARLEN_CACHE_FP16.clear()
+                recorder.requests.clear()
+                ss_host._varlen_launcher(
+                    rows,
+                    npad,
+                    top_k,
+                    n_env,
+                    next_n,
+                    compress_ratio,
+                    num_sms,
+                    sm_version,
+                    dtype=dtype,
+                    device_index=0,
+                )
+                for name, args, kwargs in recorder.requests:
+                    window = _register_window(name, args, kwargs)
+                    if window is None:
+                        continue
+                    builds.add(window[0])
+                    assert min(n_env, npad) <= window[1], (
+                        f"{dtype} K={top_k} n_env={n_env} npad={npad} rows={rows} "
+                        f"profile=({num_sms}, {sm_version}): {window[0]} {args[0][:3]} holds "
+                        f"{window[1]} scores"
+                    )
+    assert builds == {"bracket", "radix", "cr2", "cluster", "reg_clus"}, builds
+
+
+# Formerly over-capacity 16-bit register plans (BLK-halving remaps left more than BLK scores past
+# the vector batch): both ends of each N interval on the B200 profile, MTP rows on half of them
+_ROW_WINDOW_CASES = [
+    pytest.param(600, 2305, 512, 2, 4, torch.bfloat16, "ties", id="bf16_k512_blk256_lo"),
+    pytest.param(512, 2560, 1024, 1, 4, torch.bfloat16, "infinities", id="bf16_k1024_blk256_hi"),
+    pytest.param(600, 4353, 512, 2, 4, torch.bfloat16, "crosszero", id="bf16_k512_v4_lo"),
+    pytest.param(300, 4608, 1024, 1, 4, torch.bfloat16, "ties", id="bf16_k1024_v4_hi"),
+    pytest.param(132, 4609, 1024, 2, 4, torch.bfloat16, "ties", id="bf16_k1024_blk512_lo"),
+    pytest.param(148, 9216, 1024, 1, 4, torch.bfloat16, "infinities", id="bf16_k1024_v4x2_hi"),
+    pytest.param(96, 16897, 1024, 2, 4, torch.bfloat16, "ties", id="bf16_k1024_v8_lo"),
+    pytest.param(4, 4609, 2048, 2, 1, torch.bfloat16, "ties", id="bf16_k2048_lo"),
+    pytest.param(148, 5120, 2048, 1, 1, torch.bfloat16, "crosszero", id="bf16_k2048_hi"),
+    pytest.param(600, 1153, 512, 2, 4, torch.float16, "subnormal", id="fp16_k512_cr2_lo"),
+    pytest.param(600, 2560, 1024, 1, 4, torch.float16, "ties", id="fp16_k1024_cr2_hi"),
+    pytest.param(256, 4353, 512, 2, 4, torch.float16, "zero_kth_neg", id="fp16_k512_cr2_v4_lo"),
+    pytest.param(600, 6656, 2048, 1, 1, torch.float16, "ties", id="fp16_k2048_cr2_v6_hi"),
+    pytest.param(8, 4609, 512, 2, 4, torch.float16, "ties", id="fp16_k512_counter_lo"),
+    pytest.param(148, 5120, 512, 1, 4, torch.float16, "fp16max", id="fp16_k512_counter_hi"),
+    pytest.param(600, 2305, 512, 2, 4, torch.float16, "ties", id="fp16_k512_bracket_lo"),
+    pytest.param(512, 4608, 1024, 1, 4, torch.float16, "infinities", id="fp16_k1024_bracket_hi"),
+    pytest.param(64, 5119, 2048, 2, 1, torch.float16, "ties", id="fp16_k2048_radix_hi"),
+    pytest.param(4, 16641, 1024, 1, 4, torch.float16, "ties", id="fp16_k1024_cluster_lo"),
+    pytest.param(8, 16896, 2048, 2, 1, torch.float16, "infinities", id="fp16_k2048_cluster_hi"),
+]
+
+
+@pytest.mark.parametrize("rows,ncols,top_k,next_n,compress_ratio,dtype,pattern", _ROW_WINDOW_CASES)
+def test_selfsampling_topk_varlen_16bit_row_window_edges(
+    rows: int,
+    ncols: int,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    dtype: torch.dtype,
+    pattern: str,
+    monkeypatch,
+) -> None:
+    """Envelopes just past a 16-bit register row window are exact and every compiled register
+    plan holds the envelope (code radix, cr2, FP16 counter, bracket and cluster builds). The last
+    valid score of each row is +inf, so a row that drops it fails."""
+    monkeypatch.setattr(
+        ss_host, "_device_profile_key", lambda device: ss_host._pack_device_profile(148, 100)
+    )
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+    device = ss_host._device()
+    get_compiled_reg = device.get_compiled__reg
+    windows = []
+
+    def record_window(*args: object, **kwargs: object) -> object:
+        windows.append(_device_row_window(*args[0][:2], kwargs.get("clus", 1)))
+        return get_compiled_reg(*args, **kwargs)
+
+    monkeypatch.setattr(device, "get_compiled__reg", record_window)
+    logits, kv_lens, lengths = _make_low_varlen_case(
+        rows, ncols, top_k, next_n, compress_ratio, pattern, dtype
+    )
+    for row, valid in enumerate(lengths):
+        if valid > top_k:
+            logits[row, valid - 1] = float("inf")
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=ncols * compress_ratio,
+    )
+    torch.cuda.synchronize()
+    _check_low_varlen_exact(logits, indices, lengths)
+    assert windows and min(windows) >= ncols, windows
 
 
 @_LOW_DTYPE_PARAMS

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
@@ -16,6 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     true_fp32_matmul,
 )
 
+from ... import native_ops
 from .low_m_gemm import low_m_gemm
 
 HIDDEN_SIZE = 6144
@@ -120,7 +120,7 @@ class GlmFusedAGemm(OpWrapper):
         l2_prefetch: list[torch.Tensor],
     ) -> torch.Tensor:
         if hidden_states.shape[0] <= NATIVE_MAX_TOKENS:
-            return torch.ops.trtllm.glm_fused_a_gemm(hidden_states, weight, l2_prefetch)
+            return native_ops.glm_fused_a_gemm(hidden_states, weight, l2_prefetch)
         if not 1 <= hidden_states.shape[0] <= MAX_TOKENS:
             raise ValueError(f"fused-A supports at most {MAX_TOKENS} rows")
         if (

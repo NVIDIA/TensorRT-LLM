@@ -11,6 +11,8 @@ The things worth proving:
 
 * ``off`` changes nothing. This is the whole safety argument for making the
   decision in the model loader at all.
+* a ``@disable_v2_by_default`` target is built only when the deployment sets
+  ``modeling_v2`` itself; left at its default, the built-in implementation runs.
 * a matching configuration resolves to the target class itself, imported
   from its own directory; no registry lookup stands between the decision and
   the class.
@@ -18,12 +20,16 @@ The things worth proving:
   missed; ``auto`` falls back to the built-in implementation instead.
 * speculative decoding is an identity criterion: a target that does not
   implement the requested mode does not claim the deployment.
+* so is a MoE tactic: a target claims a deployment under one only when it
+  declares every implementation the tactic can resolve to.
 * ``AutoModelForCausalLM._resolve_class`` reads the decision off the
   ``ModelConfig`` rather than deciding again.
 """
 
 from __future__ import annotations
 
+import importlib
+import re
 from dataclasses import replace
 
 import pytest
@@ -33,15 +39,20 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     _RESOLVED_MODES,
+    _ROUTES,
+    ANY_MOE_IMPL,
     ModelingV2Mode,
     NoTarget,
+    disable_v2_by_default,
     modeling_v2_resolve,
+    registered_routes,
     resolved_mode,
 )
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
@@ -215,16 +226,56 @@ _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_atten
 _TEP4 = dict(_DEP4, enable_attention_dp=False)
 
 
-@pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
-def test_off_resolves_nothing(mode):
-    """The default must be indistinguishable from modeling_v2 not existing.
-
-    Leaving the argument alone and an explicit "off" have to behave
-    identically: the common case is that nobody has heard of this package.
-    """
-    args = TorchLlmArgs(model=_DUMMY_MODEL) if mode is None else _llm_args(mode)
+def test_off_resolves_nothing():
+    """``off`` must be indistinguishable from modeling_v2 not existing, even for a deployment a target claims."""
     config = _model_config(_gpt_oss_config())
-    assert modeling_v2_resolve(config, args) is None
+    assert modeling_v2_resolve(config, _llm_args("off")) is None
+
+
+class _TargetUsedByDefault:
+    """A target the default mode builds."""
+
+
+@disable_v2_by_default
+class _TargetDisabledByDefault:
+    """A target the default mode declines."""
+
+
+def _claimed_by(monkeypatch, target):
+    """A config whose architecture's ``route`` claims every deployment for ``target``."""
+    arch = "ModelingV2TestForCausalLM"
+    monkeypatch.setitem(_ROUTES, arch, lambda *_: target)
+    return _model_config(PretrainedConfig(architectures=[arch]))
+
+
+def test_the_default_mode_builds_a_claiming_target(monkeypatch):
+    config = _claimed_by(monkeypatch, _TargetUsedByDefault)
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is _TargetUsedByDefault
+
+
+def test_the_default_mode_declines_a_target_disabled_by_default(monkeypatch):
+    config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is None
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_a_set_mode_builds_a_target_disabled_by_default(monkeypatch, mode):
+    """Setting ``modeling_v2`` is the opt-in, including to the value it defaults to."""
+    config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
+    assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetDisabledByDefault
+
+
+@pytest.mark.parametrize(
+    "pretrained_config, expected",
+    [(_gpt_oss_config, _GPT_OSS_DEFAULT_TARGET), (_r1_config, _R1_DEFAULT_TARGET)],
+    ids=["gpt_oss", "deepseek_r1"],
+)
+def test_gpt_oss_and_r1_run_builtin_unless_modeling_v2_is_set(pretrained_config, expected):
+    """Both default targets are ``@disable_v2_by_default``: a deployment they claim keeps the built-in model
+    until it sets ``modeling_v2``."""
+    config = _model_config(pretrained_config(), **_layout(4, False))
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is None
+    assert _qualified(modeling_v2_resolve(config, _llm_args("auto"))) == expected
 
 
 def test_off_still_reaches_the_builtin_implementation():
@@ -240,6 +291,179 @@ def test_gpt_oss_tp1_matches(mode):
     """One GPU has no specialization of its own: it is a default-target layout."""
     config = _model_config(_gpt_oss_config())
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _GPT_OSS_DEFAULT_TARGET
+
+
+def test_a_moe_tactic_keeps_the_builtin_implementation():
+    """gpt-oss's target runs its own expert kernels, which no tactic names."""
+    config = replace(_model_config(_gpt_oss_config()), moe_tactic="cutlass")
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="moe_config.tactic='cutlass' pins a MoE implementation"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_a_draft_moe_tactic_keeps_the_builtin_implementation():
+    """R1's target builds its MTP draft's experts without the draft MoE selection."""
+    spec_config = MTPDecodingConfig(max_draft_len=3, moe_tactic="cutlass")
+    config = _model_config(_r1_config(), spec_config=spec_config, **_R1_DEFAULT_LAYOUTS["dep4"])
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(
+        ValueError, match="speculative_config.moe_tactic='cutlass' pins a MoE implementation"
+    ):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+_TACTIC_ARCH = "TacticTestForCausalLM"
+_TRTLLM_GEN_NVFP4 = "trtllm.trtllm_gen.fused_moe.nvfp4"
+_CUTLASS_NVFP4 = "trtllm.cutlass.grouped_gemm.nvfp4"
+
+
+class _TacticBlindTarget:
+    """Declares nothing: its experts and its draft's run kernels of its own."""
+
+
+class _AnyTacticTarget:
+    """Its experts and its draft's come from the MoE registry, and only those modules run them."""
+
+    moe_impls_honored = frozenset({ANY_MOE_IMPL})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
+
+
+class _DraftOnlyTarget:
+    """Like the MiniMax-M3 targets: only its draft's experts come from the MoE registry."""
+
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
+
+
+class _TrtllmGenNvfp4Target:
+    """Like the GLM-5.2 sm107 target: its kernels read the TRTLLM-Gen NVFP4 experts' buffers, and
+    its draft's MoE runs on weights of its own."""
+
+    moe_impls_honored = frozenset({_TRTLLM_GEN_NVFP4})
+    draft_moe_impls_honored = frozenset()
+
+
+class _TrtllmGenNvfp4DraftTarget:
+    """Its draft's kernels read the TRTLLM-Gen NVFP4 experts' buffers."""
+
+    draft_moe_impls_honored = frozenset({_TRTLLM_GEN_NVFP4})
+
+
+def _tactic_config(
+    moe_tactic=None, draft_moe_tactic=None, quant_algo=QuantAlgo.NVFP4
+) -> ModelConfig:
+    """A checkpoint whose experts are ``quant_algo`` (NVFP4 unless given), with the tactics set."""
+    spec_config = None
+    if draft_moe_tactic is not None:
+        spec_config = MTPDecodingConfig(max_draft_len=3, moe_tactic=draft_moe_tactic)
+    config = _model_config(PretrainedConfig(architectures=[_TACTIC_ARCH]), spec_config=spec_config)
+    return replace(config, moe_tactic=moe_tactic, quant_config=QuantConfig(quant_algo=quant_algo))
+
+
+def _route_to(monkeypatch, target) -> None:
+    monkeypatch.setitem(registered_routes(), _TACTIC_ARCH, lambda config, llm_args, sm: target)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "target, moe_tactic, draft_moe_tactic, quant_algo",
+    [
+        (_AnyTacticTarget, "cutlass", None, QuantAlgo.NVFP4),
+        (_AnyTacticTarget, None, "cutlass", QuantAlgo.NVFP4),
+        (_AnyTacticTarget, "cutlass", "trtllm_gen", QuantAlgo.NVFP4),
+        (_DraftOnlyTarget, None, "cutlass", QuantAlgo.NVFP4),
+        (_TrtllmGenNvfp4Target, _TRTLLM_GEN_NVFP4, None, QuantAlgo.NVFP4),
+        # The NVFP4 experts narrow the TRTLLM-Gen leaves of this provider to the NVFP4 one.
+        (_TrtllmGenNvfp4Target, "trtllm.trtllm_gen", None, QuantAlgo.NVFP4),
+        # Every quantized TRTLLM-Gen format has one leaf, so the technique alone narrows to it.
+        (_TrtllmGenNvfp4Target, "trtllm_gen", None, QuantAlgo.NVFP4),
+        # The id is of no format the checkpoint declares, so its one match counts.
+        (_TrtllmGenNvfp4Target, _TRTLLM_GEN_NVFP4, None, None),
+        (_TrtllmGenNvfp4DraftTarget, None, _TRTLLM_GEN_NVFP4, QuantAlgo.NVFP4),
+        (_TacticBlindTarget, None, None, QuantAlgo.NVFP4),
+    ],
+    ids=[
+        "any_target",
+        "any_draft",
+        "any_both",
+        "draft_only_draft",
+        "honored_id",
+        "honored_after_narrowing",
+        "honored_technique_after_narrowing",
+        "honored_id_of_another_format",
+        "honored_draft_id",
+        "neither_set",
+    ],
+)
+def test_a_target_that_honors_a_tactic_claims_the_deployment(
+    monkeypatch, mode, target, moe_tactic, draft_moe_tactic, quant_algo
+):
+    """A tactic every implementation of which the target declares is built under it."""
+    _route_to(monkeypatch, target)
+    config = _tactic_config(moe_tactic, draft_moe_tactic, quant_algo)
+    assert modeling_v2_resolve(config, _llm_args(mode)) is target
+
+
+@pytest.mark.parametrize(
+    "target, moe_tactic, draft_moe_tactic, refused",
+    [
+        (_TacticBlindTarget, "cutlass", None, "moe_config.tactic='cutlass'"),
+        (_TacticBlindTarget, None, "cutlass", "speculative_config.moe_tactic='cutlass'"),
+        (_DraftOnlyTarget, "cutlass", None, "moe_config.tactic='cutlass'"),
+        (_TrtllmGenNvfp4Target, "cutlass", None, "moe_config.tactic='cutlass'"),
+        (_TrtllmGenNvfp4Target, _CUTLASS_NVFP4, None, f"moe_config.tactic='{_CUTLASS_NVFP4}'"),
+        (
+            _TrtllmGenNvfp4Target,
+            None,
+            _TRTLLM_GEN_NVFP4,
+            f"speculative_config.moe_tactic='{_TRTLLM_GEN_NVFP4}'",
+        ),
+        (
+            _TrtllmGenNvfp4Target,
+            _TRTLLM_GEN_NVFP4,
+            "cutlass",
+            "speculative_config.moe_tactic='cutlass'",
+        ),
+        # A draft tactic is not narrowed to the target's formats: every TRTLLM-Gen leaf counts.
+        (
+            _TrtllmGenNvfp4DraftTarget,
+            None,
+            "trtllm.trtllm_gen",
+            "speculative_config.moe_tactic='trtllm.trtllm_gen'",
+        ),
+    ],
+    ids=[
+        "blind_target",
+        "blind_draft",
+        "draft_only_target",
+        "other_technique",
+        "other_id",
+        "empty_draft_set",
+        "honored_target_unhonored_draft",
+        "draft_not_narrowed",
+    ],
+)
+def test_a_target_that_does_not_honor_a_tactic_is_refused(
+    monkeypatch, target, moe_tactic, draft_moe_tactic, refused
+):
+    """``auto`` builds the built-in implementation, and ``require`` names the tactic and the target."""
+    _route_to(monkeypatch, target)
+    config = _tactic_config(moe_tactic, draft_moe_tactic)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=rf"{re.escape(refused)} .*{target.__name__}"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_a_refusal_names_what_the_tactic_can_resolve_to(monkeypatch):
+    _route_to(monkeypatch, _TrtllmGenNvfp4Target)
+    config = _tactic_config("fused_moe")
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "runs its experts only as trtllm.trtllm_gen.fused_moe.nvfp4; the tactic can resolve to "
+            "trtllm.trtllm_gen.fused_moe.nvfp4, marlin.cuda.fused_moe.nvfp4"
+        ),
+    ):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 def _layout(ws, attention_dp, moe_tp=None, moe_ep=None):
@@ -491,8 +715,8 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
-def test_the_default_mode_is_off():
-    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "off"
+def test_the_default_mode_is_auto():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "auto"
 
 
 def test_no_target_is_a_value_error():
@@ -964,8 +1188,8 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
 @pytest.mark.usefixtures("_minimax_m3_sm")
 @pytest.mark.parametrize("tp", [4, 8])
 @pytest.mark.parametrize("role", ["aggregated", "context", "generation"])
-def test_minimax_m3_requires_explicit_opt_in(monkeypatch, tp: int, role: str) -> None:
-    """Every serving role stays on the built-in model unless modeling_v2 is requested."""
+def test_minimax_m3_is_claimed_in_every_serving_role(monkeypatch, tp: int, role: str) -> None:
+    """Every serving role builds the target, under the default mode as under a set one."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
@@ -974,11 +1198,37 @@ def test_minimax_m3_requires_explicit_opt_in(monkeypatch, tp: int, role: str) ->
     kwargs = dict(kv_cache_config=dict(dtype="nvfp4"))
     if role != "aggregated":
         kwargs["cache_transceiver_config"] = CacheTransceiverConfig()
-    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL, **kwargs)) is None
-    for mode in ("auto", "require"):
-        target = modeling_v2_resolve(config, _llm_args(mode, **kwargs))
+    for args in (
+        TorchLlmArgs(model=_DUMMY_MODEL, **kwargs),
+        _llm_args("auto", **kwargs),
+        _llm_args("require", **kwargs),
+    ):
+        target = modeling_v2_resolve(config, args)
         assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
-        assert resolved_mode(target) is ModelingV2Mode(mode)
+        assert resolved_mode(target) is ModelingV2Mode(args.modeling_v2)
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_minimax_m3_honors_a_draft_moe_tactic_only(monkeypatch, tp):
+    """The drafter config loads with the draft tactic's selection; the trunk runs expert kernels of
+    its own, which no tactic names."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
+    eagle3 = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(name="EAGLE3_ONE_MODEL"), moe_tactic="cutlass"
+    )
+    config = replace(_m3_resolve_config(_m3_sparse(), None, tp), spec_config=eagle3)
+    target = modeling_v2_resolve(config, _m3_llm_args("require", "nvfp4"))
+    assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
+    trunk = replace(config, moe_tactic="cutlass")
+    assert modeling_v2_resolve(trunk, _m3_llm_args("auto", "nvfp4")) is None
+    with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.__name__}"):
+        modeling_v2_resolve(trunk, _m3_llm_args("require", "nvfp4"))
 
 
 _SM100 = (10, 0)
@@ -1158,6 +1408,65 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+_K3_TARGETS = pytest.mark.parametrize(
+    "mapping_kwargs, target",
+    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
+    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
+)
+
+
+def _k3_model_config(mapping_kwargs, moe_tactic) -> ModelConfig:
+    """K3 as the model config reads the checkpoint, W4A16_MXFP4, with ``moe_tactic``."""
+    return replace(
+        _model_config(_k3_config(), **mapping_kwargs),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
+        moe_tactic=moe_tactic,
+    )
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "tactic", ["trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", "trtllm.trtllm_gen", "trtllm_gen"]
+)
+@_K3_TARGETS
+def test_kimi_k3_targets_take_the_tactic_of_the_experts_their_kernels_read(
+    mapping_kwargs, target, tactic
+):
+    """Decode steps run k3_moe over the TRTLLM-Gen W4A8_MXFP4_MXFP8 experts' buffers. The model
+    config reads the checkpoint as W4A16_MXFP4, but K3 runs experts the checkpoint does not list
+    as W4A8_MXFP4_MXFP8, so a tactic is narrowed to that format."""
+    config = _k3_model_config(mapping_kwargs, tactic)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@_K3_TARGETS
+def test_kimi_k3_targets_decline_the_tactic_of_other_experts(mapping_kwargs, target):
+    config = _k3_model_config(mapping_kwargs, "cutlass")
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.split('.')[-1]}"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@_K3_TARGETS
+def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_experts_as(
+    mapping_kwargs, target
+):
+    """Three places spell the format K3 runs the experts a checkpoint does not list in: the
+    loader's ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, each
+    target's own copy, which it builds the experts in, and the quant of the ids it honors."""
+    module_path, class_name = target.rsplit(".", 1)
+    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
+    assert module._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
+    loaded = ModelConfig._declared_moe_quants(
+        QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
+        None,
+        architecture="KimiK3ForConditionalGeneration",
+    )
+    honored = getattr(module, class_name).moe_impls_honored
+    assert {MoEImplId.parse(impl_id).quant for impl_id in honored} == loaded
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
@@ -1425,8 +1734,11 @@ def test_glm52_tep4_matches(mode):
 
 
 @pytest.mark.usefixtures("_glm52_sm")
-def test_glm52_tep4_with_mtp_matches():
-    config = _model_config(_glm52_config(), spec_config=MTPDecodingConfig(max_draft_len=1), **_TEP4)
+@pytest.mark.parametrize("max_draft_len", [1, 3, 5], ids=["mtp1", "mtp3", "mtp5"])
+def test_glm52_tep4_with_mtp_matches(max_draft_len):
+    config = _model_config(
+        _glm52_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len), **_TEP4
+    )
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _GLM52_TARGET
 
 
@@ -1435,18 +1747,45 @@ def test_glm52_tep4_with_mtp_matches():
     "spec_config, missed",
     [
         (MTPDecodingConfig(max_draft_len=2), r"max_draft_len=2, max_total_draft_tokens=2"),
-        (MTPDecodingConfig(max_draft_len=3), r"max_draft_len=3, max_total_draft_tokens=3"),
+        (MTPDecodingConfig(max_draft_len=4), r"max_draft_len=4, max_total_draft_tokens=4"),
         (
             MTPDecodingConfig(max_draft_len=1, use_dynamic_tree=True, dynamic_tree_max_topK=2),
-            r"max_draft_len=1, max_total_draft_tokens=2",
+            r"max_draft_len=1, max_total_draft_tokens=2, dynamic tree",
+        ),
+        # A dynamic tree capped at its chain length has the row count of a certified
+        # linear chain, but still carries tree masks and position offsets.
+        (
+            MTPDecodingConfig(
+                max_draft_len=3,
+                max_total_draft_tokens=3,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=3, max_total_draft_tokens=3, dynamic tree",
+        ),
+        (
+            MTPDecodingConfig(
+                max_draft_len=5,
+                max_total_draft_tokens=5,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=5, max_total_draft_tokens=5, dynamic tree",
         ),
     ],
-    ids=["draft2", "draft3", "dynamic_tree"],
+    ids=[
+        "draft2",
+        "draft4",
+        "dynamic_tree",
+        "capped_dynamic_tree_mtp3",
+        "capped_dynamic_tree_mtp5",
+    ],
 )
-def test_glm52_tep4_with_more_than_one_draft_token_does_not_match(spec_config, missed):
-    """The decode attention, the base-row index kind and the MLA rope kernel are
-    built for two query rows per sequence; a longer draft chain or a tree puts
-    more rows on a sequence and is a different forward."""
+def test_glm52_tep4_with_uncertified_draft_chain_does_not_match(spec_config, missed):
+    """The target is certified on linear chains of 1, 3 and 5 draft tokens (the decode
+    attention's grid is compiled for D + 1 rows per sequence); other chain lengths route
+    nowhere, and so does a dynamic tree, even one capped at a certified chain length:
+    the MLA / RoPE and top-k paths do not consume its tree masks or position offsets."""
     config = _model_config(_glm52_config(), spec_config=spec_config, **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed):
@@ -1490,4 +1829,63 @@ def test_glm52_without_an_fp8_kv_cache_does_not_match():
     config = _model_config(_glm52_config(), kv_cache_quant_algo=None, **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match="KV cache bf16"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- GLM-5.2 on sm107: MoE tactics ------------------------------------------------
+
+_GLM52_SM107_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.modeling."
+    "ModelingV2Glm52Nvfp4Sm107LowLatency"
+)
+_TP16 = dict(world_size=16, tp_size=16, moe_ep_size=1, moe_tp_size=16)
+
+
+@pytest.fixture
+def _on_sm107(monkeypatch):
+    """Route as if this were a Rubin GPU."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+
+
+def _glm52_tp16_config(moe_tactic=None, draft_moe_tactic=None) -> ModelConfig:
+    """GLM-5.2-NVFP4 at the sm107 target's layout, as loaded: NVFP4 experts and an FP8 KV cache."""
+    spec_config = None
+    if draft_moe_tactic is not None:
+        spec_config = MTPDecodingConfig(max_draft_len=3, moe_tactic=draft_moe_tactic)
+    config = _model_config(_glm52_config(), spec_config=spec_config, **_TP16)
+    return replace(
+        config,
+        moe_tactic=moe_tactic,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, kv_cache_quant_algo=QuantAlgo.FP8),
+    )
+
+
+@pytest.mark.usefixtures("_on_sm107")
+@pytest.mark.parametrize("moe_tactic", [_TRTLLM_GEN_NVFP4, "trtllm.trtllm_gen", "trtllm_gen"])
+def test_glm52_tp16_takes_a_tactic_of_the_experts_its_kernels_read(moe_tactic):
+    """Decode steps run the target's kernels over the TRTLLM-Gen NVFP4 experts' buffers, so a
+    tactic that resolves to that implementation alone keeps the target."""
+    config = _glm52_tp16_config(moe_tactic)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _GLM52_SM107_TARGET
+
+
+@pytest.mark.usefixtures("_on_sm107")
+@pytest.mark.parametrize(
+    "moe_tactic, draft_moe_tactic, refused",
+    [
+        ("cutlass", None, "moe_config.tactic='cutlass'"),
+        (_CUTLASS_NVFP4, None, f"moe_config.tactic='{_CUTLASS_NVFP4}'"),
+        # The draft's decode MoE runs on a BF16 copy of its weights, not on the draft module.
+        (None, _TRTLLM_GEN_NVFP4, f"speculative_config.moe_tactic='{_TRTLLM_GEN_NVFP4}'"),
+    ],
+    ids=["cutlass", "cutlass_id", "draft"],
+)
+def test_glm52_tp16_declines_a_tactic_its_kernels_do_not_read(
+    moe_tactic, draft_moe_tactic, refused
+):
+    config = _glm52_tp16_config(moe_tactic, draft_moe_tactic)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(
+        ValueError, match=rf"{re.escape(refused)} .*ModelingV2Glm52Nvfp4Sm107LowLatency"
+    ):
         modeling_v2_resolve(config, _llm_args("require"))

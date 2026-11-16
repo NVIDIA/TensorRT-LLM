@@ -61,9 +61,8 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 1. **Source and CPU (seconds).** Grep the forward for what the feature forbids:
    host syncs or value-dependent Python branches under graphs, a context
    assumed to start at position 0, state in target-owned tensors. Run
-   `tests/unittest/_torch/modeling_v2/test_modeling_v2_claims.py` and
-   `test_modeling_v2_routing.py` (no GPU) and `trtllm-modeling-v2 intake lint`
-   on the spec. *Blind to* numerics and to whether the engine turned the
+   `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py` (no GPU)
+   and `trtllm-modeling-v2 intake lint` on the spec. *Blind to* numerics and to whether the engine turned the
    feature on.
 2. **In-tree unit tests to imitate (minutes, one GPU).** Each section names the
    op-, cache- or transfer-level test that already exercises the feature. Copy

@@ -37,6 +37,9 @@ def _run_one_rank():
     )
     host_group = dist.new_group(backend="gloo")
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as shared_ar
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+        native_ops,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.intra_node_moe_finalize import (  # noqa: E501
         intra_node_moe_finalize,
     )
@@ -260,7 +263,7 @@ def _run_one_rank():
     # Functionalization must fail before a peer-buffer write, not clone only the pointer table.
     try:
         torch.func.functionalize(
-            lambda a: torch.ops.trtllm.glm_intra_node_reduce(
+            lambda a: native_ops.glm_intra_node_reduce(
                 a, residual, norm.weight, EPS, *state.args(), True
             )
         )(x)

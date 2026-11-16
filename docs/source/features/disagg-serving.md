@@ -421,6 +421,35 @@ requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
 
+### Generation slot preemption (prototype)
+
+GEN slot preemption pauses a resident decode request when all batch slots are
+occupied and a waiter risks missing its TTFT target. Configure exactly one bound
+(neither: disabled):
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.10          # up to +10% mean TPOT from pauses
+    # target_output_tps: 35.0  # alternative: output-rate floor for ~80% of requests
+```
+
+Preemption requires the auto GEN admission policy
+(`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`) and the V2 KV scheduler.
+Pipeline parallelism and attention DP are rejected. Startup checks these
+prerequisites before reserving paused-request headroom.
+
+Pauses free batch slots while retaining KV, recurrent, and drafter state. Cache
+sizing must cover active plus paused requests: SWA and NVFP4-MLA HP-ring
+reservations include the paused cap; full-attention demand depends on sequence
+lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
+recompute context locally, and Helix CP raises on decode allocation failure.
+Reduce concurrency or increase the KV budget when both slots and pages are full.
+
+Pool headroom belongs to each executor. Configuring preemption on a context
+worker also reserves headroom. `target_output_tps` has simulation coverage only;
+GPU validation is limited to `tpot_budget`.
+
 ### Bounding the graceful stop of a server
 
 A server can still have request handlers running when it is told to stop, for
@@ -438,6 +467,27 @@ in the `trtllm-serve` reference describes it for every server.
 ```yaml
 serve_graceful_shutdown_timeout_s: 30
 ```
+
+### Generation server options
+
+Two prototype options of a generation server's configuration:
+
+* `scheduler_config.max_gen_init_admissions_per_pass` bounds how many
+  disaggregated generation requests a rank admits, allocating their KV cache, per
+  scheduling pass of the KV cache manager V2 scheduler; the others are admitted
+  in later passes, in order. A bound trades the start latency of a burst of
+  requests for shorter passes, which every attention-DP rank waits for. Unset,
+  the default, admits all that fit; KV cache manager V1 ignores it with a warning.
+* `gen_prompt_tail_tokens: N` (at least 256) sends a context-first
+  generation-only request to the generation workers with only its last `N`
+  prompt ids and the number of ids left out, since its KV cache comes from the
+  context server. Remote-tail, generation-first and multimodal requests keep
+  their full prompt, as do requests that read it (penalties, prompt logprobs,
+  logits processors, beams or several sequences, among others). The option is
+  rejected together with KV cache block reuse, KV cache events, a KV cache
+  connector, routed-expert capture, context parallelism, the SA, NGram or AUTO
+  drafters, KV cache manager V1, or a cache transceiver runtime other than
+  `PYTHON`.
 
 ## Environment Variables
 

@@ -98,6 +98,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
         is_mtp_eagle=True,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
+        _step0_draft_layer_picks_rows=lambda draft_model, use_epilogue: False,
     )
 
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
@@ -616,6 +617,7 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
     # layout from this hook, so a plain (non-FP4) manager must not expose it.
     mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
+    mock_kv_cache_manager.mixed_precision_high_layers = {}
     return mock_kv_cache_manager
 
 

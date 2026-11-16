@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -65,19 +66,8 @@ struct HostCacheTierConfig
     //! exceed anyway.
     std::optional<size_t> maxQuota;
 
-    //! Whether a page may come from a NUMA node other than the one the GPU
-    //! attaches to, when the local node cannot satisfy it.
-    //!
-    //! False keeps every page local, at the cost of capping the tier at one
-    //! node's memory: a quota sized from total system memory cannot then be
-    //! filled. True accepts a remote page, which the GPU reaches more slowly,
-    //! rather than failing the allocation.
-    //!
-    //! False additionally requires that a memory policy be settable. Where the
-    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
-    //! one, and the tier refuses to start rather than fall back to first touch
-    //! -- which prefers the local node but takes a remote page instead of
-    //! failing, and so would not be the strictness that was asked for.
+    //! Deprecated: set KVCacheManagerConfig::hostMemBacking instead. False here still makes the
+    //! host memory's placement strict; the tier itself does not read it.
     bool allowRemoteNumaFallback = true;
 
     [[nodiscard]] CacheTier tier() const noexcept
@@ -98,6 +88,28 @@ struct DiskCacheTierConfig
 {
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
+
+    //! Upper bound of numIoThreads, matching KvCacheConfig.disk_io_threads.
+    static constexpr int kMaxIoThreads = 256;
+
+    //! Worker threads for asynchronous disk I/O, 0 to kMaxIoThreads. Process-wide: the first nonzero value starts the
+    //! pool for the life of the process, and later values, including 0, do not change it. Without a pool, disk I/O is
+    //! synchronous.
+    int numIoThreads = 0;
+
+    //! Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
+    bool keepCopyAfterRestore = false;
+
+    //! Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
+    //! and required writes. Requires numIoThreads > 0 and a host tier right above this disk tier.
+    bool writeThrough = false;
+
+    //! Share of this tier's slots, 0 to 1, that retained copies (from keepCopyAfterRestore or writeThrough) may hold
+    //! ahead of pages whose only copy is on disk. When the tier runs short, copies beyond the share are released
+    //! before any of those pages is evicted, and write-through creates no copy beyond it. Copies within the share are
+    //! released only for what evicting those pages cannot cover. 1 favors saving writes (write-bound deployments); a
+    //! lower value keeps more distinct pages on disk (capacity-bound deployments).
+    float protectedCopyFraction = 1.0F;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -245,6 +257,13 @@ struct BufferConfig
 // ---------------------------------------------------------------------------
 struct SparseCacheConfig
 {
+    //! The 32-bit probe word packs a cache slot beside a unit ordinal. Both fields
+    //! reserve their all-ones value, so the largest ordinal is two below 2^18.
+    static constexpr uint32_t kProbeSlotBits = 14;
+    static constexpr int32_t kMaxUnitOrdinal = static_cast<int32_t>((1U << (32 - kProbeSlotBits)) - 2U);
+    //! Maximum cache entries per selection supported by the sparse resolve probe.
+    static constexpr int32_t kMaxCacheEntries = static_cast<int32_t>((1U << kProbeSlotBits) - 2U);
+
     //! Selection width: units a sparse-attention step selects for this layer.
     int numSelectedBlocks;
 
@@ -388,6 +407,49 @@ inline std::vector<BufferConfig> const& layerBuffers(LayerConfig const& layer)
 }
 
 // ---------------------------------------------------------------------------
+// Regions — buffers whose life cycle is declared rather than derived from a layer config.
+// ---------------------------------------------------------------------------
+
+//! What one unit of a region's allocation covers.
+enum class RegionAllocationUnit : std::uint8_t
+{
+    kRequest,    //!< One slot per KV cache and beam, held for the cache's lifetime.
+    kTokenBlock, //!< One page per token block. Not supported yet.
+};
+
+//! One buffer of a region. The layer id places the buffer in the per-layer address
+//! space; the buffer's life cycle comes from its region.
+struct RegionBuffer
+{
+    LayerId layerId = 0;
+    BufferConfig buffer;
+};
+
+//! Buffers that share a life cycle of the region's own. The life cycle is never merged
+//! with another one, even one whose parameters are equal.
+//!
+//! Only request regions with the PRIVATE reuse policy are supported: one slot per living
+//! KV cache and beam, never published for reuse, returned when the cache closes. Each
+//! buffer sits on a layer that has an SsmLayerConfig.
+struct RegionConfig
+{
+    std::string name;
+    RegionAllocationUnit allocationUnit = RegionAllocationUnit::kRequest;
+    ReusePolicy reusePolicy = ReusePolicy::PRIVATE;
+    std::vector<RegionBuffer> buffers;
+
+    //! GPU slot count of the region's pool group. When set, the region's life cycle gets a
+    //! pool group of its own with exactly this many hot-tier slots; ratio-based sizing at
+    //! construction, in resize() and adjust(), and in tuner targets leaves that group at
+    //! this size. A GPU quota too small to hold it is raised, as for the constraint floors.
+    //! When unset, the region is sized by ratio like any other life cycle.
+    std::optional<std::int64_t> fixedSlotCount;
+
+    //! Checks of the region alone; KVCacheManagerConfig::validate() checks it against the layers.
+    void validate() const;
+};
+
+// ---------------------------------------------------------------------------
 // KVCacheDesc — describes one KV cache request's capacity and history length.
 // Mirrors _config.py::KVCacheDesc.
 // ---------------------------------------------------------------------------
@@ -522,6 +584,32 @@ struct PoolRebalanceConfig
     }
 };
 
+//! How the KV cache manager backs the host cache tier's memory. HostMemBacking applies it where the
+//! memory is mapped; the tier takes the backed memory and does not read it.
+struct HostMemBackingConfig
+{
+    //! The NUMA node for the pages instead of the one the GPU attaches to.
+    std::optional<int> numaNode;
+
+    //! Whether a page may come from another NUMA node when the chosen node cannot satisfy it.
+    //!
+    //! False keeps every page on that node, at the cost of capping the memory at one node's: a
+    //! quota sized from total system memory cannot then be filled. True accepts a remote page,
+    //! which the GPU reaches more slowly, rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the memory is
+    //! mmap-backed, a container without CAP_SYS_NICE cannot set one, and the manager refuses to
+    //! start rather than fall back to first touch -- which prefers the local node but takes a
+    //! remote page instead of failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
+    void validate() const
+    {
+        if (numaNode && *numaNode < 0)
+            throw std::invalid_argument("HostMemBackingConfig: numa_node must be >= 0");
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
@@ -535,6 +623,11 @@ struct KVCacheManagerConfig
 
     // Layer configs (attention or SSM). Layer IDs must be unique.
     std::vector<LayerConfig> layers;
+
+    // Regions, each with a life cycle of its own. A (layer, role) pair belongs to one layer
+    // config or one region. Region life cycles are numbered after every layer life cycle,
+    // in declaration order, so declaring a region never renumbers the layer groups.
+    std::vector<RegionConfig> regions;
 
     // Suspend/resume threshold: if utilization > this, resuming will fail.
     float maxUtilForResume = 0.97f;
@@ -556,7 +649,8 @@ struct KVCacheManagerConfig
     std::vector<BatchDesc> constraints;   // batches that must always be supportable
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
     // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
-    // layer-group slot-count proportions while accounting for cold page sizes.
+    // layer-group slot-count proportions while accounting for cold page sizes. The group of a region with a
+    // fixed slot count keeps its entry, which the hot tier ignores.
     std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
@@ -602,6 +696,8 @@ struct KVCacheManagerConfig
 
     // Unreferenced GPU pages below this priority are dropped instead of offloaded.
     Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
+
+    HostMemBackingConfig hostMemBacking;
 
     bool enableSwaScratchReuse() const noexcept
     {

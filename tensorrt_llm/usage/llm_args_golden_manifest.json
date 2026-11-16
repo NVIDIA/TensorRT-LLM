@@ -39,6 +39,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_packed_sync"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
     },
     {
@@ -75,11 +80,22 @@
       "allowed_values": [
         "round_robin",
         "least_queued",
-        "least_tokens"
+        "least_tokens",
+        "least_prefill"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "attention_dp_config.kv_cache_routing_new_conv_placement"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_strict_affinity_max_wait_iters"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_strict_conversation_affinity"
     },
     {
       "capture_policy": "int",
@@ -367,6 +383,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_client_io_during_gpu_wait"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_early_first_token_response"
     },
     {
@@ -532,6 +553,11 @@
       "path": "gather_generation_logits"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "gen_prompt_tail_tokens"
+    },
+    {
       "allowed_values": [
         "auto",
         "trtllm"
@@ -602,6 +628,16 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_last_n"
     },
     {
       "capture_policy": "bool",
@@ -688,7 +724,27 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "kv_cache_config.disk_io_threads"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.disk_keep_copy_after_restore"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "kv_cache_config.disk_prefetch_num_reqs"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.disk_protected_copy_fraction"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.disk_write_through"
     },
     {
       "allowed_values": [
@@ -741,6 +797,11 @@
       "capture_policy": "float|none",
       "kind": "value",
       "path": "kv_cache_config.free_gpu_memory_fraction"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.host_cache_bind_to_gpu_numa_node"
     },
     {
       "capture_policy": "int|none",
@@ -1139,9 +1200,78 @@
       "path": "moe_config.load_balancer.num_slots"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.count_every_steps"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.deadline_step"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.decay"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.interval_steps"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.max_migrations"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.max_moved_fraction"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.min_gain"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.min_pos"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.min_round_gain"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.min_rows"
+    },
+    {
+      "allowed_values": [
+        "lpt",
+        "cost"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.warmup_placement.planner"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.warmup_placement.start_step"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.max_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "moe_config.megamoe_fuse_shared_expert"
     },
     {
       "capture_policy": "bool",
@@ -1363,6 +1493,11 @@
       "path": "prometheus_metrics_config.time_to_first_token_buckets"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "prompt_token_cache_config.max_bytes"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "ray_placement_config.defer_workers_init"
@@ -1488,6 +1623,21 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.target_output_tps"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.tpot_budget"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.max_gen_init_admissions_per_pass"
     },
     {
       "capture_policy": "bool",
@@ -1627,6 +1777,16 @@
       "capture_policy": "allowlist|none",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.gpu_cache_factor"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.host_history_size"
     },
     {
       "capture_policy": "int|none",
@@ -2150,6 +2310,53 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "use_fine_grained_sync"
+    },
+    {
+      "allowed_values": [
+        "gumbel",
+        "gumbel_dual_key"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.algorithm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_request_opt_out"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_target_only_watermarking"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "watermark_config.context_width"
+    },
+    {
+      "allowed_values": [
+        "none",
+        "single_turn",
+        "all"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.deduplicate_contexts"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "watermark_config.deduplicate_contexts_max_history"
+    },
+    {
+      "allowed_values": [
+        "philox"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.prf"
     }
   ]
 }

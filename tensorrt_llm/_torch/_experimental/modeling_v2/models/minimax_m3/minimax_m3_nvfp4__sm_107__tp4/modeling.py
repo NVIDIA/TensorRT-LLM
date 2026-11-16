@@ -80,6 +80,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ANY_MOE_IMPL,
     ModelingV2Mode,
     resolved_mode,
     step_contract_enabled,
@@ -206,11 +207,14 @@ from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllRed
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
-    _ensure_draft_vocab_size,
-    _slice_spec_position_ids,
+    _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
 )
 from tensorrt_llm._torch.models.modeling_speculative import (
-    _get_requested_draft_moe_backend as _get_requested_draft_moe_backend,
+    _draft_moe_selection as _draft_moe_selection,
+)
+from tensorrt_llm._torch.models.modeling_speculative import (
+    _ensure_draft_vocab_size,
+    _slice_spec_position_ids,
 )
 from tensorrt_llm._torch.models.modeling_speculative import (
     _set_draft_kv_cache_quant_algo as _set_draft_kv_cache_quant_algo,
@@ -1119,9 +1123,6 @@ MERGE_MXFP8_HANDOFF = True
 MSA_KV_UPDATE = True
 MSA_SKIP_UNCHANGED_BLOCK_OFFSETS = True
 MSA_REUSE_POOL_VIEWS = True
-# Step-input preparation fills the MSA block-id table by slice-copying each request's page-index view (MSA
-# RuntimeHooks.block_ids_from_views) instead of building a Python list of the whole padded row; the table is the same.
-MSA_BLOCK_IDS_FROM_VIEWS = True
 
 FAST_PATHS: Tuple[RowRange, ...] = (
     EMBED_FIRSTNORM,
@@ -1454,7 +1455,7 @@ def _linear(
     _record("linear", (n, k), rows, path, push is not None)
     output = None
     # MX-TAC: the decode-graph MXFP8 quantize and GEMM at the target's fixed tactics, no AutoTuner.
-    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_decode_graph_backends
+    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_mxfp8_backends
     if prequant is not None:
         act, act_scale = prequant
         if path == MX_GEMV_PATH:
@@ -5560,7 +5561,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
             kv_update=_msa_kv_update_kernel.msa_kv_update if MSA_KV_UPDATE else None,
             skip_unchanged_block_offsets=MSA_SKIP_UNCHANGED_BLOCK_OFFSETS,
             reuse_pool_views=MSA_REUSE_POOL_VIEWS,
-            block_ids_from_views=MSA_BLOCK_IDS_FROM_VIEWS,
         ),
     )
 
@@ -5574,6 +5574,11 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
+    # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
+    # moe_config.tactic names, so it declares no moe_impls_honored.
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

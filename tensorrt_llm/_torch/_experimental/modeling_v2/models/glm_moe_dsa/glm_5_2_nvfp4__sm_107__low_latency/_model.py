@@ -40,13 +40,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.attention.attention import (
-    maybe_allgather_for_helix_cp,
-    maybe_slice_for_helix_cp,
-)
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -71,6 +66,8 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+from ._mla import Glm52MLA
 
 # isort: off
 from tensorrt_llm._torch.moe.fused_moe.routing import Deepseekv3RoutingImpl
@@ -181,7 +178,7 @@ class Glm52Linear(Linear):
         return output
 
 
-class Glm52Attention(MLA):
+class Glm52Attention(Glm52MLA):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -917,9 +914,6 @@ class Glm52DecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        residual = maybe_slice_for_helix_cp(
-            residual, attn_metadata, self.mapping_with_cp, self.layer_idx
-        )
         if isinstance(self.mlp, Glm52MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
@@ -1173,9 +1167,6 @@ class Glm52Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        hidden_states = maybe_allgather_for_helix_cp(
-            hidden_states, attn_metadata, self.mapping_with_cp
-        )
         return hidden_states
 
 

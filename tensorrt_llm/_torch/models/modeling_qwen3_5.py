@@ -55,31 +55,37 @@ _LANG_PREFIX = "model.language_model."
 
 _MTP_TOP_TO_TRTLLM = {
     "fc": "fc",
+    "fc_embedding": "fc_embedding",
+    "fc_hidden": "fc_hidden",
+    "hyper_connection_mixer": "shared_head.hyper_connection_mixer",
     "norm": "shared_head.norm",
     "pre_fc_norm_embedding": "pre_fc_norm_embedding",
     "pre_fc_norm_hidden": "pre_fc_norm_hidden",
 }
 
 
-def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
-    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
-    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+def _use_nvfp4_marlin(llm_args: "TorchLlmArgs") -> bool:
     quant_config = getattr(llm_args, "quant_config", None)
-    if getattr(quant_config, "quant_algo", None) in (
+    return getattr(quant_config, "quant_algo", None) in (
         QuantAlgo.NVFP4,
         QuantAlgo.MIXED_PRECISION,
-    ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
+    ) and is_nvfp4_marlin_supported_sm(get_sm_version())
+
+
+def _get_qwen35_dense_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for dense Qwen3.5 with NVFP4 linears on Ada/Hopper."""
+    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
         # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
-        defaults.update(
-            {
-                "moe_config": {
-                    "backend": "MARLIN",
-                },
-                "nvfp4_gemm_config": {
-                    "allowed_backends": ["marlin"],
-                },
-            }
-        )
+        defaults["nvfp4_gemm_config"] = {"allowed_backends": ["marlin"]}
+    return defaults
+
+
+def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
+    defaults = _get_qwen35_dense_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
+        defaults["moe_config"] = {"backend": "MARLIN"}
     return defaults
 
 
@@ -265,14 +271,16 @@ class Qwen35ConfigCompat:
         """Translate HF quantization exclude-module paths to TRT-LLM names.
 
         - Strip model.language_model. prefix -> model.
-        - Drop model.visual.* and mtp.* entries
+        - Drop model.visual.* entries
         - Map split projection names to packed TRT-LLM names
+        - Keep mtp.* in HF naming for _normalize_qwen35_exclude_modules to
+          translate once num_hidden_layers is known
         """
         normalized = set()
         for name in modules:
             if name.startswith("model.language_model."):
                 name = "model." + name[len("model.language_model.") :]
-            if name.startswith("model.visual.") or name.startswith("mtp."):
+            if name.startswith("model.visual."):
                 continue
             name = re.sub(r"\.in_proj_[ab]$", ".in_proj_ba", name)
             name = re.sub(r"\.in_proj_(q|k|v|z|qkv)$", ".in_proj_qkvz", name)
@@ -486,6 +494,7 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
     function translates the patterns so that
     ``apply_quant_config_exclude_modules`` can match them.
+    Dense MLP projections include the runtime adapter's ``.mlp.mlp.`` level.
 
     ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) skips the lm_head
     force-exclusion so the quantized LMHead path can engage.
@@ -504,6 +513,12 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
         # Drop vision tensors (not part of the language model graph)
         if name.startswith("model.visual"):
             continue
+        # Only dense _DenseMlpAdapter paths match; MoE expert paths are unchanged.
+        name = re.sub(
+            r"(\.layers\.[^.]+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\b|\*)",
+            r"\1.mlp.\2\3",
+            name,
+        )
         # Translate MTP-namespace patterns to TRT-LLM paths so the MTP
         # layer (which the checkpoint stores unquantized) gets correctly
         # excluded from the global NVFP4/FP8 quant_config.
@@ -553,20 +568,19 @@ def _normalize_qwen35_quant_config_dict(
     scales -- provided the checkpoint uses 16-element scale blocks. 32-element
     dense weight-only exports (``group_size=32``) stay on the W4A16
     dequantization path because the W4A4 GEMMs cannot consume them. MoE expert
-    entries with 32-element blocks are rejected before promotion. Dense MLP keys are
-    additionally re-pathed to the doubled ``.mlp.mlp.`` form to match the
-    ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
+    entries with 32-element blocks are rejected before promotion. Dense MLP keys of
+    every quant algorithm are re-pathed to the doubled ``.mlp.mlp.`` form to match
+    the ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
     their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
 
     Split linear-attn in_proj projections (in_proj_qkv/in_proj_z or fully
     split q/k/v/z) are fused into a single ``in_proj_qkvz`` Linear at runtime.
-    When the checkpoint quantizes every one of them per-tensor FP8, a single
-    FP8 entry is synthesized under the fused module name so the Linear is
-    built FP8; the weight mapper then requantizes the split weights onto one
-    shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
-    sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+    When all of them share one FP8 scheme, a single entry is synthesized under
+    the fused module name. Per-tensor FP8 weights are requantized onto a shared
+    scale (_requantize_linear_attn_fp8_qkvz); per-channel scales are packed with
+    the rows. Other sets get no fused entry; per-tensor FP8 ones load as bf16.
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
     _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103 for 16-element
@@ -621,7 +635,11 @@ def _normalize_qwen35_quant_config_dict(
         # model.layers.{offset+N} key, so a fused entry would build an FP8
         # module whose weights load as bf16.
         in_proj_match = re.search(r"^(.+\.linear_attn)\.in_proj_(qkv|q|k|v|z)$", name)
-        if in_proj_match and not from_mtp and cfg.quant_algo == QuantAlgo.FP8:
+        if (
+            in_proj_match
+            and not from_mtp
+            and cfg.quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        ):
             in_proj_fp8.setdefault(in_proj_match.group(1), {})[in_proj_match.group(2)] = cfg
             continue
         if name.endswith(".mlp.experts"):
@@ -644,10 +662,7 @@ def _normalize_qwen35_quant_config_dict(
             # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
             # consume the checkpoint's packed FP4 weights and static input scales.
             dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
-            if dense_mlp_match and cfg.quant_algo in (
-                QuantAlgo.W4A16_NVFP4,
-                QuantAlgo.NVFP4,
-            ):
+            if dense_mlp_match:
                 if (
                     convert_to_nvfp4
                     and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
@@ -658,10 +673,11 @@ def _normalize_qwen35_quant_config_dict(
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
         normalized[name] = cfg
 
-    # Synthesize one FP8 entry per fused in_proj_qkvz whose split projections
-    # are all FP8; the weight mapper requantizes them onto a shared scale.
+    # One fused in_proj_qkvz entry per complete split set with a single FP8 scheme.
     for prefix, projs in in_proj_fp8.items():
-        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}):
+        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}) and (
+            len({cfg.quant_algo for cfg in projs.values()}) == 1
+        ):
             normalized[f"{prefix}.in_proj_qkvz"] = next(iter(projs.values()))
 
     qcd.clear()
@@ -717,6 +733,10 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_dense_model_defaults(llm_args)
+
 
 # Shared placeholder metadata for both Qwen3.5 VLM variants. The image/video
 # placeholder layout is identical for MoE and dense; only the registration
@@ -750,12 +770,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     @classmethod
     def get_model_defaults(cls, llm_args):
         # `ModelLoader` applies `get_model_defaults()` on the resolved outer
-        # model class (this VLM wrapper), not on the inner decoder. Both
-        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
-        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
-        # keep block reuse disabled until a recurrent-state snapshot policy is
-        # configured.
-        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+        # model class (this VLM wrapper), not on the inner decoder.
+        return _get_qwen35_dense_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

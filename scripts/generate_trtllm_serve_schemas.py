@@ -82,6 +82,20 @@ class _ServeSchemaGeneratorMixin:
                         properties[name] = copy.deepcopy(properties[names[0]])
         return result
 
+    def tagged_union_schema(self, schema: core_schema.TaggedUnionSchema) -> JsonSchemaValue:
+        result = super().tagged_union_schema(schema)
+        # Pydantic emits the tag's JSON name (alias resolved) only for field discriminators.
+        tag = result.get("discriminator", {}).get("propertyName")
+        if tag is not None:
+            # Validation reads the tag before choosing a branch, so a mapping without it is
+            # rejected even when the branch model defaults the field. Require it on the union
+            # branches only; the shared definitions keep their Python defaults.
+            for branch in result.get("oneOf", []):
+                required = branch.setdefault("required", [])
+                if tag not in required:
+                    required.append(tag)
+        return result
+
     def dataclass_schema(self, schema: core_schema.DataclassSchema) -> JsonSchemaValue:
         result = super().dataclass_schema(schema)
         # These configs are constructed with **yaml_dict, which rejects unknown arguments.
@@ -179,6 +193,44 @@ def _dwdp_launch_rules() -> list[dict]:
     ]
 
 
+def _any_case(token: str) -> str:
+    """A pattern matching ``token`` in any case; JSON Schema patterns take no flags."""
+    return "".join(f"[{char}{char.upper()}]" if char.isalpha() else char for char in token)
+
+
+def _stripped_whitespace() -> str:
+    r"""A pattern class of the characters ``str.strip()`` removes.
+
+    ``\s`` is not that set: it also matches U+FEFF, which ``strip()`` keeps,
+    and misses U+001C-U+001F and U+0085, which it removes.
+    """
+    spaces = (char for char in map(chr, range(0x10000)) if char.isspace())
+    return "[" + "".join(f"\\u{ord(char):04x}" for char in spaces) + "]"
+
+
+def _moe_tactic_schema() -> dict:
+    """The MoE tactics the runtime accepts, as far as patterns can tell.
+
+    Every segment is ``*`` or a segment value in any case, around the
+    whitespace the runtime strips, and not every segment is ``*``. Which values
+    combine into an implementation id is left to the runtime.
+    """
+    from dataclasses import fields
+
+    from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MOE_IMPL_REGISTRY
+
+    values = "|".join(_any_case(token) for token in sorted(MOE_IMPL_REGISTRY.known_tokens()))
+    segment = rf"(\*|{values})"
+    more = len(fields(MoEImplId)) - 1
+    space = _stripped_whitespace()
+    return {
+        "type": "string",
+        "pattern": rf"^{space}*{segment}(\.{segment}){{0,{more}}}{space}*$",
+        "not": {"pattern": rf"^{space}*\*(\.\*){{0,{more}}}{space}*$"},
+    }
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
@@ -214,6 +266,10 @@ def generate_serve_schema() -> dict:
         standard,
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
+    ]
+    # The model validator allows at most one non-null preemption bound.
+    schema["$defs"]["GenPreemptionConfig"]["anyOf"] = [
+        {"properties": {name: {"type": "null"}}} for name in ("tpot_budget", "target_output_tps")
     ]
     # Mirror DwdpConfig._validate_modes(): without expert DWDP, dense DWDP is on and the expert
     # fields keep their defaults; contention_opt, which selects batched copies, rules out another
@@ -268,6 +324,32 @@ def generate_serve_schema() -> dict:
         {"properties": {name: {"const": 0} for name in pair}},
         {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
     ]
+    # Mirror the MoE tactic validators of MoeConfig and of every decoding
+    # config as far as a schema can, and that a tactic excludes any backend
+    # but AUTO (or unset, where that is allowed).
+    schema["$defs"]["MoeTactic"] = _moe_tactic_schema()
+
+    def mirror_moe_tactic_validators(
+        config_schema: dict, backend: str, tactic: str, admitted_backend: dict
+    ) -> None:
+        branches = config_schema["properties"][tactic]["anyOf"]
+        branches[:] = [
+            {"$ref": "#/$defs/MoeTactic"} if branch.get("type") == "string" else branch
+            for branch in branches
+        ]
+        config_schema["not"] = {
+            "required": [backend, tactic],
+            "properties": {backend: {"not": admitted_backend}, tactic: {"type": "string"}},
+        }
+
+    mirror_moe_tactic_validators(
+        schema["$defs"]["MoeConfig"], "backend", "tactic", {"const": "AUTO"}
+    )
+    for definition in schema["$defs"].values():
+        if "moe_tactic" in definition.get("properties", {}):
+            mirror_moe_tactic_validators(
+                definition, "moe_backend", "moe_tactic", {"enum": ["AUTO", None]}
+            )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

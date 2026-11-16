@@ -14,12 +14,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
-    _indexer_reference,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_k_tail import (  # noqa: E501
-    indexer_k_tail as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
+        _indexer_reference,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_k_tail import (  # noqa: E501
+        indexer_k_tail as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../..", "."]
@@ -30,7 +35,8 @@ pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the GLM-5.2 tp16 target's entries are certified on sm_107"
 )
 
-assert torch.cuda.is_available(), "indexer_k_tail requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("indexer_k_tail requires a CUDA device", allow_module_level=True)
 
 
 def _build(spec, seed: int) -> dict:
