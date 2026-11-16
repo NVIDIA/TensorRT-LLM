@@ -204,8 +204,6 @@ On the context servers of a disaggregated deployment, whose role `trtllm-serve` 
 
 Agentic and multi-turn workloads resend a growing history with every turn. Serving them efficiently depends on finding that history in the cache instead of prefilling it again. NVFP4 MLA supports KV cache block reuse and chunked prefill, together or separately. When a request finds cached blocks, context attention gathers the cached FP4 prefix into the operands of the FP8 context kernel and merges the attention over the prefix with the attention over the new tokens; the later chunks of a chunked prefill take the same path. Reuse works on whole 128-token blocks, and chunk boundaries align with the 16-token quantization tiles. Because the prefix is read back from the NVFP4 cache, context attention sees the same values that decode sees.
 
-<!-- TODO(before publishing): block reuse for DeepSeek-V3 and DeepSeek-R1 lands with #21313; publish this section after it merges. -->
-
 ## How to Use
 
 NVFP4 MLA is enabled by setting the KV cache data type of an MLA model to `nvfp4`. In a `trtllm-serve` configuration file:
