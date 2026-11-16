@@ -218,9 +218,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "timeout",
     "dataset_path",
     "llm_api_options",
-    # A reference's first-token log-probs per prompt, and the bounds a divergence from
-    # them is recorded past (``checks/divergence.py``): never a failure by itself.
-    "reference_logits",
     # Which ROW of reference_yaml this run anchors to. The references key a
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
@@ -1220,20 +1217,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
 
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
-
-    reference = block.get("reference_logits")
-    if reference is not None:
-        where = f"{ACCURACY_FIELD}.reference_logits"
-        if not isinstance(reference, dict) or not _text(reference.get("path")):
-            errors.append(f"'{where}' must be a mapping with a `path` to the reference's file")
-        else:
-            from ..checks.divergence import REFERENCE_KEYS
-
-            reject_unknown_keys(reference, REFERENCE_KEYS, errors, where=where)
-            for key in ("tie_margin", "max_js", "min_cosine"):
-                value = reference.get(key)
-                if value is not None and (not _number(value) or value < 0):
-                    errors.append(f"'{where}.{key}' must be a number >= 0")
 
     _validate_floor(block, errors)
 

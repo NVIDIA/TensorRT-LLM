@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
-from . import check_config, divergence, feature_evidence
+from . import check_config, feature_evidence
 from .check_config import (
     EngineLimits,
     check_configuration,
@@ -228,20 +228,6 @@ def run_boot_gate(
                 f"leave no room for a prompt the engine would have to split",
             )
         requests.append({"id": "chunk", "probe_tokens": length, "max_tokens": 1})
-    # The reference's prompts, one token each with its top-k, on the same engine: the
-    # model-level divergence is recorded with the verdict, never a failure by itself.
-    reference, unread = None, ""
-    if mode == MODE_REQUIRE:
-        try:
-            reference = divergence.load_reference(task_data)
-        except (OSError, ValueError) as exc:
-            unread = f"the reference logits cannot be read ({exc}): divergence UNKNOWN"
-    reference_at = len(requests)
-    if reference is not None:
-        requests.extend(
-            {"id": f"reference:{key}", "prompt": text, "max_tokens": 1, "logprobs": reference.top_k}
-            for key, text in reference.prompts.items()
-        )
     if timeout is None:
         declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", unit)
         timeout = declared or BOOT_TIMEOUT_S
@@ -317,30 +303,12 @@ def run_boot_gate(
         if shortfall:
             return _verdict(passed=False, detail=shortfall, **ran)
         chunked = f"; a prompt past max_num_tokens {limits.max_num_tokens} was served in chunks"
-    compared, warnings = "", []
-    if reference is not None:
-        measured = {}
-        for n in range(reference_at, len(requests)):
-            steps = (records.get(n) or {}).get("top_logprobs") or [[]]
-            row = {int(e[0]): float(e[1]) for e in steps[0] or () if e and e[0] is not None}
-            measured[str(requests[n]["id"]).partition(":")[2]] = row
-        found = divergence.assess(reference.first_tokens, measured, reference.bounds)
-        compared = f"; {found.describe()}"
-        if not found.within:
-            warnings.append(
-                f"divergence from the reference recorded: {len(found.crossed)} of "
-                f"{found.prompts} prompt(s) past a bound (the verdict stands)"
-            )
-    elif unread:
-        compared, warnings = f"; {unread}", [unread]
     images = sum(len(r.get("images") or ()) for r in requests)
     sent = f", {images} image(s) sent" if images else ""
     return _verdict(
         passed=True,
         detail=f"engine cold-started and produced non-empty generation for {len(texts)} prompt(s)"
-        f"{sent}; workload: {spec.source}{chunked}{compared}",
-        warnings=tuple(warnings),
-        explained=bool(compared),
+        f"{sent}; workload: {spec.source}{chunked}",
         **ran,
     )
 

@@ -112,17 +112,9 @@ benchmark you start by hand runs captured too.
   whose output is neither lm-eval's `accuracy:` line nor MMLU's weighted average needs
   `score_pattern` (a regular expression whose first group is the score, on the anchor's scale)
   and `samples`; without one, its gate quotes the lines that look like a score and fails.
-- **What fails a check.** Nothing generated, or a benchmark under its floor. Everything
-  stricter is recorded, not gated: the golden rule is the
-  benchmark score close to its reference. A model-level reference, when the run has one
-  (`accuracy.reference_logits.path`: first-token top-k log-probs per prompt, written by
-  `checks/harness/hf_reference.py` where `transformers` loads the checkpoint natively), is
-  compared at every boot: the first token the reference's (a flip within `tie_margin`, 0.15
-  nats, is a near-tie) and the distribution not diverged (Jensen-Shannon <= `max_js`, 0.20 nats;
-  centered cosine >= `min_cosine`, 0.98). A divergence past them is written into the verdict
-  with its prompts and numbers, and the verdict stands: loosen the bounds there if they are too
-  tight; the user judges the record. Kernel entries are judged by their output distribution
-  against their reference the same way (`trtllm-modeling-v2-entry`).
+- **What fails a check.** Nothing generated, or a benchmark under its floor: the golden rule
+  is the benchmark score close to its reference. Kernel entries are judged by their output
+  distribution against their reference (`trtllm-modeling-v2-entry`).
 - **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
   the spec states (`org/model`; the checkpoint path's last two components are no model's name):
   the user's score, else the reference implementation's (HuggingFace `transformers`, where it
