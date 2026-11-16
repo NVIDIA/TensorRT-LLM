@@ -791,7 +791,12 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 "[IMG]": count
             } if count else {} for count in counts],
             mm_data={"image": images},
-            chat_template_kwargs=self.chat_template_kwargs)
+            chat_template_kwargs={
+                **(self.chat_template_kwargs or {}),
+                # A gen_prefix ends the chat with the assistant turn to continue.
+                "continue_final_message":
+                not deferred["add_generation_prompt"],
+            })
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         """

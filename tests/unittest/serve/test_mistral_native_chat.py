@@ -201,7 +201,7 @@ def test_a_json_response_format_reaches_the_renderer(response_format, passed):
 
 @pytest.mark.parametrize("model_type", [_MODEL_TYPE, "llama"])
 def test_chat_parsing(model_type):
-    """mistral_common keeps each text part and empties a history call's invalid arguments."""
+    """mistral_common keeps each text part and a history call's arguments as sent."""
     native = model_type == _MODEL_TYPE
     parts = [{"type": "text", "text": "Rule one."}, {"type": "text", "text": "Rule two."}]
     conversation, media, _, _ = parse_chat_messages_coroutines(
@@ -220,7 +220,7 @@ def test_chat_parsing(model_type):
         return
     conversation, media, _, _ = parse_chat_messages_coroutines(history, _config(model_type))
     asyncio.run(media)
-    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == {}
+    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == "{not json"
 
 
 @pytest.fixture(scope="module", params=["v13", "v15"])
@@ -329,11 +329,23 @@ _IMAGES = [
         ],
     },
 ]
+
+
+def _tool_history(arguments):
+    """A tool call in the history whose arguments are ``arguments`` as sent."""
+    history = copy.deepcopy(_TOOL_HISTORY)
+    history[1]["tool_calls"][0]["function"]["arguments"] = arguments
+    return history
+
+
 # Each case: the request fields, and what mistral-common is given besides the messages.
 _CASES = {
     "control_tokens": ({"messages": _CHAT}, {}),
     "text_parts": ({"messages": _PARTS}, {}),
     "tools": ({"messages": _TOOL_HISTORY, "tools": [_WEATHER_TOOL]}, {"tools": [_WEATHER_TOOL]}),
+    # Arguments that are not a JSON object reach mistral-common as sent, which renders them.
+    "unparsable_args": ({"messages": _tool_history("{not json")}, {}),
+    "array_args": ({"messages": _tool_history("[1, 2]")}, {}),
     "ignored_fields": (
         {
             "messages": _HI,

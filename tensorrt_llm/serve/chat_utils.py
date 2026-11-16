@@ -273,19 +273,16 @@ def parse_chat_message_content(
         lenient_tool_call_arguments: bool = False,
         keep_message_tools: bool = False,
         keep_text_parts: bool = False,
-        coerce_invalid_tool_call_arguments: bool = False
-) -> ConversationMessage:
+        raw_tool_call_arguments: bool = False) -> ConversationMessage:
     """Parse the content of a chat message.
 
     With `keep_text_parts`, a content list keeps its text parts as separate
     `content_parts` entries even without media, for renderers that encode each
     part on its own rather than the newline-joined `content`.
 
-    With `coerce_invalid_tool_call_arguments`, an assistant tool call whose
-    `function.arguments` is not a JSON object (unparsable, empty, or JSON of
-    another type) gets an empty object and a warning instead of a
-    `ValueError`, so a conversation that carries one malformed call in its
-    history can still continue.
+    With `raw_tool_call_arguments`, an assistant tool call keeps its
+    `function.arguments` as the client sent them, for a renderer that parses
+    them itself.
     """
     role = message["role"]
     content = message.get("content")
@@ -306,9 +303,9 @@ def parse_chat_message_content(
     )
     if role == "assistant":
         result.update(
-            _parse_assistant_message_content(
-                message, lenient_tool_call_arguments,
-                coerce_invalid_tool_call_arguments))
+            _parse_assistant_message_content(message,
+                                             lenient_tool_call_arguments,
+                                             raw_tool_call_arguments))
     elif role == "tool":
         result.update(_parse_tool_message_content(message))
     elif keep_message_tools and role == "system" and message.get("tools"):
@@ -378,26 +375,18 @@ def _validate_fallback_tool_calls(
     return [tc.model_dump(exclude_unset=True) for tc in validated]
 
 
-def _normalize_tool_call_arguments(
-        index: int,
-        item: Any,
-        lenient_json: bool = False,
-        coerce_invalid_json: bool = False) -> dict[str, Any]:
+def _normalize_tool_call_arguments(index: int,
+                                   item: Any,
+                                   lenient_json: bool = False,
+                                   keep_raw: bool = False) -> dict[str, Any]:
     """Normalize `function.arguments` to the internal dict form.
 
-    `coerce_invalid_json` replaces arguments that are not a JSON object with an
-    empty object (logged) instead of raising; `lenient_json` keeps an
-    unparsable string as is and takes precedence over it.
+    `keep_raw` leaves the arguments as given, for a renderer that parses them
+    itself (mistral-common); `lenient_json` keeps an unparsable string as is.
     """
     item = dict(item)
     item["function"] = dict(item["function"])
-
-    def coerce(reason: str) -> dict[str, Any]:
-        logger.warning(
-            f"tool_calls[{index}] {item['function'].get('name')!r}: arguments "
-            f"{reason}; using an empty object so the conversation can continue."
-        )
-        item["function"]["arguments"] = {}
+    if keep_raw:
         return item
 
     arguments = item["function"].get("arguments")
@@ -412,15 +401,10 @@ def _normalize_tool_call_arguments(
                 # normalize unparsable arguments themselves and render them
                 # verbatim as a JSON block, matching the reference tokenizer.
                 return item
-            if coerce_invalid_json:
-                return coerce(f"are not valid JSON ({len(arguments)} chars)")
             raise ValueError(
                 f"tool_calls[{index}].function.arguments must be valid JSON."
             ) from e
         if not isinstance(arguments, dict):
-            if coerce_invalid_json:
-                return coerce(
-                    f"decode to {type(arguments).__name__}, not a JSON object")
             raise ValueError(
                 f"tool_calls[{index}].function.arguments must be a JSON object."
             )
@@ -428,17 +412,14 @@ def _normalize_tool_call_arguments(
     elif isinstance(arguments, dict):
         item["function"]["arguments"] = arguments
     else:
-        if coerce_invalid_json:
-            return coerce(f"are a {type(arguments).__name__}, not an object")
         raise ValueError(
             f"tool_calls[{index}].function.arguments must be an object.")
     return item
 
 
-def _parse_fallback_tool_calls(
-        tool_calls: list[Any],
-        lenient_json: bool = False,
-        coerce_invalid_json: bool = False) -> list[dict[str, Any]]:
+def _parse_fallback_tool_calls(tool_calls: list[Any],
+                               lenient_json: bool = False,
+                               keep_raw: bool = False) -> list[dict[str, Any]]:
     """Parse raw tool-call lists accepted only by the tau2-bench fallback path.
 
     `openai_server.py` first attempts strict OpenAI request validation. Some tau2-bench requests
@@ -450,17 +431,15 @@ def _parse_fallback_tool_calls(
     """
     tool_calls = _validate_fallback_tool_calls(tool_calls)
     return [
-        _normalize_tool_call_arguments(index, item, lenient_json,
-                                       coerce_invalid_json)
+        _normalize_tool_call_arguments(index, item, lenient_json, keep_raw)
         for index, item in enumerate(tool_calls)
     ]
 
 
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
-def _parse_assistant_message_content(
-        message: Dict[str, Any],
-        lenient_json: bool = False,
-        coerce_invalid_json: bool = False) -> Dict[str, Any]:
+def _parse_assistant_message_content(message: Dict[str, Any],
+                                     lenient_json: bool = False,
+                                     keep_raw: bool = False) -> Dict[str, Any]:
     result = {}
     # Include reasoning if present for interleaved thinking.
     reasoning_content = message.get("reasoning")
@@ -473,7 +452,7 @@ def _parse_assistant_message_content(
     if tool_calls is not None:
         if isinstance(tool_calls, list):
             result["tool_calls"] = _parse_fallback_tool_calls(
-                tool_calls, lenient_json, coerce_invalid_json)
+                tool_calls, lenient_json, keep_raw)
         else:
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
@@ -484,7 +463,7 @@ def _parse_assistant_message_content(
             message["tool_calls"] = tool_calls
             result["tool_calls"] = [
                 _normalize_tool_call_arguments(index, item, lenient_json,
-                                               coerce_invalid_json)
+                                               keep_raw)
                 for index, item in enumerate(tool_calls)
             ]
 
@@ -567,9 +546,8 @@ def parse_chat_messages_coroutines(
         # kimi_k3's reference renderer keeps unparsable tool-call argument
         # strings verbatim; other templates expect the strict dict contract.
         # mistral-common (the Mistral-native renderer) encodes each text part
-        # of a content list on its own, and gives a history tool call whose
-        # arguments are not a JSON object an empty object rather than
-        # rejecting the request.
+        # of a content list on its own, and parses a history tool call's
+        # arguments itself.
         native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
         parsed_msg = parse_chat_message_content(
             msg,
@@ -577,7 +555,7 @@ def parse_chat_messages_coroutines(
             lenient_tool_call_arguments=(model_type == "kimi_k3"),
             keep_message_tools=(model_type == "kimi_k3"),
             keep_text_parts=native_mistral,
-            coerce_invalid_tool_call_arguments=native_mistral)
+            raw_tool_call_arguments=native_mistral)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.
