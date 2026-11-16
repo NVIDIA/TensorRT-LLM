@@ -946,7 +946,7 @@ class TestRequestLocalMediaPaths:
         path = allowed / "img.png"
         url = f"file://{path}" if form == "file_uri" else str(path)
         image = await self._load(url)
-        assert tuple(image.shape) == (3, 8, 8)
+        assert tuple(image.shape) == (8, 8, 3)  # uint8 HWC, the default image format
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -998,7 +998,7 @@ class TestRequestLocalMediaPaths:
             Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")
             encoded = base64.b64encode(buf.getvalue()).decode("ascii")
         image = await self._load(f"data:image/png;base64,{encoded}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert tuple(image.shape) == (8, 8, 3)
 
     @pytest.mark.asyncio
     async def test_remote_url_not_checked_as_local(self, monkeypatch):
@@ -1041,7 +1041,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         (allowed / "alias.png").symlink_to(allowed / "img.png")
         image = await self._load(f"file://{allowed}/alias.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert tuple(image.shape) == (8, 8, 3)
 
     @pytest.mark.asyncio
     async def test_symlink_appearing_after_resolution_refused(self, monkeypatch, media_dirs):
@@ -1090,7 +1090,7 @@ class TestRequestLocalMediaPaths:
 
         monkeypatch.setattr(media_io, "open_allowed_local_media", open_then_replace)
         image = await self._load(f"file://{path}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert tuple(image.shape) == (8, 8, 3)
 
     @pytest.mark.asyncio
     async def test_loaded_without_descriptor_directory(self, monkeypatch, media_dirs):
@@ -1099,7 +1099,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         monkeypatch.setattr("tensorrt_llm.inputs.media_io._DESCRIPTOR_DIR", None)
         image = await self._load(f"file://{allowed}/img.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert tuple(image.shape) == (8, 8, 3)
 
     @pytest.mark.asyncio
     async def test_misconfigured_directory_refused_generically(

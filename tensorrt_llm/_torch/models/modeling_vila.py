@@ -24,6 +24,7 @@ import warnings
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -40,6 +41,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
+from ...inputs.media_io import uint8_image_to_tensor
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
@@ -972,7 +974,13 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         ), "Multimodal input data must be a dict of Image/Video/Audio, etc."
         images = []
         if "image" in mm_data and len(mm_data["image"]) > 0:
-            images = mm_data["image"]
+            # `process_images` reads PIL images or [0, 1] CHW tensors; convert
+            # uint8 arrays to the same tensor the "pt" loader gives.
+            images = [
+                uint8_image_to_tensor(image)
+                if isinstance(image, np.ndarray) else image
+                for image in mm_data["image"]
+            ]
             return process_images(images,
                                   self.image_processor,
                                   self.config,

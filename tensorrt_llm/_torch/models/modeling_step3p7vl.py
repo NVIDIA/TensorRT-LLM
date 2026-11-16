@@ -1112,6 +1112,11 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
     def get_vocab_size(self) -> int:
         return self._vocab_size
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # Images go to the checkpoint's own processor. Keep the float [0, 1]
+        # CHW tensors it always got; uint8 arrays are not checked with it.
+        return {"image": {"format": "pt"}}
+
     def get_num_tokens_per_image(
         self,
         *,

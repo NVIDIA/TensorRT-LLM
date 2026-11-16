@@ -71,8 +71,19 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
 
 def load_image(
         image: Union[str, Image.Image],
-        format: str = "pt",
+        format: str = "np",
         device: str = "cpu") -> Union[Image.Image, torch.Tensor, np.ndarray]:
+    """Load an RGB image from a URL, `data:` URI or local path.
+
+    `format` sets the return type:
+      `"np"`  - uint8 array of shape (H, W, 3) (default).
+      `"pt"`  - float32 tensor of shape (3, H, W) in [0, 1].
+      `"pil"` - PIL image.
+    Changed in 1.4: the default was `"pt"`. Pass `format="pt"` to keep float
+    images. This function does not know the model, so pass the image format
+    the model declares in `get_preferred_media_io_kwargs()`. A PIL image input
+    is returned as an RGB PIL image.
+    """
     image_io = ImageMediaIO(format=format, device=device)
 
     if isinstance(image, Image.Image):
@@ -95,8 +106,14 @@ def load_image(
 
 async def async_load_image(
         image: Union[str, Image.Image],
-        format: str = "pt",
+        format: str = "np",
         device: str = "cpu") -> Union[Image.Image, torch.Tensor, np.ndarray]:
+    """Load an image without blocking the event loop.
+
+    Same `format` values and default as `load_image`: a uint8 (H, W, 3) array
+    by default (changed in 1.4 from `"pt"`); pass `format="pt"` to keep float
+    images.
+    """
     image_io = ImageMediaIO(format=format, device=device)
 
     if isinstance(image, Image.Image):
@@ -1100,8 +1117,8 @@ def default_multimodal_input_loader(
     `image_data_format`, when set, is the decode format for every modality.
     Otherwise each modality uses the `format` in `media_io_kwargs`, then the
     format the model declares in `get_preferred_media_io_kwargs()` (as
-    `trtllm-serve` does), then its loader's default: `"pt"` for images and
-    `"np"` for video.
+    `trtllm-serve` does), then its loader's default: uint8 `"np"` for images
+    and video.
     """
     model_kwargs = INPUT_PROCESSOR_REGISTRY.get_preferred_media_io_kwargs(
         model_type)

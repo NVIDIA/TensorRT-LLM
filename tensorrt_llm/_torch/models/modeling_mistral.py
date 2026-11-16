@@ -5,6 +5,7 @@ import copy
 import dataclasses
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torchvision
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
@@ -328,13 +329,18 @@ class MistralCommonImageProcessor:
 
     def __call__(self,
                  text: str,
-                 images: list[Image.Image] | None = None,
+                 images: list[Image.Image | np.ndarray] | None = None,
                  **kwargs: Any) -> dict[str, torch.Tensor]:
         """Tokenize a native request and batch images without losing their sizes."""
-        mm_items = [{
-            "type": "image",
-            "base64": encode_base64_image(image)
-        } for image in (images or [])]
+        mm_items = []
+        for image in images or []:
+            if isinstance(image, np.ndarray):
+                # uint8 arrays (the default image format) become PIL images.
+                image = Image.fromarray(image)
+            mm_items.append({
+                "type": "image",
+                "base64": encode_base64_image(image)
+            })
 
         conversation = [{
             "role": "user",

@@ -27,6 +27,7 @@ from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from tensorrt_llm.inputs.media_io import uint8_image_to_tensor
 from tensorrt_llm.inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalItemPartition,
@@ -177,10 +178,16 @@ def get_video_target_size_and_feature_size(
     return target_w, target_h, feature_size
 
 
-def _media_to_raw_chw(media: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
-    """Convert a single PIL Image or [0,1] tensor to a CHW float tensor in [0, 255]."""
+def _media_to_raw_chw(media: Union[Image.Image, torch.Tensor, np.ndarray]) -> torch.Tensor:
+    """Convert a PIL Image, uint8 HWC array or [0,1] tensor to a CHW float tensor in [0, 255]."""
     if isinstance(media, Image.Image):
         return _pil_to_chw_tensor(media)
+    if isinstance(media, np.ndarray):
+        return (
+            torch.from_numpy(media)
+            .permute(2, 0, 1)
+            .to(torch.float32, memory_format=torch.contiguous_format)
+        )
     if isinstance(media, torch.Tensor):
         return media * 255.0
     raise TypeError(f"Unsupported media type: {type(media)}")
@@ -232,10 +239,12 @@ def video_to_pixel_values(
     return _resize_and_normalize(video_tensor, target_h, target_w, norm_mean, norm_std)
 
 
-def _get_media_dimensions(media: Union[Image.Image, torch.Tensor]) -> Tuple[int, int]:
-    """Return (width, height) for a PIL Image or a CHW tensor."""
+def _get_media_dimensions(media: Union[Image.Image, torch.Tensor, np.ndarray]) -> Tuple[int, int]:
+    """Return (width, height) for a PIL Image, a CHW tensor or an HWC array."""
     if isinstance(media, torch.Tensor):
         return media.shape[2], media.shape[1]
+    if isinstance(media, np.ndarray):
+        return media.shape[1], media.shape[0]
     return media.width, media.height
 
 
@@ -1161,8 +1170,8 @@ class NemotronHMultimodalInputProcessor(
         return modalities
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # The video helpers (`_media_to_raw_chw` and the shape helpers) read
-        # CHW tensors or PIL images, not uint8 HWC arrays.
+        # Images may be uint8 arrays. Some video helpers (frame shape reads and
+        # the HF processor fallback) read CHW tensors or PIL images only.
         return {"video": {"format": "pt"}}
 
     def get_mm_item_metadata(
@@ -2132,8 +2141,14 @@ class NemotronHMultimodalInputProcessor(
         return expanded, evs
 
     def _process_images(
-        self, images: List[Image.Image | torch.Tensor], text_prompt: str
+        self, images: List[Image.Image | torch.Tensor | np.ndarray], text_prompt: str
     ) -> Tuple[Dict[str, Any], str]:
+        # The HF processor reads PIL images or [0, 1] CHW tensors; convert uint8
+        # arrays to the same tensor the "pt" loader gives.
+        images = [
+            uint8_image_to_tensor(image) if isinstance(image, np.ndarray) else image
+            for image in images
+        ]
         # Multiple images can be processed in one call.
         processed_images = self.processor(images=images, return_tensors="pt").to(self.device)
 
@@ -2155,7 +2170,7 @@ class NemotronHMultimodalInputProcessor(
         return processed_images, processed_query
 
     def _process_images_dynamic(
-        self, images: List[Image.Image | torch.Tensor], text_prompt: str
+        self, images: List[Image.Image | torch.Tensor | np.ndarray], text_prompt: str
     ) -> Tuple[Dict[str, Any], str]:
         """Process images using dynamic resolution tiling.
 

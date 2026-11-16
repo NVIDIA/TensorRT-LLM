@@ -1148,7 +1148,9 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         """
         return torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
 
-    def get_num_tokens_per_image(self, *, image: Union[Image.Image, torch.Tensor], **kwargs) -> int:
+    def get_num_tokens_per_image(
+        self, *, image: Union[Image.Image, torch.Tensor, np.ndarray], **kwargs
+    ) -> int:
         """Calculate the number of tokens for a single image.
 
         Delegates to the HF KimiK25VisionProcessor's
@@ -1156,12 +1158,16 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         tiling, spatial merge kernel, and patch size.
 
         Args:
-            image: PIL image or Torch tensor to compute the token count for.
+            image: PIL image, uint8 HWC array or Torch tensor to compute the
+                token count for.
 
         Returns:
             Number of visual tokens this image produces after
             MoonViT3d + PatchMergerMLP.
         """
+        if isinstance(image, np.ndarray):
+            # The same PIL image `call_with_text_prompt` hands the processor.
+            image = Image.fromarray(image)
         image_processor = getattr(self._processor, "image_processor", None)
         if image_processor is not None and hasattr(image_processor, "media_tokens_calculator"):
             media_input = {"type": "image", "image": image}
@@ -1277,12 +1283,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         # ``split_video_chunks()`` which requires ``mecord``.
         medias: List[Dict[str, Any]] = []
         for img in images:
-            # The serving layer may pass images as torch.Tensor (default
-            # format="pt"). Convert to PIL for the HF processor.
+            # The serving layer may pass images as uint8 arrays (default
+            # format="np") or torch.Tensor (format="pt"). Convert to PIL for
+            # the HF processor.
             if isinstance(img, torch.Tensor):
                 from torchvision.transforms.functional import to_pil_image
 
                 img = to_pil_image(img)
+            elif isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
             medias.append({"type": "image", "image": img})
 
         video_prompt_parts: List[str] = []

@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pixel-parity tests for the `ImageMediaIO` JPEG decode fast path."""
+"""Pixel-parity tests for the `ImageMediaIO` JPEG decode fast path and the image formats."""
 
+import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
@@ -14,7 +15,21 @@ import torch
 import torchvision.io
 from PIL import Image
 
+from tensorrt_llm.inputs import utils as input_utils
+from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.media_io import ImageMediaIO, _decode_jpeg_image, convert_image_mode
+from tensorrt_llm.inputs.registry import (
+    INPUT_PROCESSOR_REGISTRY,
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+)
+from tensorrt_llm.inputs.utils import (
+    async_build_multimodal_prompt,
+    async_load_image,
+    default_multimodal_input_loader,
+    load_image,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -122,3 +137,198 @@ def test_jpeg_decoder_error_falls_back_to_pillow(
         )
         torch.testing.assert_close(output, expected_tensor, rtol=0, atol=0)
         assert output.is_contiguous()
+
+
+@pytest.fixture
+def sample_image_path(tmp_path: Path) -> str:
+    path = tmp_path / "sample image.jpg"
+    pixels = np.random.default_rng(0).integers(0, 256, size=(48, 64, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(path, quality=90)
+    return str(path)
+
+
+@pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
+def test_image_loaders_default_to_uint8_and_keep_pt(image_format: str, tmp_path: Path) -> None:
+    """Image loaders return uint8 (H, W, 3) arrays by default; "pt" gives the same pixels as floats."""
+    from tensorrt_llm.inputs.media_io import uint8_image_to_tensor
+
+    path = tmp_path / f"input.{image_format.lower()}"
+    pixels = np.random.default_rng(0).integers(0, 256, size=(48, 64, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(path, format=image_format)
+    expected = np.array(convert_image_mode(Image.open(path), "RGB"))
+    encoded = path.read_bytes()
+    defaults = [
+        ImageMediaIO().load_bytes(encoded),
+        ImageMediaIO().load_file(str(path)),
+        load_image(str(path)),
+        asyncio.run(async_load_image(str(path))),
+    ]
+    for image in defaults:
+        assert isinstance(image, np.ndarray)
+        assert image.dtype == np.uint8
+        np.testing.assert_array_equal(image, expected)
+    floats = [
+        ImageMediaIO(format="pt").load_bytes(encoded),
+        ImageMediaIO(format="pt").load_file(str(path)),
+        load_image(str(path), format="pt"),
+        asyncio.run(async_load_image(str(path), format="pt")),
+    ]
+    for image in floats:
+        assert image.dtype == torch.float32
+        assert image.shape == (3, 48, 64)
+        # The helper models use to turn uint8 arrays into float images gives the same tensor.
+        torch.testing.assert_close(image, uint8_image_to_tensor(expected), rtol=0, atol=0)
+    assert isinstance(load_image(str(path), format="pil"), Image.Image)
+
+
+@pytest.mark.parametrize(
+    ("image_data_format", "media_io_kwargs", "expected_format"),
+    [
+        (None, None, "np"),
+        (None, {"image": {"format": "pt"}}, "pt"),
+        ("pil", {"image": {"format": "pt"}}, "pil"),
+    ],
+    ids=["default", "model_preference", "explicit_format"],
+)
+def test_default_loader_image_format(
+    sample_image_path: str,
+    image_data_format: str | None,
+    media_io_kwargs: dict | None,
+    expected_format: str,
+) -> None:
+    """`default_multimodal_input_loader` uses an explicit format, else the given preference."""
+    model_type = "test_image_format_model"
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        model_type,
+        MultimodalPlaceholderMetadata(
+            placeholder_map={"image": "<image>"},
+            placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+            content_format=ContentFormat.PASSTHROUGH,
+        ),
+    )
+    try:
+        [inputs] = default_multimodal_input_loader(
+            tokenizer=None,
+            model_dir="unused",
+            model_type=model_type,
+            modality="image",
+            prompts=["Describe the image."],
+            media=[sample_image_path],
+            image_data_format=image_data_format,
+            media_io_kwargs=media_io_kwargs,
+        )
+    finally:
+        MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(model_type)
+    [image] = inputs["multi_modal_data"]["image"]
+    expected_type = {"np": np.ndarray, "pt": torch.Tensor, "pil": Image.Image}[expected_format]
+    assert isinstance(image, expected_type)
+
+
+# The image format each registered model type declares. `None` means the loader default, uint8 "np".
+_DECLARED_IMAGE_FORMATS = {
+    # The checkpoint's own processor reads the images; keep the float tensors it always got.
+    "hyperclovax_vlm": "pt",
+    "step3p7": "pt",
+    # Declared "np" before images defaulted to it.
+    "cosmos3": "np",
+    "cosmos3_edge": "np",
+    "cosmos3_omni": "np",
+    "minimax_m3_vl": "np",
+    "qwen3_5": "np",
+    "qwen3_5_moe": "np",
+    "qwen3_vl": "np",
+    "qwen3_vl_moe": "np",
+    "qwen4_exp": "np",
+    # PIL is the native input of its processor.
+    "glm5_next": "pil",
+    # HF processors that rescale uint8 images themselves.
+    "gemma3": None,
+    "gemma4": None,
+    "gemma4_unified": None,
+    "llama4": None,
+    "llava_next": None,
+    "minicpmv4_6": None,
+    "mistral3": None,
+    "mistral_large_3": None,
+    "qwen2_5_vl": None,
+    "qwen2_vl": None,
+    # Processors that turn uint8 arrays into the PIL images or float tensors they need.
+    "deepseek_v41": None,
+    "kimi_k25": None,
+    "kimi_k3": None,
+    "llava_llama": None,
+    "mistral_common": None,
+    "NemotronH_Nano_Omni_Reasoning_V3": None,
+    "NemotronH_Nano_VL_V2": None,
+    "nemotron_h_omni": None,
+    "phi4mm": None,
+    # Declares "pil", but reads it from the checkpoint, so helpers without it use the default.
+    "muse_spark": None,
+    # No images.
+    "whisper": None,
+}
+
+
+@pytest.mark.parametrize(("model_type", "image_format"), sorted(_DECLARED_IMAGE_FORMATS.items()))
+def test_registered_model_image_format(model_type: str, image_format: str | None) -> None:
+    preferences = INPUT_PROCESSOR_REGISTRY.get_preferred_media_io_kwargs(model_type)
+    assert preferences.get("image", {}).get("format") == image_format
+
+
+@pytest.mark.parametrize(
+    ("model_type", "media_io_kwargs", "image_type"),
+    [
+        # Nothing declared: the loader default.
+        ("qwen2_5_vl", None, np.ndarray),
+        ("gemma4", None, np.ndarray),
+        # Declared formats.
+        ("step3p7", None, torch.Tensor),
+        ("glm5_next", None, Image.Image),
+        # The caller's kwargs win, as per-request kwargs do in trtllm-serve.
+        ("qwen2_5_vl", {"image": {"format": "pt"}}, torch.Tensor),
+        ("step3p7", {"image": {"format": "np"}}, np.ndarray),
+    ],
+)
+@pytest.mark.parametrize("helper", ["async_build_multimodal_prompt", "default_loader"])
+def test_prompt_helpers_follow_model_image_format(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_image_path: str,
+    helper: str,
+    model_type: str,
+    media_io_kwargs: dict | None,
+    image_type: type,
+) -> None:
+    """Helpers that name the model decode images in the format it declares."""
+
+    # Only the media path is under test: skip loading and rendering the template.
+    async def render(**kwargs) -> str:
+        return "rendered"
+
+    monkeypatch.setattr(input_utils, "async_apply_chat_template", render)
+    monkeypatch.setattr(input_utils, "apply_chat_template", lambda **kwargs: "rendered")
+    monkeypatch.setattr(input_utils, "resolve_hf_chat_template", lambda *args: None)
+    monkeypatch.setattr(input_utils, "AutoProcessor", Mock())
+    if helper == "async_build_multimodal_prompt":
+        inputs = asyncio.run(
+            async_build_multimodal_prompt(
+                model_type=model_type,
+                tokenizer=Mock(),
+                processor=None,
+                prompt="Describe the image.",
+                media=[sample_image_path],
+                modality="image",
+                media_io_kwargs=media_io_kwargs,
+            )
+        )
+    else:
+        [inputs] = default_multimodal_input_loader(
+            tokenizer=Mock(),
+            model_dir="unused",
+            model_type=model_type,
+            modality="image",
+            prompts=["Describe the image."],
+            media=[sample_image_path],
+            media_io_kwargs=media_io_kwargs,
+        )
+    [image] = inputs["multi_modal_data"]["image"]
+    assert isinstance(image, image_type)

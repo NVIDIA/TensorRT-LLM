@@ -1207,12 +1207,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                              device=input_device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # Float frames for both modalities: `_preprocess` passes one
-        # `do_rescale` for images and videos, so both must arrive already
-        # rescaled.
-        return {"image": {"format": "pt"}, "video": {"format": "pt"}}
-
     def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
@@ -1221,11 +1215,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
+        # Float `"pt"` tensors arrive in [0, 1]; the HF processor rescales
+        # uint8 arrays and PIL images itself. Set this per modality, so images
+        # and videos may arrive in different formats.
+        if "do_rescale" not in mm_processor_kwargs:
+            mm_processor_kwargs = dict(mm_processor_kwargs)
+            first_items = {
+                "images_kwargs": images[0] if images else None,
+                "videos_kwargs": videos[0][0] if videos else None,
+            }
+            for key, item in first_items.items():
+                if item is not None:
+                    mm_processor_kwargs[key] = {
+                        "do_rescale": not isinstance(item, torch.Tensor),
+                        **mm_processor_kwargs.get(key, {}),
+                    }
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
@@ -1239,7 +1243,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                               images=images,
                               videos=videos,
                               padding=True,
-                              do_rescale=do_rescale,
                               return_tensors='pt',
                               **mm_processor_kwargs)
 

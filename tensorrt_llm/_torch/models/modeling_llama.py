@@ -17,7 +17,6 @@ import os
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
-from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
@@ -1487,7 +1486,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         if mm_data and mm_data.get("image"):
             images = mm_data["image"]
             img_type = type(mm_data["image"][0])
-            do_rescale = (img_type == Image)
+            # Float `"pt"` tensors arrive in [0, 1]; the HF processor rescales
+            # uint8 arrays and PIL images itself.
+            do_rescale = not issubclass(img_type, torch.Tensor)
             assert all(isinstance(img, img_type) for img in mm_data["image"])
 
         truncate_kwargs = {}

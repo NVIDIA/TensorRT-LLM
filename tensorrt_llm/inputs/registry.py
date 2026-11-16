@@ -709,9 +709,10 @@ class BaseMultimodalInputProcessor(ABC):
 
         Delegates to the Hugging Face processor's ``_get_num_multimodal_tokens``.
 
-        Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
-        in `find_mm_token_lengths` feeds tensors directly to avoid a costly
-        ToPIL round-trip, while existing direct callers may still pass PIL.
+        Accepts a PIL Image, a uint8 HWC `np.ndarray` or a CHW
+        `torch.Tensor` — the hashing path in `find_mm_token_lengths` feeds
+        decoded images directly to avoid a costly ToPIL round-trip, while
+        existing direct callers may still pass PIL.
 
         Returns the token count for the given image.
         Example: for Mistral, this count includes IMG placeholders plus row
@@ -862,8 +863,9 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """Per-modality media-IO decode defaults for this model.
 
         Applied under the server's ``--media_io_kwargs`` and any per-request
-        override, so a model can opt into a decode format it was tuned for
-        (e.g. ``{"video": {"format": "np"}}``) without operator config.
+        override, so a model can ask for a decode format other than the uint8
+        ``"np"`` default (e.g. ``{"image": {"format": "pt"}}``) without
+        operator config.
         """
         return {}
 

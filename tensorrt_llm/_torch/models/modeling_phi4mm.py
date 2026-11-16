@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MethodType
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torchvision
 import transformers
@@ -39,6 +40,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
+from ...inputs.media_io import uint8_image_to_tensor
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
@@ -437,7 +439,7 @@ def image_preprocess(
 ):
     """Optimize preprocess for image modality.
 
-    * Support both PIL.Image.Image and torch.Tensor.
+    * Support PIL.Image.Image, torch.Tensor and uint8 numpy arrays.
     * Carve out the num_img_tokens calculation.
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L161
@@ -447,6 +449,11 @@ def image_preprocess(
         raise TypeError(
             "Invalid image type. Must be of type PIL.Image.Image, torch.Tensor."
         )
+    # uint8 arrays become the same [0, 1] CHW tensor the "pt" loader gives.
+    images = [
+        uint8_image_to_tensor(image) if isinstance(image, np.ndarray) else image
+        for image in images
+    ]
 
     img_processor = [
         torchvision.transforms.ToTensor()
@@ -831,6 +838,9 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
         image: torch.Tensor,
         **kwargs,
     ):
+        if isinstance(image, np.ndarray):
+            # Only the size is read here; a CHW view of the array is enough.
+            image = torch.from_numpy(image).permute(2, 0, 1)
         images = [image]
         # Dynamic HD
         base_resolution = _BASE_RESOLUTION

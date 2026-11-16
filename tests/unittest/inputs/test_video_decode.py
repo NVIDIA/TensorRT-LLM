@@ -214,7 +214,9 @@ def test_model_video_format_preference(
 @pytest.mark.parametrize(
     ("model_type", "expected"),
     [
-        ("qwen2_5_vl", {"image": {"format": "pt"}, "video": {"format": "pt"}}),
+        # Takes the uint8 defaults: it sets `do_rescale` per modality.
+        ("qwen2_5_vl", {}),
+        ("step3p7", {"image": {"format": "pt"}}),
         # Registered with the same processor as "cosmos3".
         (
             "cosmos3_omni",
@@ -233,14 +235,15 @@ def test_preferred_media_io_kwargs_by_model_type(model_type: str, expected: dict
 @pytest.mark.parametrize(
     ("model_type", "media_io_kwargs", "video_format"),
     [
-        # Declared "pt": their video paths need float frames.
-        ("qwen2_5_vl", None, "pt"),
+        # Declared "pt": its video path needs float frames.
         ("NemotronH_Nano_VL_V2", None, "pt"),
         # Declared "np", and nothing declared (the loader default).
         ("qwen3_vl", None, "np"),
+        ("qwen2_5_vl", None, "np"),
         ("gemma4", None, "np"),
         # The caller's kwargs win, as per-request kwargs do in trtllm-serve.
-        ("qwen2_5_vl", {"video": {"format": "np"}}, "np"),
+        ("NemotronH_Nano_VL_V2", {"video": {"format": "np"}}, "np"),
+        ("qwen2_5_vl", {"video": {"format": "pt"}}, "pt"),
     ],
 )
 @pytest.mark.parametrize("helper", ["async_build_multimodal_prompt", "default_loader"])

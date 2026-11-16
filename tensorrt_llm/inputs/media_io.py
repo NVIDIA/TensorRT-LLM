@@ -131,8 +131,8 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
 
 
 # Output representations supported by `ImageMediaIO`:
-# `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
-# `"pil"` -> `PIL.Image.Image`.
+# `"np"` -> uint8 HWC `numpy.ndarray` (default), `"pt"` -> float32 CHW
+# `torch.Tensor` in [0, 1], `"pil"` -> `PIL.Image.Image`.
 _SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 
 # Output representations supported by `VideoMediaIO`. See
@@ -404,6 +404,18 @@ def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
     return convert_image_mode(image, "RGB")
+
+
+def uint8_image_to_tensor(image: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    """Return the float ``(3, H, W)`` tensor in [0, 1] that the `"pt"` image format gives.
+
+    Takes a uint8 ``(H, W, 3)`` array (the `"np"` format) or a uint8
+    ``(3, H, W)`` tensor. For processors that need float images.
+    """
+    if isinstance(image, np.ndarray):
+        image = torch.from_numpy(image).permute(2, 0, 1)
+    image = image.to(dtype=torch.get_default_dtype(), memory_format=torch.contiguous_format)
+    return image.div_(255)
 
 
 def _jpeg_frame_header(data: bytes) -> Optional[Tuple[int, int, int, int]]:
@@ -1522,7 +1534,11 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
     _modality = "image"
 
-    def __init__(self, format: str = "pt", device: str = "cpu") -> None:
+    def __init__(self, format: str = "np", device: str = "cpu") -> None:
+        # uint8 `"np"` images are a quarter of the size of float `"pt"` images
+        # and HF image processors rescale them themselves. Models whose
+        # processors still need float images ask for `"pt"` via
+        # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_IMAGE_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
         self._format = format
@@ -1547,11 +1563,7 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
         if self._format == "np":
             # torchvision decodes into an HWC buffer, so RGB needs no copy here.
             return np.ascontiguousarray(image.numpy().transpose(1, 2, 0))
-        return (
-            image.to(dtype=torch.get_default_dtype(), memory_format=torch.contiguous_format)
-            .div_(255)
-            .to(device=self._device)
-        )
+        return uint8_image_to_tensor(image).to(device=self._device)
 
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format in ("np", "pt"):

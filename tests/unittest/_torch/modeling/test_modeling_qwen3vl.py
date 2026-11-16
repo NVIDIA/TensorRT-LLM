@@ -16,7 +16,20 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
-from transformers import PretrainedConfig, Qwen3VLConfig
+from test_multimodal_image_formats import (
+    SIZES,
+    _all_formats,
+    _assert_uint8_matches,
+    _new,
+    _test_image,
+    _to_float,
+)
+from transformers import (
+    PretrainedConfig,
+    Qwen2VLImageProcessor,
+    Qwen2VLVideoProcessor,
+    Qwen3VLConfig,
+)
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
@@ -41,6 +54,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -943,21 +957,69 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
 
 @pytest.mark.cpu_only
 def test_qwen_vl_processors_ask_for_their_frame_format() -> None:
-    """Processors that pass one `do_rescale` for images and video keep both float; Qwen3-VL keeps uint8."""
+    """Processors that set `do_rescale` per modality take the uint8 defaults; Qwen3-VL asks for uint8."""
     for processor_cls in (
         modeling_qwen2vl.Qwen2VLInputProcessorBase,
         modeling_qwen2vl.Qwen2_5VLInputProcessorBase,
     ):
         processor = processor_cls.__new__(processor_cls)
-        assert processor.get_preferred_media_io_kwargs() == {
-            "image": {"format": "pt"},
-            "video": {"format": "pt"},
-        }
+        assert processor.get_preferred_media_io_kwargs() == {}
     processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
     assert processor.get_preferred_media_io_kwargs() == {
         "image": {"format": "np"},
         "video": {"format": "np"},
     }
+
+
+def _qwen2vl_processor():
+    """Qwen2-VL input processor with the real HF image and video processors (default configs)."""
+    return _new(
+        modeling_qwen2vl.Qwen2VLInputProcessorBase, Qwen2VLImageProcessor(), Qwen2VLVideoProcessor()
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("size", SIZES)
+def test_qwen2vl_takes_uint8_images(size: str) -> None:
+    """uint8 images give the PIL result exactly, and the float result up to rounding."""
+    processor = _qwen2vl_processor()
+    from_uint8, from_pil, from_float = (
+        processor._preprocess("<image>", {"image": [image]}, {})["pixel_values"]
+        for image in _all_formats(size)
+    )
+    _assert_uint8_matches(from_uint8, from_pil, from_float, min(Qwen2VLImageProcessor().image_std))
+
+
+@pytest.mark.cpu_only
+def test_qwen2vl_rescales_images_and_videos_separately() -> None:
+    """A request may mix uint8 and float media: each modality keeps its own rescale."""
+    processor = _qwen2vl_processor()
+    image = _test_image(64, 96)
+    frames = np.stack([_test_image(64, 96)[:, ::-1]] * 4)
+    metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+    uint8_video = VideoData(frames=frames, metadata=dict(metadata))
+    float_video = VideoData(frames=[_to_float(frame) for frame in frames], metadata=dict(metadata))
+
+    def run(mm_data):
+        return processor._preprocess("<image><video>", mm_data, {})
+
+    for images, video in (([image], float_video), ([_to_float(image)], uint8_video)):
+        mixed = run({"image": images, "video": [video]})
+        torch.testing.assert_close(
+            mixed["pixel_values"], run({"image": images})["pixel_values"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            mixed["pixel_values_videos"],
+            run({"video": [video]})["pixel_values_videos"],
+            rtol=0,
+            atol=0,
+        )
+    # Both formats give the same video up to rounding.
+    steps = (
+        run({"video": [uint8_video]})["pixel_values_videos"]
+        - run({"video": [float_video]})["pixel_values_videos"]
+    ).abs() * (255 * min(Qwen2VLImageProcessor().image_std))
+    assert steps.mean() < 0.5
 
 
 # ---------------------------------------------------------------------------
