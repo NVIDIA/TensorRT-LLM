@@ -87,11 +87,15 @@ def _hash_provider(num_heads: int) -> EngramHashProvider:
     provider._moduli_ints = {
         0: [buckets[start : start + width] for start in range(0, num_heads, width)]
     }
+    provider._moduli_keys = {0: tuple(tuple(moduli) for moduli in provider._moduli_ints[0])}
     provider._modules = {0: [torch.tensor(sizes) for sizes in provider._moduli_ints[0]]}
     provider._device = None
     provider._cached_hashes = None
     provider._cached_hashes_store = {}
     provider._captured_shapes = set()
+    provider._cached_hash_stacks = {}
+    provider._multiplier_stack = None
+    provider._moduli_stack = (provider._moduli_keys[0],)
     provider._history = None
     provider._history_row_of = {}
     provider._history_free_rows = []

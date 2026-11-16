@@ -963,8 +963,14 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
+        # Lets a model start work that reads only graph inputs beside the input corrections.
         inputs = self._inputs.preprocess_inputs(
-            inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
+            inputs,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            mark_prologue_start=getattr(
+                getattr(self._model, "model", None), "mark_prologue_start", None
+            ),
         )
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None

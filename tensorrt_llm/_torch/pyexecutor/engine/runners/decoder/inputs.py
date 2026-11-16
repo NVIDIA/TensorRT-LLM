@@ -3257,10 +3257,16 @@ class DecoderInputPreparer:
         )
 
     def preprocess_inputs(
-        self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
+        self,
+        inputs: dict[str, Any],
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+        mark_prologue_start: Callable[[Any], None] | None = None,
     ) -> dict[str, Any]:
         """
-        Make some changes to the device inputs and avoid blocking the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer.
+        ``mark_prologue_start(attn_metadata)`` runs behind the position correction, else at the end.
         """
         attn_meta = inputs.get("attn_metadata")
         # A model's decode prologue may replace the device work below with one
@@ -3272,6 +3278,8 @@ class DecoderInputPreparer:
         ):
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
+            if mark_prologue_start is not None:
+                mark_prologue_start(attn_meta)
             return inputs
         # Overlap scheduling corrects kv_lens_cuda below from the runtime
         # accepted-token counts and calls on_update_kv_lens() again after it.
@@ -3322,6 +3330,10 @@ class DecoderInputPreparer:
                     inputs["position_ids"][0, num_ctx_tokens:] += (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
+                if mark_prologue_start is not None:
+                    # Behind the step's first launch, so a captured decode graph keeps a single root.
+                    mark_prologue_start(attn_meta)
+                    mark_prologue_start = None
 
                 if has_kv_lens_correction:
                     if fused_offsets:
@@ -3379,6 +3391,8 @@ class DecoderInputPreparer:
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
+        if mark_prologue_start is not None:
+            mark_prologue_start(attn_meta)
 
         return inputs
 

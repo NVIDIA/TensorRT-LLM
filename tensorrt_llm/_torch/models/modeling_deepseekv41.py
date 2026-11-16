@@ -26,7 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._utils import is_blackwell_datacenter, mpi_disabled
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -70,7 +70,7 @@ from ..moe.fused_moe.moe_scheduler import routes_padding_nowhere
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
-from ..utils import AuxStreamType, MxFp8QuantizedTensor
+from ..utils import AuxStreamType, MxFp8QuantizedTensor, decode_stream_priority
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .deepseekv41_decoder_graph import (
     ENCODER_MAX_PAD,
@@ -94,6 +94,7 @@ from .modeling_utils import register_auto_model
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+    from ..distributed.ll_allgather import LowLatencyAllGather
     from ..pyexecutor.llm_request import LlmRequest
 
 
@@ -347,6 +348,95 @@ class _EngramKvShard:
 
     def __init__(self, shard: torch.Tensor) -> None:
         self.shard = shard
+
+
+# Row counts up to which the initial one-hot ``pre`` mix is a kept, read-only buffer.
+_STATIC_PRE_MIX_MAX_ROWS = 64
+# Grid cap of the Engram-stream WKV pair gather, which spins beside layer 0: that layer's all-reduce
+# boundaries (and resident PDL dependents) need free SMs on every rank, or ranks deadlock.
+_ENGRAM_WKV_GATHER_SIDE_MAX_PROGRAMS = 16
+
+
+class _EngramKvPair:
+    """Two Engram layers' WKV shards ``[rows, out / tp]``, gathered in one launch on the Engram
+    stream (:meth:`launch_on`); the first reader waits for ``event``."""
+
+    __slots__ = ("gathered", "event")
+
+    def __init__(self, gathered: tuple, event: torch.cuda.Event | None) -> None:
+        self.gathered = gathered
+        self.event = event
+
+    @classmethod
+    def launch_on(
+        cls, gather, shards: tuple, stream: torch.cuda.Stream, event: torch.cuda.Event
+    ) -> "_EngramKvPair":
+        """Gather the pair on ``stream``, behind both projections already queued there."""
+        # Every rank orders its gathers alike: the lookup pair feeds the projections, and the next
+        # forward's lookup gather waits for lookups queued behind this one.
+        caller = torch.cuda.current_stream()
+        programs = gather.pair_programs(*shards, max_programs=_ENGRAM_WKV_GATHER_SIDE_MAX_PROGRAMS)
+        with torch.cuda.stream(stream):
+            gathered = gather.gather_pair(*shards, max_programs=programs)
+            if gathered is None:
+                raise RuntimeError(
+                    "Engram WKV shard pair is not supported by the peer-memory gather"
+                )
+            event.record()
+        for out in gathered:
+            out.record_stream(caller)
+        return cls(gathered, event)
+
+    def take(self, index: int) -> torch.Tensor:
+        """Layer ``index``'s gathered ``[rows, out]``, on the current stream."""
+        if self.event is not None:
+            # The first reader joins; later readers run after it on the same stream.
+            torch.cuda.current_stream().wait_event(self.event)
+            self.event = None
+        return self.gathered[index]
+
+
+class _EngramKvPairShard:
+    """One layer's entry of an ``_EngramKvPair`` in the forward's precomputed-kv dict."""
+
+    __slots__ = ("pair", "index")
+
+    def __init__(self, pair: _EngramKvPair, index: int) -> None:
+        self.pair = pair
+        self.index = index
+
+
+class _PrologueFork:
+    """A captured decode step's embedding and stacked residual, launched on the prologue stream from
+    the step's mark (``DeepseekV41Model.mark_prologue_start``), beside the input corrections."""
+
+    __slots__ = ("inputs_embeds", "_residual", "_done", "_model")
+
+    def __init__(self, model: "DeepseekV41Model", input_ids: torch.Tensor) -> None:
+        self._model = model
+        stream = model._prologue_stream
+        stream.wait_event(model._prologue_start)
+        with torch.cuda.stream(stream):
+            self.inputs_embeds = model.embed_tokens(input_ids)
+            self._residual = torch.stack([self.inputs_embeds] * model.hc_mult, dim=1)
+            self._done = torch.cuda.Event()
+            self._done.record()
+
+    def join(self, engram_embeddings: dict | None) -> torch.Tensor:
+        """The stacked residual, once the current stream waits for it."""
+        if self._done is not None:
+            caller = torch.cuda.current_stream()
+            caller.wait_event(self._done)
+            self._done = None
+            for tensor in (self.inputs_embeds, self._residual):
+                tensor.record_stream(caller)
+            # The join's edges must land on a plain launch: a PDL kernel would make them programmatic.
+            if (
+                engram_embeddings is None
+                or self._model._engram_lookup_pair(0, engram_embeddings)[1] is None
+            ):
+                self._residual.new_zeros(1)
+        return self._residual
 
 
 def _wkv_shard_projection(proj: EngramFp8Projection, rank: int, tp: int) -> EngramFp8Projection:
@@ -659,6 +749,7 @@ class DeepseekV41Engram(Engram):
         dtype: Optional[torch.dtype] = None,
         *,
         all_rank_num_tokens: list[int] | None = None,
+        after: torch.cuda.Event | None = None,
     ) -> torch.Tensor | _AttentionDPEngramEmbeddings:
         """Launch the local lookup; leave its TP collective on the model stream.
 
@@ -669,12 +760,13 @@ class DeepseekV41Engram(Engram):
         The collective stays on the model stream because it shares communicator
         ordering and all-reduce workspaces with attention and MoE.
 
-        Attention DP gathers token rows before lookup and retains the local span.
+        Attention DP gathers token rows before lookup and retains the local span. With ``after``
+        the lookup waits only for that event instead of the caller's work so far.
         """
         hash_indices, local_start, local_num_tokens, group_num_tokens = self._gather_hash_indices(
             hash_indices, all_rank_num_tokens
         )
-        embeddings = self._lookup_embeddings(hash_indices, dtype)
+        embeddings = self._lookup_embeddings(hash_indices, dtype, after)
         if self.enable_attention_dp:
             return _AttentionDPEngramEmbeddings(
                 embeddings, local_start, local_num_tokens, group_num_tokens
@@ -760,7 +852,10 @@ class DeepseekV41Engram(Engram):
         return _PrecomputedEngramKV(kv)
 
     def _lookup_embeddings(
-        self, hash_indices: torch.Tensor, dtype: torch.dtype | None
+        self,
+        hash_indices: torch.Tensor,
+        dtype: torch.dtype | None,
+        after: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         if self.stream is None:
             embeddings = self.multi_head_embedding(hash_indices)
@@ -769,7 +864,10 @@ class DeepseekV41Engram(Engram):
 
         # Stream waits order work; record_stream also prevents allocator reuse.
         caller_stream = torch.cuda.current_stream()
-        self.stream.wait_stream(caller_stream)
+        if after is None:
+            self.stream.wait_stream(caller_stream)
+        else:
+            self.stream.wait_event(after)
         hash_indices.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
             # Leave SM capacity for concurrent model work.
@@ -793,7 +891,12 @@ class DeepseekV41Engram(Engram):
         caller_stream = torch.cuda.current_stream()
         caller_stream.wait_event(self.sync_event)
         # TP collectives share communicator ordering with attention and MoE.
-        embeddings = self._combine_embeddings(embeddings)
+        return self.project_combined(self._combine_embeddings(embeddings))
+
+    def project_combined(self, embeddings: torch.Tensor) -> torch.Tensor | _EngramKvShard:
+        """Launch the WKV projection of combined lookups ``[rows, H * D]`` on the Engram stream
+        after the caller's work so far; ``sync_event`` marks the result (as ``precompute_kv``)."""
+        caller_stream = torch.cuda.current_stream()
         projection, sharded = self._kv_projection_for(embeddings.shape[0])
         self.stream.wait_stream(caller_stream)
         embeddings.record_stream(self.stream)
@@ -815,7 +918,7 @@ class DeepseekV41Engram(Engram):
         *,
         add_residual: bool = False,
         token_mask: Optional[torch.Tensor] = None,
-        precomputed_kv: torch.Tensor | _EngramKvShard | None = None,
+        precomputed_kv: torch.Tensor | _EngramKvShard | _EngramKvPairShard | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Recombine lookup shards, project WKV, then run the fused FP32 gate.
@@ -823,8 +926,8 @@ class DeepseekV41Engram(Engram):
         ``add_residual=True`` preserves the reference's single cast after the
         FP32 residual addition. The default returns a delta for standalone users.
         A supplied ``precomputed_kv`` must be ready on the caller's stream (a WKV shard is
-        gathered here, on the caller's stream); the gate writes into ``out`` (which may be
-        ``hidden_states``) when it fits.
+        gathered here, on the caller's stream; a shard pair's first reader waits for its gather);
+        the gate writes into ``out`` (which may be ``hidden_states``) when it fits.
         """
         if use_cache or conv_state is not None:
             raise ValueError(
@@ -853,6 +956,8 @@ class DeepseekV41Engram(Engram):
         elif isinstance(precomputed_kv, _EngramKvShard):
             # precompute_kv shards only what the gather takes; every rank gathers the same shape.
             kv = self._ll_allgather.gather(precomputed_kv.shard)
+        elif isinstance(precomputed_kv, _EngramKvPairShard):
+            kv = precomputed_kv.pair.take(precomputed_kv.index)
         else:
             kv = precomputed_kv
             if hidden_states.shape[0] == 0:
@@ -1370,6 +1475,13 @@ class DeepseekV41Model(DeepseekV4Model):
     # Models built without __init__ (test stubs) do not overlap the Engram context work.
     _engram_context_overlap = False
     _engram_projection_layers: dict[int, int] = {}
+    _engram_wkv_gather_event: torch.cuda.Event | None = None
+    # A captured decode step's mark (``mark_prologue_start``); its Engram lookups and the
+    # ``_PrologueFork`` on ``_prologue_stream`` wait only for it.
+    _prologue_event: torch.cuda.Event | None = None
+    _prologue_pending = False
+    _prologue_start: torch.cuda.Event | None = None
+    _prologue_stream: torch.cuda.Stream | None = None
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__(model_config, *args, **kwargs)
@@ -1387,11 +1499,16 @@ class DeepseekV41Model(DeepseekV4Model):
         # The CSA2 cache manager and its estimator follow this decision.
         model_config.extra_attrs["csa2_encoder_replay"] = self.encoder_replay_enabled
         mapping = model_config.mapping
-        # Measured on GB300 with head-sharded host tables (TP4 and TP8, up to 64 rows).
+        # Model-loop index -> Engram layers whose WKV projections it launches early, measured with
+        # head-sharded host tables (TP4 and TP8, up to 64 rows); SM103 launches both at index 0
+        # after one gather of both lookups. Other Engram layer sets keep the per-layer path, which
+        # issues the shared peer-memory gathers in layer order on every rank.
+        pair = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3)
         self._engram_projection_schedule = (
-            {0: 1, 2: 14}
+            ({0: (1, 14)} if pair else {0: (1,), 2: (14,)})
             if torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and tuple(getattr(self, "engram_layer_ids", None) or ()) == (1, 14)
+            and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
             and mapping.tp_size in (4, 8)
             and not mapping.has_pp()
             and mapping.cp_size == 1
@@ -1399,6 +1516,11 @@ class DeepseekV41Model(DeepseekV4Model):
             and model_config.pretrained_config.hidden_size == 5120
             else {}
         )
+        if self.use_engram and self._engram_projection_schedule and is_blackwell_datacenter():
+            # The model stream joins this stream before layer 0: it runs at the decode priority.
+            self._prologue_stream = torch.cuda.Stream(
+                priority=decode_stream_priority(model_config.max_num_tokens)
+            )
         self._engram_context_overlap = self._supports_engram_context_overlap(model_config)
         schedule = _ENGRAM_CONTEXT_SCHEDULE if self._engram_context_overlap else {}
         layers = list(schedule)
@@ -1473,24 +1595,99 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def _precompute_engram_kv(
         self, layer_idx: int, embeddings: dict[int, torch.Tensor]
-    ) -> tuple[int, torch.Tensor] | None:
-        target = self._engram_projection_schedule.get(layer_idx)
-        if target is None or target not in embeddings:
-            return None
-        local_embeddings = embeddings[target]
+    ) -> dict[int, object]:
+        targets, gather = self._engram_lookup_pair(layer_idx, embeddings)
+        if gather is not None:
+            return self._precompute_engram_kv_pair(targets, embeddings, gather)
+        return {
+            target: self.layers[target].engram.precompute_kv(embeddings[target])
+            for target in targets
+        }
+
+    def _engram_lookup_pair(
+        self, layer_idx: int, embeddings: dict[int, torch.Tensor]
+    ) -> tuple[list[int], "LowLatencyAllGather | None"]:
+        """The Engram layers whose projections layer ``layer_idx`` launches early, and the
+        peer-memory gather that takes their two lookups in one plain launch, else None."""
+        targets = [
+            target
+            for target in self._engram_projection_schedule.get(layer_idx, ())
+            if target in embeddings and self._engram_precompute_eligible(target, embeddings[target])
+        ]
+        if len(targets) == 2:
+            first, second = (self.layers[target].engram for target in targets)
+            gather = first._ll_allgather
+            if (
+                gather is not None
+                and second._ll_allgather is gather
+                and gather.supports_pair(embeddings[targets[0]], embeddings[targets[1]])
+            ):
+                return targets, gather
+        return targets, None
+
+    def _engram_precompute_eligible(self, target: int, local_embeddings: torch.Tensor) -> bool:
         engram = self.layers[target].engram
+        return (
+            0 < local_embeddings.shape[0] <= _ENGRAM_PRECOMPUTE_MAX_ROWS
+            and engram.stream is not None
+            and engram.multi_head_embedding.shard_heads
+            and isinstance(engram.kv_proj, EngramFp8Projection)
+        )
+
+    def _precompute_engram_kv_pair(
+        self,
+        targets: list[int],
+        embeddings: dict[int, torch.Tensor],
+        gather: "LowLatencyAllGather",
+    ) -> dict[int, object]:
+        """Both lookups in one peer-memory gather, both projections on the Engram stream and both
+        WKV shards in one gather where it takes them."""
+        first, second = (self.layers[target].engram for target in targets)
+        lookups = (embeddings[targets[0]], embeddings[targets[1]])
+        caller_stream = torch.cuda.current_stream()
+        for engram in (first, second):
+            caller_stream.wait_event(engram.sync_event)
+        combined = gather.gather_pair(*lookups)
+        kv = [engram.project_combined(c) for engram, c in zip((first, second), combined)]
+        if all(isinstance(entry, _EngramKvShard) for entry in kv):
+            shards = (kv[0].shard, kv[1].shard)
+            # Both projections are queued on the one Engram stream the gather then joins.
+            if gather.supports_pair(*shards) and second.stream is first.stream:
+                if self._engram_wkv_gather_event is None:
+                    self._engram_wkv_gather_event = torch.cuda.Event()
+                pair = _EngramKvPair.launch_on(
+                    gather, shards, first.stream, self._engram_wkv_gather_event
+                )
+                return {target: _EngramKvPairShard(pair, i) for i, target in enumerate(targets)}
+        return dict(zip(targets, kv))
+
+    def mark_prologue_start(self, attn_metadata) -> None:
+        """Called behind a step's first input correction: under the capture of a decode-only
+        attention-TP step, record where its Engram lookups, embedding and stacked residual start."""
+        # They read only graph inputs (cached hash rows, input ids), written before every replay.
+        self._prologue_pending = False
         if (
-            not 0 < local_embeddings.shape[0] <= _ENGRAM_PRECOMPUTE_MAX_ROWS
-            or engram.stream is None
-            or not engram.multi_head_embedding.shard_heads
-            or not isinstance(engram.kv_proj, EngramFp8Projection)
+            self._prologue_stream is not None
+            and attn_metadata is not None
+            and attn_metadata.num_contexts == 0
+            and torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
         ):
+            if self._prologue_event is None:
+                self._prologue_event = torch.cuda.Event()
+            self._prologue_event.record()
+            self._prologue_pending = True
+
+    def _fork_prologue(self, input_ids: torch.Tensor) -> _PrologueFork | None:
+        if self._prologue_start is None:
             return None
-        return target, engram.precompute_kv(local_embeddings)
+        return _PrologueFork(self, input_ids)
 
     def forward(self, attn_metadata, *args, **kwargs):
         from ..pyexecutor.ced_replay import uses_private_decoder_cache
 
+        self._prologue_start = self._prologue_event if self._prologue_pending else None
+        self._prologue_pending = False
         attn_metadata.begin_model_forward()
         spec_metadata = kwargs.get("spec_metadata")
         if isinstance(spec_metadata, DSparkSpecMetadata):
@@ -1536,6 +1733,7 @@ class DeepseekV41Model(DeepseekV4Model):
         try:
             output = super().forward(attn_metadata, *args, **kwargs)
         finally:
+            self._prologue_start = None
             self._engram_overlap_decision = None
             for engram, stream, event in engram_streams:
                 engram.stream = stream
@@ -1646,7 +1844,10 @@ class DeepseekV41Model(DeepseekV4Model):
             if exchanged is not None:
                 return exchanged
         return engram.precompute(
-            hash_indices, dtype=dtype, all_rank_num_tokens=attn_metadata.all_rank_num_tokens
+            hash_indices,
+            dtype=dtype,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            after=self._prologue_start,
         )
 
     def _precompute_engram_exchange(
@@ -2221,10 +2422,20 @@ class DeepseekV41Model(DeepseekV4Model):
         of the streams being identical -- and would diverge the moment engram
         fires on layer 0.
         """
-        pre_mix = hidden_states.new_zeros(
-            (hidden_states.shape[0], self.hc_mult, 1), dtype=torch.float32
-        )
-        pre_mix[:, 0, :] = 1.0
+        rows = hidden_states.shape[0]
+        key = (rows, hidden_states.device)
+        cache = self.__dict__.setdefault("_identity_pre_mixes", {})
+        pre_mix = cache.get(key)
+        if pre_mix is None:
+            pre_mix = hidden_states.new_zeros((rows, self.hc_mult, 1), dtype=torch.float32)
+            pre_mix[:, 0, :] = 1.0
+            # Cached read-only, so a captured decode step launches no kernel for its seed.
+            if (
+                rows <= _STATIC_PRE_MIX_MAX_ROWS
+                and is_blackwell_datacenter()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                cache[key] = pre_mix
         return HCState.resolved(hidden_states, pre_mix=pre_mix)
 
     def _finalize_hc_state(self, hc_state: HCState) -> torch.Tensor:
@@ -3472,7 +3683,11 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             )
         # WKV shards serve only projections launched ahead of their layer; they copy the loaded
         # scales, so every load refreshes them.
-        scheduled = set(self.model._engram_projection_schedule.values())
+        scheduled = {
+            target
+            for targets in self.model._engram_projection_schedule.values()
+            for target in targets
+        }
         sharded = [
             engram.layer_id
             for engram in engrams
