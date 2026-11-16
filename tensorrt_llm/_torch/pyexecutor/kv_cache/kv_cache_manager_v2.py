@@ -522,18 +522,13 @@ class ConversationManager:
         if state is None or state.current_request_id != request_id:
             return
 
-        # Compare complete-block prefixes only; trailing partial tokens are not checked.
-        prefix_length = (
-            kv_cache.num_committed_tokens // kv_cache.tokens_per_block * kv_cache.tokens_per_block
-        )
-        prefix_hash = kv_cache._get_committed_prefix_key(prefix_length)
-        if prefix_hash is None or (
-            state.prefix_hash is not None
-            and kv_cache._get_committed_prefix_key(state.prefix_length) != state.prefix_hash
-        ):
-            self.finish_request(request)
-            return
-
+        # The retention limit bounds every retained history under the conversation,
+        # forks included, exactly as it bounds continuing turns. The saved prefix
+        # anchor tracks the newest queued plan's complete-block prefix, so a later
+        # turn can tell whether it extended the retained branch or started a new
+        # one; either way, only its own committed blocks are planned, and the
+        # oldest plan beyond ``max_num_turns`` is dropped. Trailing partial
+        # tokens are not checked.
         drop_handle = kv_cache.plan_committed_block_drop()
         if drop_handle is None:
             logger.warning(
@@ -541,8 +536,15 @@ class ConversationManager:
                 f"{conversation_key[0]} have been dropped."
             )
         else:
-            state.prefix_length = prefix_length
-            state.prefix_hash = prefix_hash
+            prefix_length = (
+                kv_cache.num_committed_tokens
+                // kv_cache.tokens_per_block
+                * kv_cache.tokens_per_block
+            )
+            prefix_hash = kv_cache._get_committed_prefix_key(prefix_length)
+            if prefix_hash is not None:
+                state.prefix_length = prefix_length
+                state.prefix_hash = prefix_hash
             state.planned_drop_handles.append(drop_handle)
             if len(state.planned_drop_handles) > self._max_num_turns:
                 state.planned_drop_handles.popleft().drop()

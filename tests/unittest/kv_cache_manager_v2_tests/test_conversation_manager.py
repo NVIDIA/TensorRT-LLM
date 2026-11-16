@@ -96,30 +96,60 @@ def test_cached_block_keys_match_native_hash_chain(native_cache: SimpleNamespace
     assert cache._get_committed_prefix_key(4) is None
 
 
-@pytest.mark.parametrize(
-    "candidate,salt,advances",
-    [
-        (list(range(100, 116)), "scope", False),
-        (list(range(4)) + list(range(100, 112)), "scope", False),
-        (list(range(4)), "scope", False),
-        (list(range(16)) + list(range(100, 108)), "scope", True),
-        (list(range(16)), "other-scope", False),
-    ],
-)
-def test_complete_block_prefix_controls_retention(
-    native_cache: SimpleNamespace, candidate: list[int], salt: str, advances: bool
-) -> None:
-    manager, conversation = native_cache.manager, native_cache.conversation
-    tokens = list(range(16))
-    first = native_cache.create(tokens, "scope")
+def test_oldest_plan_evicts_beyond_turn_limit_native(native_cache: SimpleNamespace) -> None:
+    """The retention limit bounds every history under the conversation, forks included.
+
+    Under ``max_num_turns=2`` a fork keeps the older branch within the limit; the
+    third turn, continuing or not, evicts the oldest plan. Retained states never
+    leave the conversation boundless because a fork queued behind them.
+    """
+    conversation = native_cache.conversation
+    assert conversation._max_num_turns == 1
+    a_tokens = list(range(16))
+    first = native_cache.create(a_tokens, "scope")
     conversation.prepare_request(_request(1, "scope"))
     conversation.save_drop_plan(_request(1, "scope"), first)
     first.close()
     scope = native.ReuseScope(salt="scope")
-    assert manager.probe_reuse(scope, tokens) == len(tokens)
+    assert native_cache.manager.probe_reuse(scope, a_tokens) == len(a_tokens)
 
-    second = native_cache.create(candidate, salt)
-    conversation.prepare_request(_request(2, salt))
-    conversation.save_drop_plan(_request(2, salt), second)
+    # An unrelated history in the same conversation queues its own plan; under
+    # max_num_turns=1 the oldest plan is evicted, keeping the bound.
+    b_tokens = list(range(100, 116))
+    second = native_cache.create(b_tokens, "scope")
+    conversation.prepare_request(_request(2, "scope"))
+    conversation.save_drop_plan(_request(2, "scope"), second)
     second.close()
-    assert manager.probe_reuse(scope, tokens) == (0 if advances else len(tokens))
+    assert native_cache.manager.probe_reuse(scope, a_tokens) == 0
+    assert native_cache.manager.probe_reuse(scope, b_tokens) == len(b_tokens)
+
+
+def test_cached_forks_keep_older_plans_within_the_limit(native_cache: SimpleNamespace) -> None:
+    """With spare capacity a fork must not evict the earlier branch's plan."""
+    conversation = native_cache.conversation
+    conversation._max_num_turns = 2
+    a_tokens = list(range(16))
+    first = native_cache.create(a_tokens, "scope")
+    conversation.prepare_request(_request(1, "scope"))
+    conversation.save_drop_plan(_request(1, "scope"), first)
+    first.close()
+    scope = native.ReuseScope(salt="scope")
+    assert native_cache.manager.probe_reuse(scope, a_tokens) == len(a_tokens)
+
+    # A fork fills the second slot without evicting the first branch.
+    b_tokens = list(range(100, 116))
+    second = native_cache.create(b_tokens, "scope")
+    conversation.prepare_request(_request(2, "scope"))
+    conversation.save_drop_plan(_request(2, "scope"), second)
+    second.close()
+    assert native_cache.manager.probe_reuse(scope, a_tokens) == len(a_tokens)
+
+    # A third history evicts the oldest plan; the limit still bounds retained state.
+    c_tokens = list(range(200, 216))
+    third = native_cache.create(c_tokens, "scope")
+    conversation.prepare_request(_request(3, "scope"))
+    conversation.save_drop_plan(_request(3, "scope"), third)
+    third.close()
+    assert native_cache.manager.probe_reuse(scope, a_tokens) == 0
+    assert native_cache.manager.probe_reuse(scope, b_tokens) == len(b_tokens)
+    assert native_cache.manager.probe_reuse(scope, c_tokens) == len(c_tokens)
