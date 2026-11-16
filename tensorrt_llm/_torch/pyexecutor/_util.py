@@ -1501,6 +1501,11 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
+        if (not is_draft and issubclass(manager_cls, MambaHybridCacheManagerV2)
+                and self._model_engine is not None
+                and _uses_gdn_mtp_replay(self._model_engine.model)):
+            # Cost the GDN replay region of the state the manager will select.
+            extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -4625,6 +4630,23 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s GDN layers can verify drafts with the GDN MTP replay kernels.
+
+    They must be the PyTorch GDN mixer, and none may verify with the fused
+    kernels into an FP8 out_proj input (gdn_verify_tcgen05 / trtllm::gdn_verify),
+    which keep the cached replay history.
+    """
+    from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+    layers = [
+        module for module in model.modules()
+        if isinstance(module, Qwen3NextGatedDeltaNet)
+    ]
+    return bool(layers) and not any(
+        layer.fused_verify and layer.norm.fp8_scale is not None
+        for layer in layers)
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
@@ -5090,6 +5112,9 @@ def _create_kv_cache_manager(
             mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
                 module.fused_verify for module in model_engine.model.modules()
                 if isinstance(module, Qwen3NextGatedDeltaNet))
+            if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+                mamba_manager_extra_kwargs["gdn_mtp_replay"] = (
+                    _uses_gdn_mtp_replay(model_engine.model))
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
             mamba_manager_extra_kwargs.update(

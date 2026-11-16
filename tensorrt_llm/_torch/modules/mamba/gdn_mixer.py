@@ -39,6 +39,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...attention.backends import AttentionMetadata
 from ...autotuner import AutoTuner
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -96,6 +97,11 @@ _FUSED_VERIFY_MIN_TOKENS = 2
 _FUSED_VERIFY_MAX_TOKENS = 8
 _FUSED_VERIFY_HISTORY = 16
 
+if IS_CUTLASS_DSL_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_replay import gdn_mtp_replay
+else:
+    gdn_mtp_replay = None
+
 
 class GdnIterationContext(NamedTuple):
     """Metadata-derived arguments of forward_extend / forward_decode, shared by every GDN layer of one iteration.
@@ -129,6 +135,10 @@ class GdnIterationContext(NamedTuple):
     replay_work_items: Optional[torch.Tensor]
     replay_n_writes: Optional[torch.Tensor]
     use_cached_replay_all_layer_commit: bool
+    # GDN MTP replay (the manager's GDNMtpReplayState) and the decode rows'
+    # dummy mask it reads; otherwise False / None.
+    use_mtp_replay: bool
+    replay_is_dummy: Optional[torch.Tensor]
     scan_state_indices: Optional[torch.Tensor]
     scan_cu_seqlens: Optional[torch.Tensor]
     scan_prefill_layout: object
@@ -1417,8 +1427,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = attn_metadata.seq_lens.shape[0]
         if (
             num_decodes == 0
-            # The fused kernels read the Triton replay history, not the FlashInfer ring.
+            # The fused kernels read the Triton replay history, not the FlashInfer
+            # ring or the GDN MTP replay history.
             or getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False)
+            or getattr(kv_cache_manager, "use_gdn_mtp_replay", False)
             or not kv_cache_manager.is_speculative()
             or kv_cache_manager.gdn_replay_partitioned(num_decodes)
         ):
@@ -1655,6 +1667,72 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ba_ready.wait()
         return self._fused_verify_replay_norm(plan, mixed_qkv, z, a, b)
 
+    def _replay_verify(
+        self,
+        raw_x: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
+        num_decodes: int,
+        draft_token_num: int,
+        replay_metadata,
+        layer_cache,
+        is_dummy: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """MTP target verification through the GDN MTP replay kernel.
+
+        One launch per layer runs the Conv4 update of the raw q|k|v rows and
+        the gated delta-rule replay of the accepted history plus the new
+        candidates; neither checkpoint changes. The raw candidates are kept for
+        the all-layer commit the cache manager issues after acceptance.
+        ``raw_x`` holds the pre-conv q|k|v rows and ``b`` / ``a`` the beta and
+        decay gate inputs, which may be padded column views of the fused input
+        projection; returns [num_decodes, draft_token_num, HV, V].
+        """
+        assert replay_metadata is not None, (
+            "GDN replay enabled but replay metadata was not allocated."
+        )
+        assert draft_token_num == replay_metadata.replay_step_width, (
+            "GDN replay does not support dynamic draft length: "
+            f"{draft_token_num} != {replay_metadata.replay_step_width}"
+        )
+        if gdn_mtp_replay is None:
+            raise RuntimeError("GDN MTP replay requires CUTLASS DSL")
+        if self.conv1d.bias is not None or self.activation not in ("silu", "swish"):
+            raise RuntimeError("GDN MTP replay requires a bias-free SiLU Conv4")
+        if output is None:
+            output = raw_x.new_empty(
+                num_decodes, draft_token_num, self.num_v_heads_per_tp, self.head_v_dim
+            )
+        row_stride = raw_x.stride(0)
+        gdn_mtp_replay(
+            raw_x=raw_x.as_strided(
+                (num_decodes, draft_token_num, self.conv_dim_per_tp),
+                (draft_token_num * row_stride, row_stride, 1),
+            ),
+            conv_weight=self.conv1d.weight,
+            conv_state=conv_states,
+            b=b,
+            a=a,
+            checkpoint=ssm_states,
+            state_indices=state_indices[:num_decodes],
+            replay_indices=replay_indices[:num_decodes],
+            is_dummy=is_dummy,
+            history_u=layer_cache.old_x,
+            history_k=layer_cache.old_B,
+            history_G=layer_cache.old_dt,
+            history_len=layer_cache.prev_num_accepted_tokens,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            output=output,
+            candidate_x=layer_cache.intermediate_conv_window[:num_decodes],
+        )
+        return output
+
     def _replay_verify_recurrent(
         self,
         query,
@@ -1777,6 +1855,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             assert b.shape[0] == num_decodes * draft_token_num
             assert intermediate_conv_states is not None
             assert kwargs.get("use_replay", False) or intermediate_ssm_states is not None
+
+            if kwargs.get("use_mtp_replay", False):
+                # The GDN MTP replay kernel runs the Conv4 update itself.
+                output_d = None
+                if output is not None:
+                    output_d = output.view(
+                        num_decodes, draft_token_num, self.num_v_heads_per_tp, self.head_v_dim
+                    )
+                return self._replay_verify(
+                    raw_x=mixed_qkv,
+                    b=b,
+                    a=a,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    state_indices=cache_indices,
+                    replay_indices=kwargs["replay_state_indices_d"],
+                    num_decodes=num_decodes,
+                    draft_token_num=draft_token_num,
+                    replay_metadata=kwargs.get("replay_metadata"),
+                    layer_cache=kwargs.get("layer_cache"),
+                    is_dummy=kwargs["replay_is_dummy"],
+                    output=output_d,
+                ).view(1, num_decodes * draft_token_num, self.num_v_heads_per_tp, self.head_v_dim)
 
             # Speculative verification path:
             # 1. run conv update with per-step intermediate cache writes
@@ -2030,6 +2131,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         packed: Optional[_PackedPostConv] = None
 
         conv_states_to_use = conv_states
+        use_mtp_replay = kwargs.get("use_mtp_replay", False)
         # Context-only batches may take the fused prefill conv, which leaves mixed_qkv untouched. Not under
         # FORCE_DETERMINISTIC: its q / k L2 norms differ from the stock kernels that prefill next to decodes.
         fused_conv = (
@@ -2086,22 +2188,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 assert intermediate_conv_states is not None
                 assert kwargs.get("use_replay", False) or intermediate_ssm_states is not None
 
-                intermediate_state_indices = kwargs["intermediate_state_indices"]
-                mixed_qkv_d = mixed_qkv_d.reshape(num_decodes, draft_token_num, -1).transpose(1, 2)
-                mixed_qkv_d = causal_conv1d_update_triton(
-                    mixed_qkv_d,
-                    conv_states_to_use,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation=self.activation,
-                    conv_state_indices=state_indices_d,
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=intermediate_state_indices,
-                    # PDL chain: conv1d -> replay verify kernel (replay only)
-                    launch_dependent_kernels=kwargs.get("use_replay", False),
-                    hoist_x=True,
-                )
-                mixed_qkv_d = mixed_qkv_d.transpose(1, 2).reshape(num_decode_tokens, -1)
+                # The GDN MTP replay kernel runs the Conv4 update itself.
+                if not use_mtp_replay:
+                    intermediate_state_indices = kwargs["intermediate_state_indices"]
+                    mixed_qkv_d = mixed_qkv_d.reshape(num_decodes, draft_token_num, -1).transpose(
+                        1, 2
+                    )
+                    mixed_qkv_d = causal_conv1d_update_triton(
+                        mixed_qkv_d,
+                        conv_states_to_use,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation=self.activation,
+                        conv_state_indices=state_indices_d,
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                        # PDL chain: conv1d -> replay verify kernel (replay only)
+                        launch_dependent_kernels=kwargs.get("use_replay", False),
+                        hoist_x=True,
+                    )
+                    mixed_qkv_d = mixed_qkv_d.transpose(1, 2).reshape(num_decode_tokens, -1)
             else:
                 mixed_qkv_d = causal_conv1d_update(
                     mixed_qkv_d,
@@ -2128,7 +2234,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         g_linear=g_linear,
                     )
                 layer_cache = kwargs.get("layer_cache")
-                if (
+                if use_mtp_replay:
+                    pass  # The replay kernel reads the raw q|k|v rows.
+                elif (
                     kwargs.get("use_replay", False)
                     and layer_cache is not None
                     and layer_cache.cache_base is not None
@@ -2219,6 +2327,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
+            if use_mtp_replay:
+                output_d = None
+                if output is not None:
+                    output_d = output[:, num_prefill_tokens:, :, :].view(
+                        num_decodes, draft_token_num, self.num_v_heads_per_tp, self.head_v_dim
+                    )
+                attn_out_decode = self._replay_verify(
+                    raw_x=mixed_qkv_d,
+                    b=b_d,
+                    a=a_d,
+                    conv_states=conv_states_to_use,
+                    ssm_states=ssm_states,
+                    state_indices=state_indices_d,
+                    replay_indices=kwargs["replay_state_indices_d"],
+                    num_decodes=num_decodes,
+                    draft_token_num=draft_token_num,
+                    replay_metadata=kwargs.get("replay_metadata"),
+                    layer_cache=kwargs.get("layer_cache"),
+                    is_dummy=kwargs["replay_is_dummy"],
+                    output=output_d,
+                ).reshape(1, num_decode_tokens, self.num_v_heads_per_tp, self.head_v_dim)
+                if output is not None:
+                    return output
+                if attn_out_prefill is None:
+                    return attn_out_decode
+                return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
+
             query_d = query_d.reshape(
                 num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
             )
@@ -2819,9 +2954,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             kv_cache_manager.get_replay_state_update_metadata() if is_target_verify else None
         )
         use_replay = replay_metadata is not None
+        use_mtp_replay = use_replay and getattr(kv_cache_manager, "use_gdn_mtp_replay", False)
+        replay_is_dummy = None
+        if use_mtp_replay:
+            dummy_mask = kv_cache_manager.get_replay_dummy_request_mask()
+            replay_is_dummy = dummy_mask[num_prefills : num_prefills + num_decodes]
         # Work items only feed Triton's large-batch replay + all-layer commit;
         # the FlashInfer ring kernel always folds in-kernel.
-        partitioned_replay = use_replay and kv_cache_manager.gdn_replay_partitioned(num_decodes)
+        partitioned_replay = (
+            use_replay
+            and not use_mtp_replay
+            and kv_cache_manager.gdn_replay_partitioned(num_decodes)
+        )
         pass_replay_work_items = partitioned_replay and not getattr(
             kv_cache_manager, "use_gdn_flashinfer_ring_replay", False
         )
@@ -2874,6 +3018,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             else None,
             replay_n_writes=mamba_metadata.replay_n_writes if pass_replay_work_items else None,
             use_cached_replay_all_layer_commit=use_cached_replay_all_layer_commit,
+            use_mtp_replay=use_mtp_replay,
+            replay_is_dummy=replay_is_dummy,
             # The main scan's layout: the context segments first, then the decode
             # requests as one-token sequences; its prefill-only prefix serves the
             # mixed-iteration scan.

@@ -217,6 +217,70 @@ def build_replay_work_items(
     )
 
 
+# As above, neither the decode count nor the slice alignment is specialized.
+@triton.jit(
+    do_not_specialize=["num_decodes", "history_len_stride"],
+    do_not_specialize_on_alignment=["state_indices", "replay_indices"],
+)
+def _snapshot_gdn_mtp_replay_work_items_kernel(
+    state_indices,
+    replay_indices,
+    history_len,
+    history_len_stride,
+    work_items,
+    num_decodes,
+    work_item_width: tl.constexpr,
+    position_field: tl.constexpr,
+    cache_slot_field: tl.constexpr,
+    history_len_field: tl.constexpr,
+    cache_buf_idx_field: tl.constexpr,
+    replay_slot_field: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Snapshot each decode's slots and history length before the layer loop."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    active = offsets < num_decodes
+    slots = tl.load(state_indices + offsets, mask=active, other=0)
+    replay_slots = tl.load(replay_indices + offsets, mask=active, other=0)
+    lengths = tl.load(
+        history_len + replay_slots.to(tl.int64) * history_len_stride, mask=active, other=0
+    )
+    output_base = work_items + offsets * work_item_width
+    tl.store(output_base + position_field, offsets, mask=active)
+    tl.store(output_base + cache_slot_field, slots, mask=active)
+    tl.store(output_base + history_len_field, lengths, mask=active)
+    tl.store(output_base + cache_buf_idx_field, 0, mask=active)
+    tl.store(output_base + replay_slot_field, replay_slots, mask=active)
+
+
+def snapshot_gdn_mtp_replay_work_items(
+    state_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    history_len: torch.Tensor,
+    work_items: torch.Tensor,
+) -> None:
+    """Inputs of the GDN MTP all-layer commit: (decode position, state slot,
+    history length, unused, replay slot) per decode request."""
+    num_decodes = state_indices.shape[0]
+    block_size = 256
+    _snapshot_gdn_mtp_replay_work_items_kernel[(triton.cdiv(num_decodes, block_size),)](
+        state_indices,
+        replay_indices,
+        history_len,
+        history_len.stride(0),
+        work_items,
+        num_decodes,
+        work_item_width=REPLAY_WORK_ITEM_WIDTH,
+        position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+        cache_slot_field=REPLAY_WORK_CACHE_SLOT,
+        history_len_field=REPLAY_WORK_PNAT,
+        cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
+        replay_slot_field=REPLAY_WORK_REPLAY_SLOT,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
 class ReplaySlotIndices:
     """A static device buffer of the batch's replay slots.
 
