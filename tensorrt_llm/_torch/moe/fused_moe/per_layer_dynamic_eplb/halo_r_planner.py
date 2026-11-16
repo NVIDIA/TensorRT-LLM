@@ -483,10 +483,11 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     ``plan_finish`` lends the constant READY generation, ``_wait_route_epoch``
     waits for the constant route target and resets the counter,
     ``_bind_main_stream`` lets MAIN change between layer calls behind a
-    MAIN-to-MAIN fence, and ``finish`` joins COPY into MAIN. All five are
-    hooks the base group declares; its owner checks (``_check_owner``) are
-    shared. Every other method is HALO-Q's.
-    It adds ``forget_helper_residency``, which the layer handle calls on every rebind.
+    MAIN-to-MAIN fence, and ``finish`` joins COPY into MAIN. It also overrides
+    ``forget_helper_residency``, which the layer handle calls on every rebind
+    and which HALO-Q leaves a no-op. All six are hooks the base group
+    declares; its owner checks (``_check_owner``) are shared. Every other
+    method is HALO-Q's.
     """
 
     planner_name = "HALO-R"

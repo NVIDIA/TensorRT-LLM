@@ -17,6 +17,9 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+    RebalanceSlotSchedulerGroup,
+)
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import (
     PER_LAYER_DYNAMIC_PLANNERS,
 )
@@ -83,6 +86,7 @@ class _Group:
         self.wait_calls = 0
         self.finish_calls = []
         self.events = []
+        self.forget_calls = 0
 
     def plan(self, routes, *, defer_wait):
         assert defer_wait
@@ -106,6 +110,9 @@ class _Group:
 
     def finish(self, completion_event=None):
         self.finish_calls.append(completion_event)
+
+    def forget_helper_residency(self):
+        self.forget_calls += 1
 
     def close(self):
         pass
@@ -298,6 +305,15 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(
     )
     assert layer._arena is arena
     assert layer._scheduler_group is group
+    # The second bind, as a standard load makes, calls the group's residency reset.
+    assert group.forget_calls == 1
+
+
+def test_halo_q_group_declares_a_no_op_helper_residency_reset() -> None:
+    """HALO-Q's group has the reset that the layer handle calls on a rebind, and it does nothing."""
+    group = object.__new__(RebalanceSlotSchedulerGroup)
+    assert group.forget_helper_residency() is None
+    assert vars(group) == {}
 
 
 def test_bind_backend_requires_the_layer_arena_and_rejects_another_backend(

@@ -763,7 +763,7 @@ def test_relay_counts_come_from_the_native_context(monkeypatch: pytest.MonkeyPat
     assert env.endpoint.relay_counts() == (3, 12, 0)
 
 
-def test_group_overrides_construction_and_the_four_graph_hooks() -> None:
+def test_group_overrides_construction_and_the_base_hooks() -> None:
     methods = {
         name for name, value in vars(HaloRSlotSchedulerGroup).items() if inspect.isfunction(value)
     }
@@ -775,9 +775,10 @@ def test_group_overrides_construction_and_the_four_graph_hooks() -> None:
         "_wait_route_epoch",
         "plan_finish",
         "finish",
+        "forget_helper_residency",
     }
-    # The one addition is the weight-reload hook that the layer handle looks up.
-    assert methods - overridden == {"forget_helper_residency"}
+    # Every method is a hook the base group declares, so the layer handle calls them directly.
+    assert methods == overridden
     assert inspect.signature(HaloRSlotSchedulerGroup.__init__) == inspect.signature(
         RebalanceSlotSchedulerGroup.__init__
     )

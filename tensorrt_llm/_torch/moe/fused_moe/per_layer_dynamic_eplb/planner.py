@@ -129,8 +129,9 @@ class RebalanceSlotSchedulerGroup:
     ``__init__``, overrides only these hooks, each documented with what an override must keep:
     ``_bind_copy_endpoint`` (the copy endpoint), ``_bind_main_stream`` (whether
     MAIN may change), ``_wait_route_epoch`` (MAIN's route wait),
-    ``plan_finish`` (the READY generation lent to MegaMoE) and ``finish``
-    (the release of a generation). The checks every planner shares, such as
+    ``plan_finish`` (the READY generation lent to MegaMoE), ``finish``
+    (the release of a generation) and ``forget_helper_residency`` (the reset
+    of helper residency on a rebind). The checks every planner shares, such as
     ``_check_owner`` and the generation pairing, stay here.
     """
 
@@ -317,6 +318,19 @@ class RebalanceSlotSchedulerGroup:
             helper_residency=helper_residency,
         )
         self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
+
+    def forget_helper_residency(self) -> None:
+        """Hook: the layer handle calls it on every rebind of the same backend; HALO-Q's does nothing.
+
+        A standard load binds every layer twice, as ConfigurableMoE and its
+        backend each run ``post_load_weights``, so the second bind of every
+        default load reaches this call, and raising here would break every
+        load. HALO-Q's residency table (kept only with ``per_layer_resident``)
+        is set only when the copy endpoint binds, so this hook cannot reset
+        it. MegaMoE has no weight reload (``pre_reload_weights`` raises), so
+        failing closed for HALO-Q belongs with the first reload path. HALO-R
+        overrides it with an EP-collective reset.
+        """
 
     def close(self) -> None:
         """Release this layer after the owning pool has drained device work."""

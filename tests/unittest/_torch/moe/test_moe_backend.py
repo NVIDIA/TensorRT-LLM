@@ -2844,7 +2844,11 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     )
 
     # The manager reads HALO-Q's group builder from the registry when it is built.
-    builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
+    builder = MagicMock(
+        return_value=SimpleNamespace(
+            home_experts=4, helper_slots=2, forget_helper_residency=MagicMock()
+        )
+    )
     monkeypatch.setitem(
         PER_LAYER_DYNAMIC_PLANNERS,
         "halo_q",
@@ -2916,6 +2920,8 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
         max_tokens_per_rank=128,
         layer_idx=5,
     )
+    # The second call rebinds the built producer, which resets its helper residency.
+    builder.return_value.forget_helper_residency.assert_called_once_with()
 
 
 @pytest.mark.cpu_only

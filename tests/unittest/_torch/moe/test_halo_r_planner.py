@@ -267,10 +267,6 @@ def test_rebinding_the_backend_forgets_helper_residency(monkeypatch: pytest.Monk
     layer.bind_backend(backend)
     assert group.forget_helper_residency.call_count == 2
 
-    # A producer without the hook, such as HALO-Q's, rebinds as before.
-    del group.forget_helper_residency
-    layer.bind_backend(backend)
-
 
 def test_manager_rejects_unknown_planner() -> None:
     with pytest.raises(ValueError, match="unknown per-layer dynamic EPLB planner"):

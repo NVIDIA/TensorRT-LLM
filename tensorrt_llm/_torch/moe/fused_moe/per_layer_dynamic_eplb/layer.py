@@ -238,15 +238,11 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             # its backend each run ``post_load_weights`` and both end here;
             # the second call finds the producer built. This backend has no
             # weight reload (``pre_reload_weights`` raises), so the reset
-            # below, for a producer that has one, runs on that second bind
-            # and covers a reload path added later: helper slots may then
-            # still hold copies of the old weights, and a producer that
-            # tracks what they hold must forget it.
-            forget_helper_residency = getattr(
-                self._scheduler_group, "forget_helper_residency", None
-            )
-            if forget_helper_residency is not None:
-                forget_helper_residency()
+            # below runs on that second bind and covers a reload path added
+            # later: helper slots may then still hold copies of the old
+            # weights. HALO-R forgets what they hold; HALO-Q's hook is a
+            # no-op, since its table can be reset only when the producer is built.
+            self._scheduler_group.forget_helper_residency()
             return
 
         backend_ref = weakref.ref(backend)
