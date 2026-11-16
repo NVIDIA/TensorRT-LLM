@@ -597,6 +597,7 @@ def create_config(
     sink_tokens: int,
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
+    disk_tier_options: dict | None = None,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -615,7 +616,7 @@ def create_config(
     cache_tiers = [
         GpuCacheTierConfig(quota=gpu_quota),
         HostCacheTierConfig(quota=host_quota),
-        DiskCacheTierConfig(quota=disk_quota, path=disk_path),
+        DiskCacheTierConfig(quota=disk_quota, path=disk_path, **(disk_tier_options or {})),
     ]
     cache_tiers = [t for t in cache_tiers if t.quota > 0]
     return KVCacheManagerConfig(
@@ -693,6 +694,106 @@ class TestSparseBufferConfig(unittest.TestCase):
             self.assertEqual(len(set(bases.values())), 2, bases)
         finally:
             manager.shutdown()
+
+    def test_each_arena_pool_has_a_zeroed_tile_tail(self):
+        import ctypes
+
+        import cuda.bindings.runtime as cudart
+
+        def aligned(size: int) -> int:
+            return (size + 255) // 256 * 256
+
+        init_cuda_once()
+        # Exercise 32, 64, 128 and 256 stored rows per page, multiple layers and
+        # multiple leases. The guard is always 128 rows for each whole pool.
+        for tokens_per_block, unit_tokens, num_layers, max_leases in (
+            (128, 4, 1, 1),
+            (128, 2, 2, 3),
+            (128, 1, 2, 3),
+            (256, 1, 2, 3),
+        ):
+            with self.subTest(
+                tokens_per_block=tokens_per_block,
+                unit_tokens=unit_tokens,
+                num_layers=num_layers,
+                max_leases=max_leases,
+            ):
+                units_per_page = tokens_per_block // unit_tokens
+                units_per_buffer = 3 * units_per_page
+                row_bytes = {"key": 576, "key_scale": 36}
+                manager = KVCacheManager(
+                    KVCacheManagerConfig(
+                        tokens_per_block=tokens_per_block,
+                        cache_tiers=[GpuCacheTierConfig(64 << 20)],
+                        constraints=[
+                            BatchDesc(
+                                kv_caches=[KVCacheDesc(capacity=1024, history_length=0)]
+                                * max_leases
+                            )
+                        ],
+                        layers=[
+                            AttentionLayerConfig(
+                                layer,
+                                [
+                                    BufferConfig(role, units_per_page * size, is_sparse=True)
+                                    for role, size in row_bytes.items()
+                                ]
+                                + [BufferConfig("index", 256)],
+                                sparse_cache=SparseCacheConfig(
+                                    num_selected_blocks=2,
+                                    max_cached_units=units_per_buffer,
+                                    unit_tokens=unit_tokens,
+                                ),
+                            )
+                            for layer in range(num_layers)
+                        ],
+                    )
+                )
+                try:
+                    with TemporaryCudaStream([]) as stream:
+                        batch = Batch(
+                            manager,
+                            cast(CudaStream, stream.handle),
+                            max_batch_size=max_leases,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        usable_rows = max_leases * num_layers * units_per_buffer
+                        regions = sorted(
+                            (
+                                int(batch.get_sparse_cache_base_address(LayerId(0), role)),
+                                usable_rows * size,
+                                128 * size,
+                            )
+                            for role, size in row_bytes.items()
+                        )
+                        # Each region pads its payload and tail to 256 bytes, which the
+                        # one-lease key_scale region needs. No guard is allocated for the
+                        # dense indexer's empty arena region.
+                        first_base, first_payload, first_tail = regions[0]
+                        self.assertEqual(
+                            regions[1][0] - first_base, aligned(first_payload + first_tail)
+                        )
+                        metadata_bytes = aligned(num_layers * units_per_buffer * 4)
+                        self.assertEqual(
+                            batch.sparse_arena_bytes,
+                            sum(aligned(payload + tail) for _, payload, tail in regions)
+                            + 3 * 256
+                            + max_leases * metadata_bytes,
+                        )
+                        self.assertEqual(manager.get_sparse_cache_max_units(0), units_per_buffer)
+                        for base, payload, tail in regions:
+                            sink = (ctypes.c_ubyte * tail)()
+                            (err,) = cudart.cudaMemcpy(
+                                ctypes.addressof(sink),
+                                base + payload,
+                                tail,
+                                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                            )
+                            self.assertEqual(int(err), 0)
+                            self.assertEqual(bytes(sink), bytes(tail))
+                finally:
+                    manager.shutdown()
 
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
@@ -1050,26 +1151,32 @@ class TestSparseCacheReservation(unittest.TestCase):
         return sum(stats.free for stats in manager.get_storage_statistics())
 
     def test_batch_rejects_resolve_shared_memory_overflow_before_fetch(self) -> None:
-        for max_cached_units, selection_width in ((1 << 20, 2), (1 << 16, (1 << 16) - 1)):
-            with self.subTest(max_cached_units=max_cached_units, selection_width=selection_width):
-                # Token-sized units keep the arena small while either residency metadata
-                # or the selection's probe table exceeds a device's per-block limit.
-                manager = self._manager(
-                    max_cached_units,
-                    num_selected_blocks=selection_width,
-                    unit_tokens=1,
+        # Token-sized units keep the arena small. The widest cache the probe index can name,
+        # 16256 units at 128 per page, needs about 80 KiB for its residency metadata, so the
+        # selection's probe table and miss lists are what exceed a device's per-block limit.
+        manager = self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+                Batch(
+                    manager,
+                    NULL_STREAM,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_specs(),
                 )
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
-                        Batch(
-                            manager,
-                            NULL_STREAM,
-                            max_batch_size=1,
-                            max_blocks_per_seq=4,
-                            index_tables=manager.sparse_index_table_specs(),
-                        )
-                finally:
-                    manager.shutdown()
+        finally:
+            manager.shutdown()
+
+    def test_a_cache_wider_than_the_probe_index_fails_with_the_config(self) -> None:
+        # The probe index names at most 16382 entries, which round down to 16256 token-sized
+        # units at 128 per page. A wider cache fails when the config is built, before a
+        # Batch sizes any resolve.
+        for max_cached_units in (16257, 1 << 20):
+            with self.subTest(max_cached_units=max_cached_units):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exceeds the supported capacity of 16256 units"
+                ):
+                    self._manager(max_cached_units, unit_tokens=1)
 
     def test_batch_accepts_resolve_shared_memory_that_fits(self) -> None:
         # Three token-sized units round up to a full 128-unit cell.
@@ -1648,7 +1755,7 @@ class TestSparseCacheReservation(unittest.TestCase):
 
 
 class TestSparseResolve(unittest.TestCase):
-    """The sparse resolve kernel: probe index, victim choice and recency rebuild."""
+    """The sparse resolve kernel: probe index, victim choice and the ages it leaves."""
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -1663,7 +1770,7 @@ class TestSparseResolve(unittest.TestCase):
         selected: list[int],
         *,
         num_layers: int = 1,
-        lru: list[int] | None = None,
+        ages: list[int] | None = None,
         history_units: int = 1 << 20,
         capacity_units: int | None = None,
         max_in_flight_units: int = 0,
@@ -1672,13 +1779,11 @@ class TestSparseResolve(unittest.TestCase):
     ):
         entries = len(resident) // (num_layers * num_rows)
         width = len(selected) // (num_layers * num_rows)
-        if lru is None:
-            lru = list(range(entries)) * num_layers * num_rows
         history = [history_units] * num_rows
         capacity = [history_units if capacity_units is None else capacity_units] * num_rows
         return _introspection.sparse_resolve(
             resident,
-            lru,
+            ages or [],
             num_layers,
             entries,
             selected,
@@ -1711,29 +1816,33 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[1:], [-1, -1])
 
     def test_hits_outrank_units_fetched_this_step(self):
+        """Both entries are used this step, and the history flag is what separates them."""
         # Entry 0 holds unit 10 and is selected; unit 99 is new.
         resident = [10] + self._free(7)
         result = self._resolve(resident, [10, 99])
         fetched = result.out_slot[1]
-        self.assertEqual(result.lru_order[0], 0, "the hit should be most recently used")
-        self.assertEqual(result.lru_order[1], fetched, "the fetch ranks below the hit")
+        self.assertEqual(result.entry_age[0], 0)
+        self.assertEqual(result.entry_hit[0], 1, "the entry already held its unit")
+        self.assertEqual(result.entry_age[fetched], 0)
+        self.assertEqual(result.entry_hit[fetched], 0, "the unit was fetched into the entry")
 
-    def test_victims_come_from_the_lru_tail(self):
-        # A full cache, with entry 2 placed last in recency so it is the victim.
+    def test_victims_are_the_stalest_entries(self):
+        # A full cache, with entry 2 the oldest so it is the victim.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]
-        result = self._resolve(resident, [99], lru=lru)
+        result = self._resolve(resident, [99], ages=[1, 1, 9, 1])
         self.assertEqual(result.miss_count, [1])
         self.assertEqual(result.out_slot, [2])
         self.assertEqual(result.resident_ordinal[2], 99)
-        # The units that were not selected keep their data.
+        # The units that were not selected keep their data, and age by nothing: the step
+        # clock only advances between resolves.
         self.assertEqual([result.resident_ordinal[i] for i in (0, 1, 3)], [10, 11, 13])
+        self.assertEqual([result.entry_age[i] for i in (0, 1, 3)], [1, 1, 1])
 
     def test_in_flight_entries_are_never_evicted(self):
         # Unit 12 is at or above the watermark, so it holds the only copy of its data.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]  # entry 2 (unit 12) is least recently used
-        result = self._resolve(resident, [99], lru=lru, history_units=12)
+        ages = [1, 1, 9, 1]  # entry 2 (unit 12) is the oldest
+        result = self._resolve(resident, [99], ages=ages, history_units=12)
         self.assertEqual(result.resident_ordinal[2], 12, "an in-flight unit must survive")
         self.assertEqual(result.resident_ordinal[result.out_slot[0]], 99)
 
@@ -1841,35 +1950,20 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[0], 0)
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
 
-    def test_large_caches_preserve_victims_and_recency_order(self):
-        """Hits, fetched victims, and untouched entries retain their relative order."""
-        import cuda.bindings.runtime as cudart
-
-        # The 8192-entry case needs 147552 bytes of dynamic shared memory per resolve block,
-        # on top of what the kernel declares statically.
-        err, device = cudart.cudaGetDevice()
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        err, shared_optin = cudart.cudaDeviceGetAttribute(
-            cudart.cudaDeviceAttr.cudaDevAttrMaxSharedMemoryPerBlockOptin, device
-        )
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        if shared_optin < 160 << 10:
-            self.skipTest(
-                f"needs 160 KiB of shared memory per block; this device allows {shared_optin}"
-            )
+    def test_large_caches_evict_the_free_entries_then_the_stalest(self):
+        """Free entries go first, then the oldest, and every other entry is left alone."""
         for entries in (31, 32, 33, 255, 256, 257, 2048, 4096, 4224, 8192):
             with self.subTest(entries=entries):
                 rng = random.Random(entries)
                 history = 100000
                 in_flight = 4
+                count = min(entries // 4, 512)
+                num_free = min(entries // 8, count // 2)
                 resident = list(range(entries - in_flight)) + list(
                     range(history, history + in_flight)
                 )
-                resident[: entries // 8] = self._free(entries // 8)
+                resident[:num_free] = self._free(num_free)
                 rng.shuffle(resident)
-                lru = list(range(entries))
-                rng.shuffle(lru)
-                count = min(entries // 4, 512)
                 hits = rng.sample(
                     [ordinal for ordinal in resident if 0 <= ordinal < history], count
                 )
@@ -1881,18 +1975,22 @@ class TestSparseResolve(unittest.TestCase):
                     for slot, ordinal in enumerate(resident)
                     if ordinal in hits or history <= ordinal < history + in_flight
                 }
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                free_slots = {slot for slot, ordinal in enumerate(resident) if ordinal < 0}
+                # Two ages, far enough apart that the cache has to take the older group
+                # whole before it reaches anything else.
+                eligible = [
+                    slot
+                    for slot in range(entries)
+                    if slot not in hit_slots and slot not in free_slots
+                ]
+                stale = set(rng.sample(eligible, count - num_free))
+                ages = [9 if slot in stale else 1 for slot in range(entries)]
+                victims = free_slots | stale
                 try:
                     result = self._resolve(
                         resident,
                         selected,
-                        lru=lru,
+                        ages=ages,
                         history_units=history,
                         capacity_units=history + in_flight,
                         max_in_flight_units=in_flight,
@@ -1902,7 +2000,6 @@ class TestSparseResolve(unittest.TestCase):
                         raise unittest.SkipTest(str(error)) from error
                     raise
                 self.assertEqual(result.miss_count, [count])
-                self.assertEqual(result.lru_order, expected_lru)
                 fetched_slots = set()
                 for ordinal, slot in zip(selected, result.out_slot):
                     if ordinal < 0:
@@ -1915,40 +2012,42 @@ class TestSparseResolve(unittest.TestCase):
                 for slot, ordinal in enumerate(resident):
                     if slot not in victims:
                         self.assertEqual(result.resident_ordinal[slot], ordinal)
+                # Every entry the step used is now the youngest there is, and the flag
+                # separates the ones that were already holding their unit.
+                for slot in range(entries):
+                    if slot in victims:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 0))
+                    elif slot in hit_slots - free_slots:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 1))
+                    else:
+                        self.assertEqual(result.entry_age[slot], ages[slot])
                 self.assertEqual(
                     result.in_flight_slot,
                     [resident.index(history + i) for i in range(in_flight)],
                 )
 
-    def test_colliding_selections_preserve_slots_and_recency(self) -> None:
-        """Sparse ordinals and padding preserve the same eviction and stable-order contract."""
+    def test_colliding_selections_preserve_slots_and_eviction(self) -> None:
+        """Sparse ordinals and padding preserve the same eviction contract."""
         for entries in (63, 257, 2080):
             with self.subTest(entries=entries):
-                history = 1 << 28
-                resident = [i * 2048 for i in range(entries - 2)] + [history, history + 1]
-                lru = list(range(entries))
-                random.Random(entries).shuffle(lru)
+                history = 200000
+                resident = [i * 64 for i in range(entries - 2)] + [history, history + 1]
                 count = min(entries // 4, 32)
                 hits = resident[:count]
-                misses = [(entries + i) * 2048 for i in range(count)]
+                misses = [(entries + i) * 64 for i in range(count)]
                 selected = [-1, *misses, -1, *reversed(hits), -1]
                 hit_slots = set(range(count)) | {entries - 2, entries - 1}
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                eligible = [slot for slot in range(entries) if slot not in hit_slots]
+                victims = set(random.Random(entries).sample(eligible, count))
+                ages = [9 if slot in victims else 1 for slot in range(entries)]
                 result = self._resolve(
                     resident,
                     selected,
-                    lru=lru,
+                    ages=ages,
                     history_units=history,
                     capacity_units=history + 2,
                     max_in_flight_units=4,
                 )
-                self.assertEqual(result.lru_order, expected_lru)
                 self.assertEqual(result.miss_count, [count])
                 self.assertEqual(result.miss_total, [count])
                 self.assertEqual(result.in_flight_slot, [entries - 2, entries - 1, -1, -1])
@@ -2046,7 +2145,7 @@ class TestSparseUnitCopy(unittest.TestCase):
 
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.
-        unit, layers = 16, 2
+        unit, layers, cells = 16, 2, 2
         host = self._pattern(unit * layers)
         result = _introspection.sparse_unit_copy(
             host_pool=host,
@@ -2056,10 +2155,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             # offset array: slot 0 of a pool coalescing two buffers converts to index 0 or
             # 1, and layer 0 is given the second.
             page_table=[1, 0],
-            device_arena=[0] * (unit * layers),
+            device_arena=[0] * (unit * layers * cells),
             base_cell=0,
             num_blocks=1,
-            cells_per_buffer=1,
+            cells_per_buffer=cells,
             buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
@@ -2067,15 +2166,18 @@ class TestSparseUnitCopy(unittest.TestCase):
             unit_stride=unit,
             expansion=1,
             miss_ordinal=[0, 0],
-            miss_slot=[0, 0],
+            # Each layer reads its own work list, so the layers name different entries.
+            miss_slot=[0, 1],
             miss_count=[1, 1],
             selection_width=1,
             buffer_layer=list(range(layers)),
         )
         # The cold page comes from the entry and the hot cell is arithmetic on the sub-slot,
-        # so layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
+        # so layer 0 reads the second cold buffer into its first cell, and layer 1 the first
+        # cold buffer into its second.
         self.assertEqual(result[:unit], host[unit:])
-        self.assertEqual(result[unit:], host[:unit])
+        self.assertEqual(result[unit : 3 * unit], [0] * (2 * unit))
+        self.assertEqual(result[3 * unit :], host[:unit])
 
     def test_a_layer_without_misses_copies_nothing(self):
         unit = 16
@@ -3144,13 +3246,15 @@ class TestIndexTables(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_scratch_blocks_match_the_reference_converter(self):
+    @parameterized.expand([(0,), (32,)])
+    def test_scratch_blocks_match_the_reference_converter(self, reserve: int):
         """The substituting path, against PageIndexConverter given the same scratch range.
 
         A scratch block's slot comes from the spec rather than the page table, and the
         layer's offset wraps inside the shared slot instead of being added to it. Both are
         easy to transcribe wrongly, and neither shows up on a config without scratch, so
-        this drives a real scratch range and defers the arithmetic to the reference.
+        this drives a real scratch range and defers the arithmetic to the reference. A
+        ``reserve`` first gives blocks regular pages that the chunk's scratch range then covers.
         """
         num_layers, window, tpb, prompt_len = 4, 128, 32, 1024
         cfg = KVCacheManagerConfig(
@@ -3168,7 +3272,7 @@ class TestIndexTables(unittest.TestCase):
                 )
                 for i in range(num_layers)
             ],
-            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=reserve),
         )
         manager = KVCacheManager(cfg)
         cache = None
@@ -3203,12 +3307,23 @@ class TestIndexTables(unittest.TestCase):
                 cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
+                if reserve:
+                    self.assertTrue(cache.resize(reserve))
                 self.assertTrue(cache.resize(prompt_len))
                 self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
 
                 scratch = _scratch_desc(cache, lg)
                 self.assertIsNotNone(scratch)
                 self.assertGreater(scratch.range.end - scratch.range.beg, 0)
+                if reserve:
+                    raw = [int(x) for x in cache.get_base_page_indices(lg)]
+                    self.assertTrue(
+                        any(
+                            raw[block] != BAD_PAGE_INDEX
+                            for block in range(scratch.range.beg, scratch.range.end)
+                        ),
+                        "the reservation left no regular page inside the scratch range",
+                    )
 
                 batch.wait_published()
                 batch.publish()
@@ -3635,16 +3750,25 @@ class TestBatchPageTable(unittest.TestCase):
         them: the members' own mutations, and the watermarks and views publish() stages
         itself. Waiting inside publish() would cover only the second, and would do it while
         hiding that a member mutated before the call had already raced.
+
+        The refusal comes before publish() stages anything, the eviction clock included: the
+        copy in flight may still be reading the staged clock, and a refused step must not
+        count, so the next accepted publish advances the clock by exactly one.
         """
         with self._fixture() as (torch, manager, batch, handle):
             with self._member(manager, batch, 0, handle):
+                step_age, staged = _introspection.batch_sparse_clock(batch)
                 # _member's resize() published and nobody has waited on it.
                 with self.assertRaises(Exception) as caught:
                     batch.publish()
                 self.assertIn("still reading the staged rows", str(caught.exception))
+                self.assertEqual(_introspection.batch_sparse_clock(batch), (step_age, staged))
 
                 batch.wait_published()
                 batch.publish()
+                self.assertEqual(
+                    _introspection.batch_sparse_clock(batch), (step_age + 1, staged + 1)
+                )
 
     def test_a_member_refuses_a_second_page_index_buffer(self):
         """Its indices live in the Batch's row, so a second buffer is refused.
@@ -4497,11 +4621,11 @@ class TestSparseWriteIndices(unittest.TestCase):
         that treated its entry as an ordinary miss would copy stale bytes over what the model
         wrote. Removing that guard fails this.
 
-        It does not cover the separate `pinned` term in the victim test. Every in-flight
+        It does not cover the separate held-entry term in the victim test. Every in-flight
         ordinal is probed in the resolve's required prefix, so its entry is always classified
-        hit or fetched and never `kClassUntouched` -- which the victim test already excludes.
-        Dropping `pinned` leaves every test here passing, so it appears to be redundant with
-        that classification rather than load-bearing.
+        as matched and never as evictable -- which the victim test already excludes. Dropping
+        the held term leaves every test here passing, so it appears to be redundant with that
+        classification rather than load-bearing.
         """
         ctypes, cudart, torch = self._deps()
         manager = self._manager()
@@ -5748,6 +5872,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
     cfg: KVCacheManagerConfig
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
+    disk_tier_options: dict = {}
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -5795,6 +5920,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
             sink_tokens,
             kv_buf_size,
             block_quant_buf_size,
+            disk_tier_options=self.disk_tier_options,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -6202,7 +6328,7 @@ class TestStorageStatistics(TestKVCacheManagerV2):
             )
             for item in stats:
                 self.assertEqual(item.total, item.available + item.unavailable)
-                self.assertEqual(item.available, item.free + item.evictable)
+                self.assertEqual(item.available, item.free + item.evictable + item.retained_copies)
                 sizes = item.slot_sizes
                 sizes[0] = 0
             self.assertEqual(
@@ -9914,6 +10040,72 @@ class TestScratchReuse(TestKVCacheManagerV2):
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
+    @parameterized.expand([(0, 0), (127, 32)])
+    def test_scratch_capacity_shrink_preserves_history(self, prefix_length: int, reserve: int):
+        self._prepare_scratch(
+            num_layers=8,
+            window_size=64,
+            tokens_per_block=32,
+            max_rewind_len=reserve,
+            gpu_quota=16 << 20,
+        )
+        prefix = [self.next_token() for _ in range(prefix_length)]
+        suffix = [self.next_token() for _ in range(512)]
+        kv = self.manager.create_kv_cache(None, prefix + suffix)
+        old_capacity = prefix_length + reserve
+        new_capacity = old_capacity + len(suffix)
+        group = LayerGroupId(0)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv.resume(stream))
+            if prefix:
+                self.assertTrue(kv.resize(prefix_length))
+                self.engine.execute([Step(kv, prefix, [])], stream)
+                kv.commit(prefix)
+            self.assertTrue(kv.resize(old_capacity))
+            old_indices = list(kv.get_base_page_indices(group))
+            kv.commit_pending_stats()
+            for attempt in range(2):
+                self.assertTrue(kv.resize(new_capacity))
+                self.assertTrue(kv.has_scratch_slots)
+                if attempt == 1:
+                    # Written but uncommitted input leaves history unchanged.
+                    self.engine.execute([Step(kv, suffix, prefix)], stream)
+                with self.assertRaisesRegex(ValueError, "scratch blocks would remain"):
+                    kv.resize(old_capacity + 256)
+                with self.assertRaisesRegex(ValueError, "retained live block has no normal page"):
+                    kv.resize(old_capacity + 32)
+                # Advancing history still needs the rewind guarantee: scratch
+                # cannot preserve an arbitrary prefix of the executed chunk.
+                with self.assertRaisesRegex(
+                    (RuntimeError, AssertionError), "old_capacity - max_rewind_len"
+                ):
+                    kv.resize(old_capacity + 32, old_capacity + 32)
+                self.assertEqual(kv.capacity, new_capacity)
+                self.assertEqual(kv.history_length, prefix_length)
+                self.assertTrue(kv.resize(old_capacity))
+                self.assertEqual(kv.capacity, old_capacity)
+                self.assertEqual(kv.history_length, prefix_length)
+                self.assertFalse(kv.has_scratch_slots)
+                self.assertEqual(list(kv.get_base_page_indices(group)), old_indices)
+                canceled = kv.commit_pending_stats()
+                self.assertEqual(canceled.alloc_total_blocks, 0)
+                self.assertEqual(canceled.alloc_new_blocks, 0)
+                self.assertEqual(canceled.missed_blocks, 0)
+                self.engine.execute([Step(kv, [], prefix)], stream)
+                if attempt == 1 and reserve:
+                    self.engine.execute([Step(kv, [], prefix + suffix[:reserve])], stream)
+                kv.suspend()
+                self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(new_capacity))
+            self.engine.execute([Step(kv, suffix, prefix)], stream)
+            kv.commit(suffix)
+            self.assertGreater(kv.commit_pending_stats().alloc_total_blocks, 0)
+            self.engine.execute([Step(kv, [], prefix + suffix)], stream)
+            kv.stop_committing()
+        s.take_finish_event().synchronize()
+        kv.close()
+
     def test_excess_scratch_slot_waits_for_ready_event_on_new_stream(self):
         num_layers = 512
         self._prepare_scratch(
@@ -11388,6 +11580,452 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
+
+
+# Disk-tier tests rerun with every SSD offload option on.
+# The disk I/O pool is process-wide and starts at the first nonzero num_io_threads, so once one of these classes has
+# run, later tests in the same process that set num_io_threads=0 also use the pool. Disk contents and results are the
+# same either way; only the I/O path differs.
+_ALL_DISK_OPTIONS = {"num_io_threads": 4, "keep_copy_after_restore": True, "write_through": True}
+
+
+class TestNoBatchingDiskOptions(TestNoBatching):
+    disk_tier_options = _ALL_DISK_OPTIONS
+    # Inherited tests that move pages to the disk tier. The others build no disk tier or never evict, so rerunning
+    # them with the options on adds time but no coverage; the larger test_cache_reuse cases repeat case 0's pattern.
+    _INHERITED_DISK_TESTS = ("test_cache_reuse_0", "test_sol_mem_utilization")
+
+    def setUp(self) -> None:
+        name = self._testMethodName
+        if name not in type(self).__dict__ and not name.startswith(self._INHERITED_DISK_TESTS):
+            self.skipTest("inherited test does not reach the disk tier")
+        super().setUp()
+
+    def _run_and_close(self, req: "TestNoBatching.Request") -> None:
+        with TemporaryCudaStream([]) as s:
+            assert req.kv_cache.resume(cast(CudaStream, s.handle))
+            self._run_by_block(req)
+            req.kv_cache.close()
+        s.take_finish_event()
+
+    def _run_by_block(self, req: "TestNoBatching.Request", block: int = 32) -> None:
+        # run_request with refcheck, but decoding a block of tokens per engine step instead of one: the pages
+        # committed, and the sliding-window pages released as the sequence grows, are the same, with far fewer
+        # refchecked steps. These tests only need requests to commit pages and push them down the tiers.
+        _, kv_cache, prompt, decode_len = req
+        stream = kv_cache.cuda_stream
+        num_reused = kv_cache.num_committed_tokens
+        if not kv_cache.resize(round_up(len(prompt), block)):
+            raise OutOfPagesError("Not enough pages in GPU memory")
+        history = prompt[:num_reused]
+        new_tokens = prompt[num_reused:]
+        self.engine.execute([Step(kv_cache, new_tokens, history)], stream)
+        if new_tokens:
+            kv_cache.commit(new_tokens)
+            history.extend(new_tokens)
+        remaining = decode_len
+        while remaining > 0:
+            count = min(block - len(history) % block, remaining)
+            kv_cache.commit(history[kv_cache.history_length :])
+            if not kv_cache.resize(round_up(len(history) + count, block)):
+                raise OutOfPagesError("Not enough pages in GPU memory")
+            tokens = [self.next_token() for _ in range(count)]
+            self.engine.execute([Step(kv_cache, tokens, history)], stream)
+            history.extend(tokens)
+            remaining -= count
+        kv_cache.commit(history[kv_cache.history_length :])
+        self.engine.execute([Step(kv_cache, [], history)], stream)
+
+    def _assert_copies_balance(self, counters: dict) -> None:
+        # With one disk tier every retained copy is created once and leaves through exactly one counter.
+        self.assertEqual(
+            counters["retained"],
+            counters["created"] - counters["reused"] - counters["reclaimed"] - counters["dropped"],
+            counters,
+        )
+
+    def test_disk_io_threads_alone_restore_correctly(self) -> None:
+        # Async disk I/O alone: restores from disk move the page back (no retained copies) and pass refcheck.
+        self.disk_tier_options = {"num_io_threads": 4}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertTrue(_introspection.async_disk_io_enabled())
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        counters = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(counters["created"], 0)
+        self.assertEqual(counters["retained"], 0)
+        self.manager.clear_reusable_blocks()
+
+    def test_retained_disk_copies_are_reused_and_reclaimed(self) -> None:
+        # GPU and host each hold about one request, so later requests push committed pages GPU -> host -> disk.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(filled["write_through_pages"], 0)
+        # Host -> disk evictions of written-through pages took their disk slot back instead of writing.
+        self.assertGreater(filled["reused"], 0)
+        self._assert_copies_balance(filled)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["retained"], 0)
+        # The disk tier reports its retained copies apart from evictable pages.
+        disk = self.manager.get_storage_statistics(CacheLevel(2))
+        self.assertEqual(sum(stats.retained_copies for stats in disk), restored["retained"])
+        for stats in disk:
+            self.assertEqual(stats.available, stats.free + stats.evictable + stats.retained_copies)
+        # Restoring the prefix kept its disk copies: more copies were created than written through.
+        self.assertGreater(
+            restored["created"] - filled["created"],
+            restored["write_through_pages"] - filled["write_through_pages"],
+        )
+        self._assert_copies_balance(restored)
+
+        # Growing the disk tier keeps the retained copies.
+        self.assertTrue(self.manager.resize(CacheLevel(2), 2 << 30))
+        grown = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(grown["retained"], restored["retained"])
+        self.assertEqual(grown["reclaimed"], restored["reclaimed"])
+
+        # Shrinking the disk tier drops its retained copies; the pages themselves stay valid.
+        self.assertTrue(self.manager.resize(CacheLevel(2), 512 << 20))
+        shrunk = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(shrunk["retained"], 0)
+        self._assert_copies_balance(shrunk)
+        self.assertGreater(shrunk["reclaimed"], restored["reclaimed"])
+        # Push the prefix off the GPU and host again, then restore it from disk; refcheck verifies the KV. Only a
+        # restore from disk keeps a copy without writing one, so created copies exceed written-through pages.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        evicted = _introspection.disk_copy_counters(self.manager)
+        again = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(again.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(again)
+        reread = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(
+            reread["created"] - evicted["created"],
+            reread["write_through_pages"] - evicted["write_through_pages"],
+        )
+        self._assert_copies_balance(reread)
+        self.manager.clear_reusable_blocks()
+
+    def test_write_through_without_keep_copy(self) -> None:
+        # Write-through alone: pages evicted GPU -> host are copied to disk early and their host -> disk eviction
+        # reuses the copy, while a restore from disk still frees the disk slot (no keep-copy).
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(filled["write_through_pages"], 0)
+        self.assertGreater(filled["reused"], 0)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+    def test_keep_copy_without_write_through(self) -> None:
+        # Keep-copy alone: nothing is copied early, a restore from disk keeps the disk copy, and when the restored
+        # page falls back to disk it takes that slot back instead of being written again.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(filled["write_through_pages"], 0)
+        self.assertEqual(filled["created"], 0)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["created"], 0)
+        self.assertGreater(restored["retained"], 0)
+        self._assert_copies_balance(restored)
+
+        # Push the restored prefix back down: its host -> disk eviction reuses the kept copies.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        pushed = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(pushed["reused"], restored["reused"])
+        self.assertEqual(pushed["write_through_pages"], 0)
+        self._assert_copies_balance(pushed)
+
+        # The copies that were taken back hold the right bytes: restore from them again.
+        again = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(again.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(again)
+        self.manager.clear_reusable_blocks()
+
+    def test_full_disk_evicts_lru_pages_before_retained_copies(self) -> None:
+        # The disk holds only a few requests, so it fills with pages whose only copy is on disk. Further
+        # evictions must drop the least recently used of those before reclaiming any retained copy.
+        self.prepare(32 << 20, 32 << 20, 96 << 20, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        last = None
+        for _ in range(24):
+            last = self.new_request(next(req_ids), None, 256, seq_len - 256)
+            self._run_and_close(last)
+        counters = _introspection.disk_copy_counters(self.manager)
+        disk = self.manager.get_storage_statistics(CacheLevel(2))
+        self.assertGreaterEqual(max(1 - stats.free / stats.total for stats in disk), 0.9)
+        self.assertGreater(counters["write_through_pages"], 0)
+        self.assertGreater(counters["reused"], 0)
+        self.assertEqual(counters["reclaimed"], 0)
+
+        # The most recent request's prefix is still cached and restores correctly (refcheck).
+        prompt = last.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+    def test_protected_copy_fraction_zero_releases_copies_first(self) -> None:
+        # With no protected copy share, write-through makes no copy, and on a full disk the copies kept after a
+        # restore are released before any page whose only copy is on disk.
+        self.disk_tier_options = dict(_ALL_DISK_OPTIONS, protected_copy_fraction=0.0)
+        self.prepare(32 << 20, 32 << 20, 96 << 20, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        requests = []
+        for _ in range(24):
+            requests.append(self.new_request(next(req_ids), None, 256, seq_len - 256))
+            self._run_and_close(requests[-1])
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(filled["write_through_pages"], 0)
+        self.assertGreater(filled["write_through_skipped"], 0)
+        # Without write-through copies the disk fills a little less than in the tests above, but it is still full
+        # enough that the evictions below run short of free slots.
+        disk = self.manager.get_storage_statistics(CacheLevel(2))
+        self.assertGreaterEqual(max(1 - stats.free / stats.total for stats in disk), 0.85)
+
+        # GPU and host each hold about the last request, so this one's prefix is restored from disk, which keeps
+        # copies of it; refcheck verifies the KV.
+        prompt = requests[-3].kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["created"], filled["created"])
+
+        # Later evictions into the full disk release those copies first.
+        for _ in range(2):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        pushed = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(pushed["reclaimed"], restored["reclaimed"])
+        self._assert_copies_balance(pushed)
+        self.manager.clear_reusable_blocks()
+
+    def test_eviction_takes_back_copy_whose_write_is_still_running(self) -> None:
+        # Background writes are delayed, so write-through copies stay in flight. Pushing their pages from host to
+        # disk takes those copies back and promotes their writes to required ones, which are not delayed. The delay
+        # must outlast the time from a copy's write to its take-back, which spans several GPU synchronizations; other
+        # work that queues behind a delayed write waits at most the delay. Restoring the prefix then checks the KV.
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        _introspection.delay_background_disk_writes_for_testing(10.0)
+        try:
+            for _ in range(4):
+                self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+                counters = _introspection.disk_copy_counters(self.manager)
+                if counters["reused_pending"] > 0:
+                    break
+        finally:
+            _introspection.delay_background_disk_writes_for_testing(0.0)
+        self.assertGreater(counters["write_through_pages"], 0)
+        self.assertGreater(counters["reused_pending"], 0)
+        self.assertLessEqual(counters["reused_pending"], counters["reused"])
+        self._assert_copies_balance(counters)
+
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+    def test_write_through_uses_only_free_disk_slots(self) -> None:
+        # A write-through copy only saves a later write. On a full disk it must not evict pages whose only copy is
+        # on disk to make room for itself.
+        self.prepare(32 << 20, 256 << 20, 96 << 20, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        for _ in range(16):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        # Shrinking the host tier pushes its pages down, so the disk fills with pages it holds the only copy of.
+        # Growing it back leaves room on the host, so later GPU -> host evictions go no further.
+        self.assertTrue(self.manager.resize(CacheLevel(1), 32 << 20))
+        self.assertTrue(self.manager.resize(CacheLevel(1), 256 << 20))
+        free_before = sum(
+            stats.free for stats in self.manager.get_storage_statistics(CacheLevel(2))
+        )
+        before = _introspection.disk_copy_counters(self.manager)
+
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        after = _introspection.disk_copy_counters(self.manager)
+        self.assertLessEqual(
+            after["write_through_pages"] - before["write_through_pages"], free_before
+        )
+        self.assertGreater(
+            after.get("write_through_skipped", 0), before.get("write_through_skipped", 0)
+        )
+        self.manager.clear_reusable_blocks()
+
+    def test_partial_tail_decoded_after_restore_reads_back_correctly(self) -> None:
+        # A request that stops committing keeps decoding into its partially committed tail page. Each suspend
+        # pushes its pages to disk and each resume restores them; a disk copy of the tail made on an earlier trip
+        # must not stand in for the tokens decoded since.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        req_ids = itertools.count()
+        prompt = [self.next_token() for _ in range(32 * 10 + 7)]
+        cache = self.manager.create_kv_cache(None, prompt)
+        try:
+            with TemporaryCudaStream([]) as s:
+                stream = cast(CudaStream, s.handle)
+                self.assertTrue(cache.resume(stream))
+                self.assertTrue(cache.resize(round_up(len(prompt) + 24, 32)))
+                self.engine.execute([Step(cache, prompt, [])], stream)
+                cache.commit(prompt)
+                cache.stop_committing()
+                history = list(prompt)
+                for _ in range(3):
+                    for _ in range(8):
+                        token = self.next_token()
+                        self.engine.execute([Step(cache, [token], history)], stream)
+                        history.append(token)
+                    cache.suspend()
+                    # GPU and host each hold about one request, so these push the suspended pages to disk.
+                    for _ in range(3):
+                        self._run_and_close(
+                            self.new_request(next(req_ids), None, 256, 32 * 22 - 256)
+                        )
+                    self.assertTrue(cache.resume(stream))
+                    self.engine.execute([Step(cache, [], history)], stream)
+            s.take_finish_event()
+        finally:
+            cache.close()
+        self.manager.clear_reusable_blocks()
+
+    def test_failed_write_through_copy_is_not_reused(self) -> None:
+        # A disk copy whose write failed holds stale bytes. When its page later falls to disk it must be written
+        # again rather than take the copy's slot back; restoring the prefix checks the KV.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        # The next request evicts the first one's pages GPU -> host, and write-through copies them to disk.
+        # Fail those writes once, then let the disk recover.
+        _introspection.inject_disk_write_failures_for_testing(1 << 30)
+        try:
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        finally:
+            _introspection.inject_disk_write_failures_for_testing(0)
+        before = _introspection.disk_copy_counters(self.manager)
+        # Push the first request's pages from host to disk.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        after = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(after["reclaimed"], before["reclaimed"])
+
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+    def test_held_pages_take_kept_copy_slots_on_a_full_disk(self) -> None:
+        # Held pages of a suspended request and droppable pages whose disk copies are kept fall into a disk tier
+        # filled with exactly those copies. A kept copy only saves a write, so the held pages must get its slot.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(8 << 20, 0, 2 << 20, 1, None, 0, kv_buf_size=8192)
+        gpu_pages = self.manager.get_storage_statistics(CacheLevel(0))[0].total
+        disk_pages = self.manager.get_storage_statistics(CacheLevel(1))[0].total
+        self.assertGreaterEqual(gpu_pages, 2 * disk_pages)
+        req_ids = itertools.count()
+
+        def tokens(num_blocks: int) -> list:
+            return [self.next_token() for _ in range(32 * num_blocks)]
+
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            # A fills the disk tier once it is pushed down.
+            first = self.new_request(next(req_ids), None, 32 * disk_pages, 0)
+            self.assertTrue(first.kv_cache.resume(stream))
+            self.run_request(first, 32, False)
+            first.kv_cache.close()
+            # An uncommitted request takes the whole GPU, pushing A to disk, and frees its pages on close.
+            filler = self.manager.create_kv_cache(None, tokens(gpu_pages))
+            self.assertTrue(filler.resume(stream))
+            self.assertTrue(filler.resize(32 * gpu_pages))
+            filler.close()
+            # Restoring A keeps every disk slot as a copy of one of its pages.
+            prompt = first.kv_cache.committed_tokens
+            restored = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0
+            )
+            self.assertTrue(restored.kv_cache.resume(stream))
+            self.run_request(restored, 32, False)
+            restored.kv_cache.close()
+            self.assertEqual(
+                _introspection.disk_copy_counters(self.manager)["retained"], disk_pages
+            )
+            # A suspended request holds as many GPU pages as the disk has.
+            held = self.manager.create_kv_cache(None, tokens(disk_pages))
+            self.assertTrue(held.resume(stream))
+            self.assertTrue(held.resize(32 * disk_pages))
+            held.suspend()
+            # Taking the whole GPU pushes A and the held pages to disk together.
+            last = self.manager.create_kv_cache(None, tokens(gpu_pages))
+            try:
+                self.assertTrue(last.resume(stream))
+                self.assertTrue(last.resize(32 * gpu_pages))
+            finally:
+                last.close()
+            self.assertTrue(held.resume(stream))
+            held.close()
+        s.take_finish_event()
+        self.manager.clear_reusable_blocks()
+
+
+class TestResizeQuotaDiskOptions(TestResizeQuota):
+    disk_tier_options = _ALL_DISK_OPTIONS
 
 
 class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):

@@ -91,6 +91,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import ANY_MOE_IMPL
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
@@ -2279,6 +2280,11 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = getattr(mamba_metadata, "generation_state_indices", None)
         if slots is None:
             slots = mamba_metadata.state_indices[: x.shape[0]]
+        # The replay caches' slots, which differ from the state slots when the cache manager keeps them in a pool of
+        # their own.
+        replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
+        if replay_slots is None:
+            replay_slots = mamba_metadata.replay_state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(
@@ -2300,7 +2306,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             float(self.o_norm.eps),
         )
         # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
-        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
+        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv, replay_slots)
         return core
 
 
@@ -3201,6 +3207,12 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
     weights.py, the KDA metadata class, the model defaults), which walk the model by its module names; the text model
     keeps the built-in one's.
     """
+
+    # Decode steps run k3_moe over the routed experts' TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers
+    # (decode_moe.py). Any draft comes from the inherited one-engine construction, whose
+    # draft config the draft tactic selects; the drafter fast path has dense MLPs only.
+    moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8"})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

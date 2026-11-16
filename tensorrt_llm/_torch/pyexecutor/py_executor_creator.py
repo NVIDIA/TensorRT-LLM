@@ -54,7 +54,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
                     instantiate_sampler, is_disagg_enabled, is_mla)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
+from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -806,6 +806,13 @@ def _create_py_executor(
             "generation servers; aggregated serving with Helix is not "
             "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
             "development only).")
+    if (is_decode_only(llm_args.sparse_attention_config)
+            and not is_disagg_enabled(cache_transceiver_config)):
+        raise NotImplementedError(
+            "Sparse KV cache offload runs only on disaggregated generation "
+            "servers: it admits one input token per request per step, so it "
+            "cannot serve context requests. Set cache_transceiver_config, or "
+            "disable sparse_attention_config.enable_kv_cache_offload.")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -865,12 +872,25 @@ def _create_py_executor(
     # that bijection -- and that the launch runs without CUDA graphs.
     dwdp_manager: Optional[DwdpManager] = None
     if expert_dwdp:
-        # Only the CuteDSL MoE backends support DWDP (with NVFP4 weights), and
-        # AUTO resolves to none of them for the models DWDP serves. Without
-        # one, DWDP manages no MoE layer and every rank loads every expert
-        # before the launch fails.
-        if llm_args.moe_config.backend.upper() not in ("CUTEDSL",
-                                                       "CUTEDSL_FC12"):
+        # Only the CuteDSL MoE implementations support DWDP (with NVFP4
+        # weights), and AUTO resolves to none of them for the models DWDP
+        # serves. Without one, DWDP manages no MoE layer and every rank loads
+        # every expert before the launch fails.
+        moe_tactic = llm_args.moe_config.tactic
+        if moe_tactic is not None:
+            from tensorrt_llm._torch.moe.fused_moe.moe_resolution import \
+                moe_impl_request
+            impls = moe_impl_request(tactic=moe_tactic).impls
+            if not any(impl_cls.capabilities.supports_dwdp
+                       for impl_cls in impls):
+                raise ValueError(
+                    "DWDP requires a MoE implementation that supports it, but "
+                    f"moe_config.tactic={moe_tactic!r} matches "
+                    f"{[impl_cls.descriptor.impl_id for impl_cls in impls]}, "
+                    "none of which does. Name a CuteDSL NVFP4 implementation, "
+                    "for example 'cutedsl.grouped_gemm.nvfp4'.")
+        elif llm_args.moe_config.backend.upper() not in ("CUTEDSL",
+                                                         "CUTEDSL_FC12"):
             raise ValueError(
                 "DWDP requires an MoE backend that supports it: set "
                 "moe_config.backend: CUTEDSL (or CUTEDSL_FC12) with an NVFP4 "
@@ -1305,6 +1325,14 @@ def _create_py_executor(
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
+
+        if not skip_est and is_decode_only(sparse_attention_config):
+            # The estimation dry run prefills dummy prompts, which a
+            # decode-only worker cannot execute. Size the KV cache from free
+            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+            logger.info("KV cache size estimation is not supported for a "
+                        "decode-only worker, disable it.")
+            skip_est = True
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,

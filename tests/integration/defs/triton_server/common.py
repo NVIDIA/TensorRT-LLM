@@ -20,6 +20,8 @@ def check_server_ready(http_port="8000", timeout_timer=None, sleep_interval=5):
             status = check_output(
                 r"curl -s -w %{http_code} 0.0.0.0:8003/v2/health/ready || true",
                 shell=True).strip()
+        else:
+            raise ValueError(f"Unsupported HTTP port: {http_port}")
         if status == "200":
             break
         elif timer <= timeout:

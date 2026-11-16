@@ -25,6 +25,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
@@ -268,10 +269,11 @@ class DecoderCudaGraphs:
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         runtime_draft_len: int,
+        sampling_mode: int | None = None,
     ) -> contextlib.AbstractContextManager[ScheduledRequests]:
         """Pad ``scheduled_requests`` with dummy rows up to a captured batch size."""
         return self.cuda_graph_runner.pad_batch(
-            scheduled_requests, resource_manager, runtime_draft_len
+            scheduled_requests, resource_manager, runtime_draft_len, sampling_mode
         )
 
     def select(
@@ -311,16 +313,19 @@ class DecoderCudaGraphs:
         return GraphSelection(key, graph_attn_metadata, graph_spec_metadata, use_lora_graph)
 
     def attention_dp_execution_batch(
-        self, scheduled_requests: ScheduledRequests
+        self, scheduled_requests: ScheduledRequests, runtime_draft_len: int = 0
     ) -> ScheduledRequests:
         """Give a phase-idle rank its retained graph row without admitting work."""
         if not scheduled_requests.is_attention_dp_phase_idle:
             return scheduled_requests
         if scheduled_requests.batch_size or scheduled_requests.encoder_requests:
             raise ValueError("An attention-DP phase-idle batch must be semantically empty")
-        dummy = self.cuda_graph_runner.padding_dummy_requests.get(0)
+        dummy = self.cuda_graph_runner.padding_dummy_requests.get(runtime_draft_len)
         if dummy is None:
-            raise RuntimeError("The retained attention-DP execution row is missing")
+            raise RuntimeError(
+                f"The retained attention-DP execution row for draft length {runtime_draft_len} "
+                "is missing"
+            )
         execution_requests = ScheduledRequests()
         execution_requests.attention_dp_phase = scheduled_requests.attention_dp_phase
         execution_requests.is_attention_dp_phase_idle = True
@@ -509,6 +514,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        is_dummy: bool = False,
         static_inputs_staged: int = 0,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
@@ -532,6 +538,7 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
+                is_dummy=is_dummy,
                 static_inputs_staged=static_inputs_staged,
             )
 
@@ -548,6 +555,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        is_dummy: bool = False,
         static_inputs_staged: int = 0,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
@@ -555,6 +563,7 @@ class DecoderCudaGraphs:
             num_tokens = inputs["input_ids"].shape[0]
             can_run_breakable_graph = (
                 breakable_runner is not None
+                and (not is_dummy or breakable_runner.is_capturing_break_graphs)
                 and get_per_request_prefill_cuda_graph_flag()
                 and not gather_context_logits
                 and breakable_runner.has_graph(num_tokens)
@@ -708,6 +717,7 @@ class DecoderCudaGraphs:
                 if not context_only:
                     from tensorrt_llm._torch.modules.linear import (
                         MXFP8LinearMethod,
+                        cuda_graph_gemm_tuning,
                         flashinfer_mxfp8_autotune,
                         flashinfer_mxfp8_decode_graph_capture,
                     )
@@ -729,7 +739,13 @@ class DecoderCudaGraphs:
                         if is_warmup_only and flashinfer_methods
                         else contextlib.nullcontext()
                     )
-                    with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
+                    with (
+                        flashinfer_autotune_context,
+                        flashinfer_mxfp8_decode_graph_capture(),
+                        cuda_graph_gemm_tuning(
+                            tune=is_warmup_only, world_size=self.mapping.world_size
+                        ),
+                    ):
                         self._capture_generation_cuda_graphs(resource_manager)
                     if (
                         is_warmup_only
@@ -739,6 +755,21 @@ class DecoderCudaGraphs:
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
                     self._capture_additional_cuda_graphs(resource_manager)
+                    if is_warmup_only and any(
+                        method.tune_mxfp8_backends for method in flashinfer_methods
+                    ):
+                        from tensorrt_llm._torch.custom_ops.mxfp8_gemm import agree_mxfp8_tactics
+                        from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+                            _MXFP8_GEMM_AUTOTUNED_OP,
+                        )
+
+                        # Every rank captures the GEMM kernels most ranks tuned.
+                        agree_mxfp8_tactics(_MXFP8_GEMM_AUTOTUNED_OP)
+                        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+                        if cache_path:
+                            AutoTuner.get().profiling_cache.save_cache(
+                                cache_path, self.mapping.rank
+                            )
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
         if not is_warmup_only:
@@ -821,19 +852,10 @@ class DecoderCudaGraphs:
                         with self._dummy_requests.release_batch_context(
                             warmup_request, resource_manager
                         ) as batch:
-                            if batch is not None and verify_bucket is not None:
-                                self._set_warmup_ragged_windows(batch, verify_bucket, draft_len)
-                            if batch is None:
-                                # No KV cache space for this batch size. During KV
-                                # cache estimation this makes the profiling peak
-                                # unrepresentative (the final executor still
-                                # captures this graph), so don't skip silently.
-                                logger.warning(
-                                    f"Skipping CUDA graph warmup ({label}) for "
-                                    f"batch size={bs}, draft_len={draft_len}: "
-                                    f"not enough KV cache space."
-                                )
+                            if not self._agreement.agree_capture_batch(batch, label, bs, draft_len):
                                 continue
+                            if verify_bucket is not None:
+                                self._set_warmup_ragged_windows(batch, verify_bucket, draft_len)
                             logger.info(
                                 f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
@@ -891,10 +913,12 @@ class DecoderCudaGraphs:
             self._config.spec_config is not None
             and self._config.spec_config.spec_dec_mode.use_one_engine()
         )
-        temperature_only_graphs = (
-            uses_own_spec_decoder
-            and self._metadata.spec_metadata is not None
-            and self._metadata.spec_metadata.temperature_only_graphs
+        temperature_only_graphs = uses_own_spec_decoder and (
+            self._config.samples_from_vocab_shards
+            or (
+                self._metadata.spec_metadata is not None
+                and self._metadata.spec_metadata.temperature_only_graphs
+            )
         )
 
         def _capture_variant(
@@ -955,6 +979,7 @@ class DecoderCudaGraphs:
         # This is a defensive guard.
         if self._metadata.spec_metadata is not None:
             self._metadata.spec_metadata.is_all_greedy_sample = True
+            self._metadata.spec_metadata.is_all_temperature_only = False
             self._metadata.spec_metadata.temperature_only = False
 
     def _capture_break_graphs(
@@ -1012,6 +1037,17 @@ class DecoderCudaGraphs:
             and not self._config.torch_compile_enabled
         ):
             return
+        if is_decode_only(self.sparse_attention_config):
+            logger.warning(
+                "Skipping prefill CUDA graph capture: this worker serves "
+                "decode only and never runs a context batch."
+            )
+            return
+        if self.breakable_cuda_graph_runner is not None and not getattr(
+            self.breakable_cuda_graph_runner.layer_model, "supports_prefill_cuda_graph", True
+        ):
+            logger.info("Skipping prefill CUDA graph capture: no prefill replays the whole body")
+            return
 
         logger.info("Running prefill CUDA graph warmup...")
         prefill_cuda_graph_num_tokens = sorted(
@@ -1042,7 +1078,7 @@ class DecoderCudaGraphs:
                     if self.breakable_cuda_graph_runner is not None:
                         runner = self.breakable_cuda_graph_runner
                         try:
-                            runner.capture(
+                            captured = runner.capture(
                                 num_tokens,
                                 lambda: self._forward_warmup(
                                     batch,
@@ -1051,7 +1087,16 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
+                                can_capture=lambda: getattr(
+                                    self._metadata.attn_metadata, "decoder_replay_plan", None
+                                )
+                                is None,
                             )
+                            if not captured:
+                                logger.info(
+                                    "Skipping breakable prefill graph capture for "
+                                    f"{num_tokens} tokens: decoder replay changes boundary metadata"
+                                )
                         finally:
                             self._metrics["ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
                                 BreakableCUDAGraphRunner.CUDA_GRAPH_WARMUP_METRIC, 0.0

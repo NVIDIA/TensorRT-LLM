@@ -104,11 +104,12 @@ def _coordinator(
         ),
         transfer_manager=None,
         kv_cache_manager=None,
-        dist=SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1, cp_size=1),
+        dist=SimpleNamespace(
+            rank=4, world_size=8, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1, cp_size=1
+        ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
         registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
         admission_controller=controller,
         is_kv_manager_v2=True,
     )
@@ -248,6 +249,7 @@ def _gen_admission_setup(
     """Use real admission paths with fake external KV and receive operations."""
     manager = SimpleNamespace(
         prepare_disagg_gen_init=Mock(return_value=True),
+        wait_disagg_receive_ready=Mock(),
         kv_cache_map={request.py_request_id: SimpleNamespace(capacity=65, history_length=64)},
         mapping=SimpleNamespace(rank=4),
         tokens_per_block=32,
@@ -465,7 +467,6 @@ def test_gen_timeout_start_and_observation_share_request_identity(
         effects=SimpleNamespace(prepare_gen_resources=Mock()),
         registry=SimpleNamespace(active_requests=lambda: [request]),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     coordinator.reap_gen_receives = Mock()
 
@@ -542,6 +543,8 @@ def test_gen_decode_ready_requires_successful_handoff_and_uses_full_cp_prompt_le
     executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=3)
     executor._disagg_coordinator = _coordinator()
     executor._disagg_coordinator._transceiver = executor.kv_cache_transceiver
+    # The state receive_gen_init leaves for a receive it started.
+    executor._disagg_coordinator._started_gen_receives[request.py_request_id] = request
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -601,7 +604,6 @@ def test_ctx_send_ready_and_timeout_start_follow_transfer_handoff(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
 
     def emit_event(event: str, **kwargs) -> None:
@@ -670,7 +672,6 @@ def test_ctx_send_continues_when_diagnostic_preparation_fails(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -728,7 +729,6 @@ def test_bridge_validation_rejection_emits_failed_ctx_settlement_after_release(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     coordinator.release_transfer = lambda req: operations.append(("release", req))
 
@@ -972,6 +972,7 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
     request.set_kv_cache_transfer_start = Mock()
     manager = SimpleNamespace(
         prepare_disagg_gen_init=Mock(return_value=True),
+        wait_disagg_receive_ready=Mock(),
         kv_cache_map={41: SimpleNamespace(capacity=65, history_length=64)},
         mapping=SimpleNamespace(rank=4),
         tokens_per_block=32,

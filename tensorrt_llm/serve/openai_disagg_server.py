@@ -218,6 +218,13 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class OpenAIDisaggServer:
+    # Per-request hooks class instantiated by the entry-point wrapper.
+    # Subclasses may substitute a ResponseHooks implementation with the same
+    # constructor signature to observe the request lifecycle (e.g. relay
+    # context-leg fields onto the final response) without overriding the
+    # wrapper itself.
+    response_hooks_cls = RawRequestResponseHooks
+
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -250,9 +257,13 @@ class OpenAIDisaggServer:
         if config.disagg_cluster_config:
             validate_http_cluster_storage_scope(
                 config.disagg_cluster_config.cluster_uri, config.hostname)
-            self._disagg_cluster_storage = create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri,
-                config.disagg_cluster_config.cluster_name)
+            # This app serves only an HTTP cluster storage; an etcd one is used
+            # by the coordinator alone.
+            if not config.disagg_cluster_config.cluster_uri.startswith(
+                    "etcd://"):
+                self._disagg_cluster_storage = create_cluster_storage(
+                    config.disagg_cluster_config.cluster_uri,
+                    config.disagg_cluster_config.cluster_name)
         # The server doesn't build routers -- the coordinator object does:
         # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
         # server just reads .ctx_router / .gen_router off whichever it holds.
@@ -444,7 +455,7 @@ class OpenAIDisaggServer:
                 self._extract_conversation_id(
                     req, raw_req,
                     self._config.conversation_affinity_header_for_subagents)
-                hooks = RawRequestResponseHooks(
+                hooks = self.response_hooks_cls(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)

@@ -73,7 +73,7 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratchRange.contains(ordinal))
+        if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value() && scratchRange.contains(ordinal))
         {
             // Scratch block: its slot comes from the request's own scratch slots, not from
             // base_indices.
@@ -249,7 +249,7 @@ void KvCacheManager::_computeSparseCacheShape()
 
         // Layers of one life cycle must currently declare the same sparse_cache. The arena
         // is per life cycle and its metadata is one stride: a selection's rows are found at
-        // `residentOrdinal + slot * entriesPerSelection`, so a single entry count serves
+        // `entry + slot * entriesPerSelection`, so a single entry count serves
         // them all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
         // See SPARSE_ATTENTION_DESIGN.md.
         auto& shape = mSparseCacheShape[lcId];
@@ -881,6 +881,11 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
+}
+
+CacheGroupId KvCacheManager::getRegionGroupId(std::string const& name) const
+{
+    return mLifeCycles.regionLifeCycleId(name);
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Verify test lists for L0, QA, and waives file; AST-based validation via --validate.
 
 This script is used to verify test lists for L0, QA, and waives file.
@@ -13,7 +15,7 @@ For AST-based validation (no pytest or model weights needed):
 
 Options:
 --l0:       Check only the L0 tests located in $LLM_ROOT/tests/integration/test_list/test_db/*.yml.
---qa:       Check only the QA tests under $LLM_ROOT/tests/integration/test_list/*.txt.
+--qa:       Check QA text lists and YAML case lists under tests/integration/test_lists/qa/.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
 --report-unverifiable [PATH]: With --validate, write the list of active entries
@@ -81,6 +83,13 @@ def parse_test_entry(line: str):
         return None
     if line.startswith("- "):
         line = line[2:].strip()
+    if line.startswith("case:"):
+        original_line = line
+        line = line[len("case:"):].strip()
+        if len(line) >= 2 and line[0] in ("'", '"') and line[-1] == line[0]:
+            line = line[1:-1].strip()
+        if not line:
+            return "MALFORMED", original_line, None, None
     token = line.split()[0]
     if "::" not in token:
         return None
@@ -1048,18 +1057,64 @@ def verify_qa_test_lists(llm_src):
         pass
     # Remove dynamically generated perf tests
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
-    test_def_files = subprocess.check_output(
-        f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
-    for test_def_file in test_def_files:
-        _run_collection_pytest(llm_src, test_def_file)
-        # append all the test_def_file to qa_test.txt
-        with open(f"{llm_src}/qa_test.txt", "a") as f:
+    test_def_files = sorted(
+        glob.glob(f"{test_qa_path}/*.txt") + glob.glob(f"{test_qa_path}/*.yml"))
+    with tempfile.TemporaryDirectory(
+            prefix="trtllm-qa-lists-") as text_lists_dir:
+        for test_def_file in test_def_files:
             with open(test_def_file, "r") as test_file:
-                lines = test_file.readlines()
+                if test_def_file.endswith(".yml"):
+                    import yaml
+
+                    data = yaml.safe_load(test_file)
+                    group_key = Path(test_def_file).stem
+                    if isinstance(data, dict) and isinstance(
+                            data.get("tests"), list):
+                        entries = data["tests"]
+                        valid = all(
+                            isinstance(entry, dict)
+                            and isinstance(entry.get("case"), str)
+                            for entry in entries)
+                        lines = [entry["case"]
+                                 for entry in entries] if valid else None
+                    elif isinstance(data, dict) and isinstance(
+                            data.get(group_key), list):
+                        groups = data[group_key]
+                        valid = all(
+                            isinstance(group, dict)
+                            and isinstance(group.get("tests"), list) and all(
+                                isinstance(case, str)
+                                for case in group["tests"]) for group in groups)
+                        lines = ([
+                            case for group in groups for case in group["tests"]
+                        ] if valid else None)
+                    else:
+                        lines = None
+                    if lines is None:
+                        raise ValueError(
+                            f"Invalid QA test list {test_def_file}: "
+                            "expected a mapping with a 'tests' list of case entries "
+                            f"or a '{group_key}' list of test groups")
+                    lines = [
+                        line for line in lines
+                        if not line.startswith(_EXCLUDED_PATH_PREFIXES)
+                    ]
+                    if not lines:
+                        continue
+                    collection_list = os.path.join(
+                        text_lists_dir,
+                        Path(test_def_file).stem + ".txt")
+                    with open(collection_list, "w") as converted:
+                        converted.write("\n".join(lines) + "\n")
+                else:
+                    lines = test_file.readlines()
+                    collection_list = test_def_file
+            _run_collection_pytest(llm_src, collection_list)
+            with open(f"{llm_src}/qa_test.txt", "a") as f:
                 for line in lines:
-                    # Remove 'TIMEOUT' marker and strip spaces
+                    # Remove 'TIMEOUT' marker and strip spaces.
                     cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
-                    if cleaned_line:
+                    if cleaned_line and not cleaned_line.startswith("#"):
                         f.write(f"{cleaned_line}\n")
 
 

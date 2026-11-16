@@ -3,7 +3,7 @@
 """GEN preemption policy, startup prerequisites, and resident-state regressions."""
 
 import math
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -409,6 +409,7 @@ def drafter(kind, num_slots=4):
         worker._position_initialized = torch.zeros(rows, dtype=torch.bool)
         worker._kv_windows = torch.zeros(rows, 1, 2, 2)
         worker._batch_to_slot = torch.full((num_slots,), num_slots, dtype=torch.long)
+        worker._host_batch_to_slot = []
         meta = object.__new__(dspark.DSparkSpecMetadata)
         meta.batch_indices_cuda = torch.zeros(num_slots, dtype=torch.int)
         meta._dspark_worker = worker
@@ -426,19 +427,34 @@ def drafter(kind, num_slots=4):
 
 
 def executor_for_preemption(p, reqs, scheduler):
-    return SimpleNamespace(
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = SimpleNamespace(
         _gen_preemption=p,
         scheduler=scheduler,
         active_requests=reqs,
         inflight_req_ids=set(),
+        canceled_req_ids=[],
         kv_cache_manager=Mock(spec=[]),
         kv_cache_transceiver=None,
+        _cancelled_disagg_model_request_ids=lambda: set(),
+        ctx_decoder_batcher=None,
         is_encoder_decoder=False,
         enable_attention_dp=False,
         enable_batch_waiting=False,
         _cap_context_by_total_kv_len=lambda requests: requests,
         _maybe_record_hang_diagnostic_phase=Mock(),
     )
+    executor._cancelled_disagg_model_request_ids = MethodType(
+        PyExecutor._cancelled_disagg_model_request_ids, executor
+    )
+    executor._encoder_requests_in_arrival_order = MethodType(
+        PyExecutor._encoder_requests_in_arrival_order, executor
+    )
+    executor._fit_encoder_requests_to_encoder_step = MethodType(
+        PyExecutor._fit_encoder_requests_to_encoder_step, executor
+    )
+    return executor
 
 
 @pytest.mark.parametrize("kind", ["dflash", "dspark"])

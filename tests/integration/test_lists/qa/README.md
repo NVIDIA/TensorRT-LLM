@@ -48,9 +48,40 @@ This directory contains various test configuration files:
 
 ### Functional Test Lists
 - `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_function_multinode.txt` - Multi-node functional test cases
+- `llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
+
+### Multi-node Launch Parameters
+
+`llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
+pytest node ID in `case` and an optional `launch` mapping. Entries without
+`launch` use `defaults.launch`, which specifies `mode: mpi`, `world_size: 16`,
+and `nodes: 2`. Per-case launch fields override the defaults; omit fields whose
+values match the defaults. The shared `nodes` field is inherited in both modes.
+Mode-specific fields are inherited only when the case uses the default mode,
+so `mode: per_node` cases do not inherit an MPI `world_size`.
+
+- `mode: mpi` uses `world_size` for the total MPI rank count and `nodes` for the
+  exact number of hosts on which those ranks must run. The pipeline must honor
+  both fields when deriving tasks per node from the selected platform's GPU
+  capacity. For example, `world_size: 4` inherits `nodes: 2` and runs two ranks
+  on each node even if one node has capacity for all four ranks. Allocating a
+  second node without running ranks on it does not satisfy the node count.
+  Reject launch plans that cannot meet both the world size and node count.
+- `mode: per_node` uses `nodes`, `tasks_per_node`, and `gpus_per_node`.
+  Pytest runs on each node and the test starts its local server workers.
+
+GPU architecture, memory, and NVLink-domain requirements still apply; select a
+platform supported by the test. Account, partition, container, and node placement
+remain pipeline settings.
+
+The Jenkins consumer must parse this YAML, resolve each entry's launch parameters,
+and generate a temporary single-case text list for the existing test runner.
+The QA validator generates temporary text lists from YAML for runtime collection
+and includes those cases when checking membership against `waives.txt`.
+Jenkins consumers that still reference `llm_function_multinode.txt` must migrate
+to the YAML list and generate temporary text lists before invoking the runner.
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration

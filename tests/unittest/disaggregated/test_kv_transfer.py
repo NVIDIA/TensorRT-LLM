@@ -91,8 +91,13 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    host_cache_bind_to_gpu_numa_node: bool = False
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
+    disk_io_threads: int = 0
+    disk_keep_copy_after_restore: bool = False
+    disk_write_through: bool = False
+    disk_protected_copy_fraction: float = 1.0
     cross_kv_cache_fraction: Optional[float] = None
     cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
@@ -222,6 +227,7 @@ def test_chunk_construction():
 
     # Everything a reader cannot recompute has to be stated.
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         Chunk(
             block_ids_per_layer_groups=[],
             kind_per_layer_group=[],
@@ -850,6 +856,7 @@ def add_and_verify_request(
     setup, ctx_request_id, gen_request_id, request_len, send_first: bool = True
 ):
     """Helper function to add and verify a request transfer."""
+    send_aux_tasks = []
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -1056,7 +1063,6 @@ def add_and_verify_request(
         ]
         for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
-        send_aux_tasks = []
         for sender_session in sender_sessions:
             sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())
@@ -2248,6 +2254,22 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         _shutdown_transfer_worker_setup(healthy)
 
 
+def _single_vram_pool_page_table(tpb, kind):
+    """A one-layer-group page table whose only pool view is backed by GPU memory.
+
+    The sender reads each pool view's physical pool to group writes by memory type.
+    """
+    return SimpleNamespace(
+        tokens_per_block=tpb,
+        layer_groups={
+            0: SimpleNamespace(
+                kind=kind, pool_group_idx=0, pool_views=[SimpleNamespace(pool_idx=0)]
+            )
+        },
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(memory_type="VRAM")])],
+    )
+
+
 def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
     """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
 
@@ -2267,9 +2289,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
 
     class _BlockExtractor:
         def __init__(self, kind):
-            self.page_table = SimpleNamespace(
-                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=kind)}
-            )
+            self.page_table = _single_vram_pool_page_table(tpb, kind)
 
         def extract(self, block_ids, layer_group, pool_idx):
             return np.asarray(block_ids, dtype=np.int64)
@@ -2371,9 +2391,7 @@ def _helix_ring_write_meta(
     class _PtrExtractor:
         def __init__(self, base):
             self.base = base
-            self.page_table = SimpleNamespace(
-                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=CacheKind.PAGED)}
-            )
+            self.page_table = _single_vram_pool_page_table(tpb, CacheKind.PAGED)
 
         def extract(self, block_ids, layer_group, pool_idx):
             ptrs = self.base + np.asarray(block_ids, dtype=np.int64) * 1_000_000
