@@ -131,9 +131,13 @@ struct InplaceControlBlock final : ControlBlockBase
     {
         void* mem = nullptr;
         if constexpr (pooled())
+        {
             mem = poolAllocate(sizeof(InplaceControlBlock));
+        }
         else
+        {
             mem = ::operator new(sizeof(InplaceControlBlock), std::align_val_t{alignof(InplaceControlBlock)});
+        }
         return ::new (mem) InplaceControlBlock();
     }
 
@@ -141,9 +145,13 @@ struct InplaceControlBlock final : ControlBlockBase
     {
         this->~InplaceControlBlock();
         if constexpr (pooled())
+        {
             poolDeallocate(this, sizeof(InplaceControlBlock));
+        }
         else
+        {
             ::operator delete(this, std::align_val_t{alignof(InplaceControlBlock)});
+        }
     }
 
 private:

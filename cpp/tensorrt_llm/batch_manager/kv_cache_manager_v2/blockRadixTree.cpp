@@ -856,7 +856,9 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
             auto const key = Block::makeKey(current->key, tokens.begin() + beg, end - beg, knownNoDigest);
             auto blockIt = next.find(key);
             if (blockIt != next.end())
+            {
                 block = blockIt->second.get();
+            }
         }
         if (block == nullptr)
         {
