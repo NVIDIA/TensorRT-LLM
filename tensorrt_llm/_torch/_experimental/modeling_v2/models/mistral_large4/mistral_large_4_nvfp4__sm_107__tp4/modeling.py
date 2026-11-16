@@ -116,7 +116,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    build_split as build_ix_topk_verify,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     cute_dsl_radix_topk_decode,
+    split_radix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
     ds_mla_dequant_gather,
@@ -159,7 +163,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
     cute_dsl_allreduce_add_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
@@ -194,6 +197,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
@@ -204,6 +208,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
+from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -319,13 +324,16 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # exits the process, raising nothing, past 11622 one-row sequences on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
-# The decode indexer's top-k: True runs cute_dsl_radix_topk_decode, one launch that selects the
-# trtllm indexer_topk_decode op's set (up to exact ties), False that op itself. The CuTe DSL
-# selector serves scorer rows from 4096 columns (where the op splits each row) to 65536 (one
-# CTA scans a whole row), the widths its cells cover; the scorer's column count is the engine's
-# max_seq_len, so an engine outside that range keeps the op (`_derive_first_step`).
+# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and ten
+# partitions plus a radix merge for DSpark verification from 20480 columns (the narrowest
+# row the native op splits into ten blocks) to 1048584 (the split kernel's widest row).
+# split_radix_topk_decode keeps the native op for a call the op would not split into ten
+# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
+# Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
+_TOPK_VERIFY_COLUMNS = (20480, 1048584)
+_TOPK_VERIFY_ROWS = (4, 8, 16)
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -335,6 +343,12 @@ _TOPK_DECODE_COLUMNS = (4096, 65536)
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
+# A generation step's shared expert on the main stream after the routed experts, instead of on
+# the decode target's side stream beside the router, the NVFP4 quantization and the runner.
+# Both orders compute the same bits. The side stream is used only under CUDA-graph capture
+# (`maybe_execute_in_parallel`). Set TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT=1 in every rank's
+# environment at launch; off by default.
+_SERIAL_SHARED_EXPERT = os.environ.get("TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT", "0") == "1"
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -751,6 +765,7 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         self.ctx_workspace_rows = 0
         # The decode top-k's handle, built on the first step at a scorer width it serves.
         self._ix_topk = None
+        self._ix_topk_verify = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
@@ -840,6 +855,13 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             self._ix_topk = None
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if not (_TOPK_DECODE_CUTE_DSL and lo <= self._max_ctx_len <= hi and self.idx_topk == 2048):
+            self._ix_topk_verify = None
+        elif self._ix_topk_verify is None:
+            self._ix_topk_verify = build_ix_topk_verify(
+                dev, next_n=4, use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+            )
         # Both key-pool layouts: a launcher compiled for a contiguous view addresses a strided
         # one as if it were dense.
         if self._ix_k is None:
@@ -848,6 +870,35 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                 for contiguous in (False, True)
             }
         self._derived_for = md.kv_cache_manager
+
+    def _select_indexer_decode(
+        self,
+        logits: torch.Tensor,
+        kv_lens: torch.Tensor,
+        indices: torch.Tensor,
+        next_n: int,
+        aux_indices: torch.Tensor,
+        aux_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select generation rows with the compiled selector for their static shape."""
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if (
+            self._ix_topk_verify is not None
+            and next_n == 4
+            and logits.shape[0] in _TOPK_VERIFY_ROWS
+            and lo <= logits.shape[1] <= hi
+            and logits.dtype == torch.float32
+        ):
+            return split_radix_topk_decode(
+                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
+            )
+        if next_n != 1 or self._ix_topk is None:
+            return indexer_topk_decode(
+                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
+            )
+        return cute_dsl_radix_topk_decode(
+            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step: one host-side integer read. A mixed batch goes to
@@ -1028,15 +1079,10 @@ class PrefillTarget:
                 step["scheduler_metadata_buffer"],
                 core._max_ctx_len,
             )
-            if next_n != 1 or core._ix_topk is None:
-                indexer_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n, core.idx_topk, 1,
-                    step["radix_aux_indices"], step["radix_aux_logits"],
-                )  # fmt: skip
-            else:
-                cute_dsl_radix_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n=1, compiled=core._ix_topk
-                )
+            core._select_indexer_decode(
+                logits, kv_lens, topk_buf[tc:], next_n,
+                step["radix_aux_indices"], step["radix_aux_logits"],
+            )  # fmt: skip
 
     def _ix_plan(self, step) -> list[SimpleNamespace]:
         """Plan the context rows and key windows scored by each query tile.
@@ -1503,6 +1549,11 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._embed = core.w["embed"]
         self._norm0 = core.w["l0_attn_norm"]
+        # The shared expert's side stream (`_mlp`) and the events that fork it from and join it
+        # to the main stream; no stream keeps the shared expert on the main stream.
+        self._shared_stream = None if _SERIAL_SHARED_EXPERT else torch.cuda.Stream()
+        self._shared_fork = torch.cuda.Event()
+        self._shared_join = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1593,37 +1644,44 @@ class DecodeTarget:
             step["scheduler_metadata_buffer"],
             core._max_ctx_len,
         )
-        if next_n != 1 or core._ix_topk is None:
-            indexer_topk_decode(
-                logits, kv_lens, topk_buf, next_n, core.idx_topk, 1, step["radix_aux_indices"],
-                step["radix_aux_logits"],
-            )  # fmt: skip
-        else:
-            cute_dsl_radix_topk_decode(logits, kv_lens, topk_buf, next_n=1, compiled=core._ix_topk)
+        core._select_indexer_decode(
+            logits, kv_lens, topk_buf, next_n,
+            step["radix_aux_indices"], step["radix_aux_logits"],
+        )  # fmt: skip
 
     def _mlp(self, o, L):
         """This rank's share of the layer's MLP, a partial sum: the dense SwiGLU slice on the
         dense layer; on a MoE layer every routed expert's width slice plus the shared expert's
-        slice."""
+        slice. Under CUDA-graph capture the MoE layer's shared expert runs on the side stream
+        while the main stream runs the router, the quantization and the routed experts."""
         core = self.core
-        act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
-        shared = self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
+
+        def shared():
+            act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
+            return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
+
         m = L.moe
         if m is None:
-            return shared
-        logits = cublas_mm(o, m.router, None, torch.float32)
-        ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-        # One NVFP4 quantization under the layer's static scale serves every expert's slice on
-        # every rank: the width slices' partials sum.
-        xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
-        routed = fp4_block_scale_moe_runner(
-            None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None, None,
-            None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2, core.num_experts,
-            core.topk, None, None, core.moe_inter, core.expert_offset, core.local_experts, None,
-            _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU, topk_weights=weights, topk_ids=ids,
-            tune_max_num_tokens=core.max_num_tokens,
-        )[0]  # fmt: skip
-        return torch.add(routed, shared)
+            return shared()
+
+        def routed():
+            logits = cublas_mm(o, m.router, None, torch.float32)
+            ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
+            # One NVFP4 quantization under the layer's static scale serves every expert's slice
+            # on every rank: the width slices' partials sum.
+            xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+            return fp4_block_scale_moe_runner(
+                None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None, None,
+                None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2, core.num_experts,
+                core.topk, None, None, core.moe_inter, core.expert_offset, core.local_experts,
+                None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU, topk_weights=weights,
+                topk_ids=ids, tune_max_num_tokens=core.max_num_tokens,
+            )[0]  # fmt: skip
+
+        routed_out, shared_out = maybe_execute_in_parallel(
+            routed, shared, self._shared_fork, self._shared_join, self._shared_stream
+        )
+        return torch.add(routed_out, shared_out)
 
     def forward(
         self,
