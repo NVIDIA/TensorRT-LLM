@@ -2349,56 +2349,62 @@ def uploadArchCoverage(String arch, pipeline, testFilter, boolean multiGpu = fal
     def sbsaArchive = /results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\.tar\.gz/
     def group = multiGpu ? "Multi-GPU" : "Single-GPU"
     def artifactSuffix = multiGpu ? "_multi_gpu" : ""
+    boolean interruptionWasActualInsideTimeout = false
     try {
         timeout(time: 15, unit: 'MINUTES') {
-            def podSpec = createKubernetesPodConfig("", "agent")
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
-                stage("Upload ${group} Coverage (${arch})") {
-                  dir(multiGpu ? "cbts-multi-${arch}" : ".") {
-                    if (multiGpu) {
-                        deleteDir()
+            try {
+                def podSpec = createKubernetesPodConfig("", "agent")
+                trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
+                    stage("Upload ${group} Coverage (${arch})") {
+                      dir(multiGpu ? "cbts-multi-${arch}" : ".") {
+                        if (multiGpu) {
+                            deleteDir()
+                        }
+                        sh "rm -rf cov && mkdir -p cov"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                        withTestResultsReader { helper ->
+                            readRunTestResults(helper, { name ->
+                                def isMultiGpu = (name =~ /-[0-9]+_GPUs/).find()
+                                def excluded = ["_Nodes", "-Ray-", "Perf", "TensorRT", "CPP"].any { name.contains(it) }
+                                name ==~ /results-.*\.tar\.gz/ && (name ==~ sbsaArchive) == (arch == "SBSA") &&
+                                    (!multiGpu || (isMultiGpu && !excluded))
+                            })
+                        }
+                        sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
+                        sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                        def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
+                        if (fileCount > 0) {
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                            // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+                            sh """
+                                PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
+                                python3 -m cbts.command coverage collection pystart-report \
+                                    --glob 'cov/.cbtscov.*.sqlite' \
+                                    --out-sqlite cov/cbts_touchmap.sqlite
+                            """
+                            sh "cd cov && tar czf cbts_pystart_report_${arch}${artifactSuffix}.tar.gz cbts_touchmap.sqlite"
+                            def primary = llmArtifactsPrimary()
+                            trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz",
+                                testResultsDirTarget(primary, "cbts-coverage"), primary)
+                            echo "CBTS ${group} coverage (${arch}): " +
+                                llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz")
+                        } else {
+                            echo "CBTS ${group} coverage (${arch}): no data files found, skipping."
+                        }
+                      }
                     }
-                    sh "rm -rf cov && mkdir -p cov"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                    withTestResultsReader { helper ->
-                        readRunTestResults(helper, { name ->
-                            def isMultiGpu = (name =~ /-[0-9]+_GPUs/).find()
-                            def excluded = ["_Nodes", "-Ray-", "Perf", "TensorRT", "CPP"].any { name.contains(it) }
-                            name ==~ /results-.*\.tar\.gz/ && (name ==~ sbsaArchive) == (arch == "SBSA") &&
-                                (!multiGpu || (isMultiGpu && !excluded))
-                        })
-                    }
-                    sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
-                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
-                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
-                    if (fileCount > 0) {
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-                        // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
-                        sh """
-                            PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
-                            python3 -m cbts.command coverage collection pystart-report \
-                                --glob 'cov/.cbtscov.*.sqlite' \
-                                --out-sqlite cov/cbts_touchmap.sqlite
-                        """
-                        sh "cd cov && tar czf cbts_pystart_report_${arch}${artifactSuffix}.tar.gz cbts_touchmap.sqlite"
-                        def primary = llmArtifactsPrimary()
-                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz",
-                            testResultsDirTarget(primary, "cbts-coverage"), primary)
-                        echo "CBTS ${group} coverage (${arch}): " +
-                            llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz")
-                    } else {
-                        echo "CBTS ${group} coverage (${arch}): no data files found, skipping."
-                    }
-                  }
-                }
-            })
+                })
+            } catch (FlowInterruptedException e) {
+                interruptionWasActualInsideTimeout = e.isActualInterruption()
+                throw e
+            }
         }
     } catch (FlowInterruptedException e) {
-        // The 15-minute timeout above is non-fatal; user aborts and upstream
-        // pipeline interruptions must keep propagating.
-        if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
+        // Jenkins marks this timeout non-actual only after leaving its own block.
+        if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+            e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
             echo "CBTS ${group} coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
         } else {
             throw e

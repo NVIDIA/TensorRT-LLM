@@ -707,44 +707,52 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
         // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
+            boolean interruptionWasActualInsideTimeout = false
             try {
                 timeout(time: 5, unit: 'MINUTES') {
-                    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                        def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                        def cbtsLocalDir = "${stageName}/cbts${postTag}"
-                        def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                        sh "mkdir -p ${cbtsLocalDir}"
-                        def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
-                            "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
-                            "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
-                        def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
-                        def archiveStatus = Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(remote, "\"echo ${archiveScriptB64} | base64 -d | bash\""),
-                            returnStatus: true,
-                            numRetries: 3,
-                        )
-                        if (archiveStatus != 0) {
-                            echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
-                        } else {
-                            def gotArchive = Utils.exec(
+                    try {
+                        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                            def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                            def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                            def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                            sh "mkdir -p ${cbtsLocalDir}"
+                            def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
+                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
+                            def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
+                            def archiveStatus = Utils.exec(
                                 pipeline,
-                                script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                script: Utils.sshUserCmd(remote, "\"echo ${archiveScriptB64} | base64 -d | bash\""),
                                 returnStatus: true,
                                 numRetries: 3,
-                            ) == 0
-                            if (gotArchive) {
-                                // Aggregation flattens directories; tag retry filenames too.
-                                def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
-                                sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                            )
+                            if (archiveStatus != 0) {
+                                echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
                             } else {
-                                echo "CBTS: coverage archive transfer failed for ${stageName}."
+                                def gotArchive = Utils.exec(
+                                    pipeline,
+                                    script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                    returnStatus: true,
+                                    numRetries: 3,
+                                ) == 0
+                                if (gotArchive) {
+                                    // Aggregation flattens directories; tag retry filenames too.
+                                    def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                                    sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                                } else {
+                                    echo "CBTS: coverage archive transfer failed for ${stageName}."
+                                }
                             }
                         }
+                    } catch (FlowInterruptedException e) {
+                        interruptionWasActualInsideTimeout = e.isActualInterruption()
+                        throw e
                     }
                 }
             } catch (FlowInterruptedException e) {
-                if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
+                // Jenkins marks this timeout non-actual only after leaving its own block.
+                if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+                    e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
                     echo "CBTS: coverage pull for ${stageName} timed out; continuing."
                 } else {
                     throw e
