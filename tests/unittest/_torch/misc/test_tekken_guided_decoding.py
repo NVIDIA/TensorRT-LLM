@@ -22,11 +22,20 @@ factory's grammar, which from the model-settings Tekken (v15) on may open with o
 """
 
 import json
+import shutil
 from types import SimpleNamespace
 
 import pytest
-from test_common.mistral_tekken import TEKKEN_SOURCES, load_tekken
+from test_common.mistral_tekken import (
+    HF_TOKENIZER_IDS,
+    HF_TOKENIZER_TEXT,
+    TEKKEN_SOURCES,
+    bundled_tekken_file,
+    load_tekken,
+    write_hf_tokenizer,
+)
 
+from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
 from tensorrt_llm._torch.pyexecutor.grammar_matcher import (
     LLGuidanceMatcherFactory,
     XGrammarMatcherFactory,
@@ -34,10 +43,12 @@ from tensorrt_llm._torch.pyexecutor.grammar_matcher import (
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _llguidance_json_schema_lark,
     _llguidance_tokenizer,
+    _load_guided_decoding_tokenizer,
     get_guided_decoding_config,
 )
 from tensorrt_llm.bindings.executor import GuidedDecodingParams
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
+from tensorrt_llm.tokenizer import TransformersTokenizer
 
 pytestmark = pytest.mark.cpu_only
 
@@ -114,6 +125,56 @@ def test_guided_decoding_configs(tokenizer):
     assert get_guided_decoding_config(None, tokenizer) is None
     with pytest.raises(ValueError, match="Unsupported guided decoding backend"):
         get_guided_decoding_config("outlines", tokenizer)
+
+
+@pytest.fixture
+def dual_format_dir(tmp_path):
+    """A checkpoint directory with a Tekken file beside a complete HF checkpoint's
+    config.json and tokenizer.json, as Ministral-3 ships them."""
+    shutil.copy(bundled_tekken_file(), tmp_path / "tekken.json")
+    write_hf_tokenizer(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral"}))
+    return tmp_path
+
+
+def _llm_args(checkpoint_format=None, custom_tokenizer=None):
+    return SimpleNamespace(
+        checkpoint_format=checkpoint_format,
+        custom_tokenizer=custom_tokenizer,
+        trust_remote_code=False,
+    )
+
+
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+def test_native_checkpoint_reloads_its_tekken_tokenizer(dual_format_dir, checkpoint_format):
+    """A rank that reloads the tokenizer masks the vocabulary its input processor encodes with."""
+    tokenizer = _load_guided_decoding_tokenizer(_llm_args(checkpoint_format), str(dual_format_dir))
+    assert type(tokenizer) is MistralTokenizer
+    config = get_guided_decoding_config("xgrammar", tokenizer)
+    assert config.encoded_vocab == tokenizer.xgrammar_tokenizer_info()["encoded_vocab"]
+
+
+@pytest.mark.parametrize(
+    "llm_args",
+    [
+        _llm_args(),
+        _llm_args("HF"),
+        # An explicit custom tokenizer takes precedence over the format's.
+        _llm_args("mistral", custom_tokenizer="tensorrt_llm.tokenizer.TransformersTokenizer"),
+    ],
+    ids=["default", "HF", "custom_tokenizer"],
+)
+def test_other_checkpoints_reload_the_hf_tokenizer(dual_format_dir, llm_args):
+    tokenizer = _load_guided_decoding_tokenizer(llm_args, str(dual_format_dir))
+    assert type(tokenizer) is TransformersTokenizer
+    assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
+
+
+def test_custom_tokenizer_reloads_the_tekken_tokenizer_of_an_hf_checkpoint(dual_format_dir):
+    tokenizer = _load_guided_decoding_tokenizer(
+        _llm_args(custom_tokenizer="mistral_common"), str(dual_format_dir)
+    )
+    assert type(tokenizer) is MistralTokenizer
 
 
 def test_tokenizers_without_their_own_vocabulary_keep_the_hf_path():

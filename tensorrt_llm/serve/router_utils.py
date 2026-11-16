@@ -239,6 +239,9 @@ class BlockHashMixin:
                     self._custom_tokenizer, model_path, trust_remote_code=trust_remote_code
                 )
             else:
+                from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import (
+                    MistralTokenizer,
+                )
                 from tensorrt_llm.tokenizer import load_hf_tokenizer
 
                 # The loader a worker and the standalone renderer use, so the tokenizer's
@@ -246,7 +249,21 @@ class BlockHashMixin:
                 tokenizer = load_hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
                 if tokenizer is None:
                     raise ValueError(f"Could not load a tokenizer from {model_path!r}.")
-                self._tokenizers[model] = tokenizer.tokenizer
+                if not isinstance(tokenizer, MistralTokenizer):
+                    self._tokenizers[model] = tokenizer.tokenizer
+                else:
+                    # A Mistral-native directory loads as mistral-common's wrapper, whose
+                    # ``.tokenizer`` is not a Hugging Face tokenizer: keep the wrapper, as for
+                    # a custom tokenizer. Without the format there is no renderer for its chats.
+                    logger.warning(
+                        f"Router reads {model_path!r} as a Mistral-native checkpoint but has no "
+                        "Mistral-native checkpoint_format: it tokenizes completions as the "
+                        "servers do and routes chats on no ids. Give it the servers' "
+                        "checkpoint_format (mistral or mistral_large_3) to route chats on "
+                        "their ids."
+                    )
+                    self.__dict__.setdefault("_mistral_native_dirs", set()).add(model)
+                    self._tokenizers[model] = tokenizer
         return self._tokenizers[model]
 
     def _prefix_token_cache(self, tokenizer) -> Optional[PrefixTokenCache]:
@@ -316,7 +333,9 @@ class BlockHashMixin:
 
         A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
         template rejects raises, except for a Mistral-native checkpoint: mistral-common's
-        rejection also gets no ids, and the worker answers the request.
+        rejection also gets no ids, and the worker answers the request. So do the chats of a
+        Mistral-native directory read without the servers' checkpoint format, which this
+        router cannot render.
         """
         try:
             return render_chat_for_length(
@@ -328,7 +347,9 @@ class BlockHashMixin:
             logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
             return []
         except ValueError as error:
-            if not self._mistral_native:
+            if not self._mistral_native and request.model not in self.__dict__.get(
+                "_mistral_native_dirs", ()
+            ):
                 raise
             logger.debug(f"Router could not render the request ({error}); routing on no ids.")
             return []
