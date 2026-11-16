@@ -122,8 +122,8 @@ struct SparseBufferPlan
     size_t size;         //!< One cell.
     uint32_t pageOffset; //!< Its offset within its hot slot.
     SelectionUnitLayout layout;
-    int32_t layerRow;    //!< Metadata row: the dense index of its layer in the group.
-    int32_t slotInPool;  //!< Its index among the life cycle's buffers sharing its pool.
+    int32_t layerRow;   //!< Metadata row: the dense index of its layer in the group.
+    int32_t slotInPool; //!< Its index among the life cycle's buffers sharing its pool.
 };
 
 class Batch;
@@ -183,6 +183,8 @@ public:
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
     //                       manager-level statistics are disabled.
+    // optionalReuseMaxBacktrack: retain OPTIONAL candidates only within this distance of the REQUIRED prefix.
+    //                       Zero retains only the prefix endpoint; must be nonnegative.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
     // inputKnownNoDigest: inputTokens hold no digest token (e.g. the zero-copy int32 path), so the reuse
@@ -191,7 +193,7 @@ public:
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
         bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
-        bool inputKnownNoDigest = false, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
+        bool inputKnownNoDigest = false, std::optional<LocalityDomainId> localityDomainId = std::nullopt, int optionalReuseMaxBacktrack = 0);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();

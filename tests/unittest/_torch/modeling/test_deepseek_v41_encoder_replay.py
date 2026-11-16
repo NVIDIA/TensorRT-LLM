@@ -61,8 +61,11 @@ def _prepare_chunk(manager, request, offset, length):
 
 
 def reference(model, metadata, ids, prefix=256, chunks=None, window=128, *, request):
-    """Explicit frozen Global encoder and final-window Decoder, without replay plans."""
-    start, end = max(0, prefix - window), ids.numel()
+    """Explicit layer loop from the request's recovery start and read floor: frozen Global
+    encoder and final-window Decoder."""
+    recovery = request.py_ced_replay
+    start, end = recovery.start, ids.numel()
+    floor = recovery.swa_read_floor if recovery.restores_checkpoint else start
     body = model.model
     chunks = chunks or (end - prefix,)
     offset = prefix
@@ -77,10 +80,11 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128, *, requ
         metadata.prompt_lens = [stop - begin]
         metadata.kv_cache_params.num_cached_tokens_per_seq = [begin]
         if index == 0:
-            metadata.set_swa_bounded_replay([prefix])
+            metadata.set_swa_bounded_replay([prefix], query_starts=[start])
+            metadata._csa2_pending_swa_floors = [floor]
         metadata.prepare()
         _apply_swa_floor(
-            metadata, torch.full((stop - begin,), start, device="cuda", dtype=torch.int64)
+            metadata, torch.full((stop - begin,), floor, device="cuda", dtype=torch.int64)
         )
         embedded = body.embed_tokens(local_ids).unsqueeze(1).repeat(1, body.hc_mult, 1)
         state = body._init_hc_state(embedded)
@@ -136,7 +140,14 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128, *, requ
 )
 @pytest.mark.parametrize(
     "block,prefix,window",
-    [(128, 128, 140), (128, 256, 140), (128, 255, 140), (256, 383, 140), (256, 511, 300)],
+    [
+        (128, 128, 140),
+        (128, 256, 140),
+        (128, 255, 140),
+        (128, 266, 140),
+        (256, 383, 140),
+        (256, 511, 300),
+    ],
 )
 def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
     model_and_config, monkeypatch, chunks, remote_tail, block, prefix, window
@@ -161,6 +172,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
         spec = DSparkDecodingConfig(max_draft_len=5)
         spec.__dict__["draft_is_embedded_in_target"] = True
     total = prefix + sum(chunks)
+    earlier = not remote_tail and (prefix == 266 or (prefix == 256 and chunks == (257,)))
     ids = torch.arange(total, device="cuda", dtype=torch.int32)
     with (
         torch.inference_mode(),
@@ -168,7 +180,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
             config,
             sparse,
             dtype,
-            [prefix + 1],
+            [128 if earlier else prefix + 1],
             [0],
             1,
             reuse=True,
@@ -191,12 +203,23 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                 is_streaming=False,
             )
             warm.py_seq_slot = 0
-            run(model, metadata, [warm], ids[: prefix + 1], [0], [prefix + 1], 1)
             warm_cache = manager.kv_cache_map[0]
-            warm_cache.commit(list(range(prefix)))
+            if earlier:
+                # Publish S before advancing, so its compressor state survives
+                # independently of the later GLOBAL hit at P.
+                run(model, metadata, [warm], ids[:128], [0], [128], 1)
+                warm_cache.commit(list(range(128)))
+                assert warm_cache.resize(prefix + 1)
+                run(model, metadata, [warm], ids[128 : prefix + 1], [128], [prefix + 1 - 128], 1)
+                warm_cache.commit(list(range(128, prefix)))
+            else:
+                run(model, metadata, [warm], ids[: prefix + 1], [0], [prefix + 1], 1)
+                warm_cache.commit(list(range(prefix)))
             warm_cache.stop_committing()
             # Cover short-suffix replay despite a complete snapshot, partial
             # Encoder eviction, and complete eviction in the same numeric suite.
+            if prefix % block != 0:
+                _introspection.drop_optional_pages(warm_cache, prefix)
             if prefix % block == 0:
                 if prefix == 256 and chunks == (1,):
                     pass  # A hit still needs replay to supply the Decoder window.
@@ -207,6 +230,9 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                         else None
                     )
                     _introspection.drop_optional_pages(warm_cache, prefix, groups)
+            if remote_tail:
+                for endpoint in range(block, prefix, block):
+                    _introspection.drop_optional_pages(warm_cache, endpoint)
             assert warm_cache.num_committed_tokens == prefix
             frozen = global_bytes(metadata, 0, prefix)
             manager.free_resources(warm)
@@ -225,7 +251,17 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                     req.py_csa2_remote_tail_split = 5
                 assert manager.prepare_context(req)
                 assert req.context_current_position == prefix
-                assert encoder_replay_tokens(req) == min(prefix, window)
+                if earlier:
+                    # A one-token suffix at P=266 selects S=127 inside the
+                    # snapshot published at 128, leaving 140 Decoder rows.
+                    replay_start = min(128, total - window)
+                    assert req.py_ced_replay.restores_checkpoint
+                    assert req.py_ced_replay.start == replay_start
+                    assert encoder_replay_tokens(req) == prefix - replay_start
+                else:
+                    # Scratch does not publish the earlier compressor state.
+                    assert encoder_replay_tokens(req) == min(prefix, window)
+                    assert not req.py_ced_replay.restores_checkpoint
                 req.py_seq_slot = 0
                 req.context_chunk_size = min(chunks[0], req.context_remaining_length)
                 assert manager.resize_context(req, req.context_chunk_size)
@@ -236,7 +272,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                 metadata.num_contexts = 1
                 for layer in manager.pp_layers:
                     pages = manager.get_cache_indices(request_id, layer, CSA2CacheRole.SWA)
-                    assert pages[max(0, prefix - window) // block] >= 0
+                    assert pages[req.py_ced_replay.start // block] >= 0
                 return req
 
             if remote_tail:
@@ -325,3 +361,107 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
             finally:
                 manager.kv_cache_map[2].stop_committing()
                 manager.free_resources(req)
+
+
+def _restore_after_cold_writer(model, config, sparse, dtype, reader, scratch, fill):
+    """X commits 200 tokens and loses its Encoder pages; A = X + 60 tokens replays its Encoder
+    cold into fresh pages that hold ``fill`` beforehand and publishes them; the reader restores
+    an Encoder checkpoint inside A's first block. Returns the reader's logits."""
+    prefix = 200
+    ids = torch.arange(320, device="cuda", dtype=torch.int32)
+    with cache_case(
+        config,
+        sparse,
+        dtype,
+        [prefix + 1],
+        [0],
+        1,
+        reuse=True,
+        scratch=scratch,
+        tokens_per_block=256,
+    ) as case:
+        metadata = case[0]
+        manager = metadata.kv_cache_manager
+
+        def admit(request_id, tokens):
+            req = LlmRequest(
+                request_id=request_id,
+                max_new_tokens=2,
+                input_tokens=tokens,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            )
+            assert manager.prepare_context(req)
+            req.py_seq_slot = 0
+            req.context_chunk_size = len(tokens) - req.context_current_position
+            assert manager.resize_context(req, req.context_chunk_size)
+            scheduled = ScheduledRequests()
+            scheduled.context_requests_last_chunk = [req]
+            manager.prepare_resources(scheduled)
+            return req
+
+        def forward(req):
+            end = req.context_current_position + req.context_chunk_size
+            begin = req.context_current_position - encoder_replay_tokens(req)
+            return run(model, metadata, [req], ids[begin:end], [begin], [end - begin], 1)
+
+        warm = LlmRequest(
+            request_id=0,
+            max_new_tokens=2,
+            input_tokens=list(range(prefix + 1)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        warm.py_seq_slot = 0
+        run(model, metadata, [warm], ids[: prefix + 1], [0], [prefix + 1], 1)
+        warm_cache = manager.kv_cache_map[0]
+        warm_cache.commit(list(range(prefix)))
+        warm_cache.stop_committing()
+        _introspection.drop_optional_pages(warm_cache, prefix)
+        manager.free_resources(warm)
+
+        writer = admit(1, list(range(prefix + 60)))
+        assert writer.context_current_position == prefix
+        assert not writer.py_ced_replay.restores_checkpoint
+        for layer, _, role in manager._encoder_roles:
+            pool = manager.get_buffers(layer, role)
+            for page in manager.get_cache_indices(1, layer, role):
+                if page >= 0:
+                    pool[page].view(torch.uint8).fill_(fill)
+        forward(writer)
+        writer_cache = manager.kv_cache_map[1]
+        writer_cache.commit(list(range(prefix, prefix + 60)))
+        writer_cache.stop_committing()
+        manager.free_resources(writer)
+
+        # "earlier": P = 260 > S = 290 - 140. "odd": P = 151, one row before it is restored.
+        tokens = list(range(290)) if reader == "earlier" else list(range(151)) + [7] * 150
+        req = admit(2, tokens)
+        try:
+            # Both read the Encoder rows [S + 1 - 128, S) = [23, 150) of A's first page.
+            assert req.py_ced_replay.restores_checkpoint and req.py_ced_replay.start == 150
+            return forward(req).clone()
+        finally:
+            manager.kv_cache_map[2].stop_committing()
+            manager.free_resources(req)
+
+
+@pytest.mark.parametrize("scratch", [False, True])
+@pytest.mark.parametrize("reader", ["earlier", "odd"])
+def test_restored_encoder_reads_only_rows_its_writer_computed(
+    model_and_config, monkeypatch, reader, scratch
+):
+    """A checkpoint restored from a cold-replayed writer's pages gives logits that do not depend
+    on what those pages held before the writer ran."""
+    model, config, sparse, dtype = model_and_config
+    enable_ced(model)
+    model.model.encoder_replay_enabled = True
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", "140")
+    monkeypatch.setitem(config.extra_attrs, "bounded_replay_on_generation", False)
+    with torch.inference_mode(), canonical_routing():
+        zeroed = _restore_after_cold_writer(model, config, sparse, dtype, reader, scratch, 0)
+        filled = _restore_after_cold_writer(model, config, sparse, dtype, reader, scratch, 0x40)
+    assert torch.isfinite(zeroed).all()
+    torch.testing.assert_close(filled, zeroed, rtol=0, atol=0)

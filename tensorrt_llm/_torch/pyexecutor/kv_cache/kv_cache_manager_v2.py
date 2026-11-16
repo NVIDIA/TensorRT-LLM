@@ -6757,7 +6757,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         self._set_page_index_bufs(request_id, kv_cache)
 
-    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, optional_reuse_groups=None, *, optional_reuse_endpoints=None
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
         Returns True if the cache is (or becomes) active, False on failure.
@@ -6767,8 +6769,12 @@ class KVCacheManagerV2(BaseResourceManager):
         stream = self._cache_stream(req_id)
         if not (
             kv_cache.resume(stream)
-            if optional_reuse_groups is None
-            else kv_cache.resume(stream, optional_reuse_groups=optional_reuse_groups)
+            if optional_reuse_groups is None and optional_reuse_endpoints is None
+            else kv_cache.resume(
+                stream,
+                optional_reuse_groups=optional_reuse_groups,
+                optional_reuse_endpoints=optional_reuse_endpoints,
+            )
         ):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
@@ -10659,10 +10665,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 and req.context_remaining_length > 0
                 and req.context_current_position in req.expect_snapshot_points
             )
-            should_resize = not should_block_reuse or not is_all_reusable
+            should_advance_history = not should_block_reuse or not is_all_reusable
             should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
-            if should_resize:
+            if should_advance_history:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
                 self.try_commit_blocks(req)
@@ -10688,10 +10694,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return req.max_beam_num_tokens - 1
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
-        """Advance a context cache's history marker, or raise."""
-        if not kv_cache.resize(None, history_length):
+        """Report completed context computation and reclaim stale KV pages, or raise."""
+        if not kv_cache.resize(None, history_length, complete_optional_recovery=True):
             raise ValueError(
-                "Failed to resize history length of KV cache for request "
+                "Failed to advance computed history of KV cache for request "
                 f"{req.py_request_id} to {history_length} tokens at context update"
             )
 
@@ -10900,6 +10906,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
         custom_priority_callback: PagePriorityCallback | None = None,
         locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ):
         """Create the cache of one request.
 
@@ -10972,6 +10979,7 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
             locality_domain_id=locality_domain_id,
+            optional_reuse_max_backtrack=optional_reuse_max_backtrack,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache

@@ -1232,12 +1232,16 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
         int window;
         int sinks;
         std::vector<int> ordinals;
+        int optionalEnd = 0;
+        bool knownNoDigest = false;
     };
 
     // Minimal retention before a partial tail, a single page, and a window
     // spanning three blocks with or without a separate sink.
     for (auto const& c : {WindowCase{8, 1, 2, 0, {1}}, WindowCase{8, 0, 4, 0, {1}}, WindowCase{20, 3, 10, 0, {2, 3, 4}},
-             WindowCase{20, 3, 6, 4, {0, 3, 4}}})
+             WindowCase{20, 3, 6, 4, {0, 3, 4}}, WindowCase{7, 1, 4, 0, {1}}, WindowCase{8, 0, 4, 0, {1}, 7},
+             WindowCase{8, 0, 10, 0, {0}, 3}, WindowCase{7, 1, 4, 0, {1}, 0, true},
+             WindowCase{8, 0, 10, 0, {0}, 3, true}})
     {
         for (int victim : c.ordinals)
         {
@@ -1265,13 +1269,24 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             ASSERT_TRUE(source->resize(std::nullopt, c.prefix + c.tail));
             source->commit(TokenSpan{tokens.data(), static_cast<int>(tokens.size())});
             source->stopCommitting();
-            auto reader = manager->createKvCache({}, prefix, 2);
+            int const optionalEnd = c.optionalEnd ? c.optionalEnd : c.prefix;
+            if (c.optionalEnd)
+            {
+                // A partial lifecycle page can belong to a longer token-path node.
+                auto* page = source->blocks()[BlockOrdinal{optionalEnd / 4}].treeBlock->getPage(encoder);
+                page->numTokensInBlock = optionalEnd % 4;
+                for (int ordinal = (optionalEnd + 3) / 4; ordinal < c.prefix / 4; ++ordinal)
+                    source->blocks()[BlockOrdinal{ordinal}].treeBlock->unlinkPage(encoder);
+            }
+            auto reader
+                = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(reader->numCommittedTokens(), c.prefix);
             ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+            EXPECT_EQ(reader->reuseStatus()[encoder.value()].endpoint, optionalEnd);
             std::vector<int> covered;
             for (auto const& [begin, end] : reader->reuseStatus()[encoder.value()].coverage)
             {
-                for (int i = begin / 4; i < end / 4; ++i)
+                for (int i = begin / 4; i < (end + 3) / 4; ++i)
                 {
                     covered.push_back(i);
                 }
@@ -1288,33 +1303,43 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             declined->close();
             source->blocks()[BlockOrdinal{victim}].treeBlock->unlinkPage(encoder);
             source->close();
-            auto missing = manager->createKvCache({}, prefix, 4);
+            auto missing
+                = manager->createKvCache({}, prefix, 4, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(missing->numCommittedTokens(), c.prefix);
-            EXPECT_FALSE(missing->reuseStatus()[encoder.value()].complete);
-            EXPECT_TRUE(missing->reuseStatus()[encoder.value()].coverage.empty());
+            auto const& missingStatus = missing->reuseStatus()[encoder.value()];
+            std::vector<HalfOpenRange<int>> const earlierRanges = c.sinks > 0 && victim != 0
+                ? std::vector<HalfOpenRange<int>>{{1, 5}}
+                : std::vector<HalfOpenRange<int>>{};
+            EXPECT_EQ(missingStatus.endpointRanges, earlierRanges);
+            EXPECT_EQ(missingStatus.complete, !earlierRanges.empty());
             EXPECT_TRUE(missing->reuseStatus()[peer.value()].complete);
-            EXPECT_THROW(missing->resume(mStream, selected), std::invalid_argument);
+            std::map<LifeCycleId, int> const exactEndpoints{{encoder, c.prefix}, {peer, c.prefix}};
+            EXPECT_THROW(missing->resume(mStream, std::nullopt, exactEndpoints), std::invalid_argument);
             EXPECT_FALSE(missing->isActive());
             ASSERT_TRUE(missing->resume(mStream, std::vector<LifeCycleId>{peer}));
             missing->close();
             // The earlier claim owns every candidate even after tree unlink.
             manager->getAndResetIterationReusedBlocksByLevel();
-            ASSERT_TRUE(reader->resume(mStream, selected));
+            if (optionalEnd < c.prefix)
+                EXPECT_THROW(reader->resume(mStream, selected), std::invalid_argument);
+            std::map<LifeCycleId, int> const endpoints{{encoder, optionalEnd}, {peer, c.prefix}};
+            ASSERT_TRUE(reader->resume(mStream, std::nullopt, endpoints));
             reader->commitPendingStats();
             auto const reusedByLevel = manager->getAndResetIterationReusedBlocksByLevel();
             ASSERT_NE(reusedByLevel.find(encoder), reusedByLevel.end());
-            EXPECT_EQ(reusedByLevel.at(encoder).full.at(kHotLevel), c.ordinals.size());
-            EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).partial), 0);
+            EXPECT_EQ(reusedByLevel.at(encoder).full.at(kHotLevel), c.ordinals.size() - (optionalEnd % 4 != 0));
+            EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).partial), optionalEnd % 4 != 0);
             reader->suspend();
             ASSERT_TRUE(reader->resume(mStream));
             reader->commitPendingStats();
             EXPECT_TRUE(manager->getAndResetIterationReusedBlocksByLevel().empty());
             for (size_t i = 0; i < original.size(); ++i)
             {
-                EXPECT_EQ(reader->getBasePageIndices(encoder)[c.ordinals[i]], original[i]);
+                EXPECT_EQ(reader->getBasePageIndices(encoder)[c.ordinals[i]] == original[i],
+                    optionalEnd % 4 == 0 || c.ordinals[i] < optionalEnd / 4);
             }
             reader->close();
-            EXPECT_EQ(manager->radixTree().match({}, prefix).numTokens, c.prefix);
+            EXPECT_EQ(manager->radixTree().match({}, prefix, false, true).numTokens, c.prefix);
             manager->shutdown();
         }
     }
@@ -1374,13 +1399,14 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
     source->close();
     auto reader = manager->createKvCache({}, span, 2);
     ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    EXPECT_EQ(reader->reuseStatus()[encoder.value()].endpointRanges, (std::vector<HalfOpenRange<int>>{{8, 9}}));
     auto& storage = manager->storage();
     auto const group = storage.getPoolGroupIndex(kHotLevel, encoder);
     TypedVec<PoolGroupIndex, SlotCount> goals(storage.numPoolGroups(kHotLevel), SlotCount{0});
     goals[group] = storage.getStatistics(kHotLevel, group).total - 1;
     storage.prepareFreeSlots(kHotLevel, goals);
     auto reservations = storage.newSlotsForPoolGroup(kHotLevel, group, storage.getStatistics(kHotLevel, group).free);
-    // No host tier, no free slots: the rejected candidate is the only capacity
+    // No host tier, no free slots: the rejected candidates are the only capacity
     // available to the request's fresh writable Encoder page.
     EXPECT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{}));
     EXPECT_EQ(reader->numCommittedTokens(), 8);
