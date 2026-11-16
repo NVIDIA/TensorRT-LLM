@@ -299,3 +299,60 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
     assert params.mrope_position_deltas_handle == {"tensor_size": [1, 1]}
     (logits,) = params.first_gen_logits
     assert torch.equal(logits, first_logits[0, :1])
+
+
+def test_random_multimodal_hashes_differ_per_item():
+    """Items without a content hash get one random hash each, never a shared one."""
+    params = DisaggregatedParams(multimodal_embedding_handles=[{"tensor_size": [1, 4]}] * 3)
+    assert len(params.multimodal_hashes) == 3
+    assert all(len(mm_hash) == 8 for mm_hash in params.multimodal_hashes)
+    assert len({tuple(mm_hash) for mm_hash in params.multimodal_hashes}) == 3
+
+
+@pytest.mark.parametrize("items_only", [False, True], ids=["prompt", "items_only"])
+@pytest.mark.parametrize("hashes", [None, [[1] * 8, [2] * 8]], ids=["random", "content"])
+def test_encoder_result_puts_hash_on_each_item(items_only, hashes):
+    """Each item handle carries its hash; an item-only encode exports no mRoPE."""
+    result = GenerationResultBase(id=1, sampling_params=SamplingParams(max_tokens=1))
+    result._multimodal_hashes = hashes
+    result.mm_items_only = items_only
+    handles = [
+        {"tensor_size": [2, 16], "metadata": {"image_grid_thw": [1, 2, 4]}},
+        {"tensor_size": [3, 16]},
+    ]
+    encoder_result = SimpleNamespace(
+        is_final=True,
+        decoding_iter=1,
+        avg_decoded_tokens_per_iter=1.0,
+        context_phase_params=None,
+        finish_reasons=[tllm.FinishReason.LENGTH],
+        output_token_ids=[[0]],
+        sequence_index=0,
+        cum_log_probs=None,
+        log_probs=None,
+        generation_logits=None,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
+        context_logits=None,
+        request_perf_metrics=None,
+        additional_context_outputs=None,
+        additional_generation_outputs=None,
+        mm_embedding_handles=handles,
+        mrope_position_ids_handle={"tensor_size": [3, 1, 6]},
+        mrope_position_deltas_handle={"tensor_size": [1, 1]},
+    )
+
+    result._handle_response(SimpleNamespace(result=encoder_result, has_error=lambda: False))
+
+    params = result.disaggregated_params
+    item_hashes = [handle["metadata"]["multimodal_hash"] for handle in handles]
+    assert item_hashes == params.multimodal_hashes
+    assert handles[0]["metadata"]["image_grid_thw"] == [1, 2, 4]
+    if hashes is None:
+        assert item_hashes[0] != item_hashes[1]
+    else:
+        assert item_hashes == hashes
+    assert (params.mrope_position_ids_handle is None) == items_only
+    assert (params.mrope_position_deltas_handle is None) == items_only

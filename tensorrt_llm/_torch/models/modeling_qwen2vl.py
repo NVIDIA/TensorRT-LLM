@@ -2650,6 +2650,9 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
+    # Each image or video is processed on its own.
+    supports_mm_item_handoff = True
+
     def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,

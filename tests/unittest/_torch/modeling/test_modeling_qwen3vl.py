@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -24,10 +24,14 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
+from tensorrt_llm._torch.models.modeling_llava_next import LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
     vision_normalization_from_processor,
+)
+from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+    NemotronHMultimodalInputProcessor,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -38,11 +42,15 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
     MultimodalParams,
 )
+from tensorrt_llm.inputs.multimodal_data import VideoData
+from tensorrt_llm.inputs.registry import create_input_processor_with_hash
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1144,6 +1152,278 @@ def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_enc
         assert param.multimodal_data["multimodal_embedding_metadata"] == expected
     else:
         assert "multimodal_embedding_metadata" not in param.multimodal_data
+
+
+# ---------------------------------------------------------------------------
+# Item handoff: the encoder takes media items with no prompt, and prefill
+# builds its inputs from the per-item results.
+# ---------------------------------------------------------------------------
+
+_QWEN_VL_SPECIAL_TOKENS = {
+    "<|vision_start|>": 11,
+    "<|image_pad|>": 12,
+    "<|vision_end|>": 13,
+    "<|video_pad|>": 14,
+}
+
+
+def _make_qwen_vl_hf_processor(model: str):
+    """A Qwen2.5-VL or Qwen3-VL input processor that runs the real HF processor.
+
+    The HF processor resizes images, samples video frames, adds Qwen3 frame
+    timestamps and expands placeholders as it does for the real checkpoints.
+    Only the vocabulary is small, so no checkpoint files are needed.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    words = ["<", ">", ".", ":", "seconds", "look", "at", "and", "then", "describe"]
+    vocab = {"[UNK]": 0, "[PAD]": 1, **{word: 20 + i for i, word in enumerate(words)}}
+    vocab.update({str(digit): 40 + digit for digit in range(10)})
+    vocab.update(_QWEN_VL_SPECIAL_TOKENS)
+    tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+        [pre_tokenizers.Whitespace(), pre_tokenizers.Digits(individual_digits=True)]
+    )
+    tokenizer.add_special_tokens(list(_QWEN_VL_SPECIAL_TOKENS))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="[PAD]"
+    )
+    # Processor settings of the Qwen3-VL-8B and Qwen2.5-VL-7B checkpoints.
+    if model == "qwen3":
+        from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+        from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        patch_size = 16
+        hf_processor = Qwen3VLProcessor(
+            image_processor=Qwen2VLImageProcessor(
+                patch_size=patch_size,
+                temporal_patch_size=2,
+                merge_size=2,
+                size={"shortest_edge": 65536, "longest_edge": 16777216},
+            ),
+            tokenizer=tokenizer,
+            video_processor=Qwen3VLVideoProcessor(
+                patch_size=patch_size,
+                temporal_patch_size=2,
+                merge_size=2,
+                size={"shortest_edge": 4096, "longest_edge": 25165824},
+            ),
+        )
+        processor_cls = Qwen3VLInputProcessorBase
+    else:
+        from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+        from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoProcessor
+
+        patch_size = 14
+        size = {"shortest_edge": 3136, "longest_edge": 12845056}
+        hf_processor = Qwen2_5_VLProcessor(
+            image_processor=Qwen2VLImageProcessor(
+                patch_size=patch_size, temporal_patch_size=2, merge_size=2, size=size
+            ),
+            tokenizer=tokenizer,
+            video_processor=Qwen2VLVideoProcessor(
+                patch_size=patch_size, temporal_patch_size=2, merge_size=2, size=size
+            ),
+        )
+        processor_cls = modeling_qwen2vl.Qwen2_5VLInputProcessorBase
+    hidden_size = 8
+    vision_config = SimpleNamespace(
+        patch_size=patch_size, spatial_merge_size=2, temporal_patch_size=2
+    )
+    if model == "qwen3":
+        vision_config.deepstack_visual_indexes = [0]
+    else:
+        vision_config.tokens_per_second = 2
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        vision_config=vision_config,
+        image_token_id=12,
+        video_token_id=14,
+        vision_start_token_id=11,
+        vision_end_token_id=13,
+    )
+    with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.return_value = hf_processor
+        processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
+    # A Qwen3-VL embedding row also holds one deepstack level.
+    width = hidden_size * (2 if model == "qwen3" else 1)
+    return processor, width
+
+
+def _qwen_vl_media():
+    """A wide image, a tall image and a short video, with random pixels."""
+    rng = np.random.default_rng(0)
+    return {
+        "wide": Image.fromarray(rng.integers(0, 256, (360, 640, 3), dtype=np.uint8)),
+        "tall": Image.fromarray(rng.integers(0, 256, (640, 360, 3), dtype=np.uint8)),
+        "video": VideoData(
+            frames=rng.integers(0, 256, (8, 96, 128, 3), dtype=np.uint8),
+            metadata={
+                "total_num_frames": 8,
+                "fps": 4.0,
+                "duration": 2.0,
+                "frames_indices": list(range(8)),
+            },
+        ),
+    }
+
+
+def _qwen_vl_request(names: List[str], text: Optional[str] = "look at {} describe ."):
+    """A request with the named media items, in prompt order.
+
+    With ``text``, the prompt holds one placeholder per item, between words.
+    Without it, the request has no prompt and gives the item order.
+    """
+    media = _qwen_vl_media()
+    mm_data, order = {}, []
+    for name in names:
+        modality = "video" if name == "video" else "image"
+        order.append({"modality": modality, "index": len(mm_data.get(modality, []))})
+        mm_data.setdefault(modality, []).append(media[name])
+    if text is None:
+        return {"multi_modal_data": mm_data, "mm_item_order": order}
+    placeholders = {
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+    }
+    words = " and ".join(placeholders[entry["modality"]] for entry in order)
+    return {"prompt": text.format(words), "multi_modal_data": mm_data}
+
+
+_QWEN_VL_ITEM_CASES = [["wide"], ["wide", "tall"], ["video"], ["wide", "video", "tall"]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize(
+    "names", _QWEN_VL_ITEM_CASES, ids=["+".join(n) for n in _QWEN_VL_ITEM_CASES]
+)
+def test_qwen_vl_items_only_encode_matches_full_request(model, names):
+    """Items encoded with no prompt get the same inputs and hashes as in a full request."""
+    processor, _ = _make_qwen_vl_hf_processor(model)
+    items = _qwen_vl_request(names, text=None)
+    prompt = processor.get_mm_items_prompt(items["multi_modal_data"], items["mm_item_order"])
+    assert prompt == "".join(
+        f"<|vision_start|><|{entry['modality']}_pad|><|vision_end|>"
+        for entry in items["mm_item_order"]
+    )
+
+    process = create_input_processor_with_hash(processor)
+    _, encoded = process({**items, "prompt": prompt}, SamplingParams())
+    _, full = process(_qwen_vl_request(names), SamplingParams())
+
+    assert processor.multimodal_hashing_supported
+    assert (
+        encoded["multimodal_input"].multimodal_hashes == full["multimodal_input"].multimodal_hashes
+    )
+    item_metadata = encoded["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    full_metadata = full["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert item_metadata.item_refs == full_metadata.item_refs
+    assert item_metadata.output_embedding_lengths == full_metadata.output_embedding_lengths
+    for modality, keys in (
+        ("image", ("pixel_values", "image_grid_thw")),
+        ("video", ("pixel_values_videos", "video_grid_thw")),
+    ):
+        assert (modality in encoded["multimodal_data"]) == (modality in full["multimodal_data"])
+        for key in keys if modality in full["multimodal_data"] else ():
+            assert torch.equal(
+                encoded["multimodal_data"][modality][key], full["multimodal_data"][modality][key]
+            )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "processor_cls",
+    [
+        LlavaNextInputProcessor,
+        NemotronHMultimodalInputProcessor,
+        modeling_qwen2vl.Qwen2VLInputProcessorBase,
+    ],
+)
+def test_items_only_encode_needs_independent_items(processor_cls):
+    """Models whose items depend on the prompt or on each other keep needing a prompt."""
+    processor = object.__new__(processor_cls)
+    with pytest.raises(ValueError, match="needs a prompt"):
+        processor.get_mm_items_prompt({"image": [Image.new("RGB", (32, 32))]})
+
+
+def _mock_qwen_vl_encoder(processor):
+    """A standalone encoder (mm_encoder_only) with a mocked executor.
+
+    Returns the encoder and the list of results its executor made.
+    """
+    encoder = object.__new__(BaseLLM)
+    encoder._encode_only = False
+    encoder.args = SimpleNamespace(
+        mm_encoder_only=True, return_perf_metrics=False, multimodal_config=None
+    )
+    encoder.input_processor = processor
+    encoder._executor = Mock()
+    encoder._executor.is_shutdown.return_value = False
+    results = []
+    encoder._executor.generate_async.side_effect = lambda *args, **kwargs: (
+        results.append(Mock()) or results[-1]
+    )
+    encoder._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
+    encoder._check_arguments = Mock()
+    encoder._is_encoder_decoder_model = Mock(return_value=False)
+    encoder._post_processor_hook = None
+    return encoder, results
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("with_params", [False, True], ids=["no_params", "empty_params"])
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_items_only_encode_request_exports_no_layout(model, with_params):
+    """The encoder builds the prompt itself and keeps its layout and mRoPE out of the result.
+
+    The same holds in two steps, through preprocess() and then generate_async(),
+    and when the caller passes its own (empty) disaggregated params.
+    """
+    processor, _ = _make_qwen_vl_hf_processor(model)
+    encoder, results = _mock_qwen_vl_encoder(processor)
+    items = _qwen_vl_request(["wide", "video"], text=None)
+    items_only = {"multi_modal_data": items["multi_modal_data"]}
+    prompted = {
+        "prompt": processor.get_mm_items_prompt(items["multi_modal_data"]),
+        "multi_modal_data": items["multi_modal_data"],
+    }
+    one_step_params, two_step_params = [
+        DisaggregatedParams(request_type="context_and_generation") if with_params else None
+        for _ in range(2)
+    ]
+    with (
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        patch.object(MultimodalParams, "to_handle"),
+    ):
+        encoder.generate_async(items_only, disaggregated_params=one_step_params)
+        encoder.generate_async(
+            encoder.preprocess(items_only, disaggregated_params=two_step_params),
+            disaggregated_params=two_step_params,
+        )
+        encoder.generate_async(prompted)
+
+    items_only_call, two_step_call, prompted_call = encoder._executor.generate_async.call_args_list
+    for call, params in ((items_only_call, one_step_params), (two_step_call, two_step_params)):
+        assert call.args == prompted_call.args
+        assert call.kwargs["disaggregated_params"] is params
+        if params is not None:
+            assert params.multimodal_input_layout is None
+            assert params.mrope_position_ids_handle is None
+            assert params.mrope_position_deltas_handle is None
+    # The result then exports no mRoPE either.
+    assert [result.mm_items_only for result in results] == [True, True, False]
+    if model == "qwen3":
+        # A prompted encode keeps exporting its layout.
+        assert prompted_call.kwargs["disaggregated_params"].multimodal_input_layout is not None
+
+    # A model without independent items still needs a prompt.
+    encoder.input_processor = object.__new__(LlavaNextInputProcessor)
+    with pytest.raises(ValueError, match="needs a prompt"):
+        encoder.generate_async({"multi_modal_data": items["multi_modal_data"]})
 
 
 # ---------------------------------------------------------------------------

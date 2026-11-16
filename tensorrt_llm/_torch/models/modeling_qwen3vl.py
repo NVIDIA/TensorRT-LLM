@@ -258,6 +258,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     than a ``tokens_per_second``-scaled stretch.
     """
 
+    # Each image or video is processed on its own.
+    supports_mm_item_handoff = True
+
     def __init__(
         self,
         model_path: str,
