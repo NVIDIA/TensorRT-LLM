@@ -8,9 +8,9 @@ from typing import Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._hist_topk import shard_capacity, shard_size
 
 #: c1: 16 ranks, 64-token pages, and the shard table of the gen server's indexer capacity.
@@ -70,7 +70,7 @@ class GlmHistShardMeta(OpWrapper):
         rank: int,
         tokens_per_block: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        torch.ops.trtllm.glm_dsa_hist_shard_meta(
+        native_ops.glm_dsa_hist_shard_meta(
             kv_lens, block_table, shard_ctx, shard_block_table, group_size, rank, tokens_per_block
         )
         return shard_ctx, shard_block_table

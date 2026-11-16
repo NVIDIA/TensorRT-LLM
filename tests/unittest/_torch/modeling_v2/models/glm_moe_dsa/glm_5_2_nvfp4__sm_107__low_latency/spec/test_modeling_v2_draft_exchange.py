@@ -3,15 +3,25 @@
 """CPU coverage of collective failure handling during draft workspace setup."""
 
 import gc
+import importlib.util
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec import (  # noqa: E501
-    _draft_exchange as exchange,
+from tensorrt_llm._torch._experimental.modeling_v2.models import glm_moe_dsa
+
+# This collective setup helper has no native dependency.
+_SOURCE = (
+    Path(glm_moe_dsa.__file__).parent
+    / "glm_5_2_nvfp4__sm_107__low_latency/ops/spec/_draft_exchange.py"
 )
+_SPEC = importlib.util.spec_from_file_location("_glm_draft_exchange_cpu", _SOURCE)
+assert _SPEC is not None and _SPEC.loader is not None
+exchange = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(exchange)
 
 pytestmark = pytest.mark.cpu_only
 

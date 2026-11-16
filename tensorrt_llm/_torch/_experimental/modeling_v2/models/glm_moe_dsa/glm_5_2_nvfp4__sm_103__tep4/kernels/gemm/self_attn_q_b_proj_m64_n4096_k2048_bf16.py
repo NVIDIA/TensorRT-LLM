@@ -22,6 +22,7 @@ from functools import lru_cache
 
 from . import _projection_module_dispatch as _projectionmoduledispatch
 from . import _projection_tcgen05_template as _projectiontcgen05template
+from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
 from . import _swapped_dense_gemm_persistent as _swappeddensegemmpersistent
 
 ProjectionAbi = _projectionmoduledispatch.ProjectionAbi
@@ -33,12 +34,19 @@ GemmSchedule = _swappeddensegemmpersistent.GemmSchedule
 
 PREWAIT_TMA_W = _projectiontcgen05template.PREWAIT_TMA_W
 
+# The decode row counts above 64 (32 requests x MTP3 / MTP5 widths 4 / 6), built only
+# for an engine drafting more than one token.
+MTP_DECODE_M_VALUES = (128, 192)
 
 ABI = ProjectionAbi(
     "self_attn.q_b_proj",
     4_096,
     2_048,
     kernel_name_prefix="glm52_self_attn_q_b_proj",
+    # The MTP cells take the wait/signal PDL role with the weight preloaded ahead of the
+    # wait, as the tcgen05 cells issue the weight TMA ahead of theirs.
+    pdl_persistent_compiler=_swappeddensegemmpdlchain.compile_pdl_wait_signal_persistent_gemm,
+    pdl_enabled_m=frozenset(MTP_DECODE_M_VALUES),
 )
 
 SCHEDULE_BY_M = {
@@ -53,6 +61,13 @@ SCHEDULE_BY_M = {
     32: tcgen05_instance(64, 6, 2, PREWAIT_TMA_W),
     48: tcgen05_instance(64, 6, 2, PREWAIT_TMA_W),
     64: tcgen05_instance(64, 6, 2, PREWAIT_TMA_W),
+    # MTP3 / MTP5 (the tcgen05 cells stop at 64): persistent 2-CTA, 64 / 96-row tiles, PDL
+    # role. B300, cold weights, us: 128 rows 5.59 (5.64 for (64, 64), 5.75 c4x1, 6.33 with no
+    # PDL role, 6.81 for (128, 128)); 192 rows 5.83 (6.50 for (64, 96), 6.69 for (128, 192),
+    # 6.68 with no PDL role). The bf16 prefill GEMM those rows took: 10.67 / 10.69; cuBLAS
+    # (bitwise the same output): 5.57 / 5.75.
+    128: persistent_instance(GemmSchedule(True, (128, 64), (2, 1), raster_along="n")),
+    192: persistent_instance(GemmSchedule(True, (128, 96), (2, 1), raster_along="n")),
 } | context_instances(
     persistent_instance(GemmSchedule(True, (256, 128), (2, 1))),
     persistent_instance(GemmSchedule(True, (256, 192), (2, 1))),

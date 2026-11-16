@@ -8,8 +8,9 @@ import math
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ... import native_ops
 
 #: The latent row: kv_lora_rank 512 normalized columns followed by qk_rope_head_dim 64 K-RoPE
 #: columns.
@@ -35,7 +36,7 @@ _GLM = dict(
 class GlmMlaKvHalfAppend(OpWrapper):
     """One generation step's MLA KV half over a paged FP8 latent cache.
 
-    Wraps ``torch.ops.trtllm.glm_mla_kv_half_append``. Row ``t`` of ``latent`` is token
+    Wraps ``native_ops.glm_mla_kv_half_append``. Row ``t`` of ``latent`` is token
     ``t % seq_len_q`` of generation sequence ``s = t // seq_len_q`` and sits at position
     ``p = sequence_length[num_contexts + s] - seq_len_q + t % seq_len_q``. Its cache row is::
 
@@ -157,7 +158,7 @@ class GlmMlaKvHalfAppend(OpWrapper):
         softmax_scale: float,
         trigger_at_entry: bool = False,
     ) -> None:
-        torch.ops.trtllm.glm_mla_kv_half_append(
+        native_ops.glm_mla_kv_half_append(
             latent,
             kv_norm_weight,
             kv_norm_eps,

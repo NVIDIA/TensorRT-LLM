@@ -9,13 +9,14 @@ from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
     OpWrapper,
     true_fp32_matmul,
 )
+
+from ... import native_ops
 
 #: Query heads per rank: GLM-5.2's 64 MLA heads over 16 ranks.
 NUM_HEADS = 4
@@ -56,7 +57,7 @@ def _cell(**spec) -> dict:
 class GlmSparseMlaFlashDecode(OpWrapper):
     """Sparse MLA flash decode over an FP8 paged latent pool, v_b folded into the output.
 
-    Wraps ``torch.ops.trtllm.glm_sparse_mla_flash_decode``. Query token ``t`` (row ``t`` of
+    Wraps ``native_ops.glm_sparse_mla_flash_decode``. Query token ``t`` (row ``t`` of
     ``q``) belongs to sequence ``s = t // seq_len_q`` and attends to the first
     ``n_t = min(seq_lens_kv[s] - (seq_len_q - 1 - t % seq_len_q), top_k)`` slots of
     ``indices[t]``; a negative entry is masked. With ``block_table`` a slot holds a position
@@ -203,7 +204,7 @@ class GlmSparseMlaFlashDecode(OpWrapper):
         layer_offset: int = 0,
         gather_before_wait: bool = False,
     ) -> torch.Tensor:
-        torch.ops.trtllm.glm_sparse_mla_flash_decode(
+        native_ops.glm_sparse_mla_flash_decode(
             q,
             kv_pool,
             indices,
@@ -453,7 +454,7 @@ class GlmSparseMlaFlashDecodeLatent(OpWrapper):
         gather_before_wait: bool = False,
         trigger_after_wait: bool = False,
     ) -> torch.Tensor:
-        torch.ops.trtllm.glm_sparse_mla_flash_decode_latent(
+        native_ops.glm_sparse_mla_flash_decode_latent(
             q,
             kv_pool,
             indices,

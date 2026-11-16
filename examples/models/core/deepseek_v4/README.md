@@ -524,6 +524,9 @@ again adds or replaces the profiled `K` and `G` rows in the same file, so `--k 4
 `--graph-batch-sizes 512` extends an existing table. `--graph-batch-sizes`, `--tier-fractions` and
 `--dataset` override the defaults; see `--help`.
 
+To reproduce the published DeepSeek-V4-Pro results, or to reuse the 8x B300 cost table and
+calibration, see [CONFIDENCE_REPRODUCTION.md](CONFIDENCE_REPRODUCTION.md).
+
 At startup the runtime checks the table against the engine and fails with the command above when:
 
 - the file is missing, or has no entry for `max_draft_len`;

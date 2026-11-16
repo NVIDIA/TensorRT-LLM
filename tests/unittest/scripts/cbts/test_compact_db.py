@@ -74,6 +74,27 @@ def _merge(inputs: list[Path], output: Path) -> None:
     validate_database(output)
 
 
+@pytest.mark.parametrize(
+    "path", ["tests/integration/defs/conftest.py", "tests/test_common/llm_data.py"]
+)
+def test_empty_context_rows_do_not_make_a_python_file_eligible(tmp_path: Path, path: str) -> None:
+    """A session import is not test-attributed coverage, even when the file is in the DB."""
+    leaf = tmp_path / "leaf.sqlite"
+    write_leaf_database(
+        leaf,
+        stage="A10-PyTorch-1",
+        process_uid="coordinator",
+        touches={"": {(path, "<module>")}},
+        outcomes={},
+    )
+    merged = tmp_path / "merged.sqlite"
+    _merge([leaf], merged)
+
+    with TouchDB.open(merged) as database:
+        assert not database.file_has_touch_rows(path)
+        assert not database.tests_touching_file(path)
+
+
 class CompactDatabaseTest(unittest.TestCase):
     def test_touch_db_rejects_missing_completeness_view(self):
         with tempfile.TemporaryDirectory() as temp_dir:

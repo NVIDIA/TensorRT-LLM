@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -80,15 +80,19 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
 #: construction, and a check that can only ever hold is a check whose failure
 #: mode is its own bug taking down a working deployment.
 #:
-#: An environment variable rather than an LLM arg while modeling_v2 is
-#: experimental; it has to reach the ranks, so a test passes it through
+#: Beam additionally enables checkpoint digests, per-layer metadata rechecks and per-step
+#: routing agreement (device-to-host copies, hashing and collectives). Keep it off for
+#: performance measurements; all Beam ranks must use the same setting.
+#:
+#: An environment variable while modeling_v2 is experimental. It must reach all ranks,
+#: so a test passes it through
 #: ``env_overrides``. When this stops being experimental it belongs in the
 #: LLM args, where a caller can set it per engine rather than per process.
 MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
 
 
 def step_contract_enabled() -> bool:
-    """Whether targets should check their step contract on the first forward.
+    """Whether contract diagnostics are enabled (Beam also checks every step).
 
     Read once per model instance at construction rather than per forward: the
     answer cannot change within a process, and the forward is the hot path.
@@ -122,6 +126,26 @@ class NoTarget(ValueError):
     (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
+
+
+# Targets a deployment builds only when it sets ``modeling_v2`` itself, filled by ``@disable_v2_by_default``.
+_V2_DISABLED_BY_DEFAULT: Set[type] = set()
+
+
+def disable_v2_by_default(target: type) -> type:
+    """Keep the built-in implementation for the deployments ``target`` claims unless ``modeling_v2`` is set.
+
+    Under the default ``modeling_v2`` the resolver declines the decorated
+    target and the engine builds the built-in implementation. A deployment that
+    sets ``modeling_v2`` to ``auto`` or ``require`` itself gets the target as
+    the ``route`` decides.
+    """
+    _V2_DISABLED_BY_DEFAULT.add(target)
+    return target
+
+
+def _modeling_v2_set_explicitly(llm_args: "TorchLlmArgs") -> bool:
+    return "modeling_v2" in llm_args.model_fields_set
 
 
 # The mode each target class was last resolved under (the loader builds the class right after resolving it).
@@ -191,6 +215,97 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+#: The wildcard a target lists in ``moe_impls_honored`` / ``draft_moe_impls_honored`` to honor any
+#: tactic: ``create_moe`` builds the experts and only that module runs them, so whatever a tactic
+#: resolves to is what runs.
+ANY_MOE_IMPL = "*"
+
+
+def _refuse_unhonored_moe_tactics(config: "ModelConfig", target: type, architecture: str) -> None:
+    """Raise ``NoTarget`` unless ``target`` honors each MoE tactic the config sets.
+
+    Routes read no tactic, so a target declares the implementation ids it honors:
+    ``moe_impls_honored`` for ``moe_config.tactic`` and ``draft_moe_impls_honored`` for
+    ``speculative_config.moe_tactic``; :data:`ANY_MOE_IMPL` honors any, undeclared honors none.
+    A target whose own kernels read the expert buffers lists only the id whose layout they
+    read. A tactic is honored when every implementation it can resolve to (narrowed to the
+    formats the target's experts run as on ``architecture``) is listed; otherwise the target
+    does not claim the deployment: ``modeling_v2='auto'`` builds the built-in model and
+    ``'require'`` fails.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    moe_tactic = config.moe_tactic
+    if moe_tactic is not None:
+        _refuse_unhonored_moe_tactic(
+            "moe_config.tactic",
+            moe_tactic,
+            ModelConfig._declared_moe_quants(
+                config.quant_config, config.quant_config_dict, architecture=architecture
+            ),
+            target,
+            getattr(target, "moe_impls_honored", frozenset()),
+            "its experts",
+        )
+    draft_moe_tactic = getattr(getattr(config, "spec_config", None), "moe_tactic", None)
+    if draft_moe_tactic is not None:
+        _refuse_unhonored_moe_tactic(
+            "speculative_config.moe_tactic",
+            draft_moe_tactic,
+            None,
+            target,
+            getattr(target, "draft_moe_impls_honored", frozenset()),
+            "its draft's experts",
+        )
+
+
+def _refuse_unhonored_moe_tactic(
+    field: str,
+    tactic: str,
+    quants: set[str] | None,
+    target: type,
+    honored: frozenset[str],
+    experts: str,
+) -> None:
+    """Raise ``NoTarget`` unless every implementation ``tactic`` can resolve to is in ``honored``.
+
+    Args:
+        field: The option ``tactic`` was set by, as the refusal names it.
+        tactic: The MoE tactic.
+        quants: The experts' formats, spelled as MoE identities spell them; the tactic's
+            matches of these formats count, or all of them when none is. ``None`` counts all.
+        target: The target class, as the refusal names it.
+        honored: The implementation ids ``target`` honors for ``tactic``.
+        experts: The experts ``tactic`` selects, as the refusal names them.
+    """
+    if ANY_MOE_IMPL in honored:
+        return
+    if not honored:
+        raise NoTarget(
+            f"{field}={tactic!r} pins a MoE implementation, and {target.__name__} "
+            f"honors no MoE tactic for {experts}"
+        )
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
+
+    request = moe_impl_request(tactic=tactic)
+    impls = request.impls
+    if quants is not None:
+        impls = request.narrowed_to(quants).impls or impls
+    impl_ids = [
+        impl_cls.descriptor.impl_id
+        if getattr(impl_cls, "descriptor", None) is not None
+        else impl_cls.__name__
+        for impl_cls in impls
+    ]
+    if impl_ids and set(impl_ids) <= honored:
+        return
+    raise NoTarget(
+        f"{field}={tactic!r} pins a MoE implementation, and {target.__name__} runs "
+        f"{experts} only as {', '.join(sorted(honored))}; the tactic can resolve to "
+        f"{', '.join(impl_ids)}"
+    )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -198,6 +313,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    It also returns None for a ``@disable_v2_by_default`` target when
+    ``modeling_v2`` was left at its default.
 
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -215,11 +332,19 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
         target = route(config, llm_args, _device_compute_capability())
+        if target is not None:
+            _refuse_unhonored_moe_tactics(config, target, arch)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
         logger.info(
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+        )
+        return None
+    if target in _V2_DISABLED_BY_DEFAULT and not _modeling_v2_set_explicitly(llm_args):
+        logger.info(
+            f"modeling_v2: {target.__name__} fits {arch!r} but is built only when modeling_v2 "
+            "is set; using the built-in implementation"
         )
         return None
     if target is not None:
