@@ -47,8 +47,8 @@ SEEDS = (17, 41)
 LENGTHS = (1, 17, 129)
 
 STATE_RECIPE = {
-    "construction": "torch.manual_seed(1300 + seed + layer_id); fp32 kaiming_uniform_(a=sqrt(5)) on CPU for the "
-    "eight projection matrices in module construction order (q, k, v, gate, o, mlp gate, up, down)",
+    "construction": "torch.Generator().manual_seed(1300 + seed + layer_id); fp32 kaiming_uniform_(a=sqrt(5)) "
+    "on CPU for the eight projection matrices in module construction order (q, k, v, gate, o, mlp gate, up, down)",
     "overrides": "torch.Generator().manual_seed(10000 + seed) in state_dict order: *norm.weight = 1 + 0.25 * N(0, 1); "
     "self_attn.gate_bias = 0.75 * N(0, 1)",
     "dtype": "every tensor cast once to bfloat16",
@@ -103,11 +103,11 @@ INIT_ORDER = (
 def generate_state(seed: int, d: Dims = BLOCK0) -> "OrderedDict[str, torch.Tensor]":
     """Deterministic bf16 block state on CPU (see STATE_RECIPE)."""
     shapes = param_shapes(d)
-    torch.manual_seed(1300 + seed + d.layer_id)
+    projection_gen = torch.Generator().manual_seed(1300 + seed + d.layer_id)
     matrices = {}
     for name in INIT_ORDER:
         weight = torch.empty(shapes[name], dtype=torch.float32)
-        torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5), generator=projection_gen)
         matrices[name] = weight
     gen = torch.Generator().manual_seed(10000 + seed)
     state: "OrderedDict[str, torch.Tensor]" = OrderedDict()

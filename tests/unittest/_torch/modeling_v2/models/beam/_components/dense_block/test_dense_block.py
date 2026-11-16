@@ -41,6 +41,7 @@ import functools
 import math
 import os
 import types
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -277,6 +278,15 @@ def compare(name: str, actual: torch.Tensor, expected: torch.Tensor, rule: str |
 # ----------------------------------------------------------------------------- state, inputs, fresh context
 
 _STATE_CACHE: dict[int, dict] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def release_generated_state() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        _STATE_CACHE.clear()
+        torch.cuda.empty_cache()
 
 
 def generated(seed: int) -> dict:

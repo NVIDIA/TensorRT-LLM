@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU checks for the test harness's cache readback indexing."""
+"""CPU checks for cache readback and reference-state isolation."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-__extra_import_path__ = ["."]
+__extra_import_path__ = [".", "_components/dense_block"]
 
+import _dense_block_reference as reference  # noqa: E402
 from _beam_component_support import cache_rows  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
@@ -43,3 +44,17 @@ def test_cache_rows_reads_nonzero_slots(num_layers: int, local_layer: int) -> No
             :length
         ]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("seed", [17, 41])
+def test_dense_reference_preserves_rng(seed: int) -> None:
+    dims = reference.Dims(hidden=8, intermediate=16, heads=2, kv_heads=1, head_dim=4)
+    with torch.random.fork_rng(devices=[]):
+        before = torch.get_rng_state().clone()
+        first = reference.generate_state(seed, dims)
+        assert torch.equal(before, torch.get_rng_state())
+        second = reference.generate_state(seed, dims)
+        assert torch.equal(before, torch.get_rng_state())
+        assert first.keys() == second.keys()
+        for name in first:
+            torch.testing.assert_close(first[name], second[name], rtol=0, atol=0)
