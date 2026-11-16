@@ -2154,24 +2154,36 @@ def test_stream_ends_with_a_generic_error_at_an_upstream_error_event(error):
         "data: [DONE]\n\n",
     ]
     read = []
+    source_ended = False
 
     async def source():
+        nonlocal source_ended
         for line in lines:
             read.append(line)
             yield line
+        # The chat stream awaits its metrics after [DONE].
+        await asyncio.sleep(0)
+        source_ended = True
 
     async def collect():
-        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+        frames = []
+        source_ended_at_error_frame = None
+        async for frame in reframe_openai_stream(source(), MODEL):
+            frames.append(frame)
+            if frame.startswith("event: error"):
+                source_ended_at_error_frame = source_ended
+        return frames, source_ended_at_error_frame
 
-    frames = asyncio.run(collect())
+    frames, source_ended_at_error_frame = asyncio.run(collect())
     events = parse_frames(frames)
     names = [name for name, _ in events]
     assert names[-1] == "error"
     assert "message_stop" not in names
     assert events[-1][1]["error"]["message"] == "Internal server error"
     assert not any("internal detail" in frame for frame in frames)
-    # The upstream is read to [DONE] so the chat stream's own cleanup runs.
+    # The upstream runs to its end before the error frame, so the chat stream's own cleanup runs.
     assert read == lines
+    assert source_ended_at_error_frame is True
 
 
 def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
