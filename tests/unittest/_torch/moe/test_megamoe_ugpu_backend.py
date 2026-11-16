@@ -57,6 +57,12 @@ def env(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     monkeypatch.setattr(backend_module, "get_sm_version", lambda: 107)
     monkeypatch.setattr(backend_module, "localize_megamoe_weights", place)
+    state.die_mask_calls = 0
+
+    def die_smid_mask() -> None:
+        state.die_mask_calls += 1
+
+    monkeypatch.setattr(backend_module, "_megamoe_ugpu_die_smid_mask", die_smid_mask)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
@@ -122,6 +128,8 @@ def test_post_load_installs_once_and_releases_original_bank(env) -> None:
     backend.post_load_weights()
     backend.transform_weights()
     assert env.placements == ["n_split"]
+    # The SM dies are mapped before the weights move, ahead of any graph capture.
+    assert env.die_mask_calls == 1
     for name, original in expected.items():
         placed = getattr(backend, name)
         halves = placed.view(2, 2, original.shape[1] // 2, *original.shape[2:])

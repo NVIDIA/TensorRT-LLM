@@ -26,6 +26,7 @@ uses the memory, so this module never unmaps memory from __del__.
 from __future__ import annotations
 
 import ctypes
+import functools
 import warnings
 from dataclasses import dataclass
 from typing import Literal, Sequence
@@ -34,6 +35,7 @@ import torch
 
 __all__ = [
     "LocalizedMegaMoEWeights",
+    "die_smid_mask",
     "PackedWeightLayout",
     "localize_megamoe_weights",
     "plan_packed_weight_layout",
@@ -450,3 +452,162 @@ def _place_weights(tensors, *, mode, driver):
     finally:
         if not succeeded:
             owner.close()
+
+
+# The die of every SM for CuTe DSL builds without cute.arch.locality_domain_id. Remove together
+# with the kernel's die_smid_mask path once the pinned CuTe DSL provides it (a CUDA 13.5-based build).
+_SMID_PROBE_PTX = b"""
+.version 8.0
+.target sm_80
+.address_size 64
+.visible .entry smid_probe(.param .u64 out)
+{
+    .reg .pred %p;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p, %r1, 0;
+    @%p bra DONE;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %smid;
+    mul.wide.u32 %rd2, %r2, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+DONE:
+    ret;
+}
+"""
+_SMID_MASK_WORDS = 4
+
+
+def _driver_result(ret, operation):
+    status, *values = ret if isinstance(ret, tuple) else (ret,)
+    if int(status) != 0:
+        raise RuntimeError(f"{operation} failed with CUDA driver status {status}")
+    return values[0] if len(values) == 1 else values
+
+
+@functools.lru_cache(maxsize=None)
+def die_smid_mask(device_index: int) -> tuple[int, ...]:
+    """Return the die (locality domain) of every SM of ``device_index`` as four 64-bit words.
+
+    Bit ``s`` is 1 when ``%smid == s`` is on die 1. Each die's SMs, including the ones above the
+    per-die guaranteed count, are split into a green context and a probe kernel records the
+    ``%smid`` its blocks ran on. Needs a driver and cuda-bindings with locality-domain SM groups
+    (CUDA 13.5). Call it before CUDA graph capture; the result is cached per device.
+    """
+    import cuda.bindings.driver as cuda
+
+    if not hasattr(cuda, "cuDevSmResourceSplit") or not hasattr(
+        cuda.CUdevSmResourceGroup_flags, "CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID"
+    ):
+        raise RuntimeError(
+            "Localized MegaMoE weights need cute.arch.locality_domain_id in CuTe DSL or, without it, "
+            "cuda-bindings >= 13.5 to map SMs to dies"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Map the MegaMoE SM dies before CUDA graph capture")
+    torch.cuda.init()
+    device = _driver_result(cuda.cuDeviceGet(device_index), "cuDeviceGet")
+    attribute = cuda.CUdevice_attribute
+    sm_count = _driver_result(
+        cuda.cuDeviceGetAttribute(attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device),
+        "cuDeviceGetAttribute",
+    )
+    domains = _driver_result(
+        cuda.cuDeviceGetAttribute(attribute.CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, device),
+        "cuDeviceGetAttribute",
+    )
+    if domains != 2 or sm_count > 64 * _SMID_MASK_WORDS:
+        raise RuntimeError(
+            f"Expected two locality domains and at most 256 SMs, got {domains} and {sm_count}"
+        )
+    flags = cuda.CUdevSmResourceGroup_flags
+    group_flags = int(flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID) | int(
+        flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_SUPPLEMENTAL_SMS
+    )
+    _driver_result(cuda.cuDevicePrimaryCtxRetain(device), "cuDevicePrimaryCtxRetain")
+    previous = _driver_result(cuda.cuCtxGetCurrent(), "cuCtxGetCurrent")
+    smids_by_die = []
+    try:
+        for die in range(domains):
+            sms = _driver_result(
+                cuda.cuDeviceGetDevResource(device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+                "cuDeviceGetDevResource",
+            )
+            # The split takes an exact SM count: the largest one accepted is the whole die.
+            for count in range(sm_count, 0, -1):
+                params = cuda.CU_DEV_SM_RESOURCE_GROUP_PARAMS()
+                params.smCount = count
+                params.flags = group_flags
+                params.localityDomainId = die
+                ret = cuda.cuDevSmResourceSplit(1, sms, 0, [params])
+                if int(ret[0]) == 0:
+                    group = ret[1][0] if isinstance(ret[1], (list, tuple)) else ret[1]
+                    break
+            else:
+                raise RuntimeError(f"Could not split the SMs of locality domain {die}")
+            smids_by_die.append(_smids_of(cuda, device, group, sm_count))
+    finally:
+        _driver_result(cuda.cuCtxSetCurrent(previous), "cuCtxSetCurrent")
+        cuda.cuDevicePrimaryCtxRelease(device)
+    die0, die1 = smids_by_die
+    if die0 & die1 or len(die0 | die1) != sm_count:
+        raise RuntimeError(
+            f"Locality-domain SM groups do not partition the {sm_count} SMs: {len(die0)} + {len(die1)}"
+        )
+    words = [0] * _SMID_MASK_WORDS
+    for smid in die1:
+        words[smid // 64] |= 1 << (smid % 64)
+    return tuple(words)
+
+
+def _smids_of(cuda, device, group, sm_count) -> set:
+    """``%smid`` of every SM in ``group``: probe blocks fill each SM of a green context on it."""
+    desc = _driver_result(cuda.cuDevResourceGenerateDesc([group], 1), "cuDevResourceGenerateDesc")
+    green = _driver_result(
+        cuda.cuGreenCtxCreate(
+            desc, device, cuda.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM
+        ),
+        "cuGreenCtxCreate",
+    )
+    try:
+        _driver_result(
+            cuda.cuCtxSetCurrent(_driver_result(cuda.cuCtxFromGreenCtx(green), "ctx")), "set ctx"
+        )
+        stream = _driver_result(
+            cuda.cuGreenCtxStreamCreate(green, cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, 0),
+            "cuGreenCtxStreamCreate",
+        )
+        module = _driver_result(cuda.cuModuleLoadData(_SMID_PROBE_PTX + b"\0"), "cuModuleLoadData")
+        function = _driver_result(
+            cuda.cuModuleGetFunction(module, b"smid_probe"), "cuModuleGetFunction"
+        )
+        blocks = 8 * sm_count
+        buffer = _driver_result(cuda.cuMemAlloc(4 * blocks), "cuMemAlloc")
+        try:
+            pointer = ctypes.c_uint64(int(buffer))
+            arguments = (ctypes.c_void_p * 1)(ctypes.addressof(pointer))
+            host = (ctypes.c_uint32 * blocks)()
+            seen = set()
+            for _ in range(16):
+                _driver_result(
+                    cuda.cuLaunchKernel(
+                        function, blocks, 1, 1, 32, 1, 1, 0, stream, ctypes.addressof(arguments), 0
+                    ),
+                    "cuLaunchKernel",
+                )
+                _driver_result(cuda.cuStreamSynchronize(stream), "cuStreamSynchronize")
+                _driver_result(
+                    cuda.cuMemcpyDtoH(ctypes.addressof(host), buffer, 4 * blocks), "cuMemcpyDtoH"
+                )
+                seen.update(host)
+        finally:
+            cuda.cuMemFree(buffer)
+            cuda.cuModuleUnload(module)
+            cuda.cuStreamDestroy(stream)
+    finally:
+        cuda.cuGreenCtxDestroy(green)
+    return seen
