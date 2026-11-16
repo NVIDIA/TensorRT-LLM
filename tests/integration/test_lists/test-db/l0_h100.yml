@@ -21,14 +21,12 @@ l0_h100:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_fp8_block_scales_skewed_routing
   # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases
   # run on CPU (l0_cpu). kernels/ has no entry of its own on any list, so this entry is
-  # what runs it here. multi_gpu/ cases need >= 2 GPUs and most also need Blackwell, so
-  # they skip here and run on Blackwell multi-GPU stages: l0_gb300_multi_gpus (post_merge)
-  # and l0_dgx_b300, which runs test_helix_zero_kv.py in its pre_merge block and the rest
-  # in post_merge. Collecting them still runs their helix files' import-time rebinding of
-  # mpi4py's serializer, which applies to the whole pytest process.
+  # what runs it here. multi_gpu/ is excluded; distributed cases run on Blackwell
+  # multi-GPU stages: l0_gb300_multi_gpus (post_merge) and l0_dgx_b300, which runs
+  # test_helix_zero_kv.py in pre_merge and the rest in post_merge.
   # The GPU cases of kernels/parallel_hw_agnostic/ run here; l0_b200 and l0_b300 ignore
   # that directory, so on Blackwell only GB300 (l0_gb300_multi_gpus, post_merge) runs them.
-  - unittest/_torch/attention
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/pyexecutor
@@ -360,11 +358,7 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs[tp1]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-large]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-large]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-xl]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-xxl]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-beam2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-on-beam2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-beam2-flan-t5-small]
@@ -389,7 +383,7 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v2-graphs-off-greedy]
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
   - unittest/bindings # 8 mins on H100
-  - unittest/kv_cache_manager_v2_tests # 4 min
+  - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache Iteration Stats ---------------
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse

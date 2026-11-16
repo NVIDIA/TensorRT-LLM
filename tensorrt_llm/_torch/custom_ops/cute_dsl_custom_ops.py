@@ -3295,7 +3295,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     weights_evict_first: bool = False,
+                     weights_evict_first_max_tokens: int = 0):
+            """``weights_evict_first``: load the expert weights (B / SFB) evict-first. Such a runner serves calls
+            of up to ``weights_evict_first_max_tokens`` tokens (the caller's bound; 0: unknown), and its tuning
+            covers row buckets up to that bound whatever the tuning call's rows."""
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -3312,6 +3317,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError("Expert-count scheduling requires top_k=1")
             self.fc2_n_tile_size_override = (
                 _get_cutedsl_fc2_n_tile_size_override())
+            self.weights_evict_first = weights_evict_first
+            self.weights_evict_first_max_tokens = (
+                weights_evict_first_max_tokens if weights_evict_first else 0)
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3339,6 +3347,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "fc2_n_tile_size_override",
                     self.fc2_n_tile_size_override,
                 )
+            if self.weights_evict_first:
+                runner_id += ("weights_evict_first", )
             return runner_id
 
         def _get_default_tactic(
@@ -3403,7 +3413,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = self.unique_id()
+            """The runner's TuningConfig; an evict-first runner with a token bound tunes up to the permuted rows of
+            that bound (``tune_max_num_tokens``), so its tactics cover every call it serves."""
+            key = (self.unique_id(), self.weights_evict_first_max_tokens)
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -3439,6 +3451,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
                     share_jit_builds=True,
+                    # The dynamic dimension is input 0's (permuted) rows.
+                    tune_max_num_tokens=helper.get_max_num_permuted_tokens(
+                        self.weights_evict_first_max_tokens)
+                    if self.weights_evict_first_max_tokens > 0 else None,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -3552,14 +3568,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
-            # A kernel class a subclass swaps in need not take the L2 hint.
-            weight_evict_first = (issubclass(
-                self.__class__.kernel_class,
-                Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
-                                  and not self.use_expert_counts
-                                  and _moe_weight_evict_first(
-                                      num_tokens, self.top_k, self.num_experts,
-                                      self.num_local_experts, self.tile_size))
+            # A kernel class a subclass swaps in need not take the L2 hint. The
+            # runner's own weights_evict_first (a model-declared token bound)
+            # adds to the shape rule.
+            weight_evict_first = (
+                issubclass(
+                    self.__class__.kernel_class,
+                    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
+                and (self.weights_evict_first or
+                     (not self.use_expert_counts and _moe_weight_evict_first(
+                         num_tokens, self.top_k, self.num_experts,
+                         self.num_local_experts, self.tile_size))))
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m,
                          self.use_expert_counts, self.num_local_experts,
@@ -3662,7 +3681,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
+        weights_evict_first_max_tokens: int = 0,
     ) -> None:
+        """``weights_evict_first``: load the expert weights (B / SFB) with an L2 evict_first policy (same math).
+        ``weights_evict_first_max_tokens``: the most tokens of a call that takes ``weights_evict_first`` (the
+        caller's bound): that runner is tuned up to it, whatever the tuning call's tokens (0: up to the tuning
+        call's)."""
         tuner = AutoTuner.get()
         if expert_counts is None and expert_capacity != 0:
             raise ValueError(
@@ -3684,7 +3709,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             output_dtype,
             scaling_vector_size,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            weights_evict_first=weights_evict_first,
+            weights_evict_first_max_tokens=weights_evict_first_max_tokens)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3724,6 +3751,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
+        weights_evict_first_max_tokens: int = 0,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)

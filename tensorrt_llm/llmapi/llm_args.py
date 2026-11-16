@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     # backend while llm_args is defining its public configuration models.
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MoEImplRequest
     from tensorrt_llm._torch.virtual_memory import \
         RestoreMode as _VirtualMemoryRestoreMode
 else:
@@ -973,6 +974,10 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
+
+    uses_dense_kv_cache: ClassVar[bool] = False
+    """Whether the algorithm changes only the attention kernel and keeps the
+    dense KV cache, so it gets the KV cache manager a dense model would get."""
 
     def supports_backend(self, backend: str) -> bool:
         """Override if the sparse attention algorithm does not support
@@ -1941,6 +1946,7 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
+    uses_dense_kv_cache: ClassVar[bool] = True
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
@@ -2337,12 +2343,96 @@ _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
+def auto_moe_backend_for_load_balancer(
+    load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]]
+) -> Literal["AUTO", "MEGAMOE_CUTEDSL"]:
+    """The backend an ``AUTO`` MoE selection runs under ``load_balancer``.
+
+    Only MegaMoE CuteDSL consumes per-layer dynamic EPLB plans, so ``AUTO``
+    means ``MEGAMOE_CUTEDSL`` under that mode and stays ``AUTO`` otherwise.
+    The target (``MoeConfig``) and drafts registered into the target's
+    balancer resolve ``AUTO`` through this one rule.
+
+    Args:
+        load_balancer: The EPLB config the MoE layers register into, or None.
+    """
+    if getattr(load_balancer, "mode", None) == "per_layer_dynamic":
+        return "MEGAMOE_CUTEDSL"
+    return "AUTO"
+
+
+_MOE_IMPL_CATALOG = (
+    "the MoE implementation catalog of the MoE performance guide "
+    "(https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, "
+    "docs/source/developer-guide/moe-perf-guide.md in the source tree)")
+
+
+def _moe_tactic_request(tactic: str, field_name: str) -> "MoEImplRequest":
+    """The implementations ``tactic`` names, read as MoE resolution reads it.
+
+    Args:
+        tactic: The tactic, stripped and lowercased.
+        field_name: The config field, for error messages.
+
+    Raises:
+        ValueError: MoE resolution would refuse the tactic for any checkpoint.
+    """
+    # Imported on use: the registry fills only as the MoE implementations are
+    # imported, and they import this module through ModelConfig, so a
+    # module-level import would be circular.
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import \
+        moe_impl_request
+    try:
+        return moe_impl_request(tactic=tactic)
+    except ValueError as error:
+        raise ValueError(
+            f"{field_name}={tactic!r}: {error} (the implementation ids and "
+            f"segment values are listed in {_MOE_IMPL_CATALOG})") from error
+
+
+def _normalize_moe_tactic(tactic: Optional[str],
+                          field_name: str) -> Optional[str]:
+    """Check a MoE tactic and return it stripped and lowercased.
+
+    Refuses what MoE resolution would refuse for any checkpoint; whether a
+    match can serve the layers is known only once the model is loaded.
+    """
+    if tactic is None:
+        return None
+    normalized = tactic.strip().lower()
+    _moe_tactic_request(normalized, field_name)
+    return normalized
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: _MoeBackend = Field(
         default='AUTO',
         description="MoE backend to use. "
+        "Choosing a backend other than AUTO is planned for deprecation where tactic can "
+        "replace it; which tactic does depends on the checkpoint's format (see tactic). "
         "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
+
+    tactic: Optional[str] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "MoE implementation to run for the target model; unrelated to "
+        "the autotuner's kernel tactics. The recommended interface for choosing it. "
+        "Takes an id 'provider.technique.kernel_name.quant' (e.g. "
+        "'trtllm.cutlass.grouped_gemm.nvfp4') or any dotted subset of its segments "
+        "(e.g. 'cutlass', 'mega_moe'); case-insensitive. The first match in catalog "
+        "order that can serve a layer of the checkpoint's expert format runs, with no "
+        "fallback; the matches must belong to one backend family. Requires backend "
+        "AUTO. A backend family can span several techniques, so the tactic that "
+        "replaces a backend depends on the format (CUTLASS also covers the "
+        "hopper_grouped_gemm and triton FP8 block-scale implementations); VANILLA has "
+        "none. Drafts and MTP layers are selected by speculative_config.moe_tactic; "
+        "with both draft fields unset, a target tactic makes a draft resolve AUTO for "
+        "its own weights instead of inheriting the target's backend. The ids, the "
+        "shortest tactic naming each, and the segment values are listed in "
+        f"{_MOE_IMPL_CATALOG}; a run logs the id of each MoE implementation it builds."
     )
 
     max_num_tokens: Optional[int] = Field(
@@ -2382,16 +2472,53 @@ class MoeConfig(StrictBaseModel):
     def resolve_load_balancer_config(cls, value: Any) -> Any:
         return _resolve_load_balancer_config(value)
 
+    @field_validator("tactic")
+    @classmethod
+    def validate_tactic_syntax(cls, tactic: Optional[str]) -> Optional[str]:
+        """Check that ``tactic`` names an implementation; lowercase it."""
+        return _normalize_moe_tactic(tactic, "moe_config.tactic")
+
+    @model_validator(mode="after")
+    def validate_tactic_excludes_backend(self) -> "MoeConfig":
+        # AUTO doubles as "no backend chosen" here. The check reads the value
+        # rather than ``model_fields_set``: model defaults are applied by
+        # rebuilding the config from a full ``model_dump()``, which marks every
+        # field as set. It goes with backend (see MoEImplRequest.backend_for).
+        if self.tactic is not None and self.backend != "AUTO":
+            raise ValueError(
+                f"moe_config.backend={self.backend!r} and moe_config.tactic="
+                f"{self.tactic!r} both choose the MoE implementation. Set only "
+                "one: drop tactic to select by backend, or leave backend at "
+                "AUTO to pin by tactic.")
+        return self
+
     @model_validator(mode="after")
     def resolve_load_balancer_compatibility(self) -> "MoeConfig":
         """Resolve the backend required by per-layer dynamic EPLB."""
-        if getattr(self.load_balancer, "mode", None) != "per_layer_dynamic":
+        required_backend = auto_moe_backend_for_load_balancer(
+            self.load_balancer)
+        if required_backend == "AUTO":
+            return self
+        if self.tactic is not None:
+            # A tactic stays the whole request, and MoE resolution refuses
+            # every match that does not consume per-layer dynamic EPLB plans.
+            request = _moe_tactic_request(self.tactic, "moe_config.tactic")
+            if not any(impl_cls.capabilities.supports_per_layer_dynamic_eplb
+                       for impl_cls in request.impls):
+                matched = [
+                    impl_cls.descriptor.impl_id for impl_cls in request.impls
+                ]
+                raise ValueError(
+                    "per-layer dynamic EPLB requires a moe_config.tactic that "
+                    "matches an implementation consuming per-layer dynamic "
+                    f"EPLB plans, such as one of backend {required_backend!r}; "
+                    f"{self.tactic!r} matches {matched}, none of which does.")
             return self
         if self.backend == "AUTO":
-            self.backend = "MEGAMOE_CUTEDSL"
-        elif self.backend != "MEGAMOE_CUTEDSL":
+            self.backend = required_backend
+        elif self.backend != required_backend:
             raise ValueError("per-layer dynamic EPLB requires "
-                             "backend='MEGAMOE_CUTEDSL'")
+                             f"backend={required_backend!r}")
         return self
 
 
@@ -2547,6 +2674,19 @@ class AttentionDpConfig(StrictBaseModel):
             "prompt minus the conversation's previous prompt (all of it for a "
             "first turn). Existing conversation->rank pins are unaffected. Only "
             "used when kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_home_wait_rounds: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Conversation-affinity routing: a returning conversation whose home "
+        "rank is full waits for a slot there for up to this many scheduling "
+        "rounds in which another rank had room, then overflows by "
+        "kv_cache_routing_new_conv_placement (keeping its home rank). Later "
+        "requests of the same admission group (priority) may pass a waiting "
+        "one on any rank; later groups may pass it on other ranks only, not "
+        "into its home rank. None overflows at once. Requires "
+        "kv_cache_routing_conversation_affinity=True; not combinable with "
+        "kv_cache_routing_strict_conversation_affinity.",
+        status="prototype")
     kv_cache_routing_strict_conversation_affinity: bool = Field(
         default=False,
         description=
@@ -2576,6 +2716,11 @@ class AttentionDpConfig(StrictBaseModel):
                 raise ValueError(
                     "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
                 )
+        if (self.kv_cache_routing_home_wait_rounds is not None
+                and not self.kv_cache_routing_conversation_affinity):
+            raise ValueError(
+                "attention_dp_config.kv_cache_routing_home_wait_rounds requires "
+                "kv_cache_routing_conversation_affinity=True")
         if (self.kv_cache_routing_strict_affinity_max_wait_iters
                 and not self.kv_cache_routing_strict_conversation_affinity):
             logger.warning_once(
@@ -2588,6 +2733,12 @@ class AttentionDpConfig(StrictBaseModel):
                 "attention_dp_config.kv_cache_routing_strict_conversation_affinity "
                 "is ignored without kv_cache_routing_conversation_affinity.",
                 key="attention_dp_config.strict_conversation_affinity")
+        if (self.kv_cache_routing_home_wait_rounds is not None
+                and self.kv_cache_routing_strict_conversation_affinity):
+            raise ValueError(
+                "attention_dp_config.kv_cache_routing_home_wait_rounds and "
+                "kv_cache_routing_strict_conversation_affinity cannot be combined"
+            )
         return self
 
 
@@ -2786,18 +2937,32 @@ class DecodingBaseConfig(StrictBaseModel):
 
     moe_backend: Optional[_MoeBackend] = Field(
         default=None,
+        description=
+        ("MoE backend for a neural draft model or embedded MTP layers "
+         "(PyTorch backend); ignored without a neural draft model. Values "
+         "other than AUTO are planned for deprecation where moe_tactic can "
+         "replace them. "
+         "With this and moe_tactic unset, the draft inherits the target's "
+         "backend, or resolves AUTO for its own weights when "
+         "moe_config.tactic pins the target; set this to the target's "
+         "former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when "
+         "the draft shares the target's per-layer dynamic EPLB. Nemotron-H "
+         "embedded MTP layers must run VANILLA exactly when the target "
+         "does."))
+
+    moe_tactic: Optional[str] = Field(
+        default=None,
+        status="prototype",
         description=(
-            "MoE backend override for a neural draft model or embedded MTP "
-            "layers on the PyTorch backend. None inherits the target model's "
-            "backend. AUTO resolves from the draft checkpoint or embedded MTP "
-            "layer quantization, and a concrete backend applies only to the "
-            "draft model or layers. Resolution may fall back based on model, "
-            "quantization, and hardware support. Replacement-head MTP "
-            "checkpoints must inherit the target model's MoE backend; leave "
-            "this option unset. Nemotron-H embedded MTP "
-            "layers must inherit the target backend because their checkpoint "
-            "mapper uses a shared backend-dependent layout. Decoding methods "
-            "without a neural draft model ignore this option."))
+            "MoE implementation to run for a neural draft model or embedded "
+            "MTP layers (PyTorch backend); ignored without a neural draft "
+            "model. The recommended interface for choosing it. Takes the "
+            "values of "
+            "moe_config.tactic: an id 'provider.technique.kernel_name.quant' "
+            "or any dotted subset of its segments. The ids, the shortest "
+            "tactic naming each, and the segment values are listed in "
+            f"{_MOE_IMPL_CATALOG}. Requires moe_backend unset or AUTO. Unset, "
+            "the draft selects as moe_backend describes."))
 
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
@@ -3008,18 +3173,28 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
-    def _validate_moe_backend_compatibility(self,
-                                            *,
-                                            model_config_resolved: bool = False
-                                            ) -> None:
-        if (self.moe_backend is None or not model_config_resolved
-                or not self.uses_replacement_heads):
-            return
-        raise ValueError(
-            "speculative_config.moe_backend cannot be set for replacement-head "
-            "MTP checkpoints. Replacement heads inherit the target model's "
-            "MoE backend. Leave moe_backend unset, or use a full external "
-            "draft-model checkpoint.")
+    @field_validator("moe_tactic")
+    @classmethod
+    def validate_moe_tactic_syntax(cls,
+                                   moe_tactic: Optional[str]) -> Optional[str]:
+        """Check that ``moe_tactic`` names an implementation; lowercase it."""
+        return _normalize_moe_tactic(moe_tactic,
+                                     "speculative_config.moe_tactic")
+
+    @model_validator(mode="after")
+    def validate_moe_tactic_excludes_moe_backend(self) -> "DecodingBaseConfig":
+        # None is this field's "no backend chosen". AUTO is accepted only to
+        # mirror MoeConfig.validate_tactic_excludes_backend, a transitional
+        # rule that goes when moe_backend is removed.
+        names_no_implementation = self.moe_backend in (None, "AUTO")
+        if self.moe_tactic is not None and not names_no_implementation:
+            raise ValueError(
+                f"speculative_config.moe_backend={self.moe_backend!r} and "
+                f"speculative_config.moe_tactic={self.moe_tactic!r} both choose "
+                "the draft MoE implementation. Set only one: drop moe_tactic to "
+                "select by moe_backend, or leave moe_backend unset to pin by "
+                "moe_tactic.")
+        return self
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -4906,6 +5081,14 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+_PositiveFiniteFloat = Annotated[float,
+                                 PydanticField(gt=0, allow_inf_nan=False)]
+# Remote cache timeouts become C++ millisecond deadlines; 1e6 s (11.6 days) is
+# far past any wait yet far inside their range.
+_RemoteTimeoutSeconds = Annotated[
+    float, PydanticField(gt=0, le=1e6, allow_inf_nan=False)]
+
+
 class GenPreemptionConfig(StrictBaseModel):
     """GEN slot preemption on a disaggregated generation worker.
 
@@ -4962,6 +5145,17 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
 
+    waiting_queue_max_wait_s: Optional[_PositiveFiniteFloat] = Field(
+        default=None,
+        description=(
+            "With waiting_queue_policy='priority': a request that has waited "
+            "this many seconds since it reached the server (in disaggregated "
+            "serving, the orchestrator) goes ahead of every request that has "
+            "not, oldest first. None: no cap. Keep it at or below the context "
+            "servers' cache_transceiver_config.kv_transfer_timeout_ms, whose "
+            "clock starts later (after prefill)."),
+        status="prototype")
+
     use_python_scheduler: bool = Field(
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
@@ -5009,6 +5203,14 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "ahead of the shortest-first order, oldest first. None "
             "disables it."),
         status="prototype")
+
+    @model_validator(mode="after")
+    def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
+        if (self.waiting_queue_max_wait_s is not None
+                and self.waiting_queue_policy != WaitingQueuePolicy.PRIORITY):
+            raise ValueError("scheduler_config.waiting_queue_max_wait_s "
+                             "requires waiting_queue_policy='priority'")
+        return self
 
     @model_validator(mode="after")
     def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
@@ -5551,6 +5753,187 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Donors publish host memory in chunks of this many bytes (remote_donor.py).
+REMOTE_CACHE_CHUNK_BYTES = 1 << 30
+# Default of RemoteCacheConfig.donor_reserve_size.
+REMOTE_CACHE_DONOR_RESERVE_BYTES = 24 << 30
+# One RemoteCacheConfig.ucx_devices entry, stripped: a name without ':' or ',',
+# then optionally ':' or ':1' (NIXL's UCX backend uses port 1 of each device).
+_UCX_DEVICE_ENTRY = r"\s*[^\s,:][^,:]*(:1?)?\s*"
+REMOTE_CACHE_UCX_DEVICES_PATTERN = (
+    rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$")
+
+
+class RemoteNixlTransportConfig(StrictBaseModel):
+    """Remote cache transport over one-sided NIXL RDMA."""
+
+    kind: Literal["nixl"] = Field(
+        default="nixl",
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    ucx_devices: Optional[str] = Field(
+        default=None,
+        pattern=REMOTE_CACHE_UCX_DEVICES_PATTERN,
+        status="prototype",
+        description=
+        "Comma-separated UCX devices of the remote level's and the donor's NIXL "
+        "agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' "
+        "(NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's "
+        "physical GPU index. None uses the process's UCX environment.")
+
+    transfer_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=30.0,
+        status="prototype",
+        description=
+        "Seconds one batch of page transfers of a remote level may take before "
+        "the level fails, e.g. on a donor that died. At most 1e6.")
+
+
+class RemoteFabricTransportConfig(StrictBaseModel):
+    """Remote cache transport over CUDA fabric memory.
+
+    Claimants in the same multi-node NVLink domain copy it over NVLink.
+    """
+
+    kind: Literal["fabric"] = Field(
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    donor_reserve_size: NonNegativeInt = Field(
+        default=REMOTE_CACHE_DONOR_RESERVE_BYTES,
+        status="prototype",
+        description=
+        "Bytes of free plus reclaimable memory each host NUMA node keeps for "
+        "the processes on it while a donation is placed. Chunks go to the GPU's "
+        "node first, then to the others; a donation that does not fit is "
+        "published short.")
+
+    compact_host_memory: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Before a node that refuses a donated chunk is left, run up to 64 "
+        "reclaim-and-compact passes on it (fault in and release node-bound "
+        "huge pages under a per-node lock that donors on one host take in "
+        "turn), so fragmented or page-cache-filled memory can still take the "
+        "donation. False publishes what fits and leaves compaction to the job "
+        "prolog.")
+
+
+RemoteTransportConfig: TypeAlias = Annotated[
+    Union[RemoteNixlTransportConfig, RemoteFabricTransportConfig],
+    Field(discriminator="kind"),
+]
+
+
+class RemoteDonorConfig(StrictBaseModel):
+    """Host memory this rank donates to remote cache levels."""
+
+    size: int = Field(
+        ge=REMOTE_CACHE_CHUNK_BYTES,
+        status="prototype",
+        description=
+        "Bytes donated for the lifetime of the process, in whole 1 GiB chunks "
+        "(a remainder below one chunk is not donated; the rank logs the size "
+        "it donates).")
+
+
+class RemoteExpectedDonorsConfig(StrictBaseModel):
+    """The job's donors and claims, which only the launcher can count."""
+
+    num_donors: PositiveInt = Field(
+        status="prototype",
+        description="Number of donating ranks the job starts.")
+
+    claim_size: PositiveInt = Field(
+        status="prototype",
+        description="Bytes all ranks of the job claim from `directory` together."
+    )
+
+
+class RemoteLevelConfig(StrictBaseModel):
+    """This rank's remote cache level, in chunks of donated memory."""
+
+    size: PositiveInt = Field(
+        status="prototype",
+        description=
+        "Bytes of the level. Pages are stored as the cold tiers store them: "
+        "byte copies, or encoded by a lossy cold-page codec "
+        "(kv_cache_compression_config) when one is set. It takes the disk "
+        "level's place, so it cannot be combined with `disk_cache_size`.")
+
+    pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Split of `size` across layer groups, one positive weight per layer "
+        "group in KV cache manager v2 layer-group ID order (normalized). None "
+        "follows the hot tier's split.")
+
+    expected: Optional[RemoteExpectedDonorsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "With it, the rank waits until these donors have reported and fails "
+        "at once if they cannot cover the claims, instead of after a claim "
+        "wait.")
+
+    donor_wait_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=900.0,
+        status="prototype",
+        description=
+        "Seconds the rank waits for donors, applied to each wait on its own: "
+        "for the expected donors to report, and for each chunk claim. Donors "
+        "publish while their own servers start, so this bounds the job's "
+        "startup skew per wait, not in total. At most 1e6.")
+
+
+class RemoteCacheConfig(StrictBaseModel):
+    """KV cache manager v2 remote cache level in host memory that other ranks donate.
+
+    A rank with `level` gets a cache level below the host tier whose slots live
+    in memory that ranks with `donor` publish in `directory`.
+    """
+
+    directory: str = Field(
+        min_length=1,
+        status="prototype",
+        description=
+        "Rendezvous directory, on a file system every rank of the job sees, where "
+        "donors publish their memory and remote cache levels claim chunks of it. "
+        "Environment variables are expanded, and one that is not set is an "
+        "error; the directory is created if missing. Use one directory per job."
+    )
+
+    transport: RemoteTransportConfig = Field(
+        default_factory=RemoteNixlTransportConfig,
+        status="prototype",
+        description=
+        "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or "
+        "{kind: fabric} (CUDA fabric memory copied over NVLink).")
+
+    donor: Optional[RemoteDonorConfig] = Field(
+        default=None,
+        status="prototype",
+        description="This rank's donation; None donates nothing.")
+
+    level: Optional[RemoteLevelConfig] = Field(
+        default=None,
+        status="prototype",
+        description="This rank's remote cache level; None gives it none.")
+
+    @model_validator(mode="after")
+    def validate_remote_cache(self) -> 'RemoteCacheConfig':
+        if self.donor is None and self.level is None:
+            raise ValueError(
+                "remote_cache_config needs a `donor`, a `level`, or both")
+        return self
+
+
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;
 # the full history is stored in the first. Requires KV cache manager V2.
@@ -5623,6 +6006,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    remote_cache_config: Optional[RemoteCacheConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "KV cache manager v2 remote cache level in host memory that other ranks "
+        "donate (usually generation ranks to context ranks). None disables it.")
     disk_io_threads: NonNegativeInt = Field(
         default=0,
         le=256,
@@ -5833,6 +6223,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    defer_generation_only_release: bool = Field(
+        default=False,
+        status="prototype",
+        description="Release the KV cache of a finished generation-only request "
+        "(disaggregated generation server) after the next forward is enqueued, "
+        "so that the host-side release overlaps GPU work. The pages return one "
+        "iteration later, or as soon as the scheduler runs out of pages, before "
+        "it suspends or recompute-pauses a running request. Their KV cache events "
+        "are published one iteration later too, "
+        "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
+        "without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -6147,6 +6550,35 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                     "kv_cache_config.disk_protected_copy_fraction has no effect without "
                     "disk_keep_copy_after_restore or disk_write_through: there are no disk copies to limit."
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_remote_cache_config(self) -> 'KvCacheConfig':
+        remote = self.remote_cache_config
+        if remote is None:
+            return self
+        if self.use_kv_cache_manager_v2 is False:
+            raise ValueError("kv_cache_config.remote_cache_config requires "
+                             "use_kv_cache_manager_v2")
+        if remote.level is not None and self.disk_cache_size:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.level and "
+                "disk_cache_size cannot both be set: the remote level takes the "
+                "disk level's place")
+        if remote.level is not None and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.level and "
+                "enable_kv_pool_rebalance cannot both be set: a rebalance "
+                "would claim donor chunks while every request waits")
+        return self
+
+    @model_validator(mode='after')
+    def validate_defer_generation_only_release(self) -> 'KvCacheConfig':
+        if (self.defer_generation_only_release
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')
@@ -8287,6 +8719,35 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def warn_waiting_queue_max_wait_s(self) -> 'TorchLlmArgs':
+        scheduler = self.scheduler_config
+        transceiver = self.cache_transceiver_config
+        if (scheduler.waiting_queue_max_wait_s is not None
+                and transceiver is not None
+                and transceiver.kv_transfer_timeout_ms is not None
+                and scheduler.waiting_queue_max_wait_s * 1000
+                > transceiver.kv_transfer_timeout_ms):
+            logger.warning(
+                "scheduler_config.waiting_queue_max_wait_s "
+                f"({scheduler.waiting_queue_max_wait_s} s) exceeds "
+                "cache_transceiver_config.kv_transfer_timeout_ms "
+                f"({transceiver.kv_transfer_timeout_ms} ms): a request passed "
+                "over that long may find its context server's KV transfer "
+                "timed out.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_defer_generation_only_release(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config.defer_generation_only_release and (
+                self.disable_overlap_scheduler
+                or self.pipeline_parallel_size > 1):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release is used only "
+                "by the overlap scheduler loop, which needs "
+                "disable_overlap_scheduler=False and pipeline_parallel_size=1.")
+        return self
+
+    @model_validator(mode="after")
     def reject_csa2_kv_pool_rebalance(self) -> 'TorchLlmArgs':
         """Reject resizing while CSA2 pool views and captured decode descriptors are fixed."""
         if (isinstance(self.sparse_attention_config, CSA2SparseAttentionConfig)
@@ -8779,8 +9240,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
-
-            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,

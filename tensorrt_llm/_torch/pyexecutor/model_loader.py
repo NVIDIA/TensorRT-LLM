@@ -289,6 +289,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                            and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
+            and not getattr(getattr(model_config, "modeling_v2_target", None),
+                            "supports_nvfp4_kv_cache", False)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
@@ -938,6 +940,28 @@ def _checkpoint_io_policy_metadata(
         "effective": status.effective,
         "fallback_reason": status.fallback_reason,
     }
+
+
+def captured_cuda_graph_batch_sizes(
+        llm_args: TorchLlmArgs, max_num_tokens: int,
+        spec_config: Optional[DecodingBaseConfig]) -> Tuple[int, ...]:
+    """The decode CUDA-graph batch sizes the engine captures
+    (``engine.cuda_graph.plan_cuda_graphs``): the configured ones within
+    max_batch_size and max_num_tokens // tokens per request; () without
+    CUDA graphs. Sizes above them never run, so buffers sized by the largest
+    graph batch (``ModelConfig.cuda_graph_batch_sizes``) stop there."""
+    config = llm_args.cuda_graph_config
+    if config is None or not config.batch_sizes:
+        return ()
+    from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+    max_batch_size = (llm_args.max_batch_size if llm_args.max_batch_size
+                      is not None else max(config.batch_sizes))
+    tokens_per_request = (spec_config.tokens_per_gen_step
+                          if spec_config is not None else 1)
+    return tuple(
+        filter_cuda_graph_batch_sizes(list(config.batch_sizes), max_batch_size,
+                                      max_num_tokens, tokens_per_request,
+                                      config.enable_padding))
 
 
 class ModelLoader:
@@ -2361,9 +2385,8 @@ class ModelLoader:
             mnnvl_allreduce_fp8_payload=self.llm_args.
             mnnvl_allreduce_fp8_payload,
             replicate_embedding=self.llm_args.replicate_embedding,
-            cuda_graph_batch_sizes=tuple(
-                self.llm_args.cuda_graph_config.batch_sizes or
-                ()) if self.llm_args.cuda_graph_config else (),
+            cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
+                self.llm_args, self.max_num_tokens, self.spec_config),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
@@ -2371,6 +2394,7 @@ class ModelLoader:
                 self.llm_args.mla_skip_correction_threshold
                 if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
+            moe_tactic=self.llm_args.moe_config.tactic,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(
