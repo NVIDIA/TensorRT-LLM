@@ -3716,6 +3716,77 @@ def take_async_loads(scheduler):
     return scheduler.build_connector_meta(SchedulerOutput()).async_loads
 
 
+def test_scheduler_declares_admission_queries() -> None:
+    """A query has no effect beyond its answer until the pages are reported.
+
+    So the KV cache manager may ask while the scheduler is still admitting the
+    request (`kv_connector_config.admission_query`).
+    """
+    assert MooncakeStoreConnectorScheduler.supports_admission_query is True
+
+
+def test_scheduler_repeated_query_replaces_the_answer(store_config: Path) -> None:
+    """A request asked at admission and asked again is served by the last answer only."""
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, False)
+    scheduler._worker.hit_blocks = 3
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (3 * TOKENS_PER_BLOCK, False)
+    assert len(scheduler._worker.queries) == 2
+    # The chain is kept and extended idempotently, not rebuilt.
+    assert len(scheduler._requests[1].chain.hashes) == 5
+
+    pages = [10, 11, 12, 13, 14]
+    settle_offer(scheduler, request, 3 * TOKENS_PER_BLOCK, pages)
+    data = request_data(
+        1, tokens, pages, computed_position=0, num_scheduled_tokens=2 * TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for transfers in metadata.loads for page in transfers.pages] == [
+        10,
+        11,
+        12,
+    ]
+    assert saved_pages(metadata) == [13, 14]
+
+    # The offer is consumed once. The follow-up carries no new tokens, since the
+    # adapter accumulates the per-step token deltas.
+    again = scheduler.build_connector_meta(
+        SchedulerOutput(
+            cached_requests=[
+                request_data(
+                    1, [], [], computed_position=5 * TOKENS_PER_BLOCK, num_scheduled_tokens=0
+                )
+            ]
+        )
+    )
+    assert again.loads == []
+
+
+def test_scheduler_query_reset_query_is_clean(store_config: Path) -> None:
+    """A deferred first chunk gives its pages back between two queries."""
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    first_state = scheduler._requests[1]
+
+    scheduler.request_reset(request)
+    scheduler._worker.hit_blocks = 1
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (TOKENS_PER_BLOCK, False)
+    assert scheduler._requests[1] is not first_state
+
+    pages = [20, 21, 22, 23, 24]
+    settle_offer(scheduler, request, TOKENS_PER_BLOCK, pages)
+    data = request_data(
+        1, tokens, pages, computed_position=0, num_scheduled_tokens=4 * TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for transfers in metadata.loads for page in transfers.pages] == [20]
+    assert saved_pages(metadata) == [21, 22, 23, 24]
+
+
 def test_scheduler_offers_asynchronously_when_enabled(store_config):
     scheduler = make_async_scheduler(store_config, hit_blocks=2)
     request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
