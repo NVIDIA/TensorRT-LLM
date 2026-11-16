@@ -18,6 +18,7 @@ implementation of block hashing without importing the whole router module.
 """
 
 import os
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Union
@@ -75,6 +76,7 @@ BlockHash = Union[int, str]
 # configuration from the checkpoint's Mistral-native files (mistral-common's tekken.json and
 # params.json), not from its Hugging Face files.
 _MISTRAL_NATIVE_FORMATS = frozenset({CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3})
+_MISTRAL_TOKENIZER_MODULE = "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer"
 
 __all__ = [
     "KV_CACHE_HASH_ALGO_DEFAULT",
@@ -230,18 +232,15 @@ class BlockHashMixin:
             if self._mistral_native:
                 # The servers' own tokenizer wrapper (mistral-common's, for a Mistral-native
                 # checkpoint), which encodes as they do; its ``.tokenizer`` is not a
-                # Hugging Face tokenizer.
-                self._tokenizers[model] = self._render_resources(model).tokenizer
-            elif self._custom_tokenizer:
+                # Hugging Face tokenizer. Shared by every model name (see _render_key).
+                return self._render_resources(model).tokenizer
+            if self._custom_tokenizer:
                 from tensorrt_llm.tokenizer import load_custom_tokenizer
 
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model_path, trust_remote_code=trust_remote_code
                 )
             else:
-                from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import (
-                    MistralTokenizer,
-                )
                 from tensorrt_llm.tokenizer import load_hf_tokenizer
 
                 # The loader a worker and the standalone renderer use, so the tokenizer's
@@ -249,7 +248,10 @@ class BlockHashMixin:
                 tokenizer = load_hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
                 if tokenizer is None:
                     raise ValueError(f"Could not load a tokenizer from {model_path!r}.")
-                if not isinstance(tokenizer, MistralTokenizer):
+                # load_hf_tokenizer imports mistral-common's wrapper before it returns one;
+                # importing it here for every other tokenizer would load the model packages.
+                mistral = sys.modules.get(_MISTRAL_TOKENIZER_MODULE)
+                if mistral is None or not isinstance(tokenizer, mistral.MistralTokenizer):
                     self._tokenizers[model] = tokenizer.tokenizer
                 else:
                     # A Mistral-native directory loads as mistral-common's wrapper, whose
@@ -354,15 +356,26 @@ class BlockHashMixin:
             logger.debug(f"Router could not render the request ({error}); routing on no ids.")
             return []
 
+    def _render_key(self, model: str) -> str:
+        """What ``model``'s rendering resources are cached under.
+
+        A Mistral-native router loads the configured checkpoint whatever model name a
+        client sends, so it keys them by that checkpoint; any other router by the name.
+        """
+        if self._mistral_native:
+            return self._model_path or self._tokenizer_dir or model
+        return model
+
     def _render_resources(self, model: str) -> RenderResources:
         """Rendering resources of this router for ``model``, built once."""
         cache = self.__dict__.setdefault("_render_resources_cache", {})
-        resources = cache.get(model)
+        key = self._render_key(model)
+        resources = cache.get(key)
         if resources is None and self._mistral_native:
             # What a server of this checkpoint loads: the tokenizer and input processor of
             # the checkpoint format, and the model type from its native configuration.
-            resources = cache[model] = RenderResources.load(
-                self._model_path or self._tokenizer_dir or model,
+            resources = cache[key] = RenderResources.load(
+                key,
                 tokenizer=self._tokenizer_dir,
                 trust_remote_code=self._tokenizer_dir is not None,
                 custom_tokenizer=self._custom_tokenizer,
@@ -396,7 +409,7 @@ class BlockHashMixin:
                 use_harmony=use_harmony,
                 custom_tokenizer=self._custom_tokenizer,
             )
-            cache[model] = resources
+            cache[key] = resources
         return resources
 
     def _write_back_decision(
@@ -432,9 +445,10 @@ class BlockHashMixin:
         if not remote:
             return WriteBackDecision(allowed=False)
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
-        local = cache.get(model)
+        key = self._render_key(model)
+        local = cache.get(key)
         if local is None:
-            local = cache[model] = self._render_resources(model).fingerprint()
+            local = cache[key] = self._render_resources(model).fingerprint()
         mismatched: dict[str, str] = {}
         for server, fingerprint in zip(servers, remote):
             reason = fingerprint_mismatch(local, fingerprint)
