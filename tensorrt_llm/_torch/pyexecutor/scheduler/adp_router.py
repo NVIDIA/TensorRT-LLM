@@ -230,7 +230,7 @@ def plan_kv_balanced_admission(
 
 
 def _lru_put(table: OrderedDict, key, value, cap: int) -> None:
-    """Insert or refresh ``key`` as most recent, then evict the oldest entries above ``cap``."""
+    """Insert or refresh `key` as most recent, then evict the oldest entries above `cap`."""
     table[key] = value
     table.move_to_end(key)
     while len(table) > cap:
@@ -238,7 +238,7 @@ def _lru_put(table: OrderedDict, key, value, cap: int) -> None:
 
 
 def _attention_dp_relax(req_item) -> bool:
-    """Sort key that puts requests with a strict ``attention_dp_rank`` first."""
+    """Sort key that puts requests with a strict `attention_dp_rank` first."""
     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None or scheduling_params.attention_dp_rank is None:
         return True
@@ -319,9 +319,9 @@ class ADPRouter(ABC):
                 requests in per-rank load.  Ignored by DefaultADPRouter.
             kv_connector_manager: The executor's KV cache connector manager (may
                 be None). WorkAwareADPRouter needs one that moves KV (not
-                ``capacity_only``). Under attention DP the manager has already
+                `capacity_only`). Under attention DP the manager has already
                 validated that such a connector shares one storage pool across
-                the ranks (``KvCacheConnectorManager.validate_attention_dp``), so
+                the ranks (`KvCacheConnectorManager.validate_attention_dp`), so
                 a conversation's earlier prompt is restorable on any rank.
 
         Returns:
@@ -1777,16 +1777,16 @@ class WorkAwareADPRouter(ADPRouter):
     Intended for context servers whose KV cache connector restores prefixes
     from a pool shared by all attention-DP ranks: a conversation's earlier
     prompt is restorable on whichever rank a later request lands, so the
-    estimate does not depend on the rank. ``ADPRouter.create`` builds it only
+    estimate does not depend on the rank. `ADPRouter.create` builds it only
     when such a connector is attached.
 
-    Only ``route_requests`` changes the two tables, including their LRU order,
+    Only `route_requests` changes the two tables, including their LRU order,
     and it runs on every rank with the same gathered states and broadcast
-    requests, so the tables stay identical across ranks. ``create_rank_state``
+    requests, so the tables stay identical across ranks. `create_rank_state`
     only reads them. The estimate is also published as
-    ``py_uncached_prefill_tokens`` for the V2 scheduler's long-prefill demotion
-    (``TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS``) while that is enabled (see
-    ``set_publish_uncached_estimate``).
+    `py_uncached_prefill_tokens` for the V2 scheduler's long-prefill demotion
+    (`TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS`) while that is enabled (see
+    `set_publish_uncached_estimate`).
     """
 
     # LRU cap on each table (entries are tens of bytes each), bounding memory on
@@ -1822,7 +1822,7 @@ class WorkAwareADPRouter(ADPRouter):
         """Publish py_uncached_prefill_tokens only while the scheduler uses it.
 
         Args:
-            enabled: Whether to set ``py_uncached_prefill_tokens`` on routed
+            enabled: Whether to set `py_uncached_prefill_tokens` on routed
                 requests.
         """
         self._publish_uncached_estimate_enabled = enabled
