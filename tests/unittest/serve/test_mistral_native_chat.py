@@ -259,15 +259,22 @@ def _server_ids(tokenizer, **fields):
     return rendered.token_ids
 
 
+def _renders_response_formats():
+    from mistral_common.protocol.instruct import request
+
+    return hasattr(request, "JsonSchema")  # mistral-common >= 1.13.0
+
+
 def _mistral_ids(tokenizer, messages, response_format=None, **kwargs):
     """mistral-common encoding the raw request messages."""
     from mistral_common.protocol.instruct.request import ChatCompletionRequest as MistralRequest
-    from mistral_common.protocol.instruct.request import JsonSchema, ResponseFormat
 
-    if response_format == "json_object":
-        kwargs["response_format"] = ResponseFormat(type=response_format)
-    elif response_format == "json_schema":
-        schema = JsonSchema(**_CITY_FORMAT["json_schema"])
+    if response_format is not None:
+        from mistral_common.protocol.instruct.request import JsonSchema, ResponseFormat
+
+        schema = None
+        if response_format == "json_schema":
+            schema = JsonSchema(**_CITY_FORMAT["json_schema"])
         kwargs["response_format"] = ResponseFormat(type=response_format, json_schema=schema)
     request = MistralRequest.from_openai(messages=messages, **kwargs)
     return tokenizer.mistral.encode_chat_completion(request).tokens
@@ -345,6 +352,8 @@ def test_chats_render_as_mistral_common(tokenizer, case):
     if case == "images":
         pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
     fields, mistral_kwargs = _CASES[case]
+    if "response_format" in mistral_kwargs and not _renders_response_formats():
+        pytest.skip("mistral-common renders response formats from 1.13.0 on")
     ids = _server_ids(tokenizer, **fields)
     assert ids == _mistral_ids(tokenizer, fields["messages"], **mistral_kwargs)
     assert ids[0] == tokenizer.bos_token_id
@@ -355,6 +364,18 @@ def test_chats_render_as_mistral_common(tokenizer, case):
         assert ids != _mistral_ids(tokenizer, joined)
     if case == "images":
         assert ids.count(tokenizer.tokenizer.get_control_token("[IMG_END]")) == 2
+
+
+@pytest.mark.parametrize("response_format", [_CITY_FORMAT, {"type": "json_object"}])
+def test_an_older_mistral_common_leaves_the_response_format_out(
+    tokenizer, response_format, monkeypatch
+):
+    """Before 1.13.0 (Python 3.10), the response format only constrains decoding."""
+    from mistral_common.protocol.instruct import request
+
+    monkeypatch.delattr(request, "JsonSchema", raising=False)
+    plain = _server_ids(tokenizer, messages=_HI)
+    assert _server_ids(tokenizer, messages=_HI, response_format=response_format) == plain
 
 
 def test_reasoning_effort_renders_where_the_checkpoint_declares_it(tokenizer):
