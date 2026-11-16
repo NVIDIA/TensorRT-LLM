@@ -1181,7 +1181,7 @@ def test_a_unit_that_drafts_with_an_earlier_units_drafter_is_held_to_its_floor()
     assert resolve(accuracy, "multimodal", ["mtp", "multimodal"]).value == 1.8
 
 
-_LAYOUT_PACKAGE = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_LAYOUT_PACKAGE = "tensorrt_llm/_torch/modeling_v2"
 _LAYOUT_TESTS = "tests/unittest/_torch/modeling_v2"
 _LAYOUT_TARGET = f"{_LAYOUT_PACKAGE}/models/layout_family/layout_target"
 _SHARED_MOE_ENTRIES = (
@@ -1200,7 +1200,7 @@ def test_shared_moe_test_layout_paths_and_delivery(tmp_path: Path, layout: str) 
     model = tmp_path / _LAYOUT_TARGET / "modeling.py"
     model.parent.mkdir(parents=True)
     model.write_text(
-        f"from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.{name} import Entry\n",
+        f"from tensorrt_llm._torch.modeling_v2.catalog.moe.{name} import Entry\n",
         encoding="utf-8",
     )
 
@@ -1308,7 +1308,7 @@ def test_new_test_layout_does_not_accept_missing_or_unexercised_tests(
     if shared:
         source = f"{_LAYOUT_PACKAGE}/catalog/moe/probe.py"
         tests = f"{_LAYOUT_TESTS}/moe/ops"
-        imported = "tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.probe"
+        imported = "tensorrt_llm._torch.modeling_v2.catalog.moe.probe"
     else:
         source = f"{_LAYOUT_TARGET}/ops/moe/probe.py"
         tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe"
@@ -1343,7 +1343,12 @@ def test_new_test_layout_does_not_accept_missing_or_unexercised_tests(
     ("path", "expected"),
     [
         (f"{_LAYOUT_TESTS}/moe/ops/test_modeling_v2_probe.py", True),
+        (f"{_LAYOUT_TESTS}/moe/test_modeling_v2_probe.py", True),
         (f"{_LAYOUT_TESTS}/gemm/ops/test_modeling_v2_probe.py", False),
+        (
+            f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe/test_modeling_v2_probe.py",
+            False,
+        ),
         (
             f"{_LAYOUT_TESTS}/models/layout_family/layout_target/moe/ops/test_modeling_v2_probe.py",
             False,

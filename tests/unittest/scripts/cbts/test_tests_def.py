@@ -1109,10 +1109,44 @@ def test_modeling_v2_helper_keeps_new_same_directory_consumer(tmp_path: Path) ->
     assert new_test in _entries_by_stem(result)["l0_gr100"]
 
 
+def _has_covering_ci_entry(index: YAMLIndex, target: str) -> bool:
+    from cbts.blocks import _entry_target, _target_in_filter_subtree
+    from cbts.rules._helpers import lookup_paths_into_block_filters
+
+    filters, _ = lookup_paths_into_block_filters(index, [target])
+    entries = {
+        _entry_target(raw)
+        for by_prefix in filters.values()
+        for ids in by_prefix.values()
+        for raw in ids
+    }
+    return any(
+        _target_in_filter_subtree(entry, target) or _target_in_filter_subtree(target, entry)
+        for entry in entries
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "registered"),
+    [
+        ("ops/gemm", True),
+        ("ops/gemm/test_probe.py", True),
+        ("ops/gemm/test_probe.py::test_case TIMEOUT (30)", True),
+        ("ops", True),
+        ("ops/moe", False),
+        ("ops/gemm_other", False),
+    ],
+)
+def test_modeling_v2_registration_requires_target_coverage(
+    tmp_path: Path, entry: str, registered: bool
+) -> None:
+    rule = _make_cohort_rule(tmp_path, {"l0_gr100": {f"{_COHORT_GLM}/{entry}"}})
+    assert _has_covering_ci_entry(rule.yaml_index, f"{_COHORT_GLM}/ops/gemm") is registered
+
+
 def test_modeling_v2_association_paths_and_ci_registration(
     modeling_v2_cohort_real_rule: CbtsTestsDefRule,
 ) -> None:
-    from cbts.rules._helpers import lookup_paths_into_block_filters
     from cbts.rules.modeling_v2 import _EXTRA_SOURCE_UNIT_TESTS, _is_whole_tree_test
     from cbts.rules.tests_def import MODELING_V2_TEST_GROUPS
 
@@ -1122,8 +1156,7 @@ def test_modeling_v2_association_paths_and_ci_registration(
         assert (repo / source).is_file(), source
         for target in targets:
             assert (repo / "tests" / target).exists(), target
-            filters, _ = lookup_paths_into_block_filters(index, [target])
-            assert filters, (source, target)
+            assert _has_covering_ci_entry(index, target), (source, target)
     guard = "unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py"
     assert (repo / "tests" / guard).is_file()
     assert _is_whole_tree_test(guard)

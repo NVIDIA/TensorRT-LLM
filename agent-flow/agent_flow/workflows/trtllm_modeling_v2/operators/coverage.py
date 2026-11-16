@@ -690,7 +690,10 @@ def is_entry_file(path: str, target: str) -> bool:
     in_shared_tests_dir = _is_shared(target) and file.parent in {
         PurePosixPath(directory) for directory in shared_test_dirs(category)
     }
-    if path.startswith("tests/") and (file.parent.name == category or in_shared_tests_dir):
+    in_owner_tests_dir = (
+        parts[0] == MODEL_OPS_DIRNAME and len(parts) > 2 and file.parent.name == category
+    )
+    if path.startswith("tests/") and (in_owner_tests_dir or in_shared_tests_dir):
         stem = file.stem
         ordinary_stem = PurePosixPath(collected_test_names(name)[0]).stem
         return stem == ordinary_stem or stem.startswith((f"{ordinary_stem}_", f"_{name}_"))
