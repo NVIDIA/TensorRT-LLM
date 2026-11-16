@@ -97,16 +97,16 @@ def test_moe_router_agreement_runs_only_in_diagnostic_mode(
     assert agreements == ([3] if diagnostics else [])
 
 
-class _Reduce:
-    """A stand-in for the four-rank all-reduce: returns the sum the peers would produce."""
+class _Gather:
+    """Gather the supplied local flag with three independently configured peer flags."""
 
-    def __init__(self, total: int) -> None:
-        self.total = total
-        self.calls = 0
+    def __init__(self, peers_on: int) -> None:
+        self.peers = [1] * peers_on + [0] * (3 - peers_on)
+        self.inputs: list[torch.Tensor] = []
 
     def __call__(self, flag: torch.Tensor) -> torch.Tensor:
-        self.calls += 1
-        return torch.tensor([float(self.total)])
+        self.inputs.append(flag.clone())
+        return torch.cat((flag, flag.new_tensor(self.peers)))
 
 
 @pytest.mark.parametrize(
@@ -114,16 +114,17 @@ class _Reduce:
     [(False, 0, True), (True, 4, True), (True, 3, False), (False, 1, False), (False, 2, False)],
 )
 def test_every_rank_runs_the_same_diagnostic_mode(mine: bool, ranks_on: int, ok: bool) -> None:
-    reduce = _Reduce(ranks_on)
+    gather = _Gather(ranks_on - int(mine))
     component = SimpleNamespace(
-        diagnostics=mine, device=torch.device("cpu"), rank=0, _allgather=reduce
+        diagnostics=mine, device=torch.device("cpu"), rank=0, _allgather=gather
     )
     if ok:
         BF16_CLS._check_diagnostics_agree(component)
     else:
         with pytest.raises(bf16.LoadError, match=f"on for {ranks_on} of 4 ranks"):
             BF16_CLS._check_diagnostics_agree(component)
-    assert reduce.calls == 1
+    assert len(gather.inputs) == 1
+    assert torch.equal(gather.inputs[0], torch.tensor([int(mine)], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("cls", [BF16_CLS, NVFP4_CLS], ids=["bf16", "nvfp4"])
@@ -244,18 +245,28 @@ def test_full_model_validates_once_and_marks_every_block_call_checked(
     assert blocks == [(layer, True) for layer in range(full.NUM_LAYERS)]
 
 
+@pytest.mark.parametrize("cls", [BF16_CLS, NVFP4_CLS], ids=["bf16", "nvfp4"])
 @pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True), ("on", True)])
 def test_diagnostic_mode_is_read_once_from_the_environment(
-    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+    monkeypatch: pytest.MonkeyPatch,
+    cls: type[bf16.BeamCheckpointLayoutBf16Sm103Tp4],
+    value: str | None,
+    expected: bool,
 ) -> None:
     if value is None:
         monkeypatch.delenv(MODELING_V2_VALIDATE_ENV, raising=False)
     else:
         monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, value)
-    component = SimpleNamespace()
-    BF16_CLS._init_diagnostics(component)
+    # Exercise initialization on real instances without allocating checkpoint storage.
+    component = cls.__new__(cls)
+    torch.nn.Module.__init__(component)
+    component._init_diagnostics()
     assert component.diagnostics is expected
     monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "0" if expected else "1")
+    second = cls.__new__(cls)
+    torch.nn.Module.__init__(second)
+    second._init_diagnostics()
+    assert second.diagnostics is not expected
     assert component.diagnostics is expected
 
 
