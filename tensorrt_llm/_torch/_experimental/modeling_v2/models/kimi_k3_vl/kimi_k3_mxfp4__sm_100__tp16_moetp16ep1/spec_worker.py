@@ -1291,18 +1291,21 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         num_contexts=0,
         draft_step=None,
         mapping_lm_head_tp=None,
+        out=None,
     ):
         """Greedy block drafts straight from ``k3_markov``.
 
         When ``logits`` are the corrected logits the kernel just returned, its per-position global
         argmax (first maximum, lowest vocabulary index among equal values) is the token the
-        TP-gathered greedy sampler would pick. Anything else goes to the base sampler.
+        TP-gathered greedy sampler would pick. Anything else, and any call with ``out``, goes to
+        the base sampler.
         """
         chain = getattr(self, "_k3_markov", None)
         if (
             chain is not None
             and chain[0] is logits
             and mapping_lm_head_tp is None
+            and out is None
             and not spec_metadata.wants_advanced_draft_sampling
         ):
             self._k3_markov_next = (chain[1], chain[2], chain[3], chain[4])
@@ -1315,6 +1318,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             num_contexts=num_contexts,
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
+            out=out,
         )
 
     def _prepare_next_new_tokens(

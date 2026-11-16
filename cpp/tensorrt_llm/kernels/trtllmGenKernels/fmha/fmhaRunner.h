@@ -44,6 +44,10 @@ public:
     // Check if fmha is supported with additional info.
     std::pair<bool, std::string> isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const;
 
+    // Whether run() would compile the kernel it selects for these params with NVRTC instead of launching a
+    // precompiled one.
+    bool usesNvrtc(TllmGenFmhaRunnerParams const& runnerParams);
+
     // Get the total device memory.
     size_t getTotalDeviceMemory() const;
 

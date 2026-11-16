@@ -73,7 +73,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         The baseline and sa modes run post-merge in the GB300 16-GPU 4-node CI
         stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all four
         modes also run in QA's weekly multinode pipeline
-        (qa/llm_function_multinode.yml).
+        (qa/functional/llm_function_multinode.yml).
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")

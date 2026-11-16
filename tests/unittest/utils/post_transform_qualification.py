@@ -51,6 +51,8 @@ class AllReduceStub(nn.Module):
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         super().__init__()
+        # AllReduce's MNNVL backend, which an identity all-reduce never has.
+        self.mnnvl_allreduce = None
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Report that no NCCL symmetric memory window is in use."""

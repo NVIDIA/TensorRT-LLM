@@ -191,11 +191,12 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
 
 
 class RemoteTailPhase(Enum):
-    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+    """Fleet-wide GEN admission for remote-tail attention DP."""
 
     NONE = "none"
     CONTEXT = "context"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 class ScheduledRequests:
@@ -377,6 +378,15 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's disaggregated KV-transfer window
         (DisaggTransferAdmissionController), when it bounds admission.
@@ -395,6 +405,11 @@ class RequestScheduler(ABC):
         Args:
             probe: Whether cancelled receives still retain local resources.
         """
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
 
 
 @dataclass
@@ -750,6 +765,9 @@ class MultimodalScheduler(RequestScheduler):
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
 
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
+
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Forward the local retirement probe to the wrapped scheduler.
 
@@ -757,6 +775,9 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(

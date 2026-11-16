@@ -393,6 +393,11 @@ def test_compiled_mxfp8_warmup_backend_selection(
     if backend is not None:
         monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    # Without CuTeDSL MXFP8 the warmup keeps the FlashInfer path these call counts expect.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.custom_ops.torch_custom_ops.IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE",
+        False,
+    )
     monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", flashinfer_gemm, raising=False)
     monkeypatch.setattr(
         torch.ops.trtllm, "mxfp8_quantize", Mock(return_value=(inputs, inputs)), raising=False
@@ -1646,7 +1651,7 @@ def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) 
         )
 
     engine._dummy_requests = SimpleNamespace(
-        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens),
+        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens, guided=True),
         release_batch_context=lambda requests, _resources: _released_batch(requests),
     )
 
