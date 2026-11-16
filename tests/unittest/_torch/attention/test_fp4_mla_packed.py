@@ -59,6 +59,81 @@ def test_packed_split_count_fills_one_cluster_wave(monkeypatch) -> None:
     assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
 
 
+def test_packed_split_needed_mirrors_the_kernel_plan() -> None:
+    def needed(kv_lens, **kwargs) -> bool:
+        # DeepSeek-R1 q4 rows (4 m-tiles) on 212 SMs: 26 tasks per wave of 2-CTA clusters.
+        return fp4_mla_packed_plan.packed_split_needed(
+            kv_lens, query_len=4, m_tiles=4, sm_count=212, **kwargs
+        )
+
+    # An even batch that fills two thirds of a wave keeps every request whole at any KV length.
+    assert not needed([2048] * 32)
+    assert not needed([32768] * 32)
+    assert not needed([4096] * 128)
+    # A smaller even batch splits to fill the machine.
+    assert needed([4096] * 16)
+    # One long request among short ones splits, first or last.
+    assert needed([2048] * 31 + [32768])
+    assert needed([32768] + [2048] * 127)
+    # Lengths spread over a large batch stay whole.
+    assert not needed([1024 + 76 * i for i in range(256)])
+    # One slot per request never splits; neither does an empty step.
+    assert not needed([2048] * 31 + [32768], splits=1)
+    assert not needed([])
+
+
+def test_packed_split_variants_add_an_unsplit_graph_from_two_thirds_of_a_wave() -> None:
+    variants = fp4_mla_packed_plan.packed_split_variants
+    # q4: 26 tasks per wave, so 18 requests fill two thirds of it.
+    assert variants(17, m_tiles=4, sm_count=212) == (True,)
+    assert variants(18, m_tiles=4, sm_count=212) == (False, True)
+    assert variants(1024, m_tiles=4, sm_count=212) == (False, True)
+    # q1: 106 tasks per wave.
+    assert variants(70, m_tiles=1, sm_count=212) == (True,)
+    assert variants(71, m_tiles=1, sm_count=212) == (False, True)
+
+
+def test_on_demand_split_count_launches_the_budget_only_for_a_split(monkeypatch) -> None:
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", raising=False)
+    monkeypatch.setattr(fp4_mla_packed_plan, "_get_sm_count", lambda device: 212)
+    count = fp4_mla_packed_plan._on_demand_split_count
+
+    def metadata(kv_lens=None, *, packed_split=None, is_cuda_graph=False) -> SimpleNamespace:
+        return SimpleNamespace(
+            fp4_mla_state=SimpleNamespace(packed_split=packed_split),
+            is_cuda_graph=is_cuda_graph,
+            kv_lens_runtime=None if kv_lens is None else torch.tensor(kv_lens, dtype=torch.int32),
+        )
+
+    even, skewed = [4096] * 32, [2048] * 31 + [32768]
+    shape = dict(num_requests=32, m_tiles=4, query_len=4, device=torch.device("cuda"))
+    # Eager steps decide on their host KV lengths.
+    assert count(3, metadata(even), helix=False, **shape) == 1
+    assert count(3, metadata(skewed), helix=False, **shape) == 3
+    # The generation rows are the last kv_lens_runtime entries (context rows come first).
+    assert count(3, metadata([100000] + even), helix=False, **shape) == 1
+    # A keyed graph replays its decision; a graph without one keeps the budget.
+    assert (
+        count(3, metadata(skewed, packed_split=False, is_cuda_graph=True), helix=False, **shape)
+        == 1
+    )
+    assert (
+        count(3, metadata(even, packed_split=True, is_cuda_graph=True), helix=False, **shape) == 3
+    )
+    assert count(3, metadata(even, is_cuda_graph=True), helix=False, **shape) == 3
+    # Without host KV lengths, under Helix and with one slot the count stays.
+    assert count(3, metadata(), helix=False, **shape) == 3
+    assert count(3, metadata(even), helix=True, **shape) == 3
+    assert count(1, metadata(even), helix=False, **shape) == 1
+    # A fixed TRTLLM_FP4_MLA_SPLIT_KV and TRTLLM_FP4_MLA_SPLIT_ON_DEMAND=0 keep the budget.
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
+    assert count(3, metadata(even), helix=False, **shape) == 3
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", "0")
+    assert count(3, metadata(even), helix=False, **shape) == 3
+
+
 def _plan_mod():
     return importlib.import_module(
         "tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_packed_reduce"
@@ -66,36 +141,51 @@ def _plan_mod():
 
 
 @pytest.mark.parametrize(
-    "tiles,capacity,wave_tasks,expected_tiles_per_task,expected_begins",
+    "tiles,capacity,wave_tasks,wave_plan,expected_tiles_per_task,expected_begins",
     [
         # Even batch under one wave (helix16 B4, 6 m-tiles -> 17 wave tasks): one wave of 32-tile tasks.
-        ([128, 128, 128, 128], 24, 17, 32, [0, 4, 8, 12, 16]),
+        ([128, 128, 128, 128], 24, 17, True, 32, [0, 4, 8, 12, 16]),
+        ([128, 128, 128, 128], 24, 17, False, 32, [0, 4, 8, 12, 16]),
         # One long request among short ones: 16-tile tasks; the one task past the wave is a short tail.
-        ([1, 79, 3, 176], 24, 17, 16, [0, 1, 6, 7, 18]),
+        ([1, 79, 3, 176], 24, 17, True, 16, [0, 1, 6, 7, 18]),
+        # The rule takes most of the slots (two-wave target, fit by the fallback share).
+        ([1, 79, 3, 176], 24, 17, False, 13, [0, 1, 8, 9, 23]),
         # Full machine, longest 1.5x above the wave share: 100-tile tasks, the tails in a second wave.
-        ([128] * 15 + [200], 48, 17, 100, list(range(0, 34, 2))),
+        ([128] * 15 + [200], 48, 17, True, 100, list(range(0, 34, 2))),
+        # The rule's two-wave target also halves the short requests.
+        ([128] * 15 + [200], 48, 17, False, 67, list(range(0, 32, 2)) + [33]),
         # Full machine, longest within 1.5x of the wave share: no split at all.
-        ([128] * 15 + [130], 48, 17, 130, list(range(17))),
+        ([128] * 15 + [130], 48, 17, True, 130, list(range(17))),
+        ([128] * 15 + [130], 48, 17, False, 130, list(range(17))),
         # Strong skew in a full machine: eleven 94-tile tasks for the long request, short tails behind.
-        ([128] * 15 + [1024], 48, 17, 94, list(range(0, 32, 2)) + [41]),
+        ([128] * 15 + [1024], 48, 17, True, 94, list(range(0, 32, 2)) + [41]),
+        # The rule gives the long request twelve tasks.
+        ([128] * 15 + [1024], 48, 17, False, 86, list(range(0, 32, 2)) + [42]),
         # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
-        ([128, 128, 128, 1024], 24, 17, 94, [0, 2, 4, 6, 17]),
+        ([128, 128, 128, 1024], 24, 17, True, 94, [0, 2, 4, 6, 17]),
+        # The rule's two-wave target, fit by the fallback share.
+        ([128, 128, 128, 1024], 24, 17, False, 71, [0, 2, 4, 6, 21]),
         # A single request fills one wave with 16 tasks; a short one is not worth splitting.
-        ([128], 16, 17, 8, [0, 16]),
-        ([8], 16, 17, 8, [0, 1]),
+        ([128], 16, 17, True, 8, [0, 16]),
+        ([8], 16, 17, True, 8, [0, 1]),
+        # The rule fills one wave too, or honours the minimum task length.
+        ([128], 16, 17, False, 8, [0, 16]),
+        ([8], 16, 17, False, 2, [0, 4]),
         # No spare slots: one task per request, however long.
-        ([5, 900], 2, 17, 900, list(range(3))),
+        ([5, 900], 2, 17, True, 900, list(range(3))),
+        ([5, 900], 2, 17, False, 900, list(range(3))),
     ],
 )
 def test_plan_packed_tasks_balances_by_kv_length(
     tiles: list[int],
     capacity: int,
     wave_tasks: int,
+    wave_plan: bool,
     expected_tiles_per_task: int,
     expected_begins: list[int],
 ) -> None:
     tiles_per_task, begins = _plan_mod().plan_packed_tasks(
-        tiles, capacity, wave_tasks, wave_plan=True
+        tiles, capacity, wave_tasks, wave_plan=wave_plan
     )
     assert tiles_per_task == expected_tiles_per_task
     assert begins == expected_begins
@@ -149,16 +239,10 @@ def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
     assert order([5, 9, 5, 2], 10) == [(1, 0), (0, 0), (2, 0), (3, 0)]
 
 
-def test_plan_without_wave_plan_keeps_the_rule_and_request_order() -> None:
-    reduce_mod = _plan_mod()
-    plan = reduce_mod.plan_packed_tasks
-    # TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0: the rule's length, as before the wave simulation.
-    assert plan([1, 79, 3, 176], 24, 17, wave_plan=False) == (13, [0, 1, 8, 9, 23])
-    assert plan([128] * 15 + [1024], 48, 17, wave_plan=False) == (
-        86,
-        list(range(0, 32, 2)) + [42],
-    )
-    order = reduce_mod.plan_task_order([24, 30, 3, 14], 10, wave_plan=False)
+def test_task_order_without_wave_plan_keeps_request_order() -> None:
+    # The default plan (TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0) keeps request order; its rule-based
+    # task lengths are the wave_plan=False rows of test_plan_packed_tasks_balances_by_kv_length.
+    order = _plan_mod().plan_task_order([24, 30, 3, 14], 10, wave_plan=False)
     assert order == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (3, 0), (3, 1)]
 
 
@@ -349,6 +433,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
             generation_lengths_num_seqs=-1,
             generation_lengths_num_contexts=-1,
             generation_lengths_capture_recorded=False,
+            generation_lengths_serial=0,
             packed_plan_key=None,
         ),
     )

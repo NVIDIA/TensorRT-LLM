@@ -10,6 +10,7 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
+import traceback
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
@@ -30,6 +31,22 @@ if TYPE_CHECKING:
     import torch
 
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+
+_LEGACY_RETIRE_RETRY_INTERVAL = 2
+"""Polls to wait between legacy cancel retries on an idle decode worker."""
+
+
+# How long, in multiples of kv_transfer_timeout_ms, a context send may wait for
+# its generation peer to ask for the data before its transfer clock starts
+# counting regardless. The peer's request can queue behind a full generation
+# batch for a while, but a peer that never asks must stay reclaimable.
+_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
+
+# A started receive stays tracked until its request leaves these states.
+_RECEIVE_STATES = (
+    LlmRequestState.DISAGG_GENERATION_INIT,
+    LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+)
 
 
 def is_gen_only_no_context_benchmark() -> bool:
@@ -83,6 +100,9 @@ class DisaggTransferCoordinator:
     # Class-level default, so a coordinator assembled without ``__init__``
     # keeps the blocking receive fence.
     _defer_unready_gen_receives = False
+    # Since take_gen_receive_counters: most deferred receives pending at once, and the wait (s).
+    _max_deferred_gen_receives = 0
+    _gen_receive_ready_wait_s = 0.0
 
     def __init__(
         self,
@@ -94,7 +114,6 @@ class DisaggTransferCoordinator:
         effects: ExecutorEffects,
         registry: ActiveRequestRegistry,
         enable_attention_dp: bool,
-        force_terminate_ctx_for_partial_reuse: bool,
         draft_kv_cache_manager=None,
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
@@ -108,7 +127,6 @@ class DisaggTransferCoordinator:
         self._effects = effects
         self._registry = registry
         self._enable_attention_dp = enable_attention_dp
-        self._force_terminate_ctx_for_partial_reuse = force_terminate_ctx_for_partial_reuse
         # Transfer-window budget; None or a disabled controller means no window.
         self._admission_controller = admission_controller
         self._is_kv_manager_v2 = is_kv_manager_v2
@@ -118,7 +136,12 @@ class DisaggTransferCoordinator:
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
         self._pending_timed_out_requests: List[LlmRequest] = []
-        # Requests whose timed-out transfer was already cancelled in flight.
+        # Retire attempts whose legacy cancel could not yet prove page release;
+        # retried only every second poll so an idle decode worker's re-poll
+        # loop (pace_idle sleeps ~1 ms) does not hammer transceivers that
+        # cannot cancel an already-started receive.
+        self._legacy_retire_retry: Dict[int, int] = {}
+        self._legacy_retire_poll_index = 0
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
@@ -132,6 +155,19 @@ class DisaggTransferCoordinator:
         self._unpublished_gen_receives: Dict[
             int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
+        self._retiring_gen_receives: Dict[int, LlmRequest] = {}
+        self._gen_termination_requested: Set[int] = set()
+        self._fleet_has_retiring_gen_receives = False
+        # Prepared gen-init requests whose receive waits for start_deferred_gen_receives.
+        self._deferred_gen_receives: List[LlmRequest] = []
+        # Only a rank that polls its generation receives alone (a single rank, or attention DP with
+        # one pipeline stage) may post the ready ones first: helix CP ranks poll in a CP collective.
+        self._post_ready_gen_receives_first = is_kv_manager_v2 and (
+            dist.world_size == 1
+            or (enable_attention_dp and dist.pp_size == 1 and dist.cp_size == 1)
+        )
+        # Gen-init requests whose receive was started and not yet finished, by request id.
+        self._started_gen_receives: dict[int, LlmRequest] = {}
 
     # -- loop head -----------------------------------------------------------
 
@@ -190,7 +226,12 @@ class DisaggTransferCoordinator:
                 if self._is_error_cleanup_blocked(req)
             ],
         }
+        if self._retiring_gen_receives:
+            local_vote["retiring_gen_receives"] = True
         all_votes = self._dist.tp_allgather(local_vote)
+        self._fleet_has_retiring_gen_receives = any(
+            vote.get("retiring_gen_receives", False) for vote in all_votes
+        )
         voted_error_ids = {rid for vote in all_votes for rid in vote["error_ids"]}
         blocked_error_ids = {rid for vote in all_votes for rid in vote["blocked_ids"]}
         ready_error_ids = voted_error_ids - blocked_error_ids
@@ -242,6 +283,49 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
+        else:
+            self._retire_legacy_timed_out_gen_transfers()
+
+    def _retire_legacy_timed_out_gen_transfers(self) -> None:
+        """Progress expired receives without requiring a runnable model batch.
+
+        A successful legacy cancel authorizes memory release; a refused or
+        failed cancel must be retried with the request and its KV still held.
+        Multi-rank ADP publishes failures at the existing loop-head error vote.
+        """
+        timeout_ms = self._transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+        canceled_ids = set(self._registry.canceled_request_ids())
+        retired = False
+        poll_index = self._legacy_retire_poll_index
+        self._legacy_retire_poll_index = poll_index + 1
+        for request in list(self._registry.active_requests()):
+            if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
+                continue
+            if request.is_disagg_generation_transmission_in_progress:
+                self._flag_transfer_timeout(request, "generation", timeout_ms)
+            if (
+                not request.py_kv_transfer_timed_out
+                or request.state == LlmRequestState.DISAGG_TRANS_ERROR
+            ):
+                continue
+            request_id = request.py_request_id
+            if poll_index < self._legacy_retire_retry.get(request_id, 0):
+                continue
+            if self.request_cancellation(request):
+                # The cancel contract proves no transfer still owns these KV
+                # pages. Clear the in-progress state before the error handler
+                # checks ownership, so it can terminate instead of parking.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._legacy_retire_retry.pop(request_id, None)
+                retired = True
+            else:
+                # Legacy transceivers refuse receives that already started;
+                # retry later instead of on every idle poll.
+                self._legacy_retire_retry[request_id] = poll_index + _LEGACY_RETIRE_RETRY_INTERVAL
+        if retired:
+            self._check_transfer_errors("generation requests")
 
     def _describe_transfer_timeout(self, request: LlmRequest) -> str:
         """Get optional native progress only when an existing deadline expires.
@@ -320,12 +404,44 @@ class DisaggTransferCoordinator:
 
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
-        # context side.
+        # context side. Nothing is sent before every peer rank has asked for
+        # the data, so a send still waiting for that is not flagged, and once
+        # the peers have asked, the transfer is measured from that moment
+        # rather than charged with their queueing delay.
         for req in self._transfers.requests_in_transfer().values():
-            self._flag_transfer_timeout(req, "context", timeout_ms)
+            now = time.monotonic()
+            if self._context_send_awaits_peer(req, now, timeout_ms):
+                continue
+            peer_ready_time = self._transceiver.context_transfer_peer_ready_time(req)
+            if (
+                peer_ready_time is not None
+                and req.py_kv_transfer_start_time is not None
+                and peer_ready_time > req.py_kv_transfer_start_time
+            ):
+                req.py_kv_transfer_start_time = peer_ready_time
+            self._flag_transfer_timeout(req, "context", timeout_ms, current_time=now)
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(req, "generation", timeout_ms)
+
+    def _context_send_awaits_peer(self, req: LlmRequest, now: float, timeout_ms: int) -> bool:
+        """Whether a context send is still exempt from its transfer timeout.
+
+        The send is posted when the context finishes, but nothing is sent
+        until every generation peer rank asks, and under load that request can
+        sit in the generation queue for longer than the transfer timeout.
+        Expiring then gives up on transfers that never got to run, and the peer
+        later finds no data. A peer that never asks must still be reclaimed,
+        since this deadline is the only thing that ends such a send, so the
+        wait is capped at ``_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER`` times the
+        timeout, counted from the send.
+        """
+        if req.py_kv_transfer_start_time is None:
+            return False
+        waited_ms = (now - req.py_kv_transfer_start_time) * 1000
+        if waited_ms > timeout_ms * _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER:
+            return False
+        return self._transceiver.context_transfer_is_waiting_for_peer(req)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -437,23 +553,34 @@ class DisaggTransferCoordinator:
         )
 
     @nvtx_range("receive_gen_init")
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
         """Prepare executor resources for the admitted gen-init requests, then
-        start their KV receive in the configured transfer mode."""
+        start their KV receive in the configured transfer mode.
+
+        ``defer`` says a forward step is in flight: asynchronous receives that
+        wait for KV admission work queued behind it are then posted by
+        ``start_deferred_gen_receives``. Their resources are prepared before that
+        work finishes, so the executor does not defer with a KV connector.
+        """
         if not admitted:
+            return
+        if defer and self._is_kv_manager_v2 and uses_async_gen_transfer():
+            self._effects.prepare_gen_resources(admitted)
+            self._emit_admission_diagnostics(admitted)
+            self._deferred_gen_receives.extend(admitted)
+            self._max_deferred_gen_receives = max(
+                self._max_deferred_gen_receives, len(self._deferred_gen_receives)
+            )
             return
         defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
         # Take the admission readiness events first, so preparing resources
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
+        if not defer_unready:
+            self._wait_gen_receive_ready(admitted)
         self._effects.prepare_gen_resources(admitted)
-        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
-            # Selection and resource preparation are committed; receive
-            # publication may still wait for destination readiness below.
-            for req in admitted:
-                disagg_diagnostics.emit_kv_admission_result(
-                    req, self._kv_cache_manager, admitted=True, dist=self._dist
-                )
+        self._emit_admission_diagnostics(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -472,26 +599,80 @@ class DisaggTransferCoordinator:
             self._check_transfer_errors("generation requests")
             return
 
-        if defer_unready:
-            for req in admitted:
-                self._unpublished_gen_receives[req.py_request_id] = (
-                    req,
-                    fences.get(req.py_request_id),
-                )
-            # Admission is rank-uniform: report before any rank starts one.
-            self._report_deferred_gen_receives()
-            self._publish_ready_gen_receives()
-            # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
-            # every admitted request ends in the same state on every rank and
-            # the scheduler does not admit it again.
-            for req in admitted:
-                if req.py_request_id in self._unpublished_gen_receives:
-                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        else:
-            for req in admitted:
-                self._transceiver.request_and_receive_async(req)
-            self._stamp_gen_transfer_start(admitted)
+        if not defer_unready:
+            self._start_gen_receives(admitted)
+            return
+        for req in admitted:
+            self._unpublished_gen_receives[req.py_request_id] = (
+                req,
+                fences.get(req.py_request_id),
+            )
+        # Admission is rank-uniform: report before any rank starts one.
+        self._report_deferred_gen_receives()
+        self._publish_ready_gen_receives()
+        # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
+        # every admitted request ends in the same state on every rank and
+        # the scheduler does not admit it again.
+        for req in admitted:
+            if req.py_request_id in self._unpublished_gen_receives:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        self.reap_gen_receives(0)
 
+    def _emit_admission_diagnostics(self, admitted: List[LlmRequest]) -> None:
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
+            # Selection and resource preparation are committed; receive
+            # publication may still wait for destination readiness.
+            for req in admitted:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self._kv_cache_manager, admitted=True, dist=self._dist
+                )
+
+    @nvtx_range("start_deferred_gen_receives")
+    def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
+        """Post the receives deferred by ``receive_gen_init(defer=True)``.
+
+        Must run with ``wait_all`` before the next scheduling pass, which would
+        otherwise admit the prepared requests again. Without it a rank that polls
+        its receives alone posts only the requests whose admission work is done.
+        """
+        if not self._deferred_gen_receives:
+            return
+        deferred, self._deferred_gen_receives = self._deferred_gen_receives, []
+        # A request failed since its preparation no longer owns its pages; the
+        # status poll still runs, as it would have for the whole batch.
+        admitted = [req for req in deferred if req.state == LlmRequestState.DISAGG_GENERATION_INIT]
+        if not wait_all and self._post_ready_gen_receives_first:
+            ready = [
+                req for req in admitted if self._kv_cache_manager.disagg_receive_ready_done(req)
+            ]
+            if len(ready) != len(admitted):
+                ready_ids = {id(req) for req in ready}
+                self._deferred_gen_receives = [req for req in admitted if id(req) not in ready_ids]
+                if not ready:
+                    return
+                admitted = ready
+        self._wait_gen_receive_ready(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
+        self._start_gen_receives(admitted)
+
+    def _wait_gen_receive_ready(self, requests: List[LlmRequest]) -> None:
+        # A remote write does not follow stream order, so it waits for the pages' admission work.
+        if self._is_kv_manager_v2:
+            start = time.perf_counter()
+            self._kv_cache_manager.wait_disagg_receive_ready(requests)
+            self._gen_receive_ready_wait_s += time.perf_counter() - start
+
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        """Return and reset the most deferred receives pending at once and the wait in ms."""
+        counters = (self._max_deferred_gen_receives, self._gen_receive_ready_wait_s * 1e3)
+        self._max_deferred_gen_receives = len(getattr(self, "_deferred_gen_receives", ()))
+        self._gen_receive_ready_wait_s = 0.0
+        return counters
+
+    def _start_gen_receives(self, admitted: List[LlmRequest]) -> None:
+        for req in admitted:
+            self._transceiver.request_and_receive_async(req)
+        self._stamp_gen_transfer_start(admitted)
         self.reap_gen_receives(0)
 
     def _align_sync_receive_failures_across_cp(self, admitted: List[LlmRequest]) -> None:
@@ -627,16 +808,24 @@ class DisaggTransferCoordinator:
     # -- batch execution -----------------------------------------------------
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
-        """Generation requests in the batch whose KV receive has completed.
+        """Generation requests in the batch whose KV receive has completed, in batch order.
 
         Read-only: the executor prepares batch-level resources for these
         requests while they are still transmission-complete, then calls
-        ``try_finish_gen_receive`` for each request in the batch.
+        ``try_finish_gen_receive`` for each of them. Only requests with a
+        started receive are visited, not the whole batch.
         """
+        started = self._started_gen_receives
+        completed = set()
+        for request_id, req in list(started.items()):
+            if req.is_disagg_generation_transmission_complete:
+                completed.add(request_id)
+            elif req.state not in _RECEIVE_STATES:
+                del started[request_id]
+        if not completed:
+            return []
         return [
-            req
-            for req in scheduled_batch.generation_requests
-            if req.is_disagg_generation_transmission_complete
+            req for req in scheduled_batch.generation_requests if req.py_request_id in completed
         ]
 
     def try_finish_gen_receive(self, request: LlmRequest) -> bool:
@@ -648,6 +837,7 @@ class DisaggTransferCoordinator:
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
+        self._started_gen_receives.pop(request.py_request_id, None)
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
@@ -682,21 +872,38 @@ class DisaggTransferCoordinator:
                 # and pins them; it must run before respond_and_send_async
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
-                self._transfers.start_transfer(req)
-                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_request_event(
-                            "ctx_send_ready",
-                            req,
-                            side="ctx",
-                            dist=self._dist,
-                            prompt_tokens=req.prompt_len,
-                            state=req.state.name,
-                            source_kv_request_owned=True,
-                            source_kv_reuse_pinned=self._transfers.should_store_blocks,
-                            timeout_expected=self._transceiver.kv_transfer_timeout_ms is not None,
-                        )
-                self._transceiver.respond_and_send_async(req)
+                try:
+                    self._transfers.start_transfer(req)
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_request_event(
+                                "ctx_send_ready",
+                                req,
+                                side="ctx",
+                                dist=self._dist,
+                                prompt_tokens=req.prompt_len,
+                                state=req.state.name,
+                                source_kv_request_owned=True,
+                                source_kv_reuse_pinned=self._transfers.should_store_blocks,
+                                timeout_expected=self._transceiver.kv_transfer_timeout_ms
+                                is not None,
+                            )
+                    self._transceiver.respond_and_send_async(req)
+                except (IndexError, KeyError, RuntimeError, ValueError) as e:
+                    # Fail the request, not the executor loop of this rank. Do
+                    # not report it from here: under attention-DP only the
+                    # owning rank reaches this branch and the response path
+                    # gathers. Mark the error and let the rank-synchronized
+                    # error path (handle_errors_synced) report it.
+                    logger.error(
+                        f"KV cache send failed for context request "
+                        f"{req.py_request_id}: {e!r}; failing the request"
+                    )
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    if req.py_request_id in self._transfers.requests_in_transfer():
+                        # Undo start_transfer(): untrack and unpin.
+                        self._transfers.end_transfer(req)
+                    continue
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
                 # whose retirement the reap could poll.
@@ -797,8 +1004,12 @@ class DisaggTransferCoordinator:
             user_canceled_ids = set(self._registry.canceled_request_ids())
             for req in gen_status.cancelled_requests:
                 req_id = req.parent_request_id if req.is_child else req.py_request_id
-                if req_id not in user_canceled_ids:
+                if (
+                    req_id not in user_canceled_ids
+                    and req.py_request_id not in self._retiring_gen_receives
+                ):
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        self._retire_cancelled_gen_receives()
         if not self.inflight_cancel_active():
             self._check_transfer_errors("generation requests")
 
@@ -809,8 +1020,8 @@ class DisaggTransferCoordinator:
         request; ``AsyncTransferManager`` counts them. A request that is still
         active gets its response created here (the transfer completed before
         the response pass could run) and staged for the rank-synchronized
-        flush; a failed transfer only releases its claim so the synchronized
-        error path can respond once every owner is done.
+        flush. An active failed request stays on the synchronized error path;
+        a departed request is reclaimed when its final owner releases it.
         """
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self._registry.contains(request):
@@ -822,6 +1033,9 @@ class DisaggTransferCoordinator:
             response = request.create_response()
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                response.result.ctx_computed_tokens = getattr(request, "py_ctx_computed_tokens", 0)
+                response.result.ctx_first_begin = getattr(request, "py_ctx_first_begin", -1)
+                response.result.ctx_num_chunks = getattr(request, "py_ctx_num_chunks", 0)
                 attach_ctx_usage(request, response)
             released = self._transfers.end_transfer(request)
             if released:
@@ -834,12 +1048,10 @@ class DisaggTransferCoordinator:
                 self._effects.terminate_request(request)
             return
         if self._transfers.end_transfer(request):
-            if transfer_failed:
-                return
-            # Skip if the PP=1 early path already terminated this request;
-            # under PP>1 that path is off, so terminate here on completion.
-            if not self._force_terminate_ctx_for_partial_reuse:
-                self._effects.terminate_request(request)
+            # The response pass removed this request, but termination was
+            # deferred while a transfer owned its KV blocks. No active-request
+            # error pass can reclaim it now, so the last owner must do so.
+            self._effects.terminate_request(request)
 
     # -- timeouts and cancellation -------------------------------------------
 
@@ -862,8 +1074,108 @@ class DisaggTransferCoordinator:
             self._inflight_cancel_unsupported_logged = True
         return False
 
+    @property
+    def has_retiring_gen_receives(self) -> bool:
+        """Return TP-wide retirement under multi-rank ADP, rank-local otherwise."""
+        if self._enable_attention_dp and self._dist.world_size != 1:
+            return self._fleet_has_retiring_gen_receives
+        return self.has_local_retiring_gen_receives
+
+    @property
+    def has_local_retiring_gen_receives(self) -> bool:
+        """Whether cancelled receives still retain resources on this rank."""
+        return bool(self._retiring_gen_receives)
+
+    def cancel_gen_logically(self, request: LlmRequest) -> bool:
+        """Detach a qualified model-idle GEN result from physical retirement.
+
+        Args:
+            request: Generation request selected at an executor cancellation boundary.
+
+        Returns:
+            Whether the executor may report cancellation. Retained destinations
+            must still pass defer_gen_termination before resource release.
+        """
+        if not request.is_generation_only_request or request.state not in (
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+            LlmRequestState.DISAGG_TRANS_ERROR,
+        ):
+            return False
+        cancel = getattr(self._transceiver, "cancel_gen_logically", None)
+        if not callable(cancel):
+            return False
+        pending = self._unpublished_gen_receives.get(request.py_request_id)
+        try:
+            if cancel(request, pending[1] if pending else None) is not True:
+                return False
+        except RuntimeError as error:
+            logger.error(
+                f"Logical GEN cancellation failed for request {request.py_request_id}; "
+                f"falling back to transfer cancellation: {error}\n{traceback.format_exc()}"
+            )
+            return False
+        # The transceiver now owns any unpublished fence. Remove the only
+        # publication path before the executor makes the result terminal.
+        self._unpublished_gen_receives.pop(request.py_request_id, None)
+        if not self.request_cancellation(request):
+            self._retiring_gen_receives[request.py_request_id] = request
+        return True
+
+    def defer_gen_termination(self, request: LlmRequest) -> bool:
+        """Retain a cancelled destination after its terminal response is published.
+
+        Args:
+            request: Request reaching ordinary executor resource termination.
+
+        Returns:
+            Whether receive retirement must complete before termination can run.
+        """
+        if request.py_request_id not in self._retiring_gen_receives:
+            return False
+        self._gen_termination_requested.add(request.py_request_id)
+        return True
+
+    def _retire_cancelled_gen_receives(self) -> None:
+        """Release each cancelled receive once, after response delivery and safe evidence."""
+        for request_id, request in list(self._retiring_gen_receives.items()):
+            if request_id not in self._gen_termination_requested:
+                continue
+            if not self.request_cancellation(request):
+                continue
+            del self._retiring_gen_receives[request_id]
+            self._gen_termination_requested.remove(request_id)
+            self._effects.terminate_request(request)
+
     def request_cancellation(self, request: LlmRequest) -> bool:
-        """Best-effort cancellation that leaves ownership intact on errors."""
+        """Cancel transfers, retaining unpublished fences and resources until safe.
+
+        Transfer a qualified unpublished CUDA fence to the transceiver before
+        cancelling. False retains ownership for later progress; True permits
+        retirement. An earlier failure remains the request's logical outcome.
+        """
+        try:
+            pending = self._unpublished_gen_receives.get(request.py_request_id)
+            if (
+                pending is not None
+                and pending[1] is not None
+                and self._transceiver.supports_idle_request_cancellation(request) is True
+            ):
+                cancel = getattr(self._transceiver, "cancel_gen_logically", None)
+                if callable(cancel) and cancel(request, pending[1]) is True:
+                    # A parked failure still owns its result. Transfer only the
+                    # unpublished fence so cancellation closes admission and
+                    # starts bounded retirement without replacing that result.
+                    self._unpublished_gen_receives.pop(request.py_request_id, None)
+                elif not pending[1].query():
+                    return False
+        except RuntimeError as error:
+            logger.error(
+                f"GEN receive fence hand-off failed for request {request.py_request_id}; "
+                f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
+            )
+            return False
         try:
             return self._transceiver.cancel_request(request)
         except Exception as error:
@@ -903,6 +1215,62 @@ class DisaggTransferCoordinator:
                 "Request timed out (KV transfer)", timed_out, charge_budget=False
             )
 
+    def take_pending_timed_out(self) -> List[LlmRequest]:
+        """Drain the ADP timeout buffer without voting.
+
+        For the packed attention-DP exchange (enable_packed_sync): the
+        executor reports ``bool(buffer)`` on its loop-head all-gather and,
+        on a positive vote, fails the drained requests through
+        ``fail_timed_out_synced`` -- the same action ``handle_timeouts_synced``
+        takes after its own collective.
+        """
+        timed_out = self._pending_timed_out_requests
+        self._pending_timed_out_requests = []
+        return timed_out
+
+    def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:
+        """Fail requests drained by ``take_pending_timed_out`` after a
+        positive rank-wide timeout vote.
+
+        Called on every rank of the vote, with an empty list on ranks that
+        had no timeout, exactly as ``handle_timeouts_synced`` does: the error
+        path may enter collectives of its own, so it must be reached
+        symmetrically.
+        """
+        self._effects.fail_requests(
+            "Request timed out (KV transfer)", requests, charge_budget=False
+        )
+
+    def local_error_vote(self) -> Dict[str, List[int]]:
+        """This rank's contribution to the ``handle_errors_synced`` vote.
+
+        For the packed attention-DP exchange (enable_packed_sync): runs the
+        head of ``handle_errors_synced`` (context sends that failed after
+        leaving the transfer manager are marked ``DISAGG_TRANS_ERROR``) and
+        returns the vote ids of the local error requests and of those whose
+        cleanup is still blocked. The executor ships the two counts on its
+        loop-head all-gather and, on a positive vote, runs
+        ``handle_errors_synced`` itself on every rank.
+        """
+        pending_ids = self.take_pending_context_failures()
+        if pending_ids:
+            for req in self._registry.active_requests():
+                if get_unique_rid(req) in pending_ids:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        local_error_requests = [
+            req
+            for req in self._registry.active_requests()
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        return {
+            "error_ids": [self._vote_id(req) for req in local_error_requests],
+            "blocked_ids": [
+                self._vote_id(req)
+                for req in local_error_requests
+                if self._is_error_cleanup_blocked(req)
+            ],
+        }
+
     def take_pending_context_failures(self) -> Set[int]:
         """Drain context sends that failed after leaving the transfer manager."""
         pending = self._pending_ctx_transfer_failures
@@ -910,10 +1278,12 @@ class DisaggTransferCoordinator:
         return pending
 
     def forget_request(self, request_id: int) -> None:
-        """Drop per-request cancellation bookkeeping once the request is freed."""
+        """Drop per-request cancellation and receive bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
+        self._legacy_retire_retry.pop(request_id, None)
         self._unpublished_gen_receives.pop(request_id, None)
+        self._started_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
@@ -1044,13 +1414,19 @@ class DisaggTransferCoordinator:
         Call this at the end of an iteration that queued nothing, after the
         pass has drained its ready work, so the pending-transfer check sees the
         state that work left behind. The check is rank-local; the sleep only
-        paces and never gates a collective.
+        paces and never gates a collective. Logically cancelled receives remain
+        pending while their published accesses or unpublished CUDA fences drain.
         """
-        # Context sends are tracked by the transfer manager; generation
-        # receives live in the request state, so both directions are covered.
-        waiting_on_transfer = self._transfers.has_any_inflight_requests() or any(
-            req.is_disagg_generation_init_state or req.is_disagg_generation_transmission_in_progress
-            for req in self._registry.active_requests()
+        # Context sends are tracked by the transfer manager. Generation receives
+        # remain visible through active requests or the retirement registry.
+        waiting_on_transfer = (
+            bool(self._retiring_gen_receives)
+            or self._transfers.has_any_inflight_requests()
+            or any(
+                req.is_disagg_generation_init_state
+                or req.is_disagg_generation_transmission_in_progress
+                for req in self._registry.active_requests()
+            )
         )
         if waiting_on_transfer:
             time.sleep(0.001)
@@ -1074,7 +1450,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             effects=None,
             registry=None,
             enable_attention_dp=False,
-            force_terminate_ctx_for_partial_reuse=False,
         )
 
     def handle_errors_synced(self) -> bool:
@@ -1091,7 +1466,13 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
         return admitted
 
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
+        return None
+
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        return 0, 0.0
+
+    def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
         return None
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
@@ -1130,6 +1511,12 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def inflight_cancel_active(self) -> bool:
         return False
 
+    def cancel_gen_logically(self, request: LlmRequest) -> bool:
+        return False
+
+    def defer_gen_termination(self, request: LlmRequest) -> bool:
+        return False
+
     def request_cancellation(self, request: LlmRequest) -> bool:
         return True
 
@@ -1139,6 +1526,15 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def handle_timeouts_synced(self) -> None:
         return None
+
+    def take_pending_timed_out(self) -> List[LlmRequest]:
+        return []
+
+    def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:
+        return None
+
+    def local_error_vote(self) -> Dict[str, List[int]]:
+        return {"error_ids": [], "blocked_ids": []}
 
     def take_pending_context_failures(self) -> Set[int]:
         return set()

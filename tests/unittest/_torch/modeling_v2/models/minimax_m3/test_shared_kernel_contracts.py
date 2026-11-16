@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -76,6 +77,117 @@ def test_shared_state_default_reserves_shared_ctas(monkeypatch):
     monkeypatch.setattr(moe, "_kernel_module", kernel)
     with pytest.raises(ReachedKernelSelection):
         moe.M3MoeState(torch.device("cuda", 0), num_tokens=6, shared=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("qlen", [1, 2])
+@pytest.mark.parametrize("own_reducer", [False, True])
+def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+    qlen: int,
+    own_reducer: bool,
+) -> None:
+    """Exercise plan construction and runtime operands without CUDA kernels."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
+        m3_fullctx_decode,
+    )
+    from tensorrt_llm._torch.attention.backends.prims_ts import decode as tsdec
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode import (
+        fmha_decode_config,
+    )
+
+    def compiled_main(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor | None,
+        value_scales: torch.Tensor | None,
+        output: torch.Tensor,
+        *runtime_args: object,
+    ) -> None:
+        """Stand in for the compiled attention kernel."""
+        assert query.is_contiguous()
+        assert query.shape == (qlen, plan.GEOMETRY.heads, plan.GEOMETRY.head_dim)
+        torch.testing.assert_close(query.float(), expected_query, rtol=0, atol=0)
+        output.fill_(1.0)
+
+    def compiled_reducer(output: torch.Tensor, *runtime_args: object) -> None:
+        """Make the standalone reducer's output observable."""
+        assert not own_reducer
+        output.add_(2.0)
+
+    def owned_reducer(
+        partial_o: torch.Tensor,
+        partial_stats: torch.Tensor,
+        reducer_sequence_lengths: torch.Tensor,
+        output: torch.Tensor,
+        *reducer_args: object,
+    ) -> None:
+        """Require the plan's split-buffer storage and layout at the native merge."""
+        assert own_reducer
+        torch.testing.assert_close(reducer_sequence_lengths, sequence_lengths, rtol=0, atol=0)
+        assert reducer_args == (
+            plan.qlen,
+            plan.q_tokens_per_cta,
+            plan.tile_kv,
+            plan.insts_kv,
+            plan.causal,
+            plan.pdl,
+        )
+        for actual_buffer, workspace_buffer in (
+            (partial_o, plan.workspace.partial_o),
+            (partial_stats, plan.workspace.partial_stats),
+        ):
+            assert actual_buffer.data_ptr() == workspace_buffer.data_ptr()
+            assert actual_buffer.shape == workspace_buffer.shape
+            assert actual_buffer.stride() == workspace_buffer.stride()
+        output.fill_(3.0)
+
+    main_kernel = Mock(side_effect=compiled_main)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config, "get_max_active_clusters_for_cluster_size", lambda cluster_size: 1
+    )
+    monkeypatch.setattr(tsdec, "_get_compiled_decode", lambda spec: (main_kernel, compiled_reducer))
+    monkeypatch.setattr(
+        torch.ops.trtllm, "minimax_m3_sm107_tp2_fullctx_reduce", owned_reducer, raising=False
+    )
+    plan = m3_fullctx_decode.FullCtxPlan(
+        torch.device("cpu", 0),
+        qlen=qlen,
+        nreq=1,
+        max_kv_len=1 << 20,
+        recipe={
+            "splits": 2,
+            "config": {"tile_size_q": 32, "groups_tokens_heads_q": True} if qlen > 1 else {},
+        },
+        own_reducer=own_reducer,
+        pdl=False,
+    )
+    geometry = plan.GEOMETRY
+    assert plan.tile_kv != plan.insts_kv
+    finite_value_bits = torch.cat(
+        (torch.arange(1, 127, dtype=torch.uint8), torch.arange(129, 255, dtype=torch.uint8))
+    )
+    head_offsets = torch.arange(2 * geometry.heads).unsqueeze(-1)
+    feature_offsets = torch.arange(geometry.head_dim)
+    query_bits = finite_value_bits[(head_offsets + feature_offsets) % finite_value_bits.numel()]
+    token_sign_bits = torch.arange(qlen, dtype=torch.uint8).view(-1, 1, 1) * 128
+    query_values = (query_bits.unsqueeze(0) ^ token_sign_bits).view(torch.float8_e4m3fn)
+    query = query_values[:, ::2]
+    expected_query = query.float().clone()
+    key_pages = torch.zeros(1, geometry.kv_heads, geometry.page, geometry.head_dim).to(
+        torch.float8_e4m3fn
+    )
+    value_pages = torch.zeros_like(key_pages)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+    sequence_lengths = torch.tensor([geometry.page], dtype=torch.int32)
+    output = torch.zeros(query.shape, dtype=torch.bfloat16)
+
+    plan.run(query, key_pages, value_pages, block_table, sequence_lengths, 1.0, output)
+
+    main_kernel.assert_called()
+    torch.testing.assert_close(output, torch.full_like(output, 3.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA tensor storage required")

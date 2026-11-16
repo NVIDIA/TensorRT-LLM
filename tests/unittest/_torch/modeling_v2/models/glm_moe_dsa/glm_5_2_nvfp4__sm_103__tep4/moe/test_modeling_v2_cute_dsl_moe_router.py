@@ -15,9 +15,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     EXPERTS,
     HIDDEN,
     SIMT_MAX_ROWS,
+    SPLIT_K,
     RouterRunner,
     build,
     build_prefill,
+    build_wide,
     output_shape,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_router import (  # noqa: E402, E501
@@ -34,11 +36,14 @@ FP32_ULP = 2.0**-23
 _RUNNERS: dict[object, RouterRunner] = {}
 
 
-def _runner(rows: int) -> RouterRunner:
-    key = "prefill" if rows > DECODE_MAX_ROWS else rows
+def _runner(rows: int, wide: bool = False) -> RouterRunner:
+    key = "wide" if wide else "prefill" if rows > DECODE_MAX_ROWS else rows
     if key not in _RUNNERS:
         device = torch.cuda.current_device()
-        _RUNNERS[key] = build_prefill(device) if key == "prefill" else build(rows, device)
+        if key == "wide":
+            _RUNNERS[key] = build_wide(device)
+        else:
+            _RUNNERS[key] = build_prefill(device) if key == "prefill" else build(rows, device)
     return _RUNNERS[key]
 
 
@@ -77,18 +82,22 @@ def _inputs(rows: int, g: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
-    rows = cell.spec["rows"]
-    runner = _runner(rows)
+    rows, wide = cell.spec["rows"], cell.spec.get("wide", False)
+    runner = _runner(rows, wide)
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     x, w = _inputs(rows, g)
     # NaN, so an element the kernel never writes fails the comparison.
-    out = torch.full(output_shape(rows), float("nan"), dtype=torch.float32, device="cuda")
+    out = torch.full(output_shape(rows, wide), float("nan"), dtype=torch.float32, device="cuda")
     with validating(op):
         assert op(x, w, out, runner) is out, "the op writes `out` and returns it"
     _compare(out, op.reference(x, w, out, runner))
 
 
-_PARTIAL_CELLS = [c for c in op.CELLS if SIMT_MAX_ROWS < c.spec["rows"] <= DECODE_MAX_ROWS]
+_PARTIAL_CELLS = [
+    c
+    for c in op.CELLS
+    if SIMT_MAX_ROWS < c.spec["rows"] <= DECODE_MAX_ROWS or c.spec.get("wide", False)
+]
 
 
 @pytest.mark.parametrize("cell", _PARTIAL_CELLS, ids=[c.why[:44] for c in _PARTIAL_CELLS])
@@ -103,11 +112,11 @@ def test_the_partials_sum_to_the_logits(cell) -> None:
     plane holding a full product, miss by O(1). The reference's own planes are
     held to the same sum, which pins what its slicing means.
     """
-    rows = cell.spec["rows"]
-    runner = _runner(rows)
+    rows, wide = cell.spec["rows"], cell.spec.get("wide", False)
+    runner = _runner(rows, wide)
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     x, w = _inputs(rows, g)
-    out = torch.full(output_shape(rows), float("nan"), dtype=torch.float32, device="cuda")
+    out = torch.full(output_shape(rows, wide), float("nan"), dtype=torch.float32, device="cuda")
     op(x, w, out, runner)
     logits = op.reference(x, w, torch.empty(rows, EXPERTS, device="cuda"), runner)
     ref = op.reference(x, w, out, runner)
@@ -116,6 +125,30 @@ def test_the_partials_sum_to_the_logits(cell) -> None:
         for s in range(1, planes.shape[1]):
             total = total + planes[:, s]
         _compare(total, logits)
+
+
+@pytest.mark.parametrize("rows", (65, 127, 128, 129, 191, 192, 200, 256))
+def test_wide_partials_are_the_64_row_kernels_per_m_tile(rows: int) -> None:
+    """The wide router repeats the 64-row kernel's schedule per 64-row M tile: same MMAs in
+    the same K order, so every row's four partials are bitwise what the 64-row runner
+    writes for that row (its 64-row chunk run on it, the last chunk zero-padded as the
+    TMA zero-fills). Rows past the step are never written (NaN stays NaN)."""
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    x, w = _inputs(rows, g)
+    buf = torch.full((rows + 64, SPLIT_K, EXPERTS), float("nan"), device="cuda")
+    out = buf[:rows]
+    with validating(op):
+        op(x, w, out, _runner(rows, wide=True))
+    assert bool(torch.isnan(buf[rows:]).all()), "the wide router wrote past the step's rows"
+    narrow = _runner(DECODE_MAX_ROWS)
+    for start in range(0, rows, DECODE_MAX_ROWS):
+        chunk = x[start : start + DECODE_MAX_ROWS]
+        n = int(chunk.shape[0])
+        pad = torch.zeros(DECODE_MAX_ROWS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        pad[:n] = chunk
+        want = torch.empty(output_shape(DECODE_MAX_ROWS), dtype=torch.float32, device="cuda")
+        op(pad, w, want, narrow)
+        assert torch.equal(out[start : start + n], want[:n]), f"partials differ at rows {start}+"
 
 
 def _unreachable(*args) -> None:

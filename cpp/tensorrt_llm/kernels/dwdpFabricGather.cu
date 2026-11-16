@@ -23,7 +23,6 @@
 
 #include <cstdlib>
 #include <cuda_runtime.h>
-#include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -113,15 +112,11 @@ void invokeDwdpFabricGather(void* const* dsts, void const* const* srcs, int64_t 
             invokeDwdpFabricGatherTma(dsts, srcs, lines, rowStarts, rows, blocksPerRow, threads, stream);
             return;
         }
-        static std::once_flag warnOnce;
-        std::call_once(warnOnce,
-            [dev]
-            {
-                TLLM_LOG_WARNING(
-                    "dwdp_fabric_gather: the tma kernel needs SM90+ and enough opt-in shared memory; "
-                    "using the register gather on device %d",
-                    dev);
-            });
+        // Report the TMA fallback once per process; a constant key keeps repeated gathers quiet.
+        TLLM_LOG_WARNING_ONCE("dwdp_fabric_gather/tma_unsupported",
+            "dwdp_fabric_gather: the tma kernel needs SM90+ and enough opt-in shared memory; "
+            "using the register gather on device %d",
+            dev);
     }
     TLLM_CHECK_WITH_INFO(threads > 0 && threads <= kMaxThreads,
         "dwdp_fabric_gather: threads must be in [1, %d], got %lld", kMaxThreads, static_cast<long long>(threads));
