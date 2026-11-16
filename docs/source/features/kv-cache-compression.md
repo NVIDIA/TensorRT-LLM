@@ -422,8 +422,8 @@ For example, Llama-3.1-8B (32 layers, 8 KV heads, head dimension 128) with
 TurboQuant supports the same cache layouts as NVFP4 cold-page quantization: K
 and V of MHA, MQA, and GQA; the key-only MLA latent, including widths that are
 not a power of two such as DeepSeek's 576 values; and DeepSeek-V4 compressed
-(CSA) rows, whose 448 NoPE values are quantized while the 64 RoPE values and
-the indexer cache are stored losslessly whatever `skip_rope_quantization` says.
+(CSA) rows, whose 448 NoPE values are quantized, and their 64 RoPE values too
+unless `skip_rope_quantization` is set; the indexer cache is stored losslessly.
 Auxiliary Attention buffers, such as DSA index keys, are stored losslessly in
 the same cold page, and DeepSeek-V4 SWA, HCA, and compressor state and GDN, SSM,
 and Conv state are preserved losslessly. See [Support](#support).
@@ -439,14 +439,15 @@ and Conv state are preserved losslessly. See [Support](#support).
 
 Integer bit widths reach the paper's distortion (normalized MSE 0.117, 0.034, and
 0.0094 at 2, 3, and 4 bits for head dimension 128) on every input structure tested, and
-re-encoding a decoded Page reproduces its codes, so Pages that migrate repeatedly do not
-accumulate error; fractional bit widths settle 10-20% above their error after one round trip.
+re-encoding a decoded Page settles within a few round trips without changing the error, so Pages
+that migrate repeatedly do not accumulate error. Fractional bit widths settle 10-20% above their
+error after one round trip on 128-value heads, and 50-70% above it on GLM-5.3 MLA latents.
 Encode and decode are bound by the host link for
 conventional K/V Pages, so they take about the NVFP4 time scaled by the cold-page size. MLA
 latents and DeepSeek-V4 CSA rows need more decode work; with a fast host link (about 200 GB/s)
-their decode takes about 1.1-1.2x the NVFP4 time.
+their decode takes about 1.1-1.25x the NVFP4 time.
 
-For measured quality, encode and decode times, end-to-end accuracy, a complete configuration,
+For measured quality, encode and decode times, an end-to-end smoke test, a complete configuration,
 and how to confirm that Pages pass through the cold tier, see the
 [TurboQuant cold-page compression example](source:examples/kv_cache_compression/turboquant_cold_page.md).
 

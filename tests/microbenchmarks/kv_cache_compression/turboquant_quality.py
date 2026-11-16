@@ -11,14 +11,23 @@ into pinned host cold pages through the provider interface and decodes them back
 * the normalized MSE after 1, 4 and 16 round trips, each re-encoding the decoded Page as an
   onboarded Page that is offloaded again would be.
 
+With ``--vectors FILE`` it reports the round trips of real K vectors instead: ``FILE`` holds a
+tensor saved with ``torch.save`` whose last dimension is the vector width (for example MLA latents
+read from a KV cache), stored as one key-only buffer of 32-token Pages in BF16. With ``--rope R``
+the last ``R`` values of every vector are RoPE, and the settings are also run with
+``skip_rope_quantization`` (as for an MLA latent: ``kv_lora_rank`` NoPE values, then RoPE).
+
 Run on one GPU::
 
-    python3 tests/microbenchmarks/kv_cache_compression/turboquant_quality.py
+    python3 tests/microbenchmarks/kv_cache_compression/turboquant_quality.py \
+        [--vectors latents.pt [--rope 64]]
 """
 
+import argparse
 from types import SimpleNamespace
 
 import torch
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
@@ -32,8 +41,12 @@ INPUTS = ("gaussian", "outliers", "sparse", "one_hot", "constant", "mixed_norms"
 TRIPS = (1, 4, 16)
 
 
-def _manager(config):
-    pretrained = SimpleNamespace(model_type="llama")
+def _manager(config, rope=0, width=DIM):
+    if rope:  # an MLA latent: kv_lora_rank NoPE values, then the RoPE values
+        pretrained = PretrainedConfig(kv_lora_rank=width - rope, qk_rope_head_dim=rope)
+        pretrained.model_type = "glm_moe_dsa"
+    else:
+        pretrained = SimpleNamespace(model_type="llama")
     engine = SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: False),
         cuda_graph_batch_sizes=[],
@@ -51,22 +64,18 @@ def _manager(config):
 
 
 class _Codec:
-    """One K/V layer with 2 * PAGES hot slots and PAGES pinned cold pages."""
+    """One layer with 2 * pages hot slots and pages pinned cold pages: K and V, or K alone."""
 
-    def __init__(self, manager):
-        self.manager = manager
-        shape = (2 * PAGES, HEADS, TOKENS, DIM)
-        self.hot = {r: torch.zeros(shape, dtype=torch.bfloat16, device="cuda") for r in "kv"}
-        size = HEADS * TOKENS * DIM * 2
+    def __init__(self, manager, *, pages=PAGES, heads=HEADS, width=DIM, roles=("key", "value")):
+        self.manager, self.pages = manager, pages
+        shape = (2 * pages, heads, TOKENS, width)
+        self.hot = {r: torch.zeros(shape, dtype=torch.bfloat16, device="cuda") for r in roles}
+        size = heads * TOKENS * width * 2
         cache = SimpleNamespace(
             tokens_per_block=TOKENS,
             layers=(
                 AttentionLayerConfig(
-                    layer_id=0,
-                    buffers=[
-                        BufferConfig(role="key", size=size),
-                        BufferConfig(role="value", size=size),
-                    ],
+                    layer_id=0, buffers=[BufferConfig(role=role, size=size) for role in roles]
                 ),
             ),
         )
@@ -74,20 +83,20 @@ class _Codec:
             cache,
             runtime_dtype=DataType.BF16,
             pp_layers=(0,),
-            num_kv_heads_per_layer=(HEADS,),
-            head_dim_per_layer=(DIM,),
+            num_kv_heads_per_layer=(heads,),
+            head_dim_per_layer=(width,),
             is_draft=False,
         )
         hot = {
             role: SimpleNamespace(raw_base=t.data_ptr(), raw_slot_bytes=size, raw_bytes=size)
-            for role, t in zip(("key", "value"), self.hot.values())
+            for role, t in self.hot.items()
         }
         (props,) = manager.configure(self.state, [SimpleNamespace(layers={0: hot})])
         self.device = (
             "cuda" if props.page_index_location == native.ColdPageIndexLocation.DEVICE else "cpu"
         )
         self.cold = torch.empty(
-            PAGES * int(props.cold_page_bytes), dtype=torch.uint8, pin_memory=True
+            pages * int(props.cold_page_bytes), dtype=torch.uint8, pin_memory=True
         )
         self.stream = torch.cuda.Stream()
 
@@ -107,21 +116,22 @@ class _Codec:
         self.stream.synchronize()
 
     def round_trips(self, values, trips):
-        """NMSE after each of ``trips`` round trips of ``values`` [PAGES, HEADS, TOKENS, DIM].
+        """NMSE after each of ``trips`` round trips of ``values`` [pages, heads, TOKENS, width].
 
-        K holds ``values`` and V the same vectors in another Page order, so that a decoder that
-        mixes up the buffers shows; the NMSE is over the K and V vectors together.
+        K holds ``values`` and V, if present, the same vectors in another Page order, so that a
+        decoder that mixes up the buffers shows; the NMSE is over the K and V vectors together.
         """
-        source = {"k": values.to(torch.bfloat16), "v": values.roll(1, 0).to(torch.bfloat16)}
+        n = self.pages
+        source = {"key": values.to(torch.bfloat16), "value": values.roll(1, 0).to(torch.bfloat16)}
         for role, tensor in self.hot.items():
-            tensor[:PAGES] = source[role]
-        pages, low, high = torch.arange(PAGES), torch.arange(PAGES), torch.arange(PAGES) + PAGES
+            tensor[:n] = source[role]
+        pages, low, high = torch.arange(n), torch.arange(n), torch.arange(n) + n
         errors = []
         for trip in range(trips):
             self._call(self.manager.encode_cold_pages, pages, low if trip == 0 else high)
             self._call(self.manager.decode_cold_pages, high, pages)
-            reference = torch.cat([source[role] for role in "kv"])
-            decoded = torch.cat([self.hot[role][PAGES:] for role in "kv"])
+            reference = torch.cat([source[role] for role in self.hot])
+            decoded = torch.cat([self.hot[role][n:] for role in self.hot])
             errors.append(_nmse(reference, decoded))
         return errors
 
@@ -151,14 +161,52 @@ def _inputs(kind, generator):
     return x
 
 
+def _config(fmt, bits, skip_rope=False):
+    if fmt == "nvfp4":
+        return ColdPageQuantizationCompressionConfig(
+            quant="nvfp4", skip_rope_quantization=skip_rope
+        )
+    return ColdPageQuantizationCompressionConfig(
+        quant="turboquant", turboquant_bits=bits, skip_rope_quantization=skip_rope
+    )
+
+
+def _real_vectors(path, rope):
+    """Round trips of the K vectors saved in ``path``, whole and (with ``rope``) skipping RoPE."""
+    vectors = torch.load(path, map_location="cpu")
+    width = vectors.shape[-1]
+    vectors = vectors.reshape(-1, width)
+    pages = vectors.shape[0] // TOKENS
+    values = vectors[: pages * TOKENS].reshape(pages, 1, TOKENS, width).cuda()
+    print(f"{pages * TOKENS} vectors of {width} values from {path}, {pages} Pages\n")
+    trip_columns = " | ".join(f"{n} trip{'s' if n > 1 else ''}" for n in TRIPS)
+    print(f"| format | bits | skip_rope_quantization | {trip_columns} |")
+    print("|---|---|---|" + "---|" * len(TRIPS))
+    for skip_rope in (False, True) if rope else (False,):
+        for fmt, bits in [("turboquant", b) for b in BITS] + [("nvfp4", None)]:
+            manager = _manager(_config(fmt, bits, skip_rope), rope=rope, width=width)
+            codec = _Codec(manager, pages=pages, heads=1, width=width, roles=("key",))
+            trips = codec.round_trips(values, max(TRIPS))
+            print(
+                f"| {fmt} | {bits if bits is not None else 4.5} | {skip_rope} | "
+                + " | ".join(f"{trips[n - 1]:.4f}" for n in TRIPS)
+                + " |"
+            )
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--vectors", help="K vectors saved with torch.save, [..., width]")
+    parser.add_argument("--rope", type=int, default=0, help="trailing RoPE values per vector")
+    args = parser.parse_args()
+    if args.vectors:
+        _real_vectors(args.vectors, args.rope)
+        return
     rows = []
     for fmt, bits in [("turboquant", b) for b in BITS] + [("nvfp4", None)]:
-        if fmt == "nvfp4":
-            config = ColdPageQuantizationCompressionConfig(quant="nvfp4")
-        else:
-            config = ColdPageQuantizationCompressionConfig(quant="turboquant", turboquant_bits=bits)
-        codec = _Codec(_manager(config))
+        codec = _Codec(_manager(_config(fmt, bits)))
         generator = torch.Generator(device="cuda").manual_seed(0)
         errors = [codec.round_trips(_inputs(kind, generator), 1)[0] for kind in INPUTS]
         trips = codec.round_trips(_inputs("outliers", generator), max(TRIPS))

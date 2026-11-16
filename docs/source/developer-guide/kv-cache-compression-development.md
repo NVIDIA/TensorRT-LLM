@@ -335,9 +335,9 @@ Draft-model cold pages ignore both RoPE options and use single NVFP4.
 
 TurboQuant (`quant: turboquant`) is a second format on the same provider
 contract. `TurboQuantColdPageQuantizationCompression` shares the cold-page base
-class with the NVFP4 provider, including its row geometry and RoPE placement
-rules, and differs in what it stores for each quantized piece and in where it
-receives Page indices.
+class with the NVFP4 provider, including its row geometry, RoPE placement
+rules, buffer and layer layouts, and codec state, and differs in what it stores
+for each quantized piece and in where it receives Page indices.
 
 - Which numbers are quantized: each buffer layout records the piece as
   `quantized_range_start` and `quantized_range_elements`, as for NVFP4. With
@@ -347,10 +347,11 @@ receives Page indices.
   `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` as for NVFP4 and copied unchanged. The
   codec refuses a piece whose length is not a multiple of 16 numbers, or of 32
   with fractional bit widths.
-- DeepSeek-V4 compressed (CSA) rows always quantize the 448 NoPE numbers and
-  copy the 64 RoPE numbers and the indexer cache unchanged, whatever
-  `skip_rope_quantization` says; `nvfp4_residual_dim` has no TurboQuant
-  counterpart and is rejected. An HCA cache co-located with the CSA cache in one
+- DeepSeek-V4 compressed (CSA) rows follow `skip_rope_quantization` as for
+  NVFP4: the whole 512-number row is quantized, or with `true` the 448 NoPE
+  numbers, and the 64 RoPE numbers are copied unchanged. The indexer cache is
+  always copied unchanged; `nvfp4_residual_dim` has no TurboQuant counterpart
+  and is rejected. An HCA cache co-located with the CSA cache in one
   lifecycle is stored unchanged by the provider; the other DeepSeek-V4
   lifecycles keep the lossless fallback.
 - Draft KVCMs ignore `skip_rope_quantization` and quantize whole vectors, as
@@ -390,8 +391,9 @@ several instances (256 + 256 + 64; fractional bits keep their two halves,
 accumulates every output value of an instance in tensor memory (512 fp32
 columns, shared with the staged operand); each instance decodes in its own
 launch over its own chunks of the code planes. A single 512-value instance
-accumulates its output columns in two blocks of 256 on SM100-family GPUs, so that
-128-row tiles fit tensor memory; the second block reads the codes again. All buffers of a
+accumulates its output columns in two halves of 256 on SM100-family GPUs, so that
+128-row tiles fit tensor memory; its codes are read once, kept in registers as
+32-bit words, and unpacked again for the second half. All buffers of a
 lifecycle with the same geometry and dtype share one kernel launch, driven by
 a device table of hot base addresses, Slot strides and cold offsets; buffers
 stored unchanged share one copy launch. Kernels are compiled in `configure()`

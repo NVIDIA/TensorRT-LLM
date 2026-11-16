@@ -5500,9 +5500,8 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "True: preserve the position-encoded (RoPE) part of each K vector in "
         "its original active-cache precision and quantize the rest. "
-        "False (default): quantize both parts; for DeepSeek-V4, nvfp4 uses "
-        "residual RoPE quantization when nvfp4_residual_dim is 64 and "
-        "turboquant always keeps RoPE lossless. "
+        "False (default): quantize both parts, using residual RoPE quantization "
+        "for DeepSeek-V4 with nvfp4 when nvfp4_residual_dim is 64. "
         "An option to explore; measure its accuracy effect on your model.")
     nvfp4_residual_dim: Literal[0, 64] = Field(
         default=64,

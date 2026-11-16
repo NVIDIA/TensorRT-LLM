@@ -413,6 +413,7 @@ def _encode_block(
         h1,
         h2,
         h3,
+        # pos0..pos3: channel positions, read only when GATHER (fractional bits); placeholders here.
         rows,
         rows,
         rows,
@@ -1166,14 +1167,84 @@ def _decode_rows(
 
 
 @triton.jit
-def _decode_columns(
+def _load_code_words(
+    cold,
+    j: tl.constexpr,
+    rows,
+    row_mask,
+    OFF: tl.constexpr,
+    W: tl.constexpr,
+    ROWS: tl.constexpr,
+    C: tl.constexpr,
+):
+    """Chunk ``j`` of one bit plane as ``[rows, C * W / 32]`` 32-bit words (codes LSB first)."""
+    WORDS: tl.constexpr = C * W // 32
+    plane = (cold + OFF + j * (ROWS * (C * W // 8))).to(tl.pointer_type(tl.uint32))
+    offsets = rows[:, None] * WORDS + tl.arange(0, WORDS)[None, :]
+    return tl.load(plane[:, None] + offsets, mask=row_mask[:, None], other=0)
+
+
+@triton.jit
+def _unpack_words(words, W: tl.constexpr, BLOCK_M: tl.constexpr, C: tl.constexpr):
+    """``[BLOCK_M, C * W / 32]`` words of ``W``-bit codes into ``[BLOCK_M, C]`` codes."""
+    K: tl.constexpr = 32 // W
+    shifts = tl.arange(0, K) * W
+    fields = (words[:, :, None] >> shifts[None, None, :]) & ((1 << W) - 1)
+    return tl.reshape(fields, (BLOCK_M, C)).to(tl.int32)
+
+
+@triton.jit
+def _decode_half(
+    a0,
+    a1,
+    a2,
+    a3,
+    b0,
+    b1,
+    b2,
+    b3,
+    w_ptr,
+    alpha,
+    lut,
+    col0,
+    START: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    N: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    C: tl.constexpr,
+):
+    """Output columns ``col0..col0+HALF-1`` of the instance from its four chunks of code words."""
+    acc = tl.zeros([BLOCK_M, HALF], tl.float32)
+    cols = col0 + tl.arange(0, HALF)
+    for j in tl.static_range(4):
+        if j == 0:
+            low, high = a0, b0
+        elif j == 1:
+            low, high = a1, b1
+        elif j == 2:
+            low, high = a2, b2
+        else:
+            low, high = a3, b3
+        code = _unpack_words(low, W0, BLOCK_M, C)
+        if W1 > 0:
+            code |= _unpack_words(high, W1, BLOCK_M, C) << W0
+        z = (alpha[:, None] * _dequantize(code, lut)).to(tl.bfloat16)
+        krows = START + j * C + tl.arange(0, C)
+        acc += tl.dot(z, tl.load(w_ptr + krows[:, None] * N + cols[None, :]))
+    return acc
+
+
+@triton.jit
+def _decode_halves(
     cold,
     w_ptr,
     alpha,
     rows,
     row_mask,
-    col0,
-    COORD0: tl.constexpr,
+    row_ptr,
+    START: tl.constexpr,
     G: tl.constexpr,
     lut,
     OFF0: tl.constexpr,
@@ -1181,20 +1252,74 @@ def _decode_columns(
     OFF1: tl.constexpr,
     W1: tl.constexpr,
     N: tl.constexpr,
-    COLS: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     C: tl.constexpr,
+    ELEM: tl.constexpr,
 ):
-    """Output columns ``col0..col0+COLS-1`` of one mse instance (coordinates COORD0..+G), fp32."""
-    acc = tl.zeros([BLOCK_M, COLS], tl.float32)
-    cols = col0 + tl.arange(0, COLS)
-    for j in range(G // C):
-        code = _load_codes(cold[:, None], j, rows, row_mask, OFF0, W0, OFF1, W1, ROWS, BLOCK_M, C)
-        z = (alpha[:, None] * _dequantize(code, lut)).to(tl.bfloat16)
-        krows = COORD0 + j * C + tl.arange(0, C)
-        acc += tl.dot(z, tl.load(w_ptr + krows[:, None] * N + cols[None, :]))
-    return acc
+    """Decode one mse instance of G coordinates into output columns START..START+G, in two halves.
+
+    One accumulator of G columns and its staged operand do not fit tensor memory, and neither do
+    two of G / 2 columns, so each half is accumulated and stored before the next. The codes are
+    loaded once, as 32-bit words that stay in registers, and unpacked again for the second half.
+    """
+    tl.static_assert(G // C == 4, "a single instance of 512 values is four chunks of 128")
+    a0 = _load_code_words(cold, 0, rows, row_mask, OFF0, W0, ROWS, C)
+    a1 = _load_code_words(cold, 1, rows, row_mask, OFF0, W0, ROWS, C)
+    a2 = _load_code_words(cold, 2, rows, row_mask, OFF0, W0, ROWS, C)
+    a3 = _load_code_words(cold, 3, rows, row_mask, OFF0, W0, ROWS, C)
+    if W1 > 0:
+        b0 = _load_code_words(cold, 0, rows, row_mask, OFF1, W1, ROWS, C)
+        b1 = _load_code_words(cold, 1, rows, row_mask, OFF1, W1, ROWS, C)
+        b2 = _load_code_words(cold, 2, rows, row_mask, OFF1, W1, ROWS, C)
+        b3 = _load_code_words(cold, 3, rows, row_mask, OFF1, W1, ROWS, C)
+    else:  # one bit plane: placeholders, never unpacked
+        b0, b1, b2, b3 = a0, a1, a2, a3
+    HALF: tl.constexpr = G // 2
+    lo = _decode_half(
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        b2,
+        b3,
+        w_ptr,
+        alpha,
+        lut,
+        START,
+        START,
+        W0,
+        W1,
+        N,
+        HALF,
+        BLOCK_M,
+        C,
+    )
+    _store_piece(row_ptr, row_mask, lo, START, HALF, ELEM)
+    hi = _decode_half(
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        b2,
+        b3,
+        w_ptr,
+        alpha,
+        lut,
+        START + HALF,
+        START,
+        W0,
+        W1,
+        N,
+        HALF,
+        BLOCK_M,
+        C,
+    )
+    _store_piece(row_ptr, row_mask, hi, START + HALF, HALF, ELEM)
 
 
 @triton.jit
@@ -1252,19 +1377,12 @@ def _tq_decode_kernel(
     OFF_RAW: tl.constexpr,
     RAW: tl.constexpr,
     RAW_BLOCK: tl.constexpr,
-    COL_BLOCKS: tl.constexpr,
-    SPLIT: tl.constexpr,
+    HALVES: tl.constexpr,
 ):
-    # COL_BLOCKS > 1 (mse passes of one instance): the instance's output columns are accumulated
-    # in COL_BLOCKS blocks, so that each accumulator fits tensor memory. SPLIT neighbouring
-    # programs share the rows and take COL_BLOCKS / SPLIT blocks each (one program per row tile
-    # reads the codes once; more fit an SM).
-    if SPLIT > 1:
-        tile_page = tl.program_id(0) // SPLIT
-        col_block = tl.program_id(0) % SPLIT
-    else:
-        tile_page = tl.program_id(0)
-        col_block = 0
+    # HALVES (an mse pass that decodes a single instance of 512 values): the instance's output
+    # columns are accumulated in two halves, so that both accumulators fit tensor memory; each
+    # chunk of codes is still read once.
+    tile_page = tl.program_id(0)
     buffer = tl.program_id(1)
     tile = tl.program_id(2)
     lane = tl.arange(0, BLOCK_M)
@@ -1296,6 +1414,8 @@ def _tq_decode_kernel(
     scale_ptr = (cold + OFF_SCALE).to(tl.pointer_type(tl.bfloat16))
     alpha = tl.load(scale_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
 
+    # Channel positions of the pieces and the scale of the low-bit group: fractional bits only
+    # (MODE 1); for mse they are placeholders that GATHER = False never reads.
     pos0 = rows
     pos1 = rows
     pos2 = rows
@@ -1327,38 +1447,32 @@ def _tq_decode_kernel(
     else:
         FIRST: tl.constexpr = 0
         LAST: tl.constexpr = 4
-    if COL_BLOCKS > 1:
-        # One instance per pass (blocked mse, or a single-piece row): its codes against its
-        # output columns, one block at a time.
+    if HALVES:
+        # A single-piece mse row of 512 values, decoded by one pass.
         START: tl.constexpr = (
             (P0 if FIRST >= 1 else 0) + (P1 if FIRST >= 2 else 0) + (P2 if FIRST >= 3 else 0)
         )
         WIDTH: tl.constexpr = P0 if FIRST == 0 else P1 if FIRST == 1 else P2 if FIRST == 2 else P3
-        COLS: tl.constexpr = WIDTH // COL_BLOCKS
-        BLOCKS: tl.constexpr = COL_BLOCKS // SPLIT
-        for block in tl.static_range(BLOCKS):
-            col0 = START + (col_block * BLOCKS + block) * COLS
-            acc = _decode_columns(
-                cold,
-                w_ptr,
-                alpha,
-                rows,
-                row_mask,
-                col0,
-                START,
-                WIDTH,
-                lut_ptr if WIDTH == P0 else lut_ptr + LUT_STRIDE,
-                OFF_A0 + START // C * ROWS * (C * W_A0 // 8),
-                W_A0,
-                OFF_A1 + START // C * ROWS * (C * W_A1 // 8),
-                W_A1,
-                N,
-                COLS,
-                ROWS,
-                BLOCK_M,
-                C,
-            )
-            _store_piece(row_ptr, row_mask, acc, col0, COLS, ELEM)
+        _decode_halves(
+            cold,
+            w_ptr,
+            alpha,
+            rows,
+            row_mask,
+            row_ptr,
+            START,
+            WIDTH,
+            lut_ptr if WIDTH == P0 else lut_ptr + LUT_STRIDE,
+            OFF_A0 + START // C * ROWS * (C * W_A0 // 8),
+            W_A0,
+            OFF_A1 + START // C * ROWS * (C * W_A1 // 8),
+            W_A1,
+            N,
+            ROWS,
+            BLOCK_M,
+            C,
+            ELEM,
+        )
     else:
         a0, a1, a2, a3 = _decode_rows(
             cold,
@@ -1409,8 +1523,6 @@ def _tq_decode_kernel(
         raw_cols = tl.arange(0, RAW_BLOCK)
         raw_dst = tl.where(raw_cols < QS, raw_cols, raw_cols + N)
         raw_mask = row_mask[:, None] & (raw_cols < RAW)[None, :]
-        if SPLIT > 1:  # the first column block of the pass copies them
-            raw_mask = raw_mask & (col_block == 0)
         raw_ptr = (cold + OFF_RAW).to(tl.pointer_type(ELEM))
         values = tl.load(raw_ptr[:, None] + rows[:, None] * RAW + raw_cols[None, :], mask=raw_mask)
         tl.store(
