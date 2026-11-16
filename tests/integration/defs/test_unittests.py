@@ -244,6 +244,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         )
 
     num_workers = max(1, num_workers)
+    # The largest B200 MoE fixtures temporarily hold ~64 GiB per worker.
+    # Eight workers can OOM and trigger expensive serial retries.
+    if cur_key == ('NVIDIA B200', 'unittest/_torch/moe/kernels/parallel'):
+        num_workers = min(num_workers, 2)
 
     if parallel_override := os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
         num_workers = int(parallel_override)

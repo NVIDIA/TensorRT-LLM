@@ -639,20 +639,18 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     else:
         assert permuted_sf is None
 
-    for i in range(max_num_permuted_tokens):
-        if i >= num_non_exiting_tiles_val * tile_size:
-            break
-        expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx < 0:
-            continue
-        token_idx = expanded_idx // top_k
-        if dtype == "float4":
-            torch.testing.assert_close(
-                permuted_x[i].view(torch.uint8), x[token_idx].view(torch.uint8)
-            )
-            torch.testing.assert_close(permuted_sf[i], x_sf[token_idx])
-        else:
-            torch.testing.assert_close(permuted_x[i], x[token_idx])
+    num_checked_rows = min(max_num_permuted_tokens, num_non_exiting_tiles_val * tile_size)
+    expanded_indices = permuted_idx_to_expanded_idx[:num_checked_rows]
+    valid_rows = expanded_indices >= 0
+    token_indices = (expanded_indices[valid_rows] // top_k).long()
+
+    # Gather bytes so indexing also supports packed FP4 and FP8 tensors.
+    check_dtype = torch.uint8 if dtype == "float4" else x.dtype
+    actual = permuted_x[:num_checked_rows].view(torch.uint8)[valid_rows].view(check_dtype)
+    expected = x.view(torch.uint8)[token_indices].view(check_dtype)
+    torch.testing.assert_close(actual, expected)
+    if dtype == "float4":
+        torch.testing.assert_close(permuted_sf[:num_checked_rows][valid_rows], x_sf[token_indices])
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -1366,28 +1364,20 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             num_local_experts, interm_size * weight_n_multiplier, hidden_size // sf_vec_size
         )
 
-    # Compute reference: manually gather, compute GEMM, apply fused activation, then quantize
-    permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
-    tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
-
-    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
-    # NaN scale byte would poison the reference and ``global_sf``.
-    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
-    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
-        a.dtype
+    # Build the independent reference with batched byte gathers, keeping padding zero.
+    rows = torch.arange(num_valid_permuted_tokens, device=a.device)
+    valid_token_mask = rows < tile_idx_to_mn_limit[rows // tile_size]
+    valid_rows = rows[valid_token_mask]
+    token_ids = (permuted_idx_to_expanded_idx[valid_rows] // top_k).long()
+    a_gathered_bytes = torch.zeros(
+        max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8, device=a.device
     )
     a_sf_gathered = torch.zeros(
-        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
     )
-    for i in range(num_valid_permuted_tokens):
-        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-            continue
-        expanded_idx = permuted_idx_to_expanded_idx_list[i]
-        token_id = expanded_idx // top_k
-        a_gathered[i] = a[token_id]
-        a_sf_gathered[i] = a_sf_unswizzled[token_id]
-    a_gathered = a_gathered.to(a.device)
-    a_sf_gathered = a_sf_gathered.to(a.device)
+    a_gathered_bytes[valid_rows] = a.view(torch.uint8)[token_ids]
+    a_sf_gathered[valid_rows] = a_sf_unswizzled[token_ids]
+    a_gathered = a_gathered_bytes.view(a.dtype)
 
     # Swizzle a_sf_gathered for reference GEMM
     a_sf_gathered_swizzled = swizzle_sf(
@@ -1438,14 +1428,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         situ_linear_beta=SITU_LINEAR_BETA if is_situ else None,
     )
 
-    # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
-    # Create mask for valid tokens
-    valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
-    for i in range(num_valid_permuted_tokens):
-        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-            continue
-        valid_token_mask[i] = True
-
+    # Check only the same valid rows used by the reference, excluding tile padding.
     num_valid_tokens = valid_token_mask.sum().item()
     if num_valid_tokens > 0:
         # Compare output values only for valid tokens
@@ -1458,17 +1441,9 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             c_sf_ref, max_num_permuted_tokens, interm_size, sf_vec_size
         )
 
-        # Compare scale factors only for valid tokens
-        c_sf_valid = []
-        c_sf_ref_valid = []
-        for i in range(num_valid_permuted_tokens):
-            if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-                continue
-            c_sf_valid.append(c_sf_unswizzled[i])
-            c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
-
-        c_sf_valid = torch.cat(c_sf_valid)
-        c_sf_ref_valid = torch.cat(c_sf_ref_valid)
+        # Flatten in row order, as concatenating the individual valid rows does.
+        c_sf_valid = c_sf_unswizzled[:num_valid_permuted_tokens][valid_token_mask].flatten()
+        c_sf_ref_valid = c_sf_ref_unswizzled[:num_valid_permuted_tokens][valid_token_mask].flatten()
         # The kernel computes the activation and each block's amax in fp32, while the
         # reference rounds the GEMM output and the activation to bf16 before
         # fp4_quantize, so blocks whose scale sits near an E4M3 rounding midpoint can

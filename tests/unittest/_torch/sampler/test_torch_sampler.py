@@ -2763,14 +2763,12 @@ class TestBatchedSampling:
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for (
-                is_mixed,
                 max_draft_len,
                 allow_zero_draft_len,
                 _build_seq_slot_assignments,
                 vocab_size,
                 ordered,
             ) in product(
-                [False, True],
                 [0, 3],
                 [False, True],
                 [_build_seq_slot_assignments],
@@ -2874,12 +2872,18 @@ class TestBatchedSampling:
             new_tokens_host = res.result.new_tokens_host
             assert new_tokens_host.device == torch.device("cpu")
 
+            # Snapshot once after the UUT's no-sync region; scalar checks stay on the host.
+            new_tokens_cuda_host = new_tokens_cuda.cpu()
+            new_tokens_cuda_snapshot_host = new_tokens_cuda_snapshot.cpu()
+            batch_next_tokens_host = batch_next_tokens_cuda_int.cpu()
+            assigned_slots = set(seq_slots)
+
             # check for unwanted side effects
             for slot in range(total_seq_slots):
-                if slot in seq_slots:
+                if slot in assigned_slots:
                     continue
                 torch.testing.assert_close(
-                    new_tokens_cuda_snapshot[:, slot], new_tokens_cuda[:, slot]
+                    new_tokens_cuda_snapshot_host[:, slot], new_tokens_cuda_host[:, slot]
                 )
             torch.testing.assert_close(
                 batch_next_tokens_cuda_int, batched_sampling_result.next_tokens_cuda_int
@@ -2892,9 +2896,9 @@ class TestBatchedSampling:
             for req_idx in batch_req_indices.tolist():
                 steps = draft_lens[req_idx] + 1
                 seq_slot = seq_slots[req_idx]
-                req_tokens = batch_next_tokens_cuda_int[input_offset : (input_offset + steps)]
-                torch.testing.assert_close(new_tokens_cuda[:steps, seq_slot], req_tokens)
-                torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
+                req_tokens = batch_next_tokens_host[input_offset : (input_offset + steps)]
+                torch.testing.assert_close(new_tokens_cuda_host[:steps, seq_slot], req_tokens)
+                torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens)
                 input_offset += steps
 
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)

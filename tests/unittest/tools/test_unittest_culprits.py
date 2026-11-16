@@ -249,3 +249,64 @@ def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
 )
 def test_parallel_config_key_strips_only_ignore_arguments(case: str, expected: str) -> None:
     assert _parallel_config_key(case) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("gpu", "case", "configured", "override", "expected"),
+    [
+        (b"NVIDIA B200", "unittest/_torch/moe/kernels/parallel", 16, None, 2),
+        ("NVIDIA B200", "unittest/_torch/moe/kernels/parallel", 1, None, 1),
+        ("NVIDIA H100", "unittest/_torch/moe/kernels/parallel", 16, None, 8),
+        ("NVIDIA B200", "unittest/_torch/attention", 16, None, 8),
+        ("NVIDIA B200", "unittest/_torch/moe/kernels/parallel", 16, "4", 4),
+    ],
+)
+def test_unittest_worker_policy(tmp_path, monkeypatch, gpu, case, configured, override, expected):
+    """Exercise the emitted command, including CSV lookup and explicit overrides."""
+    test_root = tmp_path / "tests"
+    config_dir = test_root / "integration/defs"
+    config_dir.mkdir(parents=True)
+    gpu_name = gpu.decode() if isinstance(gpu, bytes) else gpu
+    (config_dir / "agg_unit_mem_df.csv").write_text(
+        f"unittest_case_name,gpu,parallel_factor\n{case},{gpu_name},{configured}\n"
+    )
+    monkeypatch.setattr(_TEST_UNITTESTS, "tests_path", lambda: str(test_root))
+    monkeypatch.setitem(
+        sys.modules,
+        "pynvml",
+        types.SimpleNamespace(
+            nvmlInit=lambda: None,
+            nvmlDeviceGetHandleByIndex=lambda index: index,
+            nvmlDeviceGetName=lambda handle: gpu,
+            NVMLError=RuntimeError,
+        ),
+    )
+    if override is None:
+        monkeypatch.delenv("LLM_TEST_PARALLEL_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("LLM_TEST_PARALLEL_OVERRIDE", override)
+    commands = []
+
+    def run_cmd(command, **kwargs):
+        commands.append(command)
+        report = next(
+            arg.split("=", 1)[1] for arg in command if arg.startswith("--periodic-junit-xmlpath=")
+        )
+        Path(report).write_text(
+            '<testsuites><testsuite><testcase name="pass" /></testsuite></testsuites>'
+        )
+
+    request = types.SimpleNamespace(
+        config=types.SimpleNamespace(getoption=lambda name, default=None: default)
+    )
+    _TEST_UNITTESTS.test_unittests_v2(
+        str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), case, str(tmp_path), request
+    )
+    assert len(commands) == 1
+    command = commands[0]
+    if expected == 1:
+        assert "-n" not in command
+        assert "no:xdist" in command
+    else:
+        assert command[command.index("-n") + 1] == str(expected)
