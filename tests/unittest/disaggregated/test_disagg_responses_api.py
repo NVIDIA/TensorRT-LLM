@@ -22,6 +22,7 @@ import asyncio
 import base64
 import contextlib
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -37,6 +38,7 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
 )
 from pydantic import ValidationError
+from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
 
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
@@ -828,32 +830,36 @@ class _WorkersStillGenerating(_Workers):
         await asyncio.Event().wait()
 
 
-def _responses_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
-    """A disaggregated server in front of ``workers``, with its routes."""
-    config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
-    coordinator = DisaggCoordinatorService(config, client_factory=Mock())
-    service = OpenAIDisaggregatedService(config, coordinator, client_factory=Mock())
-    service.is_ready = AsyncMock(return_value=True)
-    service._ctx_router = AsyncMock(spec=Router)
-    service._ctx_router.get_next_server.return_value = ("ctx:8001", {})
-    service._gen_router = AsyncMock(spec=Router)
-    service._gen_router.get_next_server.return_value = ("gen:8002", {})
-    service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
-    service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
+@contextlib.contextmanager
+def _responses_server(
+    tmp_path, schedule_style: str, workers: _Workers
+) -> Iterator[OpenAIDisaggServer]:
+    """Yield a disaggregated server in front of ``workers`` for its request lifetime."""
+    with isolated_serve_env(tmp_path) as env:
+        config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+        coordinator = DisaggCoordinatorService(config, client_factory=Mock())
+        service = OpenAIDisaggregatedService(config, coordinator, client_factory=Mock())
+        service.is_ready = AsyncMock(return_value=True)
+        service._ctx_router = AsyncMock(spec=Router)
+        service._ctx_router.get_next_server.return_value = ("ctx:8001", {})
+        service._gen_router = AsyncMock(spec=Router)
+        service._gen_router.get_next_server.return_value = ("gen:8002", {})
+        service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
+        service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
 
-    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
-    server._config = config
-    server._coordinator = coordinator
-    server._disagg_cluster_storage = None
-    server._service = service
-    server._perf_metrics_collector = Mock()
-    server._allow_request_chat_template = False
-    server._collect_perf_metrics = False
-    server.app = FastAPI()
-    server.app.add_middleware(ServerArrivalTimeMiddleware)
-    with patch("prometheus_client.multiprocess.MultiProcessCollector"):
-        server.register_routes()
-    return server
+        server = env.build_disagg_server(DisaggConfig())
+        server._config = config
+        server._coordinator = coordinator
+        server._disagg_cluster_storage = None
+        server._service = service
+        server._perf_metrics_collector = Mock()
+        server._allow_request_chat_template = False
+        server._collect_perf_metrics = False
+        server.app = FastAPI()
+        server.app.add_middleware(ServerArrivalTimeMiddleware)
+        with patch("prometheus_client.multiprocess.MultiProcessCollector"):
+            server.register_routes()
+        yield server
 
 
 def _responses_route(server: OpenAIDisaggServer):
@@ -963,7 +969,7 @@ def _on_keepalive(event: asyncio.Event):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_responses_stream_opens_and_keeps_alive_while_the_context_phase_runs(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     _short_waits(monkeypatch)
     kept_alive = asyncio.Event()
@@ -976,29 +982,30 @@ async def test_responses_stream_opens_and_keeps_alive_while_the_context_phase_ru
             started_during_context_phase.append(not workers.context_done.is_set())
         keepalive(message)
 
-    sent = await _post_responses(_responses_server(schedule_style, workers).app, on_send=on_send)
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        sent = await _post_responses(server.app, on_send=on_send)
 
-    assert _status(sent) == 200
-    assert started_during_context_phase == [True]
-    events = _sse_events(sent)
-    types = [event for event, _ in events]
-    first_output = types.index("response.output_text.delta")
-    # The opening, kept alive while the context phase ran, then the generation
-    # worker's events without its own opening.
-    assert types[:2] == ["response.created", "response.in_progress"]
-    assert first_output > 2
-    assert set(types[2:first_output]) == {"response.in_progress"}
-    relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
-    answered = [json.loads(frame.split("data: ", 1)[1]) for frame in workers.frames[2:]]
-    assert [_without_number(data) for data in relayed] == [
-        _without_number(data) for data in answered
-    ]
-    # One sequence, for one response: the one the generation worker was asked for.
-    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
-    (generation_request,) = workers.generation_requests
-    assert {data["response"]["id"] for _, data in events if "response" in data} == {
-        generation_request.request_id
-    }
+        assert _status(sent) == 200
+        assert started_during_context_phase == [True]
+        events = _sse_events(sent)
+        types = [event for event, _ in events]
+        first_output = types.index("response.output_text.delta")
+        # The opening, kept alive while the context phase ran, then the generation
+        # worker's events without its own opening.
+        assert types[:2] == ["response.created", "response.in_progress"]
+        assert first_output > 2
+        assert set(types[2:first_output]) == {"response.in_progress"}
+        relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
+        answered = [json.loads(frame.split("data: ", 1)[1]) for frame in workers.frames[2:]]
+        assert [_without_number(data) for data in relayed] == [
+            _without_number(data) for data in answered
+        ]
+        # One sequence, for one response: the one the generation worker was asked for.
+        assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+        (generation_request,) = workers.generation_requests
+        assert {data["response"]["id"] for _, data in events if "response" in data} == {
+            generation_request.request_id
+        }
 
 
 def _frame_events(frames: list[str]) -> list[tuple[str, dict]]:
@@ -1011,73 +1018,75 @@ def _frame_events(frames: list[str]) -> list[tuple[str, dict]]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
-async def test_every_keepalive_of_an_opened_stream_repeats_its_opening(monkeypatch, schedule_style):
+async def test_every_keepalive_of_an_opened_stream_repeats_its_opening(
+    tmp_path, monkeypatch, schedule_style
+):
     """The worker's own keepalives, which carry its response object, never reach the client."""
     _short_waits(monkeypatch)
     kept_alive = asyncio.Event()
     workers = _WorkersSilentAfterTheFirstOutput(_waits_for(kept_alive))
 
-    sent = await _post_responses(
-        _responses_server(schedule_style, workers).app, on_send=_on_keepalive(kept_alive)
-    )
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        sent = await _post_responses(server.app, on_send=_on_keepalive(kept_alive))
 
-    assert _status(sent) == 200
-    events = _sse_events(sent)
-    types = [event for event, _ in events]
-    assert types[:2] == ["response.created", "response.in_progress"]
-    first_output = types.index("response.output_text.delta")
-    # The worker kept its own stream alive while it was silent after its first output.
-    answered = _frame_events(workers.frames)
-    answered_types = [event for event, _ in answered]
-    assert (
-        "response.in_progress"
-        in answered_types[answered_types.index("response.output_text.delta") :]
-    )
-    # The client was kept alive meanwhile, and every response.in_progress it got is
-    # the opening's, only numbered on; none is one of the worker's.
-    assert "response.in_progress" in types[first_output:]
-    opening = _without_number(events[1][1])
-    assert all(
-        _without_number(data) == opening
-        for event, data in events
-        if event == "response.in_progress"
-    )
-    assert opening not in [
-        _without_number(data) for event, data in answered if event == "response.in_progress"
-    ]
-    # The worker's other events follow, in one sequence, for one response.
-    relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
-    assert [_without_number(data) for data in relayed] == [
-        _without_number(data)
-        for event, data in answered
-        if event not in ("response.created", "response.in_progress")
-    ]
-    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
-    (generation_request,) = workers.generation_requests
-    assert {data["response"]["id"] for _, data in events if "response" in data} == {
-        generation_request.request_id
-    }
+        assert _status(sent) == 200
+        events = _sse_events(sent)
+        types = [event for event, _ in events]
+        assert types[:2] == ["response.created", "response.in_progress"]
+        first_output = types.index("response.output_text.delta")
+        # The worker kept its own stream alive while it was silent after its first output.
+        answered = _frame_events(workers.frames)
+        answered_types = [event for event, _ in answered]
+        assert (
+            "response.in_progress"
+            in answered_types[answered_types.index("response.output_text.delta") :]
+        )
+        # The client was kept alive meanwhile, and every response.in_progress it got is
+        # the opening's, only numbered on; none is one of the worker's.
+        assert "response.in_progress" in types[first_output:]
+        opening = _without_number(events[1][1])
+        assert all(
+            _without_number(data) == opening
+            for event, data in events
+            if event == "response.in_progress"
+        )
+        assert opening not in [
+            _without_number(data) for event, data in answered if event == "response.in_progress"
+        ]
+        # The worker's other events follow, in one sequence, for one response.
+        relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
+        assert [_without_number(data) for data in relayed] == [
+            _without_number(data)
+            for event, data in answered
+            if event not in ("response.created", "response.in_progress")
+        ]
+        assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+        (generation_request,) = workers.generation_requests
+        assert {data["response"]["id"] for _, data in events if "response" in data} == {
+            generation_request.request_id
+        }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_responses_stream_after_a_fast_context_phase_is_the_generation_stream(
-    schedule_style,
+    tmp_path, schedule_style
 ):
     async def context_phase():
         pass
 
     workers = _Workers(context_phase)
-    sent = await _post_responses(_responses_server(schedule_style, workers).app)
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        sent = await _post_responses(server.app)
 
-    assert _status(sent) == 200
-    assert [event for event, _ in _sse_events(sent)] == [
-        "response.created",
-        "response.in_progress",
-        "response.output_text.delta",
-        "response.completed",
-    ]
-    assert _body(sent) == "".join(workers.frames)
+        assert _status(sent) == 200
+        assert [event for event, _ in _sse_events(sent)] == [
+            "response.created",
+            "response.in_progress",
+            "response.output_text.delta",
+            "response.completed",
+        ]
+        assert _body(sent) == "".join(workers.frames)
 
 
 _CONTEXT_FAILURES = [
@@ -1090,21 +1099,21 @@ _CONTEXT_FAILURES = [
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 @pytest.mark.parametrize("status, worker_message", _CONTEXT_FAILURES)
 async def test_responses_stream_with_a_fast_context_failure_is_an_http_error(
-    schedule_style, status, worker_message
+    tmp_path, schedule_style, status, worker_message
 ):
     async def context_phase():
         raise _worker_rejection(status, worker_message)
 
-    streamed = await _post_responses(_responses_server(schedule_style, _Workers(context_phase)).app)
-    not_streamed = await _post_responses(
-        _responses_server(schedule_style, _Workers(context_phase)).app, stream=False
-    )
+    with _responses_server(tmp_path, schedule_style, _Workers(context_phase)) as server:
+        streamed = await _post_responses(server.app)
+    with _responses_server(tmp_path, schedule_style, _Workers(context_phase)) as server:
+        not_streamed = await _post_responses(server.app, stream=False)
 
-    assert _status(streamed) == status
-    assert worker_message in _body(streamed)
-    # The error response of the same failure without a stream.
-    assert _status(not_streamed) == status
-    assert json.loads(_body(streamed)) == json.loads(_body(not_streamed))
+        assert _status(streamed) == status
+        assert worker_message in _body(streamed)
+        # The error response of the same failure without a stream.
+        assert _status(not_streamed) == status
+        assert json.loads(_body(streamed)) == json.loads(_body(not_streamed))
 
 
 @pytest.mark.asyncio
@@ -1125,7 +1134,7 @@ async def test_responses_stream_with_a_fast_context_failure_is_an_http_error(
     ],
 )
 async def test_responses_stream_with_a_late_context_failure_ends_with_response_failed(
-    monkeypatch, schedule_style, status, worker_message, error_code, failed_code
+    tmp_path, monkeypatch, schedule_style, status, worker_message, error_code, failed_code
 ):
     _short_waits(monkeypatch)
     kept_alive = asyncio.Event()
@@ -1135,40 +1144,40 @@ async def test_responses_stream_with_a_late_context_failure_ends_with_response_f
         await wait()
         raise _worker_rejection(status, worker_message)
 
-    streamed = await _post_responses(
-        _responses_server(schedule_style, _Workers(context_phase)).app,
-        on_send=_on_keepalive(kept_alive),
-    )
+    with _responses_server(tmp_path, schedule_style, _Workers(context_phase)) as server:
+        streamed = await _post_responses(
+            server.app,
+            on_send=_on_keepalive(kept_alive),
+        )
     kept_alive.set()
-    not_streamed = await _post_responses(
-        _responses_server(schedule_style, _Workers(context_phase)).app, stream=False
-    )
+    with _responses_server(tmp_path, schedule_style, _Workers(context_phase)) as server:
+        not_streamed = await _post_responses(server.app, stream=False)
 
-    assert _status(streamed) == 200
-    # The stream ends after its events, as any stream does.
-    assert streamed[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
-    events = _sse_events(streamed)
-    types = [event for event, _ in events]
-    assert types[:2] == ["response.created", "response.in_progress"]
-    assert set(types[2:-2]) == {"response.in_progress"}
-    assert types[-2:] == ["error", "response.failed"]
-    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
-    # error and response.failed, as a stream reports any failure, with the
-    # message of the error response of the same failure without a stream.
-    error_response = json.loads(_body(not_streamed))
-    message = error_response.get("detail") or error_response["message"]
-    assert worker_message in message
-    assert (events[-2][1]["code"], events[-2][1]["message"]) == (error_code, message)
-    failed = events[-1][1]["response"]
-    assert failed["id"] == events[0][1]["response"]["id"]
-    assert failed["status"] == "failed"
-    assert (failed["error"]["code"], failed["error"]["message"]) == (failed_code, message)
+        assert _status(streamed) == 200
+        # The stream ends after its events, as any stream does.
+        assert streamed[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+        events = _sse_events(streamed)
+        types = [event for event, _ in events]
+        assert types[:2] == ["response.created", "response.in_progress"]
+        assert set(types[2:-2]) == {"response.in_progress"}
+        assert types[-2:] == ["error", "response.failed"]
+        assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+        # error and response.failed, as a stream reports any failure, with the
+        # message of the error response of the same failure without a stream.
+        error_response = json.loads(_body(not_streamed))
+        message = error_response.get("detail") or error_response["message"]
+        assert worker_message in message
+        assert (events[-2][1]["code"], events[-2][1]["message"]) == (error_code, message)
+        failed = events[-1][1]["response"]
+        assert failed["id"] == events[0][1]["response"]["id"]
+        assert failed["status"] == "failed"
+        assert (failed["error"]["code"], failed["error"]["message"]) == (failed_code, message)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_an_opened_stream_whose_generation_stream_fails_ends_with_response_failed(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     _short_waits(monkeypatch)
 
@@ -1177,35 +1186,36 @@ async def test_an_opened_stream_whose_generation_stream_fails_ends_with_response
         await asyncio.sleep(0.2)
 
     workers = _WorkersFailingAfterTheFirstOutput(context_phase)
-    sent = await _post_responses(
-        _responses_server(schedule_style, workers).app, on_send=workers.on_send
-    )
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        sent = await _post_responses(server.app, on_send=workers.on_send)
 
-    assert _status(sent) == 200
-    # The stream ends after its events, as any stream does.
-    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
-    events = _sse_events(sent)
-    assert events[1][0] == "response.in_progress"
-    assert [event for event, _ in events if event != "response.in_progress"] == [
-        "response.created",
-        "response.output_text.delta",
-        "error",
-        "response.failed",
-    ]
-    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
-    assert (events[-2][1]["code"], events[-2][1]["message"]) == (
-        "upstream_error",
-        "ClientPayloadError",
-    )
-    # The failed response is the one the stream opened with.
-    opened, failed = events[0][1]["response"], events[-1][1]["response"]
-    assert (failed["id"], failed["created_at"]) == (opened["id"], opened["created_at"])
-    assert (failed["status"], failed["error"]["code"]) == ("failed", "server_error")
+        assert _status(sent) == 200
+        # The stream ends after its events, as any stream does.
+        assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+        events = _sse_events(sent)
+        assert events[1][0] == "response.in_progress"
+        assert [event for event, _ in events if event != "response.in_progress"] == [
+            "response.created",
+            "response.output_text.delta",
+            "error",
+            "response.failed",
+        ]
+        assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+        assert (events[-2][1]["code"], events[-2][1]["message"]) == (
+            "upstream_error",
+            "ClientPayloadError",
+        )
+        # The failed response is the one the stream opened with.
+        opened, failed = events[0][1]["response"], events[-1][1]["response"]
+        assert (failed["id"], failed["created_at"]) == (opened["id"], opened["created_at"])
+        assert (failed["status"], failed["error"]["code"]) == ("failed", "server_error")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
-async def test_a_relayed_generation_stream_that_fails_ends_with_an_error_event(schedule_style):
+async def test_a_relayed_generation_stream_that_fails_ends_with_an_error_event(
+    tmp_path, schedule_style
+):
     """After a fast context phase the worker's own opening is relayed, so only error is added."""
 
     async def context_phase():
@@ -1218,27 +1228,28 @@ async def test_a_relayed_generation_stream_that_fails_ends_with_an_error_event(s
         sent.append(message)
         workers.on_send(message)
 
-    with contextlib.suppress(aiohttp.ClientPayloadError):
-        await _post_responses(_responses_server(schedule_style, workers).app, on_send=on_send)
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        with contextlib.suppress(aiohttp.ClientPayloadError):
+            await _post_responses(server.app, on_send=on_send)
 
-    events = _sse_events(sent)
-    assert [event for event, _ in events] == [
-        "response.created",
-        "response.in_progress",
-        "response.output_text.delta",
-        "error",
-    ]
-    assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3]
-    assert (events[-1][1]["code"], events[-1][1]["message"]) == (
-        "upstream_error",
-        "ClientPayloadError",
-    )
+        events = _sse_events(sent)
+        assert [event for event, _ in events] == [
+            "response.created",
+            "response.in_progress",
+            "response.output_text.delta",
+            "error",
+        ]
+        assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3]
+        assert (events[-1][1]["code"], events[-1][1]["message"]) == (
+            "upstream_error",
+            "ClientPayloadError",
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_a_non_streamed_response_still_waits_for_the_whole_pipeline(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     _short_waits(monkeypatch)
 
@@ -1247,16 +1258,17 @@ async def test_a_non_streamed_response_still_waits_for_the_whole_pipeline(
         await asyncio.sleep(0.2)
 
     workers = _Workers(context_phase)
-    sent = await _post_responses(_responses_server(schedule_style, workers).app, stream=False)
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        sent = await _post_responses(server.app, stream=False)
 
-    assert _status(sent) == 200
-    assert json.loads(_body(sent)) == workers.response.model_dump(mode="json", by_alias=True)
+        assert _status(sent) == 200
+        assert json.loads(_body(sent)) == workers.response.model_dump(mode="json", by_alias=True)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_a_request_no_opening_can_be_built_for_is_answered_by_its_pipeline(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     """The opening is built from the request; one it cannot be built from waits as before."""
     _short_waits(monkeypatch)
@@ -1267,18 +1279,17 @@ async def test_a_request_no_opening_can_be_built_for_is_answered_by_its_pipeline
         await asyncio.sleep(0.2)
         raise _worker_rejection(400, rejection)
 
-    sent = await _post_responses(
-        _responses_server(schedule_style, _Workers(context_phase)).app, top_p=2.0
-    )
+    with _responses_server(tmp_path, schedule_style, _Workers(context_phase)) as server:
+        sent = await _post_responses(server.app, top_p=2.0)
 
-    assert _status(sent) == 400
-    assert json.loads(_body(sent)) == {"detail": rejection}
+        assert _status(sent) == 400
+        assert json.loads(_body(sent)) == {"detail": rejection}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_client_leaving_after_the_responses_stream_starts_cancels_the_context_phase(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     _short_waits(monkeypatch)
     workers = _Workers(_waits_for(asyncio.Event()))
@@ -1288,11 +1299,10 @@ async def test_client_leaving_after_the_responses_stream_starts_cancels_the_cont
         if message["type"] == "http.response.start":
             left.set()
 
-    await _post_responses(
-        _responses_server(schedule_style, workers).app, on_send=on_send, leave=left
-    )
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        await _post_responses(server.app, on_send=on_send, leave=left)
 
-    await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
 
 
 def _raw_request() -> Request:
@@ -1304,7 +1314,7 @@ def _raw_request() -> Request:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 async def test_cancelling_the_responses_handler_during_its_wait_cancels_the_context_phase(
-    monkeypatch, schedule_style
+    tmp_path, monkeypatch, schedule_style
 ):
     monkeypatch.setattr(openai_disagg_server, "_RESPONSES_STREAM_START_WAIT_S", 60)
     context_started = asyncio.Event()
@@ -1315,29 +1325,30 @@ async def test_cancelling_the_responses_handler_during_its_wait_cancels_the_cont
         await release_context.wait()
 
     workers = _Workers(context_phase)
-    handler = _responses_route(_responses_server(schedule_style, workers))
-    request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
-    pending = asyncio.create_task(handler(request, _raw_request()))
-    try:
-        await asyncio.wait_for(context_started.wait(), 2)
-        assert not pending.done()
-        pending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
-        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
-        assert not workers.context_done.is_set()
-    finally:
-        release_context.set()
-        pending.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pending
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        handler = _responses_route(server)
+        request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
+        pending = asyncio.create_task(handler(request, _raw_request()))
+        try:
+            await asyncio.wait_for(context_started.wait(), 2)
+            assert not pending.done()
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+            assert not workers.context_done.is_set()
+        finally:
+            release_context.set()
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 @pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
 async def test_disconnect_before_the_responses_body_starts_cancels_the_context_phase(
-    monkeypatch, schedule_style, asgi_version
+    tmp_path, monkeypatch, schedule_style, asgi_version
 ):
     """The pipeline is cancelled even if the body is never iterated."""
     from starlette.requests import ClientDisconnect
@@ -1345,44 +1356,45 @@ async def test_disconnect_before_the_responses_body_starts_cancels_the_context_p
     _short_waits(monkeypatch)
     release_context = asyncio.Event()
     workers = _Workers(_waits_for(release_context))
-    handler = _responses_route(_responses_server(schedule_style, workers))
-    request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
-    response = await asyncio.wait_for(handler(request, _raw_request()), 2)
-    response_started = asyncio.Event()
-    sent = []
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        handler = _responses_route(server)
+        request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
+        response = await asyncio.wait_for(handler(request, _raw_request()), 2)
+        response_started = asyncio.Event()
+        sent = []
 
-    async def send(message):
-        sent.append(message)
-        response_started.set()
-        if asgi_version == "2.4":
-            raise OSError("client disconnected")
-        await asyncio.Event().wait()
+        async def send(message):
+            sent.append(message)
+            response_started.set()
+            if asgi_version == "2.4":
+                raise OSError("client disconnected")
+            await asyncio.Event().wait()
 
-    async def receive():
-        await response_started.wait()
-        return {"type": "http.disconnect"}
+        async def receive():
+            await response_started.wait()
+            return {"type": "http.disconnect"}
 
-    try:
-        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
-        if asgi_version == "2.4":
-            with pytest.raises(ClientDisconnect):
+        try:
+            scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
+            if asgi_version == "2.4":
+                with pytest.raises(ClientDisconnect):
+                    await response(scope, receive, send)
+            else:
                 await response(scope, receive, send)
-        else:
-            await response(scope, receive, send)
-        assert [message["type"] for message in sent] == ["http.response.start"]
-        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
-        if schedule_style == "generation_first":
-            await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
-        assert not workers.context_done.is_set()
-    finally:
-        release_context.set()
+            assert [message["type"] for message in sent] == ["http.response.start"]
+            await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+            if schedule_style == "generation_first":
+                await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
+            assert not workers.context_done.is_set()
+        finally:
+            release_context.set()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
 @pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
 async def test_disconnect_before_the_responses_body_starts_closes_the_stream_it_answered_with(
-    monkeypatch, schedule_style, asgi_version
+    tmp_path, monkeypatch, schedule_style, asgi_version
 ):
     """The pipeline answers with a stream after the response is returned, which no body reads."""
     from starlette.requests import ClientDisconnect
@@ -1390,38 +1402,39 @@ async def test_disconnect_before_the_responses_body_starts_closes_the_stream_it_
     _short_waits(monkeypatch)
     release_context = asyncio.Event()
     workers = _WorkersStillGenerating(_waits_for(release_context))
-    handler = _responses_route(_responses_server(schedule_style, workers))
-    request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
-    response = await asyncio.wait_for(handler(request, _raw_request()), 2)
-    pipeline = response._pipeline
-    answered = asyncio.Event()
-    sent = []
+    with _responses_server(tmp_path, schedule_style, workers) as server:
+        handler = _responses_route(server)
+        request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
+        response = await asyncio.wait_for(handler(request, _raw_request()), 2)
+        pipeline = response._pipeline
+        answered = asyncio.Event()
+        sent = []
 
-    async def send(message):
-        sent.append(message)
-        # The pipeline answers while the response starts, before the body does.
-        release_context.set()
-        await asyncio.wait((pipeline,), timeout=2)
-        answered.set()
+        async def send(message):
+            sent.append(message)
+            # The pipeline answers while the response starts, before the body does.
+            release_context.set()
+            await asyncio.wait((pipeline,), timeout=2)
+            answered.set()
+            if asgi_version == "2.4":
+                raise OSError("client disconnected")
+            await asyncio.Event().wait()
+
+        async def receive():
+            await answered.wait()
+            return {"type": "http.disconnect"}
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
         if asgi_version == "2.4":
-            raise OSError("client disconnected")
-        await asyncio.Event().wait()
-
-    async def receive():
-        await answered.wait()
-        return {"type": "http.disconnect"}
-
-    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
-    if asgi_version == "2.4":
-        with pytest.raises(ClientDisconnect):
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+        else:
             await response(scope, receive, send)
-    else:
-        await response(scope, receive, send)
 
-    assert [message["type"] for message in sent] == ["http.response.start"]
-    assert isinstance(pipeline.result(), StreamingResponse)
-    # Closed by the time the response is done, while the generation worker goes on.
-    assert workers.generation_closed.is_set()
+        assert [message["type"] for message in sent] == ["http.response.start"]
+        assert isinstance(pipeline.result(), StreamingResponse)
+        # Closed by the time the response is done, while the generation worker goes on.
+        assert workers.generation_closed.is_set()
 
 
 def _frame(event_type: str, sequence_number: int, **fields) -> str:
