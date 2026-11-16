@@ -191,6 +191,78 @@ def make_keyed_multimodal_param(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("use_prepared_embeds", [False, True])
+def test_breakable_inputs_embed_through_text_embedding_hook(use_prepared_embeds):
+    # The model exposes its embedding only through the mixin hook: no `llm.model.embed_tokens`.
+    embedding = make_embedding(num_embeddings=16, hidden_size=4)
+    model = DummyMultimodalModel(embedding, torch.tensor([15]))
+    input_ids = torch.tensor([1, 2, 3])
+    expected_embeds = embedding(input_ids)
+    metadata = object()
+    inputs = {
+        "input_ids": None if use_prepared_embeds else input_ids,
+        "inputs_embeds": expected_embeds if use_prepared_embeds else None,
+        "attn_metadata": metadata,
+    }
+    if use_prepared_embeds:
+        embedding.register_forward_pre_hook(
+            lambda module, args: pytest.fail("prepared embeddings must bypass token lookup")
+        )
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert not hasattr(model, "llm")
+    assert prepared is not inputs
+    assert prepared["input_ids"] is None
+    assert prepared["attn_metadata"] is metadata
+    torch.testing.assert_close(prepared["inputs_embeds"], expected_embeds, atol=0, rtol=0)
+    if use_prepared_embeds:
+        assert prepared["inputs_embeds"] is expected_embeds
+    else:
+        assert inputs["input_ids"] is input_ids
+        assert inputs["inputs_embeds"] is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_generations", [0, 1, 3])
+def test_breakable_inputs_pad_mrope_generation_deltas_without_context_offset(num_generations):
+    model = DummyMultimodalModel(make_embedding(), torch.tensor([99]))
+    num_tokens = 5
+    mrope_config = {"mrope_rotary_cos_sin": torch.randn(1, 20)}
+    deltas = torch.tensor([-3, 0, 7], dtype=torch.int32)[:num_generations].view(-1, 1)
+    if num_generations:
+        mrope_config["mrope_position_deltas"] = deltas
+    inputs = {"inputs_embeds": torch.randn(num_tokens, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    padded = prepared["mrope_config"]["mrope_position_deltas"]
+    assert padded.shape == (num_tokens, 1)
+    assert padded.dtype == torch.int32
+    torch.testing.assert_close(padded[:num_generations], deltas, atol=0, rtol=0)
+    torch.testing.assert_close(
+        padded[num_generations:], torch.zeros(num_tokens - num_generations, 1, dtype=torch.int32)
+    )
+    assert prepared["mrope_config"] is not mrope_config
+    assert prepared["mrope_config"]["mrope_rotary_cos_sin"] is mrope_config["mrope_rotary_cos_sin"]
+    if num_generations:
+        assert mrope_config["mrope_position_deltas"] is deltas
+    else:
+        assert "mrope_position_deltas" not in mrope_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mrope_config", [None, {}])
+def test_breakable_inputs_leave_unfused_mrope_unchanged(mrope_config):
+    model = DummyMultimodalModel(make_embedding(), torch.tensor([99]))
+    inputs = {"inputs_embeds": torch.randn(3, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared["mrope_config"] is mrope_config
+
+
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 

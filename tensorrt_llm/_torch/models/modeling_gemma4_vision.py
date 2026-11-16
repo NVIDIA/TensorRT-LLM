@@ -352,6 +352,13 @@ class Gemma4VisionAttention(Attention):
         # this dim only. ``self.head_dim_pad`` is the zero-padding width.
         self.hf_head_dim = hf_head_dim
         self.head_dim_pad = padded_head_dim - hf_head_dim
+        # Vision attention runs from the multimodal wrapper with tower-local
+        # metadata. Unregister from the shared attn-layer map so it never takes
+        # the custom-op path (torch.compile or breakable CUDA graph), which reads
+        # the decoder's metadata (same contract as Qwen2_5_VLVisionAttention).
+        if self.register_to_config:
+            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
+            self.register_to_config = False
 
         # HF Gemma4RMSNorm is the plain variant (``x_normed * weight``, no
         # ``(1+w)``). v_norm has ``with_scale=False`` (no learnable weight).

@@ -238,6 +238,25 @@ def test_exaone4_5_config_preserves_unexpected_layer_type_mismatch():
         Exaone4_5Config(**config)
 
 
+@pytest.mark.cpu_only
+def test_exaone4_5_language_model_shares_attention_registry(monkeypatch) -> None:
+    """The language model registers its attention layers where the engine looks them up."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_exaone4_5
+
+    built = []
+    monkeypatch.setattr(modeling_exaone4_5.AutoModelForCausalLM, "from_config", built.append)
+    # Without a local vision encoder; only the language model's config matters here.
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+    config = Exaone4_5Config(**copy.deepcopy(EXAONE_4_5_TEST_CONFIG))
+    model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+
+    Exaone4_5_ForConditionalGeneration(model_config)
+
+    (llm_model_config,) = built
+    assert llm_model_config.extra_attrs is model_config.extra_attrs
+
+
 @dataclass(repr=False)
 class TestExaone4_5Scenario(MultimodalScenario):
     """Scenario config for Exaone4.5 multimodal smoke tests."""
