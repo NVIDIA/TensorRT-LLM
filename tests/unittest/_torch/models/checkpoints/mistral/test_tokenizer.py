@@ -51,8 +51,8 @@ def test_pickle_round_trip_keeps_the_class(tokenizer, serializer):
 
 @pytest.mark.parametrize("skip_special_tokens", [False, True])
 def test_streaming_matches_decode(tokenizer, skip_special_tokens):
-    """Streamed text equals decode(): control tokens stay unless skipped, and skipping keeps
-    [TOOL_CALLS] only. Characters split over tokens come back whole."""
+    """Without skip_special_tokens, streamed text equals decode(); skipping them drops every
+    control token but [TOOL_CALLS]. Characters split over tokens come back whole."""
     names = ["[TOOL_CALLS]", "[INST]", "[/INST]"]
     if "[THINK]" in tokenizer.tokenizer._special_tokens_reverse_vocab:
         names = ["[THINK]", "[/THINK]"] + names

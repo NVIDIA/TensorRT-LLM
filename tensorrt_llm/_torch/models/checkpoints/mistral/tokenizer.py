@@ -291,8 +291,8 @@ class MistralTokenizer(TransformersTokenizer):
         to_decode_special_tokens = {SpecialTokens.tool_calls}
         if self.is_tekken:
             assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
-            # Kept special tokens stay, as decode() keeps them: streamed text then
-            # carries the control tokens tool and reasoning parsers read.
+            # Without skip_special_tokens every control token stays, as decode() keeps
+            # them, so the streamed text equals decode()'s.
             if skip_special_tokens:
                 tokens = [
                     t

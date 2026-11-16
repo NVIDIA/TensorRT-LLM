@@ -893,8 +893,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         images = self.processor.image_list(
             inputs.get("multi_modal_data", {}).get("image"))
         if not images:
-            if self._has_vision_encoder() and any(
-                    token in self.get_mm_token_ids() for token in token_ids):
+            if self._has_vision_encoder() and not set(
+                    self.get_mm_token_ids().tolist()).isdisjoint(token_ids):
                 raise ValueError("Image tokens require image data")
             return token_ids, None
         processed = self.processor(text="", images=images)
