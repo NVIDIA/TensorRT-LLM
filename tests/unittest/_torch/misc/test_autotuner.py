@@ -60,6 +60,16 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+@pytest.fixture(autouse=True)
+def _rank_workers_off(monkeypatch):
+    """The tests here build and time in this process, as with TLLM_KERNEL_BUILDER=0; the
+    tests that take ``tune_mode_workers`` build in worker processes."""
+    from tensorrt_llm._torch import rank_worker
+
+    monkeypatch.setattr(rank_worker.RankWorker, "_instance",
+                        rank_worker.RankWorker(enabled=False))
+
+
 def test_multi_dynamic_dims():
     tuner = autotuner.AutoTuner()
     x = torch.rand([5, 1024])
@@ -2884,11 +2894,16 @@ def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
         assert (1, "tile") in cache and cache[(1, "tile")] == "kernel"
 
 
-def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
+@pytest.mark.parametrize("workers_on", [False, True])
+def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
+                                                    tune_mode_workers,
+                                                    workers_on):
     """With several tactics under INDEPENDENT tuning, a build pass runs each
     (profile, runner, tactic) this process claims once, before profiling, and
     leaves the items other processes claimed to them; profiling then times
-    every pair."""
+    every pair. A runner that cannot go to the worker processes (a local class)
+    takes the same pass with them on."""
+    tune_mode_workers.enabled = workers_on
     ran: List[tuple] = []
     timed: List[tuple] = []
 
@@ -2927,8 +2942,9 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
     tuner.clear_cache()
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
                                                                   (2, 4)), ),
-                          share_jit_builds=True)
-    with autotune():
+                          share_jit_builds=True,
+                          build_in_workers=workers_on)
+    with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one("autotuner_test::build_across_ranks",
                          [TwoTacticRunner()], config,
                          [torch.zeros(4, 64, device="cuda")])
@@ -3146,3 +3162,92 @@ def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
     assert on_caller == set(buckets)
     assert on_pool == ([] if sharing else sorted(buckets))
     tuner.clear_cache()
+
+
+@pytest.fixture
+def tune_mode_workers(monkeypatch):
+    """A RankWorker whose worker processes import autotuner_worker_targets."""
+    from tensorrt_llm._torch import rank_worker
+
+    original = rank_worker._worker_env
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def worker_env():
+        env = original()
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (here,
+                                                        env.get("PYTHONPATH"))
+                                            if p)
+        return env
+
+    monkeypatch.setattr(rank_worker, "_worker_env", worker_env)
+    rank = rank_worker.RankWorker(workers=2, enabled=True)
+    monkeypatch.setattr(rank_worker.RankWorker, "_instance", rank)
+    yield rank
+    rank.stop()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("workers_on, in_build_pass", [(True, True),
+                                                       (False, True),
+                                                       (True, False)],
+                         ids=["workers", "workers_off", "no_build_pass"])
+def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
+        tune_mode_workers, tmp_path, workers_on, in_build_pass):
+    """In tune mode inside a build pass, an op that sets ``build_in_workers`` has the rank's
+    worker processes build every (profile, tactic) its profiling times, before it profiles;
+    with the workers off (``TLLM_KERNEL_BUILDER=0``), or outside a build pass, none builds
+    there."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.enabled = workers_on
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    build_pass = (tune_mode_workers.pass_scope()
+                  if in_build_pass else contextlib.nullcontext())
+    with build_pass, autotune():
+        best_runner, _ = tuner.choose_one("test::tune_mode_builds", [runner],
+                                          config, [x])
+    assert best_runner is runner
+    built = sorted(os.listdir(tmp_path))
+    if workers_on and in_build_pass:
+        assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+        assert all(
+            int((tmp_path / name).read_text()) != os.getpid() for name in built)
+        # The build pass stopped the workers.
+        assert tune_mode_workers._pool is None
+    else:
+        assert built == []
+    tuner.clear_cache()
+
+
+def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
+    """A worker's input has the tensor's storage, padding included, and its view of it, as a
+    TMA-aligned scale is a column-major view of a padded buffer, and a small tensor's values; a
+    small view of a large buffer keeps its own extent only."""
+    padded = torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)
+    scale = padded.t()[:12, :5]
+    remade = autotuner._TensorSpec.make(autotuner._TensorSpec.of(scale))
+    assert remade.shape == scale.shape and remade.stride() == scale.stride()
+    assert remade.storage_offset() == scale.storage_offset()
+    assert remade.untyped_storage().nbytes() == padded.untyped_storage().nbytes(
+    )
+    assert torch.equal(remade, scale)
+
+    # A block scale keeps its values (powers of two, which a kernel decodes).
+    sf = torch.tensor([[0.5, 2.0], [4.0, 1.0]])
+    assert torch.equal(autotuner._TensorSpec.make(autotuner._TensorSpec.of(sf)),
+                       sf)
+
+    monkeypatch.setattr(autotuner, "_SPEC_STORAGE_SLACK_BYTES", 0)
+    buffer = torch.arange(100, dtype=torch.float16)
+    view = buffer[40:50]
+    remade = autotuner._TensorSpec.make(autotuner._TensorSpec.of(view))
+    assert torch.equal(remade, view)
+    assert remade.untyped_storage().nbytes(
+    ) == view.numel() * view.element_size()

@@ -30,7 +30,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Set, Tuple,
+                    Union)
 
 import torch
 from cuda.bindings import driver
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
+from tensorrt_llm._torch.rank_worker import RankWorker
 from tensorrt_llm._utils import (confidential_compute_enabled, local_mpi_size,
                                  mpi_disabled, nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
@@ -180,6 +182,14 @@ class TuningConfig:
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
             For decode-sized GEMMs whose weights never stay in L2 between uses.
+        build_in_workers (bool): Inside a build pass (``RankWorker.pass_scope``, the
+            memory-profiling warmup), tune mode builds the op's kernels in the rank's worker
+            processes (``tensorrt_llm._torch.rank_worker``) before it profiles: every
+            (profile, runner, tactic) the profiling times, through ``TunableRunner.build``,
+            on inputs of the profile's layout. For runners whose compiler cannot run on
+            several threads (CuTe DSL), which ``parallel_jit_warmup`` cannot take, and whose
+            builds are small: each worker allocates its build's inputs and outputs on the
+            rank's GPU. The runners and their tactics must pickle, and must not be collective.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -192,6 +202,7 @@ class TuningConfig:
     parallel_jit_warmup: int = 0
     share_jit_builds: bool = False
     cold_l2_flush_bytes: int = 0
+    build_in_workers: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -313,6 +324,116 @@ class TunableRunner(ABC):
         """
         return tuple(self.__dict__.values())
 
+    def build(self,
+              inputs: List[torch.Tensor],
+              *,
+              tactic: Any = -1,
+              **kwargs) -> None:
+        """Compile the kernels ``tactic`` runs on ``inputs``; the result is discarded.
+
+        Tune mode calls it in the rank's worker processes before it profiles
+        (``TuningConfig.build_in_workers``). This default runs the tactic
+        once, which compiles what a first call compiles. A runner that ships
+        its kernels, or can compile without launching, overrides it.
+        """
+        self(inputs, tactic=tactic, **kwargs)
+
+    def build_key(self, profile: "OptimizationProfile",
+                  tactic: Any) -> Hashable:
+        """Builds with equal keys compile the same kernels, so only one of them runs.
+
+        This default distinguishes every profile and tactic.
+        """
+        return (profile.get_opt_shapes(), str(tactic))
+
+
+# A tensor spec keeps the values of a tensor whose storage has up to this many elements: scales,
+# whose values a kernel decodes, indices and offsets, which must stay in bounds, and small
+# activations; a larger tensor (weights, activations) gets values of its own.
+_SPEC_VALUES_MAX_NUMEL = 1 << 20
+# A tensor spec keeps the tensor's whole storage, padding a kernel may read included (TMA-aligned
+# scales have some), unless the storage exceeds the tensor's own extent by more than this and by
+# more than the extent itself: a view of a larger buffer keeps its extent only.
+_SPEC_STORAGE_SLACK_BYTES = 64 << 20
+
+
+@dataclass(frozen=True, eq=False)
+class _TensorSpec:
+    """A tensor's storage and its view of it, to make one like it from in a worker process. A
+    large tensor gets values of its own, as the autotuner makes for a profile's inputs; a small
+    one keeps a CPU copy of its storage's values (see ``_SPEC_VALUES_MAX_NUMEL``)."""
+    shape: Tuple[int, ...]
+    stride: Tuple[int, ...]
+    storage_offset: int
+    storage_numel: int
+    dtype: torch.dtype
+    itemsize: int
+    on_cuda: bool
+    values: Optional[torch.Tensor] = None
+
+    @classmethod
+    def of(cls, value: Any) -> Any:
+        """A spec of a tensor; any other value itself."""
+        if not isinstance(value, torch.Tensor):
+            return value
+        itemsize = value.element_size()
+        extent = (1 + sum(
+            (n - 1) * s for n, s in zip(value.shape, value.stride()))
+                  if value.numel() else 0)
+        offset = value.storage_offset()
+        numel = value.untyped_storage().nbytes() // itemsize
+        if (numel - extent) * itemsize > max(extent * itemsize,
+                                             _SPEC_STORAGE_SLACK_BYTES):
+            base, numel, offset = offset, extent, 0
+        else:
+            base = 0
+        values = None
+        if (value.dtype != torch.float4_e2m1fn_x2
+                and numel <= _SPEC_VALUES_MAX_NUMEL):
+            values = value.detach().as_strided((numel, ), (1, ),
+                                               base).to("cpu", copy=True)
+        return cls(tuple(value.shape), tuple(value.stride()), offset, numel,
+                   value.dtype, itemsize, value.is_cuda, values)
+
+    @staticmethod
+    def make(value: Any) -> Any:
+        """A tensor of the spec's storage and view on this process's current device (or the
+        CPU), with the copied values or values of its own; any other value itself."""
+        if not isinstance(value, _TensorSpec):
+            return value
+        device = (torch.device("cuda", torch.cuda.current_device())
+                  if value.on_cuda else torch.device("cpu"))
+        if value.values is not None:
+            storage = value.values.to(device)
+        elif value.dtype.is_floating_point:
+            storage = (torch.rand(value.storage_numel, device=device) * 10 -
+                       5).to(value.dtype)
+        else:
+            storage = torch.zeros(value.storage_numel * value.itemsize,
+                                  dtype=torch.uint8,
+                                  device=device).view(value.dtype)
+        return storage.as_strided(value.shape, value.stride,
+                                  value.storage_offset)
+
+
+def _build_in_worker(runner: "TunableRunner", tactic: Any, specs: List[Any],
+                     kwargs: Dict[str, Any], prepare: bool) -> None:
+    """In a RankWorker worker process: build the kernels ``runner`` runs ``tactic`` on, on
+    inputs made from ``specs``, as tune mode's profiling would. CuTe DSL kernels the runner
+    keeps in its class's ``kernel_cache`` go to the rank's store, the others to their
+    compilers' disk caches; the rank's profiling loads them from there."""
+    tuner = AutoTuner.get()
+    tuner.is_tuning_mode = True  # Some runners compile only while tuning.
+    jit_share.share_kernel_caches([runner])
+    with (torch.inference_mode(), jit_share.sharing_kernels(),
+          nccl_window_allocation_suppressed()):
+        tensors = [_TensorSpec.make(spec) for spec in specs]
+        made = {key: _TensorSpec.make(value) for key, value in kwargs.items()}
+        if prepare:
+            runner(tensors, tactic=-1, do_preparation=True, **made)
+        runner.build(tensors, tactic=tactic, **made)
+        torch.cuda.synchronize()
+
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
@@ -377,9 +498,12 @@ def autotune(tune_mode: bool = True,
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
     # While tuning, CuTe DSL kernels in shared runner caches go through the
-    # directory of TLLM_JIT_SHARE_DIR (see tensorrt_llm._jit_share).
-    kernel_sharing = (jit_share.sharing_kernels() if tune_required
-                      and jit_share.enabled() else contextlib.nullcontext())
+    # directory of TLLM_JIT_SHARE_DIR, or else the store of this rank's worker
+    # processes, which build kernels there inside a build pass (see
+    # tensorrt_llm._jit_share and tensorrt_llm._torch.rank_worker).
+    kernel_sharing = (jit_share.sharing_kernels() if tune_required and
+                      (jit_share.enabled() or RankWorker.get().accepting()) else
+                      contextlib.nullcontext())
     eager_forks_context = (no_eager_forks()
                            if tune_required else contextlib.nullcontext())
 
@@ -1397,9 +1521,20 @@ class AutoTuner:
 
             share_builds = (tuning_config.share_jit_builds
                             and jit_share.enabled())
-            one_pair = share_builds and self._one_pair_per_profile(
-                runners, profiles, inputs, tuning_config, is_pending, **kwargs)
-            if share_builds:
+            built_in_pool = False
+            if self._builds_in_pool(tuning_config):
+                jit_share.share_kernel_caches(runners)
+                built_in_pool = self._build_in_pool(custom_op, runners,
+                                                    profiles, inputs,
+                                                    tuning_config, is_pending,
+                                                    share_builds, **kwargs)
+            one_pair = (share_builds
+                        and not built_in_pool and self._one_pair_per_profile(
+                            runners, profiles, inputs, tuning_config,
+                            is_pending, **kwargs))
+            if built_in_pool:
+                pass
+            elif share_builds:
                 jit_share.share_kernel_caches(runners)
                 if (not one_pair and tuning_config.distributed_tuning_strategy
                         == DistributedTuningStrategy.INDEPENDENT):
@@ -1477,6 +1612,93 @@ class AutoTuner:
         return sum(
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
+
+    def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
+        """Whether tune mode builds the op's kernels in the rank's worker processes before it
+        profiles: an op that sets ``build_in_workers``, whose runners are not collective (MERGE),
+        while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
+        return (tuning_config.build_in_workers
+                and tuning_config.distributed_tuning_strategy
+                != DistributedTuningStrategy.MERGE
+                and RankWorker.get().accepting())
+
+    def _build_in_pool(self, custom_op: str, runners: List[TunableRunner],
+                       profiles: List[OptimizationProfile],
+                       inputs: List[torch.Tensor], tuning_config: TuningConfig,
+                       is_pending: Callable[[OptimizationProfile], bool],
+                       share_builds: bool, **kwargs) -> bool:
+        """Build the kernels that profiling the pending profiles needs in this rank's worker
+        processes, and wait for them; the profiling that follows loads each kernel instead of
+        compiling it.
+
+        Every (profile, runner, tactic) is built, whatever share of the tactics this rank then
+        profiles (PARALLEL), since any of them may win. With shared JIT builds the ranks claim
+        the items, and each builds the ones it claims; the profiling waits for the others.
+        Returns False, before claiming any item, when the runners cannot go to a worker (they
+        do not pickle), and the caller builds as without workers. An item whose inputs cannot
+        go to a worker is left to the profiling.
+        """
+        pending = [p for p in profiles if is_pending(p)]
+        items = []
+        specs: Dict[int, List[Any]] = {}
+        for i, p in enumerate(pending):
+            tensors = self._tuning_tensors(p, inputs, tuning_config)
+            specs[i] = [_TensorSpec.of(t) for t in tensors]
+            for r, runner in enumerate(runners):
+                items.extend((i, r, tactic)
+                             for tactic in runner.get_valid_tactics(
+                                 tensors, p, **kwargs))
+            del tensors
+        if not items:
+            return True
+        sweep = (jit_share.SharedSweep(
+            repr((custom_op, [p.get_opt_shapes() for p in pending],
+                  items))) if share_builds else None)
+        start = int(jit_share.start_fraction() *
+                    len(items)) if share_builds else 0
+        kwarg_specs = {k: _TensorSpec.of(v) for k, v in kwargs.items()}
+        prepares = [
+            "do_preparation" in inspect.signature(r.forward).parameters
+            for r in runners
+        ]
+        worker = RankWorker.get()
+        if not all(worker.takes((runner, kwarg_specs)) for runner in runners):
+            logger.warning_once(
+                f"[Autotuner] {custom_op}: its runners do not go to worker "
+                "processes; its kernels build as it profiles.",
+                key=(custom_op, "builds_in_pool_refused"))
+            return False
+        task_keys = []
+        refused = 0
+        begin = time.perf_counter()
+        for k in list(range(start, len(items))) + list(range(start)):
+            if sweep is not None and not sweep.claim(k):
+                continue
+            i, r, tactic = items[k]
+            runner = runners[r]
+            task_key = "autotuner|" + repr(
+                (custom_op, type(runner).__name__, str(
+                    runner.unique_id()), runner.build_key(pending[i], tactic)))
+            future = worker.run(
+                task_key, "tensorrt_llm._torch.autotuner:_build_in_worker",
+                (runner, tactic, specs[i], kwarg_specs, prepares[r]))
+            if future is None:
+                # The profiling compiles it; no rank waits for it.
+                refused += 1
+                if sweep is not None:
+                    sweep.done(k)
+                continue
+            if sweep is not None:
+                future.add_done_callback(lambda _, k=k: sweep.done(k))
+            task_keys.append(task_key)
+        worker.join(task_keys)
+        failed = sum(worker.state(key) == "failed" for key in task_keys)
+        self._debug_logger(
+            f"[Autotuner] {custom_op}: {len(task_keys)} of {len(items)} (profile, runner, "
+            f"tactic) items of {len(pending)} profiles built in worker processes "
+            f"({failed} failed, {refused} left to profiling) in "
+            f"{time.perf_counter() - begin:.1f}s")
+        return True
 
     def _build_across_ranks(self, custom_op: str, runners: List[TunableRunner],
                             profiles: List[OptimizationProfile],

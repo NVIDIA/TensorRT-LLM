@@ -93,9 +93,15 @@ _PROCESS_ENV = "TLLM_JIT_SHARE_PROCESS"
 # Linux reads at most this much of a script's "#!" line on older kernels.
 _SHEBANG_LIMIT = 127
 
+# Set in a RankWorker worker process (tensorrt_llm._torch.rank_worker): its rank's store.
+_RANK_STORE_ENV = "TLLM_RANK_WORKER_STORE"
+
 _installed = False
 _slot: int | None = None
 _kernel_sharing_depth = 0
+# This rank's RankWorker store (set_rank_store), where shared kernel caches keep CuTe DSL
+# kernels when the processes of the launch do not share a directory.
+_rank_store: str | None = None
 _cute_salt: str | None = None
 # .claim: (claim, failed) of the kernel this thread claimed and has not stored.
 _unstored = threading.local()
@@ -264,8 +270,25 @@ class sharing_kernels:
         return False
 
 
+def set_rank_store(path: str) -> None:
+    """Have shared kernel caches keep CuTe DSL kernels in ``path``, this rank's RankWorker
+    store, when the processes of the launch do not share a directory: the rank then loads the
+    kernels its worker processes compiled."""
+    global _rank_store
+    _rank_store = path
+
+
+def _cute_store() -> str | None:
+    """Where shared kernel caches keep CuTe DSL kernels: ``<TLLM_JIT_SHARE_DIR>/cute``, else this
+    rank's RankWorker store, if it has one."""
+    share_dir = os.environ.get(SHARE_DIR_ENV)
+    if share_dir:
+        return os.path.join(share_dir, "cute")
+    return _rank_store or os.environ.get(_RANK_STORE_ENV)
+
+
 def _kernel_sharing_active() -> bool:
-    return _kernel_sharing_depth > 0 and bool(os.environ.get(SHARE_DIR_ENV))
+    return _kernel_sharing_depth > 0 and _cute_store() is not None
 
 
 def _release_unstored_claim() -> str | None:
@@ -318,7 +341,7 @@ class SharedKernelCache(dict):
             "k"
             + hashlib.sha256(f"{_cute_identity()}|{self.owner}|{text}".encode()).hexdigest()[:32]
         )
-        base = os.path.join(os.environ[SHARE_DIR_ENV], "cute", name)
+        base = os.path.join(_cute_store(), name)
         return name, base + ".o", base + ".claim", base + ".failed", base + ".json"
 
     def __contains__(self, key) -> bool:
@@ -345,7 +368,7 @@ class SharedKernelCache(dict):
                 _unstored.claim = (claim, failed)
                 return False  # This process compiles it; the store exports it.
             if os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
-                _log(os.environ[SHARE_DIR_ENV], start, "cute-busy", name)
+                _log(os.environ.get(SHARE_DIR_ENV, ""), start, "cute-busy", name)
                 raise KernelBusy(f"{BUSY_MARK} {name}")
             if not _wait(obj, failed):
                 return False
@@ -355,7 +378,7 @@ class SharedKernelCache(dict):
         except Exception:  # noqa: BLE001 - a kernel that does not load is compiled here instead
             return False
         dict.__setitem__(self, key, kernel)
-        _log(os.environ[SHARE_DIR_ENV], start, action, name)
+        _log(os.environ.get(SHARE_DIR_ENV, ""), start, action, name)
         return True
 
     def __setitem__(self, key, kernel) -> None:
@@ -378,7 +401,7 @@ class SharedKernelCache(dict):
         except Exception as e:  # noqa: BLE001 - the kernel works here; the others compile it
             _mark_failed(failed, f"{type(e).__name__}: {e}")
             return
-        _log(os.environ[SHARE_DIR_ENV], start, "cute-built", name)
+        _log(os.environ.get(SHARE_DIR_ENV, ""), start, "cute-built", name)
 
 
 def share_kernel_caches(runners) -> None:
@@ -632,7 +655,7 @@ def _update_with_file(digest, path: str) -> None:
 
 
 def _log(share_dir: str, start: float, action: str, key: str) -> None:
-    if os.environ.get(_LOG_ENV) != "1":
+    if os.environ.get(_LOG_ENV) != "1" or not share_dir:
         return
     process = os.environ.get(_PROCESS_ENV) or str(os.getppid())
     try:
