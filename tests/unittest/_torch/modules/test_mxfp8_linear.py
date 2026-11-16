@@ -1183,3 +1183,65 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
     graph.replay()
     torch.testing.assert_close(captured, runner(inputs, tactic=tactic), atol=0, rtol=0)
     reloaded._profile_single_kernel.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 native O-B GEMM requires SM107",
+)
+@pytest.mark.parametrize("rows", [1024, 1985, 2048])
+@torch.inference_mode()
+def test_sm107_mxfp8_o_b_loaded_tactic_graph(monkeypatch, tmp_path, rows):
+    """A loaded native winner primes before capture and consumes changed values and scales."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    from tensorrt_llm._torch.custom_ops.mxfp8_gemm import Sm107MXFP8GemmRunner
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    def dequantize(values, scales):
+        m, k = values.shape
+        plain = unswizzle_sf(scales, ((m + 127) // 128) * 128, k, 32)[:m, : k // 32]
+        return dequant_mxfp8_weight(values, plain)
+
+    inputs = _mxfp8_swapab_inputs(rows, 5120, 8192)
+    native = Sm107MXFP8GemmRunner(torch.bfloat16)
+    tactics = native.get_valid_tactics(inputs, None)
+    assert len(tactics) == 1
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16, ("cutedsl_sm107",))
+    tuner = AutoTuner()
+    key = tuner.profiling_cache.get_cache_key(
+        custom_ops_module._MXFP8_GEMM_AUTOTUNED_OP,
+        runner,
+        tuple(x.shape for x in inputs),
+        runner.tuning_config,
+    )
+    tuner.profiling_cache[key] = (0, ("cutedsl_sm107", tactics[0]), 0.1)
+    path = tmp_path / "sm107-o-b.json"
+    tuner.profiling_cache.save_cache(path, rank=0)
+    reloaded = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", reloaded)
+    reloaded.profiling_cache.load_cache(path, rank=0)
+    monkeypatch.setattr(
+        reloaded, "_profile_single_kernel", Mock(side_effect=AssertionError("Retuning"))
+    )
+    monkeypatch.setattr(cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear, "kernel_cache", {})
+    custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = custom_ops_module.mxfp8_gemm_autotuned(
+            *inputs, torch.bfloat16, ("cutedsl_sm107",)
+        )
+    changed = _mxfp8_swapab_inputs(rows, 5120, 8192)
+    assert not torch.equal(inputs[0].view(torch.uint8), changed[0].view(torch.uint8))
+    for destination, source in zip(inputs, changed):
+        destination.copy_(source)
+    graph.replay()
+    eager = custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    assert torch.equal(captured.view(torch.uint8), eager.view(torch.uint8))
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = dequantize(*inputs[:2]) @ dequantize(*inputs[2:]).T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    torch.testing.assert_close(captured.float(), expected, atol=2e-2, rtol=2e-2)
+    reloaded._profile_single_kernel.assert_not_called()

@@ -139,15 +139,15 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 # ---- device targets ----------------------------------------------------------
-# GVR V2 runs on Hopper (sm_90) and datacenter Blackwell (sm_100, sm_103): both have
+# GVR V2 runs on Hopper (sm_90), datacenter Blackwell (sm_100, sm_103) and Rubin (sm_107): all have
 # thread-block clusters, distributed shared memory and st.async, and the device module
 # compiles for either. The dispatch reads the device as (num_sms, sm_version):
 #   - ``num_sms`` sizes the register-resident waves on every target;
 #   - ``wave_sms`` sizes the streaming and clustered-register waves: Blackwell keeps the
-#     148-SM budget those paths were tuned at on every SKU, Hopper uses its SM count;
+#     148-SM budget on Blackwell/Rubin, Hopper uses its SM count;
 #   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
-SUPPORTED_SM_VERSIONS = (90, 100, 103)
-_BLACKWELL_SM_VERSIONS = (100, 103)
+SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
+_BLACKWELL_SM_VERSIONS = (100, 103, 107)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
 # (tuned on datacenter Blackwell, measured on Hopper H100 and H200 SXM and H20).

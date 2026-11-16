@@ -51,8 +51,8 @@ from tensorrt_llm._torch.kernels.blackwell.top_k import (
 
 if getSMVersion() not in ss_host.SUPPORTED_SM_VERSIONS:
     pytest.skip(
-        "self-sampling GVR kernels target Hopper and datacenter Blackwell "
-        "(sm_90/100/103) — same gate as the production dispatch; consumer "
+        "self-sampling GVR kernels target Hopper and datacenter Blackwell/Rubin "
+        "(sm_90/100/103/107) — same gate as the production dispatch; consumer "
         "Blackwell (sm_120/121) lacks thread-block clusters",
         allow_module_level=True,
     )
@@ -946,7 +946,7 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
 def test_selfsampling_wave_budget_per_target() -> None:
     """Blackwell keeps the 148-SM streaming and clustered wave budget on every SKU; Hopper
     sizes those waves by its own SM count."""
-    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103)
+    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103, 107)
     for num_sms in (132, 148, 160):
         assert ss_host.wave_sms(num_sms, 100) == 148
         assert ss_host.wave_sms(num_sms, 103) == 148

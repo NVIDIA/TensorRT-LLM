@@ -16042,6 +16042,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
 
+        # Prefill-sized MXFP8 GEMMs take one SM107 tile instead of autotuning the full tactic space per shape.
+        _MXFP8_PREFILL_TILE_SM107 = ((512, 256, 128), (256, 256, 64), (4, 2))
+        _mxfp8_prefill_tactics_sm107: dict = {}
+
+        def cute_dsl_mxfp8_prefill_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> Optional[torch.Tensor]:
+            """BF16 ``input @ weight.T`` of MXFP8 operands with R128c4 UE8M0 scales on the SM107 GEMM's
+            prefill tile, or None when that tile does not fit the shape."""
+            runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16)
+            inputs = [
+                input, weight,
+                input_scale.view(torch.uint8),
+                weight_scale.view(torch.uint8), alpha
+            ]
+            key = (tuple(input.shape), tuple(weight.shape), input.device,
+                   _dense_gemm_scheduler_override())
+            tactic = _mxfp8_prefill_tactics_sm107.get(key)
+            if tactic is None:
+                tiler, instruction, cluster = _MXFP8_PREFILL_TILE_SM107
+                tactic = next(
+                    (t for t in runner.get_valid_tactics(inputs, None)
+                     if t[0] == "base" and tuple(t[1]) == tiler
+                     and tuple(t[2]) == instruction and tuple(t[3]) == cluster
+                     and not t[4] and t[5] and t[6:] == ("static", "m", 1)),
+                    False)
+                _mxfp8_prefill_tactics_sm107[key] = tactic
+            return runner(inputs, tactic=tactic) if tactic else None
+
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
             mutates_args=("output_tensor", ),

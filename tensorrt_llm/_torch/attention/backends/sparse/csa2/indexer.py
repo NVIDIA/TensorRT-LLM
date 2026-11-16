@@ -180,7 +180,9 @@ class CSA2Indexer(Indexer):
             sm_version=sm,
         )
         prefill_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=True)
-        decode_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=False)
+        decode_self_sampling = use_self_sampling_gvr(
+            **self_sampling_kwargs, is_prefill=False, sm107_decode=True
+        )
         if prefill_self_sampling:
             # The self-sampling engine is exact, so prefill uses it without heuristic decode.
             prefill = TopKImplementation.CUTE_DSL_GVR
@@ -435,7 +437,7 @@ class CSA2Indexer(Indexer):
             or not _HAS_SPARSE_MQA_LOGITS
             or self.head_dim != 128
             or heads not in (8, 16, 32, 64)
-            or get_sm_version() not in (100, 103)
+            or get_sm_version() not in (100, 103, 107)
         ):
             return None
         if torch.cuda.is_current_stream_capturing():
