@@ -199,11 +199,11 @@ class MistralTokenizer(TransformersTokenizer):
         import llguidance
         from mistral_common.guidance.tokenizer import MistralLLGTokenizer
 
-        return llguidance.LLTokenizer(
-            llguidance.TokenizerWrapper(MistralLLGTokenizer(self.tokenizer)),
-            n_vocab=n_vocab,
-            eos_token=self.eos_token_id,
-        )
+        wrapper = llguidance.TokenizerWrapper(MistralLLGTokenizer(self.tokenizer))
+        # llguidance sizes the vocabulary of a wrapped tokenizer from its token list, not
+        # n_vocab: pad it with empty tokens, which a grammar never selects.
+        wrapper.tokens = wrapper.tokens + [b""] * (n_vocab - len(wrapper.tokens))
+        return llguidance.LLTokenizer(wrapper, n_vocab=n_vocab, eos_token=self.eos_token_id)
 
     def _get_special_token_ids(self) -> list[int]:
         from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
