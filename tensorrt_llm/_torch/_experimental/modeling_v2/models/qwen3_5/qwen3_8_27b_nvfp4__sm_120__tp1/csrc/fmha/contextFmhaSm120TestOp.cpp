@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
-// Test-only op for the target's SM120 context FMHA (contextFmhaSm120.h). The model does not call it; it fills the
-// kernel parameters the way the attention op does for this target (Q_PAGED_KV, FP8 Q and paged KV, BF16 output,
-// 24 query heads over 4 KV heads, head size 256, causal) so tests can check the kernel against a reference.
+// Test-only op for the target's SM120 context FMHA. The model does not call it; it builds the same
+// ContextFmhaSm120Args the attention op builds and calls the same runContextFmhaSm120, so tests check the kernel
+// under the production parameter fill (Q_PAGED_KV, FP8 Q and paged KV, BF16 output, 24 query heads over 4 KV heads,
+// head size 256, causal) against a reference.
 
-#include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/fmha/contextFmhaSm120.h"
+#include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/contextFmhaSm120Run.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
@@ -27,10 +28,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <climits>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <torch/extension.h>
 
@@ -103,65 +102,38 @@ Tensor context_fmha_sm120_test(Tensor const& q, Tensor const& kv_pool, Tensor co
     Tensor splitWorkspace;
     if (split)
     {
-        splitWorkspace = at::empty({static_cast<int64_t>(kernels::kContextFmhaSm120SplitWorkspaceBytes)},
+        splitWorkspace = at::empty({static_cast<int64_t>(kernels::contextFmhaSm120SplitWorkspaceBytes())},
             q.options().dtype(at::ScalarType::Byte));
     }
+    // The attention op's tile counter: one zeroed uint32 in its workspace.
+    Tensor tileCounter = at::zeros({1}, q.options().dtype(at::ScalarType::Int));
 
-    auto floatBits = [](float x)
-    {
-        uint32_t u;
-        std::memcpy(&u, &x, sizeof(u));
-        return u;
-    };
-
-    bert::Fused_multihead_attention_params_v2 params{};
-    params.b = b;
-    params.s = static_cast<int>(max_q_len);
-    params.d = kHeadSize;
-    params.dv = kHeadSize;
-    params.h = kNumHeads;
-    params.h_kv = kNumKvHeads;
-    params.h_q_per_kv = kNumHeads / kNumKvHeads;
-    // The attention op sets max_seq_len; the causal mask (MASK_VERSION 3) does not read it.
-    params.sliding_window_size = INT_MAX;
-    params.log2_chunked_attention_size = 0;
-    params.is_s_padded = false;
-    params.num_grouped_heads = 1;
-
-    params.q_ptr = q.data_ptr();
-    params.q_stride_in_bytes = kNumHeads * kHeadSize;
-    params.cu_q_seqlens = cu_q_seqlens.data_ptr<int>();
-    params.cu_kv_seqlens = cu_kv_seqlens.data_ptr<int>();
-
-    // KVBlockArray::copyKVBlockArrayForContextFMHA(): one token is 4 heads x 256 e4m3 bytes.
+    // The KV cache view as the attention op's kvCacheView builds it: one token is 4 heads x 256 e4m3 bytes, no
+    // window (the attention window is the KV capacity, max_seq_len), no secondary pool.
     int const maxBlocksPerSeq = static_cast<int>(block_offsets.size(2));
-    tensorrt_llm::kernels::KVBlockArrayForContextFMHA const kvArray(b, maxBlocksPerSeq, tokensPerBlock,
-        kNumKvHeads * kHeadSize, kv_pool.data_ptr(),
-        reinterpret_cast<tensorrt_llm::kernels::KVCacheIndex const*>(block_offsets.data_ptr<int32_t>()));
-    static_assert(sizeof(kvArray) == sizeof(params.paged_kv_cache), "KVBlockArrayForContextFMHA != Kv_block_array");
-    std::memcpy(&params.paged_kv_cache, &kvArray, sizeof(kvArray));
-    // One head's slab inside a page.
-    params.k_stride_in_bytes = static_cast<int64_t>(tokensPerBlock) * kHeadSize;
-    params.v_stride_in_bytes = params.k_stride_in_bytes;
+    int const maxSeqLen = maxBlocksPerSeq * tokensPerBlock;
+    tensorrt_llm::kernels::KVBlockArray const kv(b, maxBlocksPerSeq, tokensPerBlock, kNumKvHeads * kHeadSize, maxSeqLen,
+        maxSeqLen, /*sinkTokenLen=*/0, /*canUseOneMoreBlock=*/false, kv_pool.data_ptr(),
+        /*secondaryPoolPtr=*/nullptr,
+        reinterpret_cast<tensorrt_llm::kernels::KVBlockArray::DataType*>(block_offsets.data_ptr<int32_t>()));
 
-    params.o_ptr = out.data_ptr();
-    params.o_stride_in_bytes = kNumHeads * kHeadSize * 2;
-    params.softmax_stats_ptr = nullptr;
-    params.softmax_stats_stride_in_bytes = sizeof(float) * 2 * kNumHeads;
-
-    params.scale_bmm1 = floatBits(bmm1);
-    params.scale_softmax = floatBits(1.f);
-    params.scale_bmm2 = floatBits(bmm2);
-    params.softcapping_scale_bmm1 = 0;
-    params.scale_bmm1_d = reinterpret_cast<uint32_t*>(scales.data_ptr<float>());
-    params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scales.data_ptr<float>() + 2);
-    params.tile_id_counter_ptr = nullptr;
-    params.has_alibi = false;
-    params.attention_sinks = nullptr;
-
-    int const multiProcessorCount = at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
-    kernels::launchContextFmhaSm120(
-        params, multiProcessorCount, split ? splitWorkspace.data_ptr() : nullptr, skip_leading, stream);
+    kernels::ContextFmhaSm120Args fmha{};
+    fmha.qFp8 = q.data_ptr();
+    fmha.output = out.data_ptr();
+    fmha.cuQSeqlens = cu_q_seqlens.data_ptr<int32_t>();
+    fmha.cuKvSeqlens = cu_kv_seqlens.data_ptr<int32_t>();
+    fmha.kvCache = kv;
+    fmha.batch = b;
+    fmha.maxQSeqLen = static_cast<int>(max_q_len);
+    fmha.slidingWindowSize = maxSeqLen;
+    fmha.hostBmm1Scale = bmm1;
+    fmha.bmm1ScaleDevice = scales.data_ptr<float>();
+    fmha.bmm2ScaleDevice = scales.data_ptr<float>() + 2;
+    fmha.tileCounter = reinterpret_cast<uint32_t*>(tileCounter.data_ptr<int32_t>());
+    fmha.splitWorkspace = split ? splitWorkspace.data_ptr() : nullptr;
+    fmha.skipLeadingQTiles = skip_leading;
+    fmha.multiProcessorCount = at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
+    kernels::runContextFmhaSm120(fmha, stream);
     return out;
 }
 

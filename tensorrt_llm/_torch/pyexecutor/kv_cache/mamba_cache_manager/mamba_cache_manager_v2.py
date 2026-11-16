@@ -41,7 +41,7 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
-from tensorrt_llm._torch.pyexecutor.config_utils import ssm_state_rows
+from tensorrt_llm._torch.pyexecutor.config_utils import SSMStatePoolGeometry
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
@@ -190,6 +190,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
+        ssm_state_pool_geometry: Optional[SSMStatePoolGeometry] = None,
         **kwargs,
     ) -> None:
         """See the class docstring."""
@@ -292,12 +293,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_dim = conv_dim // tp_size
             nheads = nheads // tp_size
             self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
-            # An 8-bit pool appends each head's fp32 row scales as extra rows.
-            self.ssm_state_shape = [
-                nheads,
-                ssm_state_rows(mamba_head_dim, mamba_d_state, self.ssm_state_dtype),
-                mamba_d_state,
-            ]
+            self.ssm_state_pool_geometry = ssm_state_pool_geometry
+            if (
+                ssm_state_pool_geometry is not None
+                and ssm_state_pool_geometry.dtype != self.ssm_state_dtype
+            ):
+                raise ValueError("SSM state geometry dtype differs from the cache dtype")
+            if self.ssm_state_dtype == torch.int8 and ssm_state_pool_geometry is None:
+                raise ValueError("An int8 SSM pool requires target-declared state-pool geometry")
+            state_shape = (
+                ssm_state_pool_geometry.shape
+                if ssm_state_pool_geometry is not None
+                else (mamba_head_dim, mamba_d_state)
+            )
+            self.ssm_state_shape = [nheads, *state_shape]
             if self.ssm_state_dtype == torch.int8 and (
                 spec_config is not None
                 or kwargs.get("is_disagg", False)

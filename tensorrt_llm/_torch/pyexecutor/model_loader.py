@@ -60,8 +60,8 @@ from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
-from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
-                           resolve_auto_ssm_cache_dtype,
+from .config_utils import (SSMStatePoolGeometry, is_hybrid_linear,
+                           is_minimax_m3, is_mla, resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
 
@@ -193,14 +193,25 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_philox_rounds: int = 10) -> None:
     mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
         config, mamba_ssm_cache_dtype)
-    if (mamba_ssm_cache_dtype == torch.int8
-            and getattr(config, "modeling_v2_target", None) is None):
-        # The built-in recurrent kernels read the pool as values; only a target
-        # that implements the 8-bit row layout may ask for it.
+    target = getattr(config, "modeling_v2_target", None)
+    declare_geometry = getattr(target, "get_ssm_state_pool_geometry", None)
+    geometry = (declare_geometry(config.pretrained_config,
+                                 mamba_ssm_cache_dtype)
+                if declare_geometry is not None else None)
+    if geometry is not None:
+        if not isinstance(geometry, SSMStatePoolGeometry):
+            raise TypeError(
+                "get_ssm_state_pool_geometry must return SSMStatePoolGeometry or None"
+            )
+        if geometry.dtype != mamba_ssm_cache_dtype:
+            raise ValueError(
+                "Target SSM state geometry dtype differs from the requested cache dtype"
+            )
+    if mamba_ssm_cache_dtype == torch.int8 and geometry is None:
         raise ValueError(
-            "kv_cache_config.mamba_ssm_cache_dtype='int8' is implemented only by "
-            "modeling_v2 targets that claim this model (set modeling_v2 and check "
-            "that a target fits)")
+            "mamba_ssm_cache_dtype='int8' requires the selected target to declare "
+            "its state-pool geometry via get_ssm_state_pool_geometry")
+    config.ssm_state_pool_geometry = geometry
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)

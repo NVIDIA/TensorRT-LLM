@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the target's SM120 e4m3 head-256 context FMHA (csrc/fmha/).
 
-The kernel is driven through the test-only op ``context_fmha_sm120_test``, which fills the
-kernel parameters as the attention op does for this target: FP8 Q ``[T, 24, 256]``, FP8
+The kernel is driven through the test-only op ``context_fmha_sm120_test``, which builds the
+attention op's ``ContextFmhaSm120Args`` and calls its ``runContextFmhaSm120``: FP8 Q ``[T, 24, 256]``, FP8
 paged KV (4 heads, 32 tokens per page, pages in a shuffled order), causal attention over a
 cached prefix (query ``i`` of a sequence with KV length ``L`` and ``Lq`` new tokens sees
 keys ``[0, L - Lq + i]``), BF16 output.

@@ -232,7 +232,10 @@ __device__ __host__ inline Vec<Dst, size> convert(Vec<Src, size> const& src)
     {
         for (uint32_t i = 0; i < size - 1; i += 2)
         {
-            reinterpret_cast<float2&>(dst[i]) = float2(reinterpret_cast<__nv_fp8x2_e4m3 const&>(src[i]));
+            // Explicit e4m3x2 -> half2 -> float2 (both exact): the conversion operator of
+            // __nv_fp8x2_e4m3 is not accepted by every CUDA toolchain this file builds with.
+            __nv_fp8x2_e4m3 const& in = reinterpret_cast<__nv_fp8x2_e4m3 const&>(src[i]);
+            reinterpret_cast<float2&>(dst[i]) = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(in.__x, __NV_E4M3)));
         }
         if constexpr (size % 2 != 0)
         {
@@ -254,7 +257,8 @@ __device__ __host__ inline Vec<Dst, size> convert(Vec<Src, size> const& src)
     {
         for (uint32_t i = 0; i < size - 1; i += 2)
         {
-            reinterpret_cast<half2&>(dst[i]) = half2(reinterpret_cast<__nv_fp8x2_e4m3 const&>(src[i]));
+            __nv_fp8x2_e4m3 const& in = reinterpret_cast<__nv_fp8x2_e4m3 const&>(src[i]);
+            reinterpret_cast<half2&>(dst[i]) = __half2(__nv_cvt_fp8x2_to_halfraw2(in.__x, __NV_E4M3));
         }
         if constexpr (size % 2 != 0)
         {

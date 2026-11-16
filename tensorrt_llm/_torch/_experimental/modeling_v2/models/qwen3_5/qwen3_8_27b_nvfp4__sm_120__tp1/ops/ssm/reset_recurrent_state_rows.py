@@ -18,11 +18,13 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.mamba import recurrent_state_cache as _recurrent_state_cache
 
+from ...state_pool import state_pool_geometry
+
 #: The per-layer pool rows: the quantized recurrent state (`mamba_ssm_cache_dtype="int8"`),
 #: per value head 256 byte rows of int16 codes (two per state row) and 4 rows holding the
 #: 128 fp32 row scales, and the
 #: [conv_dim, d_conv - 1] = [10240, 3] convolution window.
-REC_SHAPE = (48, 260, 128)
+REC_SHAPE = (48, *state_pool_geometry(128, 128).shape)
 CONV_SHAPE = (10240, 3)
 #: GDN layers whose same-size states the KV cache manager v2 coalesces into one slot
 #: page: a layer's pool view has a slot stride of 48 layers' states.

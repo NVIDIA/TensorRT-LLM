@@ -1883,9 +1883,17 @@ class TestMambaEffectiveTpSize:
 
 
 class TestInt8RecurrentStatePool:
-    """``mamba_ssm_cache_dtype='int8'``: an int8-typed pool a modeling_v2 target fills with
-    int16 row codes plus one fp32 scale per row. Its sizing reaches the budget through
-    ``ssm_state_rows``, and only a model a modeling_v2 target claims may ask for it."""
+    """Target-declared recurrent storage reaches validation and memory budgeting."""
+
+    @staticmethod
+    def _geometry():
+        """A target-declared geometry of Qwen3.8-27B's size (260 rows of 128 bytes per head).
+        Built here: shared code and its tests do not import a target."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import SSMStatePoolGeometry
+
+        return SSMStatePoolGeometry(layout="test", dtype=torch.int8, shape=(260, 128))
 
     @staticmethod
     def _tp1() -> SimpleNamespace:
@@ -1893,26 +1901,13 @@ class TestInt8RecurrentStatePool:
             tp_size=1, cp_size=1, enable_attention_dp=False, has_cp_helix=lambda: False
         )
 
-    def test_rows_hold_two_code_bytes_per_element_and_the_row_scales(self) -> None:
-        import torch
-
-        from tensorrt_llm._torch.pyexecutor.config_utils import ssm_state_rows
-
-        # 128 value rows of int16 codes = 256 int8 rows, then 128 fp32 scales = 4 rows.
-        assert ssm_state_rows(128, 128, torch.int8) == 2 * 128 + 4
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
-            assert ssm_state_rows(128, 128, dtype) == 128
-        # The scales must fill whole rows.
-        with pytest.raises(AssertionError):
-            ssm_state_rows(100, 128, torch.int8)
-
     def test_budget_counts_the_int8_pool_bytes(self) -> None:
         """Qwen3.8-27B's Gated-DeltaNet geometry: 48 value heads of 128x128, 16 key heads."""
         import torch
 
         from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
 
-        def params(ssm_dtype):
+        def params(ssm_dtype, geometry=None):
             return MambaKVCacheParams(
                 state_size=128,
                 conv_kernel=4,
@@ -1925,15 +1920,26 @@ class TestInt8RecurrentStatePool:
                 num_draft_layers=0,
                 dtype=torch.bfloat16,
                 mamba_ssm_cache_dtype=ssm_dtype,
+                ssm_state_pool_geometry=geometry,
             )
 
         conv_bytes = (48 * 128 + 2 * 16 * 128) * (4 - 1) * 2
-        int8 = params(torch.int8).get_states_bytes_per_layer(self._tp1())
+        int8 = params(torch.int8, self._geometry()).get_states_bytes_per_layer(self._tp1())
         assert int8 == conv_bytes + 48 * 260 * 128
         # Twice the bytes of an int8 state plus 4 bytes per row: the bf16 pool's size plus
         # the scales.
         bf16 = params(torch.bfloat16).get_states_bytes_per_layer(self._tp1())
         assert int8 - bf16 == 48 * 128 * 4
+        # A generic int8 tensor does not imply the target's int16-code layout.
+        assert params(torch.int8).get_states_bytes_per_layer(self._tp1()) == (
+            conv_bytes + 48 * 128 * 128
+        )
+        for dtype in (torch.float16, torch.float32):
+            assert params(dtype).get_states_bytes_per_layer(self._tp1()) == (
+                conv_bytes + 48 * 128 * 128 * dtype.itemsize
+            )
+        with pytest.raises(ValueError, match="geometry dtype"):
+            params(torch.float32, self._geometry()).get_states_bytes_per_layer(self._tp1())
 
     @staticmethod
     def _model_config(target):
@@ -1952,21 +1958,65 @@ class TestInt8RecurrentStatePool:
         )
 
         config = self._model_config(target=None)
-        with pytest.raises(ValueError, match="implemented only by modeling_v2 targets"):
+        with pytest.raises(ValueError, match="selected target to declare"):
             validate_and_set_mamba_ssm_cache_dtype(config, "int8")
         # Other dtypes are unaffected.
         validate_and_set_mamba_ssm_cache_dtype(config, "bfloat16")
 
-    def test_int8_is_accepted_when_a_modeling_v2_target_claims_the_model(self) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            type("UnrelatedTarget", (), {}),
+            type(
+                "DecliningTarget",
+                (),
+                {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: None)},
+            ),
+        ],
+    )
+    def test_int8_is_refused_for_an_unsupported_target(self, target) -> None:
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        with pytest.raises(ValueError, match="selected target to declare"):
+            validate_and_set_mamba_ssm_cache_dtype(self._model_config(target), "int8")
+
+    def test_int8_is_accepted_when_the_selected_target_declares_geometry(self) -> None:
         import torch
 
         from tensorrt_llm._torch.pyexecutor.model_loader import (
             validate_and_set_mamba_ssm_cache_dtype,
         )
 
-        config = self._model_config(target=type("Target", (), {}))
+        geometry = self._geometry()
+        target = type(
+            "Target",
+            (),
+            {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: geometry)},
+        )
+        config = self._model_config(target=target)
         validate_and_set_mamba_ssm_cache_dtype(config, "int8")
         assert config.quant_config.mamba_ssm_cache_dtype == torch.int8
+        assert config.ssm_state_pool_geometry == geometry
+
+    def test_loader_rejects_a_geometry_with_the_wrong_storage_dtype(self) -> None:
+        from dataclasses import replace
+
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        geometry = replace(self._geometry(), dtype=torch.float32)
+        target = type(
+            "Target",
+            (),
+            {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: geometry)},
+        )
+        with pytest.raises(ValueError, match="geometry dtype"):
+            validate_and_set_mamba_ssm_cache_dtype(self._model_config(target), "int8")
 
     def test_the_legacy_python_manager_refuses_int8(self) -> None:
         """Only the V2 hybrid manager lays out the int8 pool; the guard runs before any

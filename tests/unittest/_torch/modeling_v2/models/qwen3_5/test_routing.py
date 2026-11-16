@@ -119,6 +119,45 @@ def test_qwen38_27b_tp1_matches(mode):
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _TARGET
 
 
+def test_state_pool_rows_hold_two_code_bytes_per_element_and_the_row_scales():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1 import (  # noqa: E501
+        state_pool,
+    )
+
+    # 128 value rows of int16 codes = 256 byte rows, then 128 fp32 scales = 4 rows.
+    assert state_pool.q8_state_rows(128, 128) == 260
+    assert state_pool.q8_state_rows(64, 128) == 130
+    # The scales must fill whole rows.
+    with pytest.raises(AssertionError):
+        state_pool.q8_state_rows(100, 128)
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_claimed_target_declares_recurrent_pool_geometry(composite):
+    from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
+    from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
+
+    config = _model_config(_qwen38_config())
+    target = modeling_v2_resolve(config, _llm_args("require"))
+    config.modeling_v2_target = target
+    text = config.pretrained_config.text_config
+    text.architectures = ["Qwen3_5ForCausalLM"]
+    if not composite:
+        config.pretrained_config = text
+    validate_and_set_mamba_ssm_cache_dtype(config, "int8")
+    geometry = config.ssm_state_pool_geometry
+    assert geometry.dtype == torch.int8
+    assert geometry.shape == (260, 128)
+    assert target.get_ssm_state_pool_geometry(config.pretrained_config, torch.bfloat16) is None
+    params = extract_mamba_kv_cache_params(
+        text,
+        quant_config=config.quant_config,
+        ssm_state_pool_geometry=geometry,
+    )
+    assert params.ssm_state_pool_geometry is geometry
+    assert params.get_states_bytes_per_layer(Mapping()) == 10240 * 3 * 2 + 48 * 260 * 128
+
+
 @pytest.mark.parametrize(
     "config, spec_config, mapping_kwargs, missed",
     [

@@ -78,6 +78,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.pyexecutor.config_utils import SSMStatePoolGeometry
 
 from . import weights as _weights
 from .ops.activation.sigmoid_mul_nvfp4 import sigmoid_mul_nvfp4
@@ -102,6 +103,7 @@ from .ops.ssm.flashinfer_chunk_gated_delta_rule_q8 import flashinfer_chunk_gated
 from .ops.ssm.gdn_decode_t1 import gdn_decode_t1
 from .ops.ssm.gdn_decode_t1_gated_norm import gdn_decode_t1_gated_norm
 from .ops.ssm.gdn_prefill_onepass import gdn_prefill_onepass
+from .state_pool import state_pool_geometry
 
 _SM = (12, 0)
 
@@ -381,10 +383,13 @@ class Qwen3827BTp1ModelingV2(DecoderModel):
         conv = {i: cm.get_conv_states(i) for i in self.gdn_layers}
         ssm = {i: cm.get_ssm_states(i) for i in self.gdn_layers}
         ssm0 = ssm[self.gdn_layers[0]]
-        assert ssm0.dtype == torch.int8 and tuple(ssm0.shape[1:]) == (
+        expected_geometry = state_pool_geometry(self.head_v_dim, self.head_k_dim)
+        assert getattr(cm, "ssm_state_pool_geometry", None) == expected_geometry, (
+            "the cache manager's recurrent-state encoding differs from the target declaration"
+        )
+        assert ssm0.dtype == expected_geometry.dtype and tuple(ssm0.shape[1:]) == (
             self.num_v_heads,
-            2 * self.head_v_dim + 4 * self.head_v_dim // self.head_k_dim,
-            self.head_k_dim,
+            *expected_geometry.shape,
         ), (
             f"the recurrent pool is {ssm0.dtype} {tuple(ssm0.shape)}; this target reads the "
             "int16-row layout in an int8-typed pool (mamba_ssm_cache_dtype='int8')"
@@ -1054,6 +1059,16 @@ def _carries_media(data) -> bool:
 class ModelingV2Qwen3827BNvfp4Sm120Tp1(
     DecoderModelForCausalLM[Qwen3827BTp1ModelingV2, PretrainedConfig]
 ):
+    @classmethod
+    def get_ssm_state_pool_geometry(
+        cls, pretrained_config: PretrainedConfig, dtype: torch.dtype
+    ) -> SSMStatePoolGeometry | None:
+        """Declare the physical recurrent-state encoding supported by this target."""
+        if dtype != torch.int8:
+            return None
+        cfg = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return state_pool_geometry(cfg.linear_value_head_dim, cfg.linear_key_head_dim)
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         """The quantized recurrent-state pool exists only on the V2 hybrid manager."""

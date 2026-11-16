@@ -32,7 +32,7 @@ Sharing an implementation does not make their deployment configurations intercha
 
 The Qwen3.8 MoE FP8 checkpoint quantizes the routed expert projections to FP8 (E4M3) with 128x128 weight block scales and dynamic activation scaling. Attention, GDN projections, shared experts, routers, embeddings, and the LM head are excluded from quantization and retain their checkpoint dtypes.
 
-The serving configuration controls the attention KV-cache dtype and GDN recurrent-state dtype independently through `kv_cache_config.dtype` and `kv_cache_config.mamba_ssm_cache_dtype`. The GDN state supports `auto`, `float16`, `bfloat16`, and `float32`.
+The serving configuration controls the attention KV-cache dtype and GDN recurrent-state dtype independently through `kv_cache_config.dtype` and `kv_cache_config.mamba_ssm_cache_dtype`. The GDN state supports `auto`, `float16`, `bfloat16`, and `float32`, and `int8` for the Qwen3.8-27B modeling_v2 target described below.
 
 ## Support Status
 
@@ -174,6 +174,29 @@ trtllm-serve <model_path_or_hf_id> --host 0.0.0.0 --port 8000 --reasoning_parser
 Qwen3.8 and Qwen3.5 both use the `qwen3_5` reasoning parser (their chat template pre-injects a `<think>` block, so reasoning starts at the beginning of the response). The `qwen3` tool parser handles the Qwen3 function-call format.
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
+
+## Qwen3.8-27B NVFP4 on RTX PRO 6000 Blackwell
+
+On one RTX PRO 6000 Blackwell (SM120), Qwen3.8-27B NVFP4 can run on an experimental modeling_v2 target instead of the built-in implementation. The target is used when `modeling_v2` is `auto` (the default) or `require` and all of the following hold:
+
+* The checkpoint is the ModelOpt `MIXED_PRECISION` export of Qwen3.8-27B: FP8 attention and GDN projections, NVFP4 MLP and LM head (for example, RadixArk/Qwen3.8-27B-NVFP4).
+* One GPU (`tensor_parallel_size: 1`) and no speculative decoding.
+* An FP8 KV cache (`kv_cache_config.dtype: fp8`, or `auto` with a checkpoint that declares an FP8 KV cache) and `kv_cache_config.mamba_ssm_cache_dtype: int8`.
+* `attn_backend: TRTLLM`, KV cache manager V2, `prefill_cuda_graph_backend: disabled`, no LoRA, and no disaggregated serving.
+
+With `auto`, any other configuration falls back to the built-in implementation; with `require`, it raises an error. The target serves text only and refuses requests that carry images or video.
+
+The target changes numerics. At load it requantizes the checkpoint's FP8 attention and GDN projections to NVFP4, which is lossy, and it stores the GDN recurrent state as int16 rows with one fp32 scale per row. Measured against the built-in implementation (bf16 recurrent state, otherwise the same settings):
+
+| Benchmark | modeling_v2 target | Built-in |
+|---|---:|---:|
+| GPQA Diamond | 88.01 | 87.88 |
+| IFBench | 78.60 | 78.67 |
+| SciCode | 45.04 | 46.15 |
+
+The target scores 89.46 on GSM8K.
+
+Set `modeling_v2: off` to keep the built-in numerics. Because `int8` recurrent state is only accepted by the target, also set `mamba_ssm_cache_dtype` to another value in that case.
 
 ## Qwen3.5 GB300 NVL72 Agentic Disaggregated Serving
 
@@ -551,7 +574,7 @@ Helps KV cache manager V2 divide memory between attention KV blocks and recurren
 
 ### `kv_cache_config.mamba_ssm_cache_dtype`
 
-Selects the GDN recurrent-state dtype independently of the attention KV-cache dtype. Supported values are `auto`, `float16`, `bfloat16`, and `float32`.
+Selects the GDN recurrent-state dtype independently of the attention KV-cache dtype. Supported values are `auto`, `float16`, `bfloat16`, `float32`, and `int8`. `int8` is accepted only when a modeling_v2 target claims the model, as described in the Qwen3.8-27B NVFP4 on RTX PRO 6000 Blackwell section; otherwise initialization fails with an error.
 
 ### `max_batch_size`
 

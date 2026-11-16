@@ -193,6 +193,11 @@ def route(
         and mapping.world_size == 1
         and spec_config is None
     ):
+        # Decline before the import: importing the target loads its native library.
+        _check_layer_pattern(text)
+        _check_runtime(llm_args)
+        _check_engine(kv_cache_quant_algo, engine_choices(model_config, llm_args))
+
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -200,10 +205,6 @@ def route(
         from .qwen3_8_27b_nvfp4__sm_120__tp1.modeling import ModelingV2Qwen3827BNvfp4Sm120Tp1
         # isort: on
         # fmt: on
-
-        _check_layer_pattern(text)
-        _check_runtime(llm_args)
-        _check_engine(kv_cache_quant_algo, engine_choices(model_config, llm_args))
         return ModelingV2Qwen3827BNvfp4Sm120Tp1
 
     raise NoTarget(

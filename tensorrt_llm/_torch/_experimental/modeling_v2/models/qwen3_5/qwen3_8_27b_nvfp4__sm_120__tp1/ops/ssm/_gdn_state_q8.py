@@ -14,7 +14,7 @@ bytes after them hold the ``V`` fp32 row scales (``V * 4 == Q8_SCALE_ROWS * K`` 
 ``[-32767, 32767]``. A zero row stores ``scale = 0`` and code 0, so zeroed bytes (a reset
 slot) dequantize to an exact zero state. The pool stays int8-typed so the cache manager
 and the ``mamba_ssm_cache_dtype: int8`` route are unchanged; only its row count
-(``config_utils.ssm_state_rows``) reflects the 16-bit codes.
+(``state_pool.q8_state_rows``) reflects the 16-bit codes.
 
 Why 16-bit codes: the state is requantized after every decode token, so each row's
 rounding error is re-injected thousands of times over a long generation, and in the
@@ -33,16 +33,12 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from ...state_pool import q8_state_rows
+
 #: Extra K-wide rows per value head holding the V fp32 row scales.
 Q8_SCALE_ROWS = 4
 #: The int16 magnitude a row's absolute maximum is scaled to.
 Q8_QMAX = 32767.0
-
-
-def q8_state_rows(v: int, k: int) -> int:
-    """Rows of K bytes per value head: 2V rows of int16 codes + the fp32 row scales."""
-    assert (v * 4) % k == 0, f"V={v} fp32 scales must fill whole K={k} rows"
-    return 2 * v + (v * 4) // k
 
 
 @triton.jit

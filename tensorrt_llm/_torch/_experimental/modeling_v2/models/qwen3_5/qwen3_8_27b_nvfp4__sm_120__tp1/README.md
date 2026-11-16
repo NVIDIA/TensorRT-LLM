@@ -31,4 +31,10 @@ Where it differs from the built-in `Qwen3_5VLModel` at the same settings:
 | shared-prefix decode | each request's KV walked alone | one prefix pass over all requests (FP8 Q/P), each suffix alone |
 | final layer of a long prefill step | every row | gate, o_proj, MLP and final norm on the read rows only |
 
+The FP8 to NVFP4 requantization is lossy and is on whenever the target claims the deployment;
+SciCode scores 45.04 against 46.15 for the built-in path (bf16 recurrent state, otherwise the same settings). `modeling_v2='off'`
+keeps the built-in numerics. The Qwen3.8 deployment guide
+(`docs/source/deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md`) lists the
+settings that select the target and its measured accuracy.
+
 The target and the entries it owns are certified on sm_120.
