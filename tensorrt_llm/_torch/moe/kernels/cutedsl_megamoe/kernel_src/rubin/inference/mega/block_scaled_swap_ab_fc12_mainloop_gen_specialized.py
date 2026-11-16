@@ -54,8 +54,7 @@ from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase
 from . import dynamic_mainloop
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
-from .tma_gather import sm107_tma_gather4_load
-
+from ..local_mega.tma_gather import sm107_tma_gather4_load
 
 class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     """Own all Rubin load, MMA, pipeline, SMEM, and TMEM mainloop state."""
@@ -82,9 +81,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     # Row identifiers are loaded eight at a time, which is one 256-bit access and
     # two gather4 groups. Ownership is therefore granular in eight-row runs.
     gather_index_load_rows: ClassVar[int] = 8
-    # Fixed rather than configurable: the four-way gather split of §5 is the point
-    # of this kernel, and cluster N carries no tokens under swap-AB.
-    cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
     # Rubin's block-scaled instruction K is always the doubled one here.
     mma_k_mode: ClassVar[str] = "2x"
     # Both operands are K-major: an fp4 TCGen05 operand has no other option, and
@@ -121,6 +117,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             "mma_instruction_mnk": tuple,
             "mma_tiler_mnk": tuple,
             "use_2cta_instrs": bool,
+            "cluster_shape_mn": tuple,
             "tmem_plan": Tcgen05TmemPlan,
             "mainloop_smem_budget_bytes": int,
             "num_accumulator_consumer_warps_per_cta": int,
@@ -142,6 +139,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
+        self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.tmem_plan = impl_desc["tmem_plan"]
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
@@ -815,6 +813,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
         kernel_extension: BlockScaledSwapAbFc12Extension,
+        trigger_dependents_when_drained: bool = False,
+        progress_mbarrier=None,
     ) -> None:
         """Run the TMA-A warp that loads weights and their scale factors."""
         multicast_mask = None
@@ -831,6 +831,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         # a shared one: `is_fc1` is a runtime predicate, so the atoms and the
         # per-phase tensor views cannot be chosen by a Python conditional.
         work_tile = sched_consumer.consume_work()
+        if cutlass.const_expr(progress_mbarrier is not None):
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(progress_mbarrier)
         while work_tile.is_valid_tile:
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
             if is_fc1:
@@ -863,7 +866,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
                 partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
-                mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
+                mma_tile_m = kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
@@ -921,7 +924,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
                 partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
-                mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
+                mma_tile_m = kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
@@ -952,7 +955,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
 
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(progress_mbarrier is not None):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(progress_mbarrier)
 
+        if cutlass.const_expr(trigger_dependents_when_drained):
+            # No work is left to claim: this CTA's last tile is already in flight, so
+            # the polling top-k reduce may become resident while it drains.
+            cute.arch.griddepcontrol_launch_dependents()
         ab_pipeline.producer_tail(ab_pipeline_state)
 
     @cute.jit
@@ -973,6 +983,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fc2_spin_threshold: Int32,
         fc1_sf_ready_pointer: cute.Pointer,
         expert_sizes: cute.Tensor,
+        fc1_sf_parts_per_block: int = 1,
     ) -> None:
         """Run the TMA-B warp: FC1 scale factors only, FC2 token data and scale factors.
 
@@ -1008,7 +1019,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 iket.range_push("tma_token_fc1")
                 iket.range_push("tma_b.wait_expert_sf_ready")
                 expert_idx = work_tile.expert_idx
-                expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block))
+                # The refine publishes one count per column part of each block.
+                expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
+                    fc1_sf_parts_per_block
+                )
                 spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
                 iket.range_pop()
                 k_tile_count = self.fc1_k_tile_count

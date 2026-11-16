@@ -24,14 +24,15 @@ import weakref
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple,
+                    Union)
 
 import torch
 
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
+from .._torch.pyexecutor.iteration_stats_json import iteration_stats_row
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
@@ -43,6 +44,7 @@ from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
+from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
@@ -53,7 +55,8 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_prompt_logprobs, get_metrics_dict)
+                     compute_prompt_logprobs, get_metrics_dict,
+                     prompt_logprobs_from_reduced, reduce_prompt_logprobs)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -145,6 +148,9 @@ class BaseWorker(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
+        # Requests already answered with an error by _maybe_wrap_response and
+        # aborted; their remaining engine responses are dropped.
+        self._refused_client_ids: Set[int] = set()
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -164,7 +170,12 @@ class BaseWorker(GenerationExecutor):
         return self._resource_governor_queue
 
     def _configure_device(self):
-        device_id = self.global_rank % torch.cuda.device_count()
+        # Ranks launched on other nodes (mpirun, Slurm, trtllm-llmapi-launch)
+        # are not covered by the GPU check in the LLM's own process.
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            raise no_visible_gpu_error()
+        device_id = self.global_rank % device_count
         # Fail before loading the model: missing optimized kernels for this GPU otherwise
         # surface much later as unrelated errors such as running out of memory.
         check_cuda_architecture_supported(device_id)
@@ -418,10 +429,14 @@ class BaseWorker(GenerationExecutor):
         # If both forms exist, they are assumed to describe the same token ids;
         # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
         i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        # Ids the frontend left out (executor/prompt_tail.py); the engine
+        # restores a full-length prompt from the tail and this count.
+        trimmed_prefix = request._prompt_trimmed_prefix
         if i32_buf is not None:
             prompt_token_ids = i32_buf
         else:
             prompt_token_ids = list(request.prompt_token_ids)
+        prompt_len = trimmed_prefix + len(prompt_token_ids)
         # MULTIMODAL
         # NOTE: Since, we only support PyTorch backend for multimodal, we send multimodal_data through the internal Python input payload
         # except `multimodal_input` as it needs to go through the C++ runtime.
@@ -473,16 +488,16 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            splited_prompt_len = int(prompt_len / cp_size)
             if not self.engine.is_generation_model:
                 # The prompt runs in one forward and nothing is generated, so
                 # it may fill max_seq_len; max_tokens=1 has the request
                 # complete with that forward in every executor loop.
-                if len(prompt_token_ids) > max_seq_len * cp_size:
+                if prompt_len > max_seq_len * cp_size:
                     raise ValueError(
                         context_length_exceeded_message(
                             max_context_length=max_seq_len * cp_size,
-                            num_prompt_tokens=len(prompt_token_ids)))
+                            num_prompt_tokens=prompt_len))
                 return 1
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
@@ -494,7 +509,7 @@ class BaseWorker(GenerationExecutor):
                 raise ValueError(
                     context_length_exceeded_message(
                         max_context_length=max_seq_len * cp_size,
-                        num_prompt_tokens=len(prompt_token_ids)))
+                        num_prompt_tokens=prompt_len))
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -548,6 +563,11 @@ class BaseWorker(GenerationExecutor):
                 PythonRequestInputs(
                     original_end_id=request.sampling_params.end_id,
                     num_logprobs=request.sampling_params.logprobs,
+                    context_logits_explicit=request.sampling_params.
+                    return_context_logits,
+                    prompt_logprobs=request.sampling_params.prompt_logprobs,
+                    prompt_logprobs_simple_format=request.sampling_params.
+                    prompt_logprobs_simple_format,
                     lora_path=py_lora_path,
                     lora_ckpt_source=py_lora_ckpt_source,
                     logprobs_mode=request.sampling_params.logprobs_mode,
@@ -566,6 +586,8 @@ class BaseWorker(GenerationExecutor):
                     conversation_params=request.conversation_params,
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
+                    watermarking=request.sampling_params.watermarking,
+                    prompt_trimmed_prefix=trimmed_prefix,
                 ),
             )
 
@@ -1177,9 +1199,8 @@ class BaseWorker(GenerationExecutor):
                 can_shutdown = self.engine.can_enqueue_requests
             if can_shutdown():
                 self.engine.shutdown()
-                local_cleanup = getattr(self.engine, "local_cleanup", None)
-                if local_cleanup is not None:
-                    local_cleanup()
+                if getattr(self.engine, "local_cleanup", None) is not None:
+                    self.engine.local_cleanup()
                 self.engine = None
 
     def get_disaggregated_params(self) -> dict:
@@ -1275,61 +1296,23 @@ class BaseWorker(GenerationExecutor):
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
             return json.dumps(stats[1])
+        # Attention-DP fanout rows are serialized when rank 0 appends them.
+        if isinstance(stats, str):
+            return stats
 
-        iteration_stats, req_stats = stats[0], stats[1]
-        kv_iter_stats = stats[2] if len(stats) > 2 else None
-        attention_dp_rank = stats[3] if len(stats) > 3 else None
-        # Newer slots — guarded with len() checks so historical 4-tuples and
-        # any external code still appending the legacy shape keep working.
-        host_step_time_ms = stats[4] if len(stats) > 4 else None
-        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
-        scheduler_mode = stats[6] if len(stats) > 6 else None
-        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
-
-        stats_dict = json.loads(iteration_stats.to_json_str())
-        # Always tag the row so Dynamo's adapter can read
-        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
-        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
-        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
-                                         attention_dp_rank)
-
-        if req_stats is not None and len(req_stats) > 0:
-            stats_dict["requestStats"] = []
-            for req_stat in req_stats:
-                stats_dict["requestStats"].append(
-                    json.loads(req_stat.to_json_str()))
-
-        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
-
-        # Per-loop CPU wall captured by profile_step() — always a clean
-        # single-loop measurement, matching the log line's `host_step_time`.
-        # Prefer this over iterLatencyMS when you need absolute per-loop
-        # CPU cost, especially under the overlap scheduler where
-        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
-        if host_step_time_ms is not None:
-            stats_dict["hostStepTimeMS"] = host_step_time_ms
-        # GPU forward time read via the ping-pong CUDA event pair in
-        # profile_step(). Note the "prev" in the name: under steady state
-        # the value lags its sibling host_step_time on the same record by
-        # one loop (the event-pair being read corresponds to the loop
-        # before the one host_step_time describes). See the ping-pong
-        # comment in PyExecutor._profiler for the design rationale.
-        if prev_device_step_time_ms is not None:
-            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
-        # Batch-matched GPU forward time measured from the CUDA events around
-        # this record's _forward_step. This is the preferred field for
-        # ForwardPassMetrics wall_time.
-        if gpu_forward_time_ms is not None:
-            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
-        # Scheduler mode for this record. "overlap" means iterLatencyMS
-        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
-        # "non_overlap" means iterLatencyMS is itself the clean per-loop
-        # CPU wall. Set per-record so consumers do not need server config.
-        if scheduler_mode is not None:
-            stats_dict["schedulerMode"] = scheduler_mode
-
-        # Convert back to JSON string
-        return json.dumps(stats_dict)
+        # Newer slots are guarded with len() checks so historical 4-tuples
+        # and external code still appending the legacy shape keep working.
+        return json.dumps(
+            iteration_stats_row(
+                stats[0],
+                stats[1],
+                kv_iter_stats=stats[2] if len(stats) > 2 else None,
+                attention_dp_rank=stats[3] if len(stats) > 3 else None,
+                host_step_time_ms=stats[4] if len(stats) > 4 else None,
+                prev_device_step_time_ms=stats[5] if len(stats) > 5 else None,
+                scheduler_mode=stats[6] if len(stats) > 6 else None,
+                gpu_forward_time_ms=stats[7] if len(stats) > 7 else None,
+            ))
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:
@@ -1580,9 +1563,12 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
+            is_error = isinstance(response, ErrorResponse)
+            if not is_error and _drop_refused_response(self.worker, response):
+                continue
             queue = self.worker.return_queue(response.client_id)
 
-            if not response.has_error():
+            if not is_error and not response.has_error():
                 response = _maybe_wrap_response(self.worker, response)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
@@ -1596,7 +1582,8 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.has_error() or response.result.is_final:
+            if (isinstance(response, ErrorResponse) or response.has_error()
+                    or response.result.is_final):
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -1619,6 +1606,8 @@ class AwaitResponseHelper:
 
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
+            elif _drop_refused_response(self.worker, response):
+                continue
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
@@ -1661,6 +1650,10 @@ def _get_params_for_first_rsp(
     return None, None, None
 
 
+class IncompleteContextLogitsError(RuntimeError):
+    """Context logits do not cover the whole prompt, so prompt logprobs cannot be aligned."""
+
+
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
@@ -1672,22 +1665,51 @@ def _compute_pytorch_prompt_logprobs(
         if cached is not None:
             return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
+    compact_rows = response.result.context_prompt_logprob_rows
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
-    if (context_logits is None and result.is_sequence_final
-            and result.finish_reasons
+    if (context_logits is None and compact_rows is None
+            and result.is_sequence_final and result.finish_reasons
             and all(reason == tllm.FinishReason.CANCELLED
                     for reason in result.finish_reasons)):
         # Cancellation before execution has no prompt logits to report. Keep
         # cached streaming logprobs above, but do not invent them for queued work.
         return None
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    assert context_logits is not None or compact_rows is not None, \
+        "context_logits must not be None when prompt_logprobs is requested."
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
     # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
+
+    if compact_rows is not None:
+        rows = torch.cat(compact_rows)
+        if rows.shape[0] + 1 != len(prompt_token_ids):
+            # Row t scores prompt token t + 1; a reused KV cache prefix produces
+            # no rows, so the remaining rows cannot be aligned with the prompt.
+            raise IncompleteContextLogitsError(
+                f"prompt logprobs need context logits for all "
+                f"{len(prompt_token_ids)} prompt tokens, got {rows.shape[0] + 1} "
+                "(a reused KV cache prefix is not rescored)")
+        tail = response.result.context_prompt_last_logprobs
+        assert tail is not None, "Completed prompt must retain its last prediction row"
+        # The executor already normalized the last row on the logits' device,
+        # matching the other rows; normalizing it again on the host would not.
+        rows = torch.cat([
+            rows,
+            reduce_prompt_logprobs(tail,
+                                   first_generation_token,
+                                   logprob_params.prompt_logprobs,
+                                   normalized=True)
+        ])
+        logprobs_result = LogProbsResult(prompt=prompt_logprobs_from_reduced(
+            rows, prompt_token_ids, logprob_params.prompt_logprobs,
+            logprob_params.prompt_logprobs_simple_format))
+        if generation_result._streaming:
+            generation_result._cached_prompt_logprobs = logprobs_result.prompt
+        return logprobs_result
 
     logprobs_result = compute_prompt_logprobs(
         logprob_params.prompt_logprobs,
@@ -1802,10 +1824,33 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _maybe_wrap_response(
-        worker, response: LlmResponse) -> Union[LlmResponse, ResponseWrapper]:
+def _drop_refused_response(worker, response: LlmResponse) -> bool:
+    """Whether ``response`` belongs to a request already answered with an error.
 
-    logprobs_result = _get_logprobs(worker, response)
+    Such a request was aborted, so the engine may still emit steps that were in
+    flight and a final cancellation; the client must see none of them.
+    """
+    if response.client_id not in worker._refused_client_ids:
+        return False
+    if response.has_error() or response.result.is_final:
+        worker._refused_client_ids.discard(response.client_id)
+    return True
+
+
+def _maybe_wrap_response(
+    worker, response: LlmResponse
+) -> Union[LlmResponse, ResponseWrapper, ErrorResponse]:
+
+    try:
+        logprobs_result = _get_logprobs(worker, response)
+    except IncompleteContextLogitsError as error:
+        # Fail only this request, and stop the engine generating for a client
+        # that has already been answered.
+        if not response.result.is_final:
+            worker._refused_client_ids.add(response.client_id)
+            worker.abort_request(response.client_id)
+        return ErrorResponse(response.client_id, str(error),
+                             response.request_id)
     req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)

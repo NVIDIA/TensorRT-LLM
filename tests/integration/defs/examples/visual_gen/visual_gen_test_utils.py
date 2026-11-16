@@ -483,6 +483,8 @@ def _require_exists(path, label, is_dir=False):
 
 
 def _golden_media_family(media_name):
+    if media_name.startswith("fasth3_"):
+        return "minimax_h3"
     if media_name.startswith("cosmos3_"):
         return "cosmos3"
     if media_name.startswith(("fastwan_", "wan21_", "wan22_")):

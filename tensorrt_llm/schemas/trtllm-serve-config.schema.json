@@ -50,6 +50,51 @@
     },
     "AttentionDpConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kv_cache_routing_home_wait_rounds": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kv_cache_routing_home_wait_rounds"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kv_cache_routing_conversation_affinity": {
+                "const": true
+              }
+            },
+            "required": [
+              "kv_cache_routing_conversation_affinity"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_routing_home_wait_rounds": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kv_cache_routing_home_wait_rounds"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kv_cache_routing_strict_conversation_affinity": {
+                "not": {
+                  "const": true
+                }
+              }
+            }
+          }
+        }
+      ],
       "description": "Configuration for attention DP.",
       "properties": {
         "batching_wait_iters": {
@@ -77,6 +122,12 @@
           "title": "Enable Kv Cache Aware Routing",
           "type": "boolean"
         },
+        "enable_packed_sync": {
+          "default": false,
+          "description": "Pack the per-iteration attention-DP host collectives of the disaggregated executor loops (error and KV-timeout votes, rank state, can-queue and the CUDA-graph padding vector) into two fixed-width all-gathers. Inactive, with an info log naming the reason, in modes the packing does not cover (for example PP or CP, speculative decoding, KV connectors, an aggregated executor). Every rank must see the same value.",
+          "title": "Enable Packed Sync",
+          "type": "boolean"
+        },
         "kv_cache_routing_account_for_in_transfer": {
           "default": false,
           "description": "In-transfer load accounting in KV cache-aware routing. When True, requests still streaming KV to the GEN worker (tracked by the PyExecutor AsyncTransferManager but no longer in active_requests) are folded back into the per-rank load reported via RankState. This can improve balance under heavy disagg traffic but inflates num_active_requests reported upstream, which lets the inference loop's idle-fetch wait expire even when no requests are runnable and causes empty fetch cycles. Default False preserves the prior behaviour (fetch blocks when truly idle). Only used when enable_kv_cache_aware_routing is True.",
@@ -101,6 +152,21 @@
           "title": "Kv Cache Routing Fair Share Multiplier",
           "type": "number"
         },
+        "kv_cache_routing_home_wait_rounds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Conversation-affinity routing: a returning conversation whose home rank is full waits for a slot there for up to this many scheduling rounds in which another rank had room, then overflows by kv_cache_routing_new_conv_placement (keeping its home rank). Later requests of the same admission group (priority) may pass a waiting one on any rank; later groups may pass it on other ranks only, not into its home rank. None overflows at once. Requires kv_cache_routing_conversation_affinity=True; not combinable with kv_cache_routing_strict_conversation_affinity.",
+          "status": "prototype",
+          "title": "Kv Cache Routing Home Wait Rounds"
+        },
         "kv_cache_routing_load_balance_weight": {
           "default": 1.0,
           "description": "Weight (beta) for the load-balance term in KV cache-aware routing. Higher values prioritize load balance over cache affinity. Only used when enable_kv_cache_aware_routing is True.",
@@ -121,14 +187,30 @@
         },
         "kv_cache_routing_new_conv_placement": {
           "default": "round_robin",
-          "description": "Placement policy in conversation-affinity routing for requests with no pinned rank yet (first turn of a conversation, requests without a conversation_id, sticky overflow). 'round_robin' (default) rotates across eligible ranks. 'least_queued' chooses the fewest live requests. 'least_tokens' chooses the fewest active prompt tokens, including requests assigned in the current batch; ties use live request count, then the rotating rank cursor. Active prompt tokens estimate work, not cached KV residency. Existing conversation->rank pins are unaffected. Only used when kv_cache_routing_conversation_affinity is True.",
+          "description": "Placement policy in conversation-affinity routing for requests with no pinned rank yet (first turn of a conversation, requests without a conversation_id, sticky overflow). 'round_robin' (default) rotates across eligible ranks. 'least_queued' chooses the fewest live requests. 'least_tokens' chooses the fewest active prompt tokens, including requests assigned in the current batch; ties use live request count, then the rotating rank cursor. Active prompt tokens estimate work, not cached KV residency. 'least_prefill' is 'least_tokens' on the prefill still to compute: the remaining context of started requests, and for the others the prompt minus the conversation's previous prompt (all of it for a first turn). Existing conversation->rank pins are unaffected. Only used when kv_cache_routing_conversation_affinity is True.",
           "enum": [
             "round_robin",
             "least_queued",
-            "least_tokens"
+            "least_tokens",
+            "least_prefill"
           ],
           "title": "Kv Cache Routing New Conv Placement",
           "type": "string"
+        },
+        "kv_cache_routing_strict_affinity_max_wait_iters": {
+          "default": 0,
+          "description": "Scheduler iterations a turn may wait for its conversation's rank under kv_cache_routing_strict_conversation_affinity before it overflows to another rank; 0 waits without limit. Only used when kv_cache_routing_strict_conversation_affinity is True.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Kv Cache Routing Strict Affinity Max Wait Iters",
+          "type": "integer"
+        },
+        "kv_cache_routing_strict_conversation_affinity": {
+          "default": false,
+          "description": "Admit a later turn of a conversation only on its conversation's rank. While that rank is at its active-request limit, the turn waits in the queue in arrival order and the requests behind it are still admitted, instead of overflowing to a rank that does not cache its prefix. Only used when kv_cache_routing_conversation_affinity is True.",
+          "status": "prototype",
+          "title": "Kv Cache Routing Strict Conversation Affinity",
+          "type": "boolean"
         },
         "timeout_iters": {
           "default": 50,
@@ -143,6 +225,25 @@
     "AutoDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for auto speculative decoding.\n\nThis config will automatically select a good, draft-model free\nspeculation algorithm with some heuristic.\n\nAttributes that are inherited from the base class are ignored.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -292,8 +393,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -347,6 +462,21 @@
       "title": "AutoDecodingConfig",
       "type": "object"
     },
+    "AutoTunerNvMMHConfig": {
+      "additionalProperties": false,
+      "description": "nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.\n\nCuTe DSL GEMM and BMM runners profile only the kernel configurations that\nnvMatmulHeuristics ranks highest for each problem shape, taking every\nfield it models (CTA tile, cluster shape, split-K, rasterization order and\nswizzle) as returned, instead of profiling their full tactic space.\n``max_tactics`` counts kernel configurations, not profiled tactics.",
+      "properties": {
+        "max_tactics": {
+          "default": 5,
+          "description": "Number of top-ranked nvMatmulHeuristics kernel configurations kept per GEMM/BMM shape. Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number of profiled tactics can be several times max_tactics.",
+          "exclusiveMinimum": 0,
+          "title": "Max Tactics",
+          "type": "integer"
+        }
+      },
+      "title": "AutoTunerNvMMHConfig",
+      "type": "object"
+    },
     "BlockReuseConfig": {
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
@@ -392,13 +522,63 @@
     },
     "CSA2SparseAttentionConfig": {
       "additionalProperties": false,
-      "description": "Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend.",
+      "description": "Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend.\n\nThe indexer geometry, index cache format and RoPE layout come from the\ncheckpoint; the other fields are indexer runtime options.",
       "properties": {
         "algorithm": {
           "const": "csa2",
           "default": "csa2",
           "title": "Algorithm",
           "type": "string"
+        },
+        "enable_heuristic_topk": {
+          "default": false,
+          "description": "Whether decode selects with the Guess-Verify-Refine (GVR) Top-K instead of the exact radix Top-K, on SM100-family GPUs with the CuTe DSL and a checkpoint index_topk of 512, 1024 or 2048; elsewhere decode keeps the radix Top-K. use_self_sampling_topk selects the GVR engine.",
+          "status": "prototype",
+          "title": "Enable Heuristic Topk",
+          "type": "boolean"
+        },
+        "indexer_max_chunk_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The most query rows one prefill indexer MQA call scores: consecutive requests share a call up to this many rows and longer requests are split. None uses 32768.",
+          "status": "prototype",
+          "title": "Indexer Max Chunk Size"
+        },
+        "q_split_threshold": {
+          "default": 8192,
+          "description": "From this many query tokens, a prefill indexer call splits its queries evenly across the tensor-parallel ranks (not under attention DP). A negative value never splits.",
+          "status": "prototype",
+          "title": "Q Split Threshold",
+          "type": "integer"
+        },
+        "skip_indexer_for_short_seqs": {
+          "default": true,
+          "description": "Whether a layer whose visible compressed positions all fit in the checkpoint's index_topk selects all of them instead of running the indexer MQA and Top-K.",
+          "status": "prototype",
+          "title": "Skip Indexer For Short Seqs",
+          "type": "boolean"
+        },
+        "use_cute_dsl_paged_mqa_logits": {
+          "default": false,
+          "description": "Whether to score each CSA2 decode row on its own with the CuTe DSL paged MQA logits kernel on SM100-family GPUs. When off, DeepGEMM scores the rows; from four requests up, six 32-head rows per request run the CuTe DSL kernel as three 64-head rows. Required by use_gvr_emission.",
+          "status": "prototype",
+          "title": "Use Cute Dsl Paged Mqa Logits",
+          "type": "boolean"
+        },
+        "use_cute_dsl_topk": {
+          "default": true,
+          "description": "Whether to use the CuTe DSL radix Top-K kernel instead of the CUDA C++ radix Top-K on SM100-family GPUs.",
+          "status": "prototype",
+          "title": "Use Cute Dsl Topk",
+          "type": "boolean"
         },
         "use_fp8_staging": {
           "anyOf": [
@@ -413,6 +593,20 @@
           "description": "Stage CSA2 KV as E4M3 for native trtllm-gen on SM100-family. The per-tensor staging scale is a power of two derived every forward from the persistent pools' own group scales, so staged rows keep the E4M3 range they decode to. Left unset, staging turns on wherever that path is available: attn_backend=TRTLLM on an SM100-family GPU, an FP8 kv_cache_config.dtype, and no packed sparse attention. Set True to require it, which rejects a configuration that cannot serve it instead of falling back, or False to pin BF16 staging.",
           "status": "prototype",
           "title": "Use Fp8 Staging"
+        },
+        "use_gvr_emission": {
+          "default": false,
+          "description": "Let the temporal-hint GVR Top-K skip whole blocks using per-block maximum logits that the CuTe DSL paged MQA logits kernel emits. Requires enable_heuristic_topk=True, use_self_sampling_topk=False and use_cute_dsl_paged_mqa_logits=True; other combinations are rejected.",
+          "status": "prototype",
+          "title": "Use Gvr Emission",
+          "type": "boolean"
+        },
+        "use_self_sampling_topk": {
+          "default": true,
+          "description": "The GVR engine. True runs the hint-free self-sampling engine, which selects exactly and therefore also serves long prefill rows. False runs the temporal-hint engine in decode, which reuses the previous step's selection as hints, on full indexer layers only.",
+          "status": "prototype",
+          "title": "Use Self Sampling Topk",
+          "type": "boolean"
         }
       },
       "title": "CSA2SparseAttentionConfig",
@@ -595,6 +789,22 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "mixed_precision_first_n": {
+          "default": 0,
+          "description": "Number of leading tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 0,
+          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink pages): the high layers would share that layer's page group, which the cold-page codec cannot split.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "nvfp4_residual_dim": {
           "default": 64,
           "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",
@@ -724,6 +934,25 @@
     "DFlashDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for DFlash speculative decoding.\n\nDFlash is a target-dependent speculative decoding method that uses\nhidden states from specific target model layers as cross-attention\ncontext in the draft model to predict multiple draft tokens in parallel.\n\nKey features:\n- Target-dependent: uses hidden states from target model layers\n- Parallel prediction: all K draft tokens in one forward pass\n- Cross-attention: draft model attends to target hidden states\n\nReference: https://arxiv.org/pdf/2602.06036",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -910,8 +1139,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "skip_ctx_buffer_budget_check": {
           "default": false,
@@ -997,6 +1240,25 @@
     "DSparkDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1266,8 +1528,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -1397,6 +1673,13 @@
           "title": "Enable Heuristic Topk",
           "type": "boolean"
         },
+        "enable_kv_cache_offload": {
+          "default": false,
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
+          "status": "prototype",
+          "title": "Enable Kv Cache Offload",
+          "type": "boolean"
+        },
         "gvr_deterministic_topk": {
           "default": false,
           "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
@@ -1485,6 +1768,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1564,7 +1852,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. This feature is under development and currently cannot be enabled for inference.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 the ratio-4 compressed cache. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -1657,6 +1945,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1718,6 +2011,25 @@
     },
     "DraftTargetDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1867,8 +2179,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -2163,6 +2489,25 @@
     },
     "Eagle3DecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -2365,8 +2710,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "sa_config": {
           "anyOf": [
@@ -2448,6 +2807,25 @@
     },
     "EagleDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -2650,8 +3028,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -2863,6 +3255,61 @@
       "title": "EncodeExtraInputSpec",
       "type": "object"
     },
+    "GenPreemptionConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "tpot_budget": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_output_tps": {
+              "type": "null"
+            }
+          }
+        }
+      ],
+      "description": "GEN slot preemption on a disaggregated generation worker.\n\nWhen every slot is taken and the next waiting request is at risk of missing\nits TTFT target, a decode request is paused in place for it. Set at most\none field to bound the TPOT cost (neither: off). Needs the auto GEN\nadmission policy and the KV cache manager V2 scheduler.",
+      "properties": {
+        "target_output_tps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-request output tokens/s floor kept by about 80% of requests.",
+          "status": "prototype",
+          "title": "Target Output Tps"
+        },
+        "tpot_budget": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Allowed mean-TPOT increase from pauses, as a fraction (0.10 = +10%).",
+          "status": "prototype",
+          "title": "Tpot Budget"
+        }
+      },
+      "title": "GenPreemptionConfig",
+      "type": "object"
+    },
     "GmsConfig": {
       "additionalProperties": false,
       "description": "Prototype configuration for GPU Memory Service (GMS) weight sharing.\n\nComposes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:\nGMS controls *where* weights live (a node-shared GPU memory pool\nso multiple TRT-LLM instances zero-copy share the same bytes),\nwhile ``checkpoint_format`` controls *how* they get there (HF disk,\nMX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==\nLoadFormat.GMS``; setting any non-default field here without that\nload_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.\n\nTwo roles are decided at connect time by the GMS daemon, not by\nconfig:\n\n- **RW (writer)**: the first instance loads weights into the pool\n  via the normal checkpoint-loader pipeline, then commits them.\n- **RO (reader)**: subsequent instances zero-copy materialize the\n  already-committed layout \u2014 no disk I/O, no per-instance copies.\n\nSee :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`\nfor the integration adapter and the ``LoadFormat.GMS`` branch in\n``ModelLoader.load`` for orchestration.",
@@ -2985,6 +3432,84 @@
     },
     "KvCacheConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "properties": {
+                  "level": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "level"
+                ]
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disk_cache_size": {
+                "enum": [
+                  0,
+                  null
+                ]
+              },
+              "enable_kv_pool_rebalance": {
+                "not": {
+                  "const": true
+                }
+              }
+            }
+          }
+        }
+      ],
       "description": "Configuration for the KV cache.",
       "properties": {
         "attention_dp_events_gather_period_ms": {
@@ -3045,6 +3570,13 @@
           "description": "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise.",
           "title": "Cross Kv Cache Fraction"
         },
+        "defer_generation_only_release": {
+          "default": false,
+          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later, or as soon as the scheduler runs out of pages, before it suspends or recompute-pauses a running request. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "status": "prototype",
+          "title": "Defer Generation Only Release",
+          "type": "boolean"
+        },
         "disk_cache_path": {
           "anyOf": [
             {
@@ -3072,12 +3604,44 @@
           "description": "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend.",
           "title": "Disk Cache Size"
         },
+        "disk_io_threads": {
+          "default": 0,
+          "description": "Worker threads for asynchronous disk KV cache I/O. The pool is process-wide: the first KV cache manager that sets a nonzero value starts it for the life of the process, and later values, including 0, do not change it. Without a pool, each disk transfer is a blocking read/write loop in a CUDA host callback, and CUDA may run host callbacks one at a time, so disk transfers can serialize. Only used by KV cache manager v2 with a disk cache.",
+          "maximum": 256,
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Disk Io Threads",
+          "type": "integer"
+        },
+        "disk_keep_copy_after_restore": {
+          "default": false,
+          "description": "Keep a reusable block's disk copy after restoring it from disk, so evicting it to disk again writes nothing. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Keep Copy After Restore",
+          "type": "boolean"
+        },
         "disk_prefetch_num_reqs": {
           "default": 0,
           "description": "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled.",
           "minimum": 0,
           "title": "Disk Prefetch Num Reqs",
           "type": "integer"
+        },
+        "disk_protected_copy_fraction": {
+          "default": 1.0,
+          "description": "Share of the disk cache that the copies kept by `disk_keep_copy_after_restore` and `disk_write_through` may hold ahead of blocks stored only on disk. When the disk is full, copies beyond this share are dropped before any of those blocks, and write-through makes no copy beyond it. 1.0 keeps copies ahead of all of them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Disk Protected Copy Fraction",
+          "type": "number"
+        },
+        "disk_write_through": {
+          "default": false,
+          "description": "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its later host-to-disk eviction writes nothing. Copies use free disk space only and are written after restores and evictions. Requires `disk_io_threads` > 0. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Write Through",
+          "type": "boolean"
         },
         "dtype": {
           "default": "auto",
@@ -3107,7 +3671,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -3159,6 +3723,13 @@
           "default": 0.9,
           "description": "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used.",
           "title": "Free Gpu Memory Fraction"
+        },
+        "host_cache_bind_to_gpu_numa_node": {
+          "default": false,
+          "description": "Allocate the host cache tier only on the GPU's host NUMA node, reclaiming page cache there instead of spilling to another node. Startup fails on every rank when the GPU reports no host NUMA node or that node cannot hold the tiers of all co-located ranks. Only used by KV cache manager v2 in the PyTorch backend.",
+          "status": "prototype",
+          "title": "Host Cache Bind To Gpu Numa Node",
+          "type": "boolean"
         },
         "host_cache_size": {
           "anyOf": [
@@ -3337,6 +3908,19 @@
           "description": "Initial hot-tier byte ratios by layer group for KV cache manager v2. Values map to KVCacheManagerV2 layer-group ID order and must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba models and DeepSeek-V4 use this directly, so avg_seq_len does not take effect when this is set.",
           "status": "prototype",
           "title": "Pool Ratio"
+        },
+        "remote_cache_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteCacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "KV cache manager v2 remote cache level in host memory that other ranks donate (usually generation ranks to context ranks). None disables it.",
+          "status": "prototype"
         },
         "secondary_offload_min_priority": {
           "anyOf": [
@@ -3719,6 +4303,25 @@
     },
     "MTPDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -3917,8 +4520,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "num_nextn_predict_layers": {
           "anyOf": [
@@ -4273,10 +4890,26 @@
     "MoeConfig": {
       "additionalProperties": false,
       "description": "Configuration for MoE.",
+      "not": {
+        "properties": {
+          "backend": {
+            "not": {
+              "const": "AUTO"
+            }
+          },
+          "tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "tactic"
+        ]
+      },
       "properties": {
         "backend": {
           "default": "AUTO",
-          "description": "MoE backend to use. AUTO selects default backend based on model. It currently doesn't always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.",
+          "description": "MoE backend to use. Choosing a backend other than AUTO is planned for deprecation where tactic can replace it; which tactic does depends on the checkpoint's format (see tactic). AUTO selects default backend based on model. It currently doesn't always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.",
           "enum": [
             "AUTO",
             "CUTLASS",
@@ -4334,6 +4967,27 @@
           "default": null,
           "description": "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used.",
           "title": "Max Num Tokens"
+        },
+        "megamoe_fuse_shared_expert": {
+          "default": false,
+          "description": "Run a DeepSeek-V4 or DeepSeek-V4.1 model's single FP8 block-scale shared expert inside the fused MoE kernel. Used only with the MEGAMOE_CUTEDSL backend on SM100/SM103, under attention DP with moe_tensor_parallel_size 1, for a model with one shared expert; ignored otherwise.",
+          "status": "prototype",
+          "title": "Megamoe Fuse Shared Expert",
+          "type": "boolean"
+        },
+        "tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for the target model; unrelated to the autotuner's kernel tactics. The recommended interface for choosing it. Takes an id 'provider.technique.kernel_name.quant' (e.g. 'trtllm.cutlass.grouped_gemm.nvfp4') or any dotted subset of its segments (e.g. 'cutlass', 'mega_moe'); case-insensitive. The first match in catalog order that can serve a layer of the checkpoint's expert format runs, with no fallback; the matches must belong to one backend family. Requires backend AUTO. A backend family can span several techniques, so the tactic that replaces a backend depends on the format (CUTLASS also covers the hopper_grouped_gemm and triton FP8 block-scale implementations); VANILLA has none. Drafts and MTP layers are selected by speculative_config.moe_tactic; with both draft fields unset, a target tactic makes a draft resolve AUTO for its own weights instead of inheriting the target's backend. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree); a run logs the id of each MoE implementation it builds.",
+          "status": "prototype",
+          "title": "Tactic"
         },
         "use_low_precision_moe_combine": {
           "default": false,
@@ -4394,6 +5048,19 @@
           "default": null,
           "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
           "title": "Num Slots"
+        },
+        "warmup_placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeWarmupPlacementConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Learn the expert placement online from the served traffic, in bounded swap rounds (see MoeWarmupPlacementConfig). Requires layer_updates_per_iter 0 and pure expert parallelism (moe_expert_parallel_size above 1 and equal to the world size, no MoE cluster parallelism) on a model the load balancer supports.",
+          "status": "prototype"
         }
       },
       "title": "MoeLoadBalancerConfig",
@@ -4443,6 +5110,131 @@
         "num_slots"
       ],
       "title": "MoePerLayerDynamicLoadBalancerConfig",
+      "type": "object"
+    },
+    "MoeTactic": {
+      "not": {
+        "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*\\*(\\.\\*){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$"
+      },
+      "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$",
+      "type": "string"
+    },
+    "MoeWarmupPlacementConfig": {
+      "additionalProperties": false,
+      "description": "Expert placement learned online from a server's own traffic, in bounded swap rounds.\n\nThe MoE layers stay static load-balancer layers: with ``num_slots`` equal to the expert count\neach expert keeps one slot, and extra slots per rank get copies of the hottest experts (no\n``initial_global_assignments``). From ``start_step`` on, per-layer expert\ncounters run on the GPU over the live rows of real requests; at ``start_step + k *\ninterval_steps`` a round swaps slots between heavy and light ranks, at most\n``max_moved_fraction`` of a layer's slots (moved GPU to GPU, in place); after\n``max_migrations`` rounds the placement is frozen. Steps are the executor's forward steps.\nWith ``decay < 1``, a large ``max_migrations`` and ``min_pos >= 2`` the placement keeps\nfollowing the served decode traffic. Outputs equal those of any other placement except for\nthe order of sums across EP ranks.",
+      "properties": {
+        "count_every_steps": {
+          "default": 1,
+          "description": "Count the routes of one forward in this many (lowers the host work of a placement that keeps learning).",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Count Every Steps",
+          "type": "integer"
+        },
+        "deadline_step": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "At this step a last round runs on the rows counted since the previous one (if any), then the placement is frozen.",
+          "status": "prototype",
+          "title": "Deadline Step"
+        },
+        "decay": {
+          "default": 1.0,
+          "description": "After each round every counter keeps this fraction of its value, so later rounds follow recent traffic.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "Decay",
+          "type": "number"
+        },
+        "interval_steps": {
+          "description": "A placement round every this many steps after start_step.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Interval Steps",
+          "type": "integer"
+        },
+        "max_migrations": {
+          "default": 1,
+          "description": "Rounds before the placement is frozen for the rest of the run.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Max Migrations",
+          "type": "integer"
+        },
+        "max_moved_fraction": {
+          "default": 0.1,
+          "description": "A round swaps slots between heavy and light ranks, each swap only for a gain over min_gain, and moves at most this fraction of a layer's slots.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "Max Moved Fraction",
+          "type": "number"
+        },
+        "min_gain": {
+          "default": 0.01,
+          "description": "A swap must lower the heavier of its two ranks by more than this fraction of the mean rank load (0.01: 1%).",
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Min Gain",
+          "type": "number"
+        },
+        "min_pos": {
+          "default": 0,
+          "description": "Count only the rows of generation requests that have generated at least this many tokens; 0 counts every live row, context rows included.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Min Pos",
+          "type": "integer"
+        },
+        "min_round_gain": {
+          "default": 0.0,
+          "description": "A round whose plan lowers the slowest rank's load over the mean rank load, averaged over the layers, by fewer than this many percentage points (not a fraction, unlike min_gain) moves nothing; 0 turns the check off.",
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Min Round Gain",
+          "type": "number"
+        },
+        "min_rows": {
+          "default": 0,
+          "description": "A round with fewer rows counted since the previous one waits for the next boundary.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Min Rows",
+          "type": "integer"
+        },
+        "planner": {
+          "default": "lpt",
+          "description": "Weigh each expert by its counted routes (lpt), or by its modelled MegaMoE cost (active experts and routed rows per rank; better at EP16 / EP32).",
+          "enum": [
+            "lpt",
+            "cost"
+          ],
+          "status": "prototype",
+          "title": "Planner",
+          "type": "string"
+        },
+        "start_step": {
+          "description": "Executor step from which the expert counters run.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Start Step",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_step",
+        "interval_steps"
+      ],
+      "title": "MoeWarmupPlacementConfig",
       "type": "object"
     },
     "MooncakeStoreConfig": {
@@ -4574,7 +5366,7 @@
       "properties": {
         "encoder_cache_max_bytes": {
           "default": 134217728,
-          "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items; inline caching supports only single-modality parameters. Compatible with side-stream prefetch.",
+          "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items, including those of mixed-modality requests. Compatible with side-stream prefetch, which requires inline encoding (item scheduling rejects it).",
           "minimum": 0,
           "status": "prototype",
           "title": "Encoder Cache Max Bytes",
@@ -4741,6 +5533,25 @@
     "NGramDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for NGram drafter speculative decoding.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -4915,8 +5726,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -4997,6 +5822,25 @@
     "PARDDecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for PARD (Parallel Draft) speculative decoding.\n\nPARD is a target-independent speculative decoding method that uses\nmask tokens to predict multiple draft tokens in parallel within a\nsingle forward pass.\n\nKey features:\n- Target-independent: doesn't use target model hidden states\n- Parallel prediction: all K draft tokens in one forward pass\n- Shared mask token: uses the same mask_token_id across all positions\n\nReference: https://arxiv.org/pdf/2504.18583",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5159,8 +6003,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "sa_config": {
           "anyOf": [
@@ -5451,6 +6309,31 @@
       "title": "PrometheusMetricsConfig",
       "type": "object"
     },
+    "PromptTokenCacheConfig": {
+      "additionalProperties": false,
+      "description": "Token ids of earlier prompts, shared by all serving frontends of a node.\n\nA multi-turn prompt repeats the previous turn's prompt; frontends that support the\ncache tokenize only the text after the longest cached prefix. The ids always equal a\nfull tokenization.",
+      "properties": {
+        "max_bytes": {
+          "description": "Cap on the space the entries take in ``path``, each counted in whole file system blocks (pages on a tmpfs); the least recently used entries are evicted first.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory for the cache on a node-local file system such as a tmpfs, created if missing. Every frontend of the server must use the same directory.",
+          "status": "prototype",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "max_bytes"
+      ],
+      "title": "PromptTokenCacheConfig",
+      "type": "object"
+    },
     "QSASparseAttentionConfig": {
       "additionalProperties": false,
       "description": "Configuration for QSA compressed query-selected attention.",
@@ -5547,6 +6430,274 @@
         }
       },
       "title": "RayPlacementConfig",
+      "type": "object"
+    },
+    "RemoteCacheConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "donor": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "donor"
+          ]
+        },
+        {
+          "properties": {
+            "level": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "level"
+          ]
+        }
+      ],
+      "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with `level` gets a cache level below the host tier whose slots live\nin memory that ranks with `donor` publish in `directory`.",
+      "properties": {
+        "directory": {
+          "description": "Rendezvous directory, on a file system every rank of the job sees, where donors publish their memory and remote cache levels claim chunks of it. Environment variables are expanded, and one that is not set is an error; the directory is created if missing. Use one directory per job.",
+          "minLength": 1,
+          "status": "prototype",
+          "title": "Directory",
+          "type": "string"
+        },
+        "donor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteDonorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's donation; None donates nothing.",
+          "status": "prototype"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteLevelConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's remote cache level; None gives it none.",
+          "status": "prototype"
+        },
+        "transport": {
+          "description": "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or {kind: fabric} (CUDA fabric memory copied over NVLink).",
+          "discriminator": {
+            "mapping": {
+              "fabric": "#/$defs/RemoteFabricTransportConfig",
+              "nixl": "#/$defs/RemoteNixlTransportConfig"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RemoteNixlTransportConfig",
+              "required": [
+                "kind"
+              ]
+            },
+            {
+              "$ref": "#/$defs/RemoteFabricTransportConfig",
+              "required": [
+                "kind"
+              ]
+            }
+          ],
+          "status": "prototype",
+          "title": "Transport"
+        }
+      },
+      "required": [
+        "directory"
+      ],
+      "title": "RemoteCacheConfig",
+      "type": "object"
+    },
+    "RemoteDonorConfig": {
+      "additionalProperties": false,
+      "description": "Host memory this rank donates to remote cache levels.",
+      "properties": {
+        "size": {
+          "description": "Bytes donated for the lifetime of the process, in whole 1 GiB chunks (a remainder below one chunk is not donated; the rank logs the size it donates).",
+          "minimum": 1073741824,
+          "status": "prototype",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteDonorConfig",
+      "type": "object"
+    },
+    "RemoteExpectedDonorsConfig": {
+      "additionalProperties": false,
+      "description": "The job's donors and claims, which only the launcher can count.",
+      "properties": {
+        "claim_size": {
+          "description": "Bytes all ranks of the job claim from `directory` together.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Claim Size",
+          "type": "integer"
+        },
+        "num_donors": {
+          "description": "Number of donating ranks the job starts.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Donors",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_donors",
+        "claim_size"
+      ],
+      "title": "RemoteExpectedDonorsConfig",
+      "type": "object"
+    },
+    "RemoteFabricTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over CUDA fabric memory.\n\nClaimants in the same multi-node NVLink domain copy it over NVLink.",
+      "properties": {
+        "compact_host_memory": {
+          "default": false,
+          "description": "Before a node that refuses a donated chunk is left, run up to 64 reclaim-and-compact passes on it (fault in and release node-bound huge pages under a per-node lock that donors on one host take in turn), so fragmented or page-cache-filled memory can still take the donation. False publishes what fits and leaves compaction to the job prolog.",
+          "status": "prototype",
+          "title": "Compact Host Memory",
+          "type": "boolean"
+        },
+        "donor_reserve_size": {
+          "default": 25769803776,
+          "description": "Bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while a donation is placed. Chunks go to the GPU's node first, then to the others; a donation that does not fit is published short.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Donor Reserve Size",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "fabric",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "RemoteFabricTransportConfig",
+      "type": "object"
+    },
+    "RemoteLevelConfig": {
+      "additionalProperties": false,
+      "description": "This rank's remote cache level, in chunks of donated memory.",
+      "properties": {
+        "donor_wait_timeout_s": {
+          "default": 900.0,
+          "description": "Seconds the rank waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total. At most 1e6.",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
+          "status": "prototype",
+          "title": "Donor Wait Timeout S",
+          "type": "number"
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteExpectedDonorsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With it, the rank waits until these donors have reported and fails at once if they cannot cover the claims, instead of after a claim wait.",
+          "status": "prototype"
+        },
+        "pool_ratio": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Split of `size` across layer groups, one positive weight per layer group in KV cache manager v2 layer-group ID order (normalized). None follows the hot tier's split.",
+          "status": "prototype",
+          "title": "Pool Ratio"
+        },
+        "size": {
+          "description": "Bytes of the level. Pages are stored as the cold tiers store them: byte copies, or encoded by a lossy cold-page codec (kv_cache_compression_config) when one is set. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteLevelConfig",
+      "type": "object"
+    },
+    "RemoteNixlTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over one-sided NIXL RDMA.",
+      "properties": {
+        "kind": {
+          "const": "nixl",
+          "default": "nixl",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        },
+        "transfer_timeout_s": {
+          "default": 30.0,
+          "description": "Seconds one batch of page transfers of a remote level may take before the level fails, e.g. on a donor that died. At most 1e6.",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
+          "status": "prototype",
+          "title": "Transfer Timeout S",
+          "type": "number"
+        },
+        "ucx_devices": {
+          "anyOf": [
+            {
+              "pattern": "^\\s*[^\\s,:][^,:]*(:1?)?\\s*(,\\s*[^\\s,:][^,:]*(:1?)?\\s*)*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
+          "status": "prototype",
+          "title": "Ucx Devices"
+        }
+      },
+      "title": "RemoteNixlTransportConfig",
       "type": "object"
     },
     "ReorderRequestPolicyConfig": {
@@ -5705,6 +6856,25 @@
     "SADecodingConfig": {
       "additionalProperties": false,
       "description": "Configuration for standalone Suffix Automaton (SA) speculative decoding.\n\nUses a GPU-native suffix automaton for pattern matching. Drafting runs\ninside the target model forward; supports CUDA graph and overlap scheduler.\n\nTo combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using\nit standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.",
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5880,8 +7050,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -5958,6 +7142,25 @@
     },
     "SaveHiddenStatesDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -6130,8 +7333,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
@@ -6201,6 +7418,29 @@
     },
     "SchedulerConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "waiting_queue_policy": {
+                  "const": "priority"
+                }
+              },
+              "required": [
+                "waiting_queue_policy"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "waiting_queue_max_wait_s": {
+                "const": null
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "capacity_scheduler_policy": {
           "$ref": "#/$defs/CapacitySchedulerPolicy",
@@ -6258,11 +7498,46 @@
           "title": "Enable Prefix Aware Scheduling",
           "type": "boolean"
         },
+        "gen_preemption": {
+          "$ref": "#/$defs/GenPreemptionConfig",
+          "description": "GEN slot preemption on disaggregated generation workers.",
+          "status": "prototype"
+        },
+        "max_gen_init_admissions_per_pass": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds how many disaggregated generation requests a rank admits per scheduling pass of the KV cache manager V2 scheduler (each admission allocates the request's KV cache); None admits all that fit. A bound trades the start latency of a burst of such requests for shorter passes, which every attention-DP rank waits for. KV cache manager V1 ignores it.",
+          "status": "prototype",
+          "title": "Max Gen Init Admissions Per Pass"
+        },
         "use_python_scheduler": {
           "default": false,
           "description": "Use pure-Python scheduler instead of C++ scheduler.",
           "title": "Use Python Scheduler",
           "type": "boolean"
+        },
+        "waiting_queue_max_wait_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With waiting_queue_policy='priority': a request that has waited this many seconds since it reached the server (in disaggregated serving, the orchestrator) goes ahead of every request that has not, oldest first. None: no cap. Keep it at or below the context servers' cache_transceiver_config.kv_transfer_timeout_ms, whose clock starts later (after prefill).",
+          "status": "prototype",
+          "title": "Waiting Queue Max Wait S"
         },
         "waiting_queue_policy": {
           "$ref": "#/$defs/WaitingQueuePolicy",
@@ -6341,6 +7616,37 @@
         }
       },
       "title": "SleepConfig",
+      "type": "object"
+    },
+    "SparseKvCacheOffloadConfig": {
+      "additionalProperties": false,
+      "description": "Memory sizing for sparse attention KV cache offload.\n\nWith offload, the KV history a sparse attention layer selects from lives in\nhost memory, and each request keeps a GPU cache of the units its selections\nname.",
+      "properties": {
+        "gpu_cache_factor": {
+          "default": 2.0,
+          "description": "Size of each request's GPU cache for offloaded attention history, in selections: the cache holds this many times the units one decode step selects, plus the unit being written, rounded up to whole pages. A larger cache keeps more history on the GPU between decode steps, so fewer units are fetched from host memory, at the cost of GPU memory per request.",
+          "minimum": 1.0,
+          "status": "prototype",
+          "title": "Gpu Cache Factor",
+          "type": "number"
+        },
+        "host_history_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pinned host memory in bytes, per rank, for offloaded attention history and the staging buffers that publish it to the GPU. The KV cache manager holds the history pools within it, beside the GPU KV cache quota, which it does not lower; a size too small for the batches the manager must always hold, such as one max_seq_len request, is rejected. It is separate from kv_cache_config.host_cache_size, the host tier that evicted KV cache pages move to, and the two together must fit this rank's share of available host memory and the pinned-memory limit. When unset, the history pools come first: they may take the host memory automatic sizing may pin, beside the staging buffers and, unless kv_cache_config.host_cache_size or a disk tier is set, room in the host tier for one max_seq_len request. Either way it is an upper bound: the history pools share their slot count with the GPU KV cache pools, so they pin only what the GPU quota's slots pair with. When unset, the automatic host tier takes the host memory they leave, up to the GPU KV cache quota.",
+          "status": "prototype",
+          "title": "Host History Size"
+        }
+      },
+      "title": "SparseKvCacheOffloadConfig",
       "type": "object"
     },
     "TelemetryConfig": {
@@ -6494,6 +7800,25 @@
     },
     "UserProvidedDecodingConfig": {
       "additionalProperties": false,
+      "not": {
+        "properties": {
+          "moe_backend": {
+            "not": {
+              "enum": [
+                "AUTO",
+                null
+              ]
+            }
+          },
+          "moe_tactic": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "moe_backend",
+          "moe_tactic"
+        ]
+      },
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -6647,8 +7972,22 @@
             }
           ],
           "default": null,
-          "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
+          "description": "MoE backend for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. Values other than AUTO are planned for deprecation where moe_tactic can replace them. With this and moe_tactic unset, the draft inherits the target's backend, or resolves AUTO for its own weights when moe_config.tactic pins the target; set this to the target's former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when the draft shares the target's per-layer dynamic EPLB. Nemotron-H embedded MTP layers must run VANILLA exactly when the target does.",
           "title": "Moe Backend"
+        },
+        "moe_tactic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoeTactic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
+          "status": "prototype",
+          "title": "Moe Tactic"
         },
         "resource_manager": {
           "type": "null"
@@ -6716,6 +8055,89 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configuration of the statistical text watermark applied while sampling.\n\nThe watermark is keyed: the same ``key`` and sampling settings are needed\nto detect it later. ``key`` is a secret and is excluded from ``repr``.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Watermarking algorithm. 'gumbel' replaces the random draw of the final token selection with a keyed Gumbel-max draw, which leaves the output distribution unchanged on average over keys. 'gumbel_dual_key' is the same for ordinary decoding and additionally supports speculative decoding with rejection sampling: draft tokens are drawn under the key, and the tokens that replace rejected drafts (or follow the last accepted one) under a second key derived from it, which keeps the output distribution exact.",
+          "enum": [
+            "gumbel",
+            "gumbel_dual_key"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "allow_request_opt_out": {
+          "default": true,
+          "description": "Whether a request may disable watermarking with SamplingParams.watermarking=False. Set to False to enforce the watermark on every request that can carry one.",
+          "title": "Allow Request Opt Out",
+          "type": "boolean"
+        },
+        "allow_target_only_watermarking": {
+          "default": false,
+          "description": "Only relevant to rejection-sampling speculative decoding. Accepted draft tokens are then not watermarked, so the signal weakens in proportion to the acceptance rate.",
+          "title": "Allow Target Only Watermarking",
+          "type": "boolean"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding tokens that seed each sampling decision. Larger values make the mark less robust to edits.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts": {
+          "default": "single_turn",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within the tokens this request generates; 'all' also searches the prompt (for instance earlier turns of a conversation) and leaves the first context_width generated tokens unwatermarked, so short answers do not share a random context across requests.",
+          "enum": [
+            "none",
+            "single_turn",
+            "all"
+          ],
+          "title": "Deduplicate Contexts",
+          "type": "string"
+        },
+        "deduplicate_contexts_max_history": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 8192,
+          "description": "How many generated positions back the repeated-context search reaches. None means the whole generation.",
+          "title": "Deduplicate Contexts Max History"
+        },
+        "key": {
+          "description": "Secret key, an integer in [0, 2**64). Detection needs the same value.",
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        },
+        "prf": {
+          "const": "philox",
+          "default": "philox",
+          "description": "Pseudo-random function that turns (key, context) into per-token random numbers. Fast and parallel, but not a cryptographic PRF: it does not protect against key recovery or forgery.",
+          "title": "Prf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-config.schema.json",
@@ -6873,6 +8295,38 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
     }
   ],
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -6936,6 +8390,19 @@
       },
       "title": "Attn Backend",
       "type": "string"
+    },
+    "autotuner_nvmmh_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AutoTunerNvMMHConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Use nvMatmulHeuristics to shrink the CuTe DSL GEMM/BMM autotuning search space to its top-ranked kernel configurations. None profiles every tactic.",
+      "status": "prototype"
     },
     "backend": {
       "const": "pytorch",
@@ -7101,6 +8568,48 @@
         {
           "additionalProperties": false,
           "properties": {
+            "ca_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the CA certificate used to verify etcd. Enables TLS for an `etcd://` cluster_uri.",
+              "title": "Ca Cert"
+            },
+            "cert_cert": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client certificate. Requires `cert_key` and `ca_cert`.",
+              "title": "Cert Cert"
+            },
+            "cert_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Path to the PEM file of the client key. Requires `cert_cert` and `ca_cert`.",
+              "title": "Cert Key"
+            },
             "cluster_name": {
               "default": "",
               "title": "Cluster Name",
@@ -7130,6 +8639,48 @@
                 }
               ],
               "default": null
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Password for an `etcd://` cluster_uri. Requires `user` and `ca_cert`.",
+              "title": "Password"
+            },
+            "record_auth_key": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Shared secret used to sign and verify the records in an `etcd://` cluster storage. When set, records without a valid signature are ignored by readers. Set the same value on the disaggregated server and on every worker.",
+              "title": "Record Auth Key"
+            },
+            "user": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "User name for an `etcd://` cluster_uri. Requires `password` and `ca_cert`.",
+              "title": "User"
             }
           },
           "required": [
@@ -7190,6 +8741,13 @@
       "title": "Enable Chunked Prefill",
       "type": "boolean"
     },
+    "enable_client_io_during_gpu_wait": {
+      "default": false,
+      "description": "With the overlap scheduler, publish the iteration's responses and parse newly received requests while the executor waits on the GPU, so the response and request threads do not compete with the executor's own host work. Responses reach clients up to one iteration later, and a new request is scheduled up to one iteration later.",
+      "status": "prototype",
+      "title": "Enable Client Io During Gpu Wait",
+      "type": "boolean"
+    },
     "enable_early_first_token_response": {
       "default": false,
       "description": "Under the overlap scheduler, emit the first-token response ahead of the next sample step to reduce TTFT. No effect when the overlap scheduler is disabled.",
@@ -7241,7 +8799,7 @@
     },
     "enable_lm_head_tp_in_adp": {
       "default": false,
-      "description": "Enable LM head TP in attention dp.",
+      "description": "Enable LM head TP in attention dp. Under DSpark it also shards the target verify head over the attention-DP ranks of a node, for greedy and temperature-only CUDA-graph decode steps of up to 256 rows per rank.",
       "status": "prototype",
       "title": "Enable Lm Head Tp In Adp",
       "type": "boolean"
@@ -7338,7 +8896,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
+      "description": "Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input, and encoder requests beyond it wait for later iterations. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to `max_batch_size` when unset.",
       "status": "prototype",
       "title": "Encoder Max Batch Size"
     },
@@ -7352,7 +8910,7 @@
         }
       ],
       "default": null,
-      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
+      "description": "Maximum number of encoder tokens. For encoder-decoder models, this limits the total encoder tokens of the requests encoded in one iteration: encoder requests beyond it wait for later iterations, and a request whose encoder tokens alone exceed it is rejected. It also limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to `max_num_tokens` when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model's largest atomic item when necessary.",
       "status": "prototype",
       "title": "Encoder Max Num Tokens"
     },
@@ -7391,6 +8949,21 @@
       "status": "prototype",
       "title": "Gather Generation Logits",
       "type": "boolean"
+    },
+    "gen_prompt_tail_tokens": {
+      "anyOf": [
+        {
+          "minimum": 256,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "On a disaggregated generation server, send an eligible generation-only request to the workers with only its last N prompt ids and the number of ids left out: the KV cache comes from the context server, and the workers read the prompt length but only ids near its end. Requests that read their full prompt (penalties, prompt logprobs, logits processors, beams, multimodal input, ...) keep it. Not allowed with KV cache block reuse, KV cache events, a KV cache connector, routed-expert capture, context parallelism, the SA / NGram / AUTO drafters, KV cache manager V1 or a cache transceiver runtime other than PYTHON. None sends full prompts.",
+      "status": "prototype",
+      "title": "Gen Prompt Tail Tokens"
     },
     "generation_config": {
       "default": "trtllm",
@@ -7465,7 +9038,7 @@
     },
     "iter_perf_stats_interval": {
       "default": 1,
-      "description": "Build an iteration statistics record only every N executor iterations when enable_iter_perf_stats is true, which reduces the host overhead of collecting the statistics (including the per-request statistics of enable_iter_req_stats). A value of 1 builds a record every iteration. With N > 1, numCompletedRequests, numNewActiveRequests and the KV cache iteration deltas of skipped iterations are carried into a later record, so their totals stay exact but can be reported late. Without attention DP, one extra record is emitted when the last active request finishes in a skipped iteration; with attention DP, what is left after the last record of a busy period is reported when the executor resumes. All other fields describe only the sampled iteration, so Prometheus counters built from them (e.g. speculative decoding draft and accepted token totals) reach only about 1/N of the true totals, and gauges such as KV cache utilization refresh every N iterations. With enable_iter_req_stats, requests that finish in a skipped iteration get no requestStats entry.",
+      "description": "Build an iteration statistics record only every N executor iterations when enable_iter_perf_stats is true, which reduces the host overhead of collecting the statistics (including the per-request statistics of enable_iter_req_stats). A value of 1 builds a record every iteration. With N > 1, numCompletedRequests, numNewActiveRequests and the KV cache iteration deltas of skipped iterations are carried into a later record, so their totals stay exact but can be reported late. Without attention DP, one extra record is emitted when the last active request finishes in a skipped iteration; with attention DP, what is left after the last record of a busy period is reported when the executor resumes. All other fields describe only the sampled iteration, so Prometheus counters built from them (e.g. speculative decoding draft and accepted token totals) reach only about 1/N of the true totals, and gauges such as KV cache utilization refresh every N iterations. With enable_iter_req_stats, requests that finish in a skipped iteration get no requestStats entry. With print_iter_log, the iteration log likewise prints only on every Nth iteration, and a printed line's num_fetched counts the requests fetched since the previous line.",
       "exclusiveMinimum": 0,
       "status": "prototype",
       "title": "Iter Perf Stats Interval",
@@ -7498,10 +9071,16 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/ColdPageQuantizationCompressionConfig"
+              "$ref": "#/$defs/ColdPageQuantizationCompressionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig"
+              "$ref": "#/$defs/TriAttentionKvCacheCompressionConfig",
+              "required": [
+                "algorithm"
+              ]
             }
           ]
         },
@@ -7704,7 +9283,7 @@
       "title": "Model Kwargs"
     },
     "modeling_v2": {
-      "default": "off",
+      "default": "auto",
       "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
       "enum": [
         "off",
@@ -7951,7 +9530,7 @@
     },
     "print_iter_log": {
       "default": false,
-      "description": "Print iteration logs.",
+      "description": "Print the iteration log: every iteration, or every iter_perf_stats_interval iterations while enable_iter_perf_stats is true.",
       "status": "beta",
       "title": "Print Iter Log",
       "type": "boolean"
@@ -7967,6 +9546,19 @@
       ],
       "default": null,
       "description": "Configuration for Prometheus metrics collection, including custom histogram bucket boundaries.",
+      "status": "prototype"
+    },
+    "prompt_token_cache_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PromptTokenCacheConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Prompt token ids shared by all serving frontends of a node, for multi-turn prompts. Used only by the DeepSeek-V4.1 input processor (checkpoints with a vision tower), where it takes precedence over enable_tokenization_cache; other input processors ignore it with a warning.",
       "status": "prototype"
     },
     "ray_placement_config": {
@@ -8177,25 +9769,46 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/QSASparseAttentionConfig"
+              "$ref": "#/$defs/QSASparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/RocketSparseAttentionConfig"
+              "$ref": "#/$defs/RocketSparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/DeepSeekSparseAttentionConfig"
+              "$ref": "#/$defs/DeepSeekSparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig"
+              "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/CSA2SparseAttentionConfig"
+              "$ref": "#/$defs/CSA2SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+              "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             },
             {
-              "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig"
+              "$ref": "#/$defs/MiniMaxM3SparseAttentionConfig",
+              "required": [
+                "algorithm"
+              ]
             }
           ]
         },
@@ -8230,40 +9843,76 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/DraftTargetDecodingConfig"
+              "$ref": "#/$defs/DraftTargetDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/Eagle3DecodingConfig"
+              "$ref": "#/$defs/Eagle3DecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/EagleDecodingConfig"
+              "$ref": "#/$defs/EagleDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/MTPDecodingConfig"
+              "$ref": "#/$defs/MTPDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/NGramDecodingConfig"
+              "$ref": "#/$defs/NGramDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/SADecodingConfig"
+              "$ref": "#/$defs/SADecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/UserProvidedDecodingConfig"
+              "$ref": "#/$defs/UserProvidedDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/SaveHiddenStatesDecodingConfig"
+              "$ref": "#/$defs/SaveHiddenStatesDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/PARDDecodingConfig"
+              "$ref": "#/$defs/PARDDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/DFlashDecodingConfig"
+              "$ref": "#/$defs/DFlashDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/DSparkDecodingConfig"
+              "$ref": "#/$defs/DSparkDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             },
             {
-              "$ref": "#/$defs/AutoDecodingConfig"
+              "$ref": "#/$defs/AutoDecodingConfig",
+              "required": [
+                "decoding_type"
+              ]
             }
           ]
         },
@@ -8396,6 +10045,19 @@
       "status": "prototype",
       "title": "Use Fine Grained Sync",
       "type": "boolean"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+      "status": "prototype"
     }
   },
   "required": [],

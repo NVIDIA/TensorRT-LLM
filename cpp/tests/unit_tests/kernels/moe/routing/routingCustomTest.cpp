@@ -415,7 +415,7 @@ TEST(RoutingCustomSelectionTest, CoopBlockKernelSelectionTable)
 
     // Per-expert preprocessing spills registers in the classic kernel well below 512
     // experts, so the lower bound must not apply to it. SigmoidBias tiers: 128, 256, 384,
-    // 512, 1024. Sigmoid has a single tier.
+    // 512, 1024 (and 2048). Sigmoid tiers: 128, 256, 512 (and 2048); the 128 tier is checked here.
     for (int32_t tier : {128, 256, 384, 512, 1024})
     {
         EXPECT_TRUE(prefersCoopBlockKernel(
@@ -1589,7 +1589,7 @@ TYPED_TEST(RoutingCustomKernelTest, SigmoidRenormClusterLevel)
     this->runTest(param);
 };
 
-// SigmoidRenorm PolicyTraits: only E128 × K8.
+// SigmoidRenorm PolicyTraits: GenericPolicyPairs, (128,8) (256,8) (512,8) (2048,32). These cases cover (128,8).
 
 TYPED_TEST(RoutingCustomKernelTest, SigmoidRenormDeviceLevel)
 {

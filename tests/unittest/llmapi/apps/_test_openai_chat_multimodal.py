@@ -449,6 +449,7 @@ async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
     str_chunks: List[str] = []
 
     finish_reason_counter = 0
+    delta = None
     finish_reason: str = None
     async for chunk in stream:
         choice = chunk.choices[0]

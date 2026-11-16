@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -10,8 +12,15 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def test_timing_metric_accumulates_and_records_failures(monkeypatch) -> None:
@@ -150,3 +159,94 @@ def test_load_weights_impl_v2_matches_through_torch_compile_wrapper(monkeypatch)
     torch.testing.assert_close(inner.layers[0].weight.detach(), weights["model.layers.0.weight"])
     torch.testing.assert_close(inner.layers[0].bias.detach(), weights["model.layers.0.bias"])
     torch.testing.assert_close(stub.lm_head.weight.detach(), weights["lm_head.weight"])
+
+
+def _fused_index_projection(declare_names: bool) -> nn.Module:
+    """A fused, weightless Linear whose checkpoint parts are index_q_proj / index_k_proj."""
+    projection = Linear(
+        16,
+        24,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=Mapping(),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
+        skip_create_weights_in_init=True,
+    )
+    if declare_names:
+        projection.fused_checkpoint_names = ("index_q_proj", "index_k_proj")
+    return projection
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "entries, excluded, expected",
+    [
+        ("matching", (), "declared"),
+        ("absent", (), None),
+        ("mismatched", (), ValueError),
+        ("zero_point", (), ValueError),
+        ("missing_k", (), ValueError),
+        ("matching", ("index_q_proj", "index_k_proj"), "excluded"),
+        ("matching", ("index_q_proj",), ValueError),
+        ("matching", ("index_qk_proj",), "excluded"),
+    ],
+)
+def test_quantization_passes_match_declared_fused_checkpoint_names(
+    entries: str, excluded: tuple[str, ...], expected: object
+) -> None:
+    """Per-layer entries and exclusions apply by the declared names, and the parts must agree."""
+    prefix = "model.layers.3.self_attn"
+    declared = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    other = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    legacy = QuantConfig(quant_algo=QuantAlgo.FP8)
+    quant_config_dict = {
+        # The undeclared gate/up projection keeps its by-name match.
+        "model.layers.3.mlp.gate_proj": legacy,
+        # Another layer's entries never reach this projection.
+        "model.layers.2.self_attn.index_q_proj": other,
+        "model.layers.2.self_attn.index_k_proj": other,
+    }
+    if entries != "absent":
+        quant_config_dict[f"{prefix}.index_q_proj"] = declared
+    k_configs = {
+        # Equal to the Q entry but a separate object, as a per-layer map holds it.
+        "matching": QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+        "mismatched": other,
+        # Same algorithm and group size; any other differing field still conflicts.
+        "zero_point": QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32, has_zero_point=True),
+    }
+    if entries in k_configs:
+        quant_config_dict[f"{prefix}.index_k_proj"] = k_configs[entries]
+    global_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=[f"{prefix}.{name}" for name in excluded] or None,
+    )
+    model_config = SimpleNamespace(quant_config=global_config, quant_config_dict=quant_config_dict)
+    projection = _fused_index_projection(declare_names=True)
+    # Without declared names a fused projection keeps the gate/up name match.
+    undeclared = _fused_index_projection(declare_names=False)
+    modules = [
+        (f"{prefix}.index_qk_proj", projection),
+        ("model.layers.3.mlp.gate_up_proj", undeclared),
+    ]
+
+    def run_passes() -> None:
+        """Run both passes in __post_init__ order."""
+        modeling_utils.apply_layerwise_quant_config(model_config, iter(modules))
+        modeling_utils.apply_quant_config_exclude_modules(model_config, iter(modules))
+
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="one fused projection"):
+            run_passes()
+        return
+    run_passes()
+    assert undeclared.quant_config is legacy
+    if expected == "declared":
+        assert projection.quant_config is declared
+    elif expected == "excluded":
+        assert projection.quant_config.quant_algo is None
+        assert projection.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    else:
+        assert projection.quant_config is None

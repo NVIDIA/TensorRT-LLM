@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import pytest
 import torch
@@ -319,7 +319,12 @@ def _run_one_rank() -> int:
     sf_written = _sf_written
     # Spawned by file path, not collected by pytest: the sibling moe/ operands the plain way.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))
-    import _m3_moe_operands as _operands
+    if TYPE_CHECKING:
+        from _torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.moe import (
+            _m3_moe_operands as _operands,
+        )
+    else:
+        import _m3_moe_operands as _operands
 
     operands = _operands
     WS = _make_workspace()

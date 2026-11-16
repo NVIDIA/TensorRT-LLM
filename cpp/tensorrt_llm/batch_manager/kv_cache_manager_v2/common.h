@@ -56,6 +56,7 @@ enum class CacheTier : int
     GPU_MEM = 0,
     HOST_MEM = 1,
     DISK = 2,
+    REMOTE = 3,
 };
 
 // PageIndexMode — how converted page indices relate to layers within a layer group.

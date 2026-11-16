@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
@@ -96,7 +97,7 @@ MPI_Op getMpiOp(MpiOp op)
 namespace
 {
 
-bool mpiInitialized = false;
+std::atomic<bool> mpiInitialized{false};
 std::recursive_mutex mpiMutex;
 using SignalHandler = void (*)(int);
 
@@ -192,10 +193,23 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
         return;
     }
     std::lock_guard<std::recursive_mutex> lk(mpiMutex);
-    if (mpiInitialized)
+    // Only the mutex owner can observe an in-progress initialization through re-entry.
+    static bool initializing = false;
+    if (mpiInitialized || initializing)
     {
         return;
     }
+    initializing = true;
+
+    struct ResetInitializing
+    {
+        bool& flag;
+
+        ~ResetInitializing()
+        {
+            flag = false;
+        }
+    } resetInitializing{initializing};
 #if ENABLE_MULTI_DEVICE
     int initialized = 0;
     TLLM_MPI_CHECK(MPI_Initialized(&initialized));
@@ -550,6 +564,8 @@ MpiComm& MpiComm::mutableSession()
 MpiComm& MpiComm::mutableLocalSession()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    // Runtime initialization can request the local session; finish it before taking the static initializer's guard.
+    initialize();
     static MpiComm localSession = initLocalSession();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return localSession;

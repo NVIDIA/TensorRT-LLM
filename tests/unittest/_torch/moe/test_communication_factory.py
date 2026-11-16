@@ -34,6 +34,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_model_config(
     act_dtype: torch.dtype = torch.bfloat16,
@@ -261,6 +263,44 @@ def test_nccl_ep_without_runtime_group_timeout_is_unavailable(monkeypatch: pytes
     )
 
     assert reason is not None and "set_timeout_ns" in reason
+
+
+@pytest.mark.parametrize(
+    ("num_slots", "smem_optin", "match"),
+    [
+        (32, 232448, None),
+        (32, 101376, "requires 202240 bytes of dynamic shared memory"),
+        (2632, 232448, None),
+        (4096, 232448, "at most 14 expert warp groups"),
+    ],
+    ids=["fits", "smem-too-small", "max-warp-groups", "too-many-warp-groups"],
+)
+def test_nccl_ep_v01_low_latency_combine_device_limits(
+    monkeypatch: pytest.MonkeyPatch, num_slots: int, smem_optin: int, match: str | None
+):
+    """NCCL-EP v0.1 LL combine is limited by the device's dynamic SMEM and 14 expert warp groups."""
+    monkeypatch.setattr(communication_factory, "nccl_ep_supports_version", lambda _: False)
+    monkeypatch.setattr(communication_factory, "is_nccl_ep_installed", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=188,
+            shared_memory_per_block_optin=smem_optin,
+            shared_memory_per_block=49152,
+        ),
+    )
+
+    reason = communication_factory.CommunicationFactory._get_nccl_ep_unavailable_reason(
+        torch.bfloat16, None, num_slots, 4096, 1024, 1024, 8
+    )
+
+    if match is None:
+        assert reason is None
+    else:
+        assert reason is not None and match in reason
 
 
 class _FakeNcclEP:
