@@ -407,19 +407,18 @@ class DecoderCudaGraphs:
         ``TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1`` try one pass first.
         """
         with self.cuda_graph_runner.allow_capture():
-            if allow_single_pass and self._capture_in_one_pass(resource_manager):
-                return
-            self.cuda_graph_runner.is_warmup_only = True
-            try:
-                self.run_cuda_graph_warmup(resource_manager)
-            finally:
-                self.cuda_graph_runner.is_warmup_only = False
-            self.reset_padding_dummies()
-            # Captured graphs keep the MoE communication timeouts that were
-            # current at capture, and serving replays them, so capture with the
-            # serving timeouts. The warmup-only pass above keeps the warmup ones.
-            with moe_comm_serving_timeouts():
-                self.run_cuda_graph_warmup(resource_manager)
+            if not (allow_single_pass and self._capture_in_one_pass(resource_manager)):
+                self.cuda_graph_runner.is_warmup_only = True
+                try:
+                    self.run_cuda_graph_warmup(resource_manager)
+                finally:
+                    self.cuda_graph_runner.is_warmup_only = False
+                self.reset_padding_dummies()
+                # Captured graphs keep the MoE communication timeouts that were
+                # current at capture, and serving replays them, so capture with the
+                # serving timeouts. The warmup-only pass above keeps the warmup ones.
+                with moe_comm_serving_timeouts():
+                    self.run_cuda_graph_warmup(resource_manager)
         self._warm_inforward_split(resource_manager)
 
     def _plans_inforward_splits(self, resource_manager: ResourceManager) -> bool:
