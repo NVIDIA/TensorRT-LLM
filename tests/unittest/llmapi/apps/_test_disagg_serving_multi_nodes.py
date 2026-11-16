@@ -18,6 +18,7 @@ import pytest
 from test_common import cluster_env
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
+from test_common.socket_utils import recv_exact
 
 from tensorrt_llm._utils import get_sm_version
 
@@ -181,13 +182,15 @@ def wait_for_gen_task_shutdown(host: str, test_id: str) -> None:
     with connection:
         connection.sendall(ready_signal)
         connection.shutdown(socket.SHUT_WR)
-        connection.settimeout(COMPLETION_WORK_TIMEOUT_S)
         try:
-            shutdown_signal = connection.recv(len(SHUTDOWN_MESSAGE))
+            shutdown_signal = recv_exact(connection, len(SHUTDOWN_MESSAGE),
+                                         COMPLETION_WORK_TIMEOUT_S)
         except TimeoutError as error:
             raise RuntimeError(
                 "Rank zero did not finish completion work within "
                 f"{COMPLETION_WORK_TIMEOUT_S}s") from error
+        except EOFError as error:
+            shutdown_signal = error.args[0]
         if shutdown_signal != SHUTDOWN_MESSAGE:
             raise RuntimeError(
                 "Rank zero closed the generation coordination channel "
