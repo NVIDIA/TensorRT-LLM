@@ -8,6 +8,7 @@ import ast
 import copy
 import gc
 import importlib.util
+import json
 import sys
 import weakref
 from dataclasses import dataclass
@@ -413,6 +414,7 @@ def test_cuda_graphs_read_new_minima_and_share_progress_across_buckets() -> None
     meta = _metadata(slots=2, batch=2, device="cuda")
     meta.batch_slot_ids.copy_(torch.tensor([0, 2], device="cuda"))
     graphs, results, logits = [], [], []
+    static_inputs = []
     for batch in (1, 2):
         view = copy.copy(meta)
         view.max_num_requests = batch
@@ -438,12 +440,28 @@ def test_cuda_graphs_read_new_minima_and_share_progress_across_buckets() -> None
         graphs.append(graph)
         results.append(tokens)
         logits.append(raw)
+        # CUDA graphs retain addresses; external input tensors must stay alive.
+        static_inputs.append((drafts, counts))
     req = _Request(py_min_length=2)
     _populate(meta, [req, _Request(py_seq_slot=None, is_dummy=True)])
-    for index, expected in ((0, 1), (1, 1), (0, 0)):
+    for index, expected, remaining in ((0, 1, 1), (1, 1, 0), (0, 0, 0)):
         graphs[index].replay()
         torch.cuda.synchronize()
+        print(
+            "MINIMUM_GRAPH_REPLAY",
+            json.dumps(
+                {
+                    "bucket": index,
+                    "counts": static_inputs[index][1].tolist(),
+                    "remaining": meta.minimum_length_state.remaining.tolist(),
+                    "token": results[index][0, 0].item(),
+                    "commit_flags": meta.minimum_length_state.commit.tolist(),
+                }
+            ),
+        )
         assert results[index][0, 0].item() == expected
+        assert meta.minimum_length_state.remaining[0].item() == remaining
+        assert torch.equal(static_inputs[index][1], torch.ones_like(static_inputs[index][1]))
         assert logits[index][0, 0].item() == 10.0
     assert meta.minimum_length_state.remaining[0].item() == 0
     assert meta.minimum_length_state.remaining[2].item() == 0
