@@ -63,6 +63,29 @@ def _build(spec, seed):
 
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+def _ultra_bf16_dep_cells(layout: str) -> tuple[Cell, ...]:
+    """Nemotron-3 Ultra BF16 under attention DP (dep16, dep32): every dense projection unsharded,
+    at one row, the decode CUDA-graph ceiling of 32 rows a rank and a 4096-token prefill step."""
+    return tuple(
+        Cell(
+            why=f"nemotron_h BF16 {layout} {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("mamba in_proj: 8192 -> 2 x 16384 + 2 x 1024 + 256", 8192, 35072, None),
+            ("mamba out_proj: 16384 -> 8192", 16384, 8192, None),
+            ("qkv: 8192 -> (64 + 2 + 2) x 128", 8192, 8704, None),
+            ("o_proj: 8192 -> 8192", 8192, 8192, None),
+            ("shared up: 8192 -> 10240", 8192, 10240, None),
+            ("shared down: 10240 -> 8192", 10240, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("fc2_latent: 2048 -> 8192", 2048, 8192, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 4096)
+    )
+
+
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
@@ -114,6 +137,64 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
+    # Nemotron-3 Ultra BF16 at tp8: every dense projection a rank runs, at one row, the
+    # decode CUDA-graph ceilings (32 and 256 rows) and a max_num_tokens prefill step. The
+    # tp8ep2 target runs the same shapes (its experts differ, not its dense layers).
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": tuple(
+        Cell(
+            why=f"nemotron_h BF16 tp8 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("mamba in_proj: 8192 -> 2 x 2048 + 2 x 128 + 32", 8192, 4384, None),
+            ("qkv: 8192 -> (8 + 1 + 1) x 128", 8192, 1280, None),
+            ("o_proj: 1024 -> 8192, a row-parallel partial", 1024, 8192, None),
+            ("shared up: 8192 -> 10240 / 8", 8192, 1280, None),
+            ("shared down: 1280 -> 8192, a row-parallel partial", 1280, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("fc2_latent / mamba out_proj: 2048 -> 8192", 2048, 8192, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 256, 8192)
+    ),
+    # Nemotron-3 Ultra NVFP4 at tep4: its bf16 projections (attention, the latent pair and
+    # the fp32-out router; the mamba and shared-expert projections are FP8) at one row, the
+    # decode CUDA-graph ceiling and a max_num_tokens prefill step.
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__tep4": tuple(
+        Cell(
+            why=f"nemotron_h NVFP4 tep4 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("qkv: 8192 -> (16 + 1 + 1) x 128", 8192, 2304, None),
+            ("o_proj: 2048 -> 8192, a row-parallel partial", 2048, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 8192)
+    ),
+    # ... and at dep4, where attention is replicated: a rank runs the unsharded qkv and
+    # o_proj over its own tokens.
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4": tuple(
+        Cell(
+            why=f"nemotron_h NVFP4 dep4 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("qkv: 8192 -> (64 + 2 + 2) x 128", 8192, 8704, None),
+            ("o_proj: 8192 -> 8192", 8192, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 8192)
+    ),
+    # Nemotron-3 Ultra BF16 at dep16 (attention DP over 16 ranks): every dense projection
+    # unsharded, at one row, the decode CUDA-graph ceiling of 32 rows a rank and a 4096-token
+    # prefill step (the disaggregated context tier's per-rank chunk).
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__dep16": _ultra_bf16_dep_cells("dep16"),
+    # ... and at dep32 (attention DP over 32 ranks): only the expert window differs, so every
+    # dense projection is dep16's and the cells are the same specs (run once).
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__dep32": _ultra_bf16_dep_cells("dep32"),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

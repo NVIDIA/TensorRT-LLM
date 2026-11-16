@@ -10,11 +10,14 @@ import cutlass
 
 
 class QuantKind(str, enum.Enum):
-    """One admissible block-scaled quantization mode.
+    """One admissible quantization mode: a block-scaled kind, or unquantized bf16.
 
     A member is defined by its (weight, activation) element pair -- under swap-AB the weight is
     the MMA A operand and the activation is the B operand. The selected K-throughput mode remains
     explicit because one quantization kind can use multiple instruction K extents.
+
+    ``bf16`` is the one kind without scale factors: it runs the dense ``kind::f16`` MMA, so every
+    scale-factor property raises for it and callers must branch on ``is_block_scaled`` first.
     """
 
     nvfp4 = "nvfp4"
@@ -22,12 +25,18 @@ class QuantKind(str, enum.Enum):
     mxfp8_e4m3 = "mxfp8_e4m3"
     mxfp8_e5m2 = "mxfp8_e5m2"
     mxfp4_mxfp8 = "mxfp4_mxfp8"
+    bf16 = "bf16"
 
     # Enum's __str__/__format__ for mixed-in types changed across Python 3.10/3.11/3.12, and the
     # kernels fold the kind into their compiled-kernel cache key. Pin both to the member value so
     # the key cannot silently become "QuantKind.nvfp4" on an interpreter upgrade.
     __str__ = str.__str__
     __format__ = str.__format__
+
+    @property
+    def is_block_scaled(self) -> bool:
+        """Whether the kind carries scale factors (and so a ``kind::*.block_scale`` MMA)."""
+        return self is not QuantKind.bf16
 
     @property
     def weight_dtype(self) -> Type[cutlass.Numeric]:
@@ -38,8 +47,15 @@ class QuantKind(str, enum.Enum):
         """Also the dtype the FC1 epilogue must emit: FC2 consumes it as its activation."""
         return _element_pair[self][1]
 
+    def _require_block_scaled(self, what: str) -> None:
+        # Raising rather than returning a sentinel makes a call site that forgot to branch on
+        # is_block_scaled fail at trace time instead of building a scale-factor path for bf16.
+        if not self.is_block_scaled:
+            raise ValueError(f"{self} has no scale factors, so it has no {what}.")
+
     @property
     def sf_vec_size(self) -> int:
+        self._require_block_scaled("scale-factor vector size")
         return 16 if self is QuantKind.nvfp4 else 32
 
     @property
@@ -51,11 +67,15 @@ class QuantKind(str, enum.Enum):
     def umma_kind(self) -> str:
         """The ``tcgen05.mma.kind::`` qualifier.
 
-        Mirrors the dispatch in ``blackwell_helpers._make_blockscaled_trivial_tiled_mma_impl``:
-        only an fp4 pair reaches the fp4-specific kinds, everything else -- including any mixed
-        pair -- falls back to mxf8f6f4. Keeping the two in sync matters because we build the tiled
-        MMA through that helper but emit the instruction ourselves.
+        For the block-scaled kinds this mirrors the dispatch in
+        ``blackwell_helpers._make_blockscaled_trivial_tiled_mma_impl``: only an fp4 pair reaches
+        the fp4-specific kinds, everything else -- including any mixed pair -- falls back to
+        mxf8f6f4. Keeping the two in sync matters because we build the tiled MMA through that
+        helper but emit the instruction ourselves. bf16 maps to the dense ``kind::f16`` that
+        ``blackwell_helpers._make_trivial_tiled_mma_impl`` builds for a bf16 pair.
         """
+        if not self.is_block_scaled:
+            return "f16"
         both_fp4 = self.weight_dtype is cutlass.Float4E2M1FN and self.activation_dtype is cutlass.Float4E2M1FN
         if not both_fp4:
             return "mxf8f6f4"
@@ -64,17 +84,23 @@ class QuantKind(str, enum.Enum):
     @property
     def umma_scale_vec_suffix(self) -> str:
         """PTX modifier after ``.block_scale``; mxf8f6f4 takes none (its scale vector is 32)."""
+        self._require_block_scaled("block_scale modifier")
         if self.umma_kind == "mxf8f6f4":
             return ""
         return ".block16" if self.sf_vec_size == 16 else ".block32"
 
     def instruction_k(self, mma_k_mode: Literal["1x", "2x"]) -> int:
+        if mma_k_mode not in ("1x", "2x"):
+            raise ValueError(f"Invalid MMA K mode {mma_k_mode!r}; expected '1x' or '2x'.")
+        if self.umma_kind == "f16":
+            # One kind::f16 MMA consumes 32 B of K per row (16 bf16); there is no 2x variant.
+            if mma_k_mode == "2x":
+                raise ValueError(f"{self} (kind::f16) has no '2x' MMA K mode.")
+            return 16
         instruction_k_1x = 32 if self.umma_kind == "mxf8f6f4" else 64
         if mma_k_mode == "1x":
             return instruction_k_1x
-        if mma_k_mode == "2x":
-            return instruction_k_1x * 2
-        raise ValueError(f"Invalid MMA K mode {mma_k_mode!r}; expected '1x' or '2x'.")
+        return instruction_k_1x * 2
 
     @property
     def weight_format_code(self) -> int:
@@ -89,6 +115,7 @@ class QuantKind(str, enum.Enum):
     @property
     def scale_format_code(self) -> int:
         """Instruction-descriptor ``scale_format_``: 0 = UE4M3, 1 = UE8M0."""
+        self._require_block_scaled("scale_format_ field")
         return 0 if self.sf_dtype is cutlass.Float8E4M3FN else 1
 
     def needs_unpack_tma(self, architecture: str) -> bool:
@@ -108,7 +135,8 @@ class QuantKind(str, enum.Enum):
     def uses_global_scale(self) -> bool:
         """Whether the caller supplies per-expert alpha / norm_const.
 
-        Only nvfp4: an e8m0 scale is a pure power of two and already carries the whole rescale.
+        Only nvfp4: an e8m0 scale is a pure power of two and already carries the whole rescale,
+        and bf16 is unscaled.
         """
         return self is QuantKind.nvfp4
 
@@ -119,25 +147,33 @@ _element_pair: Dict[QuantKind, Tuple[Type[cutlass.Numeric], Type[cutlass.Numeric
     QuantKind.mxfp8_e4m3: (cutlass.Float8E4M3FN, cutlass.Float8E4M3FN),
     QuantKind.mxfp8_e5m2: (cutlass.Float8E5M2, cutlass.Float8E5M2),
     QuantKind.mxfp4_mxfp8: (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN),
+    QuantKind.bf16: (cutlass.BFloat16, cutlass.BFloat16),
 }
 
 
-# The three ``a_format_`` / ``b_format_`` bits are read against one of two disjoint enums, and the
-# MMA kind picks which (CUTLASS ``UMMA::MXF4Format`` vs ``UMMA::MXF8F6F4Format`` in
-# cute/arch/mma_sm100_desc.hpp). E2M1 is 1 under the first and 5 under the second. Getting it wrong
-# still compiles and still runs -- it just computes garbage -- so these live in exactly one place.
+# The three ``a_format_`` / ``b_format_`` bits are read against one of three disjoint enums, and
+# the MMA kind picks which (CUTLASS ``UMMA::MXF4Format``, ``UMMA::MXF8F6F4Format`` and
+# ``UMMA::F16F32Format`` in cute/arch/mma_sm100_desc.hpp). E2M1 is 1 under the first and 5 under
+# the second, and BF16 is 1 under the third (F16 = 0, TF32 = 2). Getting it wrong still compiles
+# and still runs -- it just computes garbage -- so these live in exactly one place.
 _mxf4_format_code: Dict[Type[cutlass.Numeric], int] = {cutlass.Float4E2M1FN: 1}
 _mxf8f6f4_format_code: Dict[Type[cutlass.Numeric], int] = {
     cutlass.Float8E4M3FN: 0,
     cutlass.Float8E5M2: 1,
     cutlass.Float4E2M1FN: 5,
 }
+_f16_format_code: Dict[Type[cutlass.Numeric], int] = {cutlass.BFloat16: 1}
+_format_code_by_umma_kind: Dict[str, Dict[Type[cutlass.Numeric], int]] = {
+    "mxf4nvf4": _mxf4_format_code,
+    "mxf4": _mxf4_format_code,
+    "mxf8f6f4": _mxf8f6f4_format_code,
+    "f16": _f16_format_code,
+}
 
 
 def _instruction_descriptor_format_code(umma_kind: str, dtype: Type[cutlass.Numeric]) -> int:
-    codes = _mxf8f6f4_format_code if umma_kind == "mxf8f6f4" else _mxf4_format_code
     try:
-        return codes[dtype]
+        return _format_code_by_umma_kind[umma_kind][dtype]
     except KeyError as error:
         raise ValueError(f"{dtype} has no instruction-descriptor format code under kind::{umma_kind}.") from error
 
@@ -211,12 +247,15 @@ class CombineFormat:
 # Every Blackwell 1x PTX hardware encoding is restated independently of the derivations above, so
 # that a typo in a property fails at import rather than at the first wrong numerical result.
 # Ordered as (umma_kind, scale_vec_suffix, instruction_k_1x, a_format_, b_format_, scale_format_).
-_pinned_hardware_encoding: Dict[QuantKind, Tuple[str, str, int, int, int, int]] = {
+# The dense kind has no ``.block_scale`` modifier and no ``scale_format_`` field (UMMA::
+# InstrDescriptor rather than InstrDescriptorBlockScaled), so those two entries are None for it.
+_pinned_hardware_encoding: Dict[QuantKind, Tuple[str, Optional[str], int, int, int, Optional[int]]] = {
     QuantKind.nvfp4: ("mxf4nvf4", ".block16", 64, 1, 1, 0),
     QuantKind.mxfp4: ("mxf4", ".block32", 64, 1, 1, 1),
     QuantKind.mxfp8_e4m3: ("mxf8f6f4", "", 32, 0, 0, 1),
     QuantKind.mxfp8_e5m2: ("mxf8f6f4", "", 32, 1, 1, 1),
     QuantKind.mxfp4_mxfp8: ("mxf8f6f4", "", 32, 5, 0, 1),
+    QuantKind.bf16: ("f16", None, 16, 1, 1, None),
 }
 
 
@@ -225,16 +264,19 @@ def _verify_pinned_hardware_encoding() -> None:
     if unpinned:
         raise AssertionError(f"QuantKind members without a pinned hardware encoding: {unpinned}.")
     for kind, expected in _pinned_hardware_encoding.items():
+        block_scaled = kind.is_block_scaled
         derived = (
             kind.umma_kind,
-            kind.umma_scale_vec_suffix,
+            kind.umma_scale_vec_suffix if block_scaled else None,
             kind.instruction_k("1x"),
             kind.weight_format_code,
             kind.activation_format_code,
-            kind.scale_format_code,
+            kind.scale_format_code if block_scaled else None,
         )
         if derived != expected:
             raise AssertionError(f"QuantKind.{kind.name} derives {derived}, pinned encoding is {expected}.")
+        if not block_scaled:
+            continue
         expected_instruction_k_2x = expected[2] * 2
         instruction_k_2x = kind.instruction_k("2x")
         if instruction_k_2x != expected_instruction_k_2x:

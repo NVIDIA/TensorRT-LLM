@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage one MegaMoE call's routing and NVFP4 activation into the kernel's bucket buffers."""
+"""Stage one MegaMoE call's routing and activation into the kernel's bucket buffers.
+
+The activation is NVFP4 bytes with their scale factors, or unscaled bf16 rows (the bf16 kind),
+which have no scale-factor leg.
+"""
 
 import functools
 from typing import Optional
@@ -20,7 +24,8 @@ Int32, Int64, Float32 = cutlass.Int32, cutlass.Int64, cutlass.Float32
 
 class MegaMoEStageInputsKernel:
     """One CTA per bucket row: live rows get the caller's routing (and activation) rows, the
-    others expert -1 and weight 0 (dispatch skips -1; combine reads every weight)."""
+    others expert -1 and weight 0 (dispatch skips -1; combine reads every weight). ``sf_words`` is 0
+    for an unscaled activation, which has no scale-factor rows."""
 
     num_threads = 128
 
@@ -72,7 +77,8 @@ class MegaMoEStageInputsKernel:
         if cutlass.const_expr(self.act_words > 0):
             if live:
                 self.copy_row(act_src, act_dst, row, tidx, self.act_words)
-                self.copy_row(sf_src, sf_dst, row, tidx, self.sf_words)
+                if cutlass.const_expr(self.sf_words > 0):
+                    self.copy_row(sf_src, sf_dst, row, tidx, self.sf_words)
 
     @cute.jit
     def copy_row(
@@ -96,20 +102,29 @@ def _fake_rows(dtype, rows, width: int):
     return cute.runtime.make_fake_compact_tensor(dtype, (rows, width), stride_order=(1, 0))
 
 
+def _compact_rows(rows: torch.Tensor) -> torch.Tensor:
+    """``rows`` with a row stride equal to its width, which the compiled call requires of every
+    operand. A one-row (or empty) tensor reports ``is_contiguous()`` whatever its row stride, for
+    example one row of a wider tensor's column slice, so contiguity alone does not guarantee it."""
+    if rows.stride() == (rows.shape[1], 1):
+        return rows
+    return rows.clone(memory_format=torch.contiguous_format)
+
+
 @functools.cache
 def _compile_stage_inputs(top_k: int, index_dtype: torch.dtype, act_words: int, sf_words: int):
     live, rows = cute.sym_int(), cute.sym_int()
-    staged = act_words > 0
+    staged, scaled = act_words > 0, sf_words > 0
     return cute.compile(
         MegaMoEStageInputsKernel(top_k, act_words, sf_words),
         _fake_rows(Int32, live, top_k),
         _fake_rows(Float32, live, top_k),
         _fake_rows(Int32, live, act_words) if staged else None,
-        _fake_rows(Int32, live, sf_words) if staged else None,
+        _fake_rows(Int32, live, sf_words) if scaled else None,
         _fake_rows(_INDEX_TYPES[index_dtype], rows, top_k),
         _fake_rows(Float32, rows, top_k),
         _fake_rows(Int32, rows, act_words) if staged else None,
-        _fake_rows(Int32, rows, sf_words) if staged else None,
+        _fake_rows(Int32, rows, sf_words) if scaled else None,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -126,13 +141,29 @@ def stage_megamoe_inputs(
     sf_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill a bucket's routing (and, with ``x``, activation) buffers; rows past ``num_tokens`` get
-    expert -1 and weight 0. Byte rows must be whole 32-bit words."""
+    expert -1 and weight 0. Byte rows must be whole 32-bit words. An unscaled activation (the bf16
+    kind) passes neither ``x_sf`` nor ``sf_buffer``."""
     act_src = sf_src = act_dst = sf_dst = None
     act_words = sf_words = 0
     if x is not None:
-        act_src, act_dst = x.view(torch.int32), act_buffer.view(torch.int32)
-        sf_src, sf_dst = x_sf.view(torch.int32), sf_buffer.view(torch.int32)
-        act_words, sf_words = act_dst.shape[1], sf_dst.shape[1]
+        if (x_sf is None) != (sf_buffer is None):
+            raise ValueError(
+                "stage_megamoe_inputs: x_sf and sf_buffer must be given together "
+                f"(x_sf is {'None' if x_sf is None else 'set'}, "
+                f"sf_buffer is {'None' if sf_buffer is None else 'set'})."
+            )
+        act_src, act_dst = _compact_rows(x.view(torch.int32)), act_buffer.view(torch.int32)
+        act_words = act_dst.shape[1]
+        if x_sf is not None:
+            sf_src, sf_dst = _compact_rows(x_sf.view(torch.int32)), sf_buffer.view(torch.int32)
+            sf_words = sf_dst.shape[1]
     _compile_stage_inputs(idx_buffer.shape[1], idx_buffer.dtype, act_words, sf_words)(
-        topk_idx, topk_weights, act_src, sf_src, idx_buffer, weights_buffer, act_dst, sf_dst
+        _compact_rows(topk_idx),
+        _compact_rows(topk_weights),
+        act_src,
+        sf_src,
+        idx_buffer,
+        weights_buffer,
+        act_dst,
+        sf_dst,
     )

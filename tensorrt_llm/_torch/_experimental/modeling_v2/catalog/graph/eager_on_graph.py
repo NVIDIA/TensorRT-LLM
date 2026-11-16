@@ -32,7 +32,7 @@ class EagerOnGraph(OpWrapper):
     Fusion boundary: none. The break runs exactly what `inner` runs, on the current stream.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Spec axes: `capture` (inside a breakable capture, or plain eager), `breaks` (breaks in
     # one body), `tokens` (the bucket `T` the body is captured at), `width` (row width),

@@ -1,4 +1,4 @@
-"""Block-scaled SwapAb adapter between FC12 scheduling and kernel tensor views."""
+"""SwapAb adapter between FC12 scheduling and kernel tensor views (block-scaled or bf16)."""
 
 import dataclasses
 from typing import ClassVar, List, Literal, Optional, Tuple
@@ -28,13 +28,14 @@ class BlockScaledSwapAbFc12Extension:
 
     work_tile_type: ClassVar[type] = SwapAbFc12WorkTileInfo
 
-    sf_vec_size: int
+    # None for the unquantized bf16 kind, which has no scale-factor views to resolve.
+    sf_vec_size: Optional[int]
     fc1_done_counter_pointer: Pointer
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
 
     def __post_init__(self) -> None:
-        if self.sf_vec_size <= 0:
+        if self.sf_vec_size is not None and self.sf_vec_size <= 0:
             raise ValueError(f"sf_vec_size must be positive, got {self.sf_vec_size}.")
         object.__setattr__(self, "fc2_spin_threshold", Int32(self.fc2_spin_threshold))
 
@@ -124,6 +125,8 @@ class BlockScaledSwapAbFc12Extension:
         self, tensor_name: TensorRole, tensor: cute.Tensor, work_tile: SwapAbFc12WorkTileInfo
     ) -> Tuple[cute.Tensor, Optional[Pointer]]:
         """Resolve one kernel tensor to its current expert/task-tile view."""
+        if cutlass.const_expr(tensor_name in ("sfa", "sfb", "sfc") and self.sf_vec_size is None):
+            raise ValueError(f"A {tensor_name!r} view needs sf_vec_size; this kind has no scales.")
         expert_idx = work_tile.expert_idx
         data_token_offset = work_tile.cumulative_data_physical_row
         sf_token_offset = work_tile.cumulative_sf_physical_row
