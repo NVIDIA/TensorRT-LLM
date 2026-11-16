@@ -10,6 +10,7 @@ import math
 import shlex
 import subprocess
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +83,269 @@ def test_the_perf_block_runs_without_a_stock_reference_or_repeats_and_says_so():
         "perf.campaign.logits.k: unknown key",
         "perf.campaign.logits.min_top1: a number in [0, 1]",
     ]
+
+
+def test_a_perf_config_whose_cuda_graphs_stop_short_of_its_load_is_a_warning(tmp_path):
+    """128 requests over 4 attention-DP ranks: 32 per rank on average, up to 48 as they finish."""
+    from agent_flow.workflows.trtllm_modeling_v2.spec.lint import WARN, perf_rules
+
+    from .test_tune_stage import FakeRunner, _effect, _repo
+
+    adp = {"modeling_v2": "require", "tensor_parallel_size": 4, "enable_attention_dp": True}
+    configs = {
+        "short": {**adp, "cuda_graph_config": {"enable_padding": True, "max_batch_size": 32}},
+        "covered": {**adp, "cuda_graph_config": {"enable_padding": True, "max_batch_size": 48}},
+        "eager": {**adp, "cuda_graph_config": None},
+        "bounded": {**adp, "max_batch_size": 16, "cuda_graph_config": {"max_batch_size": 16}},
+    }
+    entries = []
+    for name, options in configs.items():
+        (tmp_path / f"{name}.yaml").write_text(yaml.safe_dump(options))
+        entries.append(
+            {
+                "name": name,
+                "workload": {"isl": 1024, "osl": 128, "concurrency": [1, 128]},
+                "identity_configs": [str(tmp_path / f"{name}.yaml")],
+            }
+        )
+    perf = {"configs": entries, "spools": ["s1", "s2", "s3", "s4"], "env_script": "/env.sh"}
+    task = {"trtllm_repo_path": str(_repo(tmp_path)), "checkpoint_path": "/ckpt", "perf": perf}
+    found = list(perf_rules(SimpleNamespace(task=task)))
+    assert [(f.rule, f.severity) for f in found] == [("perf-cuda-graph-coverage", WARN)] * 2
+    short, eager = (f.message for f in found)
+    assert short.startswith("perf config `short` captures CUDA graphs up to batch 32")
+    assert "32 live requests per rank on average, and a rank holds up to 48" in short
+    # Capture what one rank holds, not the whole concurrency.
+    assert "max_batch_size: 48}`, with the engine's `max_batch_size`" in found[0].fix
+    assert eager.startswith("perf config `eager` turns CUDA graphs off")
+    # The campaign journals it when it starts, and measures as the spec says.
+    perf["campaign"] = {"enabled": False}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+    logs = []
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None,
+                      runner_factory=lambda s, p: FakeRunner(s, p, _effect), poll_s=0,
+                      log=logs.append)  # fmt: skip
+    assert stage.run() == "tuned"
+    warned = [m for m in logs if m.startswith("[tune] warning: ")]
+    assert [m.removeprefix("[tune] warning: ").split(". Fix: ")[0] for m in warned] == [
+        short,
+        eager,
+    ]
+
+
+AGENTX = {"client": "agentx", "isl": 8192, "osl": 1024, "concurrency": [1], "duration_s": 600}
+
+
+def test_an_agentx_config_is_validated_resolved_and_replayed_by_aiperf(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from agent_flow.workflows.trtllm_modeling_v2.tune.harness import bench
+    from agent_flow.workflows.trtllm_modeling_v2.tune.measure import _differs, evidence_key
+    from agent_flow.workflows.trtllm_modeling_v2.tune.schema import validate_perf_block
+
+    agentx = {**AGENTX, "extra_args": ["--random-seed", "42"]}
+    configs = [
+        {"name": "tp4", "workload": agentx, "constraint": {"kv_hit_pct_min": 95}},
+        {
+            "name": "dep4",
+            "workload": {"isl": 8, "osl": 8, "concurrency": [128], "duration_s": 60},
+            "constraint": {"kv_hit_pct_min": 90},
+        },
+    ]
+    assert validate_perf_block({"perf": {"configs": configs}}) == [
+        "perf.configs[1].workload.duration_s: only with client: agentx",
+        "perf.configs[1].constraint.kv_hit_pct_min: only with client: agentx, whose points "
+        "report it",
+    ]
+    bad = [{"name": "a", "workload": {**AGENTX, "client": "trace"}},
+           {"name": "b", "workload": {**AGENTX, "extra_args": "--x"}}]  # fmt: skip
+    assert validate_perf_block({"perf": {"configs": bad, "workload": {"client": "agentx"}}}) == [
+        "perf.workload.client: another client runs only in a perf.configs entry",
+        "perf.configs[0].workload.client: one of ['random', 'agentx']",
+        "perf.configs[1].workload.extra_args: a list of aiperf arguments, each a string (quote "
+        "a number: '42')",
+    ]
+
+    task = {"checkpoint_path": str(tmp_path), "perf": {"configs": configs[:1]}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws")
+    (part,) = spec.parts
+    hf_home = str((tmp_path / "ws" / "tune" / "agentx-cache" / "hf").resolve())
+    assert (part.client, part.agentx) == (
+        "agentx",
+        {"dataset": bench.AGENTX_DATASET, "duration_s": 600, "extra_args": ["--random-seed", "42"],
+         "hf_home": hf_home},
+    )  # fmt: skip
+    assert "AgentX trace replay" in spec.describe_workload()
+    argv = shlex.split(spec.bench().command("t-baseline", tmp_path / "data", []).splitlines()[1])
+    assert argv[argv.index("--client") + 1] == "agentx"
+    assert json.loads(argv[argv.index("--agentx") + 1]) == part.agentx
+    # Where the corpus is cached is not what is measured; the client is.
+    key = evidence_key(spec.bench(), [])
+    moved = replace(part, agentx={**part.agentx, "hf_home": str(tmp_path / "elsewhere")})
+    assert evidence_key(replace(spec.bench(), parts=(moved,)), []) == key
+    random = replace(part, client="random", agentx={})
+    assert evidence_key(replace(spec.bench(), parts=(random,)), []) != key
+    # A measurement on disk is reused only if it ran the same client.
+    meta = tmp_path / "old" / "tp4" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    meta.write_text(json.dumps({"isl": 8192, "osl": 1024, "concurrencies": [1]}))
+    assert _differs(meta.parents[1], spec.bench(), [], None).startswith(
+        "was measured with another client than agentx"
+    )
+    # One scored before AgentX's own scoring is measured again, not compared.
+    meta.write_text(json.dumps({"client": "agentx", "agentx": moved.agentx}))
+    assert _differs(meta.parents[1], spec.bench(), [], None).startswith(
+        "was measured with another client than agentx"
+    )
+    meta.write_text(
+        json.dumps({"client": "agentx", "agentx": moved.agentx, "agentx_score": bench.AGENTX_SCORE})
+    )
+    assert _differs(meta.parents[1], spec.bench(), [], None) == ""
+
+    seen = {}
+    monkeypatch.setattr(
+        bench, "supervise_client", lambda argv, *_, **kw: seen.update(argv=argv, **kw)
+    )
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    bench.run_agentx_client(
+        aiperf=Path("aiperf"), model="m", port=8000, concurrency=4, settings=dict(part.agentx),
+        artifact_dir=tmp_path / "agentx_con004", server=None, log_path=tmp_path / "server.log",
+        client_log=tmp_path / "client.log",
+    )  # fmt: skip
+    argv = seen["argv"]
+    assert argv[:4] == ["aiperf", "profile", "--scenario", "agentx"]
+    assert argv[argv.index("--concurrency") + 1] == "4"
+    # Shorter than aiperf's safe duration, so overridden; the spec's own flags come last.
+    assert argv[argv.index("--benchmark-duration") + 1] == "600" and "--unsafe-override" in argv
+    assert argv[-2:] == ["--random-seed", "42"]
+    assert seen["env"]["HF_HOME"] == hf_home and "HF_HUB_OFFLINE" not in seen["env"]
+
+
+def test_an_aiperf_export_becomes_a_point_and_its_kv_floor_is_judged(tmp_path):
+    """Aiperf's csv in benchmark_serving's keys; a hit rate under the floor, or none, breaks it."""
+    from agent_flow.workflows.trtllm_modeling_v2.tune.harness import bench
+
+    artifact = tmp_path / "agentx_con001"
+    artifact.mkdir()
+    (artifact / "profile_export_aiperf.csv").write_text(
+        "Metric,avg,min,max,sum,p1,p5,p10,p25,p50,p75,p90,p95,p99,std\n"
+        "Time to First Token (ms),120.5,,,,,,,,100.0,,180.0,,250.0,\n"
+        "Inter Token Latency (ms),6.25,,,,,,,,6.0,,7.0,,9.5,\n"
+        "Request Latency (ms),9000.0,,,,,,,,8800.0,,9900.0,,12000.0,\n"
+        "Input Sequence Length (tokens),200000.0,,,4000000,,,,,,,,,,\n"
+        "Output Sequence Length (tokens),1400.0,,,28000,,,,,,,,,,\n"
+        "\n"
+        "Metric,Value\n"
+        "Request Count,20\n"
+        "Benchmark Duration (sec),600.0\n"
+        "Request Throughput (requests/sec),0.0333\n"
+        "Output Token Throughput (tokens/sec),46.7\n"
+        'Total Usage Prompt Cache Read Tokens (tokens),"3,880,000"\n'
+    )
+    point = bench.agentx_point(artifact, {"label": "t", "concurrency": 1})
+    assert point["completed"] == 20 and point["total_output_tokens"] == 28000
+    assert (point["mean_ttft_ms"], point["p99_tpot_ms"], point["median_e2el_ms"]) == (
+        120.5,
+        9.5,
+        8800.0,
+    )
+    assert round(point["kv_hit_pct"], 1) == 97.0
+
+    (tmp_path / bench.point_file(1)).write_text(json.dumps(point))
+    [row] = bench.summarize(tmp_path, [1], world_size=4)
+    assert (row["kv_hit_pct"], row["isl_avg"], row["mean_tpot_ms"]) == (
+        point["kv_hit_pct"],
+        200000.0,
+        6.25,
+    )
+    assert row["tok_s_user"] == 28000 / (20 * 9.0)
+
+    def run(hit):
+        part = Measurement(
+            label="tp4", path=tmp_path, points={1: {**row, "kv_hit_pct": hit}}, meta={}
+        )
+        return Measurement(
+            label="t", path=tmp_path, points={}, meta={}, parts={"tp4": part},
+            constraints={"tp4": {"kv_hit_pct_min": 95.0}},
+        )  # fmt: skip
+
+    assert run(row["kv_hit_pct"]).violations() == []
+    assert run(90.0).violations() == ["tp4@con1: kv_hit_pct 90.0 < 95.0"]
+    # Nothing shows the floor held.
+    assert run(None).violations() == ["tp4@con1: no kv_hit_pct (>= 95.0)"]
+
+
+def test_an_agentx_point_ranks_as_inferencex_scores_it_and_its_client_is_pinned(tmp_path):
+    """P90 full-response ITL over the profiling requests; tokens over their window; one client."""
+    from agent_flow.workflows.trtllm_modeling_v2.tune.harness import bench
+
+    artifact = tmp_path / "agentx_con002"
+    (artifact / "export").mkdir(parents=True)
+    (artifact / "profile_export_aiperf.csv").write_text(
+        "Metric,avg,min,max,sum,p1,p5,p10,p25,p50,p75,p90,p95,p99,std\n"
+        "Request Latency (ms),9000.0,,,,,,,,8800.0,,9900.0,,12000.0,\n"
+        "Output Sequence Length (tokens),100.0,,,400,,,,,,,,,,\n"
+        "\nMetric,Value\nRequest Count,4\nOutput Token Throughput (tokens/sec),99.0\n"
+    )
+
+    def request(start_s, end_s, full, legacy, isl=1000, osl=100, **extra):
+        metrics = {
+            "full_response_inter_token_latency": {"value": full},
+            "inter_token_latency": {"value": legacy},
+            "input_sequence_length": {"value": isl},
+            "output_sequence_length": {"value": osl},
+        }
+        metadata = {"request_start_ns": int(start_s * 1e9), "request_end_ns": int(end_s * 1e9)}
+        return json.dumps({"metrics": metrics, "metadata": {**metadata, **extra}})
+
+    lines = [
+        request(0, 10, 10.0, 8.0, benchmark_phase="warmup"),  # dropped: warmup
+        request(10, 20, 20.0, 9.0, benchmark_phase="profiling"),
+        request(12, 30, 30.0, 9.0, benchmark_phase="profiling"),
+        request(15, 40, 40.0, 9.0, benchmark_phase="profiling"),
+        request(20, 50, 50.0, 9.0, benchmark_phase="profiling"),
+        json.dumps({"error": "timeout", "metadata": {"benchmark_phase": "profiling"}}),
+    ]
+    (artifact / "export" / "profile_export.jsonl").write_text("\n".join(lines) + "\n")
+    point = bench.agentx_point(artifact, {"label": "t", "concurrency": 2})
+    # P90 of 20, 30, 40, 50 ms, interpolated: 47 ms; the window runs from 10 s to 50 s.
+    assert point["agentx_records"] == 4 and point["agentx_itl_source"] == "full-response"
+    assert math.isclose(point["agentx_p90_itl_ms"], 47.0)
+    assert math.isclose(point["agentx_window_s"], 40.0)
+    (tmp_path / bench.point_file(2)).write_text(json.dumps(point))
+    [row] = bench.summarize(tmp_path, [2], world_size=4)
+    assert math.isclose(row["tok_s_user"], 1000.0 / 47.0)
+    assert row["tok_s_user_basis"] == "AgentX: 1 / P90 full-response inter-token latency"
+    assert math.isclose(row["output_tok_s_gpu"], 400 / 40.0 / 4)
+    assert math.isclose(row["total_tok_s_gpu"], (4000 + 400) / 40.0 / 4)
+    assert row["throughput_basis"] == bench.AGENTX_THROUGHPUT_BASIS
+    # Without the per-request export the point keeps the csv's numbers.
+    (artifact / "export" / "profile_export.jsonl").unlink()
+    assert "agentx_p90_itl_ms" not in bench.agentx_point(artifact, {})
+
+    # Every install of one campaign resolves the client's dependencies as of its first.
+    shared = tmp_path / "agentx_client_cache"
+    first = bench.resolved_as_of(shared)
+    (shared / bench.AGENTX_RESOLVED_FILE).write_text("2026-11-01T00:00:00Z\n")
+    assert first and bench.resolved_as_of(shared) == "2026-11-01T00:00:00Z"
+
+
+def test_an_agentx_install_step_that_stalls_fails_before_the_jobs_wall(tmp_path, monkeypatch):
+    """Each install step is bounded: a stalled uv fails both attempts with the diagnostic."""
+    from agent_flow.workflows.trtllm_modeling_v2.tune.harness import bench
+
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\nsleep 30\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(bench.shutil, "which", lambda name: str(uv))
+    monkeypatch.setattr(bench, "AGENTX_INSTALL_STEP_S", 0.2)
+    settings = {"hf_home": str(tmp_path / "cache" / "hf")}
+    log = tmp_path / "client.log"
+    started = time.monotonic()
+    with pytest.raises(SystemExit, match="did not install"):
+        bench.agentx_client(settings, log, tmp_path / "freeze.txt")
+    assert time.monotonic() - started < 10
+    assert log.read_text().count("stopped after 0.2 s") == 2
 
 
 _NOISE = NoiseFloor(spread={}, samples=0, default=0.01)

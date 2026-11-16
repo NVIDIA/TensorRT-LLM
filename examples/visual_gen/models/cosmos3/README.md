@@ -49,6 +49,16 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
+[`nvidia/Cosmos3-Edge-FP8`](https://huggingface.co/nvidia/Cosmos3-Edge-FP8) is
+the same static ModelOpt FP8 recipe on the Edge Nemotron-dense backbone, but it
+is published as its own repository rather than an `fp8` revision. Pass that ID
+(or a local checkout) to `--model` and do not set `--revision`. It has no audio
+tower. Its `diffusion_step_policy` runs W8A16 on the first 3 and last 3
+denoising steps and keeps W8A8 in between; the reasoner tower stays W8A16.
+Sampling stays on the Edge defaults (832×480, shift 3.0, guidance 5.0 for
+video). The checkpoint's quantization metadata records the calibration
+sampler, which is not the inference recipe.
+
 `../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
@@ -58,11 +68,12 @@ refused, with an explicit error. Note that CFG parallelism is irrelevant to the
 distilled checkpoints — they bake guidance into the weights (guidance 1.0, one
 branch per step).
 
-These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+The Nano, Super, and distilled checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
 rather than being refused — audio is quantized and generated like any other
 supported task. It simply has not been exercised as thoroughly as the four
 video/image tasks above, and no FP8 audio quality claim is made. FP8 output
-quality in general has not been benchmarked against BF16.
+quality in general has not been benchmarked against BF16. Edge-FP8 has
+`sound_gen: false` and does not run the audio path.
 
 ## Guardrails
 
@@ -265,3 +276,44 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --output_path inverse_video.safetensors \
     --action_output_path inverse_action.json
 ```
+
+## Sampling schedule
+
+Without a selection, each mode samples its own grid. On Nano and Super, T2V, I2V
+and T2I use the checkpoint's Karras grid, and V2V and transfer use the Diffusers
+shifted-linear flow grid. Edge uses its checkpoint-declared linear flow grid in
+every mode. `extra_params.sigma_grid` selects a grid explicitly for base
+(non-distilled) checkpoints:
+
+| `sigma_grid` | Grid | `flow_shift` |
+|---|---|---|
+| `"karras"` | The checkpoint's Karras levels | Not used; an explicit value is rejected |
+| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; mode default when omitted |
+| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; mode default when omitted |
+
+Selecting a linear grid does not change the shift: pass `flow_shift` with it.
+A `flow_shift` so extreme that the grid's sigmas are not finite, strictly
+decreasing and below 1 is rejected with an error before denoising starts.
+To sample the way the Cosmos framework does, request its grid and shift
+explicitly; the examples below select that schedule, they do not change any
+default:
+
+```bash
+# Video modes (T2V, I2V, V2V, transfer): the framework's video schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 10.0}'
+
+# T2I: the framework's image schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2i.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --output_path output.png \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 3.0}'
+```
+
+Distilled 4-step checkpoints sample a fixed schedule from the checkpoint and
+reject `sigma_grid`; omit both `sigma_grid` and `flow_shift` for them. A
+`flow_shift` sent without `sigma_grid` to a mode that samples the Karras grid has
+no effect, and the server logs a warning.

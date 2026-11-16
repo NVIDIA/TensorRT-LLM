@@ -218,14 +218,15 @@ __device__ __forceinline__ float2 mul_f32x2(float2 const& a, float2 const& b)
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
     uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false>
-__global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_atomic_impl(
+__global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_impl(
     const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
     const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
     const __grid_constant__ cute::TmaDescriptor tensor_map_post,
     const __grid_constant__ cute::TmaDescriptor tensor_map_comb, float const* __restrict__ post_mix,
     float const* __restrict__ comb_mix, float* __restrict__ D, float* __restrict__ sqr_sum)
-{ // D [M, SHAPE_N], sqr_sum [M] (caller memsets both to 0)
+{ // D [kNumSplits, M, SHAPE_N], sqr_sum [kNumSplits, M]: each split CTA stores its own partial (no atomics); the
+  // consumer (mhcBigFuseKernel) sums the splits in a fixed order, so the result does not depend on CTA timing.
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -496,16 +497,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 uint32_t phys_col_grp = col_group ^ (m & 7);
                 uint32_t byte = m * kSwizzleCDMode + phys_col_grp * kNumBankGroupBytes + in_group * sizeof(float);
                 float val = *reinterpret_cast<float const*>(reinterpret_cast<uint8_t const*>(smem_cd) + byte);
-                if constexpr (kNumSplits == 1)
-                {
-                    // Single-CTA-per-(m,n) at KS=1 → safe to store directly.
-                    // Caller no longer needs to pre-zero D (see launcher).
-                    D[gm * SHAPE_N + n] = val;
-                }
-                else
-                {
-                    atomicAdd(&D[gm * SHAPE_N + n], val);
-                }
+                // Exactly one CTA owns each (split, m, n) slot, so a plain store is race-free.
+                D[(static_cast<uint64_t>(k_split_idx) * shape_m + gm) * SHAPE_N + n] = val;
             }
         }
 
@@ -739,7 +732,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         // Drain any in-flight residual_out TMA stores before exit.
         cute::tma_store_wait<0>();
 
-        // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
+        // Warp-reduce sqr across 4 col_lanes, then store this split's partial.
         float sqr_u = sqr2_u.x + sqr2_u.y;
         float sqr_l = sqr2_l.x + sqr2_l.y;
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
@@ -750,20 +743,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         {
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
-            if constexpr (kNumSplits == 1)
+            // One CTA owns each (split, row) slot: store this split's partial; splits are summed in order later.
+            uint64_t const splitBase = static_cast<uint64_t>(k_split_idx) * shape_m;
+            if (gm_u < shape_m)
             {
-                // KS=1 → only this CTA writes (gm_u, gm_l), no race possible.
-                if (gm_u < shape_m)
-                    sqr_sum[gm_u] = sqr_u;
-                if (gm_l < shape_m)
-                    sqr_sum[gm_l] = sqr_l;
+                sqr_sum[splitBase + gm_u] = sqr_u;
             }
-            else
+            if (gm_l < shape_m)
             {
-                if (gm_u < shape_m)
-                    atomicAdd(&sqr_sum[gm_u], sqr_u);
-                if (gm_l < shape_m)
-                    atomicAdd(&sqr_sum[gm_l], sqr_l);
+                sqr_sum[splitBase + gm_l] = sqr_l;
             }
         }
     }
@@ -789,15 +777,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 // residual_cur @ W_T GEMM (instead of CUDA-core FMA).
 //
 // Pipelining, warp layout, and SMEM layout inherit from Path B
-// (fused_tf32_pmap_gemm_rout_atomic_impl): the pmap warp group computes
+// (fused_tf32_pmap_gemm_rout_impl): the pmap warp group computes
 // residual_cur, TMA-stores it to GMEM, and STSM-casts it into TMEM; the MMA
-// warp group consumes TMEM for the GEMM; the epilogue atomicAdd's into
-// y_acc / sqr_sum. Phase 3 elects the last-home CTA (per m_block) via
-// atomicAdd on done_counter; Phase 4 runs bigfuse inline on that CTA only,
-// reloading residual_cur from GMEM and writing layer_input + post_mix_out +
-// comb_mix_out.
+// warp group consumes TMEM for the GEMM; the epilogue stores each split's
+// partial into its own y_acc / sqr_sum slot. Phase 3 is a per-m_block barrier
+// on done_counter; Phase 4 then sums the split partials in split order (so the
+// result is independent of CTA timing) and runs bigfuse inline, reloading
+// residual_cur from GMEM and writing layer_input + post_mix_out + comb_mix_out.
 //
-// Caller MUST zero D (y_acc), sqr_sum (r_acc), done_counter before launch.
+// Caller MUST zero done_counter before launch (D and sqr_sum need no zeroing).
 // ============================================================================
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -813,8 +801,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         const __grid_constant__ cute::TmaDescriptor tensor_map_comb,         // comb_mix_prev, fp32
         __nv_bfloat16 const* __restrict__ residual_cur_ptr,                  // same buffer as TMA target
         __nv_bfloat16* __restrict__ layer_input_out,                         // [M, HIDDEN]    bf16
-        float* __restrict__ D,              // [M, SHAPE_N]   fp32 (y_acc, caller zeros)
-        float* __restrict__ sqr_sum,        // [M]            fp32 (r_acc, caller zeros)
+        float* __restrict__ D,              // [kNumSplits, M, SHAPE_N] fp32 (y_acc, per-split partials)
+        float* __restrict__ sqr_sum,        // [kNumSplits, M]          fp32 (r_acc, per-split partials)
         int* __restrict__ done_counter,     // [ceil(M/BLOCK_M)] int (caller zeros)
         float const* __restrict__ hc_scale, // [3]
         float const* __restrict__ hc_base,  // [HC_MULT*(2+HC_MULT)]
@@ -1102,16 +1090,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 uint32_t phys_col_grp = col_group ^ (m & 7);
                 uint32_t byte = m * kSwizzleCDMode + phys_col_grp * kNumBankGroupBytes + in_group * sizeof(float);
                 float val = *reinterpret_cast<float const*>(reinterpret_cast<uint8_t const*>(smem_cd) + byte);
-                if constexpr (kNumSplits == 1)
-                {
-                    // Single-CTA-per-(m,n) at KS=1 → safe to store directly.
-                    // Caller no longer needs to pre-zero D (see launcher).
-                    D[gm * SHAPE_N + n] = val;
-                }
-                else
-                {
-                    atomicAdd(&D[gm * SHAPE_N + n], val);
-                }
+                // Exactly one CTA owns each (split, m, n) slot, so a plain store is race-free.
+                D[(static_cast<uint64_t>(k_split_idx) * shape_m + gm) * SHAPE_N + n] = val;
             }
         }
 
@@ -1284,7 +1264,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // so the global writes could still be in flight at the Phase-3 fence.
         asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
 
-        // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
+        // Warp-reduce sqr across 4 col_lanes, then store this split's partial.
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 2);
         sqr_l += __shfl_xor_sync(0xffffffff, sqr_l, 1);
@@ -1293,20 +1273,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         {
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
-            if constexpr (kNumSplits == 1)
+            // One CTA owns each (split, row) slot: store this split's partial; splits are summed in order later.
+            uint64_t const splitBase = static_cast<uint64_t>(k_split_idx) * shape_m;
+            if (gm_u < shape_m)
             {
-                // KS=1 → only this CTA writes (gm_u, gm_l), no race possible.
-                if (gm_u < shape_m)
-                    sqr_sum[gm_u] = sqr_u;
-                if (gm_l < shape_m)
-                    sqr_sum[gm_l] = sqr_l;
+                sqr_sum[splitBase + gm_u] = sqr_u;
             }
-            else
+            if (gm_l < shape_m)
             {
-                if (gm_u < shape_m)
-                    atomicAdd(&sqr_sum[gm_u], sqr_u);
-                if (gm_l < shape_m)
-                    atomicAdd(&sqr_sum[gm_l], sqr_l);
+                sqr_sum[splitBase + gm_l] = sqr_l;
             }
         }
     }
@@ -1412,14 +1387,55 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // redundant Sinkhorn work without adding a cross-warp synchronization.
         // Lanes 0..HC_MULT-1 hold the four rows and broadcast pre_mix below.
         float pre_mix_local = 0.f;
+        // Sum this token's split partials in split order (the result does not depend on CTA timing): each of the
+        // SHAPE_N + 1 values (mixes, then the sqr-sum) is owned by one lane and loaded coalesced; lanes
+        // 0..HC_MULT-1 then gather the mixes of their row and the sqr-sum. The skips above are warp-uniform, so
+        // every lane reaches the shuffles.
+        static_assert(SHAPE_N < WARP_SIZE_BF, "one lane per split-reduced value (SHAPE_N mixes + sqr-sum)");
+        float splitSum = 0.0F;
+        if (lane_bf <= SHAPE_N)
+        {
+            // Load up to kSplitChunk partials with independent loads, then add them in split order, so high split
+            // counts take a few L2 round trips instead of one per few splits.
+            constexpr uint32_t kSplitChunk = kNumSplits < 32 ? kNumSplits : 32;
+#pragma unroll 1
+            for (uint32_t base = 0; base < kNumSplits; base += kSplitChunk)
+            {
+                float part[kSplitChunk];
+#pragma unroll
+                for (uint32_t i = 0; i < kSplitChunk; ++i)
+                {
+                    uint64_t const row = static_cast<uint64_t>(base + i) * shape_m + tok;
+                    part[i] = (base + i < kNumSplits)
+                        ? ((lane_bf < SHAPE_N) ? D[row * SHAPE_N + lane_bf] : sqr_sum[row])
+                        : 0.0F;
+                }
+#pragma unroll
+                for (uint32_t i = 0; i < kSplitChunk; ++i)
+                {
+                    if (base + i < kNumSplits)
+                    {
+                        splitSum += part[i];
+                    }
+                }
+            }
+        }
+        uint32_t const rowLane = lane_bf & (HC_MULT - 1);
+        float const r_val = __shfl_sync(0xFFFFFFFFU, splitSum, SHAPE_N);
+        float const yPre = __shfl_sync(0xFFFFFFFFU, splitSum, rowLane);
+        float const yPost = __shfl_sync(0xFFFFFFFFU, splitSum, HC_MULT + rowLane);
+        float yComb[HC_MULT];
+#pragma unroll
+        for (uint32_t k = 0; k < HC_MULT; ++k)
+        {
+            yComb[k] = __shfl_sync(0xFFFFFFFFU, splitSum, 2 * HC_MULT + rowLane * HC_MULT + k);
+        }
         if (lane_bf < HC_MULT)
         {
-            float const r_val = sqr_sum[tok];
-            float const* y_row = D + static_cast<long long>(tok) * SHAPE_N;
             float const rstd = rsqrtf(r_val / static_cast<float>(HC_MULT * HIDDEN) + rms_eps);
             float const s0 = hc_scale[0];
 
-            float v = y_row[lane_bf] * rstd * s0 + hc_base[lane_bf];
+            float v = yPre * rstd * s0 + hc_base[lane_bf];
             pre_mix_local = 1.0f / (1.0f + __expf(-v)) + hc_pre_eps;
             if constexpr (kLaggedPre)
             {
@@ -1431,15 +1447,14 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             {
                 float const s1 = hc_scale[1];
                 float const s2 = hc_scale[2];
-                v = y_row[HC_MULT + lane_bf] * rstd * s1 + hc_base[HC_MULT + lane_bf];
+                v = yPost * rstd * s1 + hc_base[HC_MULT + lane_bf];
                 float const post_val = 1.0f / (1.0f + __expf(-v)) * hc_post_mult_value;
                 post_mix_out[tok * HC_MULT + lane_bf] = post_val;
 
                 float cm_vals[HC_MULT];
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
-                    cm_vals[k] = y_row[2 * HC_MULT + lane_bf * HC_MULT + k] * rstd * s2
-                        + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
+                    cm_vals[k] = yComb[k] * rstd * s2 + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
 
                 constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
                 float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));

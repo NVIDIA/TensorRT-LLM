@@ -28,6 +28,8 @@ The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memor
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
+For reranker models, the ``trtllm-serve rerank`` subcommand exposes ``/rerank``, ``/v1/rerank``, and Cohere-compatible ``/v2/rerank`` endpoints. See :doc:`Reranking <../../features/reranking>` for details.
+
 Starting a Server
 -----------------
 
@@ -91,6 +93,18 @@ At high concurrency a single serving process is host-bound: one asyncio event lo
    * Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward ``/metrics``, ``/kv_cache_events``, profiling and the Anthropic batches API to it, and ``/prometheus/metrics`` covers every frontend. Per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, ``/health`` describes the frontend that answered, and each frontend writes its own per-request perf metrics file.
    * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
    * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
+
+.. _bounding-the-graceful-stop:
+
+Bounding the Graceful Stop
+--------------------------
+
+A server can still have request handlers running when it is told to stop, for example when a benchmark client leaves while its last requests are in flight. By default the OpenAI HTTP server waits for every one of them. The prototype setting ``serve_graceful_shutdown_timeout_s: N`` in the ``--config`` YAML bounds that wait: after a shutdown signal, the server waits at most ``N`` seconds for running request handlers (uvicorn's ``timeout_graceful_shutdown``), then cancels them and shuts down as usual. It is off by default.
+
+.. note::
+
+   * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
+   * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
 
 Inference Endpoints
 -------------------

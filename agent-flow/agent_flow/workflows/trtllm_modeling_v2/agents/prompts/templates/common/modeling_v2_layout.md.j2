@@ -44,6 +44,17 @@ GPU. The tests under `{{ CATALOG_TESTS_DIR }}/test_modeling_v2_*.py` also includ
 kernel and model tests that require a GPU; do not treat that glob as a CPU-only
 test suite.
 
+**A target's own tests stay reviewable: 10-15 test modules, 20 at most**,
+counting everything under its tests directory
+(`{{ CATALOG_TESTS_DIR }}/models/<family>/<target>/`). Consolidate them by
+domain (weights and loading, routing, the forward, each feature) and extend
+the module that fits before adding one. Keep one copy of each helper, in a
+`_`-prefixed module beside the tests that use it, and import it; never paste
+it into each module. Each local entry or variant brings a test module of its
+own, named by it (delivery looks for it there), so add one only for cells the
+shared entry and the variants the target already has cannot hold. Delivery
+states the count and warns past 20.
+
 The existing targets (`{{ MODELING_V2_PACKAGE }}/models/`, one directory per
 family) are tested exemplars, and reading them is part of the work. Find the
 targets that already solved what your

@@ -23,7 +23,7 @@ workspace live in a KvReplicaFusedState, allocated by kv_replica_fused_state() b
 """
 
 import functools
-from typing import Dict, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -35,9 +35,9 @@ PAGE = 64
 HEAD_DIM = 256
 MAX_ROWS = 128
 MAX_Q_LEN = 16
-# Plan variants by batch: one request per lane of the plan warp up to 32, two per lane up to 64 (wide plan), and above
-# 64 the two-slot kernel (kernel_two, four requests per lane): a CTA computes up to two requests, so no request is held
-# to whole CTAs.
+# Plan variants by batch (_plan): one request per lane of the plan warp up to 32, two per lane up to 64 (wide plan), and
+# the two-slot kernel (kernel_two, four requests per lane) above 64 or where whole CTAs per request leave CTAs idle: a
+# CTA computes up to two requests, so no request is held to whole CTAs.
 _LANE_PLAN_MAX_BATCH = 32
 _WIDE_PLAN_MAX_BATCH = 64
 _TWO_SLOT_MAX_BATCH = 128
@@ -78,6 +78,29 @@ def _num_ctas(sm_count: int) -> int:
     return max(sm_count, 1)
 
 
+# _plan takes the two-slot plan (a balanced split, at the cost of a second epilogue) where a whole-CTA plan, b uniform
+# requests x floor(n_ctas / b) CTAs each, keeps fewer than this share of the CTAs busy.
+_TWO_SLOT_MAX_BUSY_SHARE = 0.765
+
+
+def ld_red_max_supported(device: torch.device) -> bool:
+    """Whether the partial kernel's softmax_v2 runs on device: it takes row maxima with tcgen05.ld.red.max (LDTM.STAT),
+    behind the shared tcgen05 gate."""
+    from ..prims_ts.kernels.tcgen05_compat import ldtm_stat_supported
+
+    return ldtm_stat_supported(torch.cuda.get_device_capability(device))
+
+
+def _plan(b: int, n_ctas: int) -> str:
+    """The kernel plan for a batch of b requests: "lane" up to 32, "wide" up to 64, "two" above 64 and where a
+    whole-CTA plan would keep under _TWO_SLOT_MAX_BUSY_SHARE of the CTAs busy with uniform requests."""
+    if b > _WIDE_PLAN_MAX_BATCH:
+        return "two"
+    if b * (n_ctas // b) < _TWO_SLOT_MAX_BUSY_SHARE * n_ctas:
+        return "two"
+    return "wide" if b > _LANE_PLAN_MAX_BATCH else "lane"
+
+
 def kv_replica_fused_supported(
     q_len: int, cp_size: int, hq: int, batch: int, sm_count: int
 ) -> bool:
@@ -89,18 +112,26 @@ def kv_replica_fused_supported(
 
 
 class KvReplicaFusedState:
-    """Grid-barrier counters and partial workspace of the kernel on one device, for batches up to ``max_batch``.
+    """Grid-barrier counters, partial workspace and kernel choices on one device, for batches up to ``max_batch``.
 
     Shared by every layer, like the attention workspace: the layers' calls are ordered on one stream. counters: int64
     [max_batch + 1, max_batch], row b serves batch size b; zero-initialized once, never reset.
     """
 
+    plans: Tuple[Optional[str], ...] = ()
+    softmax_v2: bool = False
+
     def __init__(self, device: torch.device, sm_count: int, max_batch: int):
         self.sm_count = sm_count
         self.max_batch = max_batch
-        need = cp_partial_balanced_ws_bytes(
-            MAX_ROWS, _num_ctas(sm_count), 2 if max_batch > _WIDE_PLAN_MAX_BATCH else 1
+        n_ctas = _num_ctas(sm_count)
+        # plans[b]: the kernel plan of a batch of b requests (_plan; b < n_ctas).
+        self.plans = (None,) + tuple(
+            _plan(b, n_ctas) for b in range(1, min(max_batch, n_ctas - 1) + 1)
         )
+        self.softmax_v2 = ld_red_max_supported(device)
+        two = "two" in self.plans
+        need = cp_partial_balanced_ws_bytes(MAX_ROWS, n_ctas, 2 if two else 1)
         self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
         self.counters = torch.zeros(max_batch + 1, max_batch, dtype=torch.int64, device=device)
 
@@ -141,6 +172,9 @@ def _compiled(
     o_vec16: bool,
     use_pdl: bool,
     plan: str,
+    ll_slot_words: int = 0,
+    ll_lse_base: int = 0,
+    softmax_v2: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -162,6 +196,10 @@ def _compiled(
         p_shift=_P_SHIFT,
         wide_plan=plan == "wide",
         two_slot=plan == "two",
+        ll_push=ll_slot_words > 0,
+        ll_slot_words=ll_slot_words,
+        ll_lse_base=ll_lse_base,
+        softmax_v2=softmax_v2,
     )
     assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(
         q_len * gh, n_ctas, 2 if plan == "two" else 1
@@ -201,7 +239,11 @@ def _compiled(
         gmem_ptr(f32, cutlass.Float32, a["ws"]),
         gmem_ptr(i64, cutlass.Int64, a["cnt"]),
         I32(1),
+        gmem_ptr(i64, cutlass.Int64, 8),
+        gmem_ptr(i32, I32, 4),
+        I32(0),
         stream,
+        **({"options": kernel.compile_options} if kernel.compile_options else {}),
     )
 
 
@@ -219,6 +261,7 @@ def kv_replica_fused_partial(
     out_lse: torch.Tensor,
     state: KvReplicaFusedState,
     enable_pdl: bool = False,
+    ll: Optional[tuple] = None,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (contract: the unit test's
     kv_replica_fused_partial_ref).
@@ -267,10 +310,10 @@ def kv_replica_fused_partial(
     )
     assert tuple(out_lse.shape) == (cp, rows, hq) and out_lse.dtype == torch.float32
     assert 1 <= b <= state.max_batch
-    plan = "two" if b > _WIDE_PLAN_MAX_BATCH else ("wide" if b > _LANE_PLAN_MAX_BATCH else "lane")
-    slots = 2 if plan == "two" else 1
     n_ctas = _num_ctas(state.sm_count)
     assert b < n_ctas, "more CTAs than requests, every CTA co-resident (one per SM)"
+    plan = state.plans[b]
+    slots = 2 if plan == "two" else 1
     cnt = state.counters
     ws = state.workspace
     assert ws.numel() * 4 >= cp_partial_balanced_ws_bytes(R, n_ctas, slots), (
@@ -301,11 +344,32 @@ def kv_replica_fused_partial(
     )
     if plan != "lane":
         logger.info_once(
-            f"KV-replica split fused partial attention: {plan} plan above {_LANE_PLAN_MAX_BATCH} requests "
-            f"(first call: batch {b}, q_len {q_len})",
+            f"KV-replica split fused partial attention: {plan} plan (first call: batch {b}, q_len {q_len})",
             key=f"kv_replica_fused_{plan}",
         )
-    fn = _compiled(q_len, gh, hq, cp, n_ctas, b1_ptr, b2_ptr, o_vec16, bool(enable_pdl), plan)
+    # ll = (peer table [G] int64, row epochs int32, member index, slot words, LSE base) of the merge channel
+    # (TPGroupExchange.merge_push_args): the combine pushes its rows to the members instead of out_o / out_lse
+    if ll is not None:
+        ll_peers, ll_state, ll_grank, ll_slot_words, ll_lse_base = ll
+        assert ll_peers.dtype == torch.int64 and ll_peers.numel() == cp and ll_grank == cp_rank
+        assert ll_state.dtype == torch.int32 and ll_state.numel() >= rows * hq
+    else:
+        ll_peers, ll_state, ll_grank, ll_slot_words, ll_lse_base = cnt, cnt, 0, 0, 0
+    fn = _compiled(
+        q_len,
+        gh,
+        hq,
+        cp,
+        n_ctas,
+        b1_ptr,
+        b2_ptr,
+        o_vec16,
+        bool(enable_pdl),
+        plan,
+        ll_slot_words,
+        ll_lse_base,
+        state.softmax_v2,
+    )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
     I32 = cutlass.Int32
@@ -336,5 +400,8 @@ def kv_replica_fused_partial(
         gmem_ptr(ws, f32, a["ws"]),
         gmem_ptr(cnt[b], cutlass.Int64, a["cnt"]),
         I32(b),
+        gmem_ptr(ll_peers, cutlass.Int64, 8),
+        gmem_ptr(ll_state, I32, 4),
+        I32(ll_grank),
         stream,
     )

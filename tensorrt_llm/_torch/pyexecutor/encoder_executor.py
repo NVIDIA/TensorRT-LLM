@@ -189,7 +189,7 @@ class EncoderExecutor:
             model_inputs=model_inputs,
             gather_context_logits=gather_context_logits,
         )
-        return self._runner.forward(packed_inputs)
+        return self._runner.forward_packed(packed_inputs)
 
     def shutdown(self) -> None:
         """No background thread to stop — release the loader, the graphs, then the model."""

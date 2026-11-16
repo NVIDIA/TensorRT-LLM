@@ -30,6 +30,9 @@ compile_pdl_wait_signal_persistent_gemm = (
 # Decode row counts of the serving CUDA-graph buckets (1/2/4/8/16/24/32 requests
 # x 2 MTP rows) plus the M=1 cell.
 DECODE_M_VALUES = (1, 2, 4, 8, 16, 32, 48, 64)
+# The decode row counts above 64 (32 requests x MTP3 / MTP5 widths 4 / 6), built only
+# for an engine drafting more than one token.
+MTP_DECODE_M_VALUES = (128, 192)
 
 ABI = ProjectionAbi(
     "self_attn.o_proj",
@@ -42,7 +45,7 @@ ABI = ProjectionAbi(
     # TGV cell and carries
     # the TGV template's own PDL instead; the catalog validator rejects the
     # persistent role on TGV rows.
-    pdl_enabled_m=frozenset(DECODE_M_VALUES) - {8},
+    pdl_enabled_m=frozenset(DECODE_M_VALUES + MTP_DECODE_M_VALUES) - {8},
 )
 
 # Schedules chosen per M from B300 measurements. The M=64 (64,64) schedule is
@@ -56,6 +59,12 @@ SCHEDULE_BY_M = {
     32: persistent_instance(GemmSchedule(False, (64, 32), (4, 1))),
     48: persistent_instance(GemmSchedule(True, (128, 64), (4, 1), raster_along="n")),
     64: persistent_instance(GemmSchedule(False, (64, 64), (4, 1), raster_along="n")),
+    # MTP3 / MTP5: 2-CTA tiles over every row, 96 CTAs. B300, cold weights, us: 128 rows
+    # 12.36 ((128, 128) c2x1 12.42, (64, 128) 14.70, (64, 64) 16.21, TGV split-K 2 26.17);
+    # 192 rows 13.46 ((128, 192) c4x1 13.62, (128, 96) 16.26). The context MXF8 quant + GEMM
+    # those decode rows took: 12.12 / 12.99; the bf16 prefill GEMM: 18.01 / 18.34.
+    128: persistent_instance(GemmSchedule(True, (128, 128), (4, 1))),
+    192: persistent_instance(GemmSchedule(True, (128, 192), (2, 1), raster_along="n")),
 } | context_instances(
     persistent_instance(GemmSchedule(True, (256, 192), (2, 1))),
     persistent_instance(GemmSchedule(True, (256, 192), (2, 1), raster_along="n")),

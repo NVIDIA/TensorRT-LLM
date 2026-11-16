@@ -46,6 +46,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from .activation import (materialize_activation_params,
+                         resolve_activation_support)
 from .interface import MoEWeightLoadingMode
 
 # The declarations aligns with moe_kernels.h
@@ -61,6 +63,11 @@ FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
 TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
+# The NVFP4 AWQ loader keeps one pre_quant_scale per MoE layer, so the experts of
+# a layer must agree on it within this tolerance. DWDP setup, where each rank
+# loads its own experts, holds the ranks' copies to the same tolerance.
+PRE_QUANT_SCALE_RTOL = 1e-5
+PRE_QUANT_SCALE_ATOL = 1e-8
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -3122,7 +3129,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (all_w3[i], w3_reference, "w3.pre_quant_scale"),
                 (all_w1[i], w1_reference, "w1.pre_quant_scale")
             ]:
-                if not torch.allclose(scale, ref, rtol=1e-5, atol=1e-8):
+                if not torch.allclose(scale,
+                                      ref,
+                                      rtol=PRE_QUANT_SCALE_RTOL,
+                                      atol=PRE_QUANT_SCALE_ATOL):
                     max_diff = (scale - ref).abs().max()
                     msg = (
                         f"MoE pre_quant_scale: expert {expert_ids[i]} {name} "
@@ -3138,7 +3148,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
         # keys its own staging off this same parameter -- and
         # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
-        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+        fc31_checkpoint_scale = torch.max(w3_reference, w1_reference)
+        # The cast below drops the dtype the checkpoint stores the scale in;
+        # DWDP setup compares the ranks' copies by it.
+        module.fc31_act_scale_checkpoint_dtype = fc31_checkpoint_scale.dtype
+        fc31_pre_quant_scale = fc31_checkpoint_scale.to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
@@ -5407,8 +5421,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         """Hand MegaMoE-format CPU staging tensors to the load balancer,
         then drop the module attrs so they do not double-keep the host memory.
 
-        Per the trtllm-moe-develop "CPU shared-staging buffer family"
-        rules, each per-expert ``nn.Parameter`` on the module must have
+        Each per-expert ``nn.Parameter`` on the module must have
         a corresponding CPU staging tensor in the ``weight_fns`` dict
         passed to ``register_all_parameter_slot_and_to_fix_weight_fns``;
         otherwise the load balancer either crashes on the first
@@ -7582,7 +7595,9 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
+        # GEMM1 ScaleC stores FC1 input scale / FC2 input scale; ScaleGate
+        # stores the raw FC1 dequant scale, also used to quantize the input.
         fc31_input_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
@@ -7613,7 +7628,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         dst_fc31_input_scale.copy_(w1_input_scale)
         dst_fc2_input_scale.copy_(w2_input_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -7639,6 +7654,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
                 w1_input_scale, w3_input_scale, w2_input_scale,
                 tmp_fc31_input_scale[expert_id], tmp_fc2_input_scale[expert_id])
 
+        # Keep GEMM1's output-scale ratio separate from the raw input scale.
         module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max() /
                                              tmp_fc2_input_scale.max())
         module.fc31_input_gate_dequant.data.copy_(tmp_fc31_input_scale.max())
@@ -7646,6 +7662,36 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
+
+        # Bias is consumed before the GEMM dequant scale.
+        # FC1's output scale includes FC2 quantization, so use its gate scale
+        # (the FC1 dequant scale alone) for the accumulator-unit conversion.
+        if module.bias:
+            module.w3_w1_bias.data.div_(
+                module.fc31_input_gate_dequant.view(-1, 1))
+            module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        """Restore activation registers after materialization or weight transfer.
+
+        Args:
+            module: Weight owner holding the semantic activation configuration
+                and the loaded FC1 gate dequantization scales.
+        """
+        super().cache_derived_state(module)
+        params = materialize_activation_params(
+            module.activation,
+            resolve_activation_support(module),
+            num_local_experts=module.expert_size_per_partition,
+            device=module.fc31_input_gate_dequant.device,
+            owner=type(module).__name__,
+        )
+        if params.alpha is not None:
+            module.act_alpha.data.copy_(params.alpha)
+        for target, value in ((module.act_beta, params.beta), (module.act_clamp,
+                                                               params.clamp)):
+            if value is not None:
+                target.data.copy_(value / module.fc31_input_gate_dequant)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
