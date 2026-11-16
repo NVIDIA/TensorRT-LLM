@@ -17,11 +17,16 @@ with the k3_moe_m1 / k3_moe_m2 engines) has its own matrix, ``_kimi_k3_route_b_d
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "comm"))
 import _kimi_k3_decode_comm_checks as dc  # noqa: E402
-import _lockstep as ls  # noqa: E402
+
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 DEADLINE_S = dc.DEADLINE_S
 

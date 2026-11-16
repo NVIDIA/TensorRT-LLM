@@ -583,3 +583,74 @@ def test_prefill_capture_skips_break_graphs_without_graphable_breaks(
     # Bucket 128 exceeds max_num_tokens // 4, so only bucket 16 is a candidate.
     captured = [c.args[1] for c in capture_break_graphs.call_args_list]
     assert captured == ([16] if graphable_breaks else [])
+
+
+class _SplitMetadata:
+    """resolve_mamba_metadata_cls stand-in: records whether a warmup forward ran under the split knob."""
+
+    splitting = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def inforward_split_for_warmup(cls) -> Iterator[None]:
+        cls.splitting = True
+        try:
+            yield
+        finally:
+            cls.splitting = False
+
+
+def _split_warmup_graphs(plans_splits: bool, max_num_tokens: int = 258):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    kv = Mock(spec=KVCacheManagerV2)
+    kv.inforward_snapshot_rows = 2 if plans_splits else 0
+    kv.inforward_snapshot_min_main, kv.inforward_snapshot_max_tail = 3, 64
+    dummy_requests = MagicMock()
+    batch = object()
+    dummy_requests.create_warmup_request.return_value = batch
+    dummy_requests.release_batch_context.return_value.__enter__.return_value = batch
+    forwards = []
+    graphs = decoder_graphs(
+        decoder_config(max_num_tokens=max_num_tokens),
+        cuda_graph_runner=MagicMock(enabled=False, is_warmup_only=False),
+        dummy_requests=dummy_requests,
+        forward_warmup=lambda b, rm, **kw: forwards.append((b, _SplitMetadata.splitting)),
+    )
+    return graphs, ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv}), forwards
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("plans_splits", [False, True])
+def test_split_kernels_warm_up_without_prefill_graphs(plans_splits):
+    """With the prefill CUDA graphs off (the default), no break-graph capture runs a snapshot split: the warmup runs
+    one eager context request under the split knob, so the split's kernels compile before serving; once."""
+    graphs, resource_manager, forwards = _split_warmup_graphs(plans_splits)
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.resolve_mamba_metadata_cls",
+            return_value=_SplitMetadata,
+        ),
+        patch("torch.cuda.synchronize"),
+        patch.object(graphs, "run_cuda_graph_warmup"),
+    ):
+        graphs.warmup_and_capture(resource_manager)
+        graphs.warmup_and_capture(resource_manager)
+    assert len(forwards) == (1 if plans_splits else 0)
+    if plans_splits:
+        assert forwards[0][1], "the warmup forward must plan a split"
+        kwargs = graphs._dummy_requests.create_warmup_request.call_args
+        assert kwargs.args[1:] == (3 + 64, 0) and kwargs.kwargs == {"num_context_requests": 1}
+
+
+@pytest.mark.cpu_only
+def test_split_warmup_skipped_after_break_graph_capture_or_without_room():
+    """A break-graph capture that ran the split variant already compiled the kernels; a token budget below the
+    shortest split request cannot plan one."""
+    graphs, resource_manager, forwards = _split_warmup_graphs(True)
+    graphs._inforward_split_warmed = True
+    graphs._warm_inforward_split(resource_manager)
+    graphs, resource_manager, forwards_small = _split_warmup_graphs(True, max_num_tokens=32)
+    graphs._warm_inforward_split(resource_manager)
+    assert forwards == [] and forwards_small == []

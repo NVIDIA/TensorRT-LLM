@@ -222,7 +222,8 @@ registration alone.
 CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
 compression and shared KV/index sources; per-phase query tiles feed selected
 rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
-for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+for SM90, SM100-family and SM120/121 routing (candidate-consumer layers need
+SM100-family GPUs), persistent cache formats, and replay.
 
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
@@ -328,17 +329,24 @@ NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
 
-CSA2 also gathers the complete compressed prefix during index prefill and
-declares a conservative gather rate even with chunked prefill. Its native
+CSA2 also gathers the complete compressed prefix during index prefill, even
+with chunked prefill: on the native SM100 path 69 bytes per gathered key (E2M1
+data, scale word, validity) for each query piece a request splits into, and a
+conservative 512 bytes per key on the decoded fallback. Its native
 index descriptor/radix arena follows maximum batch, draft width and sequence
 length, so it declares a separate fixed reserve for an eager arena and, when
 enabled, a shared CUDA graph arena. The estimator conservatively reserves the
 full arena capacity alongside the profiled peak: a decode arena may first be
 allocated after peak prefill, so its final retained bytes cannot safely be
-subtracted from that earlier peak.
+subtracted from that earlier peak. The fixed reserve also covers one prefill
+indexer group's FP32 logits, whose width follows the attended prefix; the MQA
+logits element budget and the step's query rows bound them.
 The attended-KV admission cap applies to the prefix gather, independently of
-the fixed graph arena. Projection, native/provider scratch and transient logits
-still require representative peak-memory profiling.
+the fixed graph arena. The attention-DP minimum-KV-split scratch of
+`fmha/gqa_decode.py` needs no declaration: it is sized by the largest
+generation CUDA-graph batch, which graph warmup runs before KV-cache sizing,
+and larger eager batches keep FlashInfer's split heuristic. Projection and
+native/provider scratch still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -480,6 +488,17 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
+`Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
+from `FmhaPrewarmConfig`; it does not replace request-level selection.
+Under pipeline parallelism, decoder warmup finds backend attributes on modules
+with retained projection weights, including MLA's `mqa`/`mha` and cross-attention,
+and asks each manager to prewarm its eligible libraries. A shared set limits
+each library to one attempt across the rank's layers. Failures are logged and
+deferred to first use, and all TP peers synchronize before the first forward.
+FlashInfer's decode, prefill and MLA getters load the same `fmha_gen` JIT spec,
+so its prewarm invokes one getter to build the shared library.
+
 `FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
 `thop.run_generation`; the native carrier behind them is per host thread and
 never visible to Python. Generated nanobind readers
@@ -522,6 +541,28 @@ silently drop the routing semantics. Likewise a generation call whose
 QK-norm / RoPE / KV-append prologue the attention module deferred
 (`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
 libraries that declare `supports_deferred_prologue`.
+
+Two per-forward arguments and one layer field let a library return less than
+a full BF16 `output`; callers that set them must read the result accordingly:
+
+- `output_gate`: a library that multiplies `sigmoid(gate)` into the output sets
+  `output_gate_applied`; otherwise the caller applies the gate.
+- `gated_out_scale` / `output_fp8` (offered only with `output_gate`): a library
+  that applies the gate may write the gated output as E4M3 at o_proj's static
+  input scale into `output_fp8` and leave `output` unwritten. The caller then
+  feeds `output_fp8` to o_proj; `output` holds stale data.
+- `context_last_rows_only` (a `TrtllmAttention` field the model sets, e.g. the
+  Qwen3.5 MTP layer): in a context-only step `FlashInferTrtllmGenFmha` computes
+  only each request's last output row, against the full KV, and writes zeros to
+  the other rows; every row's K / V is still appended. Mixed steps run the full
+  call.
+
+`trtllm::fmha_paged_context_fp8` (the stage-KV context path of
+`FlashInferTrtllmGenFmha`, `context_fmha_head_dim_per_stage_kv > 0`) runs only
+a precompiled kernel: when the config the runner selects for the call has no
+cubin, the op returns `False` without launching and the library runs
+FlashInfer's kernel, so no step compiles with NVRTC.
+
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
@@ -666,7 +707,11 @@ The FMHA package is split by role:
   `gqa_split_kv` and `gqa_segmented` take the generation calls their
   `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
   size conditions are evaluated at the upper bound of the selection-cache
-  cell (`generation_selection_cell`).
+  cell (`generation_selection_cell`). The segment attention of
+  `gqa_kv_replica` and `gqa_segmented` requests the LSE, for which FlashInfer
+  takes softmax stats off the front of the FMHA workspace: these calls run on
+  the trtllm-gen slice extended in place, and `GqaDecodeFmha.prepare_workspace`
+  sizes the attention workspace for the layer's largest such call.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased

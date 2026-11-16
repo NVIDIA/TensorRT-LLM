@@ -78,8 +78,10 @@ def test_qwen35_watermark_detected_and_not_degraded(kind):
         model=_model_path(kind),
         watermark_config=config,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.5),
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16),
-        max_batch_size=16,
+        cuda_graph_config=CudaGraphConfig(max_batch_size=len(PROMPTS)),
+        max_batch_size=len(PROMPTS),
+        max_num_tokens=1024,
+        max_seq_len=1024,
     )
     try:
         prompts = [

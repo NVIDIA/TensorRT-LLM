@@ -91,6 +91,7 @@ def _forward_step_executor(
         kv_connector_manager=None,
         resource_manager=object(),
         iter_counter=0,
+        is_warmup=False,
         enable_spec_decode=enable_spec_decode,
         runtime_draft_len=runtime_draft_len,
         sampler=Mock(get_cache_indirection=Mock(return_value=object())),
@@ -273,6 +274,7 @@ def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     request = types.SimpleNamespace(
         py_end_id=end_id,
         py_multimodal_data=None,
+        py_prompt_token_bound=None,
         check_token_id_range=lambda _vocab_size: True,
     )
 
@@ -622,17 +624,6 @@ def test_remote_tail_short_prompt_rejects_unsupported_requests(
     setattr(request, field, value)
 
     with pytest.raises(ValueError, match=message):
-        PyExecutor._configure_csa2_remote_tail(executor, request)
-
-
-@pytest.mark.parametrize("context_only", [False, True])
-def test_remote_tail_short_prompt_rejects_block_reuse(context_only: bool) -> None:
-    executor, request = _make_remote_tail_executor_and_request(64, context_only)
-    executor.resource_manager.resource_managers[
-        ResourceManagerType.KV_CACHE_MANAGER
-    ].enable_block_reuse = True
-
-    with pytest.raises(ValueError, match="requires block reuse to be disabled"):
         PyExecutor._configure_csa2_remote_tail(executor, request)
 
 
@@ -1219,6 +1210,8 @@ def _make_encoder_fallback_batch_wait_executor():
     executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = None
+    executor.model_engine.encoder_batch_size = 8
+    executor.model_engine.encoder_max_num_tokens = 32
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -1781,6 +1774,16 @@ def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, record
         assert split_encoder_from_decoder_context_requests([request]) == ([request], [])
 
 
+def test_recompute_active_requests_rejects_encoder_decoder() -> None:
+    executor = _make_handoff_executor()
+    executor.is_encoder_decoder = True
+    executor.dist.pp_size = 1
+    executor.previous_batch = None
+
+    with pytest.raises(NotImplementedError, match="encoder-decoder"):
+        executor.recompute_active_requests()
+
+
 def test_request_terminated_before_first_context_releases_packed_output(recorded_streams):
     cancelled, sibling = (
         _make_encoder_decoder_request(1, "token", 3),
@@ -1897,6 +1900,7 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyE
     executor.enable_attention_dp = False
     executor._kv_connector_deadlines = {}
     executor.adp_router = Mock(exclude_retiring_requests=False)
+    executor._fetch_hint_enabled = False
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
@@ -2007,7 +2011,7 @@ def test_idle_entry_refreshes_load_before_waiting():
     class ReachedIdleWait(Exception):
         pass
 
-    def idle_wait(waiting_queue, num_active):
+    def idle_wait(waiting_queue, num_active, **kwargs):
         assert num_active == 0
         assert executor.get_kv_cache_load()["usedKvBlocks"] == 0
         raise ReachedIdleWait
@@ -2093,7 +2097,7 @@ def test_adp_running_counts_update_without_a_new_block_sample():
     class ReachedWait(Exception):
         pass
 
-    def stop_at_wait(*args):
+    def stop_at_wait(*args, **kwargs):
         raise ReachedWait
 
     executor._fetch_and_enqueue_requests = stop_at_wait
@@ -3044,6 +3048,8 @@ class _CleanupStub:
         self.send_expected_batch_num_handles = {}
         self._pp_handles_raise = pp_handles_raise
         self._events: list = []
+        self._staged_responses = []
+        self._intake_window = threading.Event()
 
         original_notify = self.response_cv.notify_all
 
@@ -3059,6 +3065,7 @@ class _CleanupStub:
             raise RuntimeError("PP send handle in bad state")
 
     _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
+    _flush_staged_responses = PyExecutor._flush_staged_responses
 
 
 class TestExecutorLoopCleanup:
@@ -3136,6 +3143,8 @@ def _make_adp_request(
 
 class _StubADPExecutor:
     _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
+    _num_skipped_forward_ctx_chunks = 0
+    _num_reverted_ctx_tokens = 0
 
     def __init__(
         self,
@@ -3164,6 +3173,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.enable_joint_kv_cache_reuse = False
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
@@ -3225,6 +3235,8 @@ class _StubADPExecutor:
                 request_id=kwargs["request_ids"][0],
                 is_dummy_request=True,
             )
+            if not kwargs["is_gen"]:
+                req.context_remaining_length = kwargs["token_nums"][0]
             return [req]
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
@@ -3575,12 +3587,13 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        track_unique_tokens=False,
     )
     seen = {}
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
     )
-    stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
+    stub._fetch_and_enqueue_requests = lambda waiting_queue, live, **kw: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
         seen["active"] = total_num_active_requests
@@ -3665,6 +3678,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        track_unique_tokens=False,
     )
     for name in (
         "_get_request_admission_capacity",
@@ -3673,7 +3687,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
     ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []
-    stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
+    stub._fetch_and_enqueue_requests = lambda queue, num_live, **kw: live.append(num_live)
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
@@ -4421,7 +4435,7 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 
     stub._is_kv_manager_v2 = True
     stub.enable_joint_kv_cache_reuse = False
-    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
     reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
     assert reverted == [real_gen_request]
@@ -4439,7 +4453,7 @@ def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests.append(gen_request)
 
-    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
     stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
     stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
@@ -4585,7 +4599,10 @@ class TestPendingTransferResponseFlush:
         executor._is_kv_manager_v2 = False
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
+        executor.previous_batch = None
         executor._flush_pending_transfer_responses = Mock()
+        executor._packed_sync_enabled = False
+        executor._stage_timing = False
         return executor
 
     @staticmethod
@@ -4643,7 +4660,7 @@ class TestPendingTransferResponseFlush:
         executor._pause_requests = Mock()
         executor._can_queue = Mock(return_value=(False, None))
         executor.kv_connector_manager = None
-        executor._revert_gen_alloc = Mock()
+        executor._revert_unexecuted_alloc = Mock()
         executor._finalize_adp_dummy_allocation = Mock()
         executor.kv_cache_transceiver = None
         executor._kv_connector_terminate_requests = Mock()
@@ -4772,6 +4789,8 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.enable_attention_dp = False
         ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
+        ex._packed_sync_enabled = False
+        ex._stage_timing = False
         ex.waiting_queue = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
@@ -5035,6 +5054,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
     request = types.SimpleNamespace(
         py_request_id=rid,
         py_decoding_iter=1,
+        py_batch_idx=None,
         py_result=py_result,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
@@ -5176,3 +5196,31 @@ def test_disagg_gen_first_step_is_streamed_once():
     executor.active_requests = [request]
     PyExecutor._handle_responses(executor)
     assert request.create_response.call_count == 1
+
+
+def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
+    """torch keeps each Dynamo config value per thread: the limit the engine sets while it is built does
+    not reach PyExecutor's worker thread, which applies it again."""
+    from tensorrt_llm._torch.pyexecutor.engine.model_setup import DYNAMO_RECOMPILE_LIMIT
+
+    config = torch._dynamo.config
+    original = config.cache_size_limit
+    seen = {}
+    executor = types.SimpleNamespace(_uses_torch_compile=True)
+
+    def worker():
+        seen["inherited"] = config.cache_size_limit
+        PyExecutor._apply_dynamo_recompile_limit(executor)
+        seen["applied"] = config.cache_size_limit
+
+    config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
+    try:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+    finally:
+        config.cache_size_limit = original
+    assert seen["inherited"] != DYNAMO_RECOMPILE_LIMIT, (
+        "Dynamo config is process-wide; drop the hook"
+    )
+    assert seen["applied"] == DYNAMO_RECOMPILE_LIMIT

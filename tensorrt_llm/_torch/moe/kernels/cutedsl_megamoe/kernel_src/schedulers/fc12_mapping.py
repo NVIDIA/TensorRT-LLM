@@ -35,6 +35,9 @@ class BlockPhase(IntEnum):
     None_ = 0
     Linear1 = 1
     Linear2 = 2
+    # The fused FP8 shared expert's gate/up and down projections.
+    SharedLinear1 = 3
+    SharedLinear2 = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -889,11 +892,6 @@ class _PhaseFc12CursorState:
             self.token_block_cumulative,
         )
 
-    @cute.jit
-    def clone(self) -> "_PhaseFc12CursorState":
-        """Fork this cursor while sharing its immutable initial SSA values."""
-        return type(self)(*self._runtime_fields(), blocks_per_token_block=self.blocks_per_token_block)
-
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
         for field in self._runtime_fields():
@@ -931,11 +929,23 @@ class PhaseInterleavedFc12MappingState:
         fc2_cursor: _PhaseFc12CursorState,
         num_fc1_intermediate_blocks: int,
         num_fc2_hidden_blocks: int,
+        stream_token_blocks: Int32,
         dfc1_m_group: int = 1,
+        owner_index=0,
+        owner_count: int = 1,  # die-aware owners (dies)
+        expert_half: bool = False,
+        expert_remap: Optional[cute.Tensor] = None,  # slot -> expert, expert_half only
     ) -> None:
         if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
             raise ValueError("dfc1_m_group must be 1 or 16")
         self.dfc1_m_group = dfc1_m_group
+        # Owner: the weight-row half (n_split) or the expert half (expert_half) this state enumerates. Runtime Int32
+        # die id (loop-carried: extracted and rebuilt), flipped to 1 - die for the steal pass. The data / sf /
+        # token_block cumulatives stay global (fc1_done slot space).
+        self.owner_index = owner_index
+        self.owner_count = owner_count
+        self.expert_half = expert_half
+        self.expert_remap = expert_remap
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
         self.mapping_cluster_shape_mn = mapping_cluster_shape_mn
@@ -948,7 +958,10 @@ class PhaseInterleavedFc12MappingState:
         self.fc2_cursor = fc2_cursor
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
-        self.fc2_claims_per_token_block = num_fc2_hidden_blocks
+        self.stream_token_blocks = stream_token_blocks
+        # Per-owner share of the FC2 blocks per token block (the cursors are built with the divided counts); an
+        # expert_half owner enumerates whole experts.
+        self.fc2_claims_per_token_block = num_fc2_hidden_blocks // (1 if expert_half else self.owner_count)
         if fc2_cursor.blocks_per_token_block != self.fc2_claims_per_token_block:
             raise ValueError(
                 "FC2 cursor blocks_per_token_block does not match the selected "
@@ -959,11 +972,19 @@ class PhaseInterleavedFc12MappingState:
     def mapping_cluster_tile_m(self) -> int:
         return self.mapping_cta_tile_shape_mnk[0] * self.mapping_cluster_shape_mn[0]
 
+    def stream_tiles(self, phase_blocks: int) -> Int32:
+        """Tiles of one phase stream over all local experts (needs a resolved stream extent)."""
+        return self.stream_token_blocks * Int32(phase_blocks)
+
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
+        if isinstance(self.owner_index, Int32):
+            values.extend(extract_mlir_values(self.owner_index))
         token_counts = self.expert_token_sizes if self.expert_token_sizes is not None else self.expert_token_prefix_sum
         values.extend(extract_mlir_values(token_counts))
-        for field in (self.fc1_cursor, self.fc2_cursor):
+        if self.expert_remap is not None:
+            values.extend(extract_mlir_values(self.expert_remap))
+        for field in (self.fc1_cursor, self.fc2_cursor, self.stream_token_blocks):
             values.extend(extract_mlir_values(field))
         return values
 
@@ -977,12 +998,14 @@ class PhaseInterleavedFc12MappingState:
             value_index += field_value_count
             return result
 
+        owner_index = rebuild(self.owner_index) if isinstance(self.owner_index, Int32) else self.owner_index
         if self.expert_token_sizes is not None:
             expert_token_sizes = rebuild(self.expert_token_sizes)
             expert_token_prefix_sum = None
         else:
             expert_token_sizes = None
             expert_token_prefix_sum = rebuild(self.expert_token_prefix_sum)
+        expert_remap = rebuild(self.expert_remap) if self.expert_remap is not None else None
         result = type(self)(
             expert_count=self.expert_count,
             mapping_cta_tile_shape_mnk=self.mapping_cta_tile_shape_mnk,
@@ -996,7 +1019,12 @@ class PhaseInterleavedFc12MappingState:
             fc2_cursor=rebuild(self.fc2_cursor),
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=self.num_fc2_hidden_blocks,
+            stream_token_blocks=rebuild(self.stream_token_blocks),
             dfc1_m_group=self.dfc1_m_group,
+            owner_index=owner_index,
+            owner_count=self.owner_count,
+            expert_half=self.expert_half,
+            expert_remap=expert_remap,
         )
         if value_index != len(values):
             raise ValueError(
@@ -1034,12 +1062,20 @@ def create_phase_interleaved_fc12_mapping_state(
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
     dfc1_m_group: int = 1,
+    owner_index=0,
+    owner_count: int = 1,
+    expert_half: bool = False,
+    expert_remap: Optional[cute.Tensor] = None,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
     num_fc1_intermediate_blocks = (intermediate_gateup_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
     num_fc2_hidden_blocks = (hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
-    fc2_claims_per_token_block = num_fc2_hidden_blocks
+    # n_split: per-owner block counts (the kernel's n_split check guarantees divisibility); _decode_phase_work_id adds
+    # owner_index * that count as the block offset. expert_half owners enumerate whole experts.
+    block_share = 1 if expert_half else owner_count
+    cursor_fc1_blocks = num_fc1_intermediate_blocks // block_share
+    cursor_fc2_blocks = num_fc2_hidden_blocks // block_share
     return PhaseInterleavedFc12MappingState(
         expert_count=expert_count,
         mapping_cta_tile_shape_mnk=mapping_cta_tile_shape_mnk,
@@ -1049,12 +1085,52 @@ def create_phase_interleaved_fc12_mapping_state(
         is_swap_ab=is_swap_ab,
         expert_token_sizes=expert_token_sizes,
         expert_token_prefix_sum=expert_token_prefix_sum,
-        fc1_cursor=_make_phase_cursor(num_fc1_intermediate_blocks),
-        fc2_cursor=_make_phase_cursor(fc2_claims_per_token_block),
+        fc1_cursor=_make_phase_cursor(cursor_fc1_blocks),
+        fc2_cursor=_make_phase_cursor(cursor_fc2_blocks),
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+        stream_token_blocks=Int32(-1),
         dfc1_m_group=dfc1_m_group,
+        owner_index=owner_index,
+        owner_count=owner_count,
+        expert_half=expert_half,
+        expert_remap=expert_remap,
     )
+
+
+@cute.jit
+def _owner_owns_slot(mapping_state, slot: Int32) -> Boolean:
+    """expert_half: resolve the load-sorted slot to its expert, then test the owner's half
+    ``[owner * E / 2, (owner + 1) * E / 2)`` (the half the host placed on that die)."""
+    expert = mapping_state.expert_remap[slot]
+    return (expert * Int32(mapping_state.owner_count)) // Int32(mapping_state.expert_count) == Int32(
+        mapping_state.owner_index
+    )
+
+
+@cute.jit
+def reset_phase_interleaved_cursors_for_owner(
+    mapping_state: PhaseInterleavedFc12MappingState, owner_index: Int32
+) -> PhaseInterleavedFc12MappingState:
+    """Reset the forward-only cursors when switching owners (once, before the other die's first id is mapped).
+
+    Assign the returned state (mapping = reset(...)) so a dynamic if yields the reset cursors.
+    """
+    mapping_state.fc1_cursor = _make_phase_cursor(mapping_state.fc1_cursor.blocks_per_token_block)
+    mapping_state.fc2_cursor = _make_phase_cursor(mapping_state.fc2_cursor.blocks_per_token_block)
+    mapping_state.owner_index = Int32(owner_index)
+
+
+@cute.jit
+def resolve_phase_interleaved_stream_extent(
+    mapping_state: PhaseInterleavedFc12MappingState,
+) -> PhaseInterleavedFc12MappingState:
+    """Count the token blocks of all local experts in one warp pass, once the sizes are ready."""
+    _, _, token_blocks = _sum_expert_range(
+        mapping_state, Int32(0), Int32(mapping_state.expert_count)
+    )
+    mapping_state.stream_token_blocks = token_blocks
+    return mapping_state
 
 
 @cute.jit
@@ -1086,9 +1162,12 @@ def _advance_phase_cursor(
         mapping_state.mapping_cluster_tile_m
     )
     cursor.expert_tile_start = cursor.expert_tile_end
-    cursor.expert_tile_end = cursor.expert_tile_start + cursor.current_token_block_count * Int32(
-        cursor.blocks_per_token_block
-    )
+    tile_token_blocks = cursor.current_token_block_count
+    if cutlass.const_expr(mapping_state.expert_half):
+        # Another die's expert adds its rows and token blocks to the cumulatives but no tiles to this stream.
+        if not _owner_owns_slot(mapping_state, cursor.expert_idx):
+            tile_token_blocks = Int32(0)
+    cursor.expert_tile_end = cursor.expert_tile_start + tile_token_blocks * Int32(cursor.blocks_per_token_block)
     return cursor
 
 
@@ -1110,12 +1189,11 @@ def resolve_phase_interleaved_fc1_claim_target(
     minimum_claim_count: Int32, mapping_state: PhaseInterleavedFc12MappingState
 ) -> Tuple[Int32, Boolean]:
     """Resolve the static FC1 watermark or the smaller runtime stream extent."""
-    target_work_id = minimum_claim_count - Int32(1)
-    probe_cursor = _seek_phase_cursor(target_work_id, mapping_state.fc1_cursor.clone(), mapping_state)
-    stream_ends_before_target = target_work_id >= probe_cursor.expert_tile_end
+    fc1_stream_tiles = mapping_state.stream_tiles(mapping_state.num_fc1_intermediate_blocks)
+    stream_ends_before_target = minimum_claim_count > fc1_stream_tiles
     claim_target = minimum_claim_count
     if stream_ends_before_target:
-        claim_target = probe_cursor.expert_tile_end
+        claim_target = fc1_stream_tiles
     return claim_target, stream_ends_before_target
 
 
@@ -1154,6 +1232,11 @@ def _decode_phase_work_id(
                 strip_m_begin + in_strip - cluster_output_block_idx * strip_rows
             )
 
+    if cutlass.const_expr(mapping_state.owner_count > 1 and not mapping_state.expert_half):
+        # n_split: offset into this owner's half. tile_m_idx stays global; only the weight/SF TMA views are die-major.
+        cluster_output_block_idx = cluster_output_block_idx + Int32(mapping_state.owner_index) * Int32(
+            cursor.blocks_per_token_block
+        )
     cta_token_block_idx = (
         cluster_token_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[0]) + cta_id_in_mapping_cluster[0]
     )
@@ -1208,15 +1291,15 @@ def map_phase_interleaved_fc12_work_id(
     fc2_cursor = mapping_state.fc2_cursor
 
     if phase == Int32(BlockPhase.Linear1):
-        fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
-        if linear_work_id < fc1_cursor.expert_tile_end:
+        if linear_work_id < mapping_state.stream_tiles(mapping_state.num_fc1_intermediate_blocks):
+            fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
             work_tile = _decode_phase_work_id(
                 linear_work_id, phase, cta_id_in_mapping_cluster, fc1_cursor, mapping_state
             )
             stream_has_work = Boolean(True)
     else:
-        fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
-        if linear_work_id < fc2_cursor.expert_tile_end:
+        if linear_work_id < mapping_state.stream_tiles(mapping_state.fc2_claims_per_token_block):
+            fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
             work_tile = _decode_phase_work_id(
                 linear_work_id, phase, cta_id_in_mapping_cluster, fc2_cursor, mapping_state
             )
@@ -1242,6 +1325,8 @@ __all__ = [
     "map_fc12_linear_work_id",
     "map_phase_interleaved_fc12_work_id",
     "peek_ready_bit",
+    "reset_phase_interleaved_cursors_for_owner",
     "resolve_phase_interleaved_fc1_claim_target",
+    "resolve_phase_interleaved_stream_extent",
     "rewind_fc12_mapping_cursor",
 ]
