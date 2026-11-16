@@ -1077,10 +1077,11 @@ class DecoderWarmup:
             getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
         ):
             return
-        metadata = self._metadata.setup_attention(
-            kv_cache_manager, get_draft_kv_cache_manager(self._config.spec_config, resource_manager)
-        )
         with torch.inference_mode():
+            metadata = self._metadata.setup_attention(
+                kv_cache_manager,
+                get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
+            )
             warmup_prims_ts_sparse_mla(self.model, metadata)
         torch.cuda.synchronize()
         # Compilation is local; align peers before the first collective-bearing forward.

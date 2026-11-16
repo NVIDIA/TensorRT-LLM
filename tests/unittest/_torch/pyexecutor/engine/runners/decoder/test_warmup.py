@@ -1088,15 +1088,19 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
     )
 
     events = []
-    metadata = object()
+    metadata = SimpleNamespace()
+
+    def build_metadata(*args: object) -> SimpleNamespace:
+        events.append("metadata")
+        metadata.cu_seq_lens = torch.zeros(1, dtype=torch.int32)
+        return metadata
+
     owner = SimpleNamespace(
         _config=SimpleNamespace(
             attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
             spec_config=None,
         ),
-        _metadata=SimpleNamespace(
-            setup_attention=Mock(side_effect=lambda *args: events.append("metadata") or metadata)
-        ),
+        _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
         model=object(),
         mapping=SimpleNamespace(cp_size=1, tp_size=4),
         dist=SimpleNamespace(tp_allgather=Mock(side_effect=lambda *args: events.append("barrier"))),
@@ -1113,6 +1117,7 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
     ):
         DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
         assert events == ["metadata", "kernels", "sync", "barrier"]
+        assert metadata.cu_seq_lens.is_inference()
         warm.assert_called_once_with(owner.model, metadata)
         owner._metadata.setup_attention.assert_called_once_with(manager, None)
         events.clear()

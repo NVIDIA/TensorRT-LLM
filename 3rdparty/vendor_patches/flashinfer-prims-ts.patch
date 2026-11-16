@@ -187,7 +187,7 @@ index a6a4261ca8ad3aecf065f8a4c36fca327f307dbc..7b553b20c6d9c924a08db08235b0dbc5
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/mla_decode.py b/mla_decode.py
-index 744c7afb703d2bfffa868650463da02b5369690a..b10ec75109beeedf41088c65c3788ac05066e056 100644
+index d6ef4d01a9b991c557a3a9a98f977834c10700f8..9816542142f04722d8204e8070e33ce4f6041088 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -195,7 +195,7 @@ index 744c7afb703d2bfffa868650463da02b5369690a..b10ec75109beeedf41088c65c3788ac0
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -40,12 +41,8 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
+@@ -43,12 +44,8 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
      validate_nvfp4_kv_formats,
  )
  
@@ -209,7 +209,7 @@ index 744c7afb703d2bfffa868650463da02b5369690a..b10ec75109beeedf41088c65c3788ac0
  
  
  from .decode import (
-@@ -1905,7 +1902,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1992,7 +1989,7 @@ class BatchMLADecodePagedTSWrapper:
              softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
          )
  
@@ -218,7 +218,7 @@ index 744c7afb703d2bfffa868650463da02b5369690a..b10ec75109beeedf41088c65c3788ac0
      def run(
          self,
          query: torch.Tensor,
-@@ -2021,7 +2018,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2108,7 +2105,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -227,7 +227,7 @@ index 744c7afb703d2bfffa868650463da02b5369690a..b10ec75109beeedf41088c65c3788ac0
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2427,17 +2424,17 @@ def _resolve_sparse_mla_plan(
+@@ -2514,17 +2511,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass

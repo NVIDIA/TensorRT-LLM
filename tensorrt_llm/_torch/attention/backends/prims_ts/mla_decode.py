@@ -20,9 +20,12 @@ from dataclasses import dataclass, field, replace
 import copy
 import math
 import functools
+import weakref
 from typing import Any, Literal, Optional, cast
 
 import torch
+from torch.overrides import has_torch_function_unary
+from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
@@ -201,6 +204,80 @@ class _MLARuntime:
     extra_cache: Optional[torch.Tensor] = None
     sparse_inputs: Optional[tuple] = None
     output_quant_args: Optional[tuple] = None
+
+
+class _TensorViewCache:
+    """Keep one binding after observing a still-live source allocation again.
+
+    The first observation is weak: ephemeral query/index/output tensors must
+    not acquire an extra storage owner merely by passing through run(). Only
+    zero-copy views belong here; changing tensor contents must remain visible.
+    """
+
+    __slots__ = ("source", "key", "views")
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.source = None
+        self.key = None
+        self.views = None
+
+    def get(self, tensor):
+        # Tensor subclasses can override view/storage semantics (e.g. FakeTensor).
+        if type(tensor) is not torch.Tensor:
+            self.clear()
+            return None
+        previous = self.source() if self.source is not None else None
+        if previous is None:
+            self.clear()
+            self.source = weakref.ref(tensor)
+            return None
+        # A view of an activation with gradients could retain its whole graph.
+        if tensor.requires_grad:
+            self.clear()
+            return None
+        pointer, device = tensor.data_ptr(), tensor.device
+        key = (
+            pointer,
+            tensor.shape,
+            tensor.stride(),
+            tensor.dtype,
+            device,
+            tensor.is_inference(),
+            tensor.is_conj(),
+            tensor.is_neg(),
+        )
+        if key == self.key:
+            return self.views
+        self.views = None
+        self.key = (
+            key
+            if previous is tensor
+            or (pointer == previous.data_ptr() and device == previous.device)
+            else None
+        )
+        self.source = weakref.ref(tensor)
+        return None
+
+    def put(self, views):
+        if self.key is not None:
+            self.views = views
+
+
+def _resolve_cached_mla_scale(value, state, name):
+    if value is None:
+        return state[name]
+    # Tensor scales stay live, including device-side updates during replay.
+    host_scalar = type(value) in (int, float)
+    cached = state["scale_cache"].get(name) if host_scalar else None
+    if cached is not None and cached[0] is type(value) and cached[1] == value:
+        return cached[2]
+    resolved = resolve_scale(value, state[name], name, state["device"])
+    if host_scalar:
+        state["scale_cache"][name] = (type(value), value, resolved)
+    return resolved
 
 
 # Pack kernel scratch bytes and [batch, max Q tokens, heads] FP32 LSE storage.
@@ -1681,48 +1758,57 @@ def _launch_mla_decode(
     compiled: Callable[..., object],
     lse: Optional[torch.Tensor] = None,
     max_q_len: int,
-    cp_rank: int = 0,
+    tensor_views: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
-    lse_storage = workspace.lse if lse is None else lse
-    if packed_query and int(runtime.query.shape[0]) == 0:
-        return runtime.out
-    has_rope = runtime.query.shape[-1] != kv_lora_rank
-    query_latent = runtime.query[..., :kv_lora_rank] if has_rope else runtime.query
-    if packed_query:
-        q_latent = query_latent.permute(1, 2, 0)
-        q_rope = (
-            runtime.query[..., kv_lora_rank:].permute(1, 2, 0) if has_rope else q_latent
-        )
-        out_kernel = runtime.out.permute(1, 2, 0)
-        total_q = int(runtime.query.shape[0])
-        lse_kernel = (
-            lse_storage.view(-1, lse_storage.shape[-1])[:total_q].transpose(0, 1)
-            if lse_storage is not None
-            else None
+    if tensor_views is not None:
+        q_latent, q_rope, c_latent, c_rope, page_offsets, out_kernel, lse_kernel = (
+            tensor_views
         )
     else:
-        q_latent = query_latent.permute(2, 3, 1, 0)
-        q_rope = (
-            runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
-            if has_rope
-            else q_latent
-        )
-        out_kernel = runtime.out.permute(2, 3, 1, 0)
-        lse_kernel = lse_storage.permute(2, 1, 0) if lse_storage is not None else None
-    c_latent = (
-        runtime.normalized_cache
-        if runtime.normalized_cache.dtype == torch.uint8 or not has_rope
-        else runtime.normalized_cache[..., :kv_lora_rank]
-    ).permute(1, 2, 0)
-    if runtime.extra_cache is not None:
-        c_rope = runtime.extra_cache.permute(1, 2, 0)
-    elif has_rope:
-        c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
-    else:
-        c_rope = c_latent
-    page_offsets = block_tables.transpose(0, 1)
+        lse_storage = workspace.lse if lse is None else lse
+        if packed_query and int(runtime.query.shape[0]) == 0:
+            return runtime.out
+        has_rope = runtime.query.shape[-1] != kv_lora_rank
+        query_latent = runtime.query[..., :kv_lora_rank] if has_rope else runtime.query
+        if packed_query:
+            q_latent = query_latent.permute(1, 2, 0)
+            q_rope = (
+                runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
+                if has_rope
+                else q_latent
+            )
+            out_kernel = runtime.out.permute(1, 2, 0)
+            total_q = int(runtime.query.shape[0])
+            lse_kernel = (
+                lse_storage.view(-1, lse_storage.shape[-1])[:total_q].transpose(0, 1)
+                if lse_storage is not None
+                else None
+            )
+        else:
+            q_latent = query_latent.permute(2, 3, 1, 0)
+            q_rope = (
+                runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+                if has_rope
+                else q_latent
+            )
+            out_kernel = runtime.out.permute(2, 3, 1, 0)
+            lse_kernel = (
+                lse_storage.permute(2, 1, 0) if lse_storage is not None else None
+            )
+        c_latent = (
+            runtime.normalized_cache
+            if runtime.normalized_cache.dtype == torch.uint8 or not has_rope
+            else runtime.normalized_cache[..., :kv_lora_rank]
+        ).permute(1, 2, 0)
+        if runtime.extra_cache is not None:
+            c_rope = runtime.extra_cache.permute(1, 2, 0)
+        elif has_rope:
+            c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
+        else:
+            c_rope = c_latent
+        page_offsets = block_tables.transpose(0, 1)
     # Persisted FFI callables require positional arguments, including None.
     compiled(
         q_latent,
@@ -3270,13 +3356,39 @@ class BatchSparseMLADecodePagedTSWrapper:
             default_attention_sinks=torch.full(
                 (num_qo_heads,), -torch.inf, device=device, dtype=torch.float32
             ),
+            view_cache=(
+                {
+                    name: _TensorViewCache()
+                    for name in (
+                        "kv_cache",
+                        "extra_kv_cache",
+                        "query",
+                        "indices",
+                        "out",
+                        "lse",
+                    )
+                }
+                if qk_rope_head_dim == 0
+                and kernel.kv_cache_format == "native"
+                and kernel.extra_kv_cache_format == "native"
+                and output_quant is None
+                else None
+            ),
+            view_context=None,
+            lse_views=None,
+            empty_source_views=None,
+            dummy_cache_view=None,
+            scale_cache={},
         )
 
         self.workspace_size_bytes = byte_end
 
-    def _pool(self, cache, name, *, validate):
+    def _pool(self, cache, name, *, validate, views):
         """Expose physical pool rows without repacking, optionally checking metadata."""
         state = self._state
+        binding = views[name].get(cache) if views is not None else None
+        if binding is not None and not validate:
+            return binding
         dim = state["extra_cache_dim" if name == "extra_kv_cache" else "cache_dim"]
         if validate and not isinstance(cache, torch.Tensor):
             raise TypeError(f"{name} must be a tensor")
@@ -3320,15 +3432,33 @@ class BatchSparseMLADecodePagedTSWrapper:
         rows = (cache.shape[0] - 1) * row_stride + page_size
         if validate and rows >= 0x7FFFFFFF:
             raise ValueError(f"{name} exceeds signed gather coordinate range")
-        return cache.as_strided((rows, 1, dim), (dim, dim, 1))
+        if binding is None:
+            normalized = cache.as_strided((rows, 1, dim), (dim, dim, 1))
+            binding = (
+                normalized,
+                normalized.permute(1, 2, 0) if views is not None else None,
+            )
+            if views is not None:
+                views[name].put(binding)
+        return binding
 
     def _source_metadata(
-        self, indices, lengths, capacity, tokens, name, *, rows, validate
+        self, indices, lengths, capacity, tokens, name, *, rows, validate, cache_views
     ):
         state = self._state
         if capacity == 0:
             if indices is not None or lengths is not None:
                 raise ValueError(f"{name} metadata is not expected by the plan")
+            if cache_views:
+                cached = state["empty_source_views"]
+                if cached is None or cached[0] != rows:
+                    cached = (
+                        rows,
+                        state["dummy_indices"][:rows],
+                        state["default_cl"][:rows],
+                    )
+                    state["empty_source_views"] = cached
+                return cached[1], cached[2]
             return state["dummy_indices"][:rows], state["default_cl"][:rows]
         if validate:
             if not isinstance(indices, torch.Tensor) or (
@@ -3401,8 +3531,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         is a trusted-input path: the caller must guarantee shape, dtype, device,
         stride, alignment, and index/length/offset/position bounds on every launch
         and graph replay. Planning-state, required-argument/mode, and scale-override
-        checks still run. Tensor normalization, view construction and allocation
-        of omitted outputs are performed in both modes.
+        checks still run. Compatible native D512 launches reuse independent
+        zero-copy tensor views; tensor contents remain live. Omitted outputs
+        are allocated in both modes, and planning resets all view bindings.
         Q must already use the planned dtype and include the required query
         RoPE; run() performs neither Q quantization nor query rotation.
 
@@ -3464,6 +3595,24 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         if state["compiled"] is None:
             raise RuntimeError("plan(compile=True) must be called before run()")
+        views = state["view_cache"]
+        if views is not None:
+            context = (
+                torch.is_grad_enabled(),
+                torch.is_inference_mode_enabled(),
+                is_in_torch_dispatch_mode() or has_torch_function_unary(query),
+            )
+            if context != state["view_context"]:
+                for cache in views.values():
+                    cache.clear()
+                state["view_context"] = context
+                state["lse_views"] = None
+                state["empty_source_views"] = None
+                state["dummy_cache_view"] = None
+                if not context[2]:
+                    state["dummy_cache_view"] = state["dummy_cache"].permute(1, 2, 0)
+            if context[2]:
+                views = None
         if validate:
             _validate_query(
                 query,
@@ -3491,7 +3640,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         elif qo_indptr is not None:
             raise ValueError("fixed queries do not accept qo_indptr")
 
-        primary = self._pool(kv_cache, "kv_cache", validate=validate)
+        primary, primary_view = self._pool(
+            kv_cache, "kv_cache", validate=validate, views=views
+        )
         if extra_kv_cache is None:
             if (
                 state["max_extra_topk"]
@@ -3500,8 +3651,11 @@ class BatchSparseMLADecodePagedTSWrapper:
             ):
                 raise ValueError("extra pool and indices are required by the plan")
             extra = state["dummy_cache"]
+            extra_view = state["dummy_cache_view"]
         else:
-            extra = self._pool(extra_kv_cache, "extra_kv_cache", validate=validate)
+            extra, extra_view = self._pool(
+                extra_kv_cache, "extra_kv_cache", validate=validate, views=views
+            )
 
         si, sl = self._source_metadata(
             indices,
@@ -3511,6 +3665,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             "primary",
             rows=rows,
             validate=validate,
+            cache_views=views is not None,
         )
         ci, cl = self._source_metadata(
             extra_indices,
@@ -3520,6 +3675,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             "extra",
             rows=rows,
             validate=validate,
+            cache_views=views is not None,
         )
         if state["use_attention_sinks"] != (attention_sinks is not None):
             raise ValueError("attention_sinks presence must match the plan")
@@ -3534,14 +3690,10 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
         if validate and torch.isnan(attention_sinks).any().item():
             raise ValueError("attention_sinks must not contain NaN")
-        softmax_scale = resolve_scale(
-            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
-        )
-        output_scale = resolve_scale(
-            output_scale, state["output_scale"], "output_scale", state["device"]
-        )
-        kv_cache_scale = resolve_scale(
-            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
+        softmax_scale = _resolve_cached_mla_scale(softmax_scale, state, "softmax_scale")
+        output_scale = _resolve_cached_mla_scale(output_scale, state, "output_scale")
+        kv_cache_scale = _resolve_cached_mla_scale(
+            kv_cache_scale, state, "kv_cache_scale"
         )
         if state["kv_cache_format"] != "fp8" and (
             isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
@@ -3574,7 +3726,21 @@ class BatchSparseMLADecodePagedTSWrapper:
                 total_q=rows if state["packed_query"] else None,
                 out_dtype=torch.bfloat16,
             )
-        if lse is None:
+        plan_lse = lse is None and not state["return_lse"] and views is not None
+        if plan_lse:
+            cached_lse = state["lse_views"]
+            if cached_lse is None or cached_lse[0] != prefix:
+                lse = state["buffers"]["public_lse"][:rows].view(
+                    *prefix, state["num_qo_heads"]
+                )
+                cached_lse = (
+                    prefix,
+                    lse,
+                    lse.view(rows, 1, state["num_qo_heads"]).permute(2, 1, 0),
+                )
+                state["lse_views"] = cached_lse
+            lse = cached_lse[1]
+        elif lse is None:
             # A returned result must survive the next call on this wrapper.
             # Use plan-owned scratch only when the LSE is not exposed.
             lse = (
@@ -3635,18 +3801,55 @@ class BatchSparseMLADecodePagedTSWrapper:
                 )
         elif rows:
             buffers = state["buffers"]
+            tensor_views = None
+            if views is not None:
+                heads = state["num_qo_heads"]
+                q_binding = views["query"].get(query)
+                if q_binding is None:
+                    q_binding = (query.view(rows, 1, heads, 512).permute(2, 3, 1, 0),)
+                    views["query"].put(q_binding)
+                index_binding = views["indices"].get(si)
+                if index_binding is None:
+                    index_binding = (si.transpose(0, 1),)
+                    views["indices"].put(index_binding)
+                out_binding = views["out"].get(out)
+                if out_binding is None:
+                    out_binding = (out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),)
+                    views["out"].put(out_binding)
+                if plan_lse:
+                    lse_kernel = state["lse_views"][2]
+                else:
+                    lse_binding = views["lse"].get(lse)
+                    if lse_binding is None:
+                        lse_binding = (lse.view(rows, 1, heads).permute(2, 1, 0),)
+                        views["lse"].put(lse_binding)
+                    lse_kernel = lse_binding[0]
+                tensor_views = (
+                    q_binding[0],
+                    q_binding[0],
+                    primary_view,
+                    extra_view,
+                    index_binding[0],
+                    out_binding[0],
+                    lse_kernel,
+                )
             # Quantized stores use output_quant_args, including group/bucket
             # strides. The core O view supplies compact launch geometry only.
-            core_out = (
-                out.view(rows, 1, state["num_qo_heads"], 512)
-                if quant is None
-                else output_quant_args[0][: rows * state["num_qo_heads"] * 512].view(
-                    rows, 1, state["num_qo_heads"], 512
+            core_query, core_out = query, out
+            if tensor_views is None:
+                core_query = query.view(
+                    rows, 1, state["num_qo_heads"], state["query_dim"]
                 )
-            )
+                core_out = (
+                    out.view(rows, 1, state["num_qo_heads"], 512)
+                    if quant is None
+                    else output_quant_args[0][
+                        : rows * state["num_qo_heads"] * 512
+                    ].view(rows, 1, state["num_qo_heads"], 512)
+                )
             _launch_mla_decode(
                 _MLARuntime(
-                    query.view(rows, 1, state["num_qo_heads"], state["query_dim"]),
+                    core_query,
                     primary,
                     core_out,
                     primary.shape[0],
@@ -3664,10 +3867,13 @@ class BatchSparseMLADecodePagedTSWrapper:
                 split_kv=state["requested_splits"],
                 workspace=_MLAWorkspaceViews(
                     buffers["core"] if buffers["core"].numel() else None,
-                    lse.view(rows, 1, state["num_qo_heads"]),
+                    lse
+                    if tensor_views is not None
+                    else lse.view(rows, 1, state["num_qo_heads"]),
                 ),
                 compiled=state["compiled"],
                 max_q_len=1,
+                tensor_views=tensor_views,
             )
         if quant is not None:
             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
