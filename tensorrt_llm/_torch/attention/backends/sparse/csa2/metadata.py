@@ -3022,10 +3022,23 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up CSA2 paged indexer metadata before graph capture")
             page_capacity = required_pages
+            # Attention TP on SM100/SM103 (no mapping counts as TP, as in the workspace estimator):
+            # DeepGEMM's paged logits mask the unallocated pages.
+            from tensorrt_llm._utils import is_blackwell_datacenter
+
+            mapping = getattr(self, "mapping", None)
+            masked_pages = is_blackwell_datacenter() and not (
+                mapping is not None and mapping.enable_attention_dp
+            )
             scratch = {
                 "page_capacity": page_capacity,
                 "block_table": torch.empty(
                     (query_capacity, page_capacity), dtype=torch.int32, device=device
+                ),
+                "masked_block_table": torch.empty(
+                    (query_capacity, page_capacity) if masked_pages else (0, 0),
+                    dtype=torch.int32,
+                    device=device,
                 ),
                 "context_lengths": torch.empty(
                     (query_capacity, 1), dtype=torch.int32, device=device
@@ -3054,6 +3067,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self._csa2_indexer_workspaces[key] = scratch
         page_capacity = scratch["page_capacity"]
         active_blocks = scratch["block_table"][:count]
+        active_masked = (
+            scratch["masked_block_table"][:count] if scratch["masked_block_table"].numel() else None
+        )
         active_context = scratch["context_lengths"][:count]
         active_visible = scratch["visible_lengths"][:count]
         active_valid = scratch["valid_pages"][:count]
@@ -3113,6 +3129,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 active_context,
                 active_visible,
                 active_valid[:, :owner_pages],
+                None if active_masked is None else active_masked[:, :owner_pages],
             )
             if split_heads:
                 # A request's last row sees its whole context.
@@ -3131,6 +3148,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             scratch["holder"] = (group, serial)
         self.csa2_indexer_k_cache = manager.get_index_pages(owner)
         self.csa2_indexer_block_table = active_blocks
+        self.csa2_indexer_masked_block_table = active_masked
         self.csa2_indexer_context_lengths = active_context
         self.csa2_indexer_scheduler_metadata = schedule
         self.csa2_indexer_next_n = next_n
@@ -3277,6 +3295,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         active_context,
         active_visible,
         active_valid,
+        active_masked=None,
     ):
         """Derive native block tables and page validity from the owner's page table.
 
@@ -3284,6 +3303,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         pages. The paged kernel scores the whole visible prefix, reading page
         zero for unallocated source pages; ``active_valid`` marks the native
         pages backed by an allocated page, and readers bound it by the visible length.
+        ``active_masked`` gets the table with admitted rows' unallocated pages flagged for DeepGEMM.
         """
         request_count, source_pages = table.shape
         page_capacity = active_blocks.shape[1]
@@ -3302,6 +3322,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     active_context,
                     active_visible,
                     active_valid,
+                    active_masked,
                 )
                 return
         if request_count == 0:
@@ -3309,6 +3330,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             active_visible.zero_()
             active_valid.fill_(False)
             active_context.fill_(1)
+            if active_masked is not None:
+                active_masked.zero_()
             return
         native = table.long()[:, :, None] * pages_per_source_page + torch.arange(
             pages_per_source_page, device=device
@@ -3332,6 +3355,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         active_valid.copy_(valid_pages[requests] & valid_requests[:, None])
         # A zero-length row keeps one defined column for the paged kernel.
         active_context.copy_(visible.clamp_min(1)[:, None])
+        if active_masked is not None:
+            from .kernel import DEEPGEMM_MASKED_PAGE
+
+            unbacked = valid_requests[:, None] & ~valid_pages[requests]
+            active_masked.copy_(
+                torch.where(unbacked, active_blocks | DEEPGEMM_MASKED_PAGE, active_blocks)
+            )
 
     @staticmethod
     def context_workspace_bytes_per_token(model_config) -> int:
@@ -3374,6 +3404,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         num_sms: int,
         *,
         num_owners: int = 1,
+        attention_dp: bool = False,
     ) -> int:
         """Exact retained bytes for one native index descriptor arena, including schedule.
 
@@ -3385,11 +3416,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         if min(request_capacity, query_capacity, max_positions, topk, num_sms, num_owners) < 0:
             raise ValueError("CSA2 workspace capacities must be nonnegative")
+        from tensorrt_llm._utils import is_blackwell_datacenter
+
         pages_per_request = max(1, (max_positions + 63) // 64)
-        # Per query: int32 block table and one validity byte per page, context
-        # and visible lengths, the split-row request context, and the exact radix
-        # TopK scratch.
-        per_query = pages_per_request * (4 + 1) + 12 + 80 * topk
+        # Per query: int32 block table (and with attention TP on SM100/SM103 its masked-page copy
+        # for DeepGEMM) and one validity byte per page, context and visible lengths, the split-row
+        # request context, and the exact radix TopK scratch.
+        table_bytes = 8 if is_blackwell_datacenter() and not attention_dp else 4
+        per_query = pages_per_request * (table_bytes + 1) + 12 + 80 * topk
         return query_capacity * per_query + num_owners * (num_sms + 1) * 2 * 4
 
     @staticmethod
