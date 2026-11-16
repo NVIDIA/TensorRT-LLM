@@ -175,8 +175,6 @@ def build_mla_decode_task_manager(
     acc_output=None,
     lse=None,
     acc_lse=None,
-    softmax_stats=None,
-    # Domain (k_tile_count)
     domain=4,
     # Persistent loop support
     work_queue=None,
@@ -482,7 +480,6 @@ def build_mla_decode_task_manager(
     tmem_s = TmemSResource(
         page_offsets=page_offsets,
         kv_bounds=kv_bounds,
-        store_softmax_stats=softmax_stats is not None,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -533,7 +530,6 @@ def build_mla_decode_task_manager(
         partial_output=acc_output,
         lse=lse,
         partial_lse=acc_lse,
-        softmax_stats=softmax_stats,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
         attention_sinks=attention_sinks,
@@ -888,7 +884,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
     """
 
     lse_base_on_e = False
-    store_softmax_stats = False
 
     def __init__(
         self,
@@ -915,7 +910,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         zero_empty_rows: bool = True,
         softmax_rescale_threshold_log2: float = 0.0,
         fixed_seqlen: bool = False,
-        store_softmax_stats: bool = False,
     ):
         """
         Parameters
@@ -1040,7 +1034,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
         )
-        self.store_softmax_stats = store_softmax_stats
         self.num_q_tiles = self.query_tile_layout.num_tiles
         self.tail_q_rows = self.query_tile_layout.tail_rows
         self.parallel_reduction_topology: ParallelReductionTopology | None = None
@@ -1074,7 +1067,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.acc_dtype,
             self.lse_dtype,
             self.lse_base_on_e,
-            self.store_softmax_stats,
             self.mma_qk_tiler_mn,
             self.mma_pv_tiler_mn,
             self.max_active_clusters,
@@ -1258,7 +1250,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
-        softmax_stats=None,
         kv_bounds=None,
     ):
         """Execute the MLA decode TS kernel."""
@@ -1700,7 +1691,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(self.use_kv_bounds and self.zero_empty_rows):
             from ..helpers.kv_bounds import initialize_empty_rows
 
-            initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)
+            initialize_empty_rows(o, lse, kv_bounds, stream)
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1728,8 +1719,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             tma_desc_sparse_rope,
             tma_desc_sparse_extra_rope,
             max_q_len,
-            softmax_stats,
-            softmax_scale,
             kv_bounds,
         ).launch(
             grid=grid,
@@ -1760,8 +1749,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     if self.static_split_kv is None and not self.is_var_split_kv
                     else None,
                     max_q_len=max_q_len,
-                    softmax_stats=softmax_stats,
-                    softmax_stats_scale=softmax_scale,
                 ).launch(
                     grid=(
                         (
@@ -1807,8 +1794,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             else None,
                             max_q_len=max_q_len,
                             local_split_capacity=2,
-                            softmax_stats=softmax_stats,
-                            softmax_stats_scale=softmax_scale,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1842,8 +1827,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             else None,
                             max_q_len=max_q_len,
                             local_split_capacity=4,
-                            softmax_stats=softmax_stats,
-                            softmax_stats_scale=softmax_scale,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1876,8 +1859,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             if self.static_split_kv is None and not self.is_var_split_kv
                             else None,
                             max_q_len=max_q_len,
-                            softmax_stats=softmax_stats,
-                            softmax_stats_scale=softmax_scale,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1913,8 +1894,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                         if self.static_split_kv is None and not self.is_var_split_kv
                         else None,
                         max_q_len=max_q_len,
-                        softmax_stats=softmax_stats,
-                        softmax_stats_scale=softmax_scale,
                     ).launch(
                         grid=(
                             ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1966,8 +1945,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         tma_desc_sparse_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         max_q_len: cutlass.Int32 = 0,
-        softmax_stats=None,
-        softmax_stats_scale=None,
         kv_bounds: cute.Tensor | None = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
@@ -2437,7 +2414,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
-                softmax_stats=softmax_stats,
                 domain=Int32(1),  # dummy; MlaTask recomputes per-task to avoid spills
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
@@ -2521,7 +2497,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             # Set runtime params on GmemO (epilogue)
             named_res["gmem_o"].output_scale = output_scale
             named_res["gmem_o"].scale_softmax_log2 = scale_softmax_log2
-            named_res["gmem_o"].softmax_stats_scale = softmax_stats_scale
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
@@ -2606,8 +2581,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         split_divisor=None,
         max_q_len: cutlass.Int32 = 0,
         local_split_capacity: cutlass.Constexpr[int] = 0,
-        softmax_stats=None,
-        softmax_stats_scale=None,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2641,8 +2614,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             REDUCTION_ROWS_PER_CTA,
             split_divisor=split_divisor,
             runtime_seq_len_q=seq_len_q,
-            softmax_stats=softmax_stats,
-            softmax_stats_scale=softmax_stats_scale,
         )
 
     @cute.kernel
@@ -2659,8 +2630,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         output_quant_args=None,
         split_divisor=None,
         max_q_len: cutlass.Int32 = 0,
-        softmax_stats=None,
-        softmax_stats_scale=None,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2704,6 +2673,4 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             split_divisor=split_divisor,
-            softmax_stats=softmax_stats,
-            softmax_stats_scale=softmax_stats_scale,
         )

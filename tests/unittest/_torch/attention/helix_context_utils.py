@@ -381,7 +381,8 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             bounds = params.meta.helix_kv_bounds[: params.num_tokens]
             empty = bounds == 0
             active = ~empty
-            stats = params.fwd.softmax_stats_tensor
+            assert params.fwd.softmax_stats_is_lse
+            stats = params.fwd.softmax_stats
             if not graph_checked:
                 assert params.seq_offset == 1
                 positions = params.meta.helix_position_offsets[: params.num_tokens].view(

@@ -28,7 +28,6 @@ from .config import (
 from ..helpers.constants import STANDALONE_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.mask import MaskType, mask_visible_k_length
-from ..helpers.softmax_stats import store_reduced_softmax_stats
 from ..helpers.ops import (
     fmax_f32,
     warp_reduce_max_f32,
@@ -58,8 +57,6 @@ def run_reduction_kernel(
     rows_per_cta: cutlass.Constexpr[int],
     split_divisor=None,
     runtime_seq_len_q=None,
-    softmax_stats=None,
-    softmax_stats_scale=None,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -236,14 +233,6 @@ def run_reduction_kernel(
                 (lse.iterator.raw_ptr() + Int64(public_flat_query_row)).store(
                     final_lse(global_lse, cfg.lse_base_on_e)
                 )
-            store_reduced_softmax_stats(
-                softmax_stats,
-                public_flat_query_row,
-                acc_lse,
-                acc_lse_tile,
-                local_split_kv,
-                softmax_stats_scale,
-            )
         for i in cutlass.range_constexpr(lse_per_thread):
             if Int32(i * cfg.threads_per_warp) < local_split_kv:
                 split_kv_idx = lane_idx + i * cfg.threads_per_warp

@@ -194,6 +194,8 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
         )
         metadata.prepare()
 
+        partition_lse = False
+
         def run_partition(
             partition_k: torch.Tensor,
             partition_v: torch.Tensor,
@@ -201,22 +203,27 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
             mask: PredefinedAttentionMask,
             stats: torch.Tensor | None,
         ) -> torch.Tensor:
+            nonlocal partition_lse
             # These are the same runtime length views updated by MLA's chunked-context loop.
             metadata.kv_lens_runtime = torch.tensor(lengths, dtype=torch.int32)
             metadata.kv_lens_cuda_runtime = metadata.kv_lens_runtime.to("cuda")
             metadata.host_total_kv_lens[0] = sum(lengths)
-            return attn.forward(
+            forward_args = AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                attention_mask=mask,
+                softmax_stats_tensor=stats,
+            )
+            output = attn.forward(
                 q,
                 partition_k,
                 partition_v,
                 metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=AttentionInputType.context_only,
-                    latent_cache=None,
-                    attention_mask=mask,
-                    softmax_stats_tensor=stats,
-                ),
+                forward_args=forward_args,
             )
+            partition_lse = forward_args.softmax_stats_is_lse
+            assert partition_lse == (stats is not None)
+            return output
 
         cached = run_partition(k, v, case.token_nums, PredefinedAttentionMask.CAUSAL, None)
         torch.testing.assert_close(cached, reference, atol=atol, rtol=rtol)
@@ -230,18 +237,23 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
             PredefinedAttentionMask.FULL,
             temp_stats,
         )
-        attn.merge_attention_for_mla(
+        merged_lse = attn.merge_attention_for_mla(
             merged,
             historical,
             merged_stats,
             temp_stats,
             torch.tensor([2, 0, 2], dtype=torch.int64, device="cuda"),
             metadata,
+            previous_lse=None,
+            current_lse=partition_lse,
         )
         # The empty historical request must remain untouched until the fresh partition copies it.
         empty_rows = slice(case.seq_lens[0], sum(case.seq_lens[:2]))
         assert torch.isnan(merged[empty_rows]).all()
-        assert torch.isnan(merged_stats[empty_rows]).all()
+        normalizer = merged_stats.view(-1)[: case.nnz_q * case.num_heads].view(
+            case.nnz_q, case.num_heads
+        )
+        assert torch.isnan(normalizer[empty_rows]).all()
         fresh = run_partition(
             fresh_k, fresh_v, case.seq_lens, PredefinedAttentionMask.CAUSAL, temp_stats
         )
@@ -252,8 +264,10 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
             temp_stats,
             torch.tensor([1, 2, 1], dtype=torch.int64, device="cuda"),
             metadata,
+            previous_lse=merged_lse,
+            current_lse=partition_lse,
         )
-        assert torch.isfinite(merged_stats).all()
+        assert torch.isfinite(normalizer).all()
         torch.testing.assert_close(merged, reference, atol=atol, rtol=rtol)
         torch.testing.assert_close(merged[empty_rows], fresh[empty_rows], atol=0, rtol=0)
         assert context_calls == [

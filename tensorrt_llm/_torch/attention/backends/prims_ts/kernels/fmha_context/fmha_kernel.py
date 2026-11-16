@@ -139,7 +139,6 @@ Entry points:
   - FmhaTs                   -- class with @cute.jit __call__ and kernel
 """
 
-import math
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -340,6 +339,20 @@ def _init_causal_domain_state(
     task._packed_window = packed_window
 
 
+def _writes_empty_dense_lse(cfg: FmhaConfig) -> bool:
+    """Publish neutral O/LSE for empty ordinary contiguous dense requests."""
+    return (
+        cfg.lse_mode != "none"
+        and not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.use_paged_kv
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+    )
+
+
 class PackedDenseDomainTask(Task):
     """Request-local dense KV extent with one masked tile for empty rows."""
 
@@ -369,7 +382,7 @@ class PackedDenseDomainTask(Task):
         k_begin = Int32(self._cum_seqlen_k[batch_coord])
         seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
         runtime_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
-        # Empty KV still traverses HEAD/TAIL to write zero O and (-inf, 0).
+        # Keep the paired N/N-1 pipeline domain valid even for an empty request.
         domain = _domain_min(self._num_kv_tiles, _domain_max(1, runtime_tiles))
         return domain - self._offset
 
@@ -748,9 +761,7 @@ def build_context_task_manager(
     output_scale: Float32 | cute.Tensor | None = None,
     lse_output: cute.Tensor | None = None,
     attention_sinks: cute.Tensor | None = None,
-    softmax_stats: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
-    stats_scale: Float32 | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
@@ -847,8 +858,6 @@ def build_context_task_manager(
         ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
         peer_dealloc_mbar_alloc, work_queue, clc_response_alloc)``.
     """
-    if softmax_stats is not None and cfg.corr_skip_threshold_log2 > 0:
-        raise ValueError("softmax statistics require corr_skip_threshold_log2=0")
     if cfg.use_paged_kv:
         if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
             raise ValueError(
@@ -1241,9 +1250,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
-                keep_empty_kv=softmax_stats is not None
-                and not cfg.use_paged_kv
-                and not cfg.is_causal,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -1264,9 +1271,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
-                keep_empty_kv=softmax_stats is not None
-                and not cfg.use_paged_kv
-                and not cfg.is_causal,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -1337,7 +1342,6 @@ def build_context_task_manager(
         sage_scales=sage_scales,
         num_kv_heads=num_kv_heads,
         smem_k=smem_kv,
-        store_softmax_stats=softmax_stats is not None,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1356,8 +1360,6 @@ def build_context_task_manager(
         output_scale=output_scale,
         lse_output=lse_output,
         attention_sinks=attention_sinks,
-        softmax_stats=softmax_stats,
-        stats_scale=stats_scale,
         cum_seqlen_q=cum_seqlen_q,
         query_seq_len=variable_window_q_stride,
         peer_idx=0,
@@ -1448,7 +1450,6 @@ def build_context_task_manager(
             num_kv_heads=num_kv_heads,
             score_seed_owner=tmem_sp0,
             smem_k=smem_kv,
-            store_softmax_stats=softmax_stats is not None,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1459,8 +1460,6 @@ def build_context_task_manager(
             output_scale=output_scale,
             lse_output=lse_output,
             attention_sinks=attention_sinks,
-            softmax_stats=softmax_stats,
-            stats_scale=stats_scale,
             cum_seqlen_q=cum_seqlen_q,
             query_seq_len=variable_window_q_stride,
             peer_idx=1,
@@ -2935,7 +2934,6 @@ def build_fmha_task_manager(
     output_scale: Float32 | cute.Tensor | None = None,
     lse_output: cute.Tensor | None = None,
     attention_sinks: cute.Tensor | None = None,
-    softmax_stats: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
@@ -2951,7 +2949,6 @@ def build_fmha_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool | None = None,
-    stats_scale: Float32 | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -3046,8 +3043,6 @@ def build_fmha_task_manager(
         num_kv_heads=num_kv_heads,
         lse_output=lse_output,
         attention_sinks=attention_sinks,
-        softmax_stats=softmax_stats,
-        stats_scale=stats_scale,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3115,13 +3110,7 @@ class FmhaTs:
         Number of GQA head repeats (default: 1). Head-paired mode requires
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
-        Skip O rescaling when the maximum is unchanged or no prior keys were
-        visible (default: True). Independent of lazy maximum updates below.
-    corr_skip_threshold_log2 : float, optional
-        Defer maximum updates up to this base-2 logit increase, in [0, 8]. Zero
-        keeps exact maxima and is required when exporting softmax statistics.
-        None retains the default threshold of 8 when correction skipping is
-        enabled, or 0 otherwise. VC-Attention requires zero.
+        Enable skip-correction for softmax rescaling (default: True).
     uses_ldtm_stat : bool, optional
         Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
         into the TMEM S load on the non-masked path (default: False). The
@@ -3183,7 +3172,6 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
-        corr_skip_threshold_log2: float | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3303,22 +3291,11 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        # VC-Attention cannot defer maximum updates: a larger score relative
-        # to a stale maximum can code past VC_EXPCAST_CODE_BIAS and out of the
-        # E4M3 range. The exact per-tile max keeps every code at or below it.
-        if corr_skip_threshold_log2 is None:
-            corr_skip_threshold_log2 = (
-                _CORR_SKIP_THRESHOLD_LOG2
-                if enable_skip_correction and not cfg.vc_attention
-                else 0.0
-            )
-        if not math.isfinite(corr_skip_threshold_log2) or not (
-            0 <= corr_skip_threshold_log2 <= _CORR_SKIP_THRESHOLD_LOG2
-        ):
-            raise ValueError("corr_skip_threshold_log2 must be finite and in [0, 8]")
-        if cfg.vc_attention and corr_skip_threshold_log2 > 0:
-            raise ValueError("VC-Attention requires corr_skip_threshold_log2=0")
-        cfg.corr_skip_threshold_log2 = corr_skip_threshold_log2
+        # VC-Attention skips no correction. The skip keeps a stale row max,
+        # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
+        # the E4M3 range. The exact per-tile max keeps every code at or below it.
+        if enable_skip_correction and not cfg.vc_attention:
+            cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         cfg.kv_ring_stages = kv_ring_stages
@@ -3504,8 +3481,6 @@ class FmhaTs:
         sage_scales: cute.Tensor | None = None,
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
-        softmax_stats: cute.Tensor | None = None,
-        stats_scale: Float32 | cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3901,9 +3876,7 @@ class FmhaTs:
                 self.is_clc_dynamic,
                 lse_output,
                 attention_sinks,
-                softmax_stats,
                 dense_tail_capacity=capacity,
-                stats_scale=stats_scale,
             ).launch(
                 grid=grid,
                 block=[block_size, 1, 1],
@@ -3963,9 +3936,7 @@ class FmhaTs:
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
-        softmax_stats: cute.Tensor | None = None,
         dense_tail_capacity: cutlass.Constexpr[int] = 0,
-        stats_scale: Float32 | cute.Tensor | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -3998,8 +3969,6 @@ class FmhaTs:
             scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
         else:
             scale_softmax_log2 = softmax_scale_operand
-        if cutlass.const_expr(isinstance(stats_scale, cute.Tensor)):
-            stats_scale = stats_scale[0]
         if cutlass.const_expr(
             isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
         ):
@@ -4054,8 +4023,6 @@ class FmhaTs:
             num_kv_heads=num_kv_heads,
             lse_output=lse_output,
             attention_sinks=attention_sinks,
-            softmax_stats=softmax_stats,
-            stats_scale=stats_scale,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
@@ -4151,10 +4118,7 @@ class FmhaTs:
 
         # 7. Execute all tasks via the TS scheduler
         active_request = cutlass.Boolean(True)
-        if cutlass.const_expr(
-            not is_persistent
-            and (softmax_stats is None or cfg.use_paged_kv or cfg.is_causal)
-        ):
+        if cutlass.const_expr(not is_persistent and not _writes_empty_dense_lse(cfg)):
             batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
             if cutlass.const_expr(seq_lens_kv is not None):
                 active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)

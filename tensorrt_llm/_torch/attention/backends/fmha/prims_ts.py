@@ -1040,7 +1040,7 @@ class PrimsTSFmha(PhasedFmha):
         kv_dtype: torch.dtype,
         output_dtype: torch.dtype,
         mask_type: str,
-        store_softmax_stats: bool = False,
+        lse_mode: str = "none",
         use_kv_bounds: bool = False,
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
@@ -1072,7 +1072,7 @@ class PrimsTSFmha(PhasedFmha):
             kv_dtype=kv_dtype,
             out_dtype=output_dtype,
             mask_type=mask_type,
-            store_softmax_stats=store_softmax_stats,
+            lse_mode=lse_mode,
             use_kv_bounds=use_kv_bounds,
         )
         # Helix neutralizes empty rows before combining the ranks' partials.
@@ -1325,7 +1325,6 @@ class PrimsTSFmha(PhasedFmha):
                 kv_dtype=kernel_dtype,
                 out_dtype=forward_args.output.dtype,
                 mask_type=mask_type,
-                store_softmax_stats=forward_args.softmax_stats_tensor is not None,
                 use_kv_bounds=metadata.helix_position_offsets is not None,
                 device=q.device,
                 validate=False,
@@ -1498,6 +1497,8 @@ class PrimsTSFmha(PhasedFmha):
         )
         mask = self._get_prims_mask_type(fwd)
         stats = fwd.softmax_stats_tensor
+        fwd.softmax_stats_is_lse = stats is not None
+        lse = fwd.softmax_stats.squeeze(-1) if stats is not None else None
         # Dense cached chunks traverse the planned KV domain. Bucket current
         # capacities instead of traversing max_seq_len for every small chunk.
         q_capacity, kv_capacity = _mla_context_capacities(
@@ -1538,7 +1539,7 @@ class PrimsTSFmha(PhasedFmha):
                 out_dtype=params.output.dtype,
                 packed_query=True,
                 mask_type=mask,
-                store_softmax_stats=stats is not None,
+                lse_mode="base2" if stats is not None else "none",
             )
             # Planning needs only the scale operand kinds. Do not retain views
             # of the profiling workspace; every run supplies its current scales.
@@ -1566,7 +1567,7 @@ class PrimsTSFmha(PhasedFmha):
             qo_indptr,
             kv_indptr,
             out=params.output,
-            softmax_stats=stats,
+            lse=lse,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             validate=False,
@@ -1996,8 +1997,9 @@ class PrimsTSFmha(PhasedFmha):
             else:
                 raise RuntimeError("Helix MLA multi-token generation requires per-token KV bounds.")
         stats = params.fwd.softmax_stats_tensor
+        params.fwd.softmax_stats_is_lse = stats is not None
         if stats is not None:
-            stats = stats.view(batch_size, seq_len_q, attn.num_heads, 2)
+            stats = params.fwd.softmax_stats.view(batch_size, seq_len_q, attn.num_heads)
         caller_workspace = params.workspace.reshape(-1).view(torch.uint8)
         wrapper = self._get_or_plan_mla_decode_wrapper(
             caller_workspace,
@@ -2012,7 +2014,7 @@ class PrimsTSFmha(PhasedFmha):
             kv_dtype=kv_cache.dtype,
             output_dtype=output.dtype,
             mask_type=mask_type,
-            store_softmax_stats=stats is not None,
+            lse_mode="base2" if stats is not None else "none",
             use_kv_bounds=kv_bounds is not None,
         )
         wrapper.run(
@@ -2023,7 +2025,7 @@ class PrimsTSFmha(PhasedFmha):
             out=output,
             softmax_scale=bmm1_scale,
             output_scale=bmm2_scale,
-            softmax_stats=stats,
+            lse=stats,
             kv_bounds=kv_bounds,
             validate=False,
         )

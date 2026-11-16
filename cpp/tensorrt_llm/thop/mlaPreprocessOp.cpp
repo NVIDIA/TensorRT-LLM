@@ -89,7 +89,7 @@ template <typename T>
 void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
     torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
     torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
-    int64_t const num_heads, int64_t const head_size)
+    int64_t const num_heads, int64_t const head_size, bool previous_lse, bool current_lse)
 {
     auto stream = at::cuda::getCurrentCUDAStream(merged_attn.get_device());
     T* merged_attn_ptr = static_cast<T*>(merged_attn.data_ptr());
@@ -101,7 +101,7 @@ void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor
 
     tensorrt_llm::kernels::invokeMergeAttnWithSoftmax(merged_attn_ptr, merged_softmax_stats_ptr, merged_attn_ptr,
         merged_softmax_stats_ptr, temp_attn_ptr, temp_softmax_stats_ptr, num_requests, cu_q_seq_lens_ptr, max_q_seq_len,
-        merge_op_ptr, num_heads, head_size, stream);
+        merge_op_ptr, num_heads, head_size, stream, previous_lse, current_lse);
 }
 
 } // namespace
@@ -539,7 +539,7 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
 void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
     torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
     torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
-    int64_t const num_heads, int64_t const head_size)
+    int64_t const num_heads, int64_t const head_size, bool previous_lse, bool current_lse)
 {
     TORCH_CHECK(merged_attn.numel() > 0);
     TORCH_CHECK(temp_attn.numel() > 0);
@@ -548,21 +548,32 @@ void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const
         || merged_attn.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(temp_softmax_stats.scalar_type() == merged_softmax_stats.scalar_type());
     TORCH_CHECK(merged_softmax_stats.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(head_size > 0 && merged_attn.numel() % head_size == 0);
+    int64_t const rows = merged_attn.numel() / head_size;
+    TORCH_CHECK(merged_softmax_stats.is_contiguous() && temp_softmax_stats.is_contiguous(),
+        "MLA merge statistics must be contiguous");
+    TORCH_CHECK(merged_softmax_stats.numel() >= rows * (previous_lse ? 1 : 2)
+            && temp_softmax_stats.numel() >= rows * (current_lse ? 1 : 2),
+        "MLA merge statistics capacity does not match the selected format");
+    TORCH_CHECK(
+        merged_softmax_stats.device() == merged_attn.device() && temp_softmax_stats.device() == merged_attn.device(),
+        "MLA merge statistics must be on the output device");
 
     if (merged_attn.scalar_type() == torch::kFloat16)
     {
         mergeChunkedAttentionForMLAHelper<half>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size, previous_lse, current_lse);
     }
     else if (merged_attn.scalar_type() == torch::kFloat32)
     {
         mergeChunkedAttentionForMLAHelper<float>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size, previous_lse, current_lse);
     }
     else if (merged_attn.scalar_type() == torch::kBFloat16)
     {
         mergeChunkedAttentionForMLAHelper<__nv_bfloat16>(merged_attn, temp_attn, merged_softmax_stats,
-            temp_softmax_stats, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            temp_softmax_stats, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size,
+            previous_lse, current_lse);
     }
 }
 
@@ -746,6 +757,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor merge_op"
         ", int num_heads"
         ", int head_size"
+        ", bool previous_lse=False"
+        ", bool current_lse=False"
         ") -> ()");
 }
 

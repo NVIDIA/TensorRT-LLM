@@ -34,7 +34,7 @@ def query_kv_bound(kv_bounds, cu_seqlens_q, batch_idx, logical_q_idx, seq_len_q)
 
 
 @cute.kernel
-def initialize_empty_query_rows(output, lse, softmax_stats, kv_bounds):
+def initialize_empty_query_rows(output, lse, kv_bounds):
     """Publish identity rows even when the main schedule skips an empty cache.
 
     The public tensors have contiguous token/head storage before their
@@ -52,19 +52,12 @@ def initialize_empty_query_rows(output, lse, softmax_stats, kv_bounds):
         if thread == Int32(0):
             if cutlass.const_expr(lse is not None):
                 (lse.iterator.raw_ptr() + row).store(Float32(-Float32.inf))
-            if cutlass.const_expr(softmax_stats is not None):
-                (softmax_stats.iterator.raw_ptr() + row * Int64(2)).store(
-                    Float32(-Float32.inf)
-                )
-                (softmax_stats.iterator.raw_ptr() + row * Int64(2) + Int64(1)).store(
-                    Float32(0)
-                )
 
 
 @cute.jit
-def initialize_empty_rows(output, lse, softmax_stats, kv_bounds, stream):
+def initialize_empty_rows(output, lse, kv_bounds, stream):
     """Launch the bounded-mode neutral writer on the caller's stream."""
-    initialize_empty_query_rows(output, lse, softmax_stats, kv_bounds).launch(
+    initialize_empty_query_rows(output, lse, kv_bounds).launch(
         grid=(cute.size(kv_bounds) * output.shape[0], 1, 1),
         block=(128, 1, 1),
         stream=stream,

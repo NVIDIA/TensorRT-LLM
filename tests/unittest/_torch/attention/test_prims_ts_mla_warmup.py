@@ -59,7 +59,7 @@ def _geometry(**overrides: object) -> _warmup._MlaContextPlan:
         packed_query=True,
         mask_type="causal",
         window_left=-1,
-        store_softmax_stats=False,
+        lse_mode="none",
         softmax_scale=1.0,
         output_scale=1.0,
     )
@@ -206,7 +206,7 @@ def planners(
     workspace_size = create_autospec(
         decode_api.get_prims_ts_batch_mla_decode_workspace_size,
         side_effect=lambda **kwargs: (128 - kwargs["batch_size"]) * kwargs["max_q_len"]
-        + 1024 * kwargs["store_softmax_stats"],
+        + 1024 * kwargs["use_kv_bounds"],
     )
     package.get_prims_ts_batch_mla_decode_workspace_size = workspace_size
     allocations = []
@@ -276,7 +276,7 @@ def _decode_profile(**overrides: object) -> _warmup._MlaDecodePlan:
         kv_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16,
         mask_type="causal",
-        store_softmax_stats=False,
+        lse_mode="none",
         use_kv_bounds=False,
     )
     return _warmup._MlaDecodePlan(**(fields | overrides))
@@ -320,7 +320,7 @@ def test_context_public_planning_and_model_profile_dedup(planners: SimpleNamespa
             c.kwargs["max_q_len"],
             c.kwargs["max_kv_len"],
             c.kwargs["mask_type"],
-            c.kwargs["store_softmax_stats"],
+            c.kwargs["lse_mode"] == "base2",
         )
         for c in planners.context.plan.call_args_list
     } == set(_profiles())
@@ -370,7 +370,7 @@ def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
     base = _decode_profile()
     modes = (
         base,
-        replace(base, store_softmax_stats=True, use_kv_bounds=True),
+        replace(base, lse_mode="base2", use_kv_bounds=True),
         replace(base, max_q_len=8),
         replace(base, device=torch.device("cuda:1")),
     )

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -719,6 +720,29 @@ class TestHelixNcclReformatCompile(unittest.TestCase):
                 torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
         assert self._num_compiled(_helix_nccl_pre_alltoall) == num_shapes
         assert self._num_compiled(_helix_nccl_post_alltoall) == num_shapes
+
+
+@pytest.mark.parametrize("cp_dim", [0, 1, 2], ids=["nccl", "fifo-v2", "fifo-v1"])
+def test_helix_lse_empty_rows(cp_dim):
+    """Each layout must ignore empty partials and return zero for all-empty rows."""
+    torch.manual_seed(42)
+    partial = torch.randn(4, 8, 3, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.randn(4, 8, 3, 1, device="cuda") * 80
+    lse[3] = -torch.inf
+    partial[3] = torch.nan
+    lse[:, 0] = -torch.inf
+    partial[:, 0] = torch.nan
+    weights = (lse.double() * math.log(2)).softmax(dim=0).nan_to_num()
+    expected = torch.where(weights > 0, partial.double() * weights, 0).sum(dim=0).flatten(1)
+    if cp_dim == 0:
+        output = torch.ops.trtllm.helix_post_process(partial.flatten(2), lse, 1.0, True)
+    else:
+        order = (1, 0, 2, 3) if cp_dim == 1 else (1, 2, 0, 3)
+        output = torch.ops.trtllm.helix_post_process_native(
+            partial.permute(order).contiguous(), lse.permute(order).contiguous(), 1.0, cp_dim, True
+        )
+    torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-2)
+    assert torch.count_nonzero(output[0]) == 0
 
 
 if __name__ == "__main__":

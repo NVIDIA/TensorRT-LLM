@@ -1482,7 +1482,13 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
         wrapper.run.call_args.args[4], torch.tensor([0, 3, 9], dtype=torch.int32)
     )
     assert wrapper.run.call_args.args[3] is qo_indptr
-    assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
+    lse = wrapper.run.call_args.kwargs["lse"]
+    assert params.fwd.softmax_stats_is_lse is store_softmax_stats
+    if store_softmax_stats:
+        assert lse.shape == (5, num_heads)
+        assert lse.data_ptr() == stats.data_ptr()
+    else:
+        assert lse is None
     assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, num_heads, head_dim)
     assert wrapper.run.call_args.args[2].shape == (9, num_heads, v_head_dim)
@@ -1500,7 +1506,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
         assert fmha._mla_context_workspace_layout(q, longer_k, 2)[1] == workspace_bytes
     assert wrapper.plan.call_args.kwargs["head_dim"] == head_dim
     assert wrapper.plan.call_args.kwargs["head_dim_vo"] == v_head_dim
-    assert wrapper.plan.call_args.kwargs["store_softmax_stats"] is store_softmax_stats
+    assert wrapper.plan.call_args.kwargs["lse_mode"] == ("base2" if store_softmax_stats else "none")
     assert wrapper.plan.call_args.kwargs["max_q_len"] == (256 if head_dim == 192 else 4)
     assert wrapper.plan.call_args.kwargs["max_kv_len"] == (128 if head_dim == 192 else 8)
     processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
@@ -2191,7 +2197,7 @@ def _get_test_mla_wrapper(
         kv_dtype=torch.bfloat16,
         output_dtype=torch.bfloat16,
         mask_type=mask_type,
-        store_softmax_stats=store_softmax_stats,
+        lse_mode="base2" if store_softmax_stats else "none",
         use_kv_bounds=use_kv_bounds,
     )
 
@@ -2326,7 +2332,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         "kv_dtype": kernel_dtype,
         "out_dtype": torch.bfloat16,
         "mask_type": "causal",
-        "store_softmax_stats": helix,
+        "lse_mode": "base2" if helix else "none",
         "use_kv_bounds": helix,
         "zero_empty_rows": False,
     }
@@ -2357,11 +2363,13 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         assert run_kwargs["kv_bounds"].data_ptr() == expected_bounds.data_ptr()
         assert run_kwargs["kv_bounds"].shape == (num_tokens,)
         torch.testing.assert_close(run_kwargs["kv_bounds"], expected_bounds)
-        assert run_kwargs["softmax_stats"].shape == (2, query_width, attn.num_heads, 2)
-        assert run_kwargs["softmax_stats"].data_ptr() == stats.data_ptr()
+        assert forward_args.softmax_stats_is_lse
+        assert run_kwargs["lse"].shape == (2, query_width, attn.num_heads)
+        assert run_kwargs["lse"].data_ptr() == stats.data_ptr()
     else:
         assert run_kwargs["kv_bounds"] is None
-        assert run_kwargs["softmax_stats"] is None
+        assert not forward_args.softmax_stats_is_lse
+        assert run_kwargs["lse"] is None
 
     block_tables[:, 0].add_(20)
     block_tables[:, 1].add_(200)
@@ -2801,7 +2809,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     assert workspace_size.call_args.kwargs["kv_dtype"] == kernel_dtype
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
     assert workspace_size.call_args.kwargs["max_q_len"] == query_width
-    assert workspace_size.call_args.kwargs["store_softmax_stats"] == with_stats
+    assert "store_softmax_stats" not in workspace_size.call_args.kwargs
     assert workspace_size.call_args.kwargs["use_kv_bounds"] == with_bounds
     assert workspace_size.call_args.kwargs["validate"] is False
     assert workspace.numel() == 48

@@ -3006,7 +3006,6 @@ class TmemSPResource(MemoryResource):
     # 0 for SP0 (uses Q0), 1 for SP1 (uses Q1).
     q_half: Constexpr[int] = 0
     enable_early_tile_sum: Constexpr[bool] = False
-    store_softmax_stats: Constexpr[bool] = False
     q_offset_default: int | Int32 = field(init=False, default=0)
     max_seq_len_kv: int | Int32 = field(init=False, default=0)
     # Valid K/V rows of the final tile, computed once when the lengths bind.
@@ -3107,7 +3106,6 @@ class TmemSPResource(MemoryResource):
         num_kv_heads: int | Int32 = 0,
         score_seed_owner: Optional["TmemSPResource"] = None,
         smem_k: Optional[SmemKVResource] = None,
-        store_softmax_stats: bool = False,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata.
@@ -3130,7 +3128,6 @@ class TmemSPResource(MemoryResource):
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
         self.enable_early_tile_sum = cfg.enable_early_tile_sum
-        self.store_softmax_stats = store_softmax_stats
         self.q_offset_default = q_offset
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
@@ -4387,35 +4384,6 @@ class TmemSPResource(MemoryResource):
         return old_row_max, row_max
 
     @cute.jit
-    def _centered_scaled_score_pair(
-        self,
-        score_0: SoftmaxScalar,
-        score_1: SoftmaxScalar,
-        row_max: SoftmaxScalar,
-        scale: SoftmaxScalar,
-    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Center raw scores before scaling to avoid a large-logit FMA residual."""
-        anchor = Float32(
-            cutlass.select_(
-                row_max == Float32(_SOFTMAX_MASK_VALUE), Float32(0.0), row_max
-            )
-        )
-        centered = cute.arch.add_packed_f32x2(
-            (score_0, score_1),
-            (-anchor, -anchor),
-            rnd="rn",
-            ftz=False,
-        )
-        p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        return cute.arch.fma_packed_f32x2(
-            centered,
-            (scale, scale),
-            (p_scale_log2, p_scale_log2),
-            rnd="rn",
-            ftz=False,
-        )
-
-    @cute.jit
     def _exp2_p_store(
         self,
         stage_col_offset: TmemAddr,
@@ -4495,7 +4463,6 @@ class TmemSPResource(MemoryResource):
             s_data = _tmem_sp_sdata.pop(id(self))
         if cutlass.const_expr(
             self.cfg.exp2_packed_f16x2
-            and not self.store_softmax_stats
             and not block_scaled
             and (self.enable_early_tile_sum or partial)
         ):
@@ -4535,24 +4502,16 @@ class TmemSPResource(MemoryResource):
                             rnd="rn",
                             ftz=False,
                         )
-                if cutlass.const_expr(self.store_softmax_stats):
-                    fma_pair = self._centered_scaled_score_pair(
+                fma_pair = cute.arch.fma_packed_f32x2(
+                    (
                         s_data[chunk_idx][elem_idx],
                         s_data[chunk_idx][elem_idx + 1],
-                        row_max,
-                        scale,
-                    )
-                else:
-                    fma_pair = cute.arch.fma_packed_f32x2(
-                        (
-                            s_data[chunk_idx][elem_idx],
-                            s_data[chunk_idx][elem_idx + 1],
-                        ),
-                        (scale, scale),
-                        addend_pair,
-                        rnd="rn",
-                        ftz=False,
-                    )
+                    ),
+                    (scale, scale),
+                    addend_pair,
+                    rnd="rn",
+                    ftz=False,
+                )
                 if cutlass.const_expr(
                     elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
                 ):
@@ -4944,24 +4903,16 @@ class TmemSPResource(MemoryResource):
         num_chunks = num_values // tmem_x
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             for local_idx in cutlass.range_constexpr(0, fma_lookahead, 2):
-                if cutlass.const_expr(self.store_softmax_stats):
-                    fma_pair = self._centered_scaled_score_pair(
+                fma_pair = cute.arch.fma_packed_f32x2(
+                    (
                         s_data[chunk_idx][local_idx],
                         s_data[chunk_idx][local_idx + 1],
-                        row_max,
-                        scale,
-                    )
-                else:
-                    fma_pair = cute.arch.fma_packed_f32x2(
-                        (
-                            s_data[chunk_idx][local_idx],
-                            s_data[chunk_idx][local_idx + 1],
-                        ),
-                        (scale, scale),
-                        (minus_row_max_scale, minus_row_max_scale),
-                        rnd="rn",
-                        ftz=False,
-                    )
+                    ),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                    rnd="rn",
+                    ftz=False,
+                )
                 fma_ring[local_idx] = fma_pair[0]
                 fma_ring[local_idx + 1] = fma_pair[1]
 
@@ -4997,24 +4948,16 @@ class TmemSPResource(MemoryResource):
                 fma_1 = fma_ring[fma_idx + 1]
                 if cutlass.const_expr(local_idx + fma_lookahead < tmem_x):
                     future_idx = local_idx + fma_lookahead
-                    if cutlass.const_expr(self.store_softmax_stats):
-                        fma_pair = self._centered_scaled_score_pair(
+                    fma_pair = cute.arch.fma_packed_f32x2(
+                        (
                             s_data[chunk_idx][future_idx],
                             s_data[chunk_idx][future_idx + 1],
-                            row_max,
-                            scale,
-                        )
-                    else:
-                        fma_pair = cute.arch.fma_packed_f32x2(
-                            (
-                                s_data[chunk_idx][future_idx],
-                                s_data[chunk_idx][future_idx + 1],
-                            ),
-                            (scale, scale),
-                            (minus_row_max_scale, minus_row_max_scale),
-                            rnd="rn",
-                            ftz=False,
-                        )
+                        ),
+                        (scale, scale),
+                        (minus_row_max_scale, minus_row_max_scale),
+                        rnd="rn",
+                        ftz=False,
+                    )
                     fma_ring[fma_idx] = fma_pair[0]
                     fma_ring[fma_idx + 1] = fma_pair[1]
                 p_1 = cute.math.exp2(fma_1, fastmath=True)
@@ -5111,24 +5054,16 @@ class TmemSPResource(MemoryResource):
         for flat_idx in cutlass.range_constexpr(0, 8, 2):
             chunk_idx = flat_idx // tmem_x
             elem_idx = flat_idx % tmem_x
-            if cutlass.const_expr(self.store_softmax_stats):
-                fma_pair = self._centered_scaled_score_pair(
+            fma_pair = cute.arch.fma_packed_f32x2(
+                (
                     s_data[chunk_idx][elem_idx],
                     s_data[chunk_idx][elem_idx + 1],
-                    row_max,
-                    scale,
-                )
-            else:
-                fma_pair = cute.arch.fma_packed_f32x2(
-                    (
-                        s_data[chunk_idx][elem_idx],
-                        s_data[chunk_idx][elem_idx + 1],
-                    ),
-                    (scale, scale),
-                    (minus_row_max_scale, minus_row_max_scale),
-                    rnd="rn",
-                    ftz=False,
-                )
+                ),
+                (scale, scale),
+                (minus_row_max_scale, minus_row_max_scale),
+                rnd="rn",
+                ftz=False,
+            )
             fma_values += (fma_pair[0], fma_pair[1])
 
         p_values: tuple[Any, ...] = ()
@@ -5169,24 +5104,16 @@ class TmemSPResource(MemoryResource):
                 future_idx = flat_idx + 8
                 chunk_idx = future_idx // tmem_x
                 elem_idx = future_idx % tmem_x
-                if cutlass.const_expr(self.store_softmax_stats):
-                    fma_pair = self._centered_scaled_score_pair(
+                fma_pair = cute.arch.fma_packed_f32x2(
+                    (
                         s_data[chunk_idx][elem_idx],
                         s_data[chunk_idx][elem_idx + 1],
-                        row_max,
-                        scale,
-                    )
-                else:
-                    fma_pair = cute.arch.fma_packed_f32x2(
-                        (
-                            s_data[chunk_idx][elem_idx],
-                            s_data[chunk_idx][elem_idx + 1],
-                        ),
-                        (scale, scale),
-                        (minus_row_max_scale, minus_row_max_scale),
-                        rnd="rn",
-                        ftz=False,
-                    )
+                    ),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                    rnd="rn",
+                    ftz=False,
+                )
                 fma_values += (fma_pair[0], fma_pair[1])
             p1 = cute.math.exp2(fma_values[flat_idx + 1], fastmath=True)
             p_values += (p0, p1)
@@ -5586,12 +5513,6 @@ class TmemSPResource(MemoryResource):
             s_data[chunk_idx] = cutlass.Vector.from_elements(
                 tuple(masked_scores), self.cfg.qk_acc_dtype
             )
-        if cutlass.const_expr(self.store_softmax_stats):
-            # Fully masked earlier tiles use a safe zero exponent anchor.
-            # Discard it before the first visible tile so an all-negative
-            # valid row exports its actual maximum, not the safe anchor.
-            if window_start >= kv_tile_base:
-                row_max = Float32(-Float32.inf)
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit
@@ -5715,9 +5636,6 @@ class TmemSPResource(MemoryResource):
             # bottom-right windows can begin at a non-aligned Q/K offset.
             window_end = index_q + q_offset + Int32(1)
         s_data = self._mask_window_chunks(s_data, base_k, window_bound_left, window_end)
-        if cutlass.const_expr(self.store_softmax_stats):
-            if window_bound_left >= base_k:
-                row_max = Float32(-Float32.inf)
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -6007,9 +5925,7 @@ class TmemSPResource(MemoryResource):
                         (seq_tile_coord * self.cfg.q_tile_m - self.cfg.window_size_left)
                         // self.cfg.kv_tile_n,
                     )
-                if cutlass.const_expr(
-                    self.needs_window_tail_left_mask or self.store_softmax_stats
-                ):
+                if cutlass.const_expr(self.needs_window_tail_left_mask):
                     window_bound_left = bottom_right_window_left_bound(
                         index_q,
                         q_offset,
@@ -6028,11 +5944,6 @@ class TmemSPResource(MemoryResource):
             s_data = self._mask_window_chunks(
                 s_data, base_k, window_start, index_q + q_offset + Int32(1)
             )
-            if cutlass.const_expr(
-                self.store_softmax_stats and self.cfg.window_size_left > 0
-            ):
-                if window_bound_left >= base_k:
-                    row_max = Float32(-Float32.inf)
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit
@@ -6378,8 +6289,6 @@ class TmemStatsResource(MemoryResource):
     scale_softmax_log2: Float32 | None = field(init=False, default=None)
     output_scale: Float32 | cute.Tensor | None = field(init=False, default=None)
     lse_output: cute.Tensor | None = field(init=False, default=None)
-    softmax_stats: cute.Tensor | None = field(init=False, default=None)
-    stats_scale: Float32 | None = field(init=False, default=None)
     attention_sinks: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     query_seq_len: Int32 | int = field(init=False, default=0)
@@ -6404,8 +6313,6 @@ class TmemStatsResource(MemoryResource):
         scale_softmax_log2: Float32 | None = None,
         output_scale: Float32 | cute.Tensor | None = None,
         lse_output: cute.Tensor | None = None,
-        softmax_stats: cute.Tensor | None = None,
-        stats_scale: Float32 | None = None,
         attention_sinks: cute.Tensor | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         query_seq_len: Int32 | int = 0,
@@ -6419,8 +6326,6 @@ class TmemStatsResource(MemoryResource):
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
         self.lse_output = lse_output
-        self.softmax_stats = softmax_stats
-        self.stats_scale = stats_scale
         self.attention_sinks = attention_sinks
         self.cum_seqlen_q = cum_seqlen_q
         self.query_seq_len = query_seq_len
@@ -6707,11 +6612,7 @@ class TmemStatsResource(MemoryResource):
             vec_old_max = vec_new_max
         if cutlass.const_expr(
             final_stats
-            and (
-                self.lse_output is not None
-                or self.attention_sinks is not None
-                or self.softmax_stats is not None
-            )
+            and (self.lse_output is not None or self.attention_sinks is not None)
         ):
             scale *= self._store_final_lse(
                 stage_info, vec_new_max, vec_row_sum, scale_softmax_log2
@@ -6737,11 +6638,7 @@ class TmemStatsResource(MemoryResource):
         heads = (
             Int32(self.lse_output.shape[-1])
             if self.lse_output is not None
-            else (
-                Int32(self.attention_sinks.shape[0])
-                if self.attention_sinks is not None
-                else Int32(self.softmax_stats.shape[-2])
-            )
+            else Int32(self.attention_sinks.shape[0])
         )
         weight = Float32(1.0)
         start = Int32(0)
@@ -6768,20 +6665,6 @@ class TmemStatsResource(MemoryResource):
                     heads
                 ) + cutlass.Int64(head)
                 (self.lse_output.iterator + offset).store(value)
-            if cutlass.const_expr(self.softmax_stats is not None):
-                maximum = Float32(-Float32.inf)
-                denominator = Float32(0.0)
-                if row_sum > Float32(0.0):
-                    maximum = row_max * self.stats_scale
-                    denominator = row_sum / Float32(self.cfg.pv_p_scale)
-                offset = (
-                    cutlass.Int64(flat_query) * cutlass.Int64(heads)
-                    + cutlass.Int64(head)
-                ) * cutlass.Int64(2)
-                (self.softmax_stats.iterator + offset).store(maximum)
-                (self.softmax_stats.iterator + offset + cutlass.Int64(1)).store(
-                    denominator
-                )
         return weight
 
     @consumer_work(returns=(vec_old_max, vec_new_max, vec_row_sum, vec_scale))
@@ -7674,12 +7557,10 @@ class SmemOResource(MemoryResource):
         # in TmemStats.consumer_work.
         correction_scale = vec_scale
         scale = output_scale * correction_scale / vec_row_sum
-        if cutlass.const_expr(self.tmem_vec_resource is not None):
-            if cutlass.const_expr(self.tmem_vec_resource.softmax_stats is not None):
-                # Absent chunks have zero accumulated O. Avoid 0 * inf so
-                # their outputs can be merged using the exported (m, s).
-                if vec_row_sum == Float32(0.0):
-                    scale = Float32(0.0)
+        if cutlass.const_expr(self.cfg.lse_mode != "none"):
+            # Empty dense requests publish a neutral output alongside -inf LSE.
+            if vec_row_sum == Float32(0.0):
+                scale = Float32(0.0)
 
         num_correction_warps = 4
         tidx, _, _ = cute.arch.thread_idx()

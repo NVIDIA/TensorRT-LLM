@@ -3886,6 +3886,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        forward_args.softmax_stats_is_lse = False
         has_variable_window_starts = (forward_args.variable_window_token_starts
                                       is not None)
         has_variable_window_ends = forward_args.variable_window_token_ends is not None
@@ -4909,9 +4910,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_softmax_stats: torch.Tensor,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-    ) -> None:
+        previous_lse: Optional[bool] = False,
+        current_lse: bool = False,
+    ) -> bool:
+        """Merge a partition, returning the fixed accumulator normalizer format."""
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
+        if previous_lse is None:
+            previous_lse = current_lse
 
         torch.ops.trtllm.merge_chunked_attention_for_mla(
             merged_attn,
@@ -4924,7 +4930,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             merge_op,
             self.num_heads,
             self.mla_params.v_head_dim,
+            previous_lse,
+            current_lse,
         )
+        return previous_lse
 
     def sparse_kv_predict(
         self,

@@ -43,7 +43,7 @@ class _MlaContextPlan:
     mask_type: Literal["causal", "dense"]
     softmax_scale: float | _ScaleKind
     output_scale: float | _ScaleKind
-    store_softmax_stats: bool
+    lse_mode: Literal["none", "base2"]
     window_left: int = -1
 
 
@@ -62,7 +62,7 @@ class _MlaDecodePlan:
     kv_dtype: torch.dtype
     out_dtype: torch.dtype
     mask_type: Literal["causal", "dense"]
-    store_softmax_stats: bool
+    lse_mode: Literal["none", "base2"]
     use_kv_bounds: bool
 
 
@@ -149,7 +149,7 @@ def _context_plans(
             max_q_len=query_capacity,
             max_kv_len=kv_capacity,
             mask_type=mask,
-            store_softmax_stats=stats,
+            lse_mode="base2" if stats else "none",
         )
 
 
@@ -267,7 +267,6 @@ class PrimsTSDenseMlaWarmup:
                 kv_dtype=profile.kv_dtype,
                 out_dtype=profile.out_dtype,
                 mask_type=profile.mask_type,
-                store_softmax_stats=profile.store_softmax_stats,
                 use_kv_bounds=profile.use_kv_bounds,
                 device=profile.device,
             )
