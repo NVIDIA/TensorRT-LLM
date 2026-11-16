@@ -993,6 +993,12 @@ class _SlotTablesMetadata(Glm5NextMamba2Metadata):
             self._slot_group = groups.pop()
         return self._slot_group
 
+    def prepare_steady_gen_step(self, attn_metadata) -> None:
+        """The runtime's hook for a decode step whose batch is the previous step's, in place of
+        prepare(). The slot tables are per-step state too: a row takes a new page every
+        tokens_per_block tokens, so this step runs the whole prepare()."""
+        self.prepare(attn_metadata)
+
     def prepare(self, attn_metadata) -> None:
         manager = attn_metadata.kv_cache_manager
         assert manager is None or isinstance(manager, Glm5NextCacheManager), (
