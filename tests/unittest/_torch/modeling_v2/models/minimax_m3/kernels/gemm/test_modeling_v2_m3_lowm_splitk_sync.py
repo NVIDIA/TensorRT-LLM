@@ -1,0 +1,235 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Source-level checks of the low-M split-K GEMM's two cross-warp synchronization protocols.
+
+Both are ordering requirements that an accuracy or timing test cannot pin down: a
+regression shows only when a warp is delayed at the wrong moment (the TMEM release) or
+when a peer CTA's payload is reordered against its barrier completion (the split-K
+mailbox wait), and neither happens deterministically on current hardware. The bitwise
+tests next to this file pass with and without either fix. These tests scan the kernel's
+source instead and fail if either ordering is changed back. No GPU, no CUDA and no
+cutlass import are needed.
+
+1. TMEM release. ``bar_tmem_alloc`` takes 32 MMA-warp plus 128 epilogue arrivals per
+   phase. The MMA warp arrives after ``alloc_tmem``, must observe phase 0 before
+   arriving a second time, waits for phase 1 and deallocates. Without the phase-0 wait
+   the second arrival can land while phase 0 is still open; the parity-1 wait then names
+   the preceding phase, returns at once, and ``dealloc_tmem`` races the epilogue warps'
+   ``tcgen05.ld``. The epilogue warps arrive, wait for phase 0, load the accumulator,
+   fence that load with ``fence_view_async_tmem_load`` and arrive again.
+2. Split-K mailbox wait. Peer CTAs fill the owner's mailbox with ``st.async``
+   (``_store_shared_remote_v4``), whose complete-tx releases at cluster scope, so the
+   owner's mailbox reads must be ordered by a cluster-scope acquire.
+   ``cute.arch.mbarrier_wait`` acquires at CTA scope only. The kernel uses a relaxed
+   cluster-scope try-wait followed by ``fence.acquire.sync_restrict::shared::cluster.cluster``,
+   which orders the reads without the L1 invalidation an acquire-qualified try-wait
+   incurs.
+"""
+
+import ast
+from pathlib import Path
+
+import pytest
+
+import tensorrt_llm
+
+pytestmark = pytest.mark.cpu_only
+
+_KERNEL = (
+    Path(tensorrt_llm.__file__).parent
+    / "_torch"
+    / "modeling_v2"
+    / "models"
+    / "minimax_m3"
+    / "kernels"
+    / "gemm"
+    / "m3_lowm_splitk.py"
+)
+_CLASS = "SplitKDenseGemmKernel"
+_ALLOC_BAR = "bar_tmem_alloc"
+_MAILBOX_BAR = "bar_reduce"
+_WAIT = "prims.mbarrier_try_wait_parity"
+_FENCE = "prims.fence_sync_restrict"
+
+
+@pytest.fixture(scope="module")
+def module() -> ast.Module:
+    """The kernel module's AST, parsed once from the installed source file."""
+    return ast.parse(_KERNEL.read_text(), filename=str(_KERNEL))
+
+
+def _method(module: ast.Module, cls: str, name: str) -> ast.FunctionDef:
+    """The method ``name`` of class ``cls``."""
+    for node in module.body:
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == name:
+                    return item
+    raise AssertionError(f"{cls}.{name} not found in {_KERNEL.name}")
+
+
+def _calls(node: ast.AST) -> list[ast.Call]:
+    """Every call under ``node`` in source order."""
+    calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+    return sorted(calls, key=lambda c: (c.lineno, c.col_offset))
+
+
+def _callee(call: ast.Call) -> str:
+    """The called expression as source text."""
+    return ast.unparse(call.func)
+
+
+def _first_arg(call: ast.Call) -> str:
+    """The first positional argument as source text, or an empty string."""
+    return ast.unparse(call.args[0]) if call.args else ""
+
+
+def _barrier_events(fn: ast.FunctionDef, barrier: str) -> list[tuple]:
+    """``("arrive",)`` and ``("wait", parity)`` on ``barrier``, in source order."""
+    events = []
+    for call in _calls(fn):
+        if _first_arg(call) != barrier:
+            continue
+        if _callee(call) == "cute.arch.mbarrier_arrive":
+            events.append(("arrive",))
+        elif _callee(call) == "cute.arch.mbarrier_wait":
+            assert isinstance(call.args[1], ast.Constant), ast.unparse(call)
+            events.append(("wait", call.args[1].value))
+    return events
+
+
+def _only(calls: list[ast.Call], what: str) -> ast.Call:
+    """The single call in ``calls``, failing with ``what`` otherwise."""
+    assert len(calls) == 1, f"expected exactly one {what}, found {len(calls)}"
+    return calls[0]
+
+
+def test_mma_warp_observes_phase_0_before_its_release_arrival(module) -> None:
+    """Arrive, wait(0), arrive, wait(1), then dealloc. The pre-fix order skipped the wait(0)."""
+    mma_warp = _method(module, _CLASS, "mma_warp")
+
+    assert _barrier_events(mma_warp, _ALLOC_BAR) == [
+        ("arrive",),
+        ("wait", 0),
+        ("arrive",),
+        ("wait", 1),
+    ]
+
+    calls = _calls(mma_warp)
+    alloc = _only([c for c in calls if _callee(c) == "cute.arch.alloc_tmem"], "alloc_tmem")
+    dealloc = _only([c for c in calls if _callee(c) == "cute.arch.dealloc_tmem"], "dealloc_tmem")
+    on_bar = [c for c in calls if _first_arg(c) == _ALLOC_BAR]
+    assert alloc.lineno < on_bar[0].lineno, "the first arrival must follow the allocation"
+    assert on_bar[-1].lineno < dealloc.lineno, "the dealloc must follow the parity-1 wait"
+
+
+def test_epilog_warp_fences_its_tmem_load_before_releasing(module) -> None:
+    """Arrive, wait(0), tcgen05.ld, fence, arrive: the release arrival follows a fenced load."""
+    epilog_warp = _method(module, _CLASS, "epilog_warp")
+
+    assert _barrier_events(epilog_warp, _ALLOC_BAR) == [("arrive",), ("wait", 0), ("arrive",)]
+
+    calls = _calls(epilog_warp)
+    mma_done = _only(
+        [
+            c
+            for c in calls
+            if _callee(c) == "cute.arch.mbarrier_wait" and _first_arg(c) == "bar_mma_epilog"
+        ],
+        "wait on bar_mma_epilog",
+    )
+    load = _only(
+        [
+            c
+            for c in calls
+            if _callee(c) == "cute_ext.partition_and_copy"
+            and _first_arg(c) == "thr_t2r"
+            and "acc_view" in ast.unparse(c)
+        ],
+        "TMEM to register copy of the accumulator",
+    )
+    fence = _only(
+        [c for c in calls if _callee(c) == "cute.arch.fence_view_async_tmem_load"],
+        "fence_view_async_tmem_load",
+    )
+    release = [
+        c
+        for c in calls
+        if _callee(c) == "cute.arch.mbarrier_arrive" and _first_arg(c) == _ALLOC_BAR
+    ][-1]
+    assert mma_done.lineno < load.lineno < fence.lineno < release.lineno
+
+
+def test_no_cta_scope_wait_on_the_mailbox_barrier(module) -> None:
+    """Neither the DSL's CTA-scope waits nor an inline PTX try-wait touch the mailbox barrier."""
+    cta_scope_waits = [
+        c
+        for c in _calls(module)
+        if _callee(c) in ("cute.arch.mbarrier_wait", "cute.arch.mbarrier_try_wait")
+        and _first_arg(c) == _MAILBOX_BAR
+    ]
+    assert not cta_scope_waits, "the mailbox wait must not acquire at CTA scope:\n" + "\n".join(
+        f"  line {c.lineno}: {ast.unparse(c)}" for c in cta_scope_waits
+    )
+    inline_waits = [
+        s.value
+        for s in ast.walk(module)
+        if isinstance(s, ast.Constant)
+        and isinstance(s.value, str)
+        and "mbarrier.try_wait" in s.value
+    ]
+    assert not inline_waits, f"no inline-PTX mbarrier wait is expected any more: {inline_waits}"
+
+
+def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
+    """A relaxed cluster-scope wait plus a cluster acquire fence, after the scatter and before the reads."""
+    epilog_warp = _method(module, _CLASS, "epilog_warp")
+    calls = _calls(epilog_warp)
+
+    wait = _only(
+        [c for c in calls if _callee(c) == _WAIT and _first_arg(c) == _MAILBOX_BAR],
+        f"{_WAIT} on {_MAILBOX_BAR}",
+    )
+    assert isinstance(wait.args[1], ast.Constant) and wait.args[1].value == 0
+    keywords = {k.arg: ast.unparse(k.value) for k in wait.keywords}
+    assert keywords.get("scope") == "prims.MBarrierScope.CLUSTER", keywords
+    assert keywords.get("order") == "prims.MemOrder.RELAXED", (
+        "an acquire-qualified cluster-scope try_wait invalidates L1 on every attempt; "
+        "wait relaxed and acquire with the fence instead"
+    )
+
+    fence = _only(
+        [c for c in calls if _callee(c) == _FENCE and _first_arg(c) == "prims.MemOrder.ACQUIRE"],
+        f"{_FENCE}(prims.MemOrder.ACQUIRE)",
+    )
+
+    # The peers push their partials with st.async, crediting the owner's barrier; the owner
+    # arms the barrier, waits, and sums the ``split_k - 1`` partials from ``mailbox``.
+    scatters = [
+        c
+        for c in calls
+        if _callee(c) == "_store_shared_remote_v4"
+        and any(ast.unparse(a) == _MAILBOX_BAR for a in c.args)
+    ]
+    arm = _only(
+        [
+            c
+            for c in calls
+            if _callee(c) == "cute.arch.mbarrier_arrive_and_expect_tx"
+            and _first_arg(c) == _MAILBOX_BAR
+        ],
+        "arrive_and_expect_tx on the mailbox barrier",
+    )
+    reads = [
+        n
+        for n in ast.walk(epilog_warp)
+        if isinstance(n, ast.Subscript) and ast.unparse(n.value) == "mailbox"
+    ]
+    assert scatters and reads, "the split-K scatter and the mailbox reads could not be located"
+    assert (
+        max(c.lineno for c in scatters)
+        < arm.lineno
+        < wait.lineno
+        < fence.lineno
+        < min(n.lineno for n in reads)
+    )
