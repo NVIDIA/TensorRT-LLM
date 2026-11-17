@@ -107,7 +107,7 @@ must change before that.
 
 1. **Specify and prepare:** derive or validate `task.yaml`, check the environment and agent access,
    survey available operators, and compile a contract of required checks. A unit is core or a
-   feature; a member is a parallel configuration; their pairing defines a coverage cell.
+   feature; a member is a parallel configuration. One check of any kind covers a feature.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated. What a change to shared code does to other

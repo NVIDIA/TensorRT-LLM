@@ -132,6 +132,23 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
 
 
+def test_one_check_of_any_kind_covers_a_feature_and_a_bare_one_is_named():
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import requirements
+
+    task = {"features": ["mtp"], "variants": {"kv_fp8": {"llm_api_options": {}}}}
+    contract = c.Contract(
+        checks=(
+            c.Check("core", "accuracy[gsm8k]", "tp4", c.TIER_INNER),
+            c.Check("mtp", "boot", "tp1", c.TIER_INNER),
+        )
+    )
+    coverage = requirements.feature_checks(task, contract)
+    assert coverage == {"core": ["core:accuracy[gsm8k]@tp4"], "mtp": ["mtp:boot@tp1"], "kv_fp8": []}
+    assert requirements.uncovered(coverage) == ["kv_fp8"]
+    assert "| kv_fp8 | **no check** |" in requirements.render(coverage)
+
+
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 

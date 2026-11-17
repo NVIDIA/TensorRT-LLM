@@ -619,17 +619,6 @@ def derive_spec(
     chosen = {u: p for u, p in goal.unit_profiles.items() if u in built}
     if chosen:
         spec["profile"] = {"default": spec.get("profile") or PROFILE_STANDARD, **chosen}
-    layout = spec["members"] if isinstance(spec.get("members"), dict) else {}
-    everywhere = list(dict.fromkeys(m for listed in layout.values() for m in listed))
-    left_out = [
-        f"{unit}@{member}"
-        for unit in ["core", *built]
-        for member in everywhere
-        if member not in layout.get(unit, layout.get("default", ()))
-    ]
-    if left_out:
-        # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
-        spec["coverage"] = {"accept": left_out}
     # The chunk size is the chunked variant's, not core's.
     params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)

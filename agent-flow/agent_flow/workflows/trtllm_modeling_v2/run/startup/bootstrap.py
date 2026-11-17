@@ -164,8 +164,7 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
         return False
     if not _check_processor(workflow, result, log):
         return False
-    if not _check_coverage(workflow, log):
-        return False
+    _note_coverage(workflow, log)
 
     _take_survey(workflow, result, log)
 
@@ -304,39 +303,39 @@ def _prove_agents(workflow, log) -> bool:
     return True
 
 
-def _check_coverage(workflow, log) -> bool:
-    """Write what the contract proves of the request; stop on a gap ``task.yaml`` does not accept.
+def _note_coverage(workflow, log) -> None:
+    """Compile the contract, write which checks cover each feature, and name a feature none does.
 
-    The matrix (``requirements.py``) goes to ``coverage.yaml``. A requested
-    cell no check covers is a decision the spec states (``coverage.accept``),
-    or the run stops here, before anything is spent on it.
+    The coverage (``requirements.py``) goes to ``coverage.yaml``. A feature no
+    check covers is said here and stops nothing.
     """
     workflow._contract = contract_mod.compile_contract(
         workflow.task_data, workflow._gate_env().world_size
     )
-    matrix = workflow._coverage = requirements_mod.requirements_matrix(
-        workflow.task_data, workflow._contract, workflow._gate_env().world_size
+    coverage = workflow._coverage = requirements_mod.feature_checks(
+        workflow.task_data, workflow._contract
     )
     path = workflow.workspace / requirements_mod.COVERAGE_FILENAME
-    path.write_text(yaml.safe_dump(matrix.as_dict(), sort_keys=False), encoding="utf-8")
-    if not matrix.gaps():
-        return True
-    message = requirements_mod.gap_message(matrix)
-    print_message(f"[bold red]✘ coverage: {escape_markup(message)}[/bold red]", log)
-    workflow.journal.open(slug="(preflight failed)")
-    workflow.journal.section("coverage: requested cells left uncovered", message)
-    return False
+    path.write_text(yaml.safe_dump(coverage, sort_keys=False), encoding="utf-8")
+    bare = requirements_mod.uncovered(coverage)
+    if bare:
+        print_message(
+            f"[bold yellow]⚠ no check covers {escape_markup(', '.join(bare))}: the run goes "
+            "on, and its delivery report says so[/bold yellow]",
+            log,
+        )
 
 
 def _write_contract(workflow) -> None:
-    """Write the contract the coverage check compiled, and say what it holds."""
+    """Write the contract compiled with the coverage, and say what it holds."""
     contract_mod.write_contract(workflow.workspace, workflow._contract)
     workflow.journal.section(
         f"contract: {len(workflow._contract.required())} required check(s)",
         workflow._contract.render(),
     )
     workflow.journal.section(
-        "coverage: what the contract proves of the request", workflow._coverage.render()
+        "coverage: the checks behind each feature",
+        requirements_mod.render(workflow._coverage),
     )
     _write_intake_lint(workflow)
 

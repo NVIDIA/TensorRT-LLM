@@ -165,7 +165,7 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     assert ci_waiver({**spec, "profile": "bringup"}) == "not owed by the bringup profile"
     # disagg where the goal puts it; its test lays its two engines out on dep4's node.
     assert spec["members"] == {"default": ["tp1", "dep4"], "disagg": ["dep4"]}
-    assert spec["coverage"] == {"accept": ["disagg@tp1"]}
+    assert "coverage" not in spec
     # The first KV dtype is every gate's; each other one a variant judged against core's score.
     assert "--kv_cache_dtype=fp8" not in spec["runtime"]["extra_flags"]
     assert spec["variants"]["kv_fp8"]["gates"] == ["accuracy"]

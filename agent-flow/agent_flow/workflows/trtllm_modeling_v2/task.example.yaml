@@ -56,10 +56,6 @@ features: []
 #   # on a feature unit that changes a KV dtype or chunking is a combination; core's own variant
 #   # proves the axis, so add it only when the request names it.
 
-# A requested feature@member cell no check covers (`coverage.yaml`) stops the run at preflight
-# unless accepted here: `<feature>@<member>`, `<feature>@*` for a row, `<unit>+<unit>` for a pair.
-# coverage: {accept: [mtp7@tp4, disagg+multimodal@*]}
-
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
 # delivery check, and no CI files: the accuracy test, its test list entry, the anchor's row,
 # when every unit is smoke or bringup), `standard` (the default: this file as written), `certified` (also the

@@ -58,7 +58,7 @@ goal words cannot say.
 |---|---|---|
 | members, e.g. "TP4, TEP4, ADP4" | `members: [tp4, tep4, dep4]` (ADP = attention DP + EP = `dep`) | |
 | "X needs full validation" | X takes every unit and **one variant per feature axis** at X: the variant's `members: [X]`, `gates: [accuracy]` | a cross product of axes (KV dtype x chunking x reuse ...) multiplies the contract; add a combination only when the request names it |
-| "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
+| "Y only aggregate / text-only" | Y in `members.default` for core alone | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
 | chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
@@ -69,8 +69,8 @@ goal words cannot say.
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint), and every change to the target runs the stale checks again, so the contract's
 size is paid once per fix, not once per run. Prove each requested feature **once**, at the member
-the request validates fully, and accept the rest in `coverage.accept`, where the delivery report
-states it:
+the request validates fully. One check of any kind covers a feature; the delivery report lists
+the checks behind each (`coverage.yaml`):
 
 - A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
   The accuracy check loads the same engine and fails unless each rank reports the variant's

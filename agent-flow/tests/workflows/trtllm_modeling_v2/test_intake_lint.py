@@ -67,7 +67,6 @@ _GOOD = {
     "environment": {"kind": "session_spool", "gpus_per_node": 4},
     "accuracy": {"benchmark": "gsm8k"},
     # tp4 / tep4 are text-only: core alone. disagg's test runs once, at dep4.
-    "coverage": {"accept": ["kv_fp8@tp4", "kv_fp8@tep4", "chunked@tp4", "chunked@tep4"]},
     "notes": "Architecture: toy. Prior art in this tree worth surveying: the QSA sparse ops.",
 }
 

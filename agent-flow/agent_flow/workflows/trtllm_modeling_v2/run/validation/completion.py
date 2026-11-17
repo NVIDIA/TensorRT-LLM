@@ -89,10 +89,10 @@ def run_deliver_phase(
     print_rule("[bold magenta]deliver[/bold magenta]", log)
     report = delivery_report(workflow, run_tests=True)
     workflow.journal.section("delivery checks", f"```\n{report.render()}\n```")
-    matrix = requirements_mod.requirements_matrix(
-        workflow.task_data, workflow._contract, workflow._gate_env().world_size
+    coverage = requirements_mod.feature_checks(workflow.task_data, workflow._contract)
+    workflow.journal.section(
+        "coverage: the checks behind each feature", requirements_mod.render(coverage)
     )
-    workflow.journal.section("coverage: what is delivered, member by member", matrix.render())
     print_message(report.render(), log)
     result = assessment([f"{c.name}: {c.detail}" for c in report.failures])
     marker = workflow._target_marker()

@@ -173,12 +173,8 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     AGENTS_FIELD,
     COMMIT_POLICY_FIELD,
     VARIANTS_FIELD,
-    "coverage",
     "profile",
 )
-#: ``coverage.accept``: the requested feature@member cells the contract may leave uncovered.
-COVERAGE_FIELD = "coverage"
-COVERAGE_KEYS: tuple[str, ...] = ("accept",)
 #: ``profile``: how much the contract owes, for the run or per unit (a mapping
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
 #: unit's boot only; ``bringup`` gates each unit at its cheapest member, and no
@@ -408,23 +404,6 @@ def derive_checkpoint_segment(checkpoint_path: str | Path) -> str:
     # as `qwen3_30_b_a3_b`.
     name = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
-
-
-def _validate_coverage(block: Any, errors: list[str]) -> None:
-    """``coverage``: a mapping whose ``accept`` lists ``<feature>@<member>`` or ``<feature>@*``."""
-    if block is None:
-        return
-    if not isinstance(block, dict):
-        errors.append(f"'{COVERAGE_FIELD}' must be a mapping, got {type(block).__name__}")
-        return
-    reject_unknown_keys(block, COVERAGE_KEYS, errors, where=COVERAGE_FIELD)
-    raw = block.get("accept")
-    if raw is not None and (
-        not isinstance(raw, list) or not all(isinstance(x, str) and "@" in x for x in raw)
-    ):
-        errors.append(
-            f"'{COVERAGE_FIELD}.accept' must be a list of '<feature>@<member>' or '<feature>@*'"
-        )
 
 
 def _validate_target(block: Any, errors: list[str]) -> None:
@@ -1524,7 +1503,6 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             errors=errors,
         )
 
-    _validate_coverage(data.get(COVERAGE_FIELD), errors)
     _validate_profile(data, errors)
 
     if ENVIRONMENT_FIELD not in data:
@@ -1605,8 +1583,6 @@ __all__ = [
     "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
     "gpus_per_node",
-    "COVERAGE_FIELD",
-    "COVERAGE_KEYS",
     "resolve_gate_timeout",
     "resolve_per_unit",
     "resolve_samples",

@@ -447,7 +447,7 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
             "context and generation workers do not both fit",
             "an estimate from the weights alone: accept it in notes where both are known to "
             "fit; otherwise the tree's single-node launcher cannot serve this checkpoint "
-            "disaggregated here, so accept `disagg@*` in coverage.accept and say why in notes",
+            "disaggregated here: say why in notes",
         )
 
 
@@ -519,7 +519,7 @@ def contract_rules(ctx: LintContext) -> Iterator[Finding]:
             "checks that load the same engine and fail unless each rank reports the variant's "
             "setting (its KV dtype, its chunking)",
             "give each such variant `gates: [accuracy]` and `members:` the member(s) the request "
-            "validates it at, and accept its other cells in coverage.accept",
+            "validates it at",
         )
 
 
@@ -544,8 +544,8 @@ def feature_rules(ctx: LintContext) -> Iterator[Finding]:
             WARN,
             f"{'; '.join(spread)}: one member proves a feature, and each other member proves it "
             "again with a model load per check",
-            "narrow the feature's `members` to the member the request validates fully and list "
-            "its other cells in coverage.accept; keep more only when the request names them",
+            "narrow the feature's `members` to the member the request validates fully; keep "
+            "more only when the request names them",
         )
     # Axes a variant on core proves, so a variant on a feature unit that changes one is a combination.
     on_core: dict[str, list[str]] = {}
@@ -576,20 +576,6 @@ def feature_rules(ctx: LintContext) -> Iterator[Finding]:
             "put the variant on `unit: core` (or drop it when core already proves the axis); keep "
             "a combination only when the request names it",
         )
-
-
-def coverage_rules(ctx: LintContext) -> Iterator[Finding]:
-    """Preflight's coverage check, run early: a requested cell no check covers stops the launch."""
-    if ctx.contract is None:
-        return
-    try:
-        from ..run.validation import requirements as requirements_mod
-
-        matrix = requirements_mod.requirements_matrix(ctx.task, ctx.contract, ctx.world)
-    except Exception:  # the schema check owns malformed specs
-        return
-    if matrix.gaps():
-        yield Finding("coverage-gap", BLOCK, requirements_mod.gap_message(matrix))
 
 
 def _floors(accuracy: Mapping[str, Any], values: Iterable[float]) -> str:
@@ -820,7 +806,6 @@ RULES: tuple[Rule, ...] = (
     scope_rules,
     contract_rules,
     feature_rules,
-    coverage_rules,
     accuracy_rules,
     disagg_rules,
     environment_rules,
