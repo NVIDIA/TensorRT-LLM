@@ -32,10 +32,11 @@ def _huge_page_advice_accepted() -> bool:
 
 
 @pytest.mark.skipif(not _huge_page_advice_accepted(), reason="the kernel refuses MADV_HUGEPAGE")
-def test_host_table_is_advised_transparent_huge_pages() -> None:
+@pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
+def test_host_table_is_advised_transparent_huge_pages(dtype: torch.dtype) -> None:
     # The host-resident table is a mapping of its own, advised MADV_HUGEPAGE
     # before it is faulted in, whatever torch's CPU allocator does with huge pages.
-    table, host = _host_resident_empty(_ROWS, _HEAD_DIM, torch.float8_e4m3fn, torch.device("cuda"))
+    table, host = _host_resident_empty(_ROWS, _HEAD_DIM, dtype, torch.device("cuda"))
     flags, inside = None, False
     with open("/proc/self/smaps") as smaps:
         for line in smaps:
@@ -48,6 +49,10 @@ def test_host_table_is_advised_transparent_huge_pages() -> None:
                 break
     assert flags is not None and "hg" in flags, flags
     assert table.shape == (_ROWS, _HEAD_DIM)
+    assert table.dtype == dtype
+    expected = torch.full(table.shape, 1.25, dtype=torch.bfloat16, device="cuda")
+    table.copy_(expected)
+    torch.testing.assert_close(table.float(), expected.float(), rtol=0, atol=0)
 
 
 def test_host_table_loads_when_huge_page_advice_is_refused(monkeypatch) -> None:
