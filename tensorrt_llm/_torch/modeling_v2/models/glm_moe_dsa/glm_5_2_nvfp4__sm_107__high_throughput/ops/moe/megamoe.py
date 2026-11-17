@@ -489,7 +489,9 @@ class RubinFusedCommScheduler(FusedCommMoEScheduler):
         moe.backend.set_adaptive_launch_tokens(
             max(all_rank_num_tokens) if all_rank_num_tokens else None
         )
-        return moe.backend.run_moe(
+        if moe.enable_dummy_allreduce:
+            moe.dummy_allreduce()
+        out = moe.backend.run_moe(
             MoERunContext(
                 x=quantized,
                 x_sf=sf,
@@ -498,6 +500,9 @@ class RubinFusedCommScheduler(FusedCommMoEScheduler):
                 output_dtype=output_dtype or x.dtype,
             )
         )
+        if moe.enable_dummy_allreduce:
+            moe.dummy_allreduce()
+        return out
 
 
 def create_rubin_moe(**kwargs):
