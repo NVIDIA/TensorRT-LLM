@@ -238,7 +238,9 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend_runtime):
     backend, transceiver_runtime = backend_runtime
     if backend == "UCX":
-        # Run static destructors in a child so allocator failures fail this test.
+        # Import torch before loading native libraries, as the package does,
+        # to preload wheel-provided CUDA/NCCL dependencies. Run static
+        # destructors in a child so allocator failures fail this test.
         library_dir = os.path.join(os.path.dirname(tensorrt_llm.__file__),
                                    "libs")
         result = subprocess.run([
@@ -246,6 +248,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
             "-c",
             "import ctypes, os, resource, sys; "
             "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+            "import torch; "
             "host = ctypes.CDLL(sys.argv[1], mode=os.RTLD_GLOBAL | os.RTLD_NOW); "
             "wrapper = ctypes.CDLL(sys.argv[2], mode=os.RTLD_LOCAL | os.RTLD_NOW)",
             os.path.join(library_dir, "libtensorrt_llm.so"),
