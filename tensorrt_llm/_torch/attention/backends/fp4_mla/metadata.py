@@ -378,7 +378,7 @@ def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
 
     if not has_fp4_mla_cache_layout(kv_cache_manager):
         raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
-    spec = kv_cache_manager.get_fp4_mla_page_table_spec()
+    spec = kv_cache_manager.fp4_mla_layout.get_fp4_mla_page_table_spec()
     for field_name in (
         "cache_pool_id",
         "cache_page_index_scale",

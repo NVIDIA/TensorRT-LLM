@@ -56,6 +56,7 @@ from .config import (
     FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
+    fp4_mla_cache_layout,
     has_fp4_mla_cache_layout,
 )
 from .config import FP4_MLA_CUTEDSL_4X_ENV as FP4_MLA_CUTEDSL_4X_ENV
@@ -179,6 +180,7 @@ __all__ = [
     "get_fp4_mla_v_scale_pool_shape",
     "get_fp4_mla_v_scale_pool_size",
     "get_fp4_mla_v_scale_pool_view",
+    "fp4_mla_cache_layout",
     "has_fp4_mla_cache_layout",
     "materialize_fp4_mla_device_page_table",
     "populate_fp4_mla_append_metadata",

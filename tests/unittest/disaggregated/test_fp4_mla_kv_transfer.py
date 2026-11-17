@@ -129,7 +129,7 @@ def _initialize_cache(
     for manager in managers:
         generator = torch.Generator(device="cuda")
         generator.manual_seed(seed_base + manager.mapping.pp_rank)
-        for pool in manager._iter_fp4_mla_physical_pool_views():
+        for pool in manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
             pool_bytes = pool.view(torch.uint8)
             if fill_random:
                 pool_bytes.copy_(
@@ -148,7 +148,7 @@ def _initialize_cache(
 
 
 def _compact_layer(manager: Fp4MlaKVCacheManagerV2, layer_idx: int) -> int:
-    return manager._fp4_mla_compact_layer_idx(manager.layer_offsets[layer_idx])
+    return manager.fp4_mla_layout._fp4_mla_compact_layer_idx(manager.layer_offsets[layer_idx])
 
 
 def _prompt_pages(
@@ -163,7 +163,7 @@ def _prompt_pages(
 def _hp_pages(manager: Fp4MlaKVCacheManagerV2, request_id: int, prompt_len: int) -> list[int]:
     """HP-tail page per prompt block ordinal, negative outside the HP window."""
     num_blocks = math.ceil(prompt_len / TOKENS_PER_BLOCK)
-    hp_pool_id = manager.get_fp4_mla_page_table_spec().hp_pool_id
+    hp_pool_id = manager.fp4_mla_layout.get_fp4_mla_page_table_spec().hp_pool_id
     pages = manager._get_batch_cache_indices_by_pool_id(
         [request_id], pool_id=hp_pool_id, is_kv_aggregate=False
     )[0][:num_blocks]
@@ -173,16 +173,16 @@ def _hp_pages(manager: Fp4MlaKVCacheManagerV2, request_id: int, prompt_len: int)
 def _v_scale_pages(
     manager: Fp4MlaKVCacheManagerV2, compact_layer: int, pages: list[int]
 ) -> torch.Tensor:
-    return manager.get_mla_v_scale_pool().view(torch.uint8)[compact_layer][pages]
+    return manager.fp4_mla_layout.get_mla_v_scale_pool().view(torch.uint8)[compact_layer][pages]
 
 
 def _v_packed_pages(
     manager: Fp4MlaKVCacheManagerV2, compact_layer: int, pages: list[int]
 ) -> torch.Tensor | None:
-    pool = manager.get_mla_v_packed_pool(compact_layer)
+    pool = manager.fp4_mla_layout.get_mla_v_packed_pool(compact_layer)
     if pool is None:
         return None
-    return pool.view(-1, manager.mla_v_head_dim, TOKENS_PER_BLOCK // 2)[pages]
+    return pool.view(-1, manager.fp4_mla_layout.mla_v_head_dim, TOKENS_PER_BLOCK // 2)[pages]
 
 
 def _handles_request(manager, tp: int, enable_dp: bool, req_idx: int) -> bool:
@@ -247,8 +247,8 @@ def _verify_cache(
                 ctx_pages = _prompt_pages(
                     ctx_manager, ctx_request_ids[req_idx], layer_idx, prompt_len
                 )
-                gen_kv, gen_sf = gen_manager.get_fp4_mla_cache_buffers(layer_idx)
-                ctx_kv, ctx_sf = ctx_manager.get_fp4_mla_cache_buffers(layer_idx)
+                gen_kv, gen_sf = gen_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(layer_idx)
+                ctx_kv, ctx_sf = ctx_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(layer_idx)
                 assert torch.equal(gen_kv[gen_pages], ctx_kv[ctx_pages])
                 assert torch.equal(gen_sf[gen_pages], ctx_sf[ctx_pages])
 
@@ -265,10 +265,10 @@ def _verify_cache(
                 # Each ring holds global position p at slot p % ring_size of the
                 # page holding p; the two sides may size their rings
                 # differently, so compare the positions both retain.
-                gen_slots = gen_manager.fp4_mla_hp_pool_size
-                ctx_slots = ctx_manager.fp4_mla_hp_pool_size
-                gen_hp = gen_manager.get_fp4_mla_hp_pool().view(torch.uint8)
-                ctx_hp = ctx_manager.get_fp4_mla_hp_pool().view(torch.uint8)
+                gen_slots = gen_manager.fp4_mla_layout.fp4_mla_hp_pool_size
+                ctx_slots = ctx_manager.fp4_mla_layout.fp4_mla_hp_pool_size
+                gen_hp = gen_manager.fp4_mla_layout.get_fp4_mla_hp_pool().view(torch.uint8)
+                ctx_hp = ctx_manager.fp4_mla_layout.get_fp4_mla_hp_pool().view(torch.uint8)
                 gen_ring = gen_hp[gen_hp_pages[-1], gen_layer, 0].view(gen_slots, -1)
                 ctx_ring = ctx_hp[ctx_hp_pages[-1], ctx_layer, 0].view(ctx_slots, -1)
                 last_page_start = (prompt_len - 1) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
@@ -292,12 +292,12 @@ def _verify_cache(
     ):
         if ctx_context_only and managers is ctx_managers:
             for manager in managers:
-                assert manager.get_mla_v_scale_pool_base() is None
-                assert manager.get_mla_v_packed_pool_base() is None
+                assert manager.fp4_mla_layout.get_mla_v_scale_pool_base() is None
+                assert manager.fp4_mla_layout.get_mla_v_packed_pool_base() is None
             continue
         for manager in managers:
-            manager.get_mla_v_scale_pool_base().zero_()
-            v_packed_base = manager.get_mla_v_packed_pool_base()
+            manager.fp4_mla_layout.get_mla_v_scale_pool_base().zero_()
+            v_packed_base = manager.fp4_mla_layout.get_mla_v_packed_pool_base()
             if v_packed_base is not None:
                 v_packed_base.zero_()
             manager.rebuild_disagg_imported_cache(

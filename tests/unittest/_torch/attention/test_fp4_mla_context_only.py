@@ -64,11 +64,11 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     assert manager.fp4_mla_context_only_cache == context_only
     assert is_fp4_mla_context_only_cache(is_disagg) == context_only
     assert is_context_only_kv_cache(manager) == context_only
-    assert manager.mla_v_head_dim == (None if context_only or fused else 512)
-    assert (manager._v_scale_bytes_per_page() == 0) == context_only
+    assert manager.fp4_mla_layout.mla_v_head_dim == (None if context_only or fused else 512)
+    assert (manager.fp4_mla_layout._v_scale_bytes_per_page() == 0) == context_only
     if context_only:
-        assert manager.get_mla_v_scale_pool() is None
-        assert manager.get_mla_v_scale_pool_base() is None
+        assert manager.fp4_mla_layout.get_mla_v_scale_pool() is None
+        assert manager.fp4_mla_layout.get_mla_v_scale_pool_base() is None
 
     slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=config),

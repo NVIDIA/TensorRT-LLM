@@ -44,7 +44,7 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
-from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_cache_mixin import Fp4MlaV2CacheLayoutMixin
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
@@ -87,6 +87,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     LayerId,
     PageIndexMode,
+    ReusePolicy,
     SsmLayerConfig,
     TokenIdExt,
     _KVCache,
@@ -230,9 +231,7 @@ def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
     ]
 
 
-class MambaHybridCacheManagerV2(
-    Fp4MlaV2CacheLayoutMixin, KVCacheManagerV2, MambaHybridCacheManager
-):
+class MambaHybridCacheManagerV2(Fp4MlaLayoutHooks, KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
     Attention KV pages and Mamba recurrent-state pages are both owned by the
@@ -281,13 +280,8 @@ class MambaHybridCacheManagerV2(
 
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True
-    # Set per instance when the MLA latent cache uses the FP4 MLA layout.
-    _attention_cache_layout_policy = None
     # Set per instance once the FP4 MLA layout has logged a snapshot move.
     _fp4_mla_snapshot_realignment_logged = False
-    # Set per instance by the FP4 MLA layout on a disaggregated context
-    # worker, which keeps no generation-only V scales or packed V.
-    fp4_mla_context_only_cache = False
     # A disaggregated context server never decodes and keeps no replay buffers.
     _disagg_context_only = False
     # Replay buffers of the managed replay state, by global layer; see
@@ -519,13 +513,14 @@ class MambaHybridCacheManagerV2(
                 kv_cache_config.block_reuse_config = block_reuse_config.model_copy(
                     update={"policy": BlockReusePolicy.PER_REQUEST.value}
                 )
-        self._attention_cache_layout_policy = None
+        # The FP4 MLA layout, when the MLA latent cache is stored as NVFP4.
+        self.fp4_mla_layout = None
         pretrained_config = kwargs.get("pretrained_config")
         if _uses_fp4_mla_cache_layout(dtype, kv_cache_type, pretrained_config):
             # NVFP4 MLA latent cache (Kimi K3): compose the FP4 MLA V2 layout
             # (K, K scales, V scales, BF16 HP ring) with the recurrent-state
-            # lifecycle. Attention-layout operations are forwarded to the
-            # policy; SSM operations stay on this manager.
+            # lifecycle. The policy attaches the layout as fp4_mla_layout, to
+            # which the layout hooks forward; SSM operations stay on this manager.
             from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
                 Fp4MlaV2CacheLayoutPolicy,
             )
@@ -562,8 +557,8 @@ class MambaHybridCacheManagerV2(
             num_reserved_index_slots=self._num_reserved_dummy_slots,
             **kwargs,
         )
-        if self._attention_cache_layout_policy is not None:
-            self._attention_cache_layout_policy.finalize_manager(self)
+        if self.fp4_mla_layout is not None:
+            self.fp4_mla_layout.finalize()
 
         self._setup_state_pool()
 
@@ -797,9 +792,8 @@ class MambaHybridCacheManagerV2(
             **super().get_disagg_role_mapper_kinds(),
             MambaRole.CONV_STATE: MapperKind.SECTIONED,
         }
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
-            kinds.update(layout_policy.DISAGG_ROLE_MAPPER_KINDS)
+        if self.fp4_mla_layout is not None:
+            kinds.update(self.fp4_mla_layout.DISAGG_ROLE_MAPPER_KINDS)
         return kinds
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> List[int]:
@@ -811,19 +805,19 @@ class MambaHybridCacheManagerV2(
         so that the IDs stay collision-free across all of the manager's
         layers and identical under any pipeline split.
         """
-        layout_policy = self._attention_cache_layout_policy
+        layout = self.fp4_mla_layout
         result = []
         # A recurrent layer split by buffer reuse policies is listed once per group.
         layer_ids = dict.fromkeys(
             int(buffer.layer_id) for buffer in self.impl.buffer_grouping[layer_group_id]
         )
         for internal_layer in layer_ids:
-            if layout_policy is None:
+            if layout is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
             else:
-                global_layer_id = self._fp4_mla_disagg_global_layer_id(internal_layer)
+                global_layer_id = layout._fp4_mla_disagg_global_layer_id(internal_layer)
                 if global_layer_id is None:
                     raise ValueError(f"Unknown hybrid FP4 MLA internal layer {internal_layer}.")
             result.append(global_layer_id)
@@ -838,9 +832,8 @@ class MambaHybridCacheManagerV2(
         generation worker starts afresh.
         """
         roles = super().get_disagg_ignored_roles()
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
-            roles |= frozenset(layout_policy.DISAGG_IGNORED_ROLES)
+        if self.fp4_mla_layout is not None:
+            roles |= frozenset(self.fp4_mla_layout.DISAGG_IGNORED_ROLES)
         roles |= frozenset(role for layout in self._replay_layouts.values() for role in layout)
         return roles
 
@@ -852,8 +845,8 @@ class MambaHybridCacheManagerV2(
         them.
         """
         layouts = super().get_disagg_role_layouts()
-        if self._attention_cache_layout_policy is not None:
-            layouts.update(self._fp4_mla_disagg_role_layouts())
+        if self.fp4_mla_layout is not None:
+            layouts.update(self.fp4_mla_layout._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
             return layouts
         d_conv_m1 = int(self.conv_state_shape[1])
@@ -973,8 +966,8 @@ class MambaHybridCacheManagerV2(
         layer_id = int(buffers[0].layer_id)
         if layer_id >= self.num_local_layers:
             if (
-                self._attention_cache_layout_policy is not None
-                and LayerId(layer_id) in self._hp_manager_layer_ids
+                self.fp4_mla_layout is not None
+                and LayerId(layer_id) in self.fp4_mla_layout._hp_manager_layer_ids
             ):
                 return Role.MLA_HP_TAIL, None
             if layer_id in self.mixed_precision_high_layers.values():
@@ -1268,11 +1261,13 @@ class MambaHybridCacheManagerV2(
             # attempted, while the runtime config still needs the invariant.
             commit_min_snapshot=True,
         )
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
+        if self.fp4_mla_layout is not None:
             # Adds the FP4 MLA HP-ring virtual layers and the fallback-layer
-            # lifecycle; SSM layers are left unchanged.
-            result = layout_policy._build_cache_config(self, result)
+            # lifecycle; SSM layers are left unchanged. The hybrid manager
+            # keeps the HP ring with its recurrent snapshots.
+            result = self.fp4_mla_layout.apply_cache_config(
+                result, hp_reuse_policy=ReusePolicy.REQUIRED
+            )
         return self._with_draft_pool_ratio(result)
 
     def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -1678,9 +1673,9 @@ class MambaHybridCacheManagerV2(
         )
 
     def _attention_cache_bytes_per_token(self) -> int:
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
-            return layout_policy.get_cache_bytes_per_token(self)
+        if self.fp4_mla_layout is not None:
+            sizes, _ = self._get_runtime_cache_size_layer_components()
+            return sum(sizes)
         # Mamba layers have zero KV heads, so the generic calculation naturally
         # returns only bytes owned by local attention layers.
         return super().get_cache_bytes_per_token()
@@ -1702,7 +1697,7 @@ class MambaHybridCacheManagerV2(
         assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
-        if self._attention_cache_layout_policy is not None:
+        if self.fp4_mla_layout is not None:
             return self.blocks_in_primary_pool
         attention_pages = []
         ssm_pages = []
@@ -1724,9 +1719,8 @@ class MambaHybridCacheManagerV2(
     @property
     @override
     def blocks_in_primary_pool(self) -> int:
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
-            return layout_policy.blocks_in_primary_pool.fget(self)
+        if self.fp4_mla_layout is not None:
+            return self.fp4_mla_layout.blocks_in_primary_pool
         for local_layer_idx in range(self.num_local_layers):
             if self._is_local_mamba_layer(local_layer_idx):
                 continue
@@ -2220,7 +2214,7 @@ class MambaHybridCacheManagerV2(
             # waiter's point arrived, see request_prefix_snapshot), the next
             # commit can only end at history, so history follows the context.
             should_resize = (
-                self._attention_cache_layout_policy is not None
+                self.fp4_mla_layout is not None
                 or not should_block_reuse
                 or (
                     not is_all_reusable
@@ -2289,7 +2283,7 @@ class MambaHybridCacheManagerV2(
         first block can never be reused. Snapshot points also end the
         context chunks, which keeps every non-final chunk tile-aligned.
         """
-        if self._attention_cache_layout_policy is None:
+        if self.fp4_mla_layout is None:
             return
         block = self.tokens_per_block
         points = request.expect_snapshot_points
@@ -2494,11 +2488,11 @@ class MambaHybridCacheManagerV2(
 
     @override
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[tuple[int, torch.Tensor]]:
-        if self._attention_cache_layout_policy is not None:
+        if self.fp4_mla_layout is not None:
             # FP4 MLA roles have role-specific dtypes and page geometries, so
             # scan each physical pool once through a page-major view instead
             # of a logical per-layer KV view.
-            for buffer in self._iter_fp4_mla_physical_pool_views():
+            for buffer in self.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
                 yield -1, buffer
         else:
             for global_layer_id, local_layer_id in self.layer_offsets.items():

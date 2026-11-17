@@ -147,12 +147,14 @@ def _env_flag_not_disabled(name: str, default: bool) -> bool:
     )
 
 
+def fp4_mla_cache_layout(kv_cache_manager: object) -> Any:
+    """The FP4 MLA cache layout a KV cache manager holds; None for a manager without one."""
+    return getattr(kv_cache_manager, "fp4_mla_layout", None)
+
+
 def has_fp4_mla_cache_layout(kv_cache_manager: object) -> bool:
-    """Return whether ``kv_cache_manager`` exposes an active FP4 MLA page-table layout."""
-    flag = getattr(kv_cache_manager, "uses_fp4_mla_cache_layout", None)
-    if flag is not None:
-        return bool(flag)
-    return callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
+    """Whether ``kv_cache_manager`` stores its MLA latent cache in the FP4 MLA layout."""
+    return fp4_mla_cache_layout(kv_cache_manager) is not None
 
 
 def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:

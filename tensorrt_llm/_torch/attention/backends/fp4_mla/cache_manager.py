@@ -10,16 +10,14 @@ import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
-from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_cache_mixin import (
-    Fp4MlaPageTableSpec,
-    Fp4MlaV2CacheLayoutMixin,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, KVCacheManagerConfig, ReusePolicy
 
+from .cache_layout import Fp4MlaCacheLayout, Fp4MlaPageTableSpec
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     _FP4_MLA_K_RESIDUAL_BACKENDS,
@@ -56,7 +54,7 @@ def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
-class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
+class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
     """FP4 MLA storage policy for a KV cache manager V2 lifecycle.
 
     K, K block scales, V scales, and optional packed V share one full-history
@@ -72,28 +70,20 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
     therefore request-private: it does not constrain prefix matching, and the
     radix tree retains only the full-history FP4 pages.
 
-    Hybrid linear-attention managers inherit the layout itself
-    (``Fp4MlaV2CacheLayoutMixin``) and call ``configure_manager``,
-    ``_build_cache_config`` and ``finalize_manager`` of this policy on their
-    own instance, next to their SSM lifecycle. Such a manager keeps its own
-    disaggregation declarations and merges the policy's attention roles into
+    The layout itself is an ``Fp4MlaCacheLayout``, which ``configure_manager``
+    attaches to the manager as ``fp4_mla_layout``. Hybrid linear-attention
+    managers call ``configure_manager`` and ``finalize_manager`` on their own
+    instance, next to their SSM lifecycle. Such a manager keeps its own
+    disaggregation declarations and merges the layout's attention roles into
     them (``DISAGG_ROLE_MAPPER_KINDS``, ``DISAGG_IGNORED_ROLES``,
     ``_fp4_mla_disagg_global_layer_id``, ``_fp4_mla_disagg_role_layouts``), so
     the recurrent-state roles keep their own transfer mappings.
     """
 
-    uses_fp4_mla_cache_layout: bool = True
-    # Transfer layout of the MLA roles. FP4 and FP8-fallback latent pages are
-    # written token-major by the FP4 MLA kernels, and every TP rank holds the
-    # same single-head latent state, including its HP ring.
-    DISAGG_ROLE_MAPPER_KINDS: dict[DataRole, MapperKind] = {
-        Role.KEY: MapperKind.NHD,
-        Role.KEY_BLOCK_SCALE: MapperKind.NHD,
-        Role.MLA_HP_TAIL: MapperKind.REPLICATED,
-    }
-    # V scales and packed V derive from K and K scales; the generation worker
-    # rebuilds them locally in rebuild_disagg_imported_cache.
-    DISAGG_IGNORED_ROLES: frozenset[DataRole] = frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+    DISAGG_ROLE_MAPPER_KINDS: dict[DataRole, MapperKind] = (
+        Fp4MlaCacheLayout.DISAGG_ROLE_MAPPER_KINDS
+    )
+    DISAGG_IGNORED_ROLES: frozenset[DataRole] = Fp4MlaCacheLayout.DISAGG_IGNORED_ROLES
     # A one-model draft layer at position i reads prompt token i + 1, and the
     # generic reuse-match backoff recomputes that many tokens past a matched
     # block boundary. The resulting context start is not tile aligned, which
@@ -177,90 +167,78 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
         if not isinstance(head_dim, int) or head_dim <= FP4_MLA_K_RESIDUAL_DIM:
             raise ValueError(f"FP4 MLA V2 requires a positive scalar MLA head_dim, got {head_dim}.")
 
-        manager.mla_v_scale_head_dim = int(
+        layout = Fp4MlaCacheLayout(manager)
+        layout.mla_v_scale_head_dim = int(
             getattr(pretrained_config, "kv_lora_rank", head_dim - FP4_MLA_K_RESIDUAL_DIM)
         )
-        if not 0 < manager.mla_v_scale_head_dim < head_dim:
+        if not 0 < layout.mla_v_scale_head_dim < head_dim:
             raise ValueError(
                 "FP4 MLA V2 requires kv_lora_rank in (0, head_dim), got "
-                f"{manager.mla_v_scale_head_dim} and {head_dim}."
+                f"{layout.mla_v_scale_head_dim} and {head_dim}."
             )
 
-        manager._fp8_mla_global_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
+        layout._fp8_mla_global_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
             pretrained_config, nvfp4_enabled=True, mapping=mapping
         )
-        if manager._fp8_mla_global_layer_ids:
+        if layout._fp8_mla_global_layer_ids:
             logger.info(
                 "Kimi K3 MLA layers using FP8 KV-cache fallback: "
-                f"{sorted(manager._fp8_mla_global_layer_ids)}."
+                f"{sorted(layout._fp8_mla_global_layer_ids)}."
             )
-        manager._fp4_mla_storage_backend = _fp4_mla_attention_backend()
-        if manager._fp4_mla_storage_backend not in _FP4_MLA_K_RESIDUAL_BACKENDS:
+        layout._fp4_mla_storage_backend = _fp4_mla_attention_backend()
+        if layout._fp4_mla_storage_backend not in _FP4_MLA_K_RESIDUAL_BACKENDS:
             raise ValueError(
                 "Fp4MlaKVCacheManagerV2 supports only the triton and cutedsl "
-                f"backends, got {manager._fp4_mla_storage_backend!r}."
+                f"backends, got {layout._fp4_mla_storage_backend!r}."
             )
-        manager.fp4_mla_k_residual_dim = (
+        layout.fp4_mla_k_residual_dim = (
             FP4_MLA_K_RESIDUAL_DIM
-            if manager._fp4_mla_storage_backend in _FP4_MLA_K_RESIDUAL_BACKENDS
+            if layout._fp4_mla_storage_backend in _FP4_MLA_K_RESIDUAL_BACKENDS
             else 0
         )
-        manager.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(is_disagg)
-        if manager.fp4_mla_context_only_cache:
+        layout.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(is_disagg)
+        if layout.fp4_mla_context_only_cache:
             logger.info(
                 "FP4 MLA KV cache on a disaggregated context worker: omitting "
                 "the generation-only V scales and packed V."
             )
-        manager.mla_v_head_dim = (
-            manager.mla_v_scale_head_dim
-            if manager._fp4_mla_storage_backend == _FP4_MLA_CUTEDSL_BACKEND
+        layout.mla_v_head_dim = (
+            layout.mla_v_scale_head_dim
+            if layout._fp4_mla_storage_backend == _FP4_MLA_CUTEDSL_BACKEND
             and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
-            and not manager.fp4_mla_context_only_cache
+            and not layout.fp4_mla_context_only_cache
             else None
         )
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
-        manager._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
-        manager._fp4_mla_view_cache = {}
-        manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
-        # Turns on the layout hooks the manager inherits from Fp4MlaV2CacheLayoutMixin.
-        manager.uses_fp4_mla_cache_layout = True
+        layout._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
+        # From here on the manager's layout hooks (Fp4MlaLayoutHooks) run the layout.
+        manager.fp4_mla_layout = layout
         return kv_cache_config
 
     @staticmethod
     def finalize_manager(manager) -> None:
         """Validate allocated pools and initialize derived FP4 state."""
-        Fp4MlaV2CacheLayoutMixin._validate_fp4_mla_layer_groups(manager)
-        # Partial pages leave unused V-scale tiles untouched while the
-        # fixed-width PV path can load the complete scale page. Match V1's
-        # deterministic initialization before any warmup or graph capture.
-        v_scale_pool = Fp4MlaV2CacheLayoutMixin.get_mla_v_scale_pool_base(manager)
-        if v_scale_pool is not None:
-            with torch.cuda.stream(manager._stream):
-                v_scale_pool.zero_()
-            manager._stream.synchronize()
+        manager.fp4_mla_layout.finalize()
 
     def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         # The pure MLA manager resumes a reused prefix only on a block
-        # boundary, where no HP ring content is needed. A hybrid manager
-        # composing this policy keeps the HP ring with its recurrent snapshots.
-        hp_reuse_policy = (
-            ReusePolicy.PRIVATE
-            if isinstance(self, Fp4MlaV2CacheLayoutPolicy)
-            else ReusePolicy.REQUIRED
-        )
-        return Fp4MlaV2CacheLayoutMixin._apply_fp4_mla_cache_config(
-            self, config, hp_reuse_policy=hp_reuse_policy
-        )
+        # boundary, where no HP ring content is needed, so its HP rings are
+        # private to the request. (A hybrid manager keeps the HP ring with its
+        # recurrent snapshots and applies the layout with ReusePolicy.REQUIRED.)
+        return self.fp4_mla_layout.apply_cache_config(config, hp_reuse_policy=ReusePolicy.PRIVATE)
 
     @property
     def blocks_in_primary_pool(self) -> int:
-        return self._role_encoded_page_capacity(self._cache_manager_layer_ids[0], Role.KEY)
+        return self.fp4_mla_layout.blocks_in_primary_pool
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         return {Role.ALL: MapperKind.NHD, **self.DISAGG_ROLE_MAPPER_KINDS}
 
     def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
-        return {**super().get_disagg_role_layouts(), **self._fp4_mla_disagg_role_layouts()}
+        return {
+            **super().get_disagg_role_layouts(),
+            **self.fp4_mla_layout._fp4_mla_disagg_role_layouts(),
+        }
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         return self.DISAGG_IGNORED_ROLES
@@ -268,7 +246,7 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
         result = []
         for layer_id in self.impl.layer_grouping[layer_group_id]:
-            global_layer_id = self._fp4_mla_disagg_global_layer_id(int(layer_id))
+            global_layer_id = self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(int(layer_id))
             if global_layer_id is None:
                 raise ValueError(f"Unknown FP4 MLA V2 internal layer {int(layer_id)}.")
             result.append(global_layer_id)
@@ -387,7 +365,7 @@ class Fp4MlaKVCacheManagerV2(Fp4MlaV2CacheLayoutPolicy, KVCacheManagerV2):
 
 __all__ = [
     "Fp4MlaKVCacheManagerV2",
+    "Fp4MlaCacheLayout",
     "Fp4MlaPageTableSpec",
-    "Fp4MlaV2CacheLayoutMixin",
     "Fp4MlaV2CacheLayoutPolicy",
 ]

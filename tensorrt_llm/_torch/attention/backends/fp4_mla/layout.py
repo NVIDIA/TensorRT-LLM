@@ -18,6 +18,7 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
+    fp4_mla_cache_layout,
 )
 
 # FP4 MLA scale-layout helpers
@@ -128,7 +129,7 @@ def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Te
 def _get_fp4_mla_kv_cache_tensors(
     metadata: Any, layer_idx: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    return metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(layer_idx)
 
 
 def _get_fp4_mla_hp_pool_layout(
@@ -136,10 +137,10 @@ def _get_fp4_mla_hp_pool_layout(
     pool: torch.Tensor,
 ) -> tuple[int, int]:
     """Return the manager-owned HP ring size and per-token head dimension."""
-    manager = getattr(metadata, "kv_cache_manager", None)
-    if manager is None or not hasattr(manager, "fp4_mla_hp_pool_size"):
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
         raise ValueError("FP4 MLA requires a V2 manager-owned HP ring.")
-    hp_pool_size = manager.fp4_mla_hp_pool_size
+    hp_pool_size = cache_layout.fp4_mla_hp_pool_size
     if (
         hp_pool_size < HP_BLOCK_SIZE
         or pool.ndim != 4

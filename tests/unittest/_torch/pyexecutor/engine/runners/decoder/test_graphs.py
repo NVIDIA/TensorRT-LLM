@@ -485,7 +485,7 @@ def test_packed_split_resolver_resolves_only_for_the_fp4_mla_packed_decode(monke
     model = Mock()
     model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
-    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
     resource_manager = Mock()
     config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
 
@@ -569,7 +569,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     model = Mock()
     model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
-    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
     fp4_kv_cache_manager.max_blocks_per_seq = 235
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
@@ -638,7 +638,7 @@ def test_kv_regime_resolver_resolves_each_graph_shape_once() -> None:
     model = Mock()
     model.modules.return_value = [mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
-    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
     fp4_kv_cache_manager.max_blocks_per_seq = 235
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager

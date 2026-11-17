@@ -24,6 +24,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .config import fp4_mla_cache_layout
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
 
 if TYPE_CHECKING:
@@ -375,16 +376,18 @@ def get_or_create_fp8_mla_context_scratch(
     def create_scratch() -> _Fp8MlaContextScratch:
         return _Fp8MlaContextScratch.create(meta, device=device, head_dim=head_dim)
 
-    get_or_create = getattr(kv_cache_manager, "get_or_create_fp8_context_scratch", None)
+    # The cache layout owns the scratch; a manager without one keeps it itself.
+    owner = fp4_mla_cache_layout(kv_cache_manager) or kv_cache_manager
+    get_or_create = getattr(owner, "get_or_create_fp8_context_scratch", None)
     if callable(get_or_create):
-        had_scratch = getattr(kv_cache_manager, "_fp8_context_scratch", None) is not None
+        had_scratch = getattr(owner, "_fp8_context_scratch", None) is not None
         scratch = get_or_create(create_scratch)
     else:
-        scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
+        scratch = getattr(owner, _FP8_CONTEXT_SCRATCH_ATTR, None)
         had_scratch = scratch is not None
         if scratch is None:
             scratch = create_scratch()
-            setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
+            setattr(owner, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
 
     assert isinstance(scratch, _Fp8MlaContextScratch)
     if had_scratch:

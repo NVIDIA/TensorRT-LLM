@@ -33,6 +33,7 @@ from .config import (
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    fp4_mla_cache_layout,
 )
 from .fp4_mla_kernels import (
     _fp4_mla_context_cache_update_kernel,
@@ -147,6 +148,8 @@ def _prepare_fp4_mla_q_buffers(
         raise RuntimeError("Fused FP4 MLA Q quantization requires a KV cache manager.")
     if num_heads <= 0 or num_heads > 128:
         raise ValueError(f"FP4 MLA Q buffers require 1-128 local heads, got {num_heads}.")
+    # The cache layout owns the Q buffers; a manager without one keeps them itself.
+    owner = fp4_mla_cache_layout(owner) or owner
     get_or_create = getattr(owner, "get_or_create_fp4_mla_q_buffers", None)
     if callable(get_or_create):
         buffers = get_or_create()
@@ -704,7 +707,9 @@ def _scatter_fp4_mla_context(
         )
         v_packed_base = plan.v_packed_base
         if v_packed_base is not None:
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            get_v_page_offset = getattr(
+                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
+            )
             v_page_offset = (
                 int(get_v_page_offset(local_layer))
                 if callable(get_v_page_offset)
@@ -1322,7 +1327,9 @@ def scatter_fp4_mla_kv_cache(
         )
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            get_v_page_offset = getattr(
+                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
+            )
             v_page_offset = (
                 int(get_v_page_offset(local_layer))
                 if callable(get_v_page_offset)

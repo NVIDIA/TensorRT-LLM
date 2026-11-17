@@ -56,8 +56,8 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, has_fp4_mla_cache_layout,
-                      load_fp4_mla_chunked_kv_cache,
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
+                      has_fp4_mla_cache_layout, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -2601,7 +2601,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.kv_cache_manager is None:
             return local_layer_idx
-        to_compact = getattr(metadata.kv_cache_manager,
+        to_compact = getattr(fp4_mla_cache_layout(metadata.kv_cache_manager),
                              "_fp4_mla_compact_layer_idx", None)
         if not callable(to_compact):
             raise RuntimeError(

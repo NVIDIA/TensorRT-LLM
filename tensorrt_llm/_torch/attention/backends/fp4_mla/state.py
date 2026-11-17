@@ -100,14 +100,15 @@ class Fp4MlaState:
     @classmethod
     def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
         manager = metadata.kv_cache_manager
-        hp_ring_size = manager.fp4_mla_hp_pool_size
+        layout = manager.fp4_mla_layout
+        hp_ring_size = layout.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
             raise RuntimeError(
                 "FP4 MLA high-precision ring must retain at least one "
                 f"{HP_BLOCK_SIZE}-token quantization tile, got {hp_ring_size} slots."
             )
-        hp_pool = manager.get_fp4_mla_hp_pool()
-        fp4_layers = manager._fp4_mla_compact_to_local
+        hp_pool = layout.get_fp4_mla_hp_pool()
+        fp4_layers = layout._fp4_mla_compact_to_local
         if (
             not isinstance(hp_pool, torch.Tensor)
             or hp_pool.dtype != torch.bfloat16
@@ -134,7 +135,7 @@ class Fp4MlaState:
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        state = cls(hp_pool=hp_pool, v_scale_pool=layout.get_mla_v_scale_pool())
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)

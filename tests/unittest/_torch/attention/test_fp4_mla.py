@@ -37,6 +37,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     run_fp4_mla_attention_decode,
     scatter_fp4_mla_kv_cache,
 )
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_layout import Fp4MlaCacheLayout
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_context import (
     _build_fp8_mla_context_metadata,
@@ -781,8 +782,9 @@ def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) 
         ),
         get_page_index_upper_bound=lambda *_: 20 - layer_offset,
     )
+    manager.fp4_mla_layout = Fp4MlaCacheLayout(manager)
 
-    assert manager._role_encoded_page_capacity(0, Role.KEY) == 17
+    assert manager.fp4_mla_layout._role_encoded_page_capacity(0, Role.KEY) == 17
 
 
 @pytest.mark.parametrize("preemption", [False, True])
@@ -812,6 +814,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(preemption, monkeypatch
     manager.max_batch_size = 3
     manager.gen_preemption_headroom = 1 if preemption else 0
     manager.mapping = Mapping(world_size=2, tp_size=1, pp_size=2, rank=0)
+    manager.fp4_mla_layout = Fp4MlaCacheLayout(manager)
     assert manager._get_generation_request_capacity() == residents
 
 
@@ -1263,6 +1266,7 @@ def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
     manager.enable_swa_scratch_reuse = False
     manager._has_cp_helix = False
     manager._generation_kv_capacity_headroom = 1
+    manager.fp4_mla_layout = Fp4MlaCacheLayout(manager)
     manager._get_runtime_cache_size_layer_components = lambda: ([10, 8], [None, 19])
 
     quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)
@@ -1307,7 +1311,7 @@ def test_fp4_mla_manager_v2_packed_v_matches_cutedsl_variant(
             pretrained_config=SimpleNamespace(kv_lora_rank=512),
         )
 
-    assert captured["manager"].mla_v_head_dim == expected_v_head_dim
+    assert captured["manager"].fp4_mla_layout.mla_v_head_dim == expected_v_head_dim
 
 
 @pytest.mark.parametrize(
@@ -1366,17 +1370,18 @@ def test_fp4_mla_disagg_import_rebuilds_variant_sidecars(
     manager = SimpleNamespace(
         dtype=_DataType.NVFP4,
         kv_factor=1,
-        mla_v_scale_head_dim=512,
-        mla_v_head_dim=None if fused_v_transpose else 512,
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         pp_layers=[7, 11],
         num_local_layers=2,
-        get_fp4_mla_page_table_spec=lambda *_: SimpleNamespace(),
         get_batch_cache_indices=lambda request_ids, layer_idx=None: [[17, 29, 31], [5]],
-        get_fp4_mla_cache_pool_bases=lambda: (kv_cache, sf_cache),
-        get_mla_v_scale_pool_base=lambda: v_scale_pool,
-        get_mla_v_scale_page_offset=lambda compact_layer: compact_layer,
-        get_mla_v_packed_pool_base=get_v_packed_pool_base,
+        fp4_mla_layout=SimpleNamespace(
+            mla_v_scale_head_dim=512,
+            mla_v_head_dim=None if fused_v_transpose else 512,
+            get_fp4_mla_cache_pool_bases=lambda: (kv_cache, sf_cache),
+            get_mla_v_scale_pool_base=lambda: v_scale_pool,
+            get_mla_v_scale_page_offset=lambda compact_layer: compact_layer,
+            get_mla_v_packed_pool_base=get_v_packed_pool_base,
+        ),
     )
     monkeypatch.setattr(fp4_mla_v_cache, "_fp4_mla_attention_backend", lambda: "cutedsl")
     monkeypatch.setattr(
@@ -1463,19 +1468,20 @@ def test_fp4_mla_disagg_import_skips_hybrid_linear_attention_layers(monkeypatch)
     manager = SimpleNamespace(
         dtype=_DataType.NVFP4,
         kv_factor=1,
-        mla_v_scale_head_dim=512,
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         pp_layers=[3, 7, 11],
         num_local_layers=3,
-        _fp4_mla_compact_to_local=[1, 2],
-        get_fp4_mla_page_table_spec=lambda *_: SimpleNamespace(),
         get_batch_cache_indices=get_batch_cache_indices,
-        get_fp4_mla_cache_pool_bases=lambda: (
-            torch.empty(1, dtype=torch.uint8),
-            torch.empty(1, dtype=torch.uint8),
+        fp4_mla_layout=SimpleNamespace(
+            mla_v_scale_head_dim=512,
+            _fp4_mla_compact_to_local=[1, 2],
+            get_fp4_mla_cache_pool_bases=lambda: (
+                torch.empty(1, dtype=torch.uint8),
+                torch.empty(1, dtype=torch.uint8),
+            ),
+            get_mla_v_scale_pool_base=lambda: torch.empty((32, 1), dtype=torch.uint8),
+            get_mla_v_scale_page_offset=get_mla_v_scale_page_offset,
         ),
-        get_mla_v_scale_pool_base=lambda: torch.empty((32, 1), dtype=torch.uint8),
-        get_mla_v_scale_page_offset=get_mla_v_scale_page_offset,
     )
     monkeypatch.setattr(fp4_mla_v_cache, "_fp4_mla_attention_backend", lambda: "triton")
     monkeypatch.setattr(
@@ -1506,10 +1512,11 @@ def test_fp4_mla_helix_disagg_import_skips_empty_rank() -> None:
     manager = SimpleNamespace(
         dtype=_DataType.NVFP4,
         kv_factor=1,
-        mla_v_scale_head_dim=512,
-        get_fp4_mla_page_table_spec=lambda *_: SimpleNamespace(),
         get_batch_cache_indices=lambda *_args, **_kwargs: pytest.fail(
             "an empty Helix rank must not query cache pages"
+        ),
+        fp4_mla_layout=SimpleNamespace(
+            mla_v_scale_head_dim=512,
         ),
     )
 
@@ -1548,7 +1555,7 @@ def test_fp4_mla_disagg_import_rebuild_matches_context_cache_update(
     )
     try:
         manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
-        for pool in manager._iter_fp4_mla_physical_pool_views():
+        for pool in manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
             pool.view(torch.uint8).zero_()
         metadata = _build_multi_seq_metadata(manager, seq_lens=seq_lens, page_size=page_size)
         latent = (
@@ -1565,8 +1572,8 @@ def test_fp4_mla_disagg_import_rebuild_matches_context_cache_update(
         )
         torch.cuda.synchronize()
 
-        v_scale = manager.get_mla_v_scale_pool_base()
-        v_packed = manager.get_mla_v_packed_pool_base()
+        v_scale = manager.fp4_mla_layout.get_mla_v_scale_pool_base()
+        v_packed = manager.fp4_mla_layout.get_mla_v_packed_pool_base()
         assert (v_packed is None) == (backend == "triton" or fused_v_transpose)
         expected_v_scale = v_scale.clone()
         expected_v_packed = None if v_packed is None else v_packed.clone()
@@ -1623,11 +1630,11 @@ def test_fp4_mla_hp_ring_content_depends_only_on_position(monkeypatch) -> None:
             )
             managers.append(manager)
             manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
-            for pool in manager._iter_fp4_mla_physical_pool_views():
+            for pool in manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
                 pool.view(torch.uint8).zero_()
         ctx, gen = managers
-        assert ctx.fp4_mla_hp_pool_size == HP_BLOCK_SIZE
-        assert gen.fp4_mla_hp_pool_size == HP_BLOCK_SIZE + 5
+        assert ctx.fp4_mla_layout.fp4_mla_hp_pool_size == HP_BLOCK_SIZE
+        assert gen.fp4_mla_layout.fp4_mla_hp_pool_size == HP_BLOCK_SIZE + 5
 
         latent = (
             torch.randn(sum(seq_lens), 576, dtype=torch.bfloat16, device="cuda") * 0.25
@@ -1647,12 +1654,12 @@ def test_fp4_mla_hp_ring_content_depends_only_on_position(monkeypatch) -> None:
         def ring_tokens(manager, request_id, seq_len):
             page = manager._get_batch_cache_indices_by_pool_id(
                 [request_id],
-                pool_id=manager.get_fp4_mla_page_table_spec(0).hp_pool_id,
+                pool_id=manager.fp4_mla_layout.get_fp4_mla_page_table_spec(0).hp_pool_id,
                 is_kv_aggregate=False,
             )[0][(seq_len - 1) // page_size]
-            ring = manager.get_fp4_mla_hp_pool()[page, 0, 0].view(-1, 576)
+            ring = manager.fp4_mla_layout.get_fp4_mla_hp_pool()[page, 0, 0].view(-1, 576)
             tail = range(seq_len - seq_len % HP_BLOCK_SIZE, seq_len)
-            return ring[[p % manager.fp4_mla_hp_pool_size for p in tail]], tail
+            return ring[[p % manager.fp4_mla_layout.fp4_mla_hp_pool_size for p in tail]], tail
 
         for request_id, seq_len in enumerate(seq_lens):
             ctx_tail, tail = ring_tokens(ctx, request_id, seq_len)
@@ -1703,17 +1710,17 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
         assert [buffer.role for buffer in config.layers[2].buffers] == [Role.MLA_HP_TAIL]
         assert config.layers[2].sliding_window_size == HP_BLOCK_SIZE
 
-        page_spec = manager.get_fp4_mla_page_table_spec(0)
+        page_spec = manager.fp4_mla_layout.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_pool_id != page_spec.hp_pool_id
         assert page_spec.cache_page_index_scale == 1
         assert page_spec.hp_page_index_scale == 1
 
-        kv_cache, sf_cache = manager.get_fp4_mla_cache_buffers(0)
-        v_scale_pool = manager.get_mla_v_scale_pool()
-        hp_pool = manager.get_fp4_mla_hp_pool()
+        kv_cache, sf_cache = manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
+        v_scale_pool = manager.fp4_mla_layout.get_mla_v_scale_pool()
+        hp_pool = manager.fp4_mla_layout.get_fp4_mla_hp_pool()
         assert kv_cache.shape[0] == sf_cache.shape[0] == v_scale_pool.shape[1]
         assert v_scale_pool.dtype == torch.float8_e4m3fn
-        assert manager.get_mla_v_scale_pool_base().dtype == torch.uint8
+        assert manager.fp4_mla_layout.get_mla_v_scale_pool_base().dtype == torch.uint8
         assert hp_pool.shape[1:] == (2, 1, HP_BLOCK_SIZE * 576)
     finally:
         manager.shutdown()
@@ -1745,7 +1752,7 @@ def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch, device_pa
                     manager.index_mapper.get_copy_index([0, 1], 0, 1),
                 )
             )
-        page_spec = manager.get_fp4_mla_page_table_spec(0)
+        page_spec = manager.fp4_mla_layout.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_page_index_scale == 1
         dst = torch.full(
             (manager.num_attention_op_pools, len(seq_lens), 2, manager.max_blocks_per_seq),
@@ -1864,18 +1871,18 @@ def test_fp4_mla_pool_views_built_in_inference_mode_can_be_scrubbed(monkeypatch)
     manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
     try:
         with torch.inference_mode():
-            manager.get_fp4_mla_cache_buffers(0)
-            manager.get_fp4_mla_cache_pool_bases()
-            for _ in manager._iter_fp4_mla_physical_pool_views():
+            manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
+            manager.fp4_mla_layout.get_fp4_mla_cache_pool_bases()
+            for _ in manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
                 pass
         cached = [
             tensor
-            for value in manager._fp4_mla_view_cache.values()
+            for value in manager.fp4_mla_layout._fp4_mla_view_cache.values()
             for tensor in (value if isinstance(value, tuple) else (value,))
         ]
         assert cached
         assert not any(tensor.is_inference() for tensor in cached)
-        for view in manager._iter_fp4_mla_physical_pool_views():
+        for view in manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
             view.zero_()
         assert not manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
     finally:
@@ -1998,7 +2005,7 @@ def _build_multi_seq_metadata(
     num_seqs = len(seq_lens)
     request_ids = list(range(num_seqs))
     block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=0)
-    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(0)
+    page_spec = kv_cache_manager.fp4_mla_layout.get_fp4_mla_page_table_spec(0)
     hp_block_ids_per_seq = kv_cache_manager._get_batch_cache_indices_by_pool_id(
         request_ids,
         pool_id=page_spec.hp_pool_id,
@@ -2038,7 +2045,7 @@ def _build_multi_seq_metadata(
         [torch.arange(seq_len, dtype=torch.int32, device=device) for seq_len in seq_lens]
     )
 
-    hp_pool = kv_cache_manager.get_fp4_mla_hp_pool()
+    hp_pool = kv_cache_manager.fp4_mla_layout.get_fp4_mla_hp_pool()
     kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cuda = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
@@ -2072,7 +2079,7 @@ def _build_multi_seq_metadata(
             num_sequences=num_seqs,
             num_blocks=None,
             hp_pool=hp_pool,
-            v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
+            v_scale_pool=kv_cache_manager.fp4_mla_layout.get_mla_v_scale_pool(),
             generation_kv_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_append_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_lengths_num_tokens=-1,
@@ -2086,7 +2093,9 @@ def _build_multi_seq_metadata(
 
 
 def _materialize_reference_cache_storage(metadata, layer_idx: int, head_dim: int) -> torch.Tensor:
-    kv_cache, sf_cache = metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    kv_cache, sf_cache = metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(
+        layer_idx
+    )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     storage_head_dim = kv_cache.shape[-1] * 2
     static_global_scale = float(_get_fp4_mla_global_scale(metadata, kv_cache.device).item())
@@ -2154,7 +2163,9 @@ def _materialize_reference_cache_tokens(
     *,
     include_k_residual: bool = False,
 ) -> torch.Tensor:
-    kv_cache, sf_cache = metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    kv_cache, sf_cache = metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(
+        layer_idx
+    )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     storage_head_dim = kv_cache.shape[-1] * 2
     static_global_scale = float(_get_fp4_mla_global_scale(metadata, kv_cache.device).item())
@@ -2228,12 +2239,12 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             [inactive_rank], dtype=torch.bool, device="cuda"
         )
 
-        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+        kv_cache, sf_cache = kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
         kv_cache.zero_()
         sf_cache.zero_()
         state.hp_pool.zero_()
         state.v_scale_pool.zero_()
-        v_packed_pool = kv_cache_manager.get_mla_v_packed_pool_base()
+        v_packed_pool = kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
         assert v_packed_pool is not None
         v_packed_pool.zero_()
 
@@ -2373,19 +2384,19 @@ def test_fp4_mla_helix_generation_writes_hp_ring_at_global_position(monkeypatch)
     try:
         state = metadata.fp4_mla_state
         head_dim = kv_lora_rank + qk_rope_head_dim
-        ring_size = kv_cache_manager.fp4_mla_hp_pool_size
+        ring_size = kv_cache_manager.fp4_mla_layout.fp4_mla_hp_pool_size
         assert global_position % ring_size != local_cache_position % ring_size
         state.positions = torch.tensor([global_position], dtype=torch.int32, device="cuda")
         metadata._helix_spec_tokens_valid = False
         metadata.helix_position_offsets = state.positions
         metadata.helix_is_inactive_rank = torch.tensor([False], dtype=torch.bool, device="cuda")
 
-        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+        kv_cache, sf_cache = kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
         kv_cache.zero_()
         sf_cache.zero_()
         state.hp_pool.zero_()
         state.v_scale_pool.zero_()
-        v_packed_pool = kv_cache_manager.get_mla_v_packed_pool_base()
+        v_packed_pool = kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
         if v_packed_pool is not None:
             v_packed_pool.zero_()
 
@@ -2586,7 +2597,7 @@ def _build_fp4_mla_attention_decode_case(
     expected_storage_head_dim = head_dim + (
         FP4_MLA_K_RESIDUAL_DIM if _fp4_mla_attention_backend() in ("triton", "cutedsl") else 0
     )
-    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+    kv_cache, sf_cache = kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
     kv_cache.zero_()
     sf_cache.zero_()
     assert kv_cache.shape[-1] * 2 == expected_storage_head_dim
@@ -2598,7 +2609,7 @@ def _build_fp4_mla_attention_decode_case(
         page_size=page_size,
     )
     assert metadata.fp4_mla_state.v_scale_pool is not None
-    persistent_pool_base = kv_cache_manager.get_mla_v_packed_pool_base()
+    persistent_pool_base = kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
     if persistent_pool_base is not None:
         persistent_pool_base.zero_()
     metadata.fp4_mla_state.v_scale_pool.zero_()
@@ -4382,7 +4393,7 @@ def test_fp4_mla_cached_context_matches_reference(
     )
     try:
         kv_cache_manager.add_dummy_requests(request_ids, total_lens)
-        for pool in kv_cache_manager._iter_fp4_mla_physical_pool_views():
+        for pool in kv_cache_manager.fp4_mla_layout._iter_fp4_mla_physical_pool_views():
             pool.view(torch.uint8).zero_()
         attention = _make_fp4_mla_context_attention(max_seq_len)
         kv_b_weight = (
@@ -4502,8 +4513,8 @@ def test_fp4_mla_cached_context_matches_reference(
 
         # Every page, the prefix pages written by the earlier step included,
         # carries the V scales and packed V that its K payload implies.
-        v_scale = kv_cache_manager.get_mla_v_scale_pool_base()
-        v_packed = kv_cache_manager.get_mla_v_packed_pool_base()
+        v_scale = kv_cache_manager.fp4_mla_layout.get_mla_v_scale_pool_base()
+        v_packed = kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
         assert v_packed is not None
         expected_v_scale = v_scale.clone()
         expected_v_packed = v_packed.clone()
@@ -4570,7 +4581,7 @@ def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch) -> None:
         hp_layers = [
             layer
             for layer in manager.kv_cache_manager_py_config.layers
-            if layer.layer_id in manager._hp_manager_layer_ids
+            if layer.layer_id in manager.fp4_mla_layout._hp_manager_layer_ids
         ]
         assert hp_layers
         assert all(layer.reuse_policy == ReusePolicy.PRIVATE for layer in hp_layers)

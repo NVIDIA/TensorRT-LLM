@@ -654,7 +654,7 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
     # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
     # layout from this hook, so a plain (non-FP4) manager must not expose it.
-    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
+    mock_kv_cache_manager.fp4_mla_layout = None
     mock_kv_cache_manager.mixed_precision_high_layers = {}
     return mock_kv_cache_manager
 

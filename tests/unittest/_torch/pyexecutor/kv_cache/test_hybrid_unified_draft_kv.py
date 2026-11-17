@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_layout import Fp4MlaCacheLayout
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
@@ -493,18 +493,17 @@ def test_base_manager_hooks_read_appended_draft_specs():
 def test_fp4_mla_transfer_ids_of_appended_draft_layers():
     # Target layer 0 is recurrent, 1 is FP4 MLA (HP ring at virtual layer 4),
     # 2 is an FP8 fallback layer, local 3 is draft layer 6.
-    manager = SimpleNamespace(
-        pp_layers=[0, 1, 2, 6],
-        _appended_draft_layer_specs={3: _draft_spec(6)},
+    layout = SimpleNamespace(
+        _manager=SimpleNamespace(
+            pp_layers=[0, 1, 2, 6],
+            _appended_draft_layer_specs={3: _draft_spec(6)},
+        ),
         _cache_manager_layer_ids=[1],
         _fp4_mla_compact_to_local=[1],
         _fp8_mla_manager_layer_ids=[2],
         _hp_manager_layer_ids=[4],
     )
-    ids = [
-        Fp4MlaV2CacheLayoutPolicy._fp4_mla_disagg_global_layer_id(manager, layer)
-        for layer in range(5)
-    ]
+    ids = [Fp4MlaCacheLayout._fp4_mla_disagg_global_layer_id(layout, layer) for layer in range(5)]
 
     assert ids == [None, 2, 4, 12, 3]
 
