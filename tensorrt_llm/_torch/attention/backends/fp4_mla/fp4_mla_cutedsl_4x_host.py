@@ -31,15 +31,13 @@ from typing import Any
 import torch
 
 from .config import _env_flag_not_disabled as _env_flag
-from .config import _env_int as _config_env_int
+from .config import _env_int
 
 __all__ = [
     "EnvelopeGeometry",
     "FULL_ONLY_MAX_PAIRS",
     "SUPPORTED_QUERY_LENS",
     "COMPILE_OPTIONS",
-    "KERNEL_ARGV_FLAGS",
-    "check_kernel_argv",
     "kernel_module",
     "validate_envelope",
     "zero_queries",
@@ -122,11 +120,6 @@ MIN_PAIRS_DERIVED = -1  # default: the 2x two-piece-plan rule above
 Q2_MIN_PAIRS = 20
 
 
-def _env_int(name: str, default: int) -> int:
-    value = _config_env_int(name, default)
-    return default if value is None else value
-
-
 def split_enabled() -> bool:
     """Whether the plan-driven split mode may be used (``TRTLLM_FP4_MLA_4X_SPLIT``, default on)."""
     return _env_flag(SPLIT_ENV, True)
@@ -154,7 +147,6 @@ def use_split_mode(*, num_heads: int, query_len: int, num_requests: int, max_kv_
 INT32_MAX = 2147483647
 LOG2_E = 1.4426950408889634  # X79:395
 COMPILE_OPTIONS = "--opt-level 2 --ptxas-options '--uumn'"  # X79:10093
-KERNEL_ARGV_FLAGS: tuple[str, ...] = ()
 
 _HERE = Path(__file__).resolve().parent
 KERNEL_FILE = _HERE / "fp4_mla_cutedsl_4x.py"
@@ -185,11 +177,6 @@ class EnvelopeError(ValueError):
     """Raised when a call is outside the fair envelope or violates the mufu16 input contract."""
 
 
-def check_kernel_argv(argv: list[str] | None = None) -> None:
-    """Compatibility no-op: the CuTe DSL kernel modules no longer inspect sys.argv on import."""
-    del argv
-
-
 _KERNEL_LOCK = threading.Lock()
 _KERNEL: Any = None
 
@@ -200,7 +187,6 @@ def kernel_module():
     with _KERNEL_LOCK:
         if _KERNEL is not None:
             return _KERNEL
-        check_kernel_argv()
         module = sys.modules.get(KERNEL_MODULE_NAME)
         if module is None:
             if not KERNEL_FILE.is_file():
@@ -374,7 +360,6 @@ def validate_envelope(
     tensors; never do that under CUDA-graph capture).  ``require_cuda`` also requires a device that can host the
     kernel (``device_unsupported_reason``, cached per device).  ``max_pairs`` overrides FULL_ONLY_MAX_PAIRS and
     exists ONLY for the two-wave control experiment (TEST MATRIX "B26/Q4 CONTROL (b)")."""
-    check_kernel_argv()
     # --- scalars -------------------------------------------------------------------------------------------------
     if type(query_len_per_seq) is not int or query_len_per_seq not in SUPPORTED_QUERY_LENS:
         raise EnvelopeError(
@@ -844,8 +829,11 @@ def _make_wrapper_ptrs(addresses: list[int], output_dtype: torch.dtype) -> tuple
 
 
 def _current_cu_stream():
-    """Plain caller-stream handle (rig cute_dsl_utils.py:19-21); deliberately WITHOUT x79's
-    DKG_MLA_EXPLICIT_STREAM side effect (X79:637-643 calls torch.cuda.set_stream)."""
+    """The caller's stream, for launch ordering and CUDA graph capture.
+
+    Same as ``cute_dsl_utils._current_cu_stream``, with the CUDA bindings imported on use: the host-side checks of
+    this module also run where they are not installed.
+    """
     import cuda.bindings.driver as cuda
 
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)

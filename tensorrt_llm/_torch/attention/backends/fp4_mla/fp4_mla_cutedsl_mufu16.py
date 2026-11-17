@@ -5060,26 +5060,6 @@ def _packed_query_bound(
 
 
 @cute.jit
-def _packed_request_tiles(
-    mValidK_l: cute.Tensor,
-    mHelixKvBounds_l: cute.Tensor,
-    request_idx: ctm.Int32,
-    query_len_per_seq: ctm.Constexpr,
-    use_helix_kv_bounds: ctm.Constexpr,
-) -> ctm.Int32:
-    """KV tiles a packed request spans (its last query token's bound), at least one."""
-    bound = _packed_query_bound(
-        mHelixKvBounds_l,
-        request_idx,
-        ctm.Int32(query_len_per_seq - 1),
-        ctm.Int32(mValidK_l[request_idx]),
-        query_len_per_seq,
-        use_helix_kv_bounds,
-    )
-    return ctm.max((bound + ctm.Int32(KV_TILE - 1)) // ctm.Int32(KV_TILE), ctm.Int32(1))
-
-
-@cute.jit
 def _run_mla_decode_body(
     mPageTable_pl: cute.Tensor,
     mPageIndptr_s: cute.Tensor,

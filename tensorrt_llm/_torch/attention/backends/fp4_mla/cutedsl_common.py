@@ -379,29 +379,6 @@ def _p4_n256_prequant_rowsum_from_f16x2_psf(
 
 
 @cute.jit
-def _p4_n256_rowsum_from_packed_psf_word(sf_word: ctm.Int32, packed_group_sums: Any) -> ctm.Float32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 sf01, sf23;\n"
-        "\t.reg .b32 sf_h2_01, sf_h2_23, weighted_h2;\n"
-        "\t.reg .f16 weighted_lo, weighted_hi;\n"
-        "\t.reg .f32 weighted_lo_f32, weighted_hi_f32;\n"
-        "\tmov.b32 {sf01, sf23}, {$r0};\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_01, sf01;\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_23, sf23;\n"
-        "\tmul.f16x2 weighted_h2, {$r1}, sf_h2_01;\n"
-        "\tfma.rn.f16x2 weighted_h2, {$r2}, sf_h2_23, weighted_h2;\n"
-        "\tmov.b32 {weighted_lo, weighted_hi}, weighted_h2;\n"
-        "\tcvt.f32.f16 weighted_lo_f32, weighted_lo;\n"
-        "\tcvt.f32.f16 weighted_hi_f32, weighted_hi;\n"
-        "\tadd.f32 {$w0}, weighted_lo_f32, weighted_hi_f32;\n"
-        "\t}\n",
-        write_only_types=[ctm.Float32],
-        read_only_args=[sf_word, packed_group_sums[0], packed_group_sums[1]],
-    )
-
-
-@cute.jit
 def _pack_e2m1x8_from_f16x2(
     pair0: ctm.Int32, pair1: ctm.Int32, pair2: ctm.Int32, pair3: ctm.Int32
 ) -> ctm.Int32:
@@ -416,22 +393,6 @@ def _pack_e2m1x8_from_f16x2(
         "\t}\n",
         write_only_types=[ctm.Int32],
         read_only_args=[pair0, pair1, pair2, pair3],
-    )
-
-
-@cute.jit
-def _horizontal_pack_two_f16x2_sums(group_sum0: ctm.Int32, group_sum1: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .f16 g0lo, g0hi, g1lo, g1hi, sum0, sum1;\n"
-        "\tmov.b32 {g0lo, g0hi}, {$r0};\n"
-        "\tmov.b32 {g1lo, g1hi}, {$r1};\n"
-        "\tadd.rn.f16 sum0, g0lo, g0hi;\n"
-        "\tadd.rn.f16 sum1, g1lo, g1hi;\n"
-        "\tmov.b32 {$w0}, {sum0, sum1};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[group_sum0, group_sum1],
     )
 
 
