@@ -28,8 +28,7 @@
 #   FINAL_SNAPSHOT      non-empty for the snapshot taken when the tests end
 #   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; with FINAL_SNAPSHOT, regenerates
 #                       results-timeout.xml from unfinished_test.txt
-#   TIMEOUT_EVIDENCE_FILE  retained evidence from previous pytest invocations (outside the stage)
-#   TIMEOUT_LOG_FILE    this invocation's pytest output or Slurm timeout markers, outside the stage
+#   TIMEOUT_EVIDENCE_FILE  pytest timeout and attempt records for the report, outside the stage
 #   PROGRESS_HASH_FILE  path that holds the content hash every upload target last received
 #                       (default: ${WORKSPACE}/${PROGRESS_TAR}.last_hash).
 #                       Set to empty string to disable dedup.
@@ -59,7 +58,7 @@ if [ -n "$FINAL_SNAPSHOT" ] && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
     ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
         --stage-name "$STAGE_NAME" \
         --test-file-path "unfinished_test.txt" \
-        --timeout-evidence-file <(cat -- "$TIMEOUT_EVIDENCE_FILE" "$TIMEOUT_LOG_FILE" 2>/dev/null) \
+        --timeout-evidence-file "$TIMEOUT_EVIDENCE_FILE" \
         --output-file "$timeout_xml" ) && include_timeout_xml=1
 fi
 

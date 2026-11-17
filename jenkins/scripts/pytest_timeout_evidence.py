@@ -119,45 +119,50 @@ def load_timeout_evidence(path: str | None, unfinished_nodeids: Iterable[str]) -
         return {}
 
 
-def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[str]) -> str:
-    """Return retained records without replacing the agent-owned evidence file.
+def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[str]) -> None:
+    """Discard records from completed attempts before a rerun starts.
 
-    Raises OSError (including FileNotFoundError) when the evidence cannot be read,
-    so the caller leaves the file untouched instead of writing an empty one.
+    The file is rewritten in place, not replaced: the Jenkins agent owns it and writes it
+    again later, so it must keep its owner and mode.
     """
     candidates = _nodeid_set(unfinished_nodeids)
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
-
-    retained_lines = []
-    for line in lines:
-        event = _timeout_event_from_line(line)
-        if event is not None and event[1] in candidates:
-            retained_lines.append(line if line.endswith("\n") else line + "\n")
-
-    return "".join(retained_lines)
+    try:
+        with open(path, "r+", encoding="utf-8", errors="replace") as f:
+            retained_lines = []
+            for line in f.readlines():
+                event = _timeout_event_from_line(line)
+                if event is not None and event[1] in candidates:
+                    retained_lines.append(line if line.endswith("\n") else line + "\n")
+            f.seek(0)
+            f.writelines(retained_lines)
+            f.truncate()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(f"WARNING: cannot prune timeout evidence file {path}: {exc}", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Print timeout evidence only for tests still unfinished before a rerun"
+        description="Keep timeout evidence only for tests still unfinished before a rerun"
     )
     parser.add_argument("--evidence-file", required=True)
     parser.add_argument("--unfinished-test-file", required=True)
     args = parser.parse_args()
 
     try:
-        try:
-            with open(args.unfinished_test_file, encoding="utf-8", errors="replace") as f:
-                unfinished_nodeids = f.readlines()
-        except FileNotFoundError:
-            unfinished_nodeids = []
-        retained = retain_unfinished_timeout_evidence(args.evidence_file, unfinished_nodeids)
+        with open(args.unfinished_test_file, encoding="utf-8", errors="replace") as f:
+            unfinished_nodeids = f.readlines()
+    except FileNotFoundError:
+        unfinished_nodeids = []
     except OSError as exc:
-        # A non-zero exit tells the caller to keep the evidence file as it is.
-        print(f"WARNING: cannot scope timeout evidence: {exc}", file=sys.stderr)
-        sys.exit(1)
-    sys.stdout.write(retained)
+        print(
+            f"WARNING: cannot read unfinished test file {args.unfinished_test_file}: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    retain_unfinished_timeout_evidence(args.evidence_file, unfinished_nodeids)
 
 
 if __name__ == "__main__":
