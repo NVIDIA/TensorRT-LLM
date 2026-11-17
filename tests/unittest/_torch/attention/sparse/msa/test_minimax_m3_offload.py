@@ -386,8 +386,8 @@ def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
-    dtype, heads, graph
-):
+    dtype: DataType, heads: int, graph: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Bitwise data/scale and attention parity, including replay with changing batch rows.
 
     Two histories exceed two GPU cache capacities; another has one page.
@@ -426,6 +426,15 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 assert layer.sparse_cache.include_partial_units
                 assert layer.sparse_cache.num_selected_blocks == TOPK * heads
                 assert layer.sparse_cache.max_cached_units == TOPK * heads + 1
+        get_subpage_pool = manager.get_kv_subpage_pool
+
+        def resident_subpage_pool(
+            layer_idx: int, kv_layout: str = "HND"
+        ) -> tuple[torch.Tensor, int]:
+            assert not manager.offloads_layer(layer_idx), "Host history is not a CUDA pool"
+            return get_subpage_pool(layer_idx, kv_layout)
+
+        monkeypatch.setattr(manager, "get_kv_subpage_pool", resident_subpage_pool)
         metadata = MiniMaxM3MsaSparseAttentionMetadata(
             max_num_requests=BATCH,
             max_num_tokens=BATCH,

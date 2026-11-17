@@ -23,7 +23,7 @@ argument conventions are exercised without standing up a model.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import List
 
 import pytest
 import torch
@@ -133,29 +133,39 @@ def test_write_subpage_block_table_fills_a_caller_owned_buffer():
 
 
 class _PerLayerFactors:
-    """The two attributes uniform_subpages_per_slot reads off a cache manager."""
+    """Resident sub-page pools and host-only histories of a cache manager."""
 
-    def __init__(self, factors: Dict[int, int]):
+    def __init__(self, factors: dict[int, int], offloaded: tuple[int, ...] = ()) -> None:
         self.layer_offsets = dict.fromkeys(factors, 0)
         self._factors = factors
+        self._offloaded = frozenset(offloaded)
 
-    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str = "HND"):
+    def offloads_layer(self, layer_idx: int) -> bool:
+        return layer_idx in self._offloaded
+
+    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str = "HND") -> tuple[None, int]:
+        assert not self.offloads_layer(layer_idx), "Host history is not a CUDA sub-page pool"
         return None, self._factors[layer_idx]
 
 
 @pytest.mark.parametrize(
-    "factors,expected",
+    "factors,offloaded,expected",
     [
-        pytest.param({0: 2, 1: 2, 2: 2, 3: 2}, 2, id="agreeing"),
+        pytest.param({0: 2, 1: 2, 2: 2, 3: 2}, (), 2, id="agreeing"),
         # A pool that coalesces the sparse layers' index-K into their K/V blocks
         # gives those layers a different factor from the dense ones.
-        pytest.param({0: 2, 1: 9, 2: 2, 3: 9}, 0, id="disagreeing"),
+        pytest.param({0: 2, 1: 9, 2: 2, 3: 9}, (), 0, id="disagreeing"),
+        pytest.param({0: 2, 1: 9, 2: 2, 3: 9}, (1, 3), 2, id="offloaded-sparse"),
+        pytest.param({0: 2, 1: 9, 2: 4, 3: 9}, (1, 3), 0, id="resident-disagreement"),
+        pytest.param({0: 9, 1: 9}, (0, 1), 0, id="all-offloaded"),
     ],
 )
-def test_uniform_subpages_per_slot(factors, expected):
+def test_uniform_subpages_per_slot(
+    factors: dict[int, int], offloaded: tuple[int, ...], expected: int
+) -> None:
     """prepare() expands the block table without naming a layer, so the factor
-    it stages has to be one every layer agrees on, and 0 where they do not."""
-    assert uniform_subpages_per_slot(_PerLayerFactors(factors)) == expected
+    must agree across resident pools without viewing host-only histories."""
+    assert uniform_subpages_per_slot(_PerLayerFactors(factors, offloaded)) == expected
 
 
 def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
