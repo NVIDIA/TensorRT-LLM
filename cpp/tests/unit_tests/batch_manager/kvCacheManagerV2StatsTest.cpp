@@ -1478,6 +1478,46 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, DecliningOptionalPartialClaimOnRetryReleasesCapacityBeforeAllocation)
+{
+    for (int prefixLength : {7, 8})
+    {
+        SCOPED_TRACE(prefixLength);
+        auto config = makeConfig();
+        config.maxUtilForResume = 1.0f;
+        addWindow(config, 1, 4, ReusePolicy::OPTIONAL);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const encoder = manager->getLayerGroupId(LayerId{1});
+        auto const tokens = makeTokens(8);
+        TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(span);
+        source->close();
+        TokenSpan const prefix{tokens.data(), prefixLength};
+        auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, prefixLength - 7);
+        ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+        auto& storage = manager->storage();
+        auto const group = storage.getPoolGroupIndex(kHotLevel, encoder);
+        TypedVec<PoolGroupIndex, SlotCount> goals(storage.numPoolGroups(kHotLevel), SlotCount{0});
+        goals[group] = storage.getStatistics(kHotLevel, group).total - 1;
+        storage.prepareFreeSlots(kHotLevel, goals);
+        auto reservations
+            = storage.newSlotsForPoolGroup(kHotLevel, group, storage.getStatistics(kHotLevel, group).free);
+        EXPECT_FALSE(reader->resume(mStream, std::nullopt, std::map<LifeCycleId, int>{{encoder, 7}}));
+        // The rejected source is the only slot that can hold the fresh OPTIONAL page.
+        EXPECT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{}));
+        EXPECT_EQ(reader->numCommittedTokens(), prefixLength);
+        reader->close();
+        for (auto& slot : reservations)
+        {
+            storage.releaseSlot(encoder, kHotLevel, std::move(slot));
+        }
+        manager->shutdown();
+    }
+}
+
 TEST_F(ReplayCacheTest, OptionalCommitAcceptsGlobalRebase)
 {
     auto config = makeConfig();

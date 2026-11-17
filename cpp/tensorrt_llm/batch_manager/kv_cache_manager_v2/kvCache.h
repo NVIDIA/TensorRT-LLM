@@ -916,6 +916,7 @@ private:
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
     std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
+    std::map<LifeCycleId, FuncGuard<std::function<void()>>> mOptionalPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.

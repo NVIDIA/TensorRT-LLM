@@ -394,6 +394,10 @@ void KvCache::_selectOptionalGroups(std::map<LifeCycleId, int> const& endpoints)
     mSelectedOptionalGroups.clear();
     for (auto lc : previousGroups)
     {
+        if (endpoints.count(lc) == 0)
+        {
+            mOptionalPartialCopyRetentionHolds.erase(lc);
+        }
         if (mManager->lifeCycles().isSsm(lc))
             mSsmBlocks[kDefaultBeamIndex][lc] = std::monostate{};
         else
@@ -435,7 +439,7 @@ void KvCache::_selectOptionalGroups(std::map<LifeCycleId, int> const& endpoints)
                 }
                 if (partialCopy)
                 {
-                    mPartialCopyRetentionHolds.push_back(holder->page->borrowRetentionForCopy());
+                    mOptionalPartialCopyRetentionHolds.emplace(lc, holder->page->borrowRetentionForCopy());
                 }
             }
             auto& target = isSsm ? mSsmBlocks[kDefaultBeamIndex][lc] : mBlocks[ordinal].pages[kDefaultBeamIndex][lc];
@@ -1037,6 +1041,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     mOptionalCandidates.clear();
     // Deferred copies survive a failed decode admission and must not be repeated on retry.
     mPartialCopyRetentionHolds.clear();
+    mOptionalPartialCopyRetentionHolds.clear();
     // A new cache is SUSPENDED until this resume() activates it, so only one that had
     // already resumed counts as a preemption recovery.
     bool const firstActivation = mNeverResumed;
@@ -1449,6 +1454,7 @@ void KvCache::_clearBlocks(bool keepPageIndices)
 {
     mPendingSsmSnapshot.reset();
     mPartialCopyRetentionHolds.clear();
+    mOptionalPartialCopyRetentionHolds.clear();
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
     {

@@ -224,6 +224,8 @@ at the selected group endpoint, even when GLOBAL matched farther ahead. A source
 page may cover more tokens than the selected match. Resume discards unused candidates before allocation
 and releases the selected candidate references after their page locks take over.
 Failed admission retains the selected state for retry.
+Declining an OPTIONAL group on retry releases its candidate holds and partial-copy
+retention borrows before allocation; REQUIRED and retained selections keep theirs.
 
 Selected OPTIONAL groups may start behind the REQUIRED history. Their initial
 histories survive capacity reservation, rollback, and suspend/resume. The normal
