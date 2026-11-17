@@ -104,10 +104,19 @@ def test_ignores_line_wrapping_but_preserves_license_paragraphs(
 ) -> None:
     root, _, _ = scan
     path = root / "include/example.h"
-    path.write_text(HEADER.replace('License");\n * you', 'License");you'))
-    assert run_scan(scan)[0] == (1, 0, 0)
-    path.write_text(HEADER.replace(" *\n * Unless", " * Unless"))
-    assert run_scan(scan)[0] == (1, 0, 1)
+    for content in (
+        HEADER.replace('License");\n * you', 'License"); you'),
+        HEADER.replace("Apache License", "Apache\n * License"),
+        HEADER.replace("Apache License", "Apache\t  License"),
+    ):
+        path.write_text(content)
+        assert run_scan(scan)[0] == (1, 0, 0)
+    for content in (
+        HEADER.replace(" *\n * Unless", " * Unless"),
+        HEADER.replace("Apache License", "ApacheLicense"),
+    ):
+        path.write_text(content)
+        assert run_scan(scan)[0] == (1, 0, 1)
 
 
 def test_read_boundary_does_not_reject_utf8_after_header(scan: tuple[Path, Path, dict]) -> None:
@@ -153,6 +162,17 @@ def test_symlink_is_not_read(scan: tuple[Path, Path, dict]) -> None:
     root, _, _ = scan
     (root / "include/example.h").symlink_to(root / "nonexistent")
     assert run_scan(scan)[0] == (1, 0, 1)
+
+
+def test_nested_directory_symlink_is_rejected(scan: tuple[Path, Path, dict]) -> None:
+    root, config, _ = scan
+    (root / "include/ok.h").write_text(HEADER)
+    target = root.parent / "external"
+    target.mkdir()
+    (target / "bad.h").write_text("int value;\n")
+    (root / "include/linked").symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="scan directory is a symlink: .*include/linked"):
+        checker.check_licenses(root, config, ["include", "tensorrt_llm"])
 
 
 def test_missing_or_empty_scan_fails(scan: tuple[Path, Path, dict]) -> None:

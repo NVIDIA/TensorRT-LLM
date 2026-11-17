@@ -41,10 +41,10 @@ def _segments(text: str) -> list[str]:
     for line in text.split("\n"):
         line = line.strip()
         if line:
-            segments[-1] += line
+            segments[-1] += line + " "
         else:
             segments.append("")
-    return segments
+    return [" ".join(segment.split()) for segment in segments]
 
 
 def _license_header(data: bytes, suffix: str) -> str:
@@ -117,7 +117,11 @@ def check_licenses(root: Path, config: Path, directories: list[str]) -> tuple[in
         scan_root = root / directory
         if not scan_root.is_dir() or scan_root.is_symlink():
             raise ValueError(f"scan directory is missing or is a symlink: {scan_root}")
-        for current, _, files in os.walk(scan_root, onerror=_raise_walk_error):
+        for current, dirnames, files in os.walk(scan_root, onerror=_raise_walk_error):
+            for dirname in sorted(dirnames):
+                path = Path(current) / dirname
+                if path.is_symlink():
+                    raise ValueError(f"scan directory is a symlink: {path}")
             for filename in sorted(files):
                 path = Path(current) / filename
                 if path.suffix not in _EXTENSIONS:
