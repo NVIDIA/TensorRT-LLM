@@ -3380,8 +3380,8 @@ class SpecWorkerBase(nn.Module, ABC):
         which path it took.
         """
         mode = spec_metadata.advanced_sampling_mode
-        applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
-                   and self.guided_decoder is None
+        applies = (mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
+                   and self._d2t is None and self.guided_decoder is None
                    and not _watermark_active(spec_metadata)
                    and self.force_num_accepted_tokens == 0.0
                    and not isinstance(logits, VocabShardedLogits)
@@ -3400,8 +3400,7 @@ class SpecWorkerBase(nn.Module, ABC):
                     f"({site}; it needs advanced_sampling_mode="
                     "no_topk_no_topp, a shared draft/target vocabulary, "
                     "full-vocab fp32 logits, no guided decoding and no "
-                    "watermark; mode="
-                    f"{mode.name}); using the reference path.")
+                    f"watermark; mode={mode}); using the reference path.")
         return applies
 
     @staticmethod
