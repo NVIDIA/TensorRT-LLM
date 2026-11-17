@@ -552,8 +552,9 @@ class CUDAGraphRunner:
             self._sampling_modes = (batch, gathered[:, column].tolist())
         info = list(zip(flags, sizes, tiers, regimes, decisions))
         if replay_tokens is not None:
-            return [(*rank_info, tokens) for rank_info, tokens in
-                    zip(info, gathered[:, -1].tolist())]
+            return [(*rank_info, tokens)
+                    for rank_info, tokens in zip(info, gathered[:,
+                                                                -1].tolist())]
         return info
 
     def _max_total_seq_len(
@@ -1016,9 +1017,8 @@ class CUDAGraphRunner:
         forced_packed_split = _agreed_packed_split(
             rank_info[4] for rank_info in graph_batch_info)
         if same_tier and replay_tokens and all(
-                rank_info[3] == local_kv_regime
-                and rank_info[4] == local_packed_split
-                and rank_info[5] == replay_tokens
+                rank_info[3] == local_kv_regime and rank_info[4] ==
+                local_packed_split and rank_info[5] == replay_tokens
                 for rank_info in graph_batch_info):
             self._adp_replay_key = replay_key
         return True, forced_sample_type, forced_kv_regime, forced_packed_split
