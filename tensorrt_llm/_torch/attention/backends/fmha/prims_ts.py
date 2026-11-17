@@ -903,7 +903,11 @@ class PrimsTSFmha(PhasedFmha):
 
                     self._vc_preprocessor = VCAttentionPreprocessor()
                 vc_operands = self._vc_preprocessor.prepare(
-                    k_bshd, v_bshd, q=vc_q, denoise_step=forward_args.vc_denoise_step
+                    k_bshd,
+                    v_bshd,
+                    q=vc_q,
+                    denoise_step=forward_args.vc_denoise_step,
+                    grouped_tokens=forward_args.vc_grouped_tokens,
                 )
             k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
             vc_demean = vc_operands.demean

@@ -491,10 +491,13 @@ class Flux3Attention(Attention):
         quantized: Fp8RowwiseQuantizedTensor | NVFP4Activation | None = None,
         sample_bounds: Bounds | None = None,
         timestep: Tensor | None = None,
+        grouped_lengths: tuple[int, ...] | None = None,
     ):
         """QKV -> QK-norm -> RoPE -> attention, returning the pre-out-projection
         result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
-        does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary."""
+        does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary.
+        ``grouped_lengths`` is each sample's count of image-side tokens. Those
+        tokens lead the joint sequence and VC-Attention groups only them."""
         b, s = hidden_states.shape[:2]
         cos, sin = freqs
         projection_input = hidden_states if quantized is None else quantized
@@ -508,7 +511,7 @@ class Flux3Attention(Attention):
                 self.apply_packed_qk_norm_rope(qkv, fc, fs)
                 qkv = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             q, k, v = qkv
-            attn = self._attend(q, k, v, sample_bounds, timestep)
+            attn = self._attend(q, k, v, sample_bounds, timestep, grouped_lengths)
             if need_v:
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
                 return attn, v  # [B, H, S, D] for apply_flux3_pag
@@ -531,7 +534,9 @@ class Flux3Attention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q = apply_rotary_emb(q, cos, sin).to(v.dtype)
         k = apply_rotary_emb(k, cos, sin).to(v.dtype)
-        attn = self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep)
+        attn = self._attend(
+            q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep, grouped_lengths
+        )
         if need_v:
             return attn, v.transpose(1, 2)  # v as [B, H, S, D] for apply_flux3_pag
         return attn
@@ -543,9 +548,19 @@ class Flux3Attention(Attention):
         v: Tensor,
         sample_bounds: Bounds | None,
         timestep: Tensor | None = None,
+        grouped_lengths: tuple[int, ...] | None = None,
     ) -> Tensor:
+        def grouped(sample: int, length: int) -> tuple[int, int] | None:
+            # The image-side tokens lead the sample. A sample without text
+            # groups the whole sequence.
+            if grouped_lengths is None or not 0 < grouped_lengths[sample] < length:
+                return None
+            return 0, grouped_lengths[sample]
+
         if sample_bounds is None:
-            return self._attn_impl(q, k, v, timestep=timestep)
+            return self._attn_impl(
+                q, k, v, timestep=timestep, grouped_tokens=grouped(0, q.shape[1])
+            )
         if q.shape[0] == 1 and len(sample_bounds) > 1:
             length = sample_bounds[0][1]
             if (
@@ -555,14 +570,16 @@ class Flux3Attention(Attention):
                     (start, end) == (i * length, (i + 1) * length)
                     for i, (start, end) in enumerate(sample_bounds)
                 )
+                and (grouped_lengths is None or len(set(grouped_lengths)) == 1)
             ):
                 # Equal packed segments are independent batch rows for every backend.
                 return self._attn_impl(
                     *(x.view(len(sample_bounds), length, x.shape[-1]) for x in (q, k, v)),
                     timestep=timestep,
+                    grouped_tokens=grouped(0, length),
                 ).reshape_as(q)
         output = torch.zeros_like(q)
-        for start, end in sample_bounds:
+        for sample, (start, end) in enumerate(sample_bounds):
             if end > start:
                 q_sample, k_sample, v_sample = q[:, start:end], k[:, start:end], v[:, start:end]
                 # SDPA accepts strided QKV views without copying.
@@ -573,7 +590,11 @@ class Flux3Attention(Attention):
                         v_sample.contiguous(),
                     )
                 output[:, start:end] = self._attn_impl(
-                    q_sample, k_sample, v_sample, timestep=timestep
+                    q_sample,
+                    k_sample,
+                    v_sample,
+                    timestep=timestep,
+                    grouped_tokens=grouped(sample, end - start),
                 )
         return output
 
@@ -855,6 +876,7 @@ class Flux3SingleStreamBlock(nn.Module):
         sample_bounds: Bounds | None = None,
         pag_samples: tuple[int, ...] = (0,),
         timestep: Tensor | None = None,
+        grouped_lengths: tuple[int, ...] | None = None,
     ) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
         residual = combined
@@ -871,6 +893,7 @@ class Flux3SingleStreamBlock(nn.Module):
             quantized=quantized,
             sample_bounds=sample_bounds,
             timestep=timestep,
+            grouped_lengths=grouped_lengths,
         )
         attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
 
@@ -1338,6 +1361,14 @@ class Flux3Model(BaseDiffusionModel):
             streams[name] = state
 
         chunks, sample_bounds = self._joint_chunks(local_layout)
+        # The text tokens end each sample's joint sequence and the image-side
+        # tokens lead it. VC-Attention groups only the image-side tokens.
+        grouped_lengths = None
+        if local_layout[-1][0] == "text":
+            grouped_lengths = tuple(
+                (end - start) - text
+                for (start, end), text in zip(sample_bounds, local_layout[-1][1])
+            )
 
         def joint(field: str) -> Tensor:
             return torch.cat(
@@ -1359,6 +1390,7 @@ class Flux3Model(BaseDiffusionModel):
                 sample_bounds=sample_bounds,
                 pag_samples=pag_samples,
                 timestep=timestep,
+                grouped_lengths=grouped_lengths,
             )
         outputs = {}
         for name in self.final_layer:

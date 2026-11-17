@@ -981,6 +981,10 @@ class AttentionForwardArgs:
     # Denoise step as (step_index, num_steps) for the V-Smooth schedule of the
     # tile-mean recipe. None means no step is active, as in warm-up.
     vc_denoise_step: Optional[Tuple[int, int]] = None
+    # Token range (start, stop) the value grouping covers: the image tokens of a
+    # joint sequence, whose text tokens follow them in input order. None groups
+    # the whole sequence.
+    vc_grouped_tokens: Optional[Tuple[int, int]] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False

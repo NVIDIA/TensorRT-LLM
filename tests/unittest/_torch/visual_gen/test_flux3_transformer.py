@@ -13,6 +13,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.packed import bounds, pack
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
+    Flux3Attention,
     Flux3Model,
     Flux3SingleStreamBlock,
     _flux3_gated_mlp_forward,
@@ -94,13 +95,27 @@ def test_packing_preserves_sample_boundaries():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_conditioning", [False, True])
 @torch.inference_mode()
-def test_packed_sample_isolation(cache_conditioning):
-    """T1: isolated DiT predictions match the mixed batch while empty conditioning is skipped."""
+def test_packed_sample_isolation(cache_conditioning, monkeypatch):
+    """T1: isolated DiT predictions match the mixed batch while empty conditioning is skipped.
+    The joint blocks tell attention to group the image-side tokens of each sample. Those
+    tokens lead the sequence. The image-only blocks group everything."""
     model = models()
     inputs = samples((7, 11), "cuda", image_lengths=(16, 25))
     packed = pack(inputs, CHANNELS)
     packed.timesteps["image"].fill_(0.5)
+    grouped = []
+    attend = Flux3Attention._attn_impl
+
+    def spy(attention, q, k, v, **kwargs):
+        grouped.append(kwargs.get("grouped_tokens"))
+        return attend(attention, q, k, v, **kwargs)
+
+    monkeypatch.setattr(Flux3Attention, "_attn_impl", spy)
     actual = model(**packed.kwargs())["x_image"]
+    # Sample 0 has 16 image tokens then 7 text. Sample 1 has 25 image and 9 conditioning
+    # tokens then 11 text.
+    assert set(grouped) == {None, (0, 16), (0, 34)}
+    monkeypatch.undo()
     for index, (start, end) in enumerate(bounds((16, 25))):
         single = pack([inputs[index]], CHANNELS)
         single.timesteps["image"].fill_(0.5)

@@ -389,6 +389,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len_kv: Optional[int] = None,
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
+        grouped_tokens: Optional[Tuple[int, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -418,6 +419,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 prediction hooks. A ``block_sparse_inputs`` payload selects the
                 generic block-sparse FMHA.
             timestep: Denoising timestep consumed by the sparse prediction hooks.
+            grouped_tokens: Under VC-Attention, the ``(start, stop)`` token range the
+                value grouping covers: the image tokens of a joint sequence, whose text
+                tokens follow them in input order. ``None`` groups the whole sequence.
             **kwargs: Backend-specific keyword arguments forwarded by the attention
                 module, such as ``key_padding_mask``; ignored here, as by the other
                 backends. The TRTLLM kernels have no key-padding input, so callers
@@ -460,6 +464,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "vc_attention_qk_fp8": quant_cfg.qk_dtype == "fp8",
                     "vc_repair_budget": quant_cfg.vc_repair_budget,
                     "vc_denoise_step": vc_denoise_step(),
+                    "vc_grouped_tokens": grouped_tokens,
                 }
             elif quant_cfg is not None:
                 sage_kwargs = {
