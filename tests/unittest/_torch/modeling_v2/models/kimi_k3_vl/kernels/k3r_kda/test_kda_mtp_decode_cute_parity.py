@@ -283,7 +283,7 @@ def cute_run(
 ):
     """Run the op, optionally substituting a pre-populated beta-cache view or a
     caller-allocated recurrent-state tensor (e.g. a strided slice of a larger cache)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501
         kda_mtp_decode,
     )
 
@@ -343,7 +343,7 @@ def cute_run(
     elif out is None:
         out = kda_mtp_decode(**op_kwargs)
     else:
-        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
             kda_mtp_decode_impl,
         )
 
@@ -649,9 +649,7 @@ def test_round2_replay_bf16_math(B, H, M, monkeypatch):
     of the bf16 tensor-core references (FLA, prefill)."""
     data2, accept = _round2_inputs(B, H, M)
     T = data2["T"]
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (
-        mtp_ops,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import mtp_ops
 
     monkeypatch.setattr(mtp_ops, "_BF16_MATH", False)
     ref = cute_run(data2)
@@ -1005,7 +1003,7 @@ def test_misaligned_scalar_metadata_after_aligned_warmup(field):
 def test_beta_cache_alignment_is_derived_from_layout_and_dtype(
     attention_mode, parallel_size, dtype, pool_size, num_spec, expected
 ):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
         _beta_cache_assumed_align,
     )
 
@@ -1017,7 +1015,7 @@ def test_beta_cache_alignment_is_derived_from_layout_and_dtype(
 
 
 def test_beta_cache_alignment_uses_padded_physical_stride():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
         _beta_cache_assumed_align,
     )
 
@@ -1043,7 +1041,7 @@ def test_beta_cache_sibling_layer_after_aligned_warmup(
     attention_mode, parallel_size, num_spec, expected_alignment
 ):
     """A cached kernel accepts the next real per-layer beta-cache slice."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.mtp_ops import (  # noqa: E501
         _beta_cache_assumed_align,
     )
 
@@ -1129,7 +1127,7 @@ def test_v2_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, strided_state
     outputs, committed state, conv pools and replay caches must match bit for bit. Covers the
     cluster-pair (HV * B <= 64) and single-CTA grids, fp32 / bf16 state pools and a state that
     is a strided slice of a larger buffer (non-flat TMA view)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
         mtp_ops,
     )
 

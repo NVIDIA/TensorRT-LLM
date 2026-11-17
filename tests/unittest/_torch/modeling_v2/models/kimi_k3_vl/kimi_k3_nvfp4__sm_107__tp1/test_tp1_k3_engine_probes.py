@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 from torch import nn
 
-K3_RUBIN = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3_RUBIN = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 TP1 = f"{K3_RUBIN}.kimi_k3_nvfp4__sm_107__tp1"
 
 

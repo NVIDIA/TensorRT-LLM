@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ._dspark_mla_rope import _compile_rmsnorm_rope_strided
 from .k3_dspark_rmsnorm_rope import rmsnorm_rope_reference

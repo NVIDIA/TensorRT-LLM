@@ -38,14 +38,13 @@ try:
     import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
-        K3KDALinearAttention,
-        _Fp8BlockScaleWeightReadLinear,
-    )
-
     # The model module transitively imports the optional deps above, so it
     # must stay behind the guard too or collection fails instead of skipping.
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
+        K3KDALinearAttention,
+        _Fp8BlockScaleWeightReadLinear,
+    )
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 except ImportError as e:
     _HAVE_DEPS = False
@@ -307,7 +306,7 @@ def _rep(name, a, b):
 def _make_kvcm_replay_manager(num_heads):
     """The target's V2 hybrid manager, whose KVCM pools hold the KDA states with their replay caches in the same
     slots, with a host tier to offload to."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
         KimiK3Sm107CacheManager,
     )
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
@@ -632,9 +631,7 @@ def _is_sm107():
 def test_fused_verify_with_fp8_weight_read_o_proj(bf16_rows, monkeypatch):
     """FP8-resident verify on SM107 with the K3 FP8 weight-read o_proj: the verify kernel hands
     o_proj its MXFP8 operand, or BF16 rows where o_proj runs them on the low-M GEMM."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
-        k3_fp8w_lowm_gemm,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import k3_fp8w_lowm_gemm
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     B = 4

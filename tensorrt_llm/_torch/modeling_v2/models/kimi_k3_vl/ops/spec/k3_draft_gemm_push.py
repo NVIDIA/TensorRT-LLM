@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, OpWrapper
 
 from ...kernels.k3r_gemm.low_m_bf16_splitk import SplitKTactic
 from ...kernels.k3r_spec.dspark_draft_gemm_push import MAX_M, run_gemm_push, validate_push_tactic

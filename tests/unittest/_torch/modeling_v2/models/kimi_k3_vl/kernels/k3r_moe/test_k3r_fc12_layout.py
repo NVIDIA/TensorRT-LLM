@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_moe.fc12 import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_moe.fc12 import (
     fc12_counter_layout,
     fc12_counter_words,
     fc12_die_sm_words,
@@ -27,10 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = (
-    Path(__file__).resolve().parents[8]
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl"
-)
+_FAMILY = Path(__file__).resolve().parents[8] / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
 
 
 @pytest.mark.parametrize(
@@ -81,7 +78,7 @@ def test_die_words_need_floor_cluster_and_tokens():
 
 
 def test_tp_slice_and_ep_partition():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3r_experts import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3r_experts import (
         ep_partition,
         tp_slice,
     )

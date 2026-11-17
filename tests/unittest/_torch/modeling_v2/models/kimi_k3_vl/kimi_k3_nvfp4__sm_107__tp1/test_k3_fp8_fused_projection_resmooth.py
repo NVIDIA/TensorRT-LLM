@@ -23,14 +23,14 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E501  # noqa: E501
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E501  # noqa: E501
     K3KDALinearAttention,
     _Fp8BlockScaleWeightReadLinear,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.sm107_linear import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.sm107_linear import (
     Fp8BlockScaleLinear,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
 @pytest.mark.skipif(

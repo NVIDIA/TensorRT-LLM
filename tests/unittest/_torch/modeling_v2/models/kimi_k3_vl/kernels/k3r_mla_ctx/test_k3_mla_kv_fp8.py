@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers the C++ ops)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.mla_kv_fp8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.mla_kv_fp8 import (  # noqa: E501
     mla_kv_to_fp8,
 )
 

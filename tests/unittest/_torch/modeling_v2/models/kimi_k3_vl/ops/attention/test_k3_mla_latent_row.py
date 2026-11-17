@@ -21,7 +21,7 @@ LORA, ROPE = 512, 64
 
 
 def _entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_latent_row import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_latent_row import (  # noqa: E501
         k3_mla_latent_row,
     )
 

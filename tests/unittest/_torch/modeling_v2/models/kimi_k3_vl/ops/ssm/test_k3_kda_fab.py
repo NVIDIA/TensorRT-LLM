@@ -11,10 +11,10 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_fa import (  # noqa: E501, E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_fa import (  # noqa: E501, E402
     k3_kda_fab_fa,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_proj import (  # noqa: E501, E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_proj import (  # noqa: E501, E402
     FA_DIM,
     HIDDEN,
     bfa_rows,

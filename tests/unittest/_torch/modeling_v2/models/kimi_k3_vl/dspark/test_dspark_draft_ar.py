@@ -64,29 +64,29 @@ def _differ(ref, out):
 def _run_rank(world_size):
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
         DraftArSites,
         push_tactic,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm.low_m_bf16_splitk import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm.low_m_bf16_splitk import (  # noqa: E501
         run_splitk_dense,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_ar import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_ar import (  # noqa: E501
         ar_norm_config,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_gemm_push import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_gemm_push import (  # noqa: E501
         run_gemm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.sm107_allreduce import (  # noqa: E501  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.sm107_allreduce import (  # noqa: E501  # noqa: E501
         TpAllReduce,
         lamport_push_target,
         lamport_push_tensor,
         mnnvl_lamport_push_target,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_ar_norm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_ar_norm import (  # noqa: E501
         k3_draft_ar_norm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_gemm_push import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_gemm_push import (  # noqa: E501
         k3_draft_gemm_push,
     )
     from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
@@ -245,13 +245,13 @@ def _run_rank(world_size):
 def _run_rank_embed(world_size):
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
         draft_embed_site,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.embedding.sm107_embedding import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.embedding.sm107_embedding import (  # noqa: E501
         EmbeddingTable,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_vocab_shard_embedding import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_vocab_shard_embedding import (  # noqa: E501
         k3_vocab_shard_embedding,
     )
 
@@ -322,27 +322,25 @@ def _run_rank_mlp(world_size):
     fused all-reduce, and the fallback above the split-K rows against the module path."""
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.drafter import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.drafter import (  # noqa: E501
         K3DSparkDrafter,
         _draft_mlp,
         _PendingDown,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.primitives import (  # noqa: E501
         DraftArSites,
         push_tactic,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_gemm_push import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_gemm_push import (  # noqa: E501
         run_gemm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.sm107_mlp import (  # noqa: E501  # noqa: E501  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.sm107_mlp import (  # noqa: E501  # noqa: E501  # noqa: E501
         GatedMlp,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.sm107_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.sm107_allreduce import (
         TpAllReduce,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.sm107_norm import (
-        RMSNormWeight,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.sm107_norm import RMSNormWeight
     from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 

@@ -32,7 +32,7 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 #: tests/unittest/_torch/modeling_v2, where ``_validating`` lives (imported by path in the ranks).
 MV2_TESTS = str(Path(__file__).resolve().parents[4])
 WORLD = 4

@@ -17,8 +17,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import routing
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import routing
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.cpu_only
 _REPO = Path(__file__).resolve().parents[6]
 _RECIPES = _REPO / "tests/scripts/perf-sanity/disaggregated"
 _SM107 = (10, 7)
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 # Recipe file stem -> (context target, generation target).
 _RECIPE_TARGETS = {

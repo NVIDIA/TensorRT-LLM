@@ -21,7 +21,7 @@ there, with the inverse map back to the row."""
 import pytest
 import torch
 
-K3_RUBIN = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3_RUBIN = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 NUM_EXPERTS = 896
 TOP_K = 16
 

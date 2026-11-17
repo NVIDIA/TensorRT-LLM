@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
-K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,

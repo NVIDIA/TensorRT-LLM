@@ -21,11 +21,9 @@ from _k3_source_parity import REPO, function_dump
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _MULTI_STREAM_V1 = REPO / "tensorrt_llm/_torch/modules/multi_stream_utils.py"
-_MULTI_STREAM = (
-    REPO / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/common/multi_stream.py"
-)
+_MULTI_STREAM = REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/common/multi_stream.py"
 
 
 def _common(name):

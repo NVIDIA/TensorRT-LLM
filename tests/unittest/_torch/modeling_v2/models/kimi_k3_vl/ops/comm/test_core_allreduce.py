@@ -23,7 +23,7 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-_K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 def _same(a, b) -> int:

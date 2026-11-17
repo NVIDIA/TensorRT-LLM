@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_spec.spec_tail_kernels import PagedLatentPrepare, dflash_paged_latent_prepare
 from .k3_dflash_gen_prepare import gen_prepare_reference

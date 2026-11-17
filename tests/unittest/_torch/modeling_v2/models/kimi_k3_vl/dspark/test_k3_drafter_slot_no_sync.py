@@ -37,12 +37,8 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.drafter import (
-    K3DSparkPath,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (
-    K3DFlashWorker,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.drafter import K3DSparkPath
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.worker import K3DFlashWorker
 from tensorrt_llm._torch.speculative import DFlashSpecMetadata
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

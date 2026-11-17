@@ -64,9 +64,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed import alltoall_helix
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.speculative.vocab_parallel import markov_chain_logits
 from tensorrt_llm._utils import get_sm_version, is_sm_100f

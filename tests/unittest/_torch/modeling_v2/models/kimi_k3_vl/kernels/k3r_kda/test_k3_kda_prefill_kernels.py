@@ -20,7 +20,7 @@ pytest.importorskip("fla")
 
 from fla.modules import ShortConvolution  # noqa: E402
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda._kda_kernels import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda._kda_kernels import (  # noqa: E402, E501
     copy_kda_replay_conv_window,
     fused_kda_post_conv,
     is_kda_optimized_supported,
@@ -45,7 +45,7 @@ pytestmark = pytest.mark.skipif(
 
 def _kda_prefill_entry():
     """The ``ops/ssm/kda_prefill`` entry (its import needs CuTe DSL and FlashInfer)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3r_kda_prefill import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3r_kda_prefill import (  # noqa: E501
         kda_prefill,
     )
 
@@ -447,10 +447,10 @@ def test_fused_prefill_does_not_depend_on_k1_warp_timing(
     barrier, so the other K1 warps run ahead into the next chunk before it
     reads sPartialLast. Outputs and states must equal the unpatched kernel's.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
         fused_k123,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm import (
         _kda_prefill as kimi_k3_ops,
     )
 

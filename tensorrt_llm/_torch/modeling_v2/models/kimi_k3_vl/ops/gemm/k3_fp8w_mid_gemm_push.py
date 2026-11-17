@@ -9,7 +9,7 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_comm import k3_lamport_ar
 from ...kernels.k3r_gemm import k3_fp8w_lowm_gemm as _lowm

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_spec.dspark_markov_fused import fused_markov_chain_logits
 from ._reference import argmax_pairs

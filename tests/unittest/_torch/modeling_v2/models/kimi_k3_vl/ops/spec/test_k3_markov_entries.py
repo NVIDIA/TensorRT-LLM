@@ -16,7 +16,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     _reference,
     k3_dspark_markov_greedy,
     k3_fused_markov_chain_logits,
@@ -119,7 +119,7 @@ _CHAIN = k3_markov_chain.k3_markov_chain
 
 @pytest.mark.parametrize("cell", _CHAIN.CELLS, ids=[c.why[:48] for c in _CHAIN.CELLS])
 def test_markov_chain_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.vocab_parallel_kernels import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.vocab_parallel_kernels import (  # noqa: E501
         _CHAIN_MAX_REQS,
         _CHAIN_MAX_STEPS,
         _MARKOV_BLOCK_V,
@@ -203,7 +203,7 @@ def _keys(value: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("cell", _GREEDY.CELLS, ids=[c.why[:48] for c in _GREEDY.CELLS])
 def test_dspark_markov_greedy_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_markov_greedy import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_markov_greedy import (  # noqa: E501
         NUM_SETS,
         ROWS,
         STATE_WORDS,

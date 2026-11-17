@@ -28,14 +28,13 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+# The FP4 MLA KV-cache layout contract shared with the KV cache manager.
+from tensorrt_llm._torch.attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
     MLA_CONTEXT,
     MLA_GENERATION,
     thop_attention,
 )
-
-# The FP4 MLA KV-cache layout contract shared with the KV cache manager.
-from tensorrt_llm._torch.attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger

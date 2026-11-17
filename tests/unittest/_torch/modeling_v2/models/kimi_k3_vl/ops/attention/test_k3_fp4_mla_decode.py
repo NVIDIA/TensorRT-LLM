@@ -43,7 +43,7 @@ def _q_fused_helpers():
 
 
 def _decode():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
         _fp4_mla_decode as fp4_mla_decode,
     )
 

@@ -12,7 +12,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501, E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501, E402
     kda_mtp_decode,
 )
 

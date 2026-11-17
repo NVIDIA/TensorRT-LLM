@@ -20,7 +20,7 @@ block forward over a latent pool. Every value is a hash of its index, the same o
 
 import torch
 
-_K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 NEW = f"{_K3}.dspark"
 
 HIDDEN, INTER, LAYERS, HEADS, VOCAB, RANK = 7168, 2048, 2, 64, 4096, 16

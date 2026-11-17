@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _plan_mod():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
         fp4_mla_packed_reduce,
     )
 

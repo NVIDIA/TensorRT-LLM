@@ -9,7 +9,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_spec.dspark_markov_greedy import run_dspark_markov_greedy
 from ._reference import markov_chain_tokens

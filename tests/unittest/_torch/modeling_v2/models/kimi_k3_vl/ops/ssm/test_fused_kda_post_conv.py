@@ -9,7 +9,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.fused_kda_post_conv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.fused_kda_post_conv import (  # noqa: E501
     fused_kda_post_conv,
 )
 

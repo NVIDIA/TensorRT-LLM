@@ -22,21 +22,21 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda._kda_kernels import (  # noqa: E402, E501
+from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda._kda_kernels import (  # noqa: E402, E501
     is_kda_optimized_supported,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E402, E501  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E402, E501  # noqa: E402, E501
     K3KDALinearAttention,
     _Fp8BlockScaleWeightReadLinear,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.sm107_linear import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.sm107_linear import (  # noqa: E402, E501
     Bf16Linear,
     Fp8BlockScaleLinear,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.sm107_short_conv import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.sm107_short_conv import (
     ShortConvWeight,
 )
-from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
 from tensorrt_llm.models.modeling_utils import QuantConfig  # noqa: E402
 from tensorrt_llm.quantization import QuantAlgo  # noqa: E402
 from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import KimiKDAReference
@@ -527,7 +527,7 @@ def test_fused_conv_prefill_matches_channel_major_chain_with_initial_states(
     padding a single sequence) on the same weights and projections: the same outputs and recurrent
     rows, the same convolution rows bit for bit, for mixed initial states, permuted slots and an
     unused slot."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
         K3KDALinearAttention as ChannelMajorKDA,
     )
 
@@ -635,7 +635,7 @@ def test_kda_prefill_context_batch_sizes_share_one_k4_compile(
     addressed in place. Every batch on either pool matches the reference, and
     the two pools end with the same state rows.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm import (
         _kda_prefill as prefill_ops,
     )
 
@@ -702,7 +702,7 @@ def test_kda_prefill_midchunk_snapshot_matches_prefix_prefill(pool_dtype: torch.
     later (sequence 2 ends 32 tokens after its snapshot). The snapshots leave the batch's outputs
     and final states as a run without them.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (  # noqa: E501
         build_kda_snapshot_plan,
     )
 
@@ -814,7 +814,7 @@ def test_kda_prefill_inforward_snapshot_swaps_live_and_staging_rows(
     """
     from dataclasses import replace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (  # noqa: E501
         build_kda_snapshot_plan,
     )
 

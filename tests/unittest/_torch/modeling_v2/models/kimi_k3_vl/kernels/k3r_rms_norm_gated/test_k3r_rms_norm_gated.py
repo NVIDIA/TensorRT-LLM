@@ -20,13 +20,8 @@ import torch
 __extra_import_path__ = ["../.."]
 from _k3_source_parity import REPO, function_digest
 
-_KERNELS = (
-    REPO
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated"
-)
-_OP = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_rms_norm_gated.op"
-)
+_KERNELS = REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated"
+_OP = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_rms_norm_gated.op"
 
 #: function -> digest of the pinned tensorrt_llm/_torch/modules/mamba/layernorm_gated.py.
 _REFERENCE = {

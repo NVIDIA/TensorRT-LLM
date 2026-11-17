@@ -80,12 +80,6 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import kimi_k3_cache_policy as _kimi_k3_cache_policy
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize,
-)
 from tensorrt_llm._torch.attention.backends import AttentionMetadata, TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_K_RESIDUAL_DIM,
@@ -104,6 +98,10 @@ from tensorrt_llm._torch.custom_ops import BufferKind
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE, sm_reserve
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,

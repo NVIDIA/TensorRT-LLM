@@ -20,8 +20,7 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _FAMILY_DIR = (
-    Path(__file__).resolve().parents[6]
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl"
+    Path(__file__).resolve().parents[6] / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
 )
 _EXEMPT_TARGETS = {
     "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1",

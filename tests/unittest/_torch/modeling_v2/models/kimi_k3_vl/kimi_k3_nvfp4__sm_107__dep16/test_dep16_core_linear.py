@@ -17,10 +17,8 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (
-    sm107_linear as linear,
-)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import sm107_linear as linear
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -138,7 +136,7 @@ def test_bf16_linear_matches_main(n, k):
 def _weight_read(codes, scale):
     """dep16's decode chain: the checkpoint loaded into an unprepared ``Fp8BlockScaleLinear``,
     swapped to the weight-read projection, which prepares the codes and scales itself."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
         _Fp8BlockScaleWeightReadLinear,
     )
 
@@ -152,7 +150,7 @@ def _weight_read(codes, scale):
 
 def _runs_k3_low_m(proj, x):
     """Whether dep16's weight read serves ``x`` with the K3 low-M GEMM (its ``forward`` dispatch)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.modeling import (  # noqa: E501
         _rubin_mxfp8_is_available,
     )
 

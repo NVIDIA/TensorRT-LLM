@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 (``models/kimi_k3_vl``) imports no Modeling V1 code.
 
-The Modeling V2 rule (``_experimental/modeling_v2/README.md``, "Modeling V1 code"): a target
+The Modeling V2 rule (``modeling_v2/README.md``, "Modeling V1 code"): a target
 does not import, subclass or call the model classes in ``_torch/models/``, the layers in
 ``_torch/modules/``, MLA and the attention backends in ``_torch/attention/``, or fused MoE in
 ``_torch/moe/``; from the rest of TensorRT-LLM it uses only runtime interfaces.
@@ -42,7 +42,7 @@ else:
     pytestmark = pytest.mark.cpu_only
 
 _REPO = Path(__file__).resolve().parents[6]
-_FAMILY_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY_PACKAGE = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _FAMILY_DIR = _REPO.joinpath(*_FAMILY_PACKAGE.split("."))
 
 #: The Modeling V1 packages a target must not import.
@@ -314,7 +314,7 @@ def test_resolver_reads_relative_and_string_imports(tmp_path, monkeypatch):
     target.mkdir(parents=True)
     source = target / "m.py"
     source.write_text(
-        "from ......modules.linear import Linear\n"
+        "from .....modules.linear import Linear\n"
         "from tensorrt_llm._torch import moe\n"
         "def f():\n"
         "    import importlib\n"

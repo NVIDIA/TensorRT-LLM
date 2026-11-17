@@ -23,14 +23,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating  # noqa: E402
 
 k3_embedding_gather = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
-    "ops.embedding.k3_embedding_gather"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.embedding.k3_embedding_gather"
 ).k3_embedding_gather
 
 _ARCH = {(10, 0): Arch.SM_100, (10, 3): Arch.SM_103, (10, 7): Arch.SM_107}

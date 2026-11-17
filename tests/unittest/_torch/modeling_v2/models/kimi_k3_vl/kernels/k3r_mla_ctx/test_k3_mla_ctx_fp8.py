@@ -63,7 +63,7 @@ def _quant_test_input(rows, cols, seed):
 @pytest.mark.parametrize("scale", [1.0, 0.5, 3.0, 0.37])
 def test_triton_static_quant_matches_cpp(shape, scale):
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
         fp8_static_quant,
     )
 
@@ -80,7 +80,7 @@ def test_triton_static_quant_matches_cpp(shape, scale):
 def test_triton_static_quant_rows_matches_cpp(rows, scale):
     """Row-strided views (the K-pe columns of latent_cache) quantize to the C++ bytes."""
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
         fp8_static_quant,
     )
 
@@ -104,7 +104,7 @@ def test_triton_static_quant_rows_matches_cpp(rows, scale):
 
 
 def _entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.static_quantize_e4m3 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.static_quantize_e4m3 import (  # noqa: E501
         static_quantize_e4m3,
     )
 

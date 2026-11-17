@@ -11,7 +11,7 @@ from typing import Mapping, Optional
 import torch
 import triton  # type: ignore[import]
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
 from tensorrt_llm._utils import get_sm_version
 
 from ...ops.common.sm107_launch import USE_PDL

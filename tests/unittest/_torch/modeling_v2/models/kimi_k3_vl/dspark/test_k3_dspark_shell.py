@@ -26,14 +26,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark import shell
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.drafter import (
-    K3DSparkPath,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (
-    K3DSparkWorker,
-)
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark import shell
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.drafter import K3DSparkPath
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.worker import K3DSparkWorker
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig

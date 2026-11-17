@@ -33,7 +33,7 @@ from types import SimpleNamespace
 import pytest
 from torch import nn
 
-K3_RUBIN = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3_RUBIN = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 DEP16 = f"{K3_RUBIN}.kimi_k3_nvfp4__sm_107__dep16"
 
 
@@ -90,8 +90,7 @@ def test_runtime_hooks_reach_the_engine():
         hooks.kv_balanced_admission_planner
     )
     cache = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache."
-        "k3_sm107_cache_manager"
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager"
     )
     assert hooks.kv_cache_manager_cls is cache.KimiK3Sm107CacheManager
     assert hooks.kv_cache_manager_cls.KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT == 0

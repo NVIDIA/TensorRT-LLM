@@ -17,16 +17,14 @@ import torch
 
 __extra_import_path__ = ["../../.."]
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
-    k3_context_fmha_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import k3_context_fmha_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
     modeling as context,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
     modeling as ctx_split_k,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (
     K3MlaAttnState,
 )
 
@@ -645,7 +643,7 @@ def test_split_k_chunked_prefill_matches_reference(
 
 
 def _gather_entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.fp4_mla_gather_mxfp8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.fp4_mla_gather_mxfp8 import (  # noqa: E501
         fp4_mla_gather_mxfp8,
     )
 
@@ -699,7 +697,7 @@ def test_fp4_mla_gather_mxfp8_cells(cell):
         assert int((asc.int() - ref_asc.int()).abs().max()) <= 1, cell.why
 
         def dequant(codes, scales):
-            from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_q_fused import (  # noqa: E501
+            from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_q_fused import (  # noqa: E501
                 swizzled_sf_offset,
             )
 

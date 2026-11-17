@@ -24,9 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (
-    K3DFlashWorker,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.worker import K3DFlashWorker
 from tensorrt_llm.llmapi import DFlashDecodingConfig
 from tensorrt_llm.mapping import Mapping
 

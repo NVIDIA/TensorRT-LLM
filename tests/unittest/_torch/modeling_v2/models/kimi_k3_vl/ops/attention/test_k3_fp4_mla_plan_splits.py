@@ -21,7 +21,7 @@ import torch
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _REDUCE = "tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_packed_reduce"
 _FAMILY_REDUCE = f"{_FAMILY}.kernels.k3r_fp4_mla.fp4_mla_packed_reduce"
 _SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"

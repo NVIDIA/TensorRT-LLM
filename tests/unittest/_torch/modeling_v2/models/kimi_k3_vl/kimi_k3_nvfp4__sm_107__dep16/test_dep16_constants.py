@@ -14,7 +14,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _TARGET = "kimi_k3_nvfp4__sm_107__dep16"
 _CLASS = "ModelingV2KimiK3Nvfp4Sm107Dep16"
 _TARGET_DIR = Path(__file__).resolve().parents[7] / _FAMILY.replace(".", "/") / _TARGET

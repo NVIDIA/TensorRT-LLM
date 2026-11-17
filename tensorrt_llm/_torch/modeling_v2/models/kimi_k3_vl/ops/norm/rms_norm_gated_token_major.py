@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.modules.mamba.layernorm_gated  # noqa: F401 — registers the op
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_rms_norm_gated import op as _rms_norm_gated_op  # noqa: F401 — registers the op

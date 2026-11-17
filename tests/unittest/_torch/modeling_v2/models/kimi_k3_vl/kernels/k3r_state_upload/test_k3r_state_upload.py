@@ -20,10 +20,10 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_state_upload.state_upload_kernel import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_state_upload.state_upload_kernel import (  # noqa: E501
     copy_small_pinned_pair,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
     KimiK3Sm107CacheManager,
 )
 

@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_kda import k3_kda_fab
 from .k3_kda_fab_proj import fab_cells

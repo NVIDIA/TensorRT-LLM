@@ -20,9 +20,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-_DEP16 = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16"
-)
+_DEP16 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16"
 _REF_WINDOW = 32
 _REF_MAX_WAIT_ITERS = 64
 

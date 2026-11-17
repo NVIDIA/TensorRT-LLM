@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 # The KDA glue of each SM107 target: its modeling.py.
 _SM107_KDA = tuple(
     f"{_FAMILY}.kimi_k3_nvfp4__sm_107__{target}.modeling"

@@ -28,7 +28,7 @@ from tensorrt_llm._torch.speculative.interface import (  # noqa: E402
     _FORCE_ACCEPT_RNG_SLOT_STRIDE,
 )
 
-_OPS = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec"
+_OPS = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec"
 
 
 def _entry(name):

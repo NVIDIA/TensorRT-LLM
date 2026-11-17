@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 
 from ...kernels.k3r_gemm import k3_latent_fp8_gemm as _latent
 from . import _fp8_reference as ref

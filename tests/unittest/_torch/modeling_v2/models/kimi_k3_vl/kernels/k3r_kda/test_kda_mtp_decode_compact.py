@@ -46,7 +46,7 @@ try:
     import cuda.bindings.driver  # noqa: F401
     import cutlass  # noqa: F401
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E501
         mtp_ops as kda_ops,
     )
 

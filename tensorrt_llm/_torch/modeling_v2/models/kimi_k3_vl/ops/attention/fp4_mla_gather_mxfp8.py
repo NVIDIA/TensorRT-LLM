@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_fp4_mla import fp4_mla_context_gather as _gather
 from .k3_mla_q_fused import e2m1_values, swizzled_sf_offset, unpack_e2m1

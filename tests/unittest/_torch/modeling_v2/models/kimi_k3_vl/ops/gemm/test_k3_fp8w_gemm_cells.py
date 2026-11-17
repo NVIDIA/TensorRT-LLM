@@ -19,7 +19,7 @@ from tensorrt_llm._utils import get_sm_version
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402
 
-K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() not in (100, 103, 107),

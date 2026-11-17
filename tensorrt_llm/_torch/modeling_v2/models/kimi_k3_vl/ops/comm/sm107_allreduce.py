@@ -62,13 +62,13 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import allreduce
 from tensorrt_llm._torch.distributed.ops import (
     _MNNVL_ONE_SHOT_THRESHOLD_BYTES,
     MNNVLAllReduce,
     get_allreduce_workspace,
     get_or_scale_allreduce_mnnvl_workspace,
 )
+from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping

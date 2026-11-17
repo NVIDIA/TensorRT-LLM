@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_100f(), reason="needs an SM100-family GPU"
 )
 
-_OPS = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec"
+_OPS = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec"
 
 KV_LORA = 512
 ROPE = 64
@@ -163,16 +163,16 @@ def test_strided_rmsnorm_rope_matches_main_op(num_rows, row_stride, norm_dim, ap
 
 pytest.importorskip("cutlass")
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     k3_dspark_mla_block_rope as _block_rope_entry,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     k3_dspark_mla_ctx_norm_rope as _ctx_norm_rope_entry,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     k3_dspark_rmsnorm_rope as _rmsnorm_rope_entry,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     k3_dspark_rmsnorm_rope_into as _rmsnorm_rope_into_entry,
 )
 

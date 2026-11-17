@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 # The module, not the function: kernels.spec_decode_head imports this entry for its hook.
 from ...kernels.k3r_spec import spec_decode_head as _head

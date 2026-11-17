@@ -12,10 +12,8 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (
-    sm107_linear as linear,
-)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import sm107_linear as linear
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, load_weight_shard
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -33,7 +31,7 @@ requires_block_fp8 = pytest.mark.skipif(
 
 
 def _fp8_weight_read():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
         modeling as fp8_weight_read,
     )
 
@@ -41,7 +39,7 @@ def _fp8_weight_read():
 
 
 def _weights():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (  # noqa: E501
         weights,
     )
 

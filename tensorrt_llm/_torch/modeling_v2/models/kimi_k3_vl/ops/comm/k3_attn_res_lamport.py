@@ -9,7 +9,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_attn_res import k3_attn_res as _kernel
 from ..norm.k3_attn_res_norm import attn_res_rmsnorm_reference, mxfp8_rows_reference

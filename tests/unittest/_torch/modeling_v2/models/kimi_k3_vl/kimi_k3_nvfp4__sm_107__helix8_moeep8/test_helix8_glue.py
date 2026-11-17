@@ -21,7 +21,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _FAMILY_DIR = Path(__file__).resolve().parents[7] / _FAMILY.replace(".", "/")
 _TARGETS = {
     "helix8_moeep8": "ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8",

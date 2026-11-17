@@ -17,7 +17,7 @@ from torch import nn
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 def _worker(path):

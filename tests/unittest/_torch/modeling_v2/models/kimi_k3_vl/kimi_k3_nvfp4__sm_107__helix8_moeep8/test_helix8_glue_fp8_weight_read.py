@@ -22,7 +22,7 @@ import pytest
 import torch
 from torch import nn
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()

@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
     reason="the SM107 CuTe DSL MXFP8 GEMM",
 )
 
-K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 # Per-rank [N, K] of the K3 FP8 block-scale projections that reach the MXFP8 GEMM.
 SHAPES = ((2112, 7168), (1152, 1536), (2304, 512), (7168, 1024), (512, 7168), (4096, 7168))
 # Shapes and rows whose tactics run against main's runner (each new tactic compiles a kernel).
@@ -36,13 +36,11 @@ RUN_TACTICS = 2
 
 
 def _mods():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (  # noqa: E501
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as cdo
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import (  # noqa: E501
         _mxfp8_gemm as mxfp8_gemm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (
-        sm107_linear as linear,
-    )
-    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as cdo
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import sm107_linear as linear
 
     return linear, mxfp8_gemm, cdo
 

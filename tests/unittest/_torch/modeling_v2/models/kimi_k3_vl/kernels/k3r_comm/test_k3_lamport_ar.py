@@ -91,7 +91,7 @@ def _block_weights(n, k, seed):
     return w, scale
 
 
-_K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 # tests/unittest/_torch/modeling_v2, where _validating lives (the MPI workers import it by path).
 _MV2_TESTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 _ENTRIES = (
@@ -340,9 +340,9 @@ def _run_rank_cells(world_size):
     import importlib
     import zlib
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
     from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+    from tensorrt_llm._torch.modeling_v2.catalog._op import Arch
     from tensorrt_llm.mapping import Mapping
 
     sys.path.insert(0, _MV2_TESTS)
@@ -535,7 +535,7 @@ def test_k3_lamport_entry_cells(mpi_pool_executor):
     k3_latent_ar_rmsnorm (see the module docstring)."""
     import importlib
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch
+    from tensorrt_llm._torch.modeling_v2.catalog._op import Arch
 
     world_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world_size:

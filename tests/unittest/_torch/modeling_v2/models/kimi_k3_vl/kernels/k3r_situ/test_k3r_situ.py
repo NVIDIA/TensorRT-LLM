@@ -16,9 +16,9 @@ import torch
 __extra_import_path__ = ["../.."]
 from _k3_source_parity import REPO, function_dump
 
-_KERNELS = REPO / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ"
+_KERNELS = REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ"
 _V1 = REPO / "tensorrt_llm/_torch/modules/situ.py"
-_OP = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_situ.op"
+_OP = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_situ.op"
 
 _gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,

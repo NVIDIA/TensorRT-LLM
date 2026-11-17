@@ -75,7 +75,7 @@ needs_k3_decode = pytest.mark.skipif(
 
 def k3_decode():
     """K3's FP4 MLA decode module."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
         _fp4_mla_decode as fp4_mla_decode,
     )
 
@@ -89,10 +89,10 @@ def _pow2_scales(rows, cols, gen, lo, hi):
 
 @functools.lru_cache(maxsize=1)
 def _weights():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
         k3_fp8w_lowm_gemm as lowm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
         k3_mla_q_fused as fused,
     )
 
@@ -326,7 +326,7 @@ def _attention(rot=None):
 
 def _external_scatter(md, latent, rot):
     """The KV-only generation update: cache rows and the packed-Q buffers, no query rows."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
         fp4_mla_kv_append,
     )
 
@@ -334,7 +334,7 @@ def _external_scatter(md, latent, rot):
 
 
 def _run_fused(md, w, x, rot, debug=None, norm=None):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
         k3_mla_q_fused as fused,
     )
 
@@ -431,7 +431,7 @@ def test_fused_norm_matches_flashinfer_norm(num_tokens):
     FlashInfer's norm, bit for bit; so does the KV latent row kernel."""
     from flashinfer.norm import rmsnorm
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (
         k3_mla_q_fused as fused,
     )
 
@@ -466,7 +466,7 @@ def test_fused_norm_matches_flashinfer_norm(num_tokens):
 def test_projections_match_production_gemms(num_tokens):
     """q_b against the low-M FP8 GEMM, W_UK against the BF16 BMM: the same products, another FP32
     summation order, so BF16 results agree to rounding."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
         k3_fp8w_lowm_gemm as lowm,
     )
 
@@ -519,7 +519,7 @@ class _DecodeAsAttention:
 def _mla_stand_in(w, md, rot, qkv):
     """The attributes of the MLA layer that ``generation.forward_gen_q_fused`` reads, with the
     real kernels behind them."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q.q_norm_pdl import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q.q_norm_pdl import (  # noqa: E501
         rmsnorm_release_at_launch,
     )
 
@@ -549,13 +549,13 @@ def _mla_stand_in(w, md, rot, qkv):
 def test_forward_gen_q_fused_matches_default_chain(n, monkeypatch):
     from flashinfer.norm import rmsnorm
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
         k3_fp8w_lowm_gemm as lowm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q.q_norm_pdl import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q.q_norm_pdl import (  # noqa: E501
         rmsnorm_release_at_launch,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8 import (
         modeling as generation,
     )
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -608,7 +608,7 @@ def test_forward_gen_q_fused_matches_default_chain(n, monkeypatch):
 
 
 def _q_fused_entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (  # noqa: E501
         k3_mla_q_fused as entry_module,
     )
 

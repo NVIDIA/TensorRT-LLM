@@ -14,18 +14,14 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (
-    sm107_linear as linear,
-)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import sm107_linear as linear
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, load_weight_shard
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-_TARGET = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1"
-)
+_TARGET = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1"
 
 FP8 = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
 COL, ROW = TensorParallelMode.COLUMN, TensorParallelMode.ROW

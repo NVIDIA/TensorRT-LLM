@@ -16,13 +16,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating  # noqa: E402
 
 _ENTRY = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.k3_attn_res_norm"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_attn_res_norm"
 )
 k3_attn_res_norm = _ENTRY.k3_attn_res_norm
 

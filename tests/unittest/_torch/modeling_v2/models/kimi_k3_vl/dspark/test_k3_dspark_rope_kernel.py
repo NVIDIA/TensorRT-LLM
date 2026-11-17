@@ -22,10 +22,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.kernels import (
+from tensorrt_llm._torch.custom_ops import dspark_rmsnorm_rope_custom_op as shared_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark.kernels import (
     dspark_rmsnorm_rope as family,
 )
-from tensorrt_llm._torch.custom_ops import dspark_rmsnorm_rope_custom_op as shared_op
 
 # sha256 of the source of ``DSparkRMSNormRoPEKernel`` in
 # tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py at 91625b18df, the source of

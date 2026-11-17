@@ -9,10 +9,10 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.k3_l2_prefetch import (  # noqa: E501, E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda.k3_l2_prefetch import (  # noqa: E501, E402
     tensor_range,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_l2_prefetch import (  # noqa: E501, E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_l2_prefetch import (  # noqa: E501, E402
     k3_l2_prefetch,
 )
 

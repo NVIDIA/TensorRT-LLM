@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.rmsnorm_release_at_launch import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.rmsnorm_release_at_launch import (  # noqa: E501
         rmsnorm_release_at_launch,
     )
 
@@ -30,7 +30,7 @@ def _entry():
 def test_rmsnorm_release_at_launch_cells(cell):
     from flashinfer.norm import rmsnorm
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q import (  # noqa: E501
         q_norm_pdl,
     )
 

@@ -38,7 +38,7 @@ from types import SimpleNamespace
 import pytest
 from torch import nn
 
-K3_RUBIN = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3_RUBIN = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 TARGETS = ("tp1", "helix8_moeep8", "helix8_moetp2ep4", "dep16")
 #: The glue module of each SM107 target: the target's modeling.py.
 _GLUE = {t: f"kimi_k3_nvfp4__sm_107__{t}.modeling" for t in TARGETS}

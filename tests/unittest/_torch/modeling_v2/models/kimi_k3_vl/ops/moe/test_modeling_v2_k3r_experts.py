@@ -36,7 +36,7 @@ __extra_import_path__ = ["../../../.."]
 from _fp4_moe_test_utils import _q_nvfp4  # noqa: E402
 from _validating import assert_within_ulp  # noqa: E402
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe import (  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe import (  # noqa: E402
     k3r_experts as kx,
 )
 
@@ -278,9 +278,7 @@ def test_fc12_die_major(num_tokens):
     module = _family("CUTEDSL_FC12", sm_reserve=16, die_major=True, die_sched_min_tokens=24)
     layer.load(module)
     module.post_load_weights()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_moe import (
-        die_locality,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_moe import die_locality
 
     if not die_locality.is_die_alternating(module.backend.w3_w1_weight.data):
         pytest.skip("the GPU has no die-alternating memory")

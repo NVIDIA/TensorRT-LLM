@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.modules.situ  # noqa: F401 — registers torch.ops.trtllm.situ_and_mul
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_situ import op as _situ_op  # noqa: F401 — registers the op

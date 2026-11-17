@@ -22,12 +22,10 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 
 _FLASHINFER_DTYPES = (torch.bfloat16, torch.float16)
 

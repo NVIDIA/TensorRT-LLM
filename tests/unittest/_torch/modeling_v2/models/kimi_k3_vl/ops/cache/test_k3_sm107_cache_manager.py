@@ -26,10 +26,10 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.common.kda_metadata import (
     KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.cache.k3_sm107_cache_manager import (  # noqa: E501
     KimiK3Sm107CacheManager,
     KimiK3Sm107MidchunkCacheManager,
     _KDAMidchunkSnapshot,

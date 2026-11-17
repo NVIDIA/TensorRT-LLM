@@ -50,7 +50,7 @@ DIM = H * K
 
 def _fab_proj():
     """The ``k3_kda_fab_proj`` entry (its import needs CuTe DSL)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_proj import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_proj import (  # noqa: E501
         k3_kda_fab_proj,
     )
 
@@ -59,7 +59,7 @@ def _fab_proj():
 
 def _fab_fa():
     """The ``k3_kda_fab_fa`` entry (its import needs CuTe DSL)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_fa import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_fab_fa import (  # noqa: E501
         k3_kda_fab_fa,
     )
 
@@ -68,7 +68,7 @@ def _fab_fa():
 
 def _ops():
     """The ``kda_mtp_decode`` entry (its import needs CuTe DSL)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501
         kda_mtp_decode,
     )
 

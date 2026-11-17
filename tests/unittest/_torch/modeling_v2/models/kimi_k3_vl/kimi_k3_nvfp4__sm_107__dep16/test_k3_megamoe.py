@@ -48,7 +48,7 @@ if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
-K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 WORLD = 4
 NUM_EXPERTS, TOP_K, HIDDEN, INTER = 64, 8, 1024, 512
 MAX_NUM_TOKENS = 512

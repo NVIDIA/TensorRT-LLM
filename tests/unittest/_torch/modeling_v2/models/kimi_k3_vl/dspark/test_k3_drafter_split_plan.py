@@ -44,7 +44,7 @@ requires_blackwell_mla_decode = pytest.mark.skipif(
 @pytest.mark.parametrize("num_heads, seq_len_q", [(64, 8), (64, 6), (32, 8), (128, 1)])
 @pytest.mark.parametrize("num_requests", [1, 3, 17, 64, 200])
 def test_drafter_plan_matches_mains_launcher_at_mains_cost(num_heads, seq_len_q, num_requests):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark import drafter
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.dspark import drafter
 
     runner = _runner()
     # The CuTe DSL occupancy query runs on the current CUDA context, which the first

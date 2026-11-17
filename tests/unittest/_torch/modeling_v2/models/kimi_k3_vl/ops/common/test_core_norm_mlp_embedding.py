@@ -6,22 +6,14 @@ modules (one GPU, one rank): bitwise."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation import (
-    sm107_mlp as mlp,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.common import (
-    sm107_streams as streams,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.embedding import (
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation import sm107_mlp as mlp
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.common import sm107_streams as streams
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.embedding import (
     sm107_embedding as embedding,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm import (
-    sm107_norm as norm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm import (
-    sm107_short_conv as conv,
-)
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm import sm107_norm as norm
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm import sm107_short_conv as conv
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import TensorParallelMode

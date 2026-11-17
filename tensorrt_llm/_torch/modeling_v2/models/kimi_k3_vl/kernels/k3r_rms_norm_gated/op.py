@@ -10,7 +10,7 @@ the one-row kernel on a packed copy of the gate otherwise.
 import torch
 import triton
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
 
 from .rms_norm_gated_kernel import (
     _MULTIROW_MAX_N,

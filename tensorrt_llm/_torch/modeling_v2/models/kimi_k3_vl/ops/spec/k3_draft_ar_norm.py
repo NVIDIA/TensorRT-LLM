@@ -9,7 +9,7 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, OpWrapper
 
 from ...kernels.k3r_spec.dspark_draft_ar import ar_norm_config, run_draft_ar_norm
 

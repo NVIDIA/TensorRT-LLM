@@ -26,13 +26,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.spec_decode_head import (  # noqa: E501
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.spec_decode_head import (  # noqa: E501
     SpecDecodeHead,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_spec_decode_head import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_spec_decode_head import (  # noqa: E501
     k3_spec_decode_head,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")

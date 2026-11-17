@@ -17,7 +17,7 @@ pytestmark = pytest.mark.cpu_only
 
 ROOT = Path(__file__).resolve().parents[8]
 BACKEND = ROOT / "tensorrt_llm/_torch/attention/backends/fp4_mla"
-FAMILY = ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/ops/attention"
+FAMILY = ROOT / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/ops/attention"
 BACKEND_PACKAGE = "tensorrt_llm._torch.attention.backends.fp4_mla"
 CONTRACT = ("config", "layout", "metadata", "packed_plan", "state")
 DEFINITION_COPIES = ("_k3_fp4_mla_cache", "_k3_fp4_mla_kernels")

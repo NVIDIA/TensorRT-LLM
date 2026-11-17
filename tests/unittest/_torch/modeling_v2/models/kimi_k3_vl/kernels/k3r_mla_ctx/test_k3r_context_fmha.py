@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(
     reason="K3 FP8 context FMHA requires SM107",
 )
 
-_PKG = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_PKG = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 @pytest.fixture(scope="module", params=[None, 1, 3], ids=["normal", "delay-warp1", "delay-warp3"])
@@ -32,13 +32,13 @@ def run_fmha(request, tmp_path_factory):
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
         k3_context_fmha,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha import (  # noqa: E501
         RubinFusedMultiHeadAttentionForward,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_helpers import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_helpers import (  # noqa: E501
         MaskEnum,
     )
 
@@ -218,14 +218,14 @@ def _attention(heads: int) -> SimpleNamespace:
 )
 @pytest.mark.parametrize("heads", [96, 48, 24, 12, 6, 3])
 def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_op import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_op import (  # noqa: E501
         CuteDSLK3ContextFmhaRunner,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.modeling import (  # noqa: E501
         run_k3_split_k_context_partition,
         supports_k3_fp8_split_k_context,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
         k3_context_fmha,
     )
 
@@ -387,7 +387,7 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -
 
 
 def _entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
         k3_context_fmha,
     )
 

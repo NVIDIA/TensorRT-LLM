@@ -25,7 +25,7 @@ pytestmark = pytest.mark.cpu_only
 
 ROOT = Path(__file__).resolve().parents[8]
 TORCH = ROOT / "tensorrt_llm/_torch"
-FAMILY = TORCH / "_experimental/modeling_v2/models/kimi_k3_vl"
+FAMILY = TORCH / "modeling_v2/models/kimi_k3_vl"
 MAIN_KERNEL = (
     TORCH / "kernels/rubin/dense_blockscaled_gemm_persistent.py",
     "Sm107BlockScaledPersistentDenseGemmKernel",

@@ -9,10 +9,8 @@ from typing import Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import (
-    attn_res_fwd,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
 
 from ...kernels.k3r_attn_res import k3_attn_res as _kernel
 

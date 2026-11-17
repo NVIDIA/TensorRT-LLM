@@ -44,7 +44,7 @@ def _sm107_fmha_libraries(monkeypatch):
 
 
 def _ops():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (
         k3_mla_attention,
         k3_mla_cache,
         k3_mla_state,

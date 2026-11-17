@@ -9,7 +9,7 @@ from typing import Sequence, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_spec.vocab_parallel_kernels import markov_chain
 from ._reference import markov_chain_tokens

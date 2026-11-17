@@ -40,10 +40,10 @@ OUTPUT_SCALE = 0.25
 
 
 def _modules():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_fp4_mla import (
         fp4_mla_packed_reduce as reduce_mod,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_helix import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_helix import (
         k3_helix_tail as tail_mod,
     )
 
@@ -347,7 +347,7 @@ def test_helix_tail_direct_rows_and_graph_replay():
 def test_helix_tail_mxfp8_operand(num_tokens):
     """o_proj's operand: the receivers' MXFP8 form of ``bf16(out * gate)`` is bitwise the
     gated low-M GEMM's quantization of it, with a row-strided gate."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm import (
         k3_fp8w_lowm_mxfp8 as mx,
     )
 
@@ -385,7 +385,7 @@ def test_tail_output_buffer_is_the_generation_output():
     """The fused tail writes ``forward_absorption_generation``'s output in place: it is given that
     output viewed as ``[T, H / P * v_head_dim]`` (the same storage, so the copy into ``output`` is
     skipped), and nothing it could not write as is (no output, another dtype, size or layout)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8.modeling import (  # noqa: E501
         tail_output_buffer,
     )
 
@@ -405,7 +405,7 @@ def test_tail_output_buffer_is_the_generation_output():
 
 
 def _entry():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_helix_tail import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_helix_tail import (  # noqa: E501
         k3_helix_tail,
     )
 

@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_spec.spec_tail_kernels import scatter_rows_to_pool
 from .k3_store_context_latents import to_e4m3_saturated

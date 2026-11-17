@@ -91,9 +91,6 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import kimi_k3_cache_policy as _kimi_k3_cache_policy
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch.attention.backends import AttentionMetadata, TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_K_RESIDUAL_DIM,
@@ -114,6 +111,9 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import HelixCpMnnvlMemory, Mnn
 from tensorrt_llm._torch.distributed.ops import use_mnnvl_fabric_handle
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     eager_on_graph,
