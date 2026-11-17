@@ -5,10 +5,24 @@ import contextlib
 import contextvars
 import functools
 import gc
+import inspect
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Hashable, List, Optional, Protocol, Tuple, TypeAlias
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
+from torch import nn
+from torch.utils._pytree import keystr, tree_flatten_with_path, tree_unflatten
 
 from tensorrt_llm.logger import logger
 
@@ -109,6 +123,9 @@ class CUDAGraphRunner:
     """
 
     WARMUP_STEPS = 2
+    # Run gc.collect() and torch.cuda.empty_cache() after each eager warmup call,
+    # so a large captured callable starts capture with the caching allocator trimmed.
+    RELEASE_MEMORY_AFTER_WARMUP = True
 
     def __init__(
         self,
@@ -205,10 +222,13 @@ class CUDAGraphRunner:
             return self._shared_pool.handle
         return self.memory_pool
 
+    def _log_capture(self, key: KeyType) -> None:
+        logger.info(f"Capturing graph for key: {key}")
+
     def capture(
         self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
     ) -> None:
-        logger.info(f"Capturing graph for key: {key}")
+        self._log_capture(key)
 
         # One time clone of inputs
         static_args = [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
@@ -225,8 +245,9 @@ class CUDAGraphRunner:
                 with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
                     fn(*static_args, **static_kwargs)
                 torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
+                if self.RELEASE_MEMORY_AFTER_WARMUP:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
             with nccl_window_graph_capture(graph, graph_pool):
@@ -302,3 +323,183 @@ class CUDAGraphRunner:
         self._graph_output_refs.clear()
         self.static_inputs.clear()
         self.memory_pool = None
+
+
+class ModelForwardExtraKeys:
+    """Model-registered graph-key functions, evaluated against ``model.forward`` inputs.
+
+    ``register_cuda_graph_extra_key_fns`` callbacks are written for a runner that
+    wraps ``model.forward``; ``sparse_attn_phase``, for example, reads its
+    ``timestep`` kwarg. A block runner only sees block inputs. This class stands
+    in for a runner when the model registers its callbacks, records the inputs
+    of the ``model.forward`` call in progress (:meth:`record_inputs`), and hands
+    block runners callbacks that read those inputs (:meth:`block_key_fn`), so
+    block graphs are keyed the same way a whole-forward graph would be.
+    """
+
+    def __init__(self) -> None:
+        self.key_fns: Dict[str, ExtraKeyFn] = {}
+        self._inputs: contextvars.ContextVar[Optional[Tuple[Tuple[Any, ...], Dict[str, Any]]]] = (
+            contextvars.ContextVar("model_forward_inputs", default=None)
+        )
+
+    def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
+        self.key_fns[name] = fn
+
+    def record_inputs(self, forward: Callable) -> Callable:
+        """Wrap ``forward`` so key callbacks can read the inputs of the current call."""
+
+        @functools.wraps(forward)
+        def wrapper(*args, **kwargs):
+            token = self._inputs.set((args, kwargs))
+            try:
+                return forward(*args, **kwargs)
+            finally:
+                self._inputs.reset(token)
+
+        return wrapper
+
+    def block_key_fn(self, fn: ExtraKeyFn) -> ExtraKeyFn:
+        """Adapt ``fn`` for a block runner: ignore block inputs, use ``model.forward`` inputs."""
+
+        def key_fn(*_block_args: Any, **_block_kwargs: Any) -> Optional[Hashable]:
+            inputs = self._inputs.get()
+            if inputs is None:
+                return None
+            args, kwargs = inputs
+            return fn(*args, **kwargs)
+
+        return key_fn
+
+
+class BlockCUDAGraphRunner(CUDAGraphRunner):
+    """CUDA graph runner for one transformer block called from eager Python.
+
+    Used when a step cache decides inside ``model.forward`` which blocks run
+    (Cache-DiT), so the whole forward cannot be a single graph. Each block call
+    is normalized before the base ``capture`` / ``replay``:
+
+    - Arguments are bound to the block's ``forward`` signature, so positional
+      and keyword calls with the same inputs share one graph.
+    - Tensors nested in containers, such as FLUX's ``image_rotary_emb`` tuple,
+      become top-level graph inputs, so they are keyed and copied on replay.
+      The base runner only handles top-level tensors.
+    - Tensor dtypes and all non-tensor values are part of the key, because the
+      graph bakes them in. A call with an unhashable non-tensor value runs
+      eagerly.
+
+    A transformer has dozens of blocks, so the per-warmup ``gc.collect()`` and
+    ``empty_cache()`` of the base runner would run hundreds of times at startup
+    for little gain: one block's temporaries are small.
+    """
+
+    RELEASE_MEMORY_AFTER_WARMUP = False
+
+    def __init__(
+        self,
+        config: CUDAGraphRunnerConfig,
+        signature: inspect.Signature,
+        shared_pool: Optional[SharedGraphPool] = None,
+        name: str = "",
+    ):
+        super().__init__(config, shared_pool)
+        self._signature = signature
+        self.name = name
+
+    def _log_capture(self, key: KeyType) -> None:
+        logger.debug(f"{self.name}: capturing graph for key: {key}")
+
+    def wrap(self, fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not self.enabled:
+                return fn(*args, **kwargs)
+            try:
+                arguments = dict(self._signature.bind(*args, **kwargs).arguments)
+            except TypeError:
+                # Let the block report the bad call itself.
+                return fn(*args, **kwargs)
+
+            leaves_with_paths, spec = tree_flatten_with_path(arguments)
+            leaves = [leaf for _, leaf in leaves_with_paths]
+            tensor_positions = [
+                i for i, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)
+            ]
+            tensors = tuple(leaves[i] for i in tensor_positions)
+            tensor_key = tuple(
+                (keystr(leaves_with_paths[i][0]), tuple(leaves[i].shape), str(leaves[i].dtype))
+                for i in tensor_positions
+            )
+            value_key = tuple(
+                (keystr(path), leaf)
+                for path, leaf in leaves_with_paths
+                if not isinstance(leaf, torch.Tensor)
+            )
+            key = (
+                ("tensors", tensor_key),
+                ("values", value_key),
+                ("structure", str(spec)),
+            ) + self._get_extra_key(*args, **kwargs)
+            try:
+                hash(key)
+            except TypeError:
+                return fn(*args, **kwargs)
+
+            if key not in self.graphs:
+                if not self.allow_capture:
+                    return fn(*args, **kwargs)
+
+                def call_with_tensors(*graph_tensors: torch.Tensor) -> Any:
+                    rebuilt = list(leaves)
+                    for position, tensor in zip(tensor_positions, graph_tensors):
+                        rebuilt[position] = tensor
+                    bound = inspect.BoundArguments(self._signature, tree_unflatten(rebuilt, spec))
+                    return fn(*bound.args, **bound.kwargs)
+
+                self.capture(key, call_with_tensors, tensors, {})
+            return self.replay(key, tensors, {})
+
+        return wrapper
+
+
+def wrap_blocks_with_cuda_graphs(
+    model: nn.Module,
+    block_attrs: Sequence[str],
+    shared_pool: Optional[SharedGraphPool] = None,
+    name: str = "transformer",
+) -> Dict[str, BlockCUDAGraphRunner]:
+    """Capture every block in ``model``'s block lists as its own CUDA graph.
+
+    Each block's ``forward`` is wrapped in place, so block identity, module
+    names, and references other code already holds (Cache-DiT's block lists)
+    are unchanged. Call after ``torch.compile`` has replaced the block lists:
+    capturing an eager block that is later compiled would make dynamo trace the
+    graph wrapper. Model-registered extra keys are evaluated against the inputs
+    of the enclosing ``model.forward`` call (see :class:`ModelForwardExtraKeys`).
+
+    Returns the runners keyed by ``"{name}.{block_attr}.{index}"``.
+    """
+    extra_keys = ModelForwardExtraKeys()
+    register_extra_keys = getattr(model, "register_cuda_graph_extra_key_fns", None)
+    if register_extra_keys is not None:
+        register_extra_keys(extra_keys)
+    if extra_keys.key_fns:
+        model.forward = extra_keys.record_inputs(model.forward)
+
+    runners: Dict[str, BlockCUDAGraphRunner] = {}
+    for block_attr in block_attrs:
+        for index, block in enumerate(getattr(model, block_attr)):
+            runner_name = f"{name}.{block_attr}.{index}"
+            # torch.compile wrappers expose (*args, **kwargs); bind against the eager block.
+            eager_block = getattr(block, "_orig_mod", block)
+            runner = BlockCUDAGraphRunner(
+                CUDAGraphRunnerConfig(use_cuda_graph=True),
+                inspect.signature(eager_block.forward),
+                shared_pool,
+                name=runner_name,
+            )
+            for key_name, key_fn in extra_keys.key_fns.items():
+                runner.register_extra_key_fn(key_name, extra_keys.block_key_fn(key_fn))
+            block.forward = runner.wrap(block.forward)
+            runners[runner_name] = runner
+    return runners

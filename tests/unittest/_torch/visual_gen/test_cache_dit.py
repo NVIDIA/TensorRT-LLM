@@ -194,11 +194,13 @@ class TestCacheDiTRealPipelineForward:
         *,
         text_encoder_path: str = "",
         enable_torch_compile: bool = False,
+        enable_cuda_graph: bool = False,
     ):
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
         from tensorrt_llm.visual_gen.args import (
             CacheDiTConfig,
             CompilationConfig,
+            CudaGraphConfig,
             TorchCompileConfig,
             VisualGenArgs,
         )
@@ -225,6 +227,7 @@ class TestCacheDiTRealPipelineForward:
                 enable=enable_torch_compile,
                 enable_autotune=False,
             ),
+            cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
             compilation_config=CompilationConfig(skip_warmup=True),
         )
         loader = PipelineLoader(args)
@@ -351,6 +354,70 @@ class TestCacheDiTRealPipelineForward:
             finally:
                 if pipeline is not None:
                     self._teardown_cache_dit(pipeline)
+
+    def test_flux_cache_dit_with_cuda_graph_matches_eager(self):
+        """CUDA graphs + Cache-DiT capture one graph per block, not per forward.
+
+        A whole-forward graph would freeze Cache-DiT's skip decision (nothing
+        cached, and max_warmup_steps=0 used to crash capture). Per-block graphs
+        must keep caching and give a bit-identical image to running without
+        graphs.
+        """
+        ckpt = get_checkpoint(_FLUX_SUBDIR)
+
+        results = {}
+        for enable_cuda_graph in (False, True):
+            pipeline = None
+            with _suppress_stdlib_logging_for_cache_dit():
+                try:
+                    pipeline = self._load_visual_gen_pipeline(
+                        ckpt, enable_cuda_graph=enable_cuda_graph
+                    )
+                    transformer = pipeline.transformer
+                    num_blocks = len(transformer.transformer_blocks) + len(
+                        transformer.single_transformer_blocks
+                    )
+                    block_runners = {
+                        name: runner
+                        for name, runner in pipeline._cuda_graph_runners.items()
+                        if name.startswith("transformer.")
+                    }
+                    if enable_cuda_graph:
+                        assert "transformer" not in pipeline._cuda_graph_runners, (
+                            "transformer.forward must not be captured as one graph with Cache-DiT"
+                        )
+                        assert len(block_runners) == num_blocks
+                    else:
+                        assert not pipeline._cuda_graph_runners
+
+                    with torch.inference_mode():
+                        output = pipeline.forward(
+                            prompt="cache dit validation",
+                            height=256,
+                            width=256,
+                            num_inference_steps=12,
+                            guidance_scale=3.5,
+                            seed=0,
+                            max_sequence_length=256,
+                        )
+
+                    stats = pipeline.cache_accelerator.get_stats()
+                    cached = _total_accumulated_cached_steps(stats)
+                    assert cached > 0, f"Cache-DiT cached nothing; stats={stats!r}"
+                    if enable_cuda_graph:
+                        assert all(len(r.graphs) == 1 for r in block_runners.values())
+                    results[enable_cuda_graph] = (output.image.clone(), cached)
+                finally:
+                    if pipeline is not None:
+                        self._teardown_cache_dit(pipeline)
+                        pipeline.cleanup()
+                    del pipeline
+                    torch.cuda.empty_cache()
+
+        image_eager, cached_eager = results[False]
+        image_graph, cached_graph = results[True]
+        assert cached_graph == cached_eager
+        torch.testing.assert_close(image_graph, image_eager, rtol=0, atol=0)
 
     def test_ltx2_cache_dit_skips_blocks_after_forward(self):
         ckpt = get_checkpoint(_LTX2_CHECKPOINT_SUBDIR)

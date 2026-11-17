@@ -42,7 +42,12 @@ from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
-from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .cuda_graph_runner import (
+    CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
+    SharedGraphPool,
+    wrap_blocks_with_cuda_graphs,
+)
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
@@ -235,6 +240,9 @@ class BasePipeline(nn.Module):
         triggered torch.compile's lazy compilation, so the captured graph
         contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
         relies on the same ordering.)
+
+        With Cache-DiT, the blocks are captured individually instead; see
+        ``_setup_blockwise_cuda_graphs``.
         """
         if not self.pipeline_config.cuda_graph.enable:
             return
@@ -244,6 +252,13 @@ class BasePipeline(nn.Module):
                 "CUDA graphs are not supported with visual generation offloading yet. "
                 "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
             )
+
+        if self._uses_blockwise_cuda_graphs():
+            # Cache-DiT decides inside transformer.forward which blocks run, so a
+            # whole-forward graph would freeze one decision. The blocks are
+            # captured one graph per block once they are compiled; see
+            # _setup_blockwise_cuda_graphs, called from _setup_cache_acceleration.
+            return
 
         if len(self.transformer_components) > 1:
             logger.info(
@@ -267,6 +282,43 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    def _uses_blockwise_cuda_graphs(self) -> bool:
+        """True when CUDA graphs must be captured per block instead of per forward.
+
+        Cache-DiT decides inside ``transformer.forward`` whether each block runs.
+        Per-block graphs keep that decision in Python between graph replays.
+        """
+        cfg = self.pipeline_config
+        return bool(cfg.cuda_graph.enable) and cfg.cache_backend == "cache_dit"
+
+    def _setup_blockwise_cuda_graphs(self) -> None:
+        """Capture each transformer block as its own CUDA graph.
+
+        Runs after ``torch_compile()`` has replaced the block lists, so blocks
+        are compiled before they are captured, and before Cache-DiT is enabled.
+        All block graphs share one memory pool: blocks run one after another.
+        """
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+
+        shared_pool = self._get_or_create_cuda_graph_shared_pool()
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+            block_attrs = self._find_transformer_blocks(model)
+            runners = wrap_blocks_with_cuda_graphs(model, block_attrs, shared_pool, name=name)
+            logger.info(
+                f"CUDA graph runner: Cache-DiT is enabled, capturing each of the "
+                f"{len(runners)} blocks in {name}.{{{', '.join(block_attrs)}}} as its "
+                f"own graph{compile_note}"
+            )
+            self._cuda_graph_runners.update(runners)
 
     @contextlib.contextmanager
     def disallow_cuda_graph_capture(self):
@@ -767,6 +819,9 @@ class BasePipeline(nn.Module):
         cfg = self.pipeline_config
 
         if cfg.cache_backend == "cache_dit":
+            # Pipelines that install their own forward-level runner (LTX-2) keep it.
+            if self._uses_blockwise_cuda_graphs() and not self._cuda_graph_runners:
+                self._setup_blockwise_cuda_graphs()
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
             acc.wrap()
             self.cache_accelerator = acc
