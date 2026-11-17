@@ -494,7 +494,9 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
     torch.testing.assert_close(
         head.proj.weight.cpu(), weights["confidence_proj.weight"].float(), rtol=0, atol=0
     )
-    assert head.proj.bias is not None
+    torch.testing.assert_close(
+        head.proj.bias.cpu(), weights["confidence_proj.bias"].float(), rtol=0, atol=0
+    )
 
 
 @needs_gpu
@@ -664,7 +666,12 @@ def test_published_drafter_spelling_activates_the_heads():
     # the next request's anchor slot.
     assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
-    assert drafter.confidence_head.proj.bias is not None
+    torch.testing.assert_close(
+        drafter.confidence_head.proj.bias.cpu(),
+        weights["confidence_head.proj.bias"].float(),
+        rtol=0,
+        atol=0,
+    )
 
 
 @needs_gpu
