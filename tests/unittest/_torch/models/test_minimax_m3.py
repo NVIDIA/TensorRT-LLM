@@ -96,6 +96,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     apply_layerwise_quant_config,
     apply_quant_config_exclude_modules,
     fused_checkpoint_names,
+    remove_weights,
 )
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -104,6 +105,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
@@ -2861,6 +2863,16 @@ def test_minimax_m3_gate_dummy_state_splits_the_weight_as_a_load_does() -> None:
     dummy.weight.data.copy_(weight)
     dummy.initialize_dummy_state(low=-1e-3, high=1e-3, seed=0)
     assert torch.equal(dummy.split_weight, loaded.split_weight)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_gate_dummy_state_skips_a_stripped_gate() -> None:
+    """Dummy weights leave alone a gate whose layer another pipeline rank runs: its
+    weights are removed, so it has no weight to split."""
+    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 8, top_k=2, routed_scaling_factor=1.0)
+    remove_weights(gate)
+    initialize_dummy_weights(gate)
+    assert not hasattr(gate, "split_weight")
 
 
 @pytest.mark.gpu

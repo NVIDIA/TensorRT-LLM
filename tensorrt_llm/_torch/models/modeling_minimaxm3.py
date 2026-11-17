@@ -675,8 +675,14 @@ class MiniMaxM3Gate(nn.Module):
             )
 
     def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
-        """Split the dummy ``weight`` as ``load_weights`` splits a checkpoint's."""
+        """Split the dummy ``weight`` as ``load_weights`` splits a checkpoint's.
+
+        A gate whose layer another pipeline rank runs has no weight
+        (``modeling_utils.remove_weights``), so there is nothing to split.
+        """
         del low, high, seed  # The dummy weight is already in place.
+        if getattr(self, "_weights_removed", False):
+            return
         self.split_weight = split_router_weight_bf16(self.weight)
 
     @property

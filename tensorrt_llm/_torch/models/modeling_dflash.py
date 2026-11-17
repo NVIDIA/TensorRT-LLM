@@ -1250,18 +1250,24 @@ class DFlashForCausalLM(nn.Module):
             self._load_hidden_norm(dummy(hidden_size))
 
     def _target_projection_width(self) -> int:
-        """``fc``'s input width as the draft config gives it: one target hidden state per
-        captured layer."""
-        layer_ids = self.target_layer_ids or getattr(self.config, "target_layer_ids", None)
-        num_layers = len(layer_ids) if layer_ids else getattr(self.config, "num_target_layers", 0)
-        target_hidden_size = getattr(self.config, "target_hidden_size", None)
-        if not num_layers or not target_hidden_size:
+        """``fc``'s input width: one target hidden state per layer the worker captures.
+
+        The worker captures the layers ``speculative_config.target_layer_ids`` names, which
+        the draft config gives in ``dspark_config``, in ``dflash_config`` or at its top level.
+        The drafter runs on the target's embedding or LM head
+        (``load_weights_from_target_model``), so its hidden size is the target's where the
+        config gives no ``target_hidden_size``.
+        """
+        layer_ids = resolve_dspark_head_config(self.config, "target_layer_ids")
+        if not layer_ids:
             raise ValueError(
-                f"{type(self).__name__}: the draft config does not give the captured target "
-                "layers (target_layer_ids or num_target_layers) and target_hidden_size, so "
-                "the dummy fc cannot take the checkpoint's shape."
+                f"{type(self).__name__}: the draft config names no target_layer_ids, so the "
+                "dummy fc cannot take the checkpoint's shape."
             )
-        return num_layers * target_hidden_size
+        target_hidden_size = (
+            getattr(self.config, "target_hidden_size", None) or self.config.hidden_size
+        )
+        return len(layer_ids) * target_hidden_size
 
     def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
         """Build the DFlash 2 convolutions and candidate selector.

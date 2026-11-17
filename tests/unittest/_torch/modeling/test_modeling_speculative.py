@@ -820,7 +820,7 @@ def test_dflash_workspace_sizes_the_largest_folded_chunk(
     assert [call.args for call in counter_calls] == [(heads * chunk, 3, 148)]
 
 
-def _fake_mla_dspark_wrapper():
+def _fake_mla_dspark_wrapper(**draft_config: object) -> MLADSparkForCausalLM:
     """An MLA DSpark drafter as created, before a load: the fields its projection and head
     loaders read, and none of the modules they build."""
     wrapper = MLADSparkForCausalLM.__new__(MLADSparkForCausalLM)
@@ -830,10 +830,9 @@ def _fake_mla_dspark_wrapper():
         rms_norm_eps=1e-6,
         torch_dtype=torch.bfloat16,
         vocab_size=96,
-        target_layer_ids=[2, 5, 9],
-        target_hidden_size=48,
+        **draft_config,
     )
-    wrapper.target_layer_ids = None
+    wrapper.target_layer_ids = getattr(wrapper.config, "dflash_config", {}).get("target_layer_ids")
     wrapper.model_config = SimpleNamespace(mapping=Mapping())
     wrapper._tp_split = False
     wrapper._fc_input_slice = None
@@ -844,13 +843,29 @@ def _fake_mla_dspark_wrapper():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the drafter builds its modules on CUDA")
-def test_dspark_dummy_state_builds_what_a_load_builds():
+@pytest.mark.parametrize(
+    "draft_config, captured_width",
+    [
+        # Inferact/Kimi-K3-DSpark: the captured layers and the target's hidden size at the
+        # top level.
+        (dict(target_layer_ids=[2, 5, 9], num_target_layers=3, target_hidden_size=48), 3 * 48),
+        # z-lab/Qwen3-8B-DFlash-b16, RadixArk/Kimi-K3-DSpark: the layers in dflash_config,
+        # num_target_layers the target's depth, and no target_hidden_size.
+        (dict(dflash_config={"target_layer_ids": [2, 5, 9]}, num_target_layers=12), 3 * 64),
+    ],
+    ids=["top_level", "dflash_config"],
+)
+def test_dspark_dummy_state_builds_what_a_load_builds(
+    draft_config: dict, captured_width: int
+) -> None:
     """Dummy weights give the drafter the fc, hidden_norm and Markov head a checkpoint
-    gives it, in the checkpoint's shapes and dtypes."""
-    loaded, dummy = _fake_mla_dspark_wrapper(), _fake_mla_dspark_wrapper()
+    gives it, in the checkpoint's shapes and dtypes: fc takes the target hidden states
+    the worker captures."""
+    loaded = _fake_mla_dspark_wrapper(**draft_config)
+    dummy = _fake_mla_dspark_wrapper(**draft_config)
     cfg = loaded.config
 
-    def tensor(*shape):
+    def tensor(*shape: int) -> torch.Tensor:
         return torch.randn(shape, dtype=torch.bfloat16, device="cuda")
 
     loaded._take_dspark_head_weights(
@@ -859,9 +874,7 @@ def test_dspark_dummy_state_builds_what_a_load_builds():
             "markov_w2.weight": tensor(cfg.vocab_size, 16),
         }
     )
-    loaded._load_target_projection(
-        {"fc.weight": tensor(cfg.hidden_size, 3 * cfg.target_hidden_size)}
-    )
+    loaded._load_target_projection({"fc.weight": tensor(cfg.hidden_size, captured_width)})
     loaded._load_hidden_norm(tensor(cfg.hidden_size))
     dummy.initialize_dummy_state(low=-1e-3, high=1e-3, seed=0)
 
