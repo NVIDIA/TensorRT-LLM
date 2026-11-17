@@ -35,7 +35,10 @@ it owns, on its own CUDA stream (the batched page-copy kernel, or a host-callbac
 memcpy), makes the page's ready event the copy's completion so the slot's next
 owner waits for it in-stream, and queues the record. A poll thread here takes
 records whose copies have completed, puts them from the ring, and gives the ring
-slots back.
+slots back. A dropped page that finds the ring full is not written, which leaves a
+gap in the pool copy of its chain behind which the rest of the chain is unusable;
+`TRTLLM_MOONCAKE_CHAIN_LOSSLESS=1` makes the eviction wait for released slots
+instead (bounded by `TRTLLM_MOONCAKE_CHAIN_LOSSLESS_MAX_WAIT_S`, default 10 s).
 
 The radix key is the manager's SHA-256 block key, while the pool is keyed by the
 connector's own hash chain. The scheduler maps one to the other for every block
@@ -211,8 +214,14 @@ class HostChain:
         if self._async:
             ring_gib = _env_float("TRTLLM_MOONCAKE_CHAIN_RING_GIB", 8)
             prefer_kernel = os.environ.get("TRTLLM_MOONCAKE_CHAIN_COPY", "kernel") != "hostfn"
+            # Lossless: a full ring makes the evicting call wait for the put threads to release slots instead of
+            # dropping pages without a put, which would leave holes in the pool copies of their chains.
+            lossless = _env_flag("TRTLLM_MOONCAKE_CHAIN_LOSSLESS")
             addr, ring_slot, ring_n, kernel = manager.impl.host_drop_ring(
-                int(ring_gib * (1 << 30)), prefer_kernel
+                int(ring_gib * (1 << 30)),
+                prefer_kernel,
+                lossless=lossless,
+                lossless_max_wait_s=_env_float("TRTLLM_MOONCAKE_CHAIN_LOSSLESS_MAX_WAIT_S", 10.0),
             )
             status = self._store.register_buffer(addr, ring_slot * ring_n)
             if status != 0:
@@ -226,7 +235,7 @@ class HostChain:
             self._poller.start()
             hand_off = (
                 f"asynchronous hand-off, ring {ring_n} x {ring_slot} B, "
-                f"copy={'kernel' if kernel else 'hostfn'}"
+                f"copy={'kernel' if kernel else 'hostfn'}, lossless={lossless}"
             )
         else:
             manager.impl.set_host_drop_hook(self.on_host_drop)

@@ -62,6 +62,8 @@ CHAIN_SWITCHES = (
     "TRTLLM_MOONCAKE_CHAIN",
     "TRTLLM_MOONCAKE_CHAIN_ASYNC",
     "TRTLLM_MOONCAKE_CHAIN_COPY",
+    "TRTLLM_MOONCAKE_CHAIN_LOSSLESS",
+    "TRTLLM_MOONCAKE_CHAIN_LOSSLESS_MAX_WAIT_S",
     "TRTLLM_MOONCAKE_CHAIN_RING_GIB",
     "TRTLLM_MOONCAKE_CHAIN_STAGING_GIB",
     "TRTLLM_MOONCAKE_CHAIN_MAX_KEYS",
@@ -157,6 +159,7 @@ class FakeManagerImpl:
         ]
         self.hooks = []
         self.ring_calls = []
+        self.ring_options = []
         self.ring = None
         self.slot_bytes = 512
         self.lock = threading.Lock()
@@ -167,8 +170,9 @@ class FakeManagerImpl:
     def set_host_drop_hook(self, callback):
         self.hooks.append(callback)
 
-    def host_drop_ring(self, ring_bytes, prefer_kernel):
+    def host_drop_ring(self, ring_bytes, prefer_kernel, **options):
         self.ring_calls.append((ring_bytes, prefer_kernel))
+        self.ring_options.append(options)
         if self.ring is None:
             self.ring = (ctypes.c_uint8 * (self.slot_bytes * 8))()
         return ctypes.addressof(self.ring), self.slot_bytes, 8, prefer_kernel
@@ -344,6 +348,30 @@ def test_ring_copy_switch(monkeypatch, make_chain, copy, kernel):
         monkeypatch.setenv("TRTLLM_MOONCAKE_CHAIN_COPY", copy)
     _, _, impl, _ = make_chain()
     assert impl.ring_calls == [(8 << 30, kernel)]
+    make_chain.stop_all()
+
+
+@pytest.mark.parametrize(
+    "env, lossless, max_wait_s",
+    [
+        ({}, False, 10.0),
+        ({"TRTLLM_MOONCAKE_CHAIN_LOSSLESS": "1"}, True, 10.0),
+        (
+            {
+                "TRTLLM_MOONCAKE_CHAIN_LOSSLESS": "1",
+                "TRTLLM_MOONCAKE_CHAIN_LOSSLESS_MAX_WAIT_S": "2.5",
+            },
+            True,
+            2.5,
+        ),
+    ],
+)
+def test_lossless_ring_switch(monkeypatch, make_chain, env, lossless, max_wait_s):
+    monkeypatch.setenv("TRTLLM_MOONCAKE_CHAIN_ASYNC", "1")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _, _, impl, _ = make_chain()
+    assert impl.ring_options == [{"lossless": lossless, "lossless_max_wait_s": max_wait_s}]
     make_chain.stop_all()
 
 
