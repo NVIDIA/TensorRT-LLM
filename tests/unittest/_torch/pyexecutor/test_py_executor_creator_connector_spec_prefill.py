@@ -23,7 +23,7 @@ KVCacheManagerV1 selection does not select speculative-prefill mode for V1.
 
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _connector_runs_speculative_prefill_only,
     _refuse_speculation_next_to_connector,
+    _validate_speculative_connector,
     _validate_speculative_connector_role,
 )
 from tensorrt_llm.llmapi.llm_args import (
@@ -231,3 +232,24 @@ def test_speculation_is_refused_next_to_a_kv_moving_connector(
         _refuse_speculation_next_to_connector(
             spec_config, use_v2, speculative_prefill_only, connector
         )
+
+
+@pytest.mark.parametrize("failure", ["refused", "generation_role", "accepted"])
+def test_a_rejected_connector_is_shut_down_before_the_error_leaves(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    connector = Mock(capacity_only=False, speculative_prefill_only=failure == "generation_role")
+    spec_config = None if failure == "accepted" else _mtp_eagle()
+    speculative_prefill_only = failure == "generation_role"
+
+    if failure == "refused":
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
+    elif failure == "generation_role":
+        with pytest.raises(ValueError, match="generation"):
+            _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
+    else:
+        _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
+
+    assert connector.shutdown.call_count == (0 if failure == "accepted" else 1)
