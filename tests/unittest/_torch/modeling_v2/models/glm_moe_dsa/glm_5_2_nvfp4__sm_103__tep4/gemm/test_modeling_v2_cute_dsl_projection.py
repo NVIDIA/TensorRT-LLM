@@ -10,7 +10,7 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("cute_dsl_projection runs sm_103 CuTe DSL kernels", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_projection import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_projection import (  # noqa: E402, E501
     MTP_ROWS,
     PREFILL_MAX_ROWS,
     ROWS,
@@ -24,7 +24,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     build_shared_down_prefill,
     shape_of,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_projection import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_projection import (  # noqa: E402, E501
     cute_dsl_projection as op,
 )
 

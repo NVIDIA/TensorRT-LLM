@@ -317,6 +317,9 @@ class Campaign:
         """Invalidate reusable evidence when measurement or judgment inputs have changed."""
         inputs = evidence_key(self.bench, self.base_configs)
         gate_identity = asdict(self.keep_gate)
+        # The suite's width restates the members' (``KeepGate.tests_only``), which the identity
+        # already holds: it changes nothing the gate judges.
+        gate_identity.pop("suite_width", None)
         gate_identity["spec"] = {
             k: v
             for k, v in self.keep_gate.spec.items()

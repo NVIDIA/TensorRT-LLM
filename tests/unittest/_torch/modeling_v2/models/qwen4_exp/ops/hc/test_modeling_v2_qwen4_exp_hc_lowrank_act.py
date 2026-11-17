@@ -9,7 +9,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
     qwen4_exp_hc_lowrank_act as op,
 )
 

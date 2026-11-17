@@ -104,6 +104,8 @@ def _set_temperature_only(spec_metadata, temperature_capable: bool,
     ``is_all_greedy_sample`` already holds the group-synchronized value."""
     spec_metadata.temperature_only = _temperature_only(spec_metadata,
                                                        temperature_capable)
+    all_temperature_only = (all_temperature_only
+                            and spec_metadata.shard_temperature_only_graphs)
     spec_metadata.local_all_temperature_only = all_temperature_only
     if spec_metadata.group_all_temperature_only is not None:
         all_temperature_only = spec_metadata.group_all_temperature_only
@@ -672,11 +674,12 @@ class OneModelSamplingParams:
         )
 
 
-def one_model_sampling_mode(requests) -> int:
+def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
     """A batch's sampling mode as attention-DP ranks exchange it: bit 0 when every request is greedy, bit 1
     when every request is greedy or unseeded temperature-only (the two flags of
-    ``_scan_one_model_sampling``)."""
-    greedy = temperature_only = True
+    ``_scan_one_model_sampling``, with its sampling_variants gates)."""
+    greedy = spec_metadata.greedy_graphs
+    temperature_only = spec_metadata.shard_temperature_only_graphs
     for request in requests:
         params = OneModelSamplingParams.of_request(request)
         greedy &= params.is_greedy
@@ -835,6 +838,11 @@ class SpecMetadata:
     # for the current batch (see _temperature_only).
     temperature_only_graphs: bool = False
     temperature_only: bool = False
+    # Whether all-greedy batches have CUDA graphs of their own; without them they take the sampled path.
+    greedy_graphs: bool = True
+    # Whether the vocabulary-shard sampler's temperature-only batches (is_all_temperature_only) have
+    # CUDA graphs of their own; without them they take the advanced path.
+    shard_temperature_only_graphs: bool = True
     # Skip the Philox seed and offset uploads on all-greedy batches (deploy-time;
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.
@@ -917,9 +925,10 @@ class SpecMetadata:
     # step counter -- keeps a seeded request reproducible regardless of which
     # batch it lands in.
     #
-    # The fused kernel and the acceptance kernels honor these per row. The
-    # flashinfer ops behind the non-fused advanced sampling modes read only
-    # element 0.
+    # The fused kernel, the acceptance kernels and the flashinfer ops behind
+    # the non-fused advanced sampling modes all honor these per row. The
+    # flashinfer ops also use the row index as the Philox subsequence, so under
+    # those modes a seeded request's tokens still depend on its batch position.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
     # Count of RNG windows already handed out. Seeded requests are counted per
@@ -1632,7 +1641,8 @@ class SpecMetadata:
         # All-greedy iff EVERY request is greedy -- note a non-greedy request
         # may still enable no filter (e.g. temperature=1.0 with top_k/top_p
         # unset), so this cannot be derived from which filters are in use.
-        self.is_all_greedy_sample = not has_non_greedy_requests
+        # Without greedy graphs, greedy rows take the sampled path and still decode greedily.
+        self.is_all_greedy_sample = not has_non_greedy_requests and self.greedy_graphs
 
         # Apply the group-synchronized value last (semantics: see the
         # ``group_all_greedy_sample`` field comment). Local contract: rescans

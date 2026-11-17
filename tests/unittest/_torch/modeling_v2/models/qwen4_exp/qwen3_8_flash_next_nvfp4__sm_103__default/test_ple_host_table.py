@@ -10,7 +10,7 @@ import mmap
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.weights import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.weights import (  # noqa: E501
     _host_resident_empty,
 )
 from tensorrt_llm.logger import logger

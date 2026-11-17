@@ -182,8 +182,8 @@ The `py_executor.model_engine_creation_seconds` timing includes the total `model
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
 | `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |
-| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
-| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
+| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization, memory cleanup and other work. |
+| `total_model_loading_seconds` | Overall model loading interval, from loading and validating the checkpoint configuration to the end of post-load processing. It includes the named phases above. |
 
 `trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the
 `GET /server_info` response:
@@ -202,6 +202,32 @@ curl http://localhost:8000/server_info
   }
 }
 ```
+
+### Capturing Generation CUDA Graphs in One Pass (Prototype)
+
+By default the model engine captures its generation CUDA graphs in two passes: the warmup-only pass
+runs every graph shape once, so that shared buffers such as the attention workspace reach their
+largest size before any graph bakes in their addresses, and the capture pass then warms up and
+captures each shape. Setting `TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1` on every rank lets the final model
+engine skip the warmup-only pass:
+
+- Each shape still runs one eager warmup forward right before its capture. These forwards keep the
+  warmup MoE communication timeouts, each capture uses the serving ones, and the ranks line up
+  before each graph's first replay.
+- After the last capture, every rank checks that no captured graph's top-level attention or
+  speculative-decoding metadata tensor was reallocated, and the ranks agree on the result. If one
+  was on any rank, every rank discards the graphs and captures them again with both passes, so a
+  fallback costs one extra capture pass and logs a warning.
+- The check does not see other buffers, such as module buffers or tensors nested in the metadata.
+  Such a buffer that a smaller shape regrows after a larger shape's capture goes unnoticed, so
+  compare a model's outputs with and without the switch before relying on it.
+- The switch is ignored, with a warning, for LoRA CUDA graphs, FlashInfer MXFP8 decode GEMMs that
+  need autotuning, `TLLM_CUDA_GRAPH_GEMM_TUNING=1` on a single rank, encoder-decoder models, DWDP
+  and pipeline parallelism, and when not every rank sets it. The KV cache estimation executor
+  always uses both passes, so the KV cache size does not depend on the switch.
+- With the switch, the final model engine's `gen_cuda_graph_capture_seconds` includes each shape's
+  eager warmup forward and, after a fallback, the discarded pass; `gen_cuda_graph_warmup_seconds`
+  then covers only a fallback's warmup-only pass.
 
 ## Unified Cache for Compiled Artifacts
 
