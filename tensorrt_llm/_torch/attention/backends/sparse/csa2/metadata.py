@@ -2933,8 +2933,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     def reset_routing(self) -> None:
         """Begin one packed forward; graph replay recomputes captured producers."""
         self.csa2_indices = {}
-        # Main slots an index-source layer's direct decode exported this forward.
+        # Main slots and decoded main rows an index source's direct decode exported this forward.
         self.csa2_direct_slots = {}
+        self.csa2_direct_rows = {}
         self.csa2_candidates = {}
         self.csa2_candidate_blocks = {}
         self.csa2_candidate_counts = {}
