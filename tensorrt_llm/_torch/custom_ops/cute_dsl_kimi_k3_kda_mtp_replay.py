@@ -21,9 +21,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import warp as cwarp
 from cutlass.cute.runtime import make_ptr
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
 KD = 128
@@ -44,6 +45,24 @@ def _cp_async_shared_global(dst, src, size, cache_mode, *, loc=None, ip=None):
         read_only_args=[dst, src],
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_global_s32_ordered(addr, *, loc=None, ip=None):
+    """An int32 global load that stays in program order with other volatile asm."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -85,6 +104,8 @@ def _kda_kernel(
     BTB: cutlass.Constexpr,
     BTT: cutlass.Constexpr,
     I64: cutlass.Constexpr,
+    PAIRED: cutlass.Constexpr,
+    MULTI_ROW: cutlass.Constexpr,
 ):
     f32 = cutlass.Float32
     bf16 = cutlass.BFloat16
@@ -144,8 +165,20 @@ def _kda_kernel(
         sOpT4 = cute.make_tensor(pOpT, cute.make_layout((KD, NQ, 4), stride=(NACC, 4, 1)))
 
     # ---------------- slot indirection ----------------
-    slot = cute.make_tensor(pIdx + b, cute.make_layout((1,), stride=(1,)))[0]
-    rslot = cute.make_tensor(pRIdx + b, cute.make_layout((1,), stride=(1,)))[0]
+    # The history waits on the replay slot, a second indirection. Interleaved
+    # (state slot, replay slot) pairs arrive in one 8-byte load; otherwise an
+    # ordered load issues the replay slot's here, next to the state slot's,
+    # instead of after the checkpoint staging.
+    if cutlass.const_expr(PAIRED):
+        pair = cute.make_rmem_tensor((2,), cutlass.Int32)
+        cute.autovec_copy(
+            cute.make_tensor((pIdx + 2 * b).align(8), cute.make_layout((2,), stride=(1,))), pair
+        )
+        slot = pair[0]
+        rslot = pair[1]
+    else:
+        slot = cute.make_tensor(pIdx + b, cute.make_layout((1,), stride=(1,)))[0]
+        rslot = _ld_global_s32_ordered((pRIdx + b).toint())
     dummy = cute.make_tensor(pDum + b, cute.make_layout((1,), stride=(1,)))[0]
 
     # Everything that does not need the slot is fetched here, ahead of the
@@ -208,17 +241,25 @@ def _kda_kernel(
     )
     # Histories and their lengths are addressed by replay slot. Pool-backed
     # histories have large replay-slot strides, so the slot offset is 64-bit.
-    rslot64 = cutlass.Int64(rslot)
-    hoff = cutlass.Int64(h * CAP * KD)
-    gHK = cute.make_tensor(
-        pHK + (rslot64 * HKS + hoff), cute.make_layout((CAP, KD), stride=(KD, 1))
-    )
-    gHU = cute.make_tensor(
-        pHU + (rslot64 * HUS + hoff), cute.make_layout((CAP, KD), stride=(KD, 1))
-    )
-    gHG = cute.make_tensor(
-        pHG + (rslot64 * HGS + hoff), cute.make_layout((CAP, KD), stride=(KD, 1))
-    )
+    # FP32 checkpoints with five or more tokens leave this kernel register-bound
+    # (three CTAs per SM). With more than one row, 32-bit history offsets,
+    # valid while every history spans fewer than 2**31 elements, schedule
+    # better there; elsewhere 64-bit offsets do.
+    if cutlass.const_expr(
+        SD == 1 and T >= 5 and MULTI_ROW and (R - 1) * max(HKS, HUS, HGS) + H * CAP * KD < 2**31
+    ):
+        hoff32 = h * (CAP * KD)
+        hk_off = rslot * HKS + hoff32
+        hu_off = rslot * HUS + hoff32
+        hg_off = rslot * HGS + hoff32
+    else:
+        hoff = cutlass.Int64(h * CAP * KD)
+        hk_off = cutlass.Int64(rslot) * HKS + hoff
+        hu_off = cutlass.Int64(rslot) * HUS + hoff
+        hg_off = cutlass.Int64(rslot) * HGS + hoff
+    gHK = cute.make_tensor(pHK + hk_off, cute.make_layout((CAP, KD), stride=(KD, 1)))
+    gHU = cute.make_tensor(pHU + hu_off, cute.make_layout((CAP, KD), stride=(KD, 1)))
+    gHG = cute.make_tensor(pHG + hg_off, cute.make_layout((CAP, KD), stride=(KD, 1)))
     gHL = cute.make_tensor(pHL, cute.make_layout((R,), stride=(HLS,)))
 
     L = gHL[rslot]
@@ -618,6 +659,8 @@ def _launch(
     BTB: cutlass.Constexpr,
     BTT: cutlass.Constexpr,
     I64: cutlass.Constexpr,
+    PAIRED: cutlass.Constexpr,
+    MULTI_ROW: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     # The wide-T FP32 arena fits 4 CTAs/SM but its register demand collapses
@@ -662,6 +705,8 @@ def _launch(
         BTB,
         BTT,
         I64,
+        PAIRED,
+        MULTI_ROW,
     )
     if cutlass.const_expr(SD != 0 and T >= 5):
         kern.launch(grid=(H, B, 1), block=(KD, 1, 1), stream=stream, min_blocks_per_mp=3)
@@ -765,8 +810,16 @@ def kda_mtp_replay(
         raise ValueError("state_indices must be int32 with shape [batch]")
     if replay_indices.shape != (B,) or replay_indices.dtype != torch.int32:
         raise ValueError("replay_indices must be int32 with shape [batch]")
-    if not state_indices.is_contiguous() or not replay_indices.is_contiguous():
-        raise ValueError("state_indices and replay_indices must be contiguous")
+    # Interleaved (state slot, replay slot) pairs: one 8-byte load per row.
+    paired = (
+        state_indices.stride(0) == 2
+        and replay_indices.stride(0) == 2
+        and replay_indices.data_ptr() == state_indices.data_ptr() + 4
+        and state_indices.data_ptr() % 8 == 0
+    )
+    if not paired and not (state_indices.is_contiguous() and replay_indices.is_contiguous()):
+        raise ValueError("state_indices and replay_indices must be contiguous or interleaved pairs")
+    multi_row = B > 1
     if is_dummy.shape != (B,) or is_dummy.dtype != torch.bool:
         raise ValueError("is_dummy must be bool with shape [batch]")
     if output.shape != (B, T, H, KD) or output.dtype != torch.bfloat16:
@@ -842,6 +895,8 @@ def kda_mtp_replay(
         btb,
         btt,
         i64,
+        paired,
+        multi_row,
     )
     fn = _CACHE.get(key)
 
@@ -896,6 +951,8 @@ def kda_mtp_replay(
             btb,
             btt,
             i64,
+            paired,
+            multi_row,
             stream,
         )
         _CACHE[key] = fn
