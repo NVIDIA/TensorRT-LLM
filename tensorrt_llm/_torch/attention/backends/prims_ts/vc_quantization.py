@@ -66,6 +66,8 @@ VC_SMOOTH_STEP_FRACTION = 0.25
 VC_PERM_REFRESH_EVERY = 4
 VC_KMEANS_CLUSTERS = 64
 VC_KMEANS_ITERS = 3
+# Host seed of the k-means rows a cold start begins from.
+VC_KMEANS_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,15 @@ def hadamard_matrix(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_matrix_cached(d, str(device))
 
 
+@functools.lru_cache(maxsize=None)
+def _seed_rows(seq_len: int, num_clusters: int, device: torch.device) -> torch.Tensor:
+    """Rows a cold k-means start takes the centroids from. One host draw from
+    ``VC_KMEANS_SEED`` per sequence length is kept per device. A CUDA graph of
+    the cold start therefore captures no random draw."""
+    generator = torch.Generator().manual_seed(VC_KMEANS_SEED)
+    return torch.randperm(seq_len, generator=generator)[:num_clusters].to(device)
+
+
 @torch.no_grad()
 def vc_token_permutation(
     v: torch.Tensor,
@@ -144,6 +155,9 @@ def vc_token_permutation(
     tiles hold similar values and their tile means remove most of the value
     energy. ``init_centroids`` from a previous call warm-starts the clustering,
     as the paper does when the grouping is refreshed a few denoising steps later.
+    A cold start uses one set of seed rows for every batch element and head.
+    The rows come from ``generator`` or without one from the fixed rows of
+    ``VC_KMEANS_SEED``. No element's grouping depends on the others.
     """
     b, s, h, d = v.shape
     if num_clusters is None:
@@ -164,6 +178,13 @@ def vc_token_permutation(
         num_clusters,
         d,
     )
+    if not warm:
+        if generator is None:
+            seed_rows = _seed_rows(s, num_clusters, v.device)
+        else:
+            seed_rows = torch.randperm(s, device=v.device, generator=generator)[
+                :num_clusters
+            ]
     for bi in range(b):
         for h0 in range(0, h, chunk_h):
             h1 = min(h, h0 + chunk_h)
@@ -173,17 +194,7 @@ def vc_token_permutation(
             if warm:
                 centroids = init_centroids[g0 : g0 + gsz].to(x.dtype)
             else:
-                idx = torch.stack(
-                    [
-                        torch.randperm(s, device=v.device, generator=generator)[
-                            :num_clusters
-                        ]
-                        for _ in range(gsz)
-                    ]
-                )  # [G, k]
-                centroids = torch.gather(
-                    x, 1, idx.unsqueeze(-1).expand(-1, -1, d)
-                )  # [G, k, D]
+                centroids = x[:, seed_rows]  # [G, k, D]
             x_sq = (x * x).sum(-1, keepdim=True)  # [G, S, 1]
             labels = None
             for _ in range(iters):
@@ -392,9 +403,12 @@ class VCAttentionPreprocessor:
     recomputed every ``perm_refresh_every`` steps (k-means warm-started from
     the previous centroids) and kept afterwards, when the plain per-channel
     E4M3 V runs with zero tile means. ``kmeans_clusters`` (``None`` = 64) and
-    ``kmeans_iters`` parametrize the online k-means. Without a denoise step
-    the grouping is computed once per K/V geometry and kept. With ``q`` the
-    preparation is the VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
+    ``kmeans_iters`` parametrize the online k-means. Step 0 or a step behind
+    the last one seen starts a generation cold from the fixed seed rows of
+    ``VC_KMEANS_SEED``. No centroids carry over and the caller's global
+    generator is untouched. Without a denoise step the grouping is computed
+    once per K/V geometry and kept. With ``q`` the preparation is the
+    VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
     """
 
     def __init__(
@@ -417,7 +431,11 @@ class VCAttentionPreprocessor:
         self.perm_refresh_every = perm_refresh_every
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
-        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
+        # A rewind of the denoise step starts a new generation for every grouping.
+        self._generation = 0
+        self._last_step: int | None = None
+        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, last refresh
+        # step, generation.
         self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     @torch.no_grad()
@@ -429,6 +447,7 @@ class VCAttentionPreprocessor:
         *,
         q: torch.Tensor | None = None,
         denoise_step: tuple[int, int] | None = None,
+        mode: str | None = None,
     ) -> VCAttentionOperands:
         """Return the operands of one run for ``[B, S, H, D]`` bf16 K/V, and Q
         under VC-Attention-QK8.
@@ -436,18 +455,39 @@ class VCAttentionPreprocessor:
         ``denoise_step`` is the sampler's ``(step_index, num_steps)``. Kept
         out of torch.compile so the step index and the k-means refresh do not
         recompile the caller per step.
+        ``mode`` names the step kind outright for a CUDA graph runner that
+        replays one graph per kind. ``cold`` regroups from the seed rows,
+        ``warm`` refreshes from the current centroids, ``keep`` demeans on the
+        current grouping and ``plain`` runs without tile means. A mode replaces
+        the step in the bookkeeping. A missing grouping starts cold in every
+        mode.
         """
         key = (k.shape[0], k.shape[1], k.shape[2])
         entry = self._groupings.get(key)
         smooth = True
-        refresh = entry is None
-        if denoise_step is not None:
+        cold = refresh = entry is None
+        if mode is not None:
+            if mode not in ("cold", "warm", "keep", "plain"):
+                raise ValueError("mode must be cold, warm, keep or plain")
+            smooth = mode != "plain"
+            cold = entry is None or mode == "cold"
+            refresh = smooth and (cold or mode == "warm")
+        elif denoise_step is not None:
             step_idx, num_steps = denoise_step
             smooth = step_idx < math.ceil(self.smooth_step_fraction * num_steps)
-            # Step 0 starts a new generation, so it always regroups.
-            refresh = smooth and (
+            # Step 0 starts cold, as does a grouping from before the last step
+            # rewind of a sampler that begins after step 0. Later refreshes
+            # warm-start from this generation's centroids.
+            if self._last_step is not None and step_idx < self._last_step:
+                self._generation += 1
+            self._last_step = step_idx
+            cold = (
                 entry is None
                 or step_idx == 0
+                or entry["generation"] != self._generation
+            )
+            refresh = smooth and (
+                cold
                 or (
                     step_idx % self.perm_refresh_every == 0
                     and entry["step"] != step_idx
@@ -459,14 +499,19 @@ class VCAttentionPreprocessor:
                     v,
                     num_clusters=self.kmeans_clusters,
                     iters=self.kmeans_iters,
-                    init_centroids=None if entry is None else entry["centroids"],
+                    init_centroids=None if cold else entry["centroids"],
                 )
-                step = None if denoise_step is None else denoise_step[0]
+                step = (
+                    None
+                    if mode is not None or denoise_step is None
+                    else denoise_step[0]
+                )
                 if entry is None:
                     entry = {
                         "perm": perm.to(torch.int32),
                         "centroids": centroids,
                         "step": step,
+                        "generation": self._generation,
                     }
                     self._groupings[key] = entry
                 else:
@@ -475,10 +520,11 @@ class VCAttentionPreprocessor:
                     entry["perm"].copy_(perm.to(torch.int32))
                     entry["centroids"].copy_(centroids)
                     entry["step"] = step
+                    entry["generation"] = self._generation
             perm = entry["perm"]
-        elif entry is not None:
+        elif entry is not None and entry["generation"] == self._generation:
             # V-Smooth off (paper Section 3.4). The plain kernel runs on the last
-            # permutation with zero tile means.
+            # permutation of this generation with zero tile means.
             perm = entry["perm"]
         else:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
@@ -491,6 +537,7 @@ class VCAttentionPreprocessor:
 __all__ = [
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
+    "VC_KMEANS_SEED",
     "VC_PERM_REFRESH_EVERY",
     "VC_SMOOTH_STEP_FRACTION",
     "VCAttentionOperands",
