@@ -6,6 +6,8 @@ import contextvars
 import functools
 import gc
 import inspect
+import itertools
+import weakref
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -22,7 +24,7 @@ from typing import (
 
 import torch
 from torch import nn
-from torch.utils._pytree import keystr, tree_flatten_with_path, tree_unflatten
+from torch.utils._pytree import keystr, tree_flatten_with_path, tree_leaves, tree_unflatten
 
 from tensorrt_llm.logger import logger
 
@@ -235,13 +237,23 @@ class CUDAGraphRunner:
         static_kwargs = {
             k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
         }
+        self._capture_static(key, fn, static_args, static_kwargs, self.WARMUP_STEPS)
 
+    def _capture_static(
+        self,
+        key: KeyType,
+        fn: Callable,
+        static_args: List[Any],
+        static_kwargs: Dict[str, Any],
+        warmup_steps: int,
+    ) -> None:
+        """Warm up ``fn`` on the static inputs, capture it, and record the graph."""
         graph = torch.cuda.CUDAGraph()
         # Warmup and capture both see the host-resolved extra keys, so a
         # forward that needs the dense-prefix phase reads it from here instead
         # of syncing a CUDA tensor -- which capture would reject.
         with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
-            for _ in range(self.WARMUP_STEPS):
+            for _ in range(warmup_steps):
                 with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
                     fn(*static_args, **static_kwargs)
                 torch.cuda.synchronize()
@@ -325,51 +337,140 @@ class CUDAGraphRunner:
         self.memory_pool = None
 
 
-class ModelForwardExtraKeys:
-    """Model-registered graph-key functions, evaluated against ``model.forward`` inputs.
+class ModelForwardContext:
+    """Tracks the ``model.forward`` call in progress for the model's block runners.
 
-    ``register_cuda_graph_extra_key_fns`` callbacks are written for a runner that
-    wraps ``model.forward``; ``sparse_attn_phase``, for example, reads its
-    ``timestep`` kwarg. A block runner only sees block inputs. This class stands
-    in for a runner when the model registers its callbacks, records the inputs
-    of the ``model.forward`` call in progress (:meth:`record_inputs`), and hands
-    block runners callbacks that read those inputs (:meth:`block_key_fn`), so
-    block graphs are keyed the same way a whole-forward graph would be.
+    Block runners only see block inputs. :meth:`track` installs forward hooks on
+    the model that tell them two things about the enclosing call:
+
+    - Its inputs. ``register_cuda_graph_extra_key_fns`` callbacks are written for
+      a runner that wraps ``model.forward`` (``sparse_attn_phase``, for example,
+      reads its ``timestep`` kwarg). This object stands in for that runner when
+      the model registers them, and :meth:`block_key_fn` evaluates them against
+      the recorded inputs, so block graphs are keyed like a whole-forward graph.
+    - A call id, so a buffer shared by the blocks of one call is filled once per
+      call (see :class:`BlockGraphBuffers`).
+
+    Hooks rather than a ``model.forward`` wrapper: Cache-DiT replaces
+    ``model.forward`` while enabled and restores the saved attribute as a method
+    when disabled, which would break an instance-level wrapper.
     """
 
     def __init__(self) -> None:
         self.key_fns: Dict[str, ExtraKeyFn] = {}
-        self._inputs: contextvars.ContextVar[Optional[Tuple[Tuple[Any, ...], Dict[str, Any]]]] = (
-            contextvars.ContextVar("model_forward_inputs", default=None)
-        )
+        self._call_ids = itertools.count(1)
+        self._current: contextvars.ContextVar[
+            Optional[Tuple[int, Tuple[Any, ...], Dict[str, Any]]]
+        ] = contextvars.ContextVar("model_forward_call", default=None)
+        self._tokens: List[contextvars.Token] = []
 
     def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
         self.key_fns[name] = fn
 
-    def record_inputs(self, forward: Callable) -> Callable:
-        """Wrap ``forward`` so key callbacks can read the inputs of the current call."""
+    def track(self, model: nn.Module) -> None:
+        """Make the inputs and id of ``model``'s forward call in progress visible."""
+        model.register_forward_pre_hook(self._enter_call, with_kwargs=True)
+        model.register_forward_hook(self._exit_call, always_call=True)
 
-        @functools.wraps(forward)
-        def wrapper(*args, **kwargs):
-            token = self._inputs.set((args, kwargs))
-            try:
-                return forward(*args, **kwargs)
-            finally:
-                self._inputs.reset(token)
+    def _enter_call(self, _module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+        self._tokens.append(self._current.set((next(self._call_ids), args, kwargs)))
 
-        return wrapper
+    def _exit_call(self, _module: nn.Module, _args: Tuple[Any, ...], _output: Any):
+        self._current.reset(self._tokens.pop())
+
+    def call_id(self) -> Optional[int]:
+        """Id of the ``model.forward`` call in progress, or None outside one."""
+        current = self._current.get()
+        return None if current is None else current[0]
 
     def block_key_fn(self, fn: ExtraKeyFn) -> ExtraKeyFn:
         """Adapt ``fn`` for a block runner: ignore block inputs, use ``model.forward`` inputs."""
 
         def key_fn(*_block_args: Any, **_block_kwargs: Any) -> Optional[Hashable]:
-            inputs = self._inputs.get()
-            if inputs is None:
+            current = self._current.get()
+            if current is None:
                 return None
-            args, kwargs = inputs
+            _, args, kwargs = current
             return fn(*args, **kwargs)
 
         return key_fn
+
+
+class BlockGraphBuffers:
+    """Static input buffers shared by the block graphs of one model.
+
+    Most block inputs already sit in a buffer some graph reads, so a private
+    copy per block wastes a device copy per input per replay and the memory:
+
+    - **Chained**: an input that is another block graph's output buffer (the
+      previous block's output) is read in place. A different tensor arriving at
+      that input is copied into it, overwriting the earlier block's output
+      buffer, whose value has been consumed by then.
+    - **Shared**: inputs that the blocks of one ``model.forward`` call receive as
+      the same tensor (``temb``, the rotary embedding) use one buffer, filled by
+      the first block of each call.
+    """
+
+    def __init__(self, forward_context: ModelForwardContext) -> None:
+        self._forward_context = forward_context
+        self._graph_outputs: Dict[int, torch.Tensor] = {}
+        # Capture time: id(source) -> (call id, source, shared buffer).
+        self._shared: Dict[int, Tuple[int, weakref.ref, torch.Tensor]] = {}
+        # id(shared buffer) -> (call id, source) whose contents it holds.
+        self._filled: Dict[int, Tuple[int, weakref.ref]] = {}
+
+    def register_outputs(self, outputs: Any) -> None:
+        for leaf in tree_leaves(outputs):
+            if isinstance(leaf, torch.Tensor):
+                self._graph_outputs[id(leaf)] = leaf
+
+    def graph_output(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        """``tensor`` itself if it is a registered graph output buffer, else None."""
+        found = self._graph_outputs.get(id(tensor))
+        return found if found is tensor else None
+
+    def shared_buffer(self, source: torch.Tensor) -> torch.Tensor:
+        """A buffer holding ``source``; blocks of the same call get the same buffer."""
+        call = self._forward_context.call_id()
+        entry = self._shared.get(id(source))
+        if call is not None and entry is not None and entry[0] == call and entry[1]() is source:
+            return entry[2]
+        buffer = source.clone()
+        if call is not None:
+            self._shared[id(source)] = (call, weakref.ref(source), buffer)
+            self._filled[id(buffer)] = (call, weakref.ref(source))
+        return buffer
+
+    def needs_copy(self, buffer: torch.Tensor, source: torch.Tensor) -> bool:
+        """Whether ``source`` must be copied into shared ``buffer`` for the current call.
+
+        Records the fill when it returns True. Outside a ``model.forward`` call
+        there is no call to fill once per, so it always returns True.
+        """
+        call = self._forward_context.call_id()
+        filled = self._filled.get(id(buffer))
+        if call is not None and filled is not None and filled[0] == call and filled[1]() is source:
+            return False
+        if call is None:
+            self._filled.pop(id(buffer), None)
+        else:
+            self._filled[id(buffer)] = (call, weakref.ref(source))
+        return True
+
+
+# How a block graph's static input buffer relates to the tensor passed in.
+_PRIVATE = "private"  # owned by this graph; copied into on every replay
+_CHAINED = "chained"  # another block graph's output buffer
+_SHARED = "shared"  # shared by the blocks of one model.forward call; filled once per call
+
+
+def _is_same_tensor(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a is b or (
+        a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+    )
 
 
 class BlockCUDAGraphRunner(CUDAGraphRunner):
@@ -388,12 +489,21 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
       graph bakes them in. A call with an unhashable non-tensor value runs
       eagerly.
 
+    With ``buffers``, a graph reads chained and shared inputs in place (see
+    :class:`BlockGraphBuffers`) instead of copying every input on every replay.
+    At capture, the first eager run uses private copies: an input the block
+    writes in place keeps a private buffer, because a chained buffer is also the
+    previous block's output and a shared buffer is read by later blocks.
+
     A transformer has dozens of blocks, so the per-warmup ``gc.collect()`` and
     ``empty_cache()`` of the base runner would run hundreds of times at startup
     for little gain: one block's temporaries are small.
     """
 
     RELEASE_MEMORY_AFTER_WARMUP = False
+    # Read chained and shared inputs in place. False gives every graph private
+    # input buffers, copied on every replay (debugging aid).
+    CHAIN_BUFFERS = True
 
     def __init__(
         self,
@@ -401,13 +511,75 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
         signature: inspect.Signature,
         shared_pool: Optional[SharedGraphPool] = None,
         name: str = "",
+        buffers: Optional[BlockGraphBuffers] = None,
     ):
         super().__init__(config, shared_pool)
         self._signature = signature
         self.name = name
+        self._buffers = buffers
+        self._input_roles: Dict[KeyType, List[str]] = {}
+        # Input copies made by the last replay; for tests and debugging.
+        self.last_replay_copies = 0
 
     def _log_capture(self, key: KeyType) -> None:
         logger.debug(f"{self.name}: capturing graph for key: {key}")
+
+    def capture(
+        self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> None:
+        if not (self.CHAIN_BUFFERS and self._buffers is not None):
+            super().capture(key, fn, args, kwargs)
+            return
+        self._log_capture(key)
+
+        private = [arg.clone() for arg in args]
+        before = [tensor.clone() for tensor in private]
+        with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
+            with discard_nccl_window_tensor_outputs((private, {})):
+                fn(*private)
+        torch.cuda.synchronize()
+
+        static_args: List[torch.Tensor] = []
+        roles: List[str] = []
+        for index, (arg, tensor, original) in enumerate(zip(args, private, before)):
+            if not torch.equal(tensor, original):
+                input_name = key[0][1][index][0]
+                logger.warning(
+                    f"{self.name}: block writes input {input_name} in place; "
+                    "keeping a private CUDA graph buffer for it"
+                )
+                static_args.append(tensor)
+                roles.append(_PRIVATE)
+            elif (output := self._buffers.graph_output(arg)) is not None:
+                static_args.append(output)
+                roles.append(_CHAINED)
+            else:
+                static_args.append(self._buffers.shared_buffer(arg))
+                roles.append(_SHARED)
+        del private, before
+
+        self._capture_static(key, fn, static_args, {}, self.WARMUP_STEPS - 1)
+        self._input_roles[key] = roles
+        self._buffers.register_outputs(self.graph_outputs[key])
+
+    def replay(self, key: KeyType, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+        roles = self._input_roles.get(key)
+        if roles is None:
+            self.last_replay_copies = len(args)
+            return super().replay(key, args, kwargs)
+
+        static_args, _ = self.static_inputs[key]
+        copies = 0
+        for arg, static, role in zip(args, static_args, roles):
+            if _is_same_tensor(arg, static):
+                continue
+            if role == _SHARED and not self._buffers.needs_copy(static, arg):
+                continue
+            static.copy_(arg)
+            copies += 1
+        self.last_replay_copies = copies
+        self.graphs[key].replay()
+        return self.graph_outputs[key]
 
     def wrap(self, fn):
         @functools.wraps(fn)
@@ -474,17 +646,19 @@ def wrap_blocks_with_cuda_graphs(
     names, and references other code already holds (Cache-DiT's block lists)
     are unchanged. Call after ``torch.compile`` has replaced the block lists:
     capturing an eager block that is later compiled would make dynamo trace the
-    graph wrapper. Model-registered extra keys are evaluated against the inputs
-    of the enclosing ``model.forward`` call (see :class:`ModelForwardExtraKeys`).
+    graph wrapper. ``model``'s forward calls are tracked with hooks:
+    model-registered extra keys are evaluated against the call's inputs, and
+    inputs shared by its blocks are copied once per call (see
+    :class:`ModelForwardContext` and :class:`BlockGraphBuffers`).
 
     Returns the runners keyed by ``"{name}.{block_attr}.{index}"``.
     """
-    extra_keys = ModelForwardExtraKeys()
+    forward_context = ModelForwardContext()
     register_extra_keys = getattr(model, "register_cuda_graph_extra_key_fns", None)
     if register_extra_keys is not None:
-        register_extra_keys(extra_keys)
-    if extra_keys.key_fns:
-        model.forward = extra_keys.record_inputs(model.forward)
+        register_extra_keys(forward_context)
+    forward_context.track(model)
+    buffers = BlockGraphBuffers(forward_context)
 
     runners: Dict[str, BlockCUDAGraphRunner] = {}
     for block_attr in block_attrs:
@@ -497,9 +671,10 @@ def wrap_blocks_with_cuda_graphs(
                 inspect.signature(eager_block.forward),
                 shared_pool,
                 name=runner_name,
+                buffers=buffers,
             )
-            for key_name, key_fn in extra_keys.key_fns.items():
-                runner.register_extra_key_fn(key_name, extra_keys.block_key_fn(key_fn))
+            for key_name, key_fn in forward_context.key_fns.items():
+                runner.register_extra_key_fn(key_name, forward_context.block_key_fn(key_fn))
             block.forward = runner.wrap(block.forward)
             runners[runner_name] = runner
     return runners
