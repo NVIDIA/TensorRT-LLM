@@ -22,15 +22,19 @@ Supplements the repository-root and `tests/AGENTS.md` guidance.
 
 ## Waive list
 
-For known failures, add a line to `tests/integration/test_lists/waives.txt` rather
-than removing the test from its YAML list. Use `<test> SKIP (reason)`, with an
-explicit `SKIP` and a tracking bug or brief explanation. A matching waive skips
-the test body.
+For failing tests that should be retained and fixed, add a line to
+`tests/integration/test_lists/waives.txt` and keep their YAML registrations.
+Use `<test> SKIP (reason)`, with an explicit `SKIP` and a tracking bug or brief
+explanation. A matching waive skips the test body. If review instead establishes
+that a test is low-value or redundant and should be retired, remove the test,
+its registrations and obsolete waives together, explaining the retained or
+deliberately relinquished coverage in the PR.
 
 In PR CI, Jenkins normally merges the PR list with the latest target-branch
 list (tip of tree, or TOT), then applies exact-line removals from the PR diff.
-Pytest receives this effective list via `--waives-file`: main TOT waives can
-therefore affect PRs targeting main even when absent from the PR checkout.
+Pytest receives this effective list via `--waives-file`: waives from the PR's
+target branch can therefore affect the run even when absent from the PR
+checkout. This applies to both main and release-branch targets.
 
 ### Writing a waive
 
@@ -158,10 +162,13 @@ later by model workers or remote servers do not establish the detected SM.
   the observed failure, tracking bug or reason, intended cases and platforms,
   and the coverage being disabled. For a batch of waives, check each entry;
   do not copy a broad list just to make CI pass.
-- Use a case/function waive for isolated failures. For widespread unit-test
-  failures, a temporary whole-entry waive can restore CI more efficiently,
-  but also skips unaffected tests in that entry. Track the bugs, prioritize
-  fixes, and remove the waive after verifying them to restore coverage.
+- Choose scope based on the failure and the cost of maintaining the waive.
+  Case/function or platform-specific waives suit isolated failures. Widespread
+  issues can justify a temporary whole-entry, file/class, multi-platform or
+  unprefixed all-platform waive rather than many narrow entries. Use the matching
+  rules above to choose outer versus inner scope; broader waives also disable
+  unaffected coverage, so explain that tradeoff. Track the bugs, prioritize
+  fixes, and narrow or remove waives as fixes are verified.
 - Verify the intended entry/case and platform against the run's effective
   `--waives-file`, including target-branch waives. `--collect-only` helps identify
   names but does not prove skipping: check the run's skip status and reason.

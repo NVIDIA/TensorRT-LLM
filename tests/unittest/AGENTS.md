@@ -21,10 +21,22 @@ Scope: this directory and its descendants. Supplements `../AGENTS.md`.
 
 ## Coverage and execution cost
 
-- For a new case or parameter value, identify the regression its assertions
-  detect and the gap in existing tests. Prefer strengthening an existing test
-  when that protects the behavior without another setup or process. Preserve
-  distinct boundary, error, backend and lifecycle coverage.
+Before adding a unit test or parameterized variant, record in the PR:
+
+- Which regression do its assertions catch?
+- What coverage does it add beyond existing tests?
+- Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
+  check, and why is that frequency worth its setup and execution cost?
+
+Keep focused, reliable regression coverage in pre-merge CI; justify expensive
+or broad coverage there instead of registering every new test automatically.
+Use post-merge or QA for coverage suited to those schedules. Keep one-time
+investigation checks out of recurring CI unless they protect a lasting
+regression. Prune redundant cases while preserving meaningful failure modes.
+
+- Prefer strengthening an existing test when that protects the behavior without
+  another setup or process. Preserve distinct boundary, error, backend and
+  lifecycle coverage.
 - Compare executed inputs, assertions, fixtures, markers and the implementation
   under test before deduplicating. Similar names or bodies can exercise different
   implementations; different names can execute the same check.
@@ -50,3 +62,17 @@ Before changing registrations or process boundaries, follow the
 [test-list instructions](../integration/test_lists/AGENTS.md). An existing parent
 entry may already select a new test; confirm actual selection before adding an
 entry.
+
+## Build test helpers before the test stage
+
+For unit tests in CI that need native helpers or executables, build them in the
+build stage and consume matching artifacts in the test stage. Do not introduce
+ad hoc compiler, CMake, or extension builds in pytest collection, fixtures, or
+test bodies merely to prepare a helper. Reuse the existing build targets and
+artifact flow; for C++ tests, see the repository-root
+[C++ test build guidance](../../AGENTS.md#ci--testing).
+
+Keep intentional runtime compilation when it is part of the behavior under
+test (for example, a JIT kernel), and account for its cost when choosing the CI
+layer. Preserve explicit local/source-build workflows; these are not a reason
+to rebuild ordinary test helpers on every CI test node.

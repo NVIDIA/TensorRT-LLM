@@ -138,11 +138,13 @@ This executes the same tests that run post-merge for this hardware/backend.
 
 ## Waiving tests
 
-For known failures, add `<test> SKIP (reason)` to
-`tests/integration/test_lists/waives.txt` rather than removing the test from its
-YAML list. Include a tracking bug or brief explanation, limit the disabled
-coverage to the affected cases and platforms, and remove the waive after
-verifying the fix.
+For failing tests that should be retained and fixed, add `<test> SKIP (reason)`
+to `tests/integration/test_lists/waives.txt` and keep their YAML registrations.
+Include a tracking bug or brief explanation and remove the waive after verifying
+the fix. Choose a scope appropriate to the failure; widespread issues can justify
+a temporary whole-entry or multi-platform waive. Tests deliberately retired for
+low value or redundant coverage should be removed with their registrations and
+obsolete waives, rather than waived indefinitely.
 
 Before editing a waive, read the dedicated
 [Waive list guidance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/integration/test_lists/AGENTS.md#waive-list)
