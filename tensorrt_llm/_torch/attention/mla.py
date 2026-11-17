@@ -228,7 +228,13 @@ def fp8_block_scaling_bmm_out(
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
 
-def _uses_dense_fp4_mla(mla: Any) -> bool:
+def _uses_dense_fp4_mla(mla: "MLA") -> bool:
+    """Whether the layer runs dense FP4 MLA: an NVFP4 KV cache, no sparse attention.
+
+    The layer's generation attention op is built with the same sparse
+    parameters and quantization config, so it takes its FP4 MLA branch
+    (``uses_fp4_mla_attention``) exactly when this holds.
+    """
     return bool(
         mla.sparse_params is None
         and mla.mqa.support_fp4_kv_cache()
@@ -238,10 +244,16 @@ def _uses_dense_fp4_mla(mla: Any) -> bool:
 
 
 def _expand_mla_context_kv(
-    mla: Any,
+    mla: "MLA",
     compressed_kv: torch.Tensor,
     k_pe: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Up-project compressed KV to per-head K and V for context attention.
+
+    Returns K as [tokens, heads * qk_head_dim], the projected K without RoPE
+    followed by ``k_pe`` repeated for every head, and V as
+    [tokens, heads * v_head_dim].
+    """
     kv = mla._project_context_kv(compressed_kv)
     k_nope, v = kv.split(
         [
@@ -260,7 +272,7 @@ def _expand_mla_context_kv(
 
 
 def _run_mla_chunked_prefill_partitions(
-    mla: Any,
+    mla: "MLA",
     trtllm_attention: "TrtllmAttention",
     q: torch.Tensor,
     compressed_kv: torch.Tensor,
@@ -274,7 +286,17 @@ def _run_mla_chunked_prefill_partitions(
     ],
     include_helix_plan: bool = False,
 ) -> torch.Tensor:
+    """Attend the current chunk to its cached prefix, one KV partition at a time.
+
+    The cached prefix is read back in ``chunked_loop_num`` partitions, each
+    attended without a mask, and the current chunk's own KV comes last under
+    the causal mask. ``run_partition(k, v, forward_args, loop_idx,
+    total_kv_tokens)`` runs one of them, with ``loop_idx`` None for the current
+    chunk, and returns its output. Every partition's output and softmax
+    statistics are merged into ``output``, which is returned.
+    """
     chunked_loop_num = attn_metadata.chunked_loop_num
+    # Per query token and head: the softmax statistics the merge combines.
     mla.softmax_stats_tensor = torch.empty(
         (attn_metadata.num_ctx_tokens, mla.num_context_heads, 2),
         dtype=torch.float,
@@ -290,6 +312,8 @@ def _run_mla_chunked_prefill_partitions(
     def make_partition_forward_args(
         attention_mask: PredefinedAttentionMask,
     ) -> AttentionForwardArgs:
+        # latent_cache must be None to differentiate from the normal context
+        # phase, so the attention op neither applies RoPE nor appends KV.
         return AttentionForwardArgs(
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,
@@ -323,6 +347,7 @@ def _run_mla_chunked_prefill_partitions(
             **load_kwargs
         )
         chunked_k, chunked_v = _expand_mla_context_kv(mla, chunked_compressed_kv, chunked_k_pe)
+        # Release the activation memory before the attention call.
         chunked_compressed_kv = None
         chunked_k_pe = None
 
@@ -344,6 +369,7 @@ def _run_mla_chunked_prefill_partitions(
             attn_metadata,
         )
 
+    # Last, the KV of the current chunk itself.
     current_k, current_v = _expand_mla_context_kv(mla, compressed_kv, current_k_pe)
     current_total_kv_tokens = int(
         attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
@@ -1575,6 +1601,8 @@ class MLA(nn.Module):
             loop_idx: Optional[int],
             total_kv_tokens: int,
         ) -> torch.Tensor:
+            # The attention op reads the partition's KV lengths from the
+            # metadata: the current chunk's own lengths, or the cached chunk's.
             if loop_idx is None:
                 attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
                 attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
@@ -1582,8 +1610,6 @@ class MLA(nn.Module):
                 attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
                 attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
             attn_metadata.host_total_kv_lens[0] = total_kv_tokens
-            # latent_cache must be None to differentiate from normal context phase,
-            # so that we can skip applying RoPE and appending KV cache inside attention op
             return self.mha.forward(
                 q,
                 partition_k,
