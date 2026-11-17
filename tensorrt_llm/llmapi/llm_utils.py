@@ -537,7 +537,6 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
-    fields_set = set(llm_args.model_fields_set)
 
     # A user's ``moe_config.tactic`` already names the implementation, so a
     # model's preferred ``moe_config.backend`` yields to it instead of being
@@ -586,13 +585,7 @@ def apply_model_defaults_to_llm_args(
                     applied[key] = default_value
         return applied
 
-    applied = _compute_applied(model_defaults_dict, user_overrides)
-    # Assigning every field above marks each one as set. Keep only the fields
-    # the user set and the ones the model defaults applied, so checks of
-    # whether a deployment set a field (``model_fields_set``) still hold.
-    object.__setattr__(llm_args, "__pydantic_fields_set__",
-                       fields_set | applied.keys())
-    return applied
+    return _compute_applied(model_defaults_dict, user_overrides)
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
