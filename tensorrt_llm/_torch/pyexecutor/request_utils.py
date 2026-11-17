@@ -104,6 +104,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[list[int]] = None,
+    mark_admitted: bool = True,
     router: Optional["ADPRouter"] = None,
 ) -> list["RequestQueueItem"]:
     """Get requests from the waiting queue.
@@ -114,6 +115,8 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        mark_admitted: Report the returned requests to ``WaitingQueue.mark_admitted``;
+            False when the caller may still put some of them back.
         router: ADP router consulted for each request's admission rank.
 
     Returns:
@@ -159,7 +162,8 @@ def get_from_waiting_queue(
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
     waiting_queue.prepend_requests(pending_requests)
-    waiting_queue.mark_admitted(items)
+    if mark_admitted:
+        waiting_queue.mark_admitted(items)
 
     return items
 
@@ -275,8 +279,9 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
+        input_token_ids = req_item.request.get_input_token_ids_array()
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.get_input_token_ids_array(), cp_rank, cp_size, tokens_per_block
+            input_token_ids, cp_rank, cp_size, tokens_per_block
         )
 
         req = executor_request_to_llm_request(
@@ -289,6 +294,12 @@ def merge_helix_requests(
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        # The prompt tokens a multi-token stop word ending at the first
+        # generated token can span, which this rank's slice may not hold.
+        tail_len = max((len(word) - 1 for word in req.py_stop_words_list or ()), default=0)
+        prompt_tail = input_token_ids[max(0, len(input_token_ids) - tail_len) :].tolist()
+        for request in (req, *req.child_requests):
+            request.py_helix_prompt_tail = prompt_tail
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)
@@ -409,8 +420,9 @@ class RequestBroadcaster:
         self.hang_detector = hang_detector
         self.send_requests_handler = None
         # sync_clock: rank 0's time.monotonic() and ``aux`` (>= 0) ride along
-        # with the request count, read on every rank as ``rank0_now`` and
-        # ``rank0_aux``. Must be the same on all ranks: it changes the length.
+        # with the request count (or in the single-round header), read on
+        # every rank as ``rank0_now`` and ``rank0_aux``. Must be the same on
+        # all ranks: it changes the length.
         self.sync_clock = sync_clock
         self.rank0_now: Optional[float] = None
         self.aux: Optional[float] = None
@@ -469,13 +481,12 @@ class RequestBroadcaster:
 
         Rank-consistent: ``prefer_cpu`` is so by the caller's contract, the
         rest is static topology / transport state shared by every rank. The
-        PP route keeps its probe + send/recv chain, the idle path
-        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism,
-        and ``sync_clock`` keeps the probe that carries rank 0's clock.
+        PP route keeps its probe + send/recv chain and the idle path
+        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism.
+        ``sync_clock`` rides in the envelope (``_broadcast_single_round``).
         """
         return (
             not prefer_cpu
-            and not self.sync_clock
             and self.dist.world_size > 1
             and not self.dist.has_pp
             and bool(getattr(self.dist, "supports_single_round_broadcast", False))
@@ -494,12 +505,31 @@ class RequestBroadcaster:
         one call ahead of the slowest peer, no further); non-root ranks wait
         here for rank 0 exactly as they did in the probe. The hang-detector
         pause covers both the non-root wait and the root's bounded fence.
+
+        With ``sync_clock`` rank 0's clock and aux ride in a fixed-size header
+        next to the size word (``broadcast_or_none_with_header``), so the
+        collective counts stay one (empty) and two (requests).
         """
         payloads = None
-        if self.dist.rank == 0 and new_requests:
+        is_root = self.dist.rank == 0
+        if is_root and new_requests:
             payloads = new_requests
-        with self.hang_detector.pause():
-            received = self.dist.broadcast_or_none(payloads, root=0)
+        if self.sync_clock:
+            # Same microsecond encoding as the probe (_broadcast_request_count), so the clock never steps back
+            # when consecutive iterations take different routes.
+            header = [0, -1]
+            if is_root:
+                aux_us = int(self.aux * 1e6) if self.aux is not None else -1
+                header = [int(time.monotonic() * 1e6), aux_us]
+            with self.hang_detector.pause():
+                (now_us, aux_us), received = self.dist.broadcast_or_none_with_header(
+                    payloads, header, root=0
+                )
+            self.rank0_now = now_us / 1e6
+            self.rank0_aux = None if aux_us < 0 else aux_us / 1e6
+        else:
+            with self.hang_detector.pause():
+                received = self.dist.broadcast_or_none(payloads, root=0)
         if received is None:
             return []
         if self.dist.rank == 0:

@@ -26,13 +26,13 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
     qsa_paged_index_scores as _entry,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (  # noqa: E501
     qsa_paged_index_scores as op,
 )
-from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401

@@ -154,7 +154,7 @@ def check_routed_part(op, state, m: int, seed: int) -> None:
     """Exact, independent of the reference: the engine's routing (its route_dbg record: ids, then the bf16 weights'
     fp32 bits) is the reference routing bit for bit, and its routed part is the stock TRTLLM-Gen MoE's output on that
     routing bit for bit -- the claim the engines are built on."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
         moe_route,
     )
 
@@ -193,7 +193,7 @@ def check_full_output(
 ) -> None:
     """Exact: the engine's bf16(shared + routed) is the stock MoE block's shared_output.add_(routed_output) bit for bit
     (stock TRTLLM-Gen routed part on the engine's routing, stock MXFP8 shared expert)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
         moe_route,
     )
 

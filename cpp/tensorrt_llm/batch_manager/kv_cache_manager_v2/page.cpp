@@ -23,8 +23,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 
-#include <unordered_set>
-
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -234,7 +232,7 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, Page const* retentionSource)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
@@ -257,7 +255,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     }
     else
     {
-        committed->inheritRetention(*this);
+        committed->inheritRetention(retentionSource != nullptr ? *retentionSource : *this);
     }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
@@ -527,7 +525,7 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     // Every page is locked at the hot level, whatever its pool group is made of. A sparse
     // life cycle's hot pages are host memory, but that is a property of the allocation
     // rather than of the level, so locking does not see it.
-    std::unordered_set<Page*> seen;
+    uint64_t const visit = storeMgr->nextVisitStamp();
     std::vector<SharedPtr<Page>> pages;
     pages.reserve(targets.size());
     for (auto const& target : targets)
@@ -535,8 +533,11 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         auto const& page = target.page;
         if (page->status() == PageStatus::LOCKED && page->cacheLevel != kHotLevel)
             throw LogicError("Cannot migrate a page locked by another owner");
-        if (seen.insert(page.get()).second)
+        if (page->visitStamp != visit)
+        {
+            page->visitStamp = visit;
             pages.push_back(page);
+        }
     }
 
     // Protect every destination group while any group is allocating. On failure,

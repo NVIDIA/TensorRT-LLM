@@ -25,7 +25,7 @@ small set of introspection helpers (``actual_backend`` / ``scheduler_kind``
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
 
@@ -168,7 +168,11 @@ def _plain_activation(kind: ActivationType) -> MoEActivation:
     currently allows, so a third one added there needs no change here.
     """
     payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
-    return SimpleActivation(kind) if payload is SimpleActivation else payload()
+    return (
+        SimpleActivation(kind)
+        if payload is SimpleActivation
+        else cast(Callable[[], MoEActivation], payload)()
+    )
 
 
 def _create_moe_for_benchmark(**kwargs):

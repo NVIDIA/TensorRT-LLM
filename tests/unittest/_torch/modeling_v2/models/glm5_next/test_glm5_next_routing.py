@@ -6,8 +6,8 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     MTPDecodingConfig,

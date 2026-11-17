@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.bf16_to_fp32 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.bf16_to_fp32 import (  # noqa: E501
     bf16_to_fp32 as op,
 )
 
