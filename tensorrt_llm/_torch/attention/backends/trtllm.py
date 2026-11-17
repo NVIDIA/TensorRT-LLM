@@ -779,6 +779,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        # The FP4 MLA packed decode launches its split budget only when True.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.packed_split = packed_split
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        state = self.fp4_mla_state
+        return None if state is None else state.packed_split
+
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
         # buffers below must be rebuilt before the next MLA layer reads them.
@@ -1736,6 +1758,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1745,15 +1782,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1861,10 +1902,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1916,7 +1955,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,
@@ -2166,6 +2206,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
+    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
+    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
+    context_fmha_head_dim_per_stage_kv: int = 0
+    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
+    # zero); every row's K / V is still written.
+    context_last_rows_only: bool = False
 
     # Layer state the native attention op reads through FmhaParams.attn. The
     # generator (scripts/generate_fmha_params.py) collects these annotations;
@@ -2210,6 +2256,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_correction_threshold: float = 0.0,
         gqa_decode: Optional["GqaDecodeSetup"] = None,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -2239,6 +2287,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).
+            context_fmha_head_dim_per_stage_kv (int): See the class attribute.
+            context_last_rows_only (bool): See the class attribute.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -2312,6 +2362,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
+        if context_fmha_head_dim_per_stage_kv < 0 or (
+                context_fmha_head_dim_per_stage_kv > 0
+                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
+            raise ValueError(
+                f"context_fmha_head_dim_per_stage_kv="
+                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
+                f"head_dim={head_dim}.")
+        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
+        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None

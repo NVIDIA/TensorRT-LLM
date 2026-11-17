@@ -98,7 +98,7 @@ def _inputs(tokens: int, pad_rows: int, pool_layers: int, seed: int) -> dict:
     )  # fmt: skip
 
 
-def _outputs(tokens: int):
+def _outputs(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     """`(q_fp8, weights)` filled with a pattern no launch writes."""
     q8 = torch.empty(tokens, HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device="cuda")
     q8.view(torch.uint8).fill_(0x5A)

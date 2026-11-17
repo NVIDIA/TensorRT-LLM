@@ -44,6 +44,7 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_setup import (
     apply_torch_compile,
     compile_model,
+    configure_autotuner_nvmmh,
     create_model_loader,
     init_process_setup,
     prepare_loaded_model,
@@ -176,6 +177,7 @@ class ModelEngine:
                 "encode_only models run through EncoderExecutor, which does not use ModelEngine."
             )
         init_process_setup(mapping, dist)
+        configure_autotuner_nvmmh(llm_args)
 
         (
             max_beam_width,
@@ -613,6 +615,11 @@ class ModelEngine:
             mm_item_scheduler=self._mm_item_scheduler,
             **runner_kwargs,
         )
+
+    @property
+    def uses_torch_compile(self) -> bool:
+        """Whether the model forward runs under torch.compile."""
+        return self._torch_compile_backend is not None
 
     @property
     def attn_metadata(self) -> AttentionMetadata | None:

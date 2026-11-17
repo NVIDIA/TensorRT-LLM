@@ -489,6 +489,9 @@ public:
         return mCommittedTokens;
     }
 
+    // Return the existing key at a complete committed block boundary.
+    std::optional<BlockKey> committedPrefixKey(int numTokens) const;
+
     ReuseScope const& reuseScope() const noexcept
     {
         return mReuseScope;

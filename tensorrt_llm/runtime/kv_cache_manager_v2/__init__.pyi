@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 
@@ -80,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -216,6 +224,7 @@ class ReusedBlocksByLevel:
     full: list[int]
     partial: list[int]
 
+@dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -282,6 +291,26 @@ class DiskCacheTierConfig:
     keep_copy_after_restore: bool = False
     write_through: bool = False
     protected_copy_fraction: float = 1.0
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = ...  # how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = ...
+    expected_donors: int = 0  # 0: unknown
+    pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -408,7 +437,7 @@ class SparseCacheConfig:
     Setting both on one buffer is rejected.
     """
 
-    selection_id: int | None
+    selection_id: int | None = None
     """Layers whose selection is one selection, named so they can say so.
 
     A model running one indexer across several layers hands them all the same units every
@@ -1901,6 +1930,10 @@ class KVCacheManager:
     def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
+    @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote level failed on this rank (a transfer, or its donor went away). Lock-free."""
+        ...
     @property
     def tokens_per_block(self) -> int: ...
     @property

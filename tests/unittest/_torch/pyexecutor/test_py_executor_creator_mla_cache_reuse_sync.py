@@ -155,6 +155,9 @@ class _DummyKvCacheCreator:
             _stream=self._execution_stream,
         )
 
+    def close_remote_donor(self, error=None):
+        """No remote donation is started (no-op)."""
+
 
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""
@@ -552,7 +555,7 @@ def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill", "supported"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+    [(True, True, True), (True, False, False), (False, True, True), (False, False, True)],
 )
 def test_fp4_mla_block_reuse_blocker(
     monkeypatch: pytest.MonkeyPatch,
@@ -567,9 +570,7 @@ def test_fp4_mla_block_reuse_blocker(
     )
 
     assert (blocker is None) == supported
-    if not is_hybrid:
-        assert "hybrid linear-attention" in blocker
-    elif not enable_chunked_prefill:
+    if not supported:
         assert "enable_chunked_prefill" in blocker
 
 
@@ -595,8 +596,8 @@ def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_v
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill"),
-    [(True, False), (False, True), (False, False)],
-    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
+    [(True, False)],
+    ids=["hybrid_without_chunked_prefill"],
 )
 def test_fp4_mla_disables_unsupported_block_reuse(
     monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool

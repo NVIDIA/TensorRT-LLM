@@ -4,6 +4,7 @@
 import atexit
 import dataclasses
 import datetime
+import json
 import math
 import os
 import sys
@@ -74,8 +75,8 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..models.modeling_multimodal_mixin import \
-    maybe_prefetch_mm_encoder_for_next_iter
+from ..models.modeling_multimodal_mixin import (
+    MultimodalModelMixin, maybe_prefetch_mm_encoder_for_next_iter)
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -95,6 +96,7 @@ from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
+from .engine.model_setup import DYNAMO_RECOMPILE_LIMIT
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
@@ -652,6 +654,8 @@ class _ExecutorExecutionConfig:
     enable_kv_pool_rebalance: bool
     # cache_transceiver_config.max_tokens_in_buffer was set by the user.
     transfer_budget_is_explicit: bool = False
+    # kv_cache_config.defer_generation_only_release.
+    defer_generation_only_release: bool = False
 
 
 class PyExecutor:
@@ -664,6 +668,16 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Whether the waiting queue's wait cap needs rank 0's clock on every rank.
+    _waiting_queue_needs_clock = False
+    # Whether the ADP rank-state allgather carries rank 0's pending-request
+    # count for the busy-path fetch; set at construction.
+    _fetch_hint_enabled = False
+    # Whether the overlap loop defers the KV cache close of finished
+    # generation-only requests (kv_cache_config.defer_generation_only_release).
+    _defer_generation_only_release = False
+    # Whether the model forward runs under torch.compile; read once at construction.
+    _uses_torch_compile = False
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
     # Context chunks given back since the last stats record, by cause, and their tokens.
@@ -742,6 +756,7 @@ class PyExecutor:
         enable_non_overlap_adp_forward_intent: bool = False,
         gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
+        defer_generation_only_release: bool = False,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
             raise ValueError(
@@ -796,6 +811,7 @@ class PyExecutor:
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
+        self._uses_torch_compile = model_engine.uses_torch_compile
         hooks = runtime_hooks_of(model_engine.model)
         self._execution_stream_loop_armed = hooks.loop_on_execution_stream
         self._executor_events = hooks.executor_events
@@ -823,6 +839,7 @@ class PyExecutor:
             hang_detection_timeout=hang_detection_timeout,
             enable_kv_pool_rebalance=enable_kv_pool_rebalance,
             transfer_budget_is_explicit=transfer_budget_is_explicit,
+            defer_generation_only_release=defer_generation_only_release,
         )
         self._resources_released = False
         self._closed = False
@@ -979,8 +996,12 @@ class PyExecutor:
         self._late_compile_detect = False
         if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
             self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
+        timing_side_stream = False
+        if model_hooks.perf_metrics_timing_side_stream:
+            timing_side_stream = True
         self.perf_manager = PerfMetricsManager(
-            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
+            enabled=self.llm_args.return_perf_metrics,
+            timing_side_stream=timing_side_stream)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -1077,6 +1098,9 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        self._defer_generation_only_release = (
+            self._is_kv_manager_v2
+            and self._execution_config.defer_generation_only_release)
         # The KV cache manager takes Mamba snapshots inside the forward and
         # finishes them on the execution stream right after it (_forward_step).
         self._finish_inforward_snapshots = (
@@ -1369,6 +1393,9 @@ class PyExecutor:
             from tensorrt_llm._torch.late_compile import mark_server_ready
             mark_server_ready()
 
+        # Install only after warmup/capture so dummy encoder work is excluded.
+        self._setup_encoder_perf_metrics()
+
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
@@ -1417,6 +1444,13 @@ class PyExecutor:
                                               torch.cuda.Event)
 
         self._gen_admission = GenAdmissionConfig.from_env()
+        waiting_queue_max_wait_s = None
+        if waiting_queue_policy == WaitingQueuePolicy.PRIORITY:
+            waiting_queue_max_wait_s = (
+                self.llm_args.scheduler_config.waiting_queue_max_wait_s)
+        # The wait cap ages requests by rank 0's arrival stamps on rank 0's
+        # clock, so that every rank pops the same order.
+        self._waiting_queue_needs_clock = waiting_queue_max_wait_s is not None
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -1425,7 +1459,8 @@ class PyExecutor:
             max_batch_size=max_batch_size,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            stamp_admission_times=self._gen_admission.enabled,
+            stamp_admission_times=self._gen_admission.enabled
+            or self._waiting_queue_needs_clock,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # _sample_async is called twice before the first call to update_requests:
@@ -1453,7 +1488,8 @@ class PyExecutor:
             self.request_broadcaster = RequestBroadcaster(
                 self.dist,
                 self.hang_detector,
-                sync_clock=self._gen_admission.needs_clock,
+                sync_clock=self._gen_admission.needs_clock
+                or self._waiting_queue_needs_clock,
                 prompts_to_owners=(self.enable_attention_dp
                                    and not self._disable_mpi
                                    and self.dist.tp_size > 1
@@ -1463,7 +1499,8 @@ class PyExecutor:
             self.request_broadcaster = RequestBroadcaster(
                 self.dist,
                 self.hang_detector,
-                sync_clock=self._gen_admission.needs_clock)
+                sync_clock=self._gen_admission.needs_clock
+                or self._waiting_queue_needs_clock)
         # With attention DP, the per-iteration rank-state allgather can carry
         # rank 0's pending-request count, letting the busy-path fetch skip the
         # request-count probe broadcast (one host collective per iteration) or
@@ -1474,11 +1511,13 @@ class PyExecutor:
         # rank 0's clock, so it must not be skipped.
         self._fetch_hint_enabled = (self.enable_attention_dp and
                                     self.dist.tp_size == self.dist.world_size
-                                    and not self._gen_admission.needs_clock)
+                                    and not self.request_broadcaster.sync_clock)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy, gen_admission=self._gen_admission)
+            waiting_queue_policy,
+            gen_admission=self._gen_admission,
+            max_wait_s=waiting_queue_max_wait_s)
         self._first_token_timer = None
         if self.dist.rank == 0 and isinstance(self.waiting_queue,
                                               GenAdmissionWaitingQueue):
@@ -1685,6 +1724,15 @@ class PyExecutor:
         except BaseException:
             self.shutdown()
             raise
+
+    def _setup_encoder_perf_metrics(self) -> None:
+        """Install optional encoder timing on the module that owns encoder methods."""
+        # torch.compile delegates encoder methods with self bound to _orig_mod.
+        model = getattr(self.model_engine.model, "_orig_mod",
+                        self.model_engine.model)
+        if (self.enable_iter_perf_stats and self.dist.rank == 0
+                and isinstance(model, MultimodalModelMixin)):
+            model._encoder_forward_context = self.perf_manager.record_encoder_forward
 
     @property
     def is_generation_model(self) -> bool:
@@ -1937,7 +1985,8 @@ class PyExecutor:
                 "another tier have their GPU slot reassigned, which would "
                 "invalidate the addresses registered with the connector. Set "
                 "KvCacheConfig.host_cache_size=0 and "
-                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
+                "KvCacheConfig.disk_cache_size=0, and leave "
+                "remote_cache_config.level unset, to run GPU-only.")
 
     def _release_transfer(self, request: LlmRequest) -> None:
         """Release one transfer claim held by the KV connector or transceiver.
@@ -2016,10 +2065,20 @@ class PyExecutor:
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
+    def _apply_dynamo_recompile_limit(self) -> None:
+        """Apply the compiled model's Dynamo recompile limit on this thread.
+
+        torch keeps each Dynamo config value per thread, so the limit set
+        while the engine was built does not reach the worker thread.
+        """
+        if self._uses_torch_compile:
+            torch._dynamo.config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
+
     def _event_loop_wrapper(self) -> None:
         crashed = False
         self._event_loop_completed = False
         try:
+            self._apply_dynamo_recompile_limit()
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(
@@ -3703,6 +3762,8 @@ class PyExecutor:
 
         scheduler_mode = self._stats_scheduler_mode()
 
+        mm_encoder_stats = self._take_mm_encoder_stats()
+
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
@@ -3720,6 +3781,8 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            if mm_encoder_stats is not None:
+                local_dict["multimodalEncoderStats"] = mm_encoder_stats
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -3739,13 +3802,15 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] mm_encoder_stats: optional completed rank-0 encoder observations
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, None, host_step_time_ms,
-                 prev_device_step_time_ms, scheduler_mode, gpu_forward_time_ms))
+                 prev_device_step_time_ms, scheduler_mode, gpu_forward_time_ms,
+                 mm_encoder_stats))
 
     def _stats_scheduler_mode(self) -> str:
         """Per-record indicator so consumers can interpret iterLatencyMS without
@@ -3756,8 +3821,28 @@ class PyExecutor:
                            or self.dist.pp_size > 1)
         return "overlap" if is_overlap_like else "non_overlap"
 
+    def _take_mm_encoder_stats(self) -> Optional[dict]:
+        """Completed rank-0 encoder calls, including side-stream prefetch.
+
+        They can finish after the iteration that launched them, so each call
+        is taken once, for the next exported row.
+        """
+        encoder_gpu_times_ms = self.perf_manager.take_encoder_gpu_times_ms()
+        return {
+            "gpuTimesMS": encoder_gpu_times_ms
+        } if encoder_gpu_times_ms else None
+
     def _append_stats_rows(self, rows: List[str]) -> None:
-        """Append pre-serialized /metrics rows to the export buffer."""
+        """Append pre-serialized /metrics rows to the export buffer.
+
+        The rows are rank 0's attention-DP fanout in rank order. Rank 0's
+        encoder calls go on its own row only, not on every rank's row.
+        """
+        mm_encoder_stats = self._take_mm_encoder_stats()
+        if mm_encoder_stats is not None:
+            rank0_row = json.loads(rows[0])
+            rank0_row["multimodalEncoderStats"] = mm_encoder_stats
+            rows = [json.dumps(rank0_row), *rows[1:]]
         with self.stats_lock:
             for row in rows:
                 if (not _stats_buffer_is_unbounded(self.max_stats_len)
@@ -3810,9 +3895,14 @@ class PyExecutor:
         self._pending_num_completed_requests = 0
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
-        # forward time. The FPM GPU value is read from CUDA events without
-        # synchronizing here; the normal sampler/update path has already
-        # established the required completion point for processed batches.
+        # forward time. Events on the current stream are only queried (not
+        # complete -> no value); every caller runs after _update_requests,
+        # whose sampler synchronize (TorchSampler) follows this forward on that
+        # stream. With the timing side stream (perf_metrics_timing_side_stream)
+        # try_compute_gpu_elapsed_time_ms synchronizes on the end event, which
+        # that stream records once this batch's forward has finished: the host
+        # can wait for that point (already passed after a sampler synchronize),
+        # never for later work.
         host_step_time_ms = self._latest_host_step_time_ms
         prev_device_step_time_ms = self._latest_prev_device_step_time_ms
         gpu_forward_time_ms = self.perf_manager.try_compute_gpu_elapsed_time_ms(
@@ -5736,8 +5826,8 @@ class PyExecutor:
             admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(scheduler_fitting_disagg_gen_init_requests))
             # receive_gen_init enters the gen transfer status collective only
-            # on ranks that admitted something, so every CP rank must start
-            # the same receives.
+            # on ranks that admitted something. All CP peers, and TP peers
+            # without attention DP, must start the same receives.
             admitted_disagg_gen_init_requests = (
                 self.disagg.align_gen_admission_across_cp(
                     admitted_disagg_gen_init_requests))
@@ -7519,6 +7609,9 @@ class PyExecutor:
         underneath whatever holds them.
         """
         mgr = self.kv_cache_manager
+        if self._defer_generation_only_release:
+            # adjust() moves pages; a deferred close must not hold any.
+            mgr.flush_deferred_closes()
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
@@ -7772,6 +7865,12 @@ class PyExecutor:
         CUASSERT(cudart.cudaSetDevice(self.device_id))
         if self._executor_events is not None:
             self._executor_events.before_overlap_loop()
+        # A finished generation-only request's KV cache close (a host-side page
+        # release) runs after the next forward is queued instead of before the
+        # next batch's preparation.
+        defer_kv_close = self._defer_generation_only_release
+        if defer_kv_close:
+            self.kv_cache_manager.enable_deferred_close(True)
         with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
                 self.hang_detector:
             iter_start_time = time.time()
@@ -7843,6 +7942,9 @@ class PyExecutor:
                         self._pause_recompute_paused_requests(scheduled_batch)
                     self._finalize_adp_dummy_allocation(False)
                     self._flush_pending_transfer_responses()
+                    if defer_kv_close:
+                        # The flush after the forward is skipped this round.
+                        self.kv_cache_manager.flush_deferred_closes()
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
@@ -7982,6 +8084,10 @@ class PyExecutor:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
 
+                if defer_kv_close:
+                    # Closes left by the previous iteration's terminations.
+                    self.kv_cache_manager.flush_deferred_closes()
+
                 # Staged responses go out now, so the response threads work
                 # while this thread waits on the sampler event below.
                 self._flush_staged_responses()
@@ -8105,6 +8211,11 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                if defer_kv_close and not self.active_requests:
+                    # Idle: no next forward to overlap with, so close now and
+                    # let the KV cache events below publish it.
+                    self.kv_cache_manager.flush_deferred_closes()
+
                 # KV-cache event flushing performs an attention-DP allgather.
                 # Keep it outside the rank-divergent previous-batch branch so
                 # every rank enters the collective in the same order.
@@ -8161,6 +8272,11 @@ class PyExecutor:
 
                 if not self.enable_attention_dp:
                     self._kv_connector_terminate_requests()
+
+                if defer_kv_close and not self.active_requests:
+                    # Requests terminated since the flush above: do not hold
+                    # their pages while the next fetch may block.
+                    self.kv_cache_manager.flush_deferred_closes()
 
                 if not can_queue:
                     self.disagg.pace_idle()
@@ -8656,10 +8772,17 @@ class PyExecutor:
         # consumed: no further item will arrive to wake a blocking get(), so
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
-        # on `shutdown_event`.
+        # on `shutdown_event`. A rank with a pending cancellation that the
+        # loop-head vote clears is not idle either: the vote calls a TP+CP
+        # collective on every rank, and a blocking fetch here would hold it.
+        # Without a transceiver there is no vote to run: a stale ID then waits
+        # for the next batch's post-sampler cleanup instead of busy-polling.
         pending_retirement = self.disagg.has_retiring_gen_receives
+        pending_cancel_holds_vote = (
+            self.canceled_req_ids and self.kv_cache_transceiver is not None
+            and self.disagg.requires_gen_cancellation_consensus)
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
+                and not pending_cancel_holds_vote and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
                 and not pending_retirement)
         # Only trust the hint on the busy path; `idle`, `control_pending` and
@@ -8755,6 +8878,8 @@ class PyExecutor:
                                       self.request_broadcaster.rank0_aux)
             else:
                 waiting_queue.set_now(time.monotonic())
+        elif self._waiting_queue_needs_clock:
+            waiting_queue.set_now(self.request_broadcaster.rank0_now)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -8911,15 +9036,21 @@ class PyExecutor:
                                                 max_new_requests,
                                                 self.max_num_active_requests,
                                                 kv_balance=kv_balance)
+        mm_admission = getattr(self, "_mm_encoder_item_scheduling_enabled",
+                               False)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=False,
-            max_num_active_requests=self.max_num_active_requests)
-        if (not new_requests or not getattr(
-                self, "_mm_encoder_item_scheduling_enabled", False)):
+            max_num_active_requests=self.max_num_active_requests,
+            mark_admitted=not mm_admission)
+        if not mm_admission:
             return new_requests, {}
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
+        # Deferred requests go back with their arrival order, so only the rest are admitted.
+        admitted = (self._apply_mm_encoder_admission(
+            waiting_queue, new_requests) if new_requests else [])
+        waiting_queue.mark_admitted(admitted)
+        return admitted, {}
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -9719,6 +9850,12 @@ class PyExecutor:
         finally:
             if batcher is not None:
                 batcher.after_schedule()
+        # Requests whose KV pages a failed remote cache level took with it, unable to recompute them here; a
+        # wrapping scheduler (e.g. MultimodalScheduler) forwards them from the scheduler it wraps.
+        for request, error_msg in self.scheduler.take_lost_kv_requests():
+            self._handle_errors(error_msg,
+                                requests=[request],
+                                charge_budget=False)
 
         scheduled_encoder_requests = self._encoder_requests_in_arrival_order(
             scheduler_output.encoder_requests)
@@ -11763,27 +11900,32 @@ class PyExecutor:
             Executor request IDs excluded from further model scheduling.
         """
         if (not getattr(self, "canceled_req_ids", None)
-                or self.kv_cache_transceiver is None
-                or getattr(self, "kv_connector_manager", None) is not None
-                or self.dist.pp_size != 1
-                or getattr(self, "is_encoder_decoder", False)
-                or getattr(self, "_mm_encoder_item_scheduling_enabled", False)):
+                or self.kv_cache_transceiver is None or self.dist.pp_size != 1):
             return set()
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if (getattr(self, "kv_connector_manager", None) is not None
+                and not replicated_gen_cancel):
+            return set()
+        restricted_model = (
+            getattr(self, "is_encoder_decoder", False)
+            or getattr(self, "_mm_encoder_item_scheduling_enabled", False))
         cancel_ids = set(self.canceled_req_ids)
         model_ids = set()
         for request in self.active_requests:
             cancel_id = (request.parent_request_id
                          if request.is_child else request.py_request_id)
-            if (cancel_id not in cancel_ids
-                    or request.py_multimodal_params is not None
+            replicated_gen = replicated_gen_cancel and request.is_generation_only_request
+            if (cancel_id not in cancel_ids or
+                ((restricted_model or request.py_multimodal_params is not None)
+                 and not replicated_gen)
                     or not (request.is_context_only_request
                             or request.is_generation_only_request)):
                 continue
             if request.state not in (LlmRequestState.CONTEXT_INIT,
                                      LlmRequestState.GENERATION_IN_PROGRESS):
                 continue
-            if self.kv_cache_transceiver.supports_idle_request_cancellation(
-                    request) is True:
+            if (self.kv_cache_transceiver.supports_idle_request_cancellation(
+                    request) is True or replicated_gen):
                 model_ids.add(request.py_request_id)
         return model_ids
 
@@ -11804,8 +11946,16 @@ class PyExecutor:
         Returns:
             Newly activated requests that were not retired by cancellation.
         """
-        if (self.kv_cache_transceiver is None or not self.canceled_req_ids
-                or getattr(self, "kv_connector_manager", None) is not None):
+        if self.kv_cache_transceiver is None:
+            return new_requests
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if (getattr(self, "kv_connector_manager", None) is not None
+                and not replicated_gen_cancel):
+            # A connector owns its requests' cancellation, except where the
+            # replicated GEN consensus runs: those requests retire only through
+            # the rank vote, which this rank must join even with a connector.
+            return new_requests
+        if not self.canceled_req_ids and not replicated_gen_cancel:
             return new_requests
 
         supports_idle_cancel = self.kv_cache_transceiver.supports_idle_request_cancellation
@@ -11816,10 +11966,12 @@ class PyExecutor:
         new_ids = {req.py_request_id for req in new_requests}
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
         previous_batch = getattr(self, "previous_batch", None)
-        if previous_batch is not None:
-            cancelled_model_ids.difference_update(
-                req.py_request_id
-                for req in previous_batch.scheduled_requests.all_requests())
+        previous_ids = ({
+            req.py_request_id
+            for req in previous_batch.scheduled_requests.all_requests()
+        } if previous_batch is not None else set())
+        cancelled_model_ids.difference_update(previous_ids)
+        ready_to_cancel = []
         retired_ids = set()
         failed_ids = set()
         handled_cancel_ids = set()
@@ -11840,10 +11992,23 @@ class PyExecutor:
                     LlmRequestState.DISAGG_TRANS_ERROR,
                 ))
             model_cancelled = request.py_request_id in cancelled_model_ids
+            legacy_gen_waiting = replicated_gen_cancel and (generation_waiting
+                                                            or model_cancelled)
+            if legacy_gen_waiting and request.py_request_id in previous_ids:
+                continue
             if (not (context_waiting or generation_waiting or model_cancelled)
-                    or supports_idle_cancel(request) is not True):
+                    or (supports_idle_cancel(request) is not True
+                        and not legacy_gen_waiting)):
                 continue
             if model_cancelled and not self._try_cancel_request(request):
+                continue
+            if (legacy_gen_waiting
+                    and getattr(self, "kv_connector_manager", None) is not None
+                    and not self._try_cancel_request(request)):
+                # A connector still holds asynchronous work for this request (a
+                # pending load termination or preemption). Its retirement must
+                # wait for the connector hooks, exactly like local cancellation
+                # would, but the consensus batch vote still runs below.
                 continue
             if (generation_waiting
                     and id(request) in self._held_transfer_failures()):
@@ -11858,6 +12023,20 @@ class PyExecutor:
             if not logically_cancelled and not self.disagg.request_cancellation(
                     request):
                 continue
+            ready_to_cancel.append(request)
+
+        if replicated_gen_cancel:
+            ready_to_cancel, propagated_ids, completed_ids = (
+                self.disagg.align_gen_cancellation(ready_to_cancel,
+                                                   self.active_requests,
+                                                   self.canceled_req_ids))
+            self.canceled_req_ids[:] = sorted(propagated_ids)
+        else:
+            completed_ids = set()
+
+        for request in ready_to_cancel:
+            cancel_id = (request.parent_request_id
+                         if request.is_child else request.py_request_id)
             handled_cancel_ids.add(cancel_id)
             if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
                 # Keep the failure outcome. The pending cancel must no longer
@@ -11867,6 +12046,11 @@ class PyExecutor:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
+            if self._kv_connector_moves_kv:
+                # A KV-moving connector may hold a save against the blocks this
+                # request has filled; give it the same finish handshake the
+                # post-batch cancellation path runs before pages are freed.
+                self._start_connector_async_save(request)
             response = request.create_response()
             if response is not None:
                 response.result.cached_tokens = request.cached_tokens
@@ -11876,7 +12060,7 @@ class PyExecutor:
             retired_ids.add(request.py_request_id)
 
         if not cancel_queued:
-            self.waiting_queue.remove_by_ids(handled_cancel_ids)
+            self.waiting_queue.remove_by_ids(handled_cancel_ids | completed_ids)
         self.active_requests[:] = [
             req for req in self.active_requests
             if req.py_request_id not in retired_ids
@@ -11888,8 +12072,9 @@ class PyExecutor:
         }
         self.canceled_req_ids[:] = [
             request_id for request_id in self.canceled_req_ids
-            if request_id in active_cancel_ids or (
-                not cancel_queued and request_id not in handled_cancel_ids)
+            if request_id not in completed_ids and (
+                request_id in active_cancel_ids or
+                (not cancel_queued and request_id not in handled_cancel_ids))
         ]
         return [
             req for req in new_requests if req.py_request_id not in retired_ids
@@ -11964,39 +12149,67 @@ class PyExecutor:
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
+        # The consensus vote needs a transceiver to retire against. Without one no
+        # transfer can outlive the local request, so the local finish below is
+        # the complete cancellation path (fixture and connector-only executors).
+        consensus = (self.kv_cache_transceiver is not None
+                     and self.disagg.requires_gen_cancellation_consensus)
+        if consensus:
+            # Keep cancellation IDs even without a local request until the
+            # loop-head vote has checked the other ranks.
+            still_pending_canceled_ids.extend(canceled_req_ids_set)
+        ready_to_cancel = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
                 continue
 
+            if (getattr(request, "is_generation_only_request", False)
+                    and consensus):
+                still_pending_canceled_ids.append(req_id)
+                continue
+
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
-                if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
-                        and request.is_generation_only_request
-                        and self.kv_cache_transceiver is not None
-                        and getattr(self, "kv_connector_manager", None) is None
-                        and self.kv_cache_transceiver.
-                        supports_idle_request_cancellation(request) is True):
-                    # Drop the pending cancel so synchronized error cleanup
-                    # can report the committed failure without rewriting it.
-                    continue
-                # Mark requests as finished, then, we reuse all existing code
-                # to clean up the KV cache resources.
-                request.py_kv_transfer_timed_out = False
-                request.finish_by_reason(FinishReason.CANCELLED)
-                request.decoding_iter = request.py_decoding_iter
-                if self._kv_connector_moves_kv:
-                    # A request cancelled mid-prefill can have a connector save
-                    # outstanding against the blocks it has filled so far, and
-                    # the response pass below frees them as soon as it sees this
-                    # request finished.
-                    self._start_connector_async_save(request)
+                ready_to_cancel.append(request)
             else:
                 still_pending_canceled_ids.append(req_id)
 
+        aligned = ready_to_cancel
+        aligned_ids = {request.py_request_id for request in aligned}
+        still_pending_canceled_ids.extend(
+            request.parent_request_id if request.is_child else request.
+            py_request_id for request in ready_to_cancel
+            if request.py_request_id not in aligned_ids)
+        for request in aligned:
+            if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and request.is_generation_only_request
+                    and self.kv_cache_transceiver is not None
+                    and getattr(self, "kv_connector_manager", None) is None
+                    and self.kv_cache_transceiver.
+                    supports_idle_request_cancellation(request) is True):
+                # Drop the pending cancel so synchronized error cleanup
+                # can report the committed failure without rewriting it.
+                continue
+            # Mark requests as finished, then, we reuse all existing code
+            # to clean up the KV cache resources.
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            if self._kv_connector_moves_kv:
+                # A request cancelled mid-prefill can have a connector save
+                # outstanding against the blocks it has filled so far, and
+                # the response pass below frees them as soon as it sees this
+                # request finished.
+                self._start_connector_async_save(request)
+
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()
-        self.canceled_req_ids.extend(still_pending_canceled_ids)
+        if consensus:
+            self.canceled_req_ids.extend(sorted(
+                set(still_pending_canceled_ids)))
+        else:
+            self.canceled_req_ids.extend(still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):

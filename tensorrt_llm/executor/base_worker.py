@@ -1313,6 +1313,7 @@ class BaseWorker(GenerationExecutor):
                 prev_device_step_time_ms=stats[5] if len(stats) > 5 else None,
                 scheduler_mode=stats[6] if len(stats) > 6 else None,
                 gpu_forward_time_ms=stats[7] if len(stats) > 7 else None,
+                mm_encoder_stats=stats[8] if len(stats) > 8 else None,
             ))
 
     @staticmethod

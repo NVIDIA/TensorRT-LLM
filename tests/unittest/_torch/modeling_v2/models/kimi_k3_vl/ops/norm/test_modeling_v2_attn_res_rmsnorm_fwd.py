@@ -43,7 +43,9 @@ INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight", "
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
 
 
-def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
+def _make_inputs(
+    num_tokens: int, num_candidates: int, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Inputs at the scales of main's op test, seeded by the cell."""
     torch.manual_seed(seed)
     layer_residual = (

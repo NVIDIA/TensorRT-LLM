@@ -342,8 +342,11 @@ subtracted from that earlier peak. The fixed reserve also covers one prefill
 indexer group's FP32 logits, whose width follows the attended prefix; the MQA
 logits element budget and the step's query rows bound them.
 The attended-KV admission cap applies to the prefix gather, independently of
-the fixed graph arena. Projection and native/provider scratch still require
-representative peak-memory profiling.
+the fixed graph arena. The attention-DP minimum-KV-split scratch of
+`fmha/gqa_decode.py` needs no declaration: it is sized by the largest
+generation CUDA-graph batch, which graph warmup runs before KV-cache sizing,
+and larger eager batches keep FlashInfer's split heuristic. Projection and
+native/provider scratch still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -362,6 +365,10 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
+A CUDA graph runner that keys its decode graphs by KV regime hands the
+regime ceiling to the graph's metadata through `set_decode_kv_regime`; only a
+backend whose decode path depends on the KV length keeps it (the FP4 MLA
+2x | 4x | two-stream dispatcher), the default ignores it.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
 
@@ -538,6 +545,28 @@ silently drop the routing semantics. Likewise a generation call whose
 QK-norm / RoPE / KV-append prologue the attention module deferred
 (`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
 libraries that declare `supports_deferred_prologue`.
+
+Two per-forward arguments and one layer field let a library return less than
+a full BF16 `output`; callers that set them must read the result accordingly:
+
+- `output_gate`: a library that multiplies `sigmoid(gate)` into the output sets
+  `output_gate_applied`; otherwise the caller applies the gate.
+- `gated_out_scale` / `output_fp8` (offered only with `output_gate`): a library
+  that applies the gate may write the gated output as E4M3 at o_proj's static
+  input scale into `output_fp8` and leave `output` unwritten. The caller then
+  feeds `output_fp8` to o_proj; `output` holds stale data.
+- `context_last_rows_only` (a `TrtllmAttention` field the model sets, e.g. the
+  Qwen3.5 MTP layer): in a context-only step `FlashInferTrtllmGenFmha` computes
+  only each request's last output row, against the full KV, and writes zeros to
+  the other rows; every row's K / V is still appended. Mixed steps run the full
+  call.
+
+`trtllm::fmha_paged_context_fp8` (the stage-KV context path of
+`FlashInferTrtllmGenFmha`, `context_fmha_head_dim_per_stage_kv > 0`) runs only
+a precompiled kernel: when the config the runner selects for the call has no
+cubin, the op returns `False` without launching and the library runs
+FlashInfer's kernel, so no step compiles with NVRTC.
+
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
@@ -596,13 +625,19 @@ The FMHA package is split by role:
   attends every partition through `Fp4MlaFmha.forward_context_partition`;
   non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
   keeps by rounding them to the 128-token chunk unit. A prefix reused from
-  the block cache is attended the same way, so FP4 MLA block reuse requires
-  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
-  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
-  holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
-  FP4 MLA, whose reuse match can back off into a tile by the one-model
-  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  the block cache is attended the same way, with or without chunked prefill;
+  without it, each partition holds up to `max_num_tokens` cached tokens, the
+  size of the FP8 context scratch. The cached-KV path
+  (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
+  resume on a full FP4 tile. Hybrid linear-attention models resume on a
+  recurrent-state snapshot that the hybrid manager aligns to a cache block,
+  and keep block reuse tied to chunked prefill. The dense manager claims
+  whole cache blocks only, without the reuse-match backoff of one-model
+  drafts, and keeps its HP ring request-private
+  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short. With reuse
+  on, a context step repacks the packed V of every page it reads, reused
+  pages included, and a dense manager's generation steps write packed V
+  directly, since they append to pages their request allocated.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
@@ -611,7 +646,9 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
+  generation warmup shapes. A one-model MTP drafter on such a worker must
+  draft a single token (`max_draft_len: 1`), because its later draft steps
+  are generation steps; the generation worker fills in the drafts it lacks. Hybrid
   linear-attention models (Kimi K3)
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy

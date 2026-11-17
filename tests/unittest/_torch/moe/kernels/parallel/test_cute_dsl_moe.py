@@ -1052,6 +1052,81 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("top_k", [1, 2])
+@pytest.mark.parametrize("num_tokens", [7, 48 * 7, 4 * 52 * 7])
+def test_nvfp4_grouped_gemm_finalize_weights_evict_first_bitwise(num_tokens: int, top_k: int):
+    """The L2 evict_first policy on the FC2 weight loads leaves every output bit unchanged (top-k <= 2: the
+    finalize's scatter-add is order-independent)."""
+    sf_vec_size, tile_size = 16, 128
+    hidden_size, interm_size = 4096, 1024
+    num_experts, num_local_experts = 512, 128
+
+    torch.manual_seed(0)
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    # Token 0 picks local expert 0 first, so the output is never all zero (no local pick at all).
+    routing_logits[0, 0] = routing_logits.max() + 1
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+    a = torch.randn(permuted_idx_to_expanded_idx.size(0), interm_size, device="cuda").bfloat16()
+    b = torch.randn(num_local_experts, hidden_size, interm_size, device="cuda").bfloat16()
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b_sf = b_sf.view(num_local_experts, hidden_size, interm_size // sf_vec_size)
+
+    def run(weights_evict_first):
+        out = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            a.view(torch.float4_e2m1fn_x2),
+            b.view(torch.float4_e2m1fn_x2),
+            a_sf,
+            b_sf,
+            a_global_sf * b_global_sf,
+            out,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            weights_evict_first=weights_evict_first,
+        )
+        return out
+
+    expected = run(False)
+    assert expected.abs().sum().item() > 0
+    assert torch.equal(run(True).view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
