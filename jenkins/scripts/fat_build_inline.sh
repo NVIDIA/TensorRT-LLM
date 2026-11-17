@@ -119,6 +119,14 @@ echo "[fat_build] Installing opencv-python-headless..."
 pip3 install --no-user --retries 10 opencv-python-headless
 echo "[fat_build] Installing ray (required for --run-ray test jobs)..."
 pip3 install --no-user --retries 10 "ray[default]==2.55.1"
+# Optional SM100 AOT modules avoid rebuilding unchanged FlashInfer sources on
+# B200 test nodes. The CLI matches the installed FlashInfer and CUDA versions;
+# other architectures and missing kernels retain their normal JIT fallback.
+echo "[fat_build] Installing matching FlashInfer SM100 kernel cache..."
+if ! timeout 300s env PIP_USER=false FLASHINFER_CUDA_ARCH_LIST=10.0a \
+    python3 -m flashinfer install-jit-cache-wheel --sm sm100a; then
+    echo "[fat_build] Optional SM100 kernel cache unavailable; runtime JIT remains enabled."
+fi
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
 echo "$LLM_TAR_ARTIFACT_PATH" > /tmp/trtllm_installed.txt

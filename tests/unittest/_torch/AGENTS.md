@@ -37,6 +37,12 @@ Scope: this directory and its descendants. Supplements `../../AGENTS.md`.
 - Separate setup, compilation, reference computation and device execution when
   profiling a test. Use the stage's effective worker count and allocation; serial
   timings alone do not establish the cost of a parallel CI batch.
+- Measure fresh-container and warm-cache runs separately. A before/after sequence
+  in one container can attribute shared JIT or model-cache warmup to a test change.
+  Include cache preparation cost when moving compilation into a shared image.
+- Distinguish a Triton runtime dimension from a constexpr specialization. When
+  thinning a shape matrix, retain representative tile sizes, mask boundaries,
+  dtypes and state transitions; name the specializations deliberately removed.
 - Batch tensor comparisons and host/device transfers when they check the same
   elements. Preserve valid-row masks, padding, packed values, scale factors,
   ordering, dtypes and tolerances. Keep the reference independent of the operation

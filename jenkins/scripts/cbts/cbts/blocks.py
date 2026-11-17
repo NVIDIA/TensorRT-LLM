@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 import shutil
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
@@ -85,11 +86,11 @@ def normalize_test_id(test_id: str) -> str:
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 
-# Detect a pytest-style option flag (e.g. ` -k`, ` -m`) inside a YAML target
+# Detect a pytest-style option flag (e.g. ` -k`, ` --ignore`) inside a YAML target
 # spec. Used to peel `-k "..."` / `-m "..."` off so the bare path/node-id can
 # be indexed as an additional lookup key — that lets a fine-grained waive id
 # match a coarse YAML entry like `dir/x.py -k "deepseek"`.
-_PYTEST_OPTION_RE = re.compile(r"\s+-[a-zA-Z]\b")
+_PYTEST_OPTION_RE = re.compile(r"\s+--?[a-zA-Z][\w-]*\b")
 
 
 def _strip_pytest_options(s: str) -> str:
@@ -157,10 +158,19 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
                    from the test id string alone).
     No options:    always accept.
     """
+    if not (
+        _entry_covers_path(entry, _entry_target(waive_id))
+        and _entry_covers_path(waive_id, _entry_target(entry))
+    ):
+        return False
     kw = _extract_k_keyword(entry)
     if kw is None:
         return True  # no -k → unconstrained
     tokens = re.findall(r"[A-Za-z_]\w*", kw)
+    # A missing negated keyword can select the test. Keep the original -k
+    # expression for pytest rather than treating it as a positive requirement.
+    if any(token.lower() == "not" for token in tokens):
+        return True
     real = [t for t in tokens if t.lower() not in _K_RESERVED_WORDS]
     if not real:
         return True  # all-reserved expression → can't decide; over-include
@@ -207,6 +217,38 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
         or target.startswith(filter_prefix + "::")
         or target.startswith(filter_prefix + "/")
     )
+
+
+def _entry_covers_path(entry: str, path: str) -> bool:
+    """Match pytest-tree lineage, respecting root-relative collection exclusions."""
+    target = _entry_target(entry)
+    if not (_target_in_filter_subtree(target, path) or _target_in_filter_subtree(path, target)):
+        return False
+    option_start = _PYTEST_OPTION_RE.search(entry)
+    if option_start is None:
+        return True
+    try:
+        options = iter(shlex.split(entry[option_start.start() :]))
+    except ValueError:
+        return True  # Let pytest diagnose malformed options; do not drop coverage.
+    file_path = path.split("::", 1)[0]
+    for option in options:
+        name, sep, value = option.partition("=")
+        if name not in ("--ignore", "--ignore-glob"):
+            continue
+        if not sep:
+            value = next(options, "")
+        if value.startswith("./"):
+            value = value[2:]
+        if not value:
+            continue
+        if name == "--ignore" and _target_in_filter_subtree(file_path, value):
+            return False
+        if name == "--ignore-glob" and any(
+            fnmatch(parent, value) for parent in [file_path, *_iter_parent_ids(file_path)]
+        ):
+            return False
+    return True
 
 
 def _entry_in_filter_subtree(entry: str, filter_prefix: str) -> bool:
@@ -365,7 +407,7 @@ class YAMLIndex:
             covering: list[str] = []
             for entry in block.tests:
                 t = _entry_target(entry)
-                if _target_in_filter_subtree(t, anchor) or _target_in_filter_subtree(anchor, t):
+                if _entry_covers_path(entry, anchor):
                     covering.append(t)
             if not covering:
                 continue

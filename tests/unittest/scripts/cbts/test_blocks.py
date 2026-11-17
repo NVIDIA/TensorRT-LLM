@@ -27,6 +27,7 @@ from cbts.blocks import YAMLIndex, parse_stages_from_groovy, write_filtered_test
 from cbts.command.report_decision import _stage_group
 from cbts.coverage.selection.touch_db import stage_family
 from cbts.coverage.tier import write_coverage_test_db
+from cbts.rules._helpers import lookup_paths_into_block_filters
 
 pytestmark = pytest.mark.cpu_only
 
@@ -142,3 +143,83 @@ def test_narrowed_test_db_has_one_file_per_context(tmp_path: Path) -> None:
             {"condition": _CONDITION, "tests": ["perf/test_a.py::test_one"]}
         ],
     }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "--ignore=unittest/toy/test_excluded.py",
+        '--ignore unittest/toy/test_excluded.py -k "not slow"',
+        '--ignore-glob="*_slow.py"',
+        '-k "not slow"',
+    ],
+)
+def test_pytest_options_preserve_parent_lookup_and_execution(tmp_path: Path, options: str) -> None:
+    """Options must not hide a selected parent or remove its runtime exclusions."""
+    db = tmp_path / "db"
+    db.mkdir()
+    entry = f"unittest/toy {options}"
+    (db / "l0_b200.yml").write_text(
+        yaml.safe_dump({"version": "0.0.1", "l0_b200": [{"tests": [entry, "unittest/unrelated"]}]})
+    )
+    index = YAMLIndex.load(db)
+    matches = index.find_match_for_path("unittest/toy/test_active.py")
+    assert matches is not None
+    assert len(matches) == 1
+    block, prefix = matches[0]
+    filtered = tmp_path / "filtered"
+    write_filtered_test_db(
+        db,
+        filtered,
+        {(block.yaml_stem, block.block_index): {prefix: {"unittest/toy/test_active.py"}}},
+    )
+    assert yaml.safe_load((filtered / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [entry]
+
+
+@pytest.mark.parametrize(
+    "ignore",
+    [
+        "--ignore=unittest/toy/test_excluded.py",
+        "--ignore unittest/toy/test_excluded.py",
+        '--ignore-glob="*excluded.py"',
+    ],
+)
+@pytest.mark.parametrize("changed", ["test_active.py", "test_excluded.py", "conftest.py"])
+def test_parent_exclusions_do_not_select_unrelated_siblings(
+    tmp_path: Path, ignore: str, changed: str
+) -> None:
+    """File changes select their covering entries; helper changes retain both scopes."""
+    db = tmp_path / "db"
+    db.mkdir()
+    parent = f'unittest/toy {ignore} -k "not slow"'
+    child = "unittest/toy/test_excluded.py"
+    (db / "l0_b200.yml").write_text(
+        yaml.safe_dump({"l0_b200": [{"tests": [parent, child, "unittest/other"]}]})
+    )
+    index = YAMLIndex.load(db)
+    filters, misses = lookup_paths_into_block_filters(index, [f"unittest/toy/{changed}"])
+    assert not misses
+    out = tmp_path / "filtered"
+    write_filtered_test_db(db, out, filters)
+    expected = (
+        [parent, child]
+        if changed == "conftest.py"
+        else [child]
+        if changed == "test_excluded.py"
+        else [parent]
+    )
+    assert yaml.safe_load((out / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == expected
+    if changed != "conftest.py":
+        level, blocks = index.find_match_for_waive(f"unittest/toy/{changed}::test_run")
+        write_filtered_test_db(
+            db,
+            tmp_path / "waives",
+            {
+                (b.yaml_stem, b.block_index): {level: {f"unittest/toy/{changed}::test_run"}}
+                for b in blocks
+            },
+        )
+        assert (
+            yaml.safe_load((tmp_path / "waives/l0_b200.yml").read_text())["l0_b200"][0]["tests"]
+            == expected
+        )

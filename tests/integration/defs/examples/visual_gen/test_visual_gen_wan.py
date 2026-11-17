@@ -457,6 +457,8 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
 def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
 
+    Four steps exercise both noise stages for CLI/output validation.
+    Numerical quality is checked separately by the LPIPS tests.
     Reuse the shared ``configs/wan2.2-t2v-fp4-1gpu.yaml`` configuration. Prefer
     the pre-quantized checkpoint, falling back to dynamic quantization of the
     original checkpoint when it is unavailable.
@@ -474,6 +476,8 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_t2v_example")
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "wan_t2v_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
     config_path = os.path.join(
@@ -490,6 +494,8 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             model_path,
             "--visual_gen_args",
             config_path,
+            "--num_inference_steps",
+            "4",
             "--output_path",
             output_path,
         ],
@@ -501,6 +507,8 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
 def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
 
+    Four steps exercise both noise stages for CLI/output validation.
+    Numerical quality is checked separately by the LPIPS tests.
     Reuse the shared ``configs/wan2.2-i2v-fp4-1gpu.yaml`` configuration. Prefer
     the pre-quantized checkpoint, falling back to dynamic quantization of the
     original checkpoint when it is unavailable.
@@ -518,6 +526,8 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_i2v_example")
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "wan_i2v_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_i2v.py")
     config_path = os.path.join(
@@ -534,6 +544,8 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
             model_path,
             "--visual_gen_args",
             config_path,
+            "--num_inference_steps",
+            "4",
             "--output_path",
             output_path,
         ],

@@ -5561,7 +5561,8 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                       mocker,
                       acceptance_key,
                       tp_size=1,
-                      attention_dp=False):
+                      attention_dp=False,
+                      enable_autotuner=True):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
@@ -5574,6 +5575,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  enable_attention_dp=attention_dp,
+                 enable_autotuner=enable_autotuner,
                  max_seq_len=4096,
                  max_batch_size=32,
                  enable_chunked_prefill=True,
@@ -5590,7 +5592,10 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             assert_acceptance_length_for_llm(acceptance_key, llm)
 
     def test_bf16_mtp(self, mocker):
-        self._run_bf16_mtp(mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp")
+        # Exercise untuned kernels; ring replay and ADP retain autotuning.
+        self._run_bf16_mtp(mocker,
+                           "TestQwen3_5_35B_A3B::test_bf16_mtp",
+                           enable_autotuner=False)
 
     @pytest.mark.skip_less_device(2)
     def test_bf16_mtp_adp2(self, mocker):

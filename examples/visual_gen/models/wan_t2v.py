@@ -46,7 +46,15 @@ def main():
         default="wan_t2v_output.avi",
         help="Path to save the output video",
     )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=None,
+        help="Override the model's default denoising step count",
+    )
     args = parser.parse_args()
+    if args.num_inference_steps is not None and args.num_inference_steps < 1:
+        parser.error("--num_inference_steps must be positive")
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
@@ -55,6 +63,8 @@ def main():
     # --- Model-specific: T2V request construction ---
     # Start from per-model defaults (steps, guidance, seed, etc.) and override resolution/frames.
     params = visual_gen.default_params
+    if args.num_inference_steps is not None:
+        params.num_inference_steps = args.num_inference_steps
     params.height = 480
     params.width = 832
     params.num_frames = 165

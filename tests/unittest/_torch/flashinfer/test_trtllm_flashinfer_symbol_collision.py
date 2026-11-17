@@ -22,9 +22,10 @@ symbols with identical mangled names as libth_common.so (loaded with
 RTLD_GLOBAL), causing heap corruption when the dynamic linker resolves
 to the wrong implementation.
 
-This test triggers the FlashInfer CUTLASS fused-MOE JIT build (with
-use_fast_build=True to minimize compilation time), then calls into the
-compiled module to verify no symbol collision occurs.
+This test loads the FlashInfer CUTLASS fused-MOE module and invokes it to
+check symbol compatibility with the current TensorRT-LLM library. Matching
+prebuilt modules avoid repeated compilation; otherwise use_fast_build=True
+limits the JIT build cost.
 """
 
 import pytest
@@ -36,13 +37,12 @@ import tensorrt_llm._torch.custom_ops.torch_custom_ops as trt_ops  # noqa: F401
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_flashinfer_cutlass_fused_moe_jit_no_collision():
     """
-    JIT-compiling and calling FlashInfer CUTLASS fused-MOE must not crash.
+    Loading and calling FlashInfer CUTLASS fused-MOE must not crash.
 
-    get_cutlass_fused_moe_module JIT-compiles TensorRT-LLM CUTLASS MOE
-    kernels that share the tensorrt_llm:: namespace with libth_common.so.
-    use_fast_build=True reduces template instantiations for speed.
-    The actual collision manifests when module.init() is called (inside
-    cutlass_fused_moe), so we must invoke the operation with small tensors.
+    get_cutlass_fused_moe_module uses a matching prebuilt module when present,
+    or JIT-compiles the CUTLASS MOE sources with fewer template instantiations.
+    The collision manifests when the native runner is initialized, so invoke
+    the operation with small tensors rather than checking only import success.
     """
     from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
 

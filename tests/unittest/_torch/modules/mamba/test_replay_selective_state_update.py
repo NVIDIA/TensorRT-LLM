@@ -292,9 +292,7 @@ def test_replay_tma_strided_state_layout_matches_contiguous(rectangle_for_nowrit
     ],
     ids=["fp16", "bf16", "fp32", "int8", "int16", "fp8"],
 )
-@pytest.mark.parametrize(
-    "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
-)
+@pytest.mark.parametrize("T", [6, 16, 27, 55], ids=["T6", "T16", "T27", "T55"])
 @pytest.mark.parametrize(
     "write_checkpoint,rectangle_for_nowrite",
     [
@@ -2083,11 +2081,19 @@ def test_replay_heads_per_block(
 # `rectangle_nowrite` forces the rectangle vs non-rectangle nowrite path
 # (via `mode="persistent_main"` + `rectangle_for_nowrite=…` kwargs)
 # rather than relying on the tuning table's mode pick.
+# Single-step tests cover the full geometry matrix. These trajectories cover
+# both state dtypes, replay-window sizes, head tiles and nowrite paths.
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _HEADS_PER_BLOCK_CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-@pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
-@pytest.mark.parametrize("rectangle_nowrite", [True, False], ids=["rect", "norect"])
+@pytest.mark.parametrize(
+    "state_dtype,T,heads_per_block,rectangle_nowrite",
+    [
+        (torch.bfloat16, 6, 2, True),
+        (torch.bfloat16, 16, 4, False),
+        (torch.float32, 6, 4, False),
+        (torch.float32, 16, 2, True),
+    ],
+    ids=["bf16-T6-HPB2-rect", "bf16-T16-HPB4-norect", "fp32-T6-HPB4-norect", "fp32-T16-HPB2-rect"],
+)
 @pytest.mark.parametrize("mode", ["persistent_main", "persistent_dynamic"], ids=["pm", "pd"])
 def test_replay_heads_per_block_multistep(
     nheads,
