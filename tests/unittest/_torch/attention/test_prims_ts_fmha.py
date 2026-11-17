@@ -2450,7 +2450,8 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     assert run_kwargs["output_scale"] == 1.0
 
 
-def test_prims_ts_decode_task_manager_builds_schedule_without_gpu() -> None:
+@pytest.mark.parametrize("seq_len_kv", [256, 257, 513])
+def test_prims_ts_decode_task_manager_builds_schedule_without_gpu(seq_len_kv: int) -> None:
     pytest.importorskip("cutlass.experimental.task_scheduling")
     from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
@@ -2463,7 +2464,6 @@ def test_prims_ts_decode_task_manager_builds_schedule_without_gpu() -> None:
         build_decode_task_manager,
     )
 
-    seq_len_kv = 256
     cfg = make_decode_config(headdim=128)
 
     task_manager = build_decode_task_manager(

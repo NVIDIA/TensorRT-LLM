@@ -931,8 +931,8 @@ _r0_kernel_cache: dict = {}
 
 def _compile_gvr_direct(kernel):
     """Compile a ``GvrTopKKernel`` with symbolic shapes, mirroring the
-    production runner's fake-tensor construction (128-bit loads, no
-    ``order_row`` / ``output_values``)."""
+    production runner's fake-tensor construction (128-bit loads and no
+    ``order_row``)."""
     n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
     in_f = _crt.make_fake_compact_tensor(
         kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
@@ -944,10 +944,17 @@ def _compile_gvr_direct(kernel):
     oi_f = _crt.make_fake_compact_tensor(
         cutlass.Int32, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
     )
+    ov_f = (
+        _crt.make_fake_compact_tensor(
+            kernel.dtype, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
+        )
+        if kernel.return_output_values
+        else None
+    )
     fs = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
     # __call__(input, pre_idx, seq_lens, output_values, output_indices, order_row, stream)
     return cute.compile(
-        kernel, in_f, pi_f, sl_f, None, oi_f, None, stream=fs, options="--enable-tvm-ffi"
+        kernel, in_f, pi_f, sl_f, ov_f, oi_f, None, stream=fs, options="--enable-tvm-ffi"
     )
 
 
