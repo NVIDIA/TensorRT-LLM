@@ -685,6 +685,23 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
     return HostMemoryLimits(local_ranks, mem_available, memlock_limit)
 
 
+def _copy_based_rebalancing_flags(kv_cache_config: KvCacheConfig) -> tuple[bool, bool, bool]:
+    """(copy_based_rebalancing, drop_unreferenced_on_rebalance, in_place_relocation) to build with.
+
+    kv_pool_rebalance_config only applies with enable_kv_pool_rebalance. Without it the GPU arena
+    would buy nothing, and building it anyway would bypass checks keyed on rebalancing, such as
+    sparse KV cache offload's (the arena cannot hold host-backed pools).
+    """
+    if not kv_cache_config.enable_kv_pool_rebalance:
+        return False, False, False
+    cfg = kv_cache_config.kv_pool_rebalance_config
+    return (
+        cfg.copy_based_rebalancing,
+        cfg.drop_unreferenced_on_rebalance,
+        cfg.in_place_relocation,
+    )
+
+
 def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> bool:
     """Whether to leave out the automatic host tier.
 
@@ -4810,6 +4827,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
+        copy_based, drop_unreferenced, in_place = _copy_based_rebalancing_flags(kv_cache_config)
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -4850,9 +4868,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
                 ratio_tolerance=rebalance_cfg.ratio_tolerance,
                 moving_average_decay=rebalance_cfg.moving_average_decay,
-                copy_based_rebalancing=rebalance_cfg.copy_based_rebalancing,
-                drop_unreferenced_on_rebalance=rebalance_cfg.drop_unreferenced_on_rebalance,
-                in_place_relocation=rebalance_cfg.in_place_relocation,
+                copy_based_rebalancing=copy_based,
+                drop_unreferenced_on_rebalance=drop_unreferenced,
+                in_place_relocation=in_place,
             ),
             cold_tier_offload_min_priority=(
                 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY

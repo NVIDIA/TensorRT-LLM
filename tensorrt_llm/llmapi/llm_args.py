@@ -9810,7 +9810,8 @@ class TorchLlmArgs(BaseLlmArgs):
         """
         is_disagg = (self.cache_transceiver_config is not None
                      and self.cache_transceiver_config.backend is not None)
-        if (is_disagg and self.kv_cache_config.kv_pool_rebalance_config.
+        if (is_disagg and self.kv_cache_config.enable_kv_pool_rebalance
+                and self.kv_cache_config.kv_pool_rebalance_config.
                 copy_based_rebalancing):
             raise ValueError(
                 "kv_cache_config.kv_pool_rebalance_config.copy_based_rebalancing "
