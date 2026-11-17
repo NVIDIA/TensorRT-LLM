@@ -3,8 +3,7 @@
 `examples/llm-api/eval_gsm8k.py` evaluates the first N questions (1 to 1,319) of the GSM8K test
 split through an OpenAI-compatible `/v1/chat/completions` endpoint. One implementation of the
 question selection, prompt and request construction, answer extraction and scoring serves both
-manual use and the first-100 CI job
-(`tests/integration/defs/accuracy/test_nvfp4_serving_gsm8k.py`).
+manual use and the [Beam baseline accuracy gate](#beam-baseline-accuracy-gate).
 
 ## Requirements
 
@@ -141,9 +140,34 @@ nothing and contacts no server; its summary names the model those replies came f
 evaluator identifies a model only by its served name, so it cannot detect different weights
 served under an unchanged name.
 
-## Comparability
+## Beam baseline accuracy gate
 
-The prompt, request fields, scorer and manifest are those of the first-100 GSM8K job used
-before this evaluator; first-100 results of the two are directly comparable. Replaying the
-saved replies of earlier first-100 runs through this command line reproduces their question
-ids, request records, statuses, parsed answers and scores exactly.
+`TestModelingV2BeamFullModelNvfp4Sm103Tp4::test_gsm8k_first100` in
+`tests/integration/defs/accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py`
+uses this evaluator through a managed `trtllm-serve` launch. It requires exactly four visible
+GB300 GPUs and selects the NVFP4 Beam target with `modeling_v2: require`, TP4, BF16 KV cache,
+no speculative decoding, CUDA graphs disabled and overlap scheduling disabled. Batch size and
+request concurrency are both 1.
+
+Stage an authorized target below `LLM_MODELS_ROOT` and set `TRTLLM_TEST_TARGET_RELATIVE_PATH`
+to its relative directory. Stage the pinned dataset at `LLM_MODELS_ROOT/datasets/openai/gsm8k`.
+A selected run fails if required inputs are missing. The gate evaluates the first 100 questions,
+requires at least 95 correct answers and rejects execution errors, timeouts and truncations.
+Its 45-minute test timeout reserves five minutes for cleanup, leaving at most 40 minutes for
+server startup and evaluation. The generated `beam-baseline.yaml` and evaluator outputs are
+written to the test's temporary output directory.
+
+The gate is listed in `tests/integration/test_lists/qa/functional/llm_function_core.txt` and
+has a dedicated on-demand selector in
+`tests/integration/test_lists/test-db/qa_gb300_beam_baseline_gsm8k_first100.yml`.
+These entries define how the gate is selected; they do not establish that a particular
+revision has passed it. Full 1,319-question GSM8K evaluation remains manual-only.
+
+## Comparing results
+
+Compare runs using the same dataset revision and question selection, prompt and request
+fields, scoring rules and protocol manifest. Also record the checkpoint, tokenizer/chat
+template, serving configuration, precision and concurrency; sharing this evaluator alone
+does not establish equivalent model accuracy. The baseline and an optimized serving
+configuration are separate measurements. Re-scoring saved replies checks scoring consistency;
+it does not verify that a different serving configuration generates equivalent replies.
