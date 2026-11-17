@@ -3396,16 +3396,25 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                                free_gpu_memory_fraction=0.6),
                  guided_decoding_backend="xgrammar",
                  speculative_config=spec_config) as llm:
-            outputs = llm.generate(
-                ["Pick a colour and some animals:"] * 16,
-                sampling_params=SamplingParams(
-                    max_tokens=32,
-                    temperature=0.8,
-                    top_p=0.95,
-                    guided_decoding=GuidedDecodingParams(regex=pattern)),
-                use_tqdm=False)
-        for output in outputs:
+            prompts = ["Pick a colour and some animals:"] * 16
+            sampling = dict(max_tokens=32, temperature=0.8, top_p=0.95)
+            guided = llm.generate(prompts,
+                                  sampling_params=SamplingParams(
+                                      guided_decoding=GuidedDecodingParams(
+                                          regex=pattern),
+                                      **sampling),
+                                  use_tqdm=False)
+            # Negative control on the same engine: without the grammar the
+            # model does not produce this odd pattern by itself, so the
+            # guided matches below come from the grammar, not the model.
+            control = llm.generate(prompts,
+                                   sampling_params=SamplingParams(**sampling),
+                                   use_tqdm=False)
+        for output in guided:
             assert re.fullmatch(pattern, output.outputs[0].text)
+        assert not all(
+            re.fullmatch(pattern, output.outputs[0].text)
+            for output in control)
 
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",

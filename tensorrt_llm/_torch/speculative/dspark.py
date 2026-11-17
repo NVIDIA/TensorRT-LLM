@@ -1721,7 +1721,11 @@ class DSparkWorker(DFlashWorker):
     :class:`DSv4DSparkWorker`.
     """
 
-    _guided_draft_loop = True
+    # The per-position masked draft loop is off: verification against the
+    # grammar-masked target is correct without it, and it costs a host
+    # round-trip per draft position, which halves guided throughput on small
+    # models and gains little on large ones.
+    _guided_draft_loop = False
 
     def set_draft_model(self, draft_model) -> None:
         """Reject an unsupported vocab mapping here rather than mid-decode.

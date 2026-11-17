@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Iterable, List, Optional, Tuple
@@ -160,9 +163,31 @@ class GuidedRequests:
         return len(self.requests)
 
 
+def _build_threads(backend) -> int:
+    """Threads used to build the bitmask rows of one batch in parallel.
+
+    Only the XGrammar backend is parallelized: it releases the GIL while
+    filling a bitmask, and the matcher of one request is independent of the
+    others. 1 builds serially. ``TRTLLM_GUIDED_DECODING_BUILD_THREADS``
+    overrides the default.
+    """
+    if backend != GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
+        return 1
+    default = min(8, os.cpu_count() or 1)
+    try:
+        return max(
+            1, int(os.getenv("TRTLLM_GUIDED_DECODING_BUILD_THREADS", default)))
+    except ValueError:
+        return default
+
+
 class GuidedDecoder:
     bitmask_dtype = torch.int32
     token_mask_dtype = torch.int32
+    # Serial unless the backend allows a build pool; the pool itself is
+    # created by the first build of two or more requests.
+    _build_pool: Optional[ThreadPoolExecutor] = None
+    _build_pool_size: int = 1
 
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
@@ -231,6 +256,14 @@ class GuidedDecoder:
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
 
+        # Filling the next-token bitmask is by far the dominant host cost of a
+        # guided step (a bounded-string state of a JSON schema costs
+        # milliseconds with xgrammar) and it is independent per request: each
+        # request owns its matcher, its slot's counters and its own bitmask
+        # rows. XGrammar releases the GIL while it fills, so the requests of a
+        # batch are built on a small thread pool.
+        self._build_pool_size = _build_threads(self.guided_decoding_backend)
+
     @property
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
@@ -252,102 +285,151 @@ class GuidedDecoder:
         self.init_failed_requests = []
         self.token_mask_host[:requests.num_bitmask_tokens].fill_(0)
 
-        for req, offset in requests.valid_requests_with_offsets():
-            slot = req.seq_slot
-            try:
-                self.num_advanced_tokens[slot] = 0
-                self.num_guided_tokens[slot] = 0
-
-                matcher_init: bool = req.require_matcher_init()
-                matcher_advance: bool = req.require_matcher_advance()
-                if not (matcher_init or matcher_advance):
-                    continue
-
-                if matcher_init:
-                    matcher = self.grammar_matcher_factory.create(
-                        req.guided_decoding_params)
-                    self.grammar_matchers[slot] = matcher
-
-                if matcher_advance:
-                    matcher = self.grammar_matchers[slot]
-                    # The last new token must be acceptable unless the matcher is terminated or None:
-                    # 1. For the main model loop, when overlap scheduler is enabled, the matcher may have accepted the EOS token in the draft tokens at the previous iteration.
-                    # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
-                    # 3. The matcher can be None if there was an error during its creation.
-                    if matcher is None or matcher.is_terminated(
-                    ) or self.is_draft_terminated[slot]:
-                        continue
-                    accepted = matcher.accept_token(req.new_token)
-                    if not accepted:
-                        if req.is_draft:
-                            self.is_draft_terminated[slot] = True
-                            logger.debug(
-                                f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
-                            )
-                            continue
-                        raise ValueError(
-                            f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
-                        )
-
-                self.num_advanced_tokens[slot] += 1
-                if not matcher.is_terminated():
-                    matcher.fill_next_token_bitmask(self.bitmask_host, offset)
-                    if not self._has_valid_token(offset):
-                        if req.is_draft:
-                            self.is_draft_terminated[slot] = True
-                            logger.debug(
-                                f"Draft request {req.request_id} at slot {slot} reached a grammar state with no valid token."
-                            )
-                            # Unlike the unacceptable-token path above, the
-                            # matcher did advance past new_token here, so the
-                            # drafting loop must still roll that advance back.
-                            self.num_advanced_draft_tokens[
-                                slot] += self.num_advanced_tokens[slot]
-                            continue
-                        # The request is about to be terminated, so exclude it
-                        # from the rollback pass: the matcher advance made
-                        # above is never verified against accepted tokens.
-                        self.num_advanced_tokens[slot] = 0
-                        raise ValueError(
-                            f"Request {req.request_id} at slot {slot} reached a grammar state with no valid token."
-                        )
-                    self.token_mask_host[offset] = 1
-                    self.num_guided_tokens[slot] += 1
-                    # Process draft tokens. Bound by the layout's draft length:
-                    # the new_tokens buffer always holds the static max, but only
-                    # `max_num_draft_tokens` slots are reserved this iteration.
-                    for i, tid in enumerate(
-                            req.draft_tokens[:requests.max_num_draft_tokens],
-                            1):
-                        accepted = matcher.accept_token(tid)
-                        if not accepted:
-                            break
-                        self.num_advanced_tokens[slot] += 1
-                        if matcher.is_terminated():
-                            break
-                        matcher.fill_next_token_bitmask(self.bitmask_host,
-                                                        offset + i)
-                        if not self._has_valid_token(offset + i):
-                            # Stop guiding here rather than failing the
-                            # request: the remaining draft positions are left
-                            # unconstrained and get verified as usual.
-                            break
-                        self.token_mask_host[offset + i] = 1
-                        self.num_guided_tokens[slot] += 1
-
-                if req.is_draft:
-                    assert len(req.draft_tokens) == 0
-                    self.num_advanced_draft_tokens[
-                        slot] += self.num_advanced_tokens[slot]
-
-            except Exception as e:
-                error_msg = f"Guided decoding error: {str(e)}"
-                failed_requests.append((req.request_id, error_msg))
-                logger.error(
-                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
-                )
-
+        items = list(requests.valid_requests_with_offsets())
+        if self._build_pool_size <= 1 or len(items) < 2:
+            results = self._build_requests(items, requests)
+        else:
+            pool = self._get_build_pool()
+            # One chunk per worker keeps the submit overhead small when the
+            # grammar is cheap. Chunks are contiguous, so failures keep the
+            # order of the serial build.
+            num_chunks = min(len(items), self._build_pool_size)
+            size = -(-len(items) // num_chunks)
+            chunks = [items[i:i + size] for i in range(0, len(items), size)]
+            results = [
+                r for chunk_results in pool.map(
+                    lambda chunk: self._build_requests(chunk, requests), chunks)
+                for r in chunk_results
+            ]
+        failed_requests.extend(r for r in results if r is not None)
         return failed_requests
+
+    def _get_build_pool(self) -> ThreadPoolExecutor:
+        if self._build_pool is None:
+            self._build_pool = ThreadPoolExecutor(
+                max_workers=self._build_pool_size,
+                thread_name_prefix="guided-build")
+            # Idle workers exit once the pool is shut down, which also
+            # happens when the decoder is collected.
+            weakref.finalize(self, self._build_pool.shutdown, wait=False)
+        return self._build_pool
+
+    def shutdown(self) -> None:
+        """Stop the build threads; a later build starts them again."""
+        pool, self._build_pool = self._build_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+    def _build_requests(
+            self, items: List[Tuple[GuidedRequest, int]],
+            requests: GuidedRequests) -> List[Optional[Tuple[int, str]]]:
+        return [
+            self._build_request(req, offset, requests) for req, offset in items
+        ]
+
+    def _build_request(self, req: GuidedRequest, offset: int,
+                       requests: GuidedRequests) -> Optional[Tuple[int, str]]:
+        """Build the bitmask rows of one request; returns its failure, if any.
+
+        Touches only the request's own matcher, its slot's entries of the
+        per-slot lists and its own rows of the host bitmask, so requests can
+        be built concurrently.
+        """
+        slot = req.seq_slot
+        try:
+            self.num_advanced_tokens[slot] = 0
+            self.num_guided_tokens[slot] = 0
+
+            matcher_init: bool = req.require_matcher_init()
+            matcher_advance: bool = req.require_matcher_advance()
+            if not (matcher_init or matcher_advance):
+                return None
+
+            if matcher_init:
+                matcher = self.grammar_matcher_factory.create(
+                    req.guided_decoding_params)
+                self.grammar_matchers[slot] = matcher
+
+            if matcher_advance:
+                matcher = self.grammar_matchers[slot]
+                # The last new token must be acceptable unless the matcher is terminated or None:
+                # 1. For the main model loop, when overlap scheduler is enabled, the matcher may have accepted the EOS token in the draft tokens at the previous iteration.
+                # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
+                # 3. The matcher can be None if there was an error during its creation.
+                if matcher is None or matcher.is_terminated(
+                ) or self.is_draft_terminated[slot]:
+                    return None
+                accepted = matcher.accept_token(req.new_token)
+                if not accepted:
+                    if req.is_draft:
+                        self.is_draft_terminated[slot] = True
+                        logger.debug(
+                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
+                        )
+                        return None
+                    raise ValueError(
+                        f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
+                    )
+
+            self.num_advanced_tokens[slot] += 1
+            if not matcher.is_terminated():
+                matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                if not self._has_valid_token(offset):
+                    if req.is_draft:
+                        self.is_draft_terminated[slot] = True
+                        logger.debug(
+                            f"Draft request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                        )
+                        # Unlike the unacceptable-token path above, the
+                        # matcher did advance past new_token here, so the
+                        # drafting loop must still roll that advance back.
+                        self.num_advanced_draft_tokens[
+                            slot] += self.num_advanced_tokens[slot]
+                        return None
+                    # The request is about to be terminated, so exclude it
+                    # from the rollback pass: the matcher advance made
+                    # above is never verified against accepted tokens.
+                    self.num_advanced_tokens[slot] = 0
+                    raise ValueError(
+                        f"Request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                    )
+                self.token_mask_host[offset] = 1
+                self.num_guided_tokens[slot] += 1
+                # Process draft tokens. Bound by the layout's draft length:
+                # the new_tokens buffer always holds the static max, but only
+                # `max_num_draft_tokens` slots are reserved this iteration.
+                for i, tid in enumerate(
+                        req.draft_tokens[:requests.max_num_draft_tokens],
+                        1):
+                    accepted = matcher.accept_token(tid)
+                    if not accepted:
+                        break
+                    self.num_advanced_tokens[slot] += 1
+                    if matcher.is_terminated():
+                        break
+                    matcher.fill_next_token_bitmask(self.bitmask_host,
+                                                    offset + i)
+                    if not self._has_valid_token(offset + i):
+                        # Stop guiding here rather than failing the
+                        # request: the remaining draft positions are left
+                        # unconstrained and get verified as usual.
+                        break
+                    self.token_mask_host[offset + i] = 1
+                    self.num_guided_tokens[slot] += 1
+
+            if req.is_draft:
+                assert len(req.draft_tokens) == 0
+                self.num_advanced_draft_tokens[
+                    slot] += self.num_advanced_tokens[slot]
+
+            return None
+        except Exception as e:
+            error_msg = f"Guided decoding error: {str(e)}"
+            failure = (req.request_id, error_msg)
+            logger.error(
+                f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
+            )
+        return failure
 
     def _copy_bitmask(self,
                       requests: GuidedRequests,
