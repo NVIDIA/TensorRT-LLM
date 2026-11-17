@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -791,20 +799,20 @@
 <p>We discussed the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction">high-level design</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer">implementation considerations</a> of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.</p>
 <p>These issues primarily stem from the weight updating mechanism.</p>
 <section id="initial-approach-for-weight-updating-cudamemcpyasync">
-<h5>1. Initial Approach for Weight Updating - cudaMemcpyAsync<a class="headerlink" href="#initial-approach-for-weight-updating-cudamemcpyasync" title="Link to this heading">#</a></h5>
+<span id="1-initial-approach-for-weight-updating---cudamemcpyasync"></span><h5>1. Initial Approach for Weight Updating - cudaMemcpyAsync<a class="headerlink" href="#initial-approach-for-weight-updating-cudamemcpyasync" title="Link to this heading">#</a></h5>
 <p>Our initial approach for weight updating was straightforward. Since GPU kernels from the model forward thread read weights, we placed weights directly in GPU memory using <code class="docutils literal notranslate"><span class="pre">cudaMalloc</span></code> and used a separate non-blocking stream to invoke multiple <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code> calls for weight updates. After implementing the first version of the prototype, we discovered that with CUDA Graph enabled, the model forward thread and the weight updating thread could deadlock.</p>
 <p>After investigation, we found the root cause: both <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> and <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code> were competing for the same mutex inside CUDA. In our implementation with layer-wise weight updating, the GPU needs to synchronize with the CPU during model forward passes. This creates kernels that wait for CPU signals indicating that updates are complete and MoE weights are safe to use. These waiting kernels block subsequent kernels.</p>
 <p>Since LLM models contain numerous kernels, <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> may need to wait for previous kernels to finish to acquire sufficient resources for launch completion. When waiting kernels are blocked by the CPU, <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> is also blocked. The CPU thread responsible for unblocking this process is the weight update thread, which should signal completion when weight updating finishes. However, since our initial implementation used <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code> for weight updating, it needed to acquire the CUDA mutex before starting memcpy operations. Unfortunately, this mutex was held by <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> in the model forward thread, which was waiting for the weight updating thread to complete. This created a deadlock scenario.</p>
 <p>To resolve the deadlock, we needed to break the dependency cycle. While the model forward thread must depend on the weight updating thread for correctness, the weight updating process should not wait for <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> in the model forward thread. Our solution was to use alternative methods instead of <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code> to avoid competing for the same mutex with <code class="docutils literal notranslate"><span class="pre">cudaGraphLaunch</span></code> and other CUDA APIs.</p>
 </section>
 <section id="avoiding-deadlock-multithreaded-cpu-copy-with-managed-memory">
-<h5>2. Avoiding Deadlock - Multithreaded CPU Copy with Managed Memory<a class="headerlink" href="#avoiding-deadlock-multithreaded-cpu-copy-with-managed-memory" title="Link to this heading">#</a></h5>
+<span id="2-avoiding-deadlock---multithreaded-cpu-copy-with-managed-memory"></span><h5>2. Avoiding Deadlock - Multithreaded CPU Copy with Managed Memory<a class="headerlink" href="#avoiding-deadlock-multithreaded-cpu-copy-with-managed-memory" title="Link to this heading">#</a></h5>
 <p>Since weight updating is handled by CPU threads and we wanted to avoid interfering with GPU model forward passes while avoiding mutex contention in <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code>, we chose to use CPU threads for copying operations. To achieve this, we needed MoE weights to be accessible by the CPU while remaining physically located on the GPU to provide high bandwidth for MoE forward passes.</p>
 <p>On GB200 systems, the C2C link between CPU and GPU allows CPU access to GPU memory, with GPU memory treated as NUMA nodes. Although the CUDA Driver API doesn’t directly support this in CUDA 12.9, one option is to use <code class="docutils literal notranslate"><span class="pre">cudaMallocManaged</span></code> for MoE weights and use <code class="docutils literal notranslate"><span class="pre">cudaMemAdvise</span></code> to set the GPU as the preferred location while enabling CPU access. The CPU copy implementation was straightforward, but we still needed to detect system topology and bind to CPU cores belonging to the same NUMA nodes as the GPU’s host NUMA node.</p>
 <p>After completing this implementation, CUDA Graph worked well with weight updating and we began seeing end-to-end performance benefits using Online EPLB in some configurations. However, we soon encountered issues with managed memory. Although the preferred location of managed memory was set to GPU, and on GB200 it typically remains on GPU when accessed by CPU, we still observed page migration when GPU memory usage approached capacity limits. The bottom half of the UVM interrupt service process for each GPU consumed 100% of one CPU core’s time, causing severe slowdowns when approaching GPU memory limits. To address this, we needed GPU memory that was accessible by CPU without triggering page migration.</p>
 </section>
 <section id="numa-memory-to-prevent-page-migration">
-<h5>3. NUMA Memory to Prevent Page Migration<a class="headerlink" href="#numa-memory-to-prevent-page-migration" title="Link to this heading">#</a></h5>
+<span id="3-numa-memory-to-prevent-page-migration"></span><h5>3. NUMA Memory to Prevent Page Migration<a class="headerlink" href="#numa-memory-to-prevent-page-migration" title="Link to this heading">#</a></h5>
 <p>On GB200 systems, the Grace CPU and Blackwell GPU are connected via C2C links, enabling mutual memory access. GPU memories are also exposed to the OS as NUMA nodes. Running <code class="docutils literal notranslate"><span class="pre">numactl</span> <span class="pre">-H</span></code> on GB200 nodes shows output similar to this:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span># numactl -H
 available: 34 nodes (0-33)
@@ -852,7 +860,7 @@ node   0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18
 <p>This approach resolved page migration issues, and Online EPLB worked well for large batch sizes per GPU (e.g., 256). However, when investigating smaller batch sizes (32 or 64), we found that MoE GEMM kernel execution time could be higher than without Online EPLB—increasing from 75 µs to 93 µs for the first group GEMM of MoE with EP size 16. Further experiments revealed that when running group GEMM multiple times in the same layer, only the first execution suffered from this slowdown. By adding a warmup kernel that read only one value from 64 KB of weights, we found this simple warmup kernel consumed more than half the execution time of the group GEMM kernel. More interestingly, when running this warmup kernel in parallel with other kernels (using only 14 CTAs), those other kernels also became extremely slow. Based on these observations, we concluded that we were encountering TLB thrashing.</p>
 </section>
 <section id="addressing-the-tlb-thrashing-issue">
-<h5>4. Addressing the TLB Thrashing Issue<a class="headerlink" href="#addressing-the-tlb-thrashing-issue" title="Link to this heading">#</a></h5>
+<span id="4-addressing-the-tlb-thrashing-issue"></span><h5>4. Addressing the TLB Thrashing Issue<a class="headerlink" href="#addressing-the-tlb-thrashing-issue" title="Link to this heading">#</a></h5>
 <p>On GB200 systems, the default page size is 64 KB, which can be verified with:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span># getconf PAGE_SIZE
 65536
@@ -1142,9 +1150,9 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

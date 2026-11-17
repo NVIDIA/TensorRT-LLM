@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -729,12 +737,31 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/M
 </div>
 </section>
 <section id="mixed-mxfp8-nvfp4">
-<h3>Mixed MXFP8/NVFP4<a class="headerlink" href="#mixed-mxfp8-nvfp4" title="Link to this heading">#</a></h3>
+<span id="mixed-mxfp8nvfp4"></span><h3>Mixed MXFP8/NVFP4<a class="headerlink" href="#mixed-mxfp8-nvfp4" title="Link to this heading">#</a></h3>
 <p>The <code class="docutils literal notranslate"><span class="pre">MiniMax-M3-NVFP4</span></code> checkpoint uses MXFP8 base layers and NVFP4 routed experts
 (<code class="docutils literal notranslate"><span class="pre">MIXED_PRECISION</span></code>). Its name describes weight precision; set
 <code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code> explicitly to select FP8 or NVFP4 KV cache.</p>
+<p>The compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture is
+also loaded as mixed MXFP8/NVFP4. Such a checkpoint declares
+<code class="docutils literal notranslate"><span class="pre">quant_method:</span> <span class="pre">mxfp8</span></code> together with <code class="docutils literal notranslate"><span class="pre">moe_quant_algo:</span> <span class="pre">NVFP4</span></code>,
+<code class="docutils literal notranslate"><span class="pre">moe_quant_format:</span> <span class="pre">nvfp4-pack-quantized</span></code> and <code class="docutils literal notranslate"><span class="pre">group_size:</span> <span class="pre">16</span></code>, and stores each
+routed expert projection as <code class="docutils literal notranslate"><span class="pre">weight_packed</span></code>, <code class="docutils literal notranslate"><span class="pre">weight_scale</span></code>,
+<code class="docutils literal notranslate"><span class="pre">weight_global_scale</span></code> and <code class="docutils literal notranslate"><span class="pre">input_global_scale</span></code>. TensorRT LLM keeps the packed
+FP4 bytes and E4M3 block scales as stored and converts the global scales at
+load time: the stored <code class="docutils literal notranslate"><span class="pre">2688</span> <span class="pre">/</span> <span class="pre">amax</span></code> multipliers become the reciprocal
+<code class="docutils literal notranslate"><span class="pre">weight_scale_2</span></code> and <code class="docutils literal notranslate"><span class="pre">input_scale</span></code> divisors of the NVFP4 MoE weight contract.
+A global scale that cannot be inverted (zero, as stored for an expert without
+calibration data, or negative or not finite) is set to 0 with a warning; a
+weight global scale of 0 zeroes that expert’s output. The routed experts then
+run the standard static NVFP4 MoE recipe (static input scale, BF16 rounding
+after FC1, routing weights applied in the finalize) on any NVFP4-capable MoE
+backend; <code class="docutils literal notranslate"><span class="pre">moe_config.backend:</span> <span class="pre">CUTLASS</span></code> and <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> are both qualified on this
+packaging.</p>
 <p>Use the checkpoint’s chat template (<code class="docutils literal notranslate"><span class="pre">chat_template.jinja</span></code>) when launching the
-server (see <a class="reference internal" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a>).</p>
+server (see <a class="reference internal" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a>).
+Evaluate a checkpoint in this packaging through the chat template as well, for
+example <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span> <span class="pre">...</span> <span class="pre">gsm8k</span> <span class="pre">--apply_chat_template</span> <span class="pre">--chat_template_kwargs</span> <span class="pre">'{&quot;thinking_mode&quot;:</span> <span class="pre">&quot;disabled&quot;}'</span></code>; the raw eight-shot prompts of the <code class="docutils literal notranslate"><span class="pre">gsm8k</span></code>
+default bypass the template the model was trained with.</p>
 </section>
 </section>
 <section id="feature-support-notes">
@@ -787,7 +814,7 @@ in place so CUDA-graph replay retains valid addresses.</p>
 <section id="container-image">
 <h3>Container Image<a class="headerlink" href="#container-image" title="Link to this heading">#</a></h3>
 <p>The TensorRT LLM NVIDIA NGC image is used as the Slurm container:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4
 </pre></div>
 </div>
 <p>Note:</p>
@@ -857,7 +884,7 @@ MiniMax-M3’s automatic backend selection and uses the requested policy.</p>
 srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ntasks<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ntasks-per-node<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span>--gres<span class="o">=</span>gpu:4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span>/models:/models,/workspace:/workspace,<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">"trtllm-llmapi-launch \</span>
@@ -889,14 +916,14 @@ Adjust <code class="docutils literal notranslate"><span class="pre">-N</span></c
 </ul>
 </section>
 <section id="extra-llm-api-options-yaml-options">
-<h4><code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> YAML options<a class="headerlink" href="#extra-llm-api-options-yaml-options" title="Link to this heading">#</a></h4>
+<span id="--extra_llm_api_options-yaml-options"></span><h4><code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> YAML options<a class="headerlink" href="#extra-llm-api-options-yaml-options" title="Link to this heading">#</a></h4>
 <p>The curated config sets all the YAML knobs; this section only documents the two MiniMax-M3-specific constraints. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> class</a> for the full reference.</p>
 <section id="sparse-attention-config-algorithm">
-<h5><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm</span></code><a class="headerlink" href="#sparse-attention-config-algorithm" title="Link to this heading">#</a></h5>
+<span id="sparse_attention_configalgorithm"></span><h5><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm</span></code><a class="headerlink" href="#sparse-attention-config-algorithm" title="Link to this heading">#</a></h5>
 <p>Must be set to <code class="docutils literal notranslate"><span class="pre">minimax_m3</span></code>. There is no dense fallback for the MiniMax-M3 sparse-attention layers.</p>
 </section>
 <section id="kv-cache-config-enable-block-reuse">
-<h5><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse</span></code><a class="headerlink" href="#kv-cache-config-enable-block-reuse" title="Link to this heading">#</a></h5>
+<span id="kv_cache_configenable_block_reuse"></span><h5><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse</span></code><a class="headerlink" href="#kv-cache-config-enable-block-reuse" title="Link to this heading">#</a></h5>
 <p>Must be <code class="docutils literal notranslate"><span class="pre">false</span></code>. The sparse-attention path does not support KV cache block reuse across requests with shared prefixes.</p>
 </section>
 </section>
@@ -1054,18 +1081,12 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 </ul>
 <p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
 <div class="math notranslate nohighlight">
-\[
-\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
-\]</div>
+\[\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}\]</div>
 <p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
 <div class="math notranslate nohighlight">
-\[
-\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-\]</div>
+\[\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}\]</div>
 <div class="math notranslate nohighlight">
-\[
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
-\]</div>
+\[\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}\]</div>
 </section>
 <section id="end-to-end-e2e-latency">
 <h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
@@ -1075,17 +1096,13 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
 <p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p>
 <div class="math notranslate nohighlight">
-\[
-\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+\[\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}\]</div>
 </section>
 <section id="tokens-per-second-tps-or-output-token-throughput">
 <h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
 <p>How many output tokens the system generates each second.</p>
 <div class="math notranslate nohighlight">
-\[
-\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+\[\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}\]</div>
 </section>
 </section>
 </section>
@@ -1273,9 +1290,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -779,7 +787,7 @@ However, since Q is in BF16 format, FMHA will also be performed in BF16 format, 
 <p>This feature is supported by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7571">PR 7571</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7891">PR 7891</a>.</p>
 </section>
 <section id="context-phase-q-k-v-concat-optimization">
-<h3>Context phase Q/K/V <code class="docutils literal notranslate"><span class="pre">concat</span></code> optimization<a class="headerlink" href="#context-phase-q-k-v-concat-optimization" title="Link to this heading">#</a></h3>
+<span id="context-phase-qkv-concat-optimization"></span><h3>Context phase Q/K/V <code class="docutils literal notranslate"><span class="pre">concat</span></code> optimization<a class="headerlink" href="#context-phase-q-k-v-concat-optimization" title="Link to this heading">#</a></h3>
 <p>In the standard attention mechanism, Q/K/V are derived from the same hidden states through <code class="docutils literal notranslate"><span class="pre">GEMM_Q</span></code>/<code class="docutils literal notranslate"><span class="pre">GEMM_K</span></code>/<code class="docutils literal notranslate"><span class="pre">GEMM_V</span></code> operations, and TensorRT LLM typically merges the weights of these three GEMMs in advance, executing a single <code class="docutils literal notranslate"><span class="pre">GEMM_QKV</span></code> to obtain a large contiguous tensor QKV, which is then used as the input to the attention kernels.</p>
 <p>However, DeepSeek’s MLA is a special attention module where Q/K/V are obtained by applying different downsampling-upsampling processes to the hidden states. Additionally, Q and K are divided into two parts: with RoPE and without RoPE, so a contiguous QKV tensor cannot be obtained directly.</p>
 <p>In the initial implementation of context MLA, due to input format constraints of the attention kernels, TensorRT LLM had to explicitly concatenate the Q/K/V tensors into one contiguous QKV tensor, resulting in extra memory and time overhead, which became more significant in wide EP scenarios.</p>
@@ -858,7 +866,7 @@ However, since Q is in BF16 format, FMHA will also be performed in BF16 format, 
 <p>The optimization is compatible with NVFP4 combine without requiring any API changes and brings no accuracy impact. It was added by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7422">PR 7422</a>.</p>
 </section>
 <section id="optimize-pytorch-native-copy-and-concat-using-torch-compile">
-<h3>Optimize PyTorch native <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> using <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code><a class="headerlink" href="#optimize-pytorch-native-copy-and-concat-using-torch-compile" title="Link to this heading">#</a></h3>
+<span id="optimize-pytorch-native-copy-and-concat-using-torchcompile"></span><h3>Optimize PyTorch native <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> using <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code><a class="headerlink" href="#optimize-pytorch-native-copy-and-concat-using-torch-compile" title="Link to this heading">#</a></h3>
 <p>We have observed several inefficient <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> operations on context phase in wide EP scenarios, and one significant case is copying <code class="docutils literal notranslate"><span class="pre">k_nope</span></code> in the MLA module. As mentioned in previous section, Q and K are divided into two parts in DeepSeek MLA: with RoPE and without RoPE. In context phase, head size of nope will be 128, and that of rope will be 64, which adds up to 192 head size. However, the FMHA kernel will directly read Q and K with head size 192, which means that we have to prepare the full Q and K using <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code>.</p>
 <p>On ISL/OSL 8k/1k, batch size 1 cases, on context phase, we observed that the <code class="docutils literal notranslate"><span class="pre">copy</span></code> operation takes 306us, which is clearly suboptimal. If we try to calculate a theoretical duration, considering 8 TB/sec HBM3e bandwidth, the formula would roughly be:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">(</span> <span class="n">ISL</span> <span class="mi">8192</span> <span class="o">*</span> <span class="n">k_nope_size</span> <span class="mi">128</span> <span class="o">*</span> <span class="n">num_heads</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">2</span> <span class="nb">bytes</span> <span class="o">*</span> <span class="n">read</span><span class="o">/</span><span class="n">write</span> <span class="mi">2</span> <span class="p">)</span> <span class="o">/</span> <span class="p">(</span> <span class="mi">8</span> <span class="n">TB</span><span class="o">/</span><span class="n">sec</span> <span class="o">*</span> <span class="n">efficiency</span> <span class="mf">0.8</span> <span class="p">)</span> <span class="o">=</span> <span class="mi">80</span> <span class="n">us</span>
@@ -1058,9 +1066,9 @@ However, since Q is in BF16 format, FMHA will also be performed in BF16 format, 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

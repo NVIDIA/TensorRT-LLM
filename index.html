@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -80,7 +80,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -476,6 +476,8 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -505,11 +507,13 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -524,6 +528,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -535,6 +540,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
@@ -576,6 +582,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -662,7 +670,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#install-tensorrt-llm">Install TensorRT LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-online-serving-with-trtllm-serve">Deploy Online Serving with trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-with-trtllm-serve">Deploy Online Serving with trtllm-serve</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api">Run Offline Inference with LLM API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-visualgen-api">Run Offline Inference with VisualGen API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#next-steps">Next Steps</a></li>
@@ -730,7 +738,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html#visual-generation-models">Visual Generation Models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#id42">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#id49">Supported Models</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Beta)</a><ul>
@@ -825,6 +833,16 @@
 <li class="toctree-l2"><a class="reference internal" href="features/embeddings.html#encoder-cuda-graphs">Encoder CUDA graphs</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="features/reranking.html">Reranking</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#quick-start">Quick start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#request-fields">Request fields</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#dynamic-batching">Dynamic batching</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#scoring-contract">Scoring contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#supported-model-architectures">Supported model architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#error-handling">Error handling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/reranking.html#deployment-scope">Deployment scope</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/kvcache.html#the-basics">The Basics</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/kvcache.html#reuse-across-requests">Reuse Across Requests</a></li>
@@ -907,6 +925,15 @@
 <li class="toctree-l2"><a class="reference internal" href="features/sampling.html#logits-processor">Logits processor</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="features/watermarking.html">Text Watermarking</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#enable-it">Enable it</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#which-requests-are-watermarked">Which requests are watermarked</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#speculative-decoding">Speculative decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#detect-it">Detect it</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#compatibility">Compatibility</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/watermarking.html#limitations">Limitations</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/additional-outputs.html#options">Options</a></li>
 </ul>
@@ -928,6 +955,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#quick-start">Quick Start</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#suffix-automaton-sa-enhancement">Suffix Automaton (SA) Enhancement</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#advanced-runtime-controls">Advanced runtime controls</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </li>
@@ -1009,7 +1037,9 @@
 <li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#overview">Overview</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#enabling-the-cache">Enabling the cache</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#scope-and-safety">Scope and safety</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#multiple-serving-frontends">Multiple serving frontends</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#measured-effect">Measured effect</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/prefix-tokenization-cache.html#node-shared-prompt-token-cache">Node-shared prompt token cache</a></li>
 </ul>
 </li>
 </ul>
@@ -1136,6 +1166,26 @@
 <div class="toctree-wrapper compound">
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#rank-imbalance-in-expert-parallel-moe-prefill">1. Rank Imbalance in Expert-Parallel MoE Prefill</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#challenges-in-per-layer-expert-replication">2. Challenges in Per-Layer Expert Replication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#iser-moe-design">3. ISER-MoE Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#performance-evaluation">4. Performance Evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#using-iser-moe-in-tensorrt-llm">5. Using ISER-MoE in TensorRT LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#discussion">6. Discussion</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html#conclusion-and-further-reading">7. Conclusion and Further Reading</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#motivation">Motivation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#dense-dwdp-overview">Dense DWDP Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#dense-dwdp-implementation">Dense DWDP Implementation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#key-optimizations">Key Optimizations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#evaluation">Evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html#summary">Summary</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#introduction-and-motivation">Introduction and Motivation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#overview-of-kv-cache-compression-in-tensorrt-llm">Overview of KV Cache Compression in TensorRT LLM</a></li>
@@ -1653,9 +1703,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

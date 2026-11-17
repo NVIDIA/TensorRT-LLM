@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -686,12 +694,28 @@ the cached ids, so the cost of a turn scales with the delta rather than the
 whole prompt. The new prompt may also rewrite the last tokens of the cached one
 (those after the seam described below), as a chat template does when it
 replaces the previous turn’s generation prefix with the response.</p>
+<p>Agentic clients also rewrite the end of the history between turns, for example
+by trimming a tool result or replacing the last message, so the new prompt is
+no longer an extension of the cached one. The cache records a checkpoint every
+256 tokens of a cached prompt. When a new prompt diverges from a cached one, the
+cache reuses the cached ids up to the checkpoint one interval before the last
+checkpoint inside their longest common prefix, and tokenizes only the rest. The
+same is tried when a new prompt extends a much shorter cached prompt, such as
+another conversation with the same opening, and the later split is used.</p>
 <p>Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
-backs off a fixed number of tokens from the end of the cached prefix,
+backs off a fixed number of tokens from the end of the cached prefix (for a
+diverging prompt, at least one checkpoint interval before the divergence),
 re-tokenizes from there, and accepts the splice only if the re-tokenized ids
-equal the cached ids over that seam. Otherwise the prompt is tokenized in full.
-The output is always identical to tokenizing the whole prompt.</p>
+equal the cached ids over that seam (for a diverging prompt, over the whole
+interval up to the next checkpoint). Otherwise the prompt is tokenized in full. Every split is moved to
+the first token of a character, so a character tokenized into several tokens is
+never split. The output is always identical to tokenizing the whole prompt.</p>
+<p>Some tokenizers alter every text they tokenize; for example, a <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code>
+whose normalizer prepends <code class="docutils literal notranslate"><span class="pre">▁</span></code> (as for Phi-3 and Mixtral-8x7B-v0.1) adds a space
+to every tail. Such a shift can pass the check at the seam, so the cache probes
+the tokenizer when it is created and stays disabled, with a warning, if a tail
+can be shifted.</p>
 </section>
 <section id="enabling-the-cache">
 <h2>Enabling the cache<a class="headerlink" href="#enabling-the-cache" title="Link to this heading">#</a></h2>
@@ -727,12 +751,16 @@ LLM argument, either in the <code class="docutils literal notranslate"><span cla
 <td class="text-right"><p>4096</p></td>
 <td><p>Prompts shorter than this are tokenized normally and never cached.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION</span></code></p></td>
+<td class="text-right"><p>0</p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to tokenize each conversation in one serving frontend; see <a class="reference internal" href="#multiple-serving-frontends">Multiple serving frontends</a>.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
-<p>Each value must be a positive integer. A malformed value raises at server
-startup so that misconfiguration fails loudly rather than silently disabling a
-feature you turned on.</p>
+<p>The sizing values must be positive integers, and the routing switch must be <code class="docutils literal notranslate"><span class="pre">0</span></code>
+or <code class="docutils literal notranslate"><span class="pre">1</span></code>. A malformed value raises at server startup so that misconfiguration
+fails loudly rather than silently disabling a feature you turned on.</p>
 </section>
 <section id="scope-and-safety">
 <h2>Scope and safety<a class="headerlink" href="#scope-and-safety" title="Link to this heading">#</a></h2>
@@ -747,7 +775,10 @@ completions apply the chat template and tokenize with
 <code class="docutils literal notranslate"><span class="pre">add_special_tokens=False</span></code>, so they benefit. <code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code> defaults to
 <code class="docutils literal notranslate"><span class="pre">add_special_tokens=True</span></code> and is not accelerated.</p></li>
 <li><p>A prompt that reuses a cached entry replaces that entry, so a conversation
-costs one entry regardless of how many turns it has. Lookup is bucketed by a
+costs one entry regardless of how many turns it has. A prompt that diverges
+from a cached entry before its seam is added next to it instead: the
+divergence may be a branch, such as a subagent started from a shared history,
+and the original conversation can still continue from the old entry. Lookup is bucketed by a
 hash of the first <code class="docutils literal notranslate"><span class="pre">TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS</span></code> characters, and each
 entry keeps a short probe of the characters before its seam so that
 conversations sharing a long system preamble are told apart without
@@ -758,10 +789,63 @@ token ids when its <code class="docutils literal notranslate"><span class="pre">
 <li><p>An unexpected exception inside the cache disables it, with a warning, and the
 request is tokenized normally. A cache problem never fails a request.</p></li>
 <li><p>The cache logs its configuration at startup and, every 1000 cache-eligible
-requests, an <code class="docutils literal notranslate"><span class="pre">INFO</span></code> line with the hit rate, the number of re-synchronization
-fallbacks, and its occupancy, so a cache that is enabled but never hitting is
-visible in the server log.</p></li>
+requests (routed ones included), an <code class="docutils literal notranslate"><span class="pre">INFO</span></code> line with the hit rate (and how many hits were on
+diverging prompts), the number of re-synchronization fallbacks, how many
+prompts were routed to another frontend and how many were tokenized locally
+because routing failed (see below), and its occupancy, so a cache that is
+enabled but never hitting is visible in the server log.</p></li>
 </ul>
+</section>
+<section id="multiple-serving-frontends">
+<h2>Multiple serving frontends<a class="headerlink" href="#multiple-serving-frontends" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> starts 8 frontend processes by default. When you enable the
+cache for multi-turn traffic, use a single serving frontend by passing
+<code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span> <span class="pre">1</span></code> (or setting <code class="docutils literal notranslate"><span class="pre">num_serve_frontends:</span> <span class="pre">1</span></code> in the
+<code class="docutils literal notranslate"><span class="pre">--config</span></code> YAML file). Multiple frontends are available only with the classic
+IPC executor, so this section applies only there.</p>
+<p>The cache lives in the memory of one frontend process and is not shared
+between processes. With <code class="docutils literal notranslate"><span class="pre">num_serve_frontends:</span> <span class="pre">K</span></code>, the K frontend processes
+share the serving port through <code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code>, and the kernel assigns each new
+TCP connection to one of them without looking at the request. A client that
+opens a new connection per request, as many benchmark clients do, therefore
+sends each turn of a conversation to an arbitrary frontend. That frontend
+usually has not seen the conversation’s previous turn, so the prompt is
+tokenized in full.</p>
+<p>On an agentic multi-turn trace with prompts of about 160k tokens on average
+(GLM-5.3 and its tokenizer on GB300), at one session, the p90 time spent in the
+frontend was about 165 ms with 8 frontends and 44 ms with one. Decode throughput
+per user was the same from 1 to 32 concurrent sessions, the range measured,
+because at that concurrency the frontend is not the bottleneck.</p>
+<p>Multiple frontends help when a single Python frontend cannot keep up, typically
+at high request rates with short prompts. That is not the workload this cache
+targets.</p>
+<p>A client that can pick the frontend itself avoids the problem: with
+<code class="docutils literal notranslate"><span class="pre">serve_frontend_affinity_port_stride</span></code> set, each frontend also listens on its own
+port, and a disaggregated server sends every context request that carries a
+conversation id to the port of the frontend that conversation maps to.</p>
+<p>Otherwise, if you need several frontends, set
+<code class="docutils literal notranslate"><span class="pre">TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION=1</span></code> to tokenize each conversation
+in one frontend. A chat request’s conversation id (the same id attention DP
+routes by: from <code class="docutils literal notranslate"><span class="pre">conversation_params.conversation_id</span></code> or headers such as
+<code class="docutils literal notranslate"><span class="pre">X-Correlation-ID</span></code>, or, on a disaggregated context server, the sub-agent parent
+id forwarded by the disaggregated server) is mapped to an owner frontend, the
+same one the affinity ports use, and the frontend the request arrived at sends
+the prompt text to the owner over a local Unix socket and gets back the token
+ids; the request itself stays where it arrived. Routing helps only when the id
+is stable across a conversation’s turns: with an id that is fresh on every
+request, as many gateways set <code class="docutils literal notranslate"><span class="pre">X-Correlation-ID</span></code>, it only adds a hop per turn.</p>
+<p>A request without a conversation id is tokenized locally. So is one whose owner
+is not serving, does not answer within 5 seconds, or cannot tokenize the
+prompt; these are counted as route failures in the periodic log line. An owner
+that times out is logged with a warning and not asked again for 30 seconds.
+Each frontend keeps one connection to every other frontend, shared by its
+tokenizing threads, so with K frontends each one holds 2 × (K − 1) extra Unix
+sockets and K − 1 extra threads.</p>
+<p>The switch is off by default. When it is set but cannot take effect, with a
+single frontend or with the cache disabled, the server logs a warning; when it
+takes effect, each frontend logs an <code class="docutils literal notranslate"><span class="pre">INFO</span></code> line. On the trace above with 8
+frontends, it brought the p90 frontend time at one session from about 165 ms to
+about 58 ms.</p>
 </section>
 <section id="measured-effect">
 <h2>Measured effect<a class="headerlink" href="#measured-effect" title="Link to this heading">#</a></h2>
@@ -806,6 +890,34 @@ improvement from it.</p>
 tokenizers on 300 randomly grown multi-turn prompts each, with deltas
 deliberately starting mid-word: 300/300 identical ids, 280 cache hits, and 0
 re-synchronization fallbacks per tokenizer.</p>
+<p>Splicing diverging prompts was checked on 300 multi-turn prompts whose history
+is rewritten between turns: all 300 matched tokenizing the whole prompt, 99.3%
+were cache hits, and tokenization took about a tenth of the time of
+tokenizing every prompt in full.</p>
+</section>
+<section id="node-shared-prompt-token-cache">
+<h2>Node-shared prompt token cache<a class="headerlink" href="#node-shared-prompt-token-cache" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">prompt_token_cache_config</span></code> (prototype) keeps prompt token ids in files that
+every serving frontend of a node shares, so a turn still hits the cache when
+another frontend (<code class="docutils literal notranslate"><span class="pre">--num_serve_frontends</span></code>) served the previous turn. Only the
+DeepSeek-V4.1 input processor (checkpoints with a vision tower) uses it; other
+input processors ignore it with a warning.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">prompt_token_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/dev/shm/trtllm-prompt-tokens</span><span class="w">  </span><span class="c1"># node-local, the same for every frontend</span>
+<span class="w">  </span><span class="nt">max_bytes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1073741824</span><span class="w">                </span><span class="c1"># 1 GiB</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">path</span></code> is a directory on a node-local file system such as a tmpfs, created if
+missing. Every frontend of the server must use the same directory, which must
+be owned by the serving user and not writable by group or others.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_bytes</span></code> caps the space the entries take, each counted in whole file
+system blocks; the least recently used entries are evicted first.</p></li>
+<li><p>A prompt reuses the ids of its longest cached prefix that ends at an
+<code class="docutils literal notranslate"><span class="pre">&lt;｜Assistant｜&gt;</span></code> marker and tokenizes only the rest, so the ids equal a full
+tokenization. Startup fails unless the tokenizer is fast and keeps that marker
+as one added token that does not strip its neighbours.</p></li>
+</ul>
 </section>
 </section>
 
@@ -861,7 +973,9 @@ re-synchronization fallbacks per tokenizer.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-the-cache">Enabling the cache</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scope-and-safety">Scope and safety</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multiple-serving-frontends">Multiple serving frontends</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#measured-effect">Measured effect</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#node-shared-prompt-token-cache">Node-shared prompt token cache</a></li>
 </ul>
   </nav></div>
 
@@ -953,9 +1067,9 @@ re-synchronization fallbacks per tokenizer.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

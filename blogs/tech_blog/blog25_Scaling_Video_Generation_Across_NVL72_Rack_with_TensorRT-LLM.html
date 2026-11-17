@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -743,9 +751,7 @@
 <h2>CFG Parallelism<a class="headerlink" href="#cfg-parallelism" title="Link to this heading">#</a></h2>
 <p>Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step - once with the positive prompt embedding to produce the conditional noise prediction, once with the negative prompt embedding to produce the unconditional one - and combines the two predictions as</p>
 <div class="math notranslate nohighlight">
-\[
-\text{noise} = \text{noise}_\text{uncond} + \text{guidance scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})
-\]</div>
+\[\text{noise} = \text{noise}_\text{uncond} + \text{guidance scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})\]</div>
 <p>The two evaluations share weights, timestep, and shape, so they are perfectly parallelisable across two disjoint GPU groups. CFG parallelism exploits this by setting <code class="docutils literal notranslate"><span class="pre">cfg_size</span> <span class="pre">=</span> <span class="pre">2</span></code>: the conditional stream runs on one half of the mesh and the unconditional stream on the other half. Each half runs its full DiT forward end to end with no cross-stream communication; only the two scalar noise tensors meet at the combine step.</p>
 <p><code class="docutils literal notranslate"><span class="pre">cfg</span></code> is the outermost mesh dimension, so each half of the GPUs runs one stream end to end and loads only its own (conditional or unconditional) prompt embedding. The two halves meet just once per step: a single all-gather over the CFG group exchanges the local <code class="docutils literal notranslate"><span class="pre">noise_pred</span></code>, after which every rank holds both predictions and applies the combine locally. Extra guidance streams (e.g. STG, modality conditioning) reuse the same all-gather - one collective per stream.</p>
 <p><strong>The net effect is a near-2x per-step latency reduction</strong> for the cost of 2x weight replication and a single per-step all-gather over a 2-rank group - small enough that the collective is bandwidth-bound, not latency-bound, and overlaps essentially perfectly with the post-combine scheduler step on each rank. Turning on <code class="docutils literal notranslate"><span class="pre">cfg_size=2</span></code> alone, with no other parallelism, nearly halves latency:</p>
@@ -885,7 +891,7 @@
 <section id="context-parallelism">
 <h2>Context Parallelism<a class="headerlink" href="#context-parallelism" title="Link to this heading">#</a></h2>
 <section id="ring-attention">
-<h3>1. Ring Attention<a class="headerlink" href="#ring-attention" title="Link to this heading">#</a></h3>
+<span id="1-ring-attention"></span><h3>1. Ring Attention<a class="headerlink" href="#ring-attention" title="Link to this heading">#</a></h3>
 <p>Like Ulysses, Ring attention (<a class="reference external" href="https://arxiv.org/abs/2310.01889">arXiv:2310.01889</a>) shards the spatiotemporal sequence so each rank holds <span class="math notranslate nohighlight">\([B, S/P, H, D]\)</span> and FFN, norms, and modulation run on that shard with no communication. The difference is how attention itself is made global: Ulysses swaps to head sharding inside the attention layer, which caps the parallel degree at the number of attention heads. <strong>Ring has no head-count ceiling</strong> - the ring degree <span class="math notranslate nohighlight">\(P\)</span> can exceed <code class="docutils literal notranslate"><span class="pre">num_heads</span></code>, which makes it the lever required for pushing sequence parallelism past the Ulysses limit on a given GPU count.</p>
 <p><strong>K/V blocks rotate; Q stays put.</strong> Each rank keeps its local query shard resident and passes key/value blocks around a ring of <span class="math notranslate nohighlight">\(P\)</span> GPUs. Over <span class="math notranslate nohighlight">\(P\)</span> steps, the rank computes partial attention of its local Q against whichever K/V block it currently holds, then merges the result into a running output. After <span class="math notranslate nohighlight">\(P\)</span> steps, every query position has attended over every key/value in the full sequence:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Rank</span> <span class="n">r</span> <span class="n">holds</span> <span class="n">Q_r</span> <span class="p">(</span><span class="n">fixed</span><span class="p">)</span> <span class="ow">and</span> <span class="n">K</span><span class="o">/</span><span class="n">V</span> <span class="n">block</span> <span class="k">for</span> <span class="n">step</span> <span class="n">i</span>
@@ -903,7 +909,7 @@
 <p><strong>Communication cost.</strong> Ring pays <span class="math notranslate nohighlight">\(P-1\)</span> neighbor exchanges per attention layer, and communication volume scales as <span class="math notranslate nohighlight">\(O(N)\)</span> in sequence length <span class="math notranslate nohighlight">\(N\)</span> — more sequential steps than Ulysses. Each ring step also runs a partial FA4 pass plus an online-softmax merge, so attention work grows with ring degree <span class="math notranslate nohighlight">\(P\)</span>, not just communication. The upside is flexibility: <strong>no head-count ceiling</strong>, a simple 1D topology, and straightforward composition with Ulysses on the same mesh (<span class="math notranslate nohighlight">\(\text{cp size} \times \text{ulysses size}\)</span>). P2P can overlap with compute, which keeps Ring competitive at small <span class="math notranslate nohighlight">\(P\)</span> and short sequences. For production video lengths, though, we <strong>generally prefer Attention2D</strong> (detailed in the next section) for the context-parallel axis, owing to its lower communication cost – <span class="math notranslate nohighlight">\(O(N/\sqrt{P})\)</span> versus <span class="math notranslate nohighlight">\(O(N)\)</span> for Ring attention.</p>
 </section>
 <section id="attention2d-parallelism">
-<h3>2. Attention2D Parallelism<a class="headerlink" href="#attention2d-parallelism" title="Link to this heading">#</a></h3>
+<span id="2-attention2d-parallelism"></span><h3>2. Attention2D Parallelism<a class="headerlink" href="#attention2d-parallelism" title="Link to this heading">#</a></h3>
 <p>Attention2D parallelism (<a class="reference external" href="https://arxiv.org/abs/2503.15758">arXiv:2503.15758</a>) treats the <span class="math notranslate nohighlight">\(P\)</span> context-parallel GPUs as a logical 2D grid of <span class="math notranslate nohighlight">\(\text{row size} \times \text{col size}\)</span> workers. It is our preferred <strong>context-parallel strategy</strong> once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with <strong>no head-count ceiling</strong> — any <span class="math notranslate nohighlight">\(\text{row size} \times \text{col size}\)</span> grid is valid regardless of how many attention heads the DiT has. It also <strong>generalizes 1D context parallelism</strong> - setting <span class="math notranslate nohighlight">\(\text{col size}=1\)</span> reduces to the no-merge scheme (all-gather K/V), while setting <span class="math notranslate nohighlight">\(\text{row size}=1\)</span> reduces to the merge scheme (all-gather Q). - and <strong>scales the CP degree better</strong>, gathering only <span class="math notranslate nohighlight">\(S/\sqrt{P}\)</span> per axis (<span class="math notranslate nohighlight">\(O(N/\sqrt{P})\)</span> communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to <strong>full bidirectional</strong> DiT inference.</p>
 <p><strong>Gather phase: Q along rows and K/V along columns.</strong> Ranks form a <span class="math notranslate nohighlight">\(\text{row size} \times \text{col size}\)</span> grid (<span class="math notranslate nohighlight">\(P = \text{row size} \times \text{col size}\)</span>). Each rank starts with a <span class="math notranslate nohighlight">\(1/P\)</span> shard of all three tensors — <span class="math notranslate nohighlight">\(Q_i, K_i, V_i\)</span>, each <span class="math notranslate nohighlight">\([B, S/P, H, D]\)</span>. Attention2D then runs two all-gathers on the two independent grid axes:</p>
 <ul class="simple">
@@ -1589,9 +1595,9 @@ sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

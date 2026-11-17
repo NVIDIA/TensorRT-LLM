@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -726,9 +734,7 @@ SPDX-License-Identifier: Apache-2.0
 <p>GVR V1 gathers current scores at the previous step’s Top-K indices to predict admission thresholds. <strong>The GVR V1 baseline already uses multi-thresholding.</strong> Its <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16877">streaming implementation</a> uses sampled ladder counts to choose a pivot and a rescue rung, then verifies both exactly in a fused count/collect pass. This is the temporal-hint implementation compared with V2 below.</p>
 <p>Its admission objective is expressed through the monotone count function</p>
 <div class="math notranslate nohighlight">
-\[
-C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
-\]</div>
+\[C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].\]</div>
 <p>An admission threshold should leave enough survivors to contain Top-K, but few enough to fit candidate capacity. A high-quality temporal hint can make admission very cheap. The difficulty is making that benefit reliable across inference workloads, even with several thresholds checked together.</p>
 <section id="a-biased-sample-with-variable-value">
 <h4>A Biased Sample with Variable Value<a class="headerlink" href="#a-biased-sample-with-variable-value" title="Link to this heading">#</a></h4>
@@ -883,9 +889,7 @@ C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
 <p>GVR V2’s self-sampling was inspired by Floyd and Rivest’s 1975 paper, <a class="reference external" href="https://people.csail.mit.edu/rivest/pubs/FR75a.pdf"><em>Expected Time Bounds for Selection</em></a>. Its theoretical SELECT algorithm draws a random sample, chooses two sample order statistics to bracket the desired rank, partitions the full input, and continues exactly in the partition containing that rank. If the bracket misses, selection continues in the appropriate outer partition. Sampling reduces expected work without making the answer approximate.</p>
 <p>The classical expected comparison bound for ascending rank <span class="math notranslate nohighlight">\(i\)</span> among <span class="math notranslate nohighlight">\(n\)</span> elements is</p>
 <div class="math notranslate nohighlight">
-\[
-n+\min(i,n-i)+o(n).
-\]</div>
+\[n+\min(i,n-i)+o(n).\]</div>
 <p>This belongs to a comparison model with random-sampling assumptions; the original treatment assumes distinct keys. <a class="reference external" href="https://arxiv.org/abs/cs/0312055">Kiwiel’s later analysis</a> establishes rigorous bounds for SELECT variants, including repeated keys. These results motivate <strong>using sample ranks to narrow an exact selection problem</strong>.</p>
 <p>GVR V2 carries that principle into a different cost model:</p>
 <div align="center">
@@ -936,10 +940,8 @@ n+\min(i,n-i)+o(n).
 <p>A useful threshold balances <strong>full-row passes and candidate work</strong>. A loose threshold may save a scan yet admit so many candidates that processing them consumes the saving. Another pass is worthwhile only when the work it removes exceeds its cost.</p>
 <p>For a finite-score row, let <span class="math notranslate nohighlight">\(\tau\)</span> be the exact K-th-largest score and <span class="math notranslate nohighlight">\(q\le\tau\)</span> an admission threshold. The candidate population decomposes as</p>
 <div class="math notranslate nohighlight">
-\[
-C_p=C(q)=K+E+D(q,\tau),\qquad
-\frac{C_p}{K}=1+\frac{E+D(q,\tau)}{K}.
-\]</div>
+\[C_p=C(q)=K+E+D(q,\tau),\qquad
+\frac{C_p}{K}=1+\frac{E+D(q,\tau)}{K}.\]</div>
 <p>Here <span class="math notranslate nohighlight">\(E\)</span> counts excess entries tied at the boundary, and <span class="math notranslate nohighlight">\(D\)</span> counts scores in the shell <span class="math notranslate nohighlight">\(q\le x_i\lt\tau\)</span>. Dense scores near the boundary can turn a small threshold error into large <strong>candidate amplification</strong>. Temporal overlap alone therefore cannot predict refinement work.</p>
 <p><img alt="Threshold admission and candidate amplification for one schematic score row. A simplified tail-count curve labels the K required winners, E excess boundary ties, and D additional shell candidates that make up the admitted population Cp. The right panel explains the same three components without numerical ratios." src="../../_images/candidate_work.svg" /></p>
 <p><em>Figure 5.</em> A: exact tail counts identify thresholds satisfying <span class="math notranslate nohighlight">\(K\le C(q)\le B_r\)</span>, where <span class="math notranslate nohighlight">\(B_r\)</span> is candidate capacity. The labeled segments split the admitted population into required winners, excess boundary ties, and the boundary shell. B: candidate amplification arises from the latter two components; their proportions are schematic. Exact handling of ties preserves the Top-K value multiset.</p>
@@ -984,9 +986,7 @@ C_p=C(q)=K+E+D(q,\tau),\qquad
 <p>After another barrier, warp 0 scans the histogram using vector counter loads and warp shuffles. One scan finds all required rank crossings and clears the counters for the next phase, avoiding a sample sort or a separate search for every anchor.</p>
 <p>Let <span class="math notranslate nohighlight">\(S\)</span> be the actual sample size and <span class="math notranslate nohighlight">\(A\ge K\)</span> the desired full-row candidate population. The launch policy starts with a sample budget proportional to <span class="math notranslate nohighlight">\(N/A\)</span>, clamps its target between 256 scores and half the row, and rounds to legal windows. It computes target ranks from the resulting <span class="math notranslate nohighlight">\(S\)</span>, rather than the unrounded budget:</p>
 <div class="math notranslate nohighlight">
-\[
-r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2AS}{N}.
-\]</div>
+\[r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2AS}{N}.\]</div>
 <p>The intuition is to keep enough observations in the relevant tail: as its target fraction <span class="math notranslate nohighlight">\(A/N\)</span> shrinks, increasing <span class="math notranslate nohighlight">\(S\)</span> maintains roughly <span class="math notranslate nohighlight">\(AS/N\)</span> tail observations, before clamping and window rounding. Descending histogram crossings supply:</p>
 <ul class="simple">
 <li><p><strong>Primary threshold <span class="math notranslate nohighlight">\(T\)</span>:</strong> the lower edge of the sample bin at rank <span class="math notranslate nohighlight">\(r_A\)</span>, aiming for roughly <span class="math notranslate nohighlight">\(A\)</span> full-row survivors.</p></li>
@@ -1005,24 +1005,18 @@ r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2
 <p>A scalar verification pass answers one question: how many scores exceed <span class="math notranslate nohighlight">\(T\)</span>? GVR V1 already amortizes row reads across several admission thresholds. V2’s streaming path uses a verification histogram to obtain a dense family of counts from the same classification work and locate the boundary for exact refinement.</p>
 <p>Conceptually, divide the bracket <span class="math notranslate nohighlight">\([T,H]\)</span> into <span class="math notranslate nohighlight">\(M\)</span> ordered bins, with boundaries <span class="math notranslate nohighlight">\(t_0,\ldots,t_M\)</span>, and let <span class="math notranslate nohighlight">\(h_j\)</span> be the exact population of bin <span class="math notranslate nohighlight">\(j\)</span>. A descending cumulative scan yields</p>
 <div class="math notranslate nohighlight">
-\[
-C(t_j)=\sum_{\ell=j}^{M-1}h_\ell,\qquad 0\le j\lt M.
-\]</div>
+\[C(t_j)=\sum_{\ell=j}^{M-1}h_\ell,\qquad 0\le j\lt M.\]</div>
 <p>The streaming verification histogram has 256 bins. Each survivor is assigned to a bin once; a small on-chip cumulative scan then exposes counts at all its boundaries. <strong>One classification contributes to an entire family of threshold counts.</strong> The expensive score reads are shared, and the remaining scan touches only the bin counters. Verification can locate where the population crosses <span class="math notranslate nohighlight">\(K\)</span> without issuing another full-row query for each trial threshold.</p>
 <p>Values above <span class="math notranslate nohighlight">\(H\)</span> saturate into the top bin and remain candidates. Full-row accounting establishes whether enough survivors exist. The implementation may build the histogram during streaming, merge shard histograms through distributed shared memory, or reconstruct it from a complete bounded staging slab. Those execution choices preserve the same logical result: exact populations must cover the admitted set before its crossing is trusted.</p>
 <section id="turn-a-threshold-search-into-a-boundary-problem">
 <h4>Turn a Threshold Search into a Boundary Problem<a class="headerlink" href="#turn-a-threshold-search-into-a-boundary-problem" title="Link to this heading">#</a></h4>
 <p>Scanning bins from high scores to low identifies the crossing bin <span class="math notranslate nohighlight">\(j^{\ast}\)</span> with</p>
 <div class="math notranslate nohighlight">
-\[
-a=\sum_{\ell\gt j^{\ast}}h_\ell\lt K,\qquad a+h_{j^{\ast}}\ge K.
-\]</div>
+\[a=\sum_{\ell\gt j^{\ast}}h_\ell\lt K,\qquad a+h_{j^{\ast}}\ge K.\]</div>
 <p>Every score in a higher bin is a certain winner. Every score in a lower bin is unnecessary. Only <span class="math notranslate nohighlight">\(K-a\)</span> winners must be chosen from the crossing bin’s <span class="math notranslate nohighlight">\(m=h_{j^{\ast}}\)</span> candidates:</p>
 <div class="math notranslate nohighlight">
-\[
-\mathrm{TopK}(x)=\lbrace \text{all positions in higher bins}\rbrace
-\quad\cup\quad \mathrm{Top}_{K-a}(\text{crossing bin}).
-\]</div>
+\[\mathrm{TopK}(x)=\lbrace \text{all positions in higher bins}\rbrace
+\quad\cup\quad \mathrm{Top}_{K-a}(\text{crossing bin}).\]</div>
 <p>If the entire crossing bin is needed, it can be emitted directly. Small crossings use direct ranking; larger ones use exact order-preserving FP32 key refinement. The same decomposition underlies the 980-plus-44 example in Figure 4.</p>
 <p>The histogram discretizes the search region, not the selected scores. Exact comparisons within the crossing bin resolve its coarse boundaries, including ties. Thus fewer passes do not require approximate Top-K membership.</p>
 </section>
@@ -1170,17 +1164,13 @@ a=\sum_{\ell\gt j^{\ast}}h_\ell\lt K,\qquad a+h_{j^{\ast}}\ge K.
 <h4>Locate Top-K on the Hardware Roof<a class="headerlink" href="#locate-top-k-on-the-hardware-roof" title="Link to this heading">#</a></h4>
 <p>For FP32 input and INT32 index-only output, define the ideal work and minimum traffic as</p>
 <div class="math notranslate nohighlight">
-\[
-W=BN,\qquad Q_{\min}=4B(N+K)\ \text{bytes},\qquad
-I=\frac{W}{Q_{\min}}=\frac{N}{4(N+K)}.
-\]</div>
+\[W=BN,\qquad Q_{\min}=4B(N+K)\ \text{bytes},\qquad
+I=\frac{W}{Q_{\min}}=\frac{N}{4(N+K)}.\]</div>
 <p>Each work unit is an <strong>abstract comparison per input score</strong>, shared across implementations; it is neither an instruction count nor SELECT’s comparison bound. For nontrivial selection, <span class="math notranslate nohighlight">\(1\le K\lt N\)</span>, intensity lies in <strong><span class="math notranslate nohighlight">\(0.125\lt I\lt 0.25\)</span> compare/byte</strong>.</p>
 <p>The theoretical and calibrated B200 roofs, in Tcompare/s, are</p>
 <div class="math notranslate nohighlight">
-\[
-P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
-P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
-\]</div>
+\[P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
+P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).\]</div>
 <p>The calibrated limits are <strong>6.912 TB/s</strong> sustained read bandwidth and <strong>37.047 Tcompare/s</strong> semantic comparison throughput. Their <strong>5.36 compare/byte</strong> intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 10A’s bandwidth slope.</p>
 <p><img alt="A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT LLM radix CUDA at batch 1024, with GVR V2 highlighted in green." src="../../_images/roofline.svg" /></p>
 <p><em>Figure 10.</em> A: theoretical and calibrated roofs. B: Pareto curves at <span class="math notranslate nohighlight">\(B=1024\)</span>, plotting useful throughput <span class="math notranslate nohighlight">\(P=BN/t\)</span> against ideal intensity <span class="math notranslate nohighlight">\(I=N/[4(N+K)]\)</span>. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share <span class="math notranslate nohighlight">\(Q_{\min}\)</span>; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.</p>
@@ -1190,10 +1180,8 @@ P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 <p>Each operator’s <strong>Pareto curve</strong> in Figure 10B is its measured intensity–throughput trace across row lengths at <span class="math notranslate nohighlight">\(B=1024\)</span>. At fixed <span class="math notranslate nohighlight">\(N\)</span> and <span class="math notranslate nohighlight">\(K\)</span>, every implementation has the same horizontal position; a faster kernel moves <strong>upward</strong>, toward the calibrated roof. Figure 9 retains the contrasting single-row view, and Figures 7–8 cover all 11 batch sizes.</p>
 <p>The <strong>reachable rate</strong> is useful throughput divided by the calibrated roof, expressed as a percentage. Throughout the plotted bandwidth branch, its underlying ratio simplifies to</p>
 <div class="math notranslate nohighlight">
-\[
-\rho=\frac{P(I)}{P_{\mathrm{calibrated}}(I)}
-=\frac{Q_{\min}}{\mathrm{BW}\,t}.
-\]</div>
+\[\rho=\frac{P(I)}{P_{\mathrm{calibrated}}(I)}
+=\frac{Q_{\min}}{\mathrm{BW}\,t}.\]</div>
 <p>It measures efficiency relative to the ideal traffic bound. The table compares <strong>average / peak reachable rate</strong> along each Pareto curve: the average weights the plotted intensity points equally, and the peak is their maximum. Both use the same layer-averaged timings as Figure 10B.</p>
 <div align="center">
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1510,9 +1498,9 @@ P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

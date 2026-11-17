@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -697,6 +705,7 @@
 </ul>
 <p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The <code class="docutils literal notranslate"><span class="pre">start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> endpoints control iteration-scoped profiling of the backend engine; see <a class="reference internal" href="#runtime-profiling-endpoints"><span class="std std-ref">Runtime Profiling Endpoints</span></a> below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see <a class="reference internal" href="render-endpoints.html"><span class="doc">Render endpoints</span></a>.</p>
 <p>For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">embeddings</span></code> subcommand starts a server that exposes an OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">/v1/embeddings</span></code> endpoint with native dynamic batching. See <a class="reference internal" href="../../features/embeddings.html"><span class="doc">Embeddings</span></a> for details.</p>
+<p>For reranker models, the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">rerank</span></code> subcommand exposes <code class="docutils literal notranslate"><span class="pre">/rerank</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/rerank</span></code>, and Cohere-compatible <code class="docutils literal notranslate"><span class="pre">/v2/rerank</span></code> endpoints. See <a class="reference internal" href="../../features/reranking.html"><span class="doc">Reranking</span></a> for details.</p>
 </section>
 <section id="starting-a-server">
 <h2>Starting a Server<a class="headerlink" href="#starting-a-server" title="Link to this heading">#</a></h2>
@@ -750,6 +759,17 @@ shared format. <code class="docutils literal notranslate"><span class="pre">--re
 <li><p>Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>, <code class="docutils literal notranslate"><span class="pre">/kv_cache_events</span></code>, profiling and the Anthropic batches API to it, and <code class="docutils literal notranslate"><span class="pre">/prometheus/metrics</span></code> covers every frontend. Per-process state is not shared: the stateful Responses API store (<code class="docutils literal notranslate"><span class="pre">store</span></code> / <code class="docutils literal notranslate"><span class="pre">previous_response_id</span></code>) is disabled, <code class="docutils literal notranslate"><span class="pre">/health</span></code> describes the frontend that answered, and each frontend writes its own per-request perf metrics file.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code> would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.</p></li>
 <li><p>Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.</p></li>
+</ul>
+</div>
+</section>
+<section id="bounding-the-graceful-stop">
+<span id="id1"></span><h2>Bounding the Graceful Stop<a class="headerlink" href="#bounding-the-graceful-stop" title="Link to this heading">#</a></h2>
+<p>A server can still have request handlers running when it is told to stop, for example when a benchmark client leaves while its last requests are in flight. By default the OpenAI HTTP server waits for every one of them. The prototype setting <code class="docutils literal notranslate"><span class="pre">serve_graceful_shutdown_timeout_s:</span> <span class="pre">N</span></code> in the <code class="docutils literal notranslate"><span class="pre">--config</span></code> YAML bounds that wait: after a shutdown signal, the server waits at most <code class="docutils literal notranslate"><span class="pre">N</span></code> seconds for running request handlers (uvicorn’s <code class="docutils literal notranslate"><span class="pre">timeout_graceful_shutdown</span></code>), then cancels them and shuts down as usual. It is off by default.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<ul class="simple">
+<li><p>It applies to the LLM, embedding and multimodal-encoder servers of <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, in every frontend process.</p></li>
+<li><p>The gRPC servers (<code class="docutils literal notranslate"><span class="pre">--grpc</span></code>) and the VisualGen server do not use it, and the disaggregated router keeps its own <code class="docutils literal notranslate"><span class="pre">--request_timeout</span></code> for the requests it forwards.</p></li>
 </ul>
 </div>
 </section>
@@ -1365,7 +1385,7 @@ cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.</p>
 </section>
 </section>
 <section id="runtime-profiling-endpoints">
-<span id="id1"></span><h2>Runtime Profiling Endpoints<a class="headerlink" href="#runtime-profiling-endpoints" title="Link to this heading">#</a></h2>
+<span id="id2"></span><h2>Runtime Profiling Endpoints<a class="headerlink" href="#runtime-profiling-endpoints" title="Link to this heading">#</a></h2>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> endpoints are <strong>prototype</strong> and only apply to the default PyTorch backend (<code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>). APIs, parameters, and behaviour may change in future releases.</p>
@@ -1550,7 +1570,7 @@ the checked-in files without importing configuration classes. <code class="docut
 can be used to generate a separate local preview.</p>
 </section>
 <section id="syntax">
-<span id="id2"></span><h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
+<span id="id3"></span><h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
 <p>This syntax section lists all command line arguments for <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>’s subcommands. Some of the arguments are accompanied with a stability tag indicating their development status. Refer to our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html">API Reference</a> for details</p>
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
@@ -2024,6 +2044,100 @@ wrote them.</p>
 </dd></dl>
 
 </section>
+<section id="trtllm-serve-rerank">
+<h4>rerank<a class="headerlink" href="#trtllm-serve-rerank" title="Link to this heading">#</a></h4>
+<p>Run a /rerank, /v1/rerank, and /v2/rerank server.</p>
+<p>MODEL: model name | HF checkpoint path</p>
+<p class="rubric">Usage</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>rerank<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>MODEL
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-host">
+<span class="sig-name descname"><span class="pre">--host</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;host&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-host" title="Link to this definition">#</a></dt>
+<dd><p>Hostname of the server.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-port">
+<span class="sig-name descname"><span class="pre">--port</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;port&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-port" title="Link to this definition">#</a></dt>
+<dd><p>Port of the server.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-log_level">
+<span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-log_level" title="Link to this definition">#</a></dt>
+<dd><p>The logging level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug | trace</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-max_batch_size">
+<span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum batch size coalesced into a single encode() call.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-max_num_tokens">
+<span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-max_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of batched input tokens in each encode() call.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-max_queue_delay">
+<span class="sig-name descname"><span class="pre">--max_queue_delay</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_queue_delay&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-max_queue_delay" title="Link to this definition">#</a></dt>
+<dd><p>Dynamic-batching hold window in seconds: how long an incoming request waits for others to join its batch before being dispatched.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-max_queue_size">
+<span class="sig-name descname"><span class="pre">--max_queue_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_queue_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-max_queue_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of in-flight queued requests; further requests are rejected with HTTP 429.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-trust_remote_code">
+<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-trust_remote_code" title="Link to this definition">#</a></dt>
+<dd><p>Flag for HF transformers.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-config">
+<span id="cmdoption-trtllm-serve-rerank-extra_llm_api_options"></span><span class="sig-name descname"><span class="pre">--config</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-config" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML configuration file. Explicit CLI flags take precedence over values in this file.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-hf_revision">
+<span id="cmdoption-trtllm-serve-rerank-revision"></span><span class="sig-name descname"><span class="pre">--hf_revision</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--revision</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;revision&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-hf_revision" title="Link to this definition">#</a></dt>
+<dd><p>The revision to use for the HuggingFace model (branch name, tag name, or commit id).</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-metadata_server_config_file">
+<span class="sig-name descname"><span class="pre">--metadata_server_config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server_config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-metadata_server_config_file" title="Link to this definition">#</a></dt>
+<dd><p>Path to metadata server config file</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-telemetry">
+<span id="cmdoption-trtllm-serve-rerank-no-telemetry"></span><span class="sig-name descname"><span class="pre">--telemetry</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--no-telemetry</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-telemetry" title="Link to this definition">#</a></dt>
+<dd><p>Enable or disable anonymous usage telemetry collection.</p>
+</dd></dl>
+
+<p class="rubric">Arguments</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-rerank-arg-MODEL">
+<span class="sig-name descname"><span class="pre">MODEL</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-rerank-arg-MODEL" title="Link to this definition">#</a></dt>
+<dd><p>Required argument</p>
+</dd></dl>
+
+</section>
 <section id="trtllm-serve-serve">
 <h4>serve<a class="headerlink" href="#trtllm-serve-serve" title="Link to this heading">#</a></h4>
 <p>Running an OpenAI API compatible server</p>
@@ -2233,7 +2347,7 @@ wrote them.</p>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for reasoning models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | deepseek-r1 | glm_moe_dsa | glm47 | glm45 | glm | deepseek_v4 | deepseek_v41 | poolside_v1 | laguna | minimax_m3 | k-exaone | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2 | kimi_k3</p>
+<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | deepseek-r1 | glm_moe_dsa | glm47 | glm45 | glm | deepseek_v4 | deepseek_v41 | poolside_v1 | laguna | minimax_m3 | k-exaone | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2 | kimi_k3 | musespark</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2244,7 +2358,7 @@ wrote them.</p>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for tool models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | kimi_k3 | deepseek_v3 | deepseek_v31 | deepseek_v32 | deepseek_v4 | deepseek_v41 | gemma4 | glm4 | glm47 | minimax_m2 | minimax_m3 | poolside_v1</p>
+<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | kimi_k3 | deepseek_v3 | deepseek_v31 | deepseek_v32 | deepseek_v4 | deepseek_v41 | gemma4 | glm4 | glm47 | minimax_m2 | minimax_m3 | musespark | poolside_v1</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2473,6 +2587,7 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multiple-http-frontends">Multiple HTTP Frontends</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#bounding-the-graceful-stop">Bounding the Graceful Stop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inference-endpoints">Inference Endpoints</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-api">Chat API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#completions-api">Completions API</a></li>
@@ -2506,6 +2621,7 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mm-embedding-serve">mm_embedding_serve</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mooncake-master">mooncake_master</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mooncake-pool-report">mooncake_pool_report</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-rerank">rerank</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-serve">serve</a></li>
 </ul>
 </li>
@@ -2602,9 +2718,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -738,7 +746,7 @@
 <h2>Prerequisites: Install TensorRT LLM and download models<a class="headerlink" href="#prerequisites-install-tensorrt-llm-and-download-models" title="Link to this heading">#</a></h2>
 <p>This section can be skipped if you already have TensorRT LLM installed and have already downloaded the DeepSeek R1 model checkpoint.</p>
 <section id="download-tensorrt-llm">
-<h3>1. Download TensorRT LLM<a class="headerlink" href="#download-tensorrt-llm" title="Link to this heading">#</a></h3>
+<span id="1-download-tensorrt-llm"></span><h3>1. Download TensorRT LLM<a class="headerlink" href="#download-tensorrt-llm" title="Link to this heading">#</a></h3>
 <p><strong>You can also find more comprehensive instructions to install TensorRT LLM in this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html">TensorRT LLM installation guide</a>, refer to that guide for common issues if you encounter any here.</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prerequisites</span>
 apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>git<span class="w"> </span>git-lfs
@@ -758,7 +766,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <p><strong>Note</strong>: Replace <code class="docutils literal notranslate"><span class="pre">&lt;*_PATH&gt;</span></code> to your actual path.</p>
 </section>
 <section id="download-the-deepseek-r1-models">
-<h3>2. Download the DeepSeek R1 models<a class="headerlink" href="#download-the-deepseek-r1-models" title="Link to this heading">#</a></h3>
+<span id="2-download-the-deepseek-r1-models"></span><h3>2. Download the DeepSeek R1 models<a class="headerlink" href="#download-the-deepseek-r1-models" title="Link to this heading">#</a></h3>
 <p>For NVIDIA Blackwell GPUs, it’s recommended to use the <a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4">FP4 quantized version of DeepSeek R1</a> to get the best performance.
 For NVIDIA Hopper GPUs, it’s recommended to use the FP8 version of the DeepSeek R1 model.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Replace with your actual path</span>
@@ -778,7 +786,7 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/d
 </div>
 </section>
 <section id="build-and-run-tensorrt-llm-container">
-<h3>3. Build and run TensorRT LLM container<a class="headerlink" href="#build-and-run-tensorrt-llm-container" title="Link to this heading">#</a></h3>
+<span id="3-build-and-run-tensorrt-llm-container"></span><h3>3. Build and run TensorRT LLM container<a class="headerlink" href="#build-and-run-tensorrt-llm-container" title="Link to this heading">#</a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
 make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">DOCKER_RUN_ARGS</span><span class="o">=</span><span class="s2">"-v </span><span class="nv">$YOUR_MODEL_PATH</span><span class="s2">:</span><span class="nv">$YOUR_MODEL_PATH</span><span class="s2">:ro -v </span><span class="nv">$YOUR_WORK_PATH</span><span class="s2">:</span><span class="nv">$YOUR_WORK_PATH</span><span class="s2">"</span>
 </pre></div>
@@ -786,7 +794,7 @@ make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </s
 <p>Here we set <code class="docutils literal notranslate"><span class="pre">LOCAL_USER=1</span></code> argument to set up the local user instead of root account inside the container, you can remove it if running as root inside container is fine.</p>
 </section>
 <section id="compile-and-install-tensorrt-llm">
-<h3>4. Compile and Install TensorRT LLM<a class="headerlink" href="#compile-and-install-tensorrt-llm" title="Link to this heading">#</a></h3>
+<span id="4-compile-and-install-tensorrt-llm"></span><h3>4. Compile and Install TensorRT LLM<a class="headerlink" href="#compile-and-install-tensorrt-llm" title="Link to this heading">#</a></h3>
 <p>Here we compile the source inside the container:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">"90;100"</span><span class="w"> </span>--clean
 </pre></div>
@@ -800,7 +808,7 @@ make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </s
 </div>
 </section>
 <section id="optional-tune-gpu-clocks">
-<h3>5. Optional: Tune GPU clocks<a class="headerlink" href="#optional-tune-gpu-clocks" title="Link to this heading">#</a></h3>
+<span id="5-optional-tune-gpu-clocks"></span><h3>5. Optional: Tune GPU clocks<a class="headerlink" href="#optional-tune-gpu-clocks" title="Link to this heading">#</a></h3>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">sudo</span> <span class="n">nvidia</span><span class="o">-</span><span class="n">smi</span> <span class="o">-</span><span class="n">pm</span> <span class="mi">0</span><span class="p">;</span> <span class="n">sudo</span> <span class="n">nvidia</span><span class="o">-</span><span class="n">smi</span> <span class="o">-</span><span class="n">pm</span> <span class="mi">1</span><span class="p">;</span> <span class="n">sudo</span> <span class="n">nvidia</span><span class="o">-</span><span class="n">smi</span> <span class="n">boost</span><span class="o">-</span><span class="n">slider</span> <span class="o">--</span><span class="n">vboost</span> <span class="mi">4</span>
 </pre></div>
 </div>
@@ -808,7 +816,7 @@ make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </s
 This is not a required step, it’s provided here to make sure the perf numbers in this doc can be reproduced more closely to our internal run.</p>
 </section>
 <section id="dataset-preparation">
-<h3>6. Dataset preparation<a class="headerlink" href="#dataset-preparation" title="Link to this heading">#</a></h3>
+<span id="6-dataset-preparation"></span><h3>6. Dataset preparation<a class="headerlink" href="#dataset-preparation" title="Link to this heading">#</a></h3>
 <p>The trtllm-bench tool requires a dataset file to read prompts and output sequence length of each prompt. Format details of this dataset file can be seen in <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html#preparing-a-dataset">preparing a dataset</a>.</p>
 <p>For min-latency benchmarking, <strong>real dataset is required</strong> since the MTP accept rate is affected by the dataset thus affecting the performance. You can use your own dataset following the format described in the link above.</p>
 <p>For the max-throughput benchmarking, synthetic dataset is enough to be representative, since it does not use MTP.
@@ -938,7 +946,7 @@ trtllm-bench<span class="w">  </span>--model<span class="w"> </span>nvidia/DeepS
 <p>The results are reproduced with TensorRT LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.</p>
 <p>!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.</p>
 <section id="id1">
-<h4>Benchmark<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
+<span id="benchmark-1"></span><h4>Benchmark<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
 <p>To do the benchmark, run the following command:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># generate synthetic dataset</span>
 trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSeek-R1-FP4<span class="w"> </span><span class="se">\</span>
@@ -1098,7 +1106,7 @@ trtllm-bench<span class="w"> </span>-m<span class="w"> </span>deepseek-ai/DeepSe
 </section>
 </section>
 <section id="exploring-more-isl-osl-combinations">
-<h2>Exploring more ISL/OSL combinations<a class="headerlink" href="#exploring-more-isl-osl-combinations" title="Link to this heading">#</a></h2>
+<span id="exploring-more-islosl-combinations"></span><h2>Exploring more ISL/OSL combinations<a class="headerlink" href="#exploring-more-isl-osl-combinations" title="Link to this heading">#</a></h2>
 <p>To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">prepare-dataset</span></code> subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.</p>
 <section id="wip-enable-more-features-by-default">
 <h3>WIP: Enable more features by default<a class="headerlink" href="#wip-enable-more-features-by-default" title="Link to this heading">#</a></h3>
@@ -1300,9 +1308,9 @@ trtllm-bench<span class="w"> </span>-m<span class="w"> </span>deepseek-ai/DeepSe
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

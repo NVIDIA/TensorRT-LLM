@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -672,8 +680,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="overview">
-<span id="product-overview"></span><h1>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h1>
+  <section class="tex2jax_ignore mathjax_ignore" id="product-overview">
+<span id="overview"></span><h1>Overview<a class="headerlink" href="#product-overview" title="Link to this heading">#</a></h1>
 <section id="about-tensorrt-llm">
 <h2>About TensorRT LLM<a class="headerlink" href="#about-tensorrt-llm" title="Link to this heading">#</a></h2>
 <p><a class="reference external" href="https://developer.nvidia.com/tensorrt">TensorRT LLM</a> is NVIDIA’s comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs.</p>
@@ -681,12 +689,12 @@
 <section id="key-capabilities">
 <h2>Key Capabilities<a class="headerlink" href="#key-capabilities" title="Link to this heading">#</a></h2>
 <section id="architected-on-pytorch">
-<h3>🔥 <strong>Architected on Pytorch</strong><a class="headerlink" href="#architected-on-pytorch" title="Link to this heading">#</a></h3>
+<span id="-architected-on-pytorch"></span><h3>🔥 <strong>Architected on PyTorch</strong><a class="headerlink" href="#architected-on-pytorch" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM provides a high-level Python <a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api"><span class="std std-ref">LLM API</span></a> that supports a wide range of inference setups - from single-GPU to multi-GPU or multi-node deployments. It includes built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a> and the <a class="reference external" href="https://github.com/triton-inference-server/server">Triton Inference Server</a>.</p>
-<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
+<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
 </section>
 <section id="state-of-the-art-performance">
-<h3>⚡ <strong>State-of-the-Art Performance</strong><a class="headerlink" href="#state-of-the-art-performance" title="Link to this heading">#</a></h3>
+<span id="-state-of-the-art-performance"></span><h3>⚡ <strong>State-of-the-Art Performance</strong><a class="headerlink" href="#state-of-the-art-performance" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:</p>
 <ul class="simple">
 <li><p><strong>DeepSeek R1</strong>: <a class="reference external" href="https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/">World-record inference performance on Blackwell GPUs</a></p></li>
@@ -694,7 +702,7 @@
 </ul>
 </section>
 <section id="comprehensive-model-support">
-<h3>🎯 <strong>Comprehensive Model Support</strong><a class="headerlink" href="#comprehensive-model-support" title="Link to this heading">#</a></h3>
+<span id="-comprehensive-model-support"></span><h3>🎯 <strong>Comprehensive Model Support</strong><a class="headerlink" href="#comprehensive-model-support" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM supports the latest and most popular LLM and DiT architectures. See <a class="reference internal" href="models/supported-models.html"><span class="std std-doc">complete list</span></a>.</p>
 <ul class="simple">
 <li><p><strong>Language Models</strong>: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4…</p></li>
@@ -712,7 +720,7 @@
 <p>On NVIDIA H100 and later GPUs, TensorRT LLM supports <a class="reference internal" href="features/quantization.html"><span class="std std-doc">FP8 quantization</span></a>, which can double performance and halve memory consumption compared to 16-bit floating point, with minimal impact on model accuracy.</p>
 </section>
 <section id="advanced-optimization-production-features">
-<h3>🚀 <strong>Advanced Optimization &amp; Production Features</strong><a class="headerlink" href="#advanced-optimization-production-features" title="Link to this heading">#</a></h3>
+<span id="-advanced-optimization--production-features"></span><h3>🚀 <strong>Advanced Optimization &amp; Production Features</strong><a class="headerlink" href="#advanced-optimization-production-features" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong><a class="reference internal" href="features/paged-attention-ifb-scheduler.html"><span class="std std-doc">In-Flight Batching &amp; Paged Attention</span></a></strong>: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.</p></li>
 <li><p><strong><a class="reference internal" href="features/parallel-strategy.html"><span class="std std-doc">Multi-GPU Multi-Node Inference</span></a></strong>: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.</p></li>
@@ -789,7 +797,7 @@
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-tensorrt-llm">About TensorRT LLM</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-capabilities">Key Capabilities</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architected-on-pytorch">🔥 <strong>Architected on Pytorch</strong></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architected-on-pytorch">🔥 <strong>Architected on PyTorch</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#state-of-the-art-performance">⚡ <strong>State-of-the-Art Performance</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#comprehensive-model-support">🎯 <strong>Comprehensive Model Support</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp4-support">FP4 Support</a></li>
@@ -889,9 +897,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

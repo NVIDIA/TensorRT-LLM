@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -698,7 +706,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <section id="step-2-pull-the-development-container">
 <h2>Step 2: Pull the Development Container<a class="headerlink" href="#step-2-pull-the-development-container" title="Link to this heading">#</a></h2>
 <p>Pull the pre-built TensorRT LLM <code class="docutils literal notranslate"><span class="pre">devel</span></code> container from NGC. Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version. Browse the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags">available tags on NGC</a> to find the latest release.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc3
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc4
 </pre></div>
 </div>
 </section>
@@ -711,7 +719,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>pull
 <span class="w">        </span>--gpus<span class="o">=</span>all<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--volume<span class="w"> </span>&lt;path_to_tensorrt_llm_on_host&gt;:&lt;path_to_tensorrt_llm_in_container&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--workdir<span class="w"> </span>&lt;path_to_tensorrt_llm_in_container&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc3
+<span class="w">        </span>nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc4
 </pre></div>
 </div>
 <div class="dropdown note admonition">
@@ -841,7 +849,7 @@ built.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/build_wheel.py<span class="w"> </span>--build_root<span class="w"> </span>/tmp/trtllm-build<span class="w"> </span>--out-of-tree<span class="w"> </span>--use_ccache<span class="w"> </span>-a<span class="w"> </span><span class="s2">"90"</span>
 </pre></div>
 </div>
-<p>In this mode the generated FMHA kernel sources and the configured <code class="docutils literal notranslate"><span class="pre">version.h</span></code> go to the build tree (via the <code class="docutils literal notranslate"><span class="pre">TRTLLM_FMHA_GEN_DIR</span></code> and <code class="docutils literal notranslate"><span class="pre">TRTLLM_VERSION_H_INCLUDE_DIR</span></code> CMake variables), and the wheel is assembled from a staging copy of the Python package under <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/package</span></code>, landing in <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/dist</span></code> by default. Submodules and git-lfs content must be materialized before the build (the usual <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">submodule</span> <span class="pre">update</span> <span class="pre">--init</span> <span class="pre">--recursive</span></code>), since the build will not modify the checkout. Editable-install workflows (<code class="docutils literal notranslate"><span class="pre">--skip_building_wheel</span></code>, <code class="docutils literal notranslate"><span class="pre">--linking_install_binary</span></code>, <code class="docutils literal notranslate"><span class="pre">--install</span></code>) are incompatible with <code class="docutils literal notranslate"><span class="pre">--out-of-tree</span></code>: they import compiled artifacts from the checkout by design. <code class="docutils literal notranslate"><span class="pre">--version-override</span></code> is also incompatible, since it edits <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/version.py</span></code> in the checkout.</p>
+<p>In this mode the generated FMHA kernel sources and the configured <code class="docutils literal notranslate"><span class="pre">version.h</span></code> go to the build tree (via the <code class="docutils literal notranslate"><span class="pre">TRTLLM_FMHA_GEN_DIR</span></code> and <code class="docutils literal notranslate"><span class="pre">TRTLLM_VERSION_H_INCLUDE_DIR</span></code> CMake variables), and the wheel is assembled from a staging copy of the Python package under <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/package</span></code>, landing in <code class="docutils literal notranslate"><span class="pre">&lt;build_root&gt;/dist</span></code> by default. Submodules and git-lfs content must be materialized before the build (the usual <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">submodule</span> <span class="pre">update</span> <span class="pre">--init</span> <span class="pre">--recursive</span></code>), since the build will not modify the checkout. Editable-install workflows (<code class="docutils literal notranslate"><span class="pre">--skip_building_wheel</span></code>, <code class="docutils literal notranslate"><span class="pre">--linking_install_binary</span></code>, <code class="docutils literal notranslate"><span class="pre">--install</span></code>) are incompatible with <code class="docutils literal notranslate"><span class="pre">--out-of-tree</span></code>: they import compiled artifacts from the checkout by design.</p>
 </section>
 </section>
 <section id="python-only-build-no-c-compilation">
@@ -1020,9 +1028,9 @@ built.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

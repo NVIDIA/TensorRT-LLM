@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -677,9 +685,9 @@
 <p>Speculative decoding is a technique for accelerating LLM inference at low batch sizes. A lightweight drafting mechanism proposes candidate tokens, and the target model verifies them in a single forward pass. Tokens that match are accepted, reducing the number of sequential forward passes needed.</p>
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
-<p>For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.</p>
+<p>The maximum draft length is controlled by <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>. EAGLE 3 and single-layer MTP-Eagle (<code class="docutils literal notranslate"><span class="pre">use_mtp_vanilla=False</span></code>) can optionally generate a <a class="reference internal" href="#dynamic-tree-mode">dynamic draft tree</a> with <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code>. For supported linear drafting modes, advanced runtime controls can adjust draft length or disable speculation as the batch size or acceptance rate changes. See <a class="reference internal" href="#advanced-runtime-controls">Advanced runtime controls</a> for supported modes, examples, and current limitations.</p>
 <section id="draft-target">
-<h3>Draft/Target<a class="headerlink" href="#draft-target" title="Link to this heading">#</a></h3>
+<span id="drafttarget"></span><h3>Draft/Target<a class="headerlink" href="#draft-target" title="Link to this heading">#</a></h3>
 <p>Draft/target is the simplest form of speculative decoding. In this approach, an arbitrary draft model is used to produce draft tokens. It is important to make sure that the draft and target models were trained with the same tokenizer, else the acceptance rate is extremely low and performance is regressed.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DraftTargetDecodingConfig</span>
 
@@ -720,14 +728,15 @@ By default, each request uses a single sequence (linear chain) of draft tokens w
 <p>EAGLE 3 can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
 <section id="dynamic-tree-mode">
 <h4>Dynamic Tree Mode<a class="headerlink" href="#dynamic-tree-mode" title="Link to this heading">#</a></h4>
-<p>Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.</p>
-<p>To enable dynamic tree mode, set <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code> on the <code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code> and provide the following parameters:</p>
+<p>Dynamic tree mode enables tree-structured draft generation for EAGLE 3 and MTP-Eagle, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">MTPDecodingConfig</span></code>, dynamic trees require a checkpoint with exactly one MTP layer and <code class="docutils literal notranslate"><span class="pre">use_mtp_vanilla=False</span></code> (MTP-Eagle). Vanilla MTP and multi-layer MTP checkpoints do not support this dynamic-tree path. The MTP-Eagle dynamic-tree path supports greedy decoding only; non-greedy sampling is unsupported.</p>
+<p>To enable dynamic tree mode, set <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code> on <code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code> or a supported MTP-Eagle <code class="docutils literal notranslate"><span class="pre">MTPDecodingConfig</span></code> and provide the following parameters:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">use_dynamic_tree</span></code> (<code class="docutils literal notranslate"><span class="pre">bool</span></code>): Enables dynamic tree draft generation.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">dynamic_tree_max_topK</span></code> (<code class="docutils literal notranslate"><span class="pre">int</span></code>): Maximum number of tokens to expand per node at each draft layer.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">max_total_draft_tokens</span></code> (<code class="docutils literal notranslate"><span class="pre">int</span></code>, optional): Total draft token budget for the tree. Must satisfy <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">&lt;=</span> <span class="pre">max_total_draft_tokens</span> <span class="pre">&lt;=</span> <span class="pre">dynamic_tree_max_topK</span> <span class="pre">*</span> <span class="pre">max_draft_len</span></code>. Defaults to <code class="docutils literal notranslate"><span class="pre">dynamic_tree_max_topK</span> <span class="pre">*</span> <span class="pre">max_draft_len</span></code> if not set.</p></li>
 </ul>
-<p>When <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code>, the dynamic tree CUDA buffers are pre-allocated based on the <code class="docutils literal notranslate"><span class="pre">LLM</span></code>’s <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, which is propagated internally and must not be passed directly to <code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code>.</p>
+<p>When <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code>, the dynamic tree CUDA buffers are pre-allocated based on the <code class="docutils literal notranslate"><span class="pre">LLM</span></code>’s <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, which is propagated internally and must not be passed directly to the speculative decoding configuration.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">Eagle3DecodingConfig</span>
 
 <span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span>
@@ -744,6 +753,7 @@ By default, each request uses a single sequence (linear chain) of draft tokens w
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Dynamic tree mode is currently <strong>not supported</strong> for models that use sliding window attention or MLA (Multi-Latent Attention), such as DeepSeek and gpt-oss models.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code> and <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code> support linear drafting only. Do not combine either option with <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code>; the combination can fail during startup or CUDA graph warmup.</p>
 </div>
 </section>
 </section>
@@ -818,7 +828,7 @@ By default, each request uses a single sequence (linear chain) of draft tokens w
 <li><p><code class="docutils literal notranslate"><span class="pre">speculative_model</span></code>: Path or HuggingFace model ID for the DFlash draft model.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mask_token_id</span></code>: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code>: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code>: Cross-attention backend for the draft model, independent of the drafter’s standard attention modules. <code class="docutils literal notranslate"><span class="pre">&quot;VANILLA&quot;</span></code> (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. <code class="docutils literal notranslate"><span class="pre">&quot;TRTLLM&quot;</span></code> uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. <code class="docutils literal notranslate"><span class="pre">&quot;FA4&quot;</span></code> uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code>: Cross-attention backend for the draft model, independent of the drafter’s standard attention modules. <code class="docutils literal notranslate"><span class="pre">&quot;VANILLA&quot;</span></code> (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. <code class="docutils literal notranslate"><span class="pre">&quot;TRTLLM&quot;</span></code> uses TRTLLM-Gen FMHA (via FlashInfer) over a paged context K/V cache held by the KV cache manager (see <a class="reference internal" href="#dflash-draft-kv-cache">Draft KV cache</a>) and supports SM100/SM103 only. <code class="docutils literal notranslate"><span class="pre">&quot;FA4&quot;</span></code> uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.</p></li>
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DFlashDecodingConfig</span>
 
@@ -831,6 +841,49 @@ By default, each request uses a single sequence (linear chain) of draft tokens w
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">"/path/to/target_model"</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
 </pre></div>
 </div>
+<section id="dflash-draft-kv-cache">
+<h4>DFlash draft KV cache<a class="headerlink" href="#dflash-draft-kv-cache" title="Link to this heading">#</a></h4>
+<p>With <code class="docutils literal notranslate"><span class="pre">attention_backend=&quot;TRTLLM&quot;</span></code>, TRTLLM target attention, and the default
+<code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>, the drafter’s layers are allocated in the target’s KV cache
+manager. Target and draft layers share one page table, so one KV budget covers
+both and each request’s draft pages are allocated, padded and freed with its
+target pages. The draft layers keep the drafter’s own dtype, so an FP8 target KV
+cache (<code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype:</span> <span class="pre">fp8</span></code>) is paired with a BF16 draft cache.</p>
+<p>In disaggregated serving, direct worker launches require
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_SHARED_DRAFT_KV=1</span></code> (or <code class="docutils literal notranslate"><span class="pre">auto</span></code>, which shares wherever the layout
+allows it) on both the context and generation workers to enable shared
+draft-KV transfer. The <code class="docutils literal notranslate"><span class="pre">disaggregated_mpi_worker</span></code> launcher enables this setting
+automatically when its config lists both context and generation servers, both
+enable compatible speculation, and they shard attention alike: the same
+<code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>, where <code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code> counts as 1 because every
+rank keeps all KV heads. A config that lists only one side (for example, a
+context-only MPI world) leaves sharing off unless the variable is <code class="docutils literal notranslate"><span class="pre">1</span></code>. A
+two-sided config with attention DP on both sides and different
+<code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code> values shards attention alike too, so it also shares;
+set <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_SHARED_DRAFT_KV=0</span></code> to keep separate draft KV caches.</p>
+<p>When sharing is enabled, the context server’s draft pages are transferred to
+the generation server with the target pages, so the drafter starts generation
+with the prompt context instead of an empty one. This requires the draft layers
+to have the target’s rank-local KV-head count; the draft dtype and head
+dimension may differ, except that an NVFP4 target KV cache requires an
+identical draft layout unless both caches are K-only (MLA). Both servers must
+use the same layout.</p>
+<p>Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) also
+hold a standalone DSpark drafter’s layers, after their own. In every case the
+drafter decides whether it shares: it declares whether its block attention reads
+the manager’s pages at the run’s <code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code>
+(<code class="docutils literal notranslate"><span class="pre">DFlashForCausalLM.reads_managed_ctx_pages</span></code>). By default only
+<code class="docutils literal notranslate"><span class="pre">attention_backend=&quot;TRTLLM&quot;</span></code> does, at the page sizes its trtllm-gen kernels
+support; a drafter whose other backends read paged context declares that itself.</p>
+<p>The drafter keeps a separate draft KV cache manager instead when any of the
+following applies: context parallelism larger than 1 (helix context parallelism
+is shared only with a drafter that reads a helix-sharded context), a per-layer
+KV-head count on the target or drafter, a specialized KV cache manager that does
+not opt in (for example, most hybrid Mamba models), Gemma 4 hybrid attention, or,
+in disaggregated serving, a draft layout
+that cannot be transferred with the target’s. When the layers are shared, the
+worker log reports <code class="docutils literal notranslate"><span class="pre">target</span> <span class="pre">and</span> <span class="pre">draft</span> <span class="pre">KV</span> <span class="pre">layers</span> <span class="pre">share</span> <span class="pre">one</span> <span class="pre">KV</span> <span class="pre">cache</span> <span class="pre">manager</span></code> at
+startup.</p>
 <p><a class="reference external" href="https://inco.ai/blog/dflash2/">DFlash 2</a> is also supported. The same <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig</span></code> can be used for DFlash 2; no extra arguments are required.</p>
 <p><a class="reference external" href="https://arxiv.org/abs/2608.20530">LiLiCorr</a> checkpoints use the same
 <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig</span></code>. The draft checkpoint selects LiLiCorr through
@@ -856,6 +909,7 @@ hardware restrictions listed above.</p>
 sampling, a sampled token can differ from the predecessor used to score the next
 row. Rejection sampling uses the actual proposal distributions, preserving the
 target distribution, but acceptance can decrease.</p>
+</section>
 </section>
 <section id="user-provided-drafting">
 <h3>User-provided drafting<a class="headerlink" href="#user-provided-drafting" title="Link to this heading">#</a></h3>
@@ -908,6 +962,75 @@ target distribution, but acceptance can decrease.</p>
 </pre></div>
 </div>
 </section>
+<section id="advanced-runtime-controls">
+<h2>Advanced runtime controls<a class="headerlink" href="#advanced-runtime-controls" title="Link to this heading">#</a></h2>
+<section id="batch-size-based-draft-lengths">
+<h3>Batch-size-based draft lengths<a class="headerlink" href="#batch-size-based-draft-lengths" title="Link to this heading">#</a></h3>
+<p>These batch-size controls are advanced options; <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code> is an <strong>experimental developer interface</strong>. Use them with the mode and configuration restrictions below. <code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code> and <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code> are mutually exclusive: configure one at startup, and the runtime selects the draft length for each scheduled batch.</p>
+<p>Dynamic draft lengths are supported for the following linear drafting modes:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Configuration</p></th>
+<th class="head"><p>Supported execution mode</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MTPDecodingConfig</span></code></p></td>
+<td><p>One-model MTP and MTP-Eagle</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code></p></td>
+<td><p>One-model EAGLE 3</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DraftTargetDecodingConfig</span></code></p></td>
+<td><p>One-model draft/target</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PARDDecodingConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig</span></code></p></td>
+<td><p>PARD and DFlash</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SADecodingConfig</span></code></p></td>
+<td><p>Standalone Suffix Automaton (SA)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Here, one-model execution runs the target and drafter in one engine; it can still load a separate draft checkpoint. These controls do not provide support for legacy two-model execution paths. For EAGLE 3 and MTP, leave <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=False</span></code>.</p>
+<p>Schedule keys are <strong>inclusive upper bounds</strong> on the scheduled batch size, including context and generation requests. The runtime uses the first key greater than or equal to the batch size. Above the largest key, the draft length is zero and speculation is disabled. For example:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
+<span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span>
+<span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/eagle3_model</span>
+<span class="w">  </span><span class="nt">draft_len_schedule</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">4</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span>
+<span class="w">    </span><span class="nt">8</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+</pre></div>
+</div>
+<p>This uses three draft tokens at batch sizes 1–4, two at batch sizes 5–8, and disables speculation at batch size 9 and above. Speculation can resume when the batch size decreases.</p>
+<p>Specify an explicit <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> and a nonempty schedule. Keys must be positive integers, values must be nonnegative integers no greater than <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>, and the smallest key must map exactly to <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>. For example, <code class="docutils literal notranslate"><span class="pre">max_draft_len:</span> <span class="pre">4</span></code> with <code class="docutils literal notranslate"><span class="pre">{8:</span> <span class="pre">2,</span> <span class="pre">32:</span> <span class="pre">1}</span></code> is rejected. With CUDA graphs enabled (<code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> is not <code class="docutils literal notranslate"><span class="pre">None</span></code>), setting a schedule automatically enables <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.enable_padding</span></code> and merges its keys into <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.batch_sizes</span></code> for graph coverage.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_concurrency=N</span></code> is a shortcut for a cutoff: for the supported modes above, it is translated to <code class="docutils literal notranslate"><span class="pre">draft_len_schedule:</span> <span class="pre">{N:</span> <span class="pre">max_draft_len}</span></code>. There are current limitations to this shortcut:</p>
+<ul class="simple">
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> explicitly for MTP. If it is inferred later from the checkpoint, the translation is not repeated and the cutoff is ignored.</p></li>
+<li><p>Rebuilding a translated configuration from serialized arguments loses the private translation marker and raises the mutual-exclusion error. This happens when applying model defaults (including Qwen3-Next, Qwen3.5, DeepSeek-V4, Nemotron-H, and Gemma 4) and when converting <code class="docutils literal notranslate"><span class="pre">decoding_type:</span> <span class="pre">Eagle</span></code> to <code class="docutils literal notranslate"><span class="pre">Eagle3</span></code>. Use an explicit <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code> with <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>, and use <code class="docutils literal notranslate"><span class="pre">Eagle3</span></code> directly.</p></li>
+</ul>
+<p>For a cutoff at batch size four with three draft tokens, replace the example’s schedule with <code class="docutils literal notranslate"><span class="pre">{4:</span> <span class="pre">3}</span></code> and keep <code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code> unset. This avoids the shortcut’s translation limitations. For MTP, choose a <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> supported by the checkpoint.</p>
+<p>Other drafting configurations differ:</p>
+<ul class="simple">
+<li><p>Deprecated NGram honors <code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code>, but its drafter interprets schedule keys as lower bounds instead of the upper bounds described above. Do not use <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code> with NGram.</p></li>
+<li><p>Deprecated user-provided drafting returns the supplied drafter unchanged. Fields on <code class="docutils literal notranslate"><span class="pre">UserProvidedDecodingConfig</span></code> are not forwarded to it; configure a custom <code class="docutils literal notranslate"><span class="pre">Drafter</span></code> directly and account for its schedule semantics.</p></li>
+<li><p>DSpark does not implement these batch-size controls. Do not rely on either field to adjust or disable DSpark drafting.</p></li>
+</ul>
+</section>
+<section id="acceptance-rate-cutoff">
+<h3>Acceptance-rate cutoff<a class="headerlink" href="#acceptance-rate-cutoff" title="Link to this heading">#</a></h3>
+<p>For configurations that support disabling speculation, set both <code class="docutils literal notranslate"><span class="pre">acceptance_rate_window_size=N</span></code> (a positive integer) and <code class="docutils literal notranslate"><span class="pre">acceptance_rate_threshold</span></code> (between 0 and 1) to enable the rolling acceptance-rate cutoff. After at least <code class="docutils literal notranslate"><span class="pre">N</span></code> recorded samples, speculation is disabled permanently for that executor once the average of the latest <code class="docutils literal notranslate"><span class="pre">N</span></code> recorded acceptance ratios falls below the threshold. Unlike the batch-size cutoff, this does not re-enable speculation when conditions improve.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>The cutoff can underestimate acceptance when a batch-size schedule shortens the draft: it can divide the accepted-token count by the larger reserved draft-token count instead of the number actually verified in that iteration. With the schedule above at batch size 5, accepting both verified draft tokens per request can therefore record <code class="docutils literal notranslate"><span class="pre">2/3</span></code>. A window of 1 and a threshold of <code class="docutils literal notranslate"><span class="pre">0.9</span></code> then permanently disable speculation even though every verified draft token was accepted.</p>
+<p>Dynamic trees have the same limitation: the recorded denominator can be the total tree-token budget rather than the verified path length. For example, accepting a complete six-token path in a 60-token tree can record <code class="docutils literal notranslate"><span class="pre">6/60</span></code>, causing a threshold above <code class="docutils literal notranslate"><span class="pre">0.1</span></code> to permanently disable speculation.</p>
+<p>Leave the acceptance-rate cutoff disabled when using dynamic trees, <code class="docutils literal notranslate"><span class="pre">draft_len_schedule</span></code>, or <code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code> in the current implementation.</p>
+</div>
+<p>The feature is disabled when the window is unset or zero, or the threshold is unset. Model-specific restrictions still apply; for example, Kimi K3 helix rejects these acceptance-rate options.</p>
+</section>
+</section>
 <section id="usage-with-trtllm-bench-and-trtllm-serve">
 <h2>Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#usage-with-trtllm-bench-and-trtllm-serve" title="Link to this heading">#</a></h2>
 <div class="admonition note">
@@ -920,7 +1043,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p><code class="docutils literal notranslate"><span class="pre">MTP</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Eagle3</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">NGram</span></code> (deprecated; use <code class="docutils literal notranslate"><span class="pre">SA</span></code> instead)</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">DraftTarget</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Draft_Target</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">PARD</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">DFlash</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">SA</span></code></p></li>
@@ -973,6 +1096,39 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </pre></div>
 </div>
 </div>
+<section id="dspark-attention-projection-precision">
+<h3>DSpark attention projection precision<a class="headerlink" href="#dspark-attention-projection-precision" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8</span></code> selects the attention projection
+precision of the embedded DeepSeek-V4 DSpark drafter. When unset, projections
+use FP8 on Rubin SM107 with TP=1 or attention DP, and BF16 otherwise. Set
+bf16 to use dequantized BF16 draft weights. An explicit fp8 selection
+requires TP=1 or attention DP; unsupported tensor-parallel mappings are
+rejected during initialization. Non-Rubin FP8 is opt-in and requires workload
+accuracy and acceptance-length validation. The variable applies only to
+DeepSeek-V4 drafters: DeepSeek-V4.1 DSpark always uses BF16 projections and
+rejects fp8.</p>
+</section>
+<section id="packed-fp4-mla-wave-planning">
+<h3>Packed FP4 MLA wave planning<a class="headerlink" href="#packed-fp4-mla-wave-planning" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=1</span></code> enables the optional wave-simulation
+planner for packed FP4 MLA decode. The default is disabled (0); the
+rule-based split plan remains active. Validate end-to-end latency on the
+serving workload before enabling wave simulation.</p>
+</section>
+<section id="draft-layer-row-picking">
+<h3>Draft layer row picking<a class="headerlink" href="#draft-layer-row-picking" title="Link to this heading">#</a></h3>
+<p>On the first draft step of MTP-Eagle and single-layer EAGLE 3 one-model
+drafting, and on every MTP layer of vanilla MTP, a draft layer that supports it
+runs its attention on every input row (writing the draft KV cache of each) but
+the rest of the layer (norms, MLP or MoE) only on the one row per request the
+drafter reads: the last prompt row of a context request, the last accepted row
+of a generation request. Vanilla MTP does not pick rows under attention data
+parallelism, and MTP-Eagle does not pick them on the spec-decode fast paths.
+<code class="docutils literal notranslate"><span class="pre">TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1</span></code> turns this off. The picked rows
+are numerically equivalent to the full layer’s but not bitwise identical for
+MoE draft layers, whose kernels may round differently at another row count, so
+an occasional draft token can differ.</p>
+</section>
 </section>
 </section>
 
@@ -1034,12 +1190,25 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngram">NGram</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp">MTP</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pard">PARD</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash">DFlash</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash">DFlash</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-draft-kv-cache">DFlash draft KV cache</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#user-provided-drafting">User-provided drafting</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suffix-automaton-sa-enhancement">Suffix Automaton (SA) Enhancement</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-runtime-controls">Advanced runtime controls</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-size-based-draft-lengths">Batch-size-based draft lengths</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#acceptance-rate-cutoff">Acceptance-rate cutoff</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dspark-attention-projection-precision">DSpark attention projection precision</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#packed-fp4-mla-wave-planning">Packed FP4 MLA wave planning</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-layer-row-picking">Draft layer row picking</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -1131,9 +1300,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -742,6 +750,18 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
 <td><p>PrimTS FP8 for Blackwell (<code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code>)</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">1)</span></code></p></td>
+<td><p>VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (<code class="docutils literal notranslate"><span class="pre">vc_attention:</span> <span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(128,</span> <span class="pre">128,</span> <span class="pre">1)</span></code></p></td>
+<td><p>VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K scaled per 128 tokens and the same V treatment (<code class="docutils literal notranslate"><span class="pre">vc_attention:</span> <span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code>)</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUDNN</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
@@ -793,7 +813,7 @@
 </tbody>
 </table>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend picks the kernel from the block sizes: SageAttention quantizes per block, and the <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> per-tensor recipes run on the PrimTS FMHA library, which <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code> enables.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend picks the kernel from the block sizes: SageAttention quantizes per block, and the <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> per-tensor recipes run on the PrimTS FMHA library, which <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code> enables. VC-Attention fixes its block sizes to the recipe’s scaling granularity; leave them at <code class="docutils literal notranslate"><span class="pre">0</span></code> and the validator sets them, see <a class="reference internal" href="#vc-attention-in-the-trtllm-backend">VC-Attention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a>.</p>
 </section>
 <section id="choosing-and-tuning-a-recipe">
 <h3>Choosing and Tuning a Recipe<a class="headerlink" href="#choosing-and-tuning-a-recipe" title="Link to this heading">#</a></h3>
@@ -805,6 +825,7 @@
 <li><p>On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend is preferred for the surrounding workload.</p></li>
 <li><p>For SageAttention with INT8 Q/K, the default <code class="docutils literal notranslate"><span class="pre">(2,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> or <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> block-size recipes works well for most cases. Use <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code> when video quality is not satisfactory.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">CUDNN</span></code> backend requires Q/K and V to use the same format. Use <code class="docutils literal notranslate"><span class="pre">fp8</span></code> for per-tensor scaling or <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> for block scaling.</p></li>
+<li><p>For VC-Attention (<code class="docutils literal notranslate"><span class="pre">vc_attention:</span> <span class="pre">true</span></code>), <code class="docutils literal notranslate"><span class="pre">vc_repair_budget:</span> <span class="pre">0.005</span></code> (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; <code class="docutils literal notranslate"><span class="pre">0.005</span></code> to <code class="docutils literal notranslate"><span class="pre">0.02</span></code> is the useful range.</p></li>
 <li><p>For <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> MXFP8 or NVFP4 recipes, <code class="docutils literal notranslate"><span class="pre">v_block_size:</span> <span class="pre">1</span></code> uses a separate V scale per head and channel, while <code class="docutils literal notranslate"><span class="pre">v_block_size:</span> <span class="pre">0</span></code> uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.</p></li>
 </ul>
 <p>After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.</p>
@@ -854,6 +875,16 @@
 <td><p>bool</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
 <td><p>SageAttention only. Subtract the per-channel V mean before quantizing V and add it back to the output. Applied where attention runs on the PrimTS kernels; see <a class="reference internal" href="#sageattention-in-the-trtllm-backend">SageAttention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vc_attention</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Run the recipe as VC-Attention on the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend. See <a class="reference internal" href="#vc-attention-in-the-trtllm-backend">VC-Attention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vc_repair_budget</span></code></p></td>
+<td><p>float in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1)</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.0</span></code></p></td>
+<td><p>Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. <code class="docutils literal notranslate"><span class="pre">0</span></code> restores the means. <code class="docutils literal notranslate"><span class="pre">vc_attention</span></code> only.</p></td>
 </tr>
 </tbody>
 </table>
@@ -939,6 +970,50 @@
 </pre></div>
 </div>
 <p>For Hopper SageAttention, set <code class="docutils literal notranslate"><span class="pre">q_block_size</span></code> to <code class="docutils literal notranslate"><span class="pre">2</span></code>.</p>
+</section>
+<section id="vc-attention-in-the-trtllm-backend">
+<h2>VC-Attention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend<a class="headerlink" href="#vc-attention-in-the-trtllm-backend" title="Link to this heading">#</a></h2>
+<p><strong>What it does.</strong> VC-Attention (<a class="reference external" href="https://arxiv.org/abs/2609.15810">arXiv 2609.15810</a>) quantizes V around its tile means on the PrimTS FMHA library:</p>
+<ul class="simple">
+<li><p><strong>V</strong> is stored per 128-token K/V tile as a bf16 mean plus E4M3 residuals with one scale per head and channel; the kernel adds the mean back inside the softmax. A k-means permutation groups similar value rows into the same tile.</p></li>
+<li><p><strong>Q and K</strong> stay bf16 under VC-Attention-QK16 (<code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">bf16</span></code>). Under VC-Attention-QK8 (<code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">fp8</span></code>) they are Hadamard-rotated E4M3 with one scale per 128-token block.</p></li>
+<li><p><strong>V-Smooth schedule.</strong> Grouping and demeaning run over the first quarter of the denoising steps, regrouping every fourth step; later steps run plain per-channel E4M3 V. The pipeline publishes the step, so the window follows the sampler’s step count.</p></li>
+<li><p><strong>Repair rows.</strong> <code class="docutils literal notranslate"><span class="pre">vc_repair_budget</span></code> replaces the tile means by appending that fraction of the tokens with the largest residual as extra K/V rows. <code class="docutils literal notranslate"><span class="pre">0.005</span></code> is faster than the means at unchanged quality.</p></li>
+</ul>
+<p><strong>Requirements and behavior.</strong></p>
+<ul class="simple">
+<li><p>B200/GB200 and B300/GB300 with <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS=+prims_ts</span></code>; other GPUs and backends reject <code class="docutils literal notranslate"><span class="pre">vc_attention</span></code>.</p></li>
+<li><p>Separate Q, K and V, equal head counts, head dimension 128, dense mask. Not composable with <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code>, <code class="docutils literal notranslate"><span class="pre">smooth_k</span></code> or <code class="docutils literal notranslate"><span class="pre">smooth_v</span></code>.</p></li>
+<li><p>The recipe fixes the block sizes, <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">1)</span></code> for QK16 and <code class="docutils literal notranslate"><span class="pre">(128,</span> <span class="pre">128,</span> <span class="pre">1)</span></code> for QK8; the validator sets them from the defaults and rejects other values.</p></li>
+<li><p>With CUDA graphs the V-Smooth phase is a graph key, so regrouping, smoothing and plain steps replay separate graphs.</p></li>
+</ul>
+<p><strong>Configuration.</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span><span class="p">,</span> <span class="n">QuantAttentionConfig</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"Wan-AI/Wan2.1-T2V-1.3B-Diffusers"</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+        <span class="n">quant_attention_config</span><span class="o">=</span><span class="n">QuantAttentionConfig</span><span class="p">(</span>
+            <span class="n">qk_dtype</span><span class="o">=</span><span class="s2">"fp8"</span><span class="p">,</span>
+            <span class="n">v_dtype</span><span class="o">=</span><span class="s2">"fp8"</span><span class="p">,</span>
+            <span class="n">vc_attention</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">vc_repair_budget</span><span class="o">=</span><span class="mf">0.005</span><span class="p">,</span>
+        <span class="p">),</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="w">  </span><span class="nt">quant_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">qk_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
+<span class="w">    </span><span class="nt">v_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
+<span class="w">    </span><span class="nt">vc_attention</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">vc_repair_budget</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.005</span>
+</pre></div>
+</div>
 </section>
 <section id="fp8-and-mxfp8-in-the-cudnn-backend">
 <h2>FP8 and MXFP8 in the cuDNN Backend<a class="headerlink" href="#fp8-and-mxfp8-in-the-cudnn-backend" title="Link to this heading">#</a></h2>
@@ -1059,7 +1134,7 @@
 <h2>Interaction With Other Features<a class="headerlink" href="#interaction-with-other-features" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Linear-layer quantization</strong> (<code class="docutils literal notranslate"><span class="pre">VisualGenArgs.quant_config</span></code>, e.g. FP8 block scales or NVFP4) is independent and can be combined with any attention recipe.</p></li>
-<li><p><strong>Sparse attention.</strong> On <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together.</p></li>
+<li><p><strong>Sparse attention.</strong> On <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together. VC-Attention (<code class="docutils literal notranslate"><span class="pre">vc_attention:</span> <span class="pre">true</span></code>) is rejected together with any <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code>.</p></li>
 <li><p><strong>Parallelism.</strong> SageAttention is covered by a multi-GPU Ulysses test (<code class="docutils literal notranslate"><span class="pre">tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py</span></code>). The CuTe DSL dense backend produces LSE, so it also composes with Attention2D / Ring context parallelism; the TRTLLM Sage path does not expose LSE through this wrapper.</p></li>
 </ul>
 </section>
@@ -1122,6 +1197,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qk16pv8-attention-kernels-in-the-cutedsl-backend">QK16PV8 Attention Kernels in the CUTEDSL Backend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sageattention-in-the-trtllm-backend">SageAttention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#vc-attention-in-the-trtllm-backend">VC-Attention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-and-mxfp8-in-the-cudnn-backend">FP8 and MXFP8 in the cuDNN Backend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends">MXFP8 and NVFP4 in the <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> and <code class="docutils literal notranslate"><span class="pre">FlashInfer</span></code> backends</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#interaction-with-other-features">Interaction With Other Features</a></li>
@@ -1216,9 +1292,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

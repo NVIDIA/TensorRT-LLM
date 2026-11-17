@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -676,7 +684,7 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="deployment-guide-for-qwen3-8-flash-next-on-tensorrt-llm-blackwell-hardware">
-<h1>Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware<a class="headerlink" href="#deployment-guide-for-qwen3-8-flash-next-on-tensorrt-llm-blackwell-hardware" title="Link to this heading">#</a></h1>
+<span id="deployment-guide-for-qwen38-flash-next-on-tensorrt-llm---blackwell-hardware"></span><h1>Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware<a class="headerlink" href="#deployment-guide-for-qwen3-8-flash-next-on-tensorrt-llm-blackwell-hardware" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
 <p>This guide describes how to serve Qwen3.8-Flash-Next with the TensorRT LLM PyTorch backend. It covers the BF16, block-scaled FP8, and NVFP4 checkpoints, aggregated and disaggregated serving, MTP speculative decoding, and image-language input.</p>
@@ -721,6 +729,7 @@
 </table>
 </div>
 <p>The KV-cache dtype and the GDN recurrent-state dtype are selected independently of the model weight precision, through <code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code> and <code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code>.</p>
+<p>With an FP8 KV cache, QSA sparse attention selects the PrimTS kernel on SM100/SM103/SM107 when the inputs qualify, and Triton otherwise (small decode batches, unsupported shapes, or PrimTS unavailable). PrimTS converts the BF16 queries to FP8 (unit scale, clamped to the E4M3 range) and attends against the FP8 cache; Triton upcasts K/V to BF16 instead. The two differ at FP8 rounding level: full GSM8K on B300 at TP1 scores 95.45 with either kernel.</p>
 </section>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
@@ -788,7 +797,7 @@
 -p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 --name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4<span class="w"> </span><span class="se">\</span>
 /bin/bash
 </pre></div>
 </div>
@@ -920,43 +929,43 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 <h3>Key Configuration Options<a class="headerlink" href="#key-configuration-options" title="Link to this heading">#</a></h3>
 <p>These options control TensorRT LLM behavior and are set in the YAML file passed to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> with the <code class="docutils literal notranslate"><span class="pre">--config</span></code> argument.</p>
 <section id="tensor-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
+<span id="tensor_parallel_size"></span><h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
 <p>Sets the tensor-parallel size for attention, GDN, and PLE layers. This should typically match the number of GPUs used by one model instance.</p>
 </section>
 <section id="moe-tensor-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_tensor_parallel_size</span></code><a class="headerlink" href="#moe-tensor-parallel-size" title="Link to this heading">#</a></h4>
+<span id="moe_tensor_parallel_size"></span><h4><code class="docutils literal notranslate"><span class="pre">moe_tensor_parallel_size</span></code><a class="headerlink" href="#moe-tensor-parallel-size" title="Link to this heading">#</a></h4>
 <p>Sets the tensor-parallel size for routed experts, independently of <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>. Keep it at <code class="docutils literal notranslate"><span class="pre">1</span></code> and use expert parallelism instead: the routed-expert intermediate dimension is five 128-element blocks, so a pure MoE tensor-parallel split of 2 or 4 would cut FP8 scale blocks.</p>
 </section>
 <section id="moe-expert-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
+<span id="moe_expert_parallel_size"></span><h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
 <p>Sets the expert-parallel size for MoE layers. Use it together with <code class="docutils literal notranslate"><span class="pre">moe_tensor_parallel_size:</span> <span class="pre">1</span></code> for multi-GPU deployments.</p>
 </section>
 <section id="enable-attention-dp">
-<h4><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h4>
+<span id="enable_attention_dp"></span><h4><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h4>
 <p>Runs attention and linear-attention layers data-parallel while the MoE layers stay expert-parallel. This is the throughput-oriented layout. Pair it with <code class="docutils literal notranslate"><span class="pre">enable_lm_head_tp_in_adp:</span> <span class="pre">true</span></code> to keep the LM head tensor-parallel.</p>
 </section>
 <section id="kv-cache-config-free-gpu-memory-fraction">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-config-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
+<span id="kv_cache_configfree_gpu_memory_fraction"></span><h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-config-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
 <p>Fraction of free GPU memory reserved for the KV cache and recurrent state after the model is loaded. Reduce it if initialization reports an out-of-memory error.</p>
 </section>
 <section id="kv-cache-config-mamba-ssm-cache-dtype">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code><a class="headerlink" href="#kv-cache-config-mamba-ssm-cache-dtype" title="Link to this heading">#</a></h4>
+<span id="kv_cache_configmamba_ssm_cache_dtype"></span><h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code><a class="headerlink" href="#kv-cache-config-mamba-ssm-cache-dtype" title="Link to this heading">#</a></h4>
 <p>Selects the GDN recurrent-state dtype independently of the attention KV-cache dtype. Supported values are <code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, and <code class="docutils literal notranslate"><span class="pre">float32</span></code>.</p>
 </section>
 <section id="kv-cache-config-mamba-state-config-periodic-snapshot-interval">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config.periodic_snapshot_interval</span></code><a class="headerlink" href="#kv-cache-config-mamba-state-config-periodic-snapshot-interval" title="Link to this heading">#</a></h4>
+<span id="kv_cache_configmamba_state_configperiodic_snapshot_interval"></span><h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config.periodic_snapshot_interval</span></code><a class="headerlink" href="#kv-cache-config-mamba-state-config-periodic-snapshot-interval" title="Link to this heading">#</a></h4>
 <p>Number of tokens between recurrent-state snapshots in the prefix cache. Snapshots at a fixed interval suit a workload whose shared prefixes vary in length; see <a class="reference internal" href="#prefix-caching">Prefix caching</a>.</p>
 </section>
 <section id="kv-cache-config-mamba-state-config-additional-snapshot-offsets-from-start-from-end">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_start</span></code>, <code class="docutils literal notranslate"><span class="pre">..._from_end</span></code><a class="headerlink" href="#kv-cache-config-mamba-state-config-additional-snapshot-offsets-from-start-from-end" title="Link to this heading">#</a></h4>
+<span id="kv_cache_configmamba_state_configadditional_snapshot_offsets_from_start-_from_end"></span><h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_start</span></code>, <code class="docutils literal notranslate"><span class="pre">..._from_end</span></code><a class="headerlink" href="#kv-cache-config-mamba-state-config-additional-snapshot-offsets-from-start-from-end" title="Link to this heading">#</a></h4>
 <p>Snapshot the recurrent state at fixed token offsets measured from the start or the end of each prompt, instead of, or in addition to, a periodic interval. An offset of <code class="docutils literal notranslate"><span class="pre">0</span></code> from the end selects the prompt end, which suits multi-turn workloads that reuse a whole previous turn. Offsets that fall outside a prompt are ignored.</p>
 </section>
 <section id="max-batch-size-max-num-tokens-max-seq-len">
-<h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-batch-size-max-num-tokens-max-seq-len" title="Link to this heading">#</a></h4>
+<span id="max_batch_size-max_num_tokens-max_seq_len"></span><h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-batch-size-max-num-tokens-max-seq-len" title="Link to this heading">#</a></h4>
 <p>Set the maximum number of requests per scheduled batch, the maximum total tokens per scheduled batch, and the maximum length of a single request including generated tokens.</p>
 </section>
 <section id="cuda-graph-config">
-<h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
+<span id="cuda_graph_config"></span><h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
 <p>Controls CUDA graph capture and padding. The model defaults to eager execution, so set this explicitly:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">enable_padding</span></code>: Pads input batches to a captured CUDA graph batch size.</p></li>
@@ -964,7 +973,7 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 </ul>
 </section>
 <section id="moe-config">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
+<span id="moe_config"></span><h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
 <p>Controls MoE execution:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: Selects the MoE backend. Use <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> for BF16 and <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> for the FP8 and NVFP4 checkpoints; <code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code> is an alternative for block-scaled FP8 on SM100 or later.</p></li>
@@ -973,7 +982,7 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 </ul>
 </section>
 <section id="speculative-config">
-<h4><code class="docutils literal notranslate"><span class="pre">speculative_config</span></code><a class="headerlink" href="#speculative-config" title="Link to this heading">#</a></h4>
+<span id="speculative_config"></span><h4><code class="docutils literal notranslate"><span class="pre">speculative_config</span></code><a class="headerlink" href="#speculative-config" title="Link to this heading">#</a></h4>
 <p>Configures MTP speculative decoding:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code>: Set to <code class="docutils literal notranslate"><span class="pre">MTP</span></code>.</p></li>
@@ -982,11 +991,11 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 </ul>
 </section>
 <section id="cache-transceiver-config">
-<h4><code class="docutils literal notranslate"><span class="pre">cache_transceiver_config</span></code><a class="headerlink" href="#cache-transceiver-config" title="Link to this heading">#</a></h4>
+<span id="cache_transceiver_config"></span><h4><code class="docutils literal notranslate"><span class="pre">cache_transceiver_config</span></code><a class="headerlink" href="#cache-transceiver-config" title="Link to this heading">#</a></h4>
 <p>Configures the disaggregated state transfer. This model requires <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">NIXL</span></code> with <code class="docutils literal notranslate"><span class="pre">transceiver_runtime:</span> <span class="pre">PYTHON</span></code>; see <a class="reference internal" href="#disaggregated-serving">Disaggregated Serving</a>.</p>
 </section>
 <section id="trust-remote-code">
-<h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
+<span id="trust_remote_code"></span><h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
 <p>Allows Hugging Face to load custom model and tokenizer code from the model repository. Enable it only for trusted model sources.</p>
 <p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> API reference</a> for the complete configuration schema, <a class="reference internal" href="../features/kvcache.html"><span class="std std-doc">KV cache documentation</span></a> for hybrid-state cache settings, and <a class="reference internal" href="../features/speculative-decoding.html"><span class="std std-doc">speculative decoding documentation</span></a> for MTP details.</p>
 </section>
@@ -1324,9 +1333,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

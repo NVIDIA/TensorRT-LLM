@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -706,7 +714,7 @@ limitations under the License.
 </section>
 <section id="ci-pipelines">
 <h2>CI pipelines<a class="headerlink" href="#ci-pipelines" title="Link to this heading">#</a></h2>
-<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, the <strong>post-merge pipeline</strong> runs the same <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code> as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> in its name. In both pipelines, the test stages run in child jobs defined by <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>, which maps each stage name to a test-db YAML file.</p>
+<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, the <strong>post-merge pipeline</strong> runs the same <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code> as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> in its name. In both pipelines, the test stages run in child jobs defined by <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>, which maps each stage name to a test-db YAML file.</p>
 <p><code class="docutils literal notranslate"><span class="pre">stage</span></code> tags live in the YAML files under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Searching those files for <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code> shows exactly which tests the merge-request pipeline covers.</p>
 </section>
 <section id="test-definitions">
@@ -747,7 +755,7 @@ limitations under the License.
 <li><p>The resulting stage name(s) are what you pass to Jenkins via the <code class="docutils literal notranslate"><span class="pre">stage_list</span></code> parameter when triggering a job.</p></li>
 </ol>
 <section id="using-test-to-stage-mapping-py">
-<h3>Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code><a class="headerlink" href="#using-test-to-stage-mapping-py" title="Link to this heading">#</a></h3>
+<span id="using-test_to_stage_mappingpy"></span><h3>Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code><a class="headerlink" href="#using-test-to-stage-mapping-py" title="Link to this heading">#</a></h3>
 <p>Manually searching YAML and Groovy files can be tedious.  The helper script
 <code class="docutils literal notranslate"><span class="pre">scripts/test_to_stage_mapping.py</span></code> automates the lookup:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span><span class="s2">"unittest/_torch/sampler/test_beam_search.py"</span>
@@ -773,19 +781,200 @@ tests in a newline‑separated text file or a YAML list and supply it with
 </section>
 <section id="waiving-tests">
 <h2>Waiving tests<a class="headerlink" href="#waiving-tests" title="Link to this heading">#</a></h2>
-<p>Sometimes a test is known to fail due to a bug or unsupported feature. Instead
-of removing it from the YAML test lists, add the test name to
-<code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/waives.txt</span></code>. Every CI run passes this file to
-pytest via <code class="docutils literal notranslate"><span class="pre">--waives-file</span></code>, so the listed tests are skipped automatically.</p>
-<p>Each line contains the fully qualified test name followed by an optional
-<code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code> marker. A <code class="docutils literal notranslate"><span class="pre">full:GPU_TYPE/</span></code> prefix restricts the waive to a
-specific hardware family. Example:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
-full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
+<p>For known failures, add a line to <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/waives.txt</span></code> rather
+than removing the test from its YAML list. Use <code class="docutils literal notranslate"><span class="pre">&lt;test&gt;</span> <span class="pre">SKIP</span> <span class="pre">(reason)</span></code>, with an
+explicit <code class="docutils literal notranslate"><span class="pre">SKIP</span></code> and a tracking bug or brief explanation. A matching waive skips
+the test body.</p>
+<p>In PR CI, Jenkins normally merges the PR list with the latest target-branch
+list (tip of tree, or TOT), then applies exact-line removals from the PR diff.
+Pytest receives this effective list via <code class="docutils literal notranslate"><span class="pre">--waives-file</span></code>: main TOT waives can
+therefore affect PRs targeting main even when absent from the PR checkout.</p>
+<section id="writing-a-waive">
+<h3>Writing a waive<a class="headerlink" href="#writing-a-waive" title="Link to this heading">#</a></h3>
+<p>Copy the test path and command-line options, omitting <code class="docutils literal notranslate"><span class="pre">ISOLATION</span></code>, <code class="docutils literal notranslate"><span class="pre">TIMEOUT</span> <span class="pre">(N)</span></code>,
+and YAML comments. This metadata is not part of the collected node ID; leaving
+it in a waive name prevents a match. This applies to integration and <code class="docutils literal notranslate"><span class="pre">unittest/</span></code>
+entries alike:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] TIMEOUT (90) ISOLATION</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">unittest/executor/test_base_worker.py ISOLATION</span>
 </pre></div>
 </div>
-<p>Changes to <code class="docutils literal notranslate"><span class="pre">waives.txt</span></code> should include a bug link or brief explanation so other
-developers understand why the test is disabled.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] SKIP (Known issue in this test)
+unittest/executor/test_base_worker.py SKIP (Known issue in this file)
+</pre></div>
+</div>
+<p>Use one waive per line; blank lines are ignored. <code class="docutils literal notranslate"><span class="pre">#</span></code> starts a comment anywhere,
+including inside quotes or reasons. <code class="docutils literal notranslate"><span class="pre">-k</span> <span class="pre">&quot;modeling_llama&quot;</span></code> is valid, but
+<code class="docutils literal notranslate"><span class="pre">-k</span> <span class="pre">&quot;case#tag&quot;</span></code> is truncated. Use tracking URLs without fragments: a <code class="docutils literal notranslate"><span class="pre">#</span></code> can
+remove the reason’s closing parenthesis and break parsing of the whole file.
+Replace the illustrative names and reasons below with actual tests and bugs.</p>
+</section>
+<section id="matching-outer-entries-and-inner-unit-tests">
+<h3>Matching: outer entries and inner unit tests<a class="headerlink" href="#matching-outer-entries-and-inner-unit-tests" title="Link to this heading">#</a></h3>
+<p>Ordinary integration tests match exact node IDs. A <code class="docutils literal notranslate"><span class="pre">unittest/</span></code> test-db entry
+has two layers: an integration wrapper, then a separate pytest run for its
+selected unit tests. Waives apply during <code class="docutils literal notranslate"><span class="pre">pytest_collection_modifyitems</span></code> at
+each layer, before test bodies run.</p>
+<p><strong>Outer entry:</strong> <code class="docutils literal notranslate"><span class="pre">unittest/&lt;entry&gt;</span></code> becomes
+<code class="docutils literal notranslate"><span class="pre">test_unittests.py::test_unittests_v2[unittest/&lt;entry&gt;]</span></code>. The full entry includes
+options such as <code class="docutils literal notranslate"><span class="pre">-k</span></code>, <code class="docutils literal notranslate"><span class="pre">-m</span></code>, and <code class="docutils literal notranslate"><span class="pre">--ignore</span></code>: copy their order, internal spaces,
+and quotes exactly. Equivalent shell arguments are not normalized. Changing
+them requires rechecking the waive. An exact match skips the wrapper and its
+entire inner run; inner waives cannot restore it.</p>
+<p>For <code class="docutils literal notranslate"><span class="pre">unittest/_torch/modeling</span> <span class="pre">SKIP</span> <span class="pre">(Known</span> <span class="pre">modeling</span> <span class="pre">issue)</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Separate test-db entry</p></th>
+<th class="head"><p>Entire entry skipped?</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unittest/_torch/modeling</span></code></p></td>
+<td><p>Yes: exact entry.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unittest/_torch/modeling</span> <span class="pre">-k</span> <span class="pre">&quot;modeling_llama&quot;</span></code></p></td>
+<td><p>No: the options make it a different entry.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unittest/_torch/modeling/test_modeling_llama.py</span></code></p></td>
+<td><p>No: the file path is a different entry.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is not a directory-prefix match. To skip several filtered entries, list
+each complete entry with its own <code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code>.</p>
+<p><strong>Inner unittest:</strong> if the wrapper runs, the matcher checks these names in order:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Priority</p></th>
+<th class="head"><p>Waive name (append <code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code>)</p></th>
+<th class="head"><p>Scope</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">unittest/test_example.py::TestExample::test_forward[fp16]</span></code></p></td>
+<td><p>One parameter instance.</p></td>
+</tr>
+<tr class="row-odd"><td><p>2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">unittest/test_example.py::TestExample::test_forward</span></code></p></td>
+<td><p>All parameter instances of the method.</p></td>
+</tr>
+<tr class="row-even"><td><p>3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">unittest/test_example.py::TestExample</span></code></p></td>
+<td><p>All collected tests in the class.</p></td>
+</tr>
+<tr class="row-odd"><td><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">unittest/test_example.py</span></code></p></td>
+<td><p>All collected tests in the file.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The first matching name wins: check the full node ID, remove the parameter
+suffix starting at <code class="docutils literal notranslate"><span class="pre">[</span></code>, then remove the last <code class="docutils literal notranslate"><span class="pre">::</span></code> component repeatedly. A
+standalone function has no class step. Matching stops at the file; the current
+inner matcher does not walk directories. A directory invocation can only be
+waived as an exact outer entry. Neither layer supports globs, regular
+expressions, or partial parameter names; ordinary integration tests do not
+inherit the inner file/class/function matching.</p>
+<p>A file waive also skips its tests when collected through another outer entry
+(for example, one with <code class="docutils literal notranslate"><span class="pre">-k</span></code>), leaving other selected files unaffected. Use a
+method or case waive to keep the rest of that file running. Use collected node
+IDs and <code class="docutils literal notranslate"><span class="pre">unittest/</span></code> paths, not repository-root <code class="docutils literal notranslate"><span class="pre">tests/unittest/</span></code> paths.</p>
+</section>
+<section id="platform-scope">
+<h3>Platform scope<a class="headerlink" href="#platform-scope" title="Link to this heading">#</a></h3>
+<p>Scope applies to runners receiving <code class="docutils literal notranslate"><span class="pre">--waives-file</span></code>, not automatically to every
+Jenkins stage or independent runner. CI passes <code class="docutils literal notranslate"><span class="pre">--test-prefix=&lt;stage-name&gt;</span></code> to
+outer pytest and <code class="docutils literal notranslate"><span class="pre">&lt;stage-name&gt;/unittest</span></code> to inner pytest. The forms below assume
+that setup. <code class="docutils literal notranslate"><span class="pre">&lt;test&gt;</span></code> can be an exact integration/outer entry or a supported
+inner unittest name; platform scope does not change its matching rules.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Waive form (append <code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code>)</p></th>
+<th class="head"><p>Scope</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&lt;test&gt;</span></code></p></td>
+<td><p>All platforms where the test matches and the waive file is supplied. The current prefix is added if set; unprefixed integration waives also work locally without <code class="docutils literal notranslate"><span class="pre">--test-prefix</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">full:DGX_H100/&lt;test&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100</span></code> stages, e.g. <code class="docutils literal notranslate"><span class="pre">DGX_H100-PyTorch-1</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">full:GH200/&lt;test&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">GH200</span></code> stages, e.g. <code class="docutils literal notranslate"><span class="pre">GH200-PyTorch-Post-Merge-1</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">full:A100X/&lt;test&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">A100X</span></code> stages, e.g. <code class="docutils literal notranslate"><span class="pre">A100X-PyTorch-1</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">full:CPU/&lt;test&gt;</span></code></p></td>
+<td><p>Standard <code class="docutils literal notranslate"><span class="pre">CPU-Generic-x86-*</span></code> and <code class="docutils literal notranslate"><span class="pre">CPU-Generic-arm-*</span></code> stages (<code class="docutils literal notranslate"><span class="pre">l0_cpu.yml</span></code>, zero GPUs), without GPU detection.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">full:sm90/&lt;test&gt;</span></code></p></td>
+<td><p>Exact SM90 detected by the collecting pytest process; can cover both <code class="docutils literal notranslate"><span class="pre">DGX_H100</span></code> and <code class="docutils literal notranslate"><span class="pre">GH200</span></code>. See detection limits below.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">full:</span></code> supplies a prefix instead of having one prepended. For a matching
+platform, the parser expands the part before the first <code class="docutils literal notranslate"><span class="pre">-</span></code> in <code class="docutils literal notranslate"><span class="pre">--test-prefix</span></code>
+to that full prefix. Names are case-sensitive: <code class="docutils literal notranslate"><span class="pre">H100</span></code> is not an alias for
+<code class="docutils literal notranslate"><span class="pre">DGX_H100</span></code>, nor is <code class="docutils literal notranslate"><span class="pre">A100</span></code> an alias for <code class="docutils literal notranslate"><span class="pre">A100X</span></code>. Copy the name from
+the actual invocation or <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/jenkins/L0_Test.groovy">stage definitions</a>,
+not the GPU model or test-db filename. A bare <code class="docutils literal notranslate"><span class="pre">DGX_H100/&lt;test&gt;</span></code> without <code class="docutils literal notranslate"><span class="pre">full:</span></code>
+gets the current prefix prepended again.</p>
+<p>For several platforms, use one line each, such as <code class="docutils literal notranslate"><span class="pre">full:A100X/&lt;test&gt;</span></code> and
+<code class="docutils literal notranslate"><span class="pre">full:DGX_H100/&lt;test&gt;</span></code>; these exclude <code class="docutils literal notranslate"><span class="pre">GH200</span></code>. Comma lists and <code class="docutils literal notranslate"><span class="pre">*</span></code> are not
+expanded. Remove any unprefixed <code class="docutils literal notranslate"><span class="pre">SKIP</span></code> for that test when narrowing its scope,
+or it will still skip on other platforms.</p>
+<p>Expansion currently replaces <strong>every occurrence</strong> of the platform/SM string.
+For example, <code class="docutils literal notranslate"><span class="pre">full:CPU/test_example.py::test_device[CPU]</span></code> also rewrites the
+parameter ID and can stop matching; repeated <code class="docutils literal notranslate"><span class="pre">smXX</span></code> strings have the same issue.</p>
+<p><strong>SM detection:</strong> <code class="docutils literal notranslate"><span class="pre">full:sm&lt;version&gt;/</span></code> expands to the current test prefix only
+when <code class="docutils literal notranslate"><span class="pre">get_sm_version()</span></code> equals that version, not a minimum version or range. It queries
+<code class="docutils literal notranslate"><span class="pre">torch.cuda.get_device_properties(0)</span></code> in the collecting pytest process and
+returns <code class="docutils literal notranslate"><span class="pre">major</span> <span class="pre">*</span> <span class="pre">10</span> <span class="pre">+</span> <span class="pre">minor</span></code>. Device 0 is that process’s first visible CUDA
+device, not every GPU in a multi-GPU stage. The inner pytest process needs its
+own visibility. Stage names, YAML conditions, <code class="docutils literal notranslate"><span class="pre">cpu_only</span></code> markers, and GPUs used
+later by model workers or remote servers do not establish the detected SM.</p>
+<ul class="simple">
+<li><p>CUDA unavailable (including CPU-only processes), or <code class="docutils literal notranslate"><span class="pre">get_device_properties(0)</span></code>
+raising <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>: the helper returns <code class="docutils literal notranslate"><span class="pre">0</span></code>, not a real GPU SM version.</p></li>
+<li><p>Other import/detection exceptions: the waive parser catches them.</p></li>
+<li><p>On mismatch or detection failure, <code class="docutils literal notranslate"><span class="pre">sm90/</span></code> stays literal under a normal platform
+prefix, so the waive does not match. There is no all-platform fallback or
+unmatched-waive error. SM detection is not guaranteed in every stage;
+use <code class="docutils literal notranslate"><span class="pre">full:CPU/</span></code> for standard CPU stages.</p></li>
+</ul>
+</section>
+<section id="choosing-and-checking-a-waive">
+<h3>Choosing and checking a waive<a class="headerlink" href="#choosing-and-checking-a-waive" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Use a case/function waive for isolated failures. For widespread unit-test
+failures, a temporary whole-entry waive can restore CI more efficiently,
+but also skips unaffected tests in that entry. Track the bugs, prioritize
+fixes, and remove the waive after verifying them to restore coverage.</p></li>
+<li><p>Verify the intended entry/case and platform against the run’s effective
+<code class="docutils literal notranslate"><span class="pre">--waives-file</span></code>, including target-branch waives. <code class="docutils literal notranslate"><span class="pre">--collect-only</span></code> helps identify
+names but does not prove skipping: check the run’s skip status and reason.</p></li>
+</ul>
+<p>Implementation references:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/jenkins/L0_MergeRequest.groovy">Jenkins <code class="docutils literal notranslate"><span class="pre">mergeWaiveList</span></code></a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/jenkins/scripts/mergeWaiveList.py"><code class="docutils literal notranslate"><span class="pre">mergeWaiveList.py</span></code></a>: PR/TOT merging.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tests/integration/defs/test_list_parser.py"><code class="docutils literal notranslate"><span class="pre">parse_test_list_lines</span></code> / <code class="docutils literal notranslate"><span class="pre">apply_waives</span></code></a>:
+parsing, prefixes, and exact outer matching.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tests/integration/defs/test_unittests.py"><code class="docutils literal notranslate"><span class="pre">test_unittests_v2</span></code></a> /
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tests/unittest/conftest.py"><code class="docutils literal notranslate"><span class="pre">apply_waives_ut</span></code></a>: inner pytest invocation,
+waive-file forwarding, and inner matching.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tests/integration/defs/conftest.py"><code class="docutils literal notranslate"><span class="pre">get_sm_version</span></code></a>: SM detection.</p></li>
+</ul>
+<p>When changing waive merging, matching, or prefix handling, update this section
+and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tests/integration/test_lists/AGENTS.md"><code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/AGENTS.md</span></code></a>
+in the same change.</p>
+</section>
 </section>
 <section id="multi-gpu-tests">
 <h2>Multi-GPU Tests<a class="headerlink" href="#multi-gpu-tests" title="Link to this heading">#</a></h2>
@@ -840,7 +1029,7 @@ behavior.</p>
 <p>Being selective keeps CI turnaround fast and conserves hardware resources.</p>
 </section>
 <section id="avoiding-unnecessary-disable-fail-fast-usage">
-<h3>Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage<a class="headerlink" href="#avoiding-unnecessary-disable-fail-fast-usage" title="Link to this heading">#</a></h3>
+<span id="avoiding-unnecessary---disable-fail-fast-usage"></span><h3>Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage<a class="headerlink" href="#avoiding-unnecessary-disable-fail-fast-usage" title="Link to this heading">#</a></h3>
 <p>Avoid habitually using <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> commands only retry failed stages. Overusing <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.</p>
 </section>
 </section>
@@ -904,7 +1093,13 @@ behavior.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-test-to-stage-mapping-py">Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#waiving-tests">Waiving tests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#waiving-tests">Waiving tests</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#writing-a-waive">Writing a waive</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-outer-entries-and-inner-unit-tests">Matching: outer entries and inner unit tests</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#platform-scope">Platform scope</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#choosing-and-checking-a-waive">Choosing and checking a waive</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-tests">Multi-GPU Tests</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-ci-best-practices">Triggering CI Best Practices</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-post-merge-tests">Triggering Post-merge tests</a></li>
@@ -1002,9 +1197,9 @@ behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

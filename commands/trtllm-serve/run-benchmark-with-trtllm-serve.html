@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -759,7 +767,7 @@ A complete reference for the API is available in the <a class="reference externa
 <h3><a class="toc-backref" href="#id4" role="doc-backlink">Launch the NGC container</a><a class="headerlink" href="#launch-the-ngc-container" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM distributes the pre-built container on <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>.</p>
 <p>You can launch the container using the following command:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4
 </pre></div>
 </div>
 </section>
@@ -817,7 +825,7 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </section>
 </section>
 <section id="benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving">
-<h2><a class="toc-backref" href="#id6" role="doc-backlink">Benchmark using <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code></a><a class="headerlink" href="#benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving" title="Link to this heading">#</a></h2>
+<span id="benchmark-using-tensorrt_llmservescriptsbenchmark_serving"></span><h2><a class="toc-backref" href="#id6" role="doc-backlink">Benchmark using <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code></a><a class="headerlink" href="#benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving" title="Link to this heading">#</a></h2>
 <p>Similar to starting <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, create a script to execute the benchmark using the following code and name it bench.sh.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">concurrency_list</span><span class="o">=</span><span class="s2">"1 2 4 8 16 32 64 128 256"</span>
 <span class="nv">multi_round</span><span class="o">=</span><span class="m">5</span>
@@ -897,18 +905,12 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </ul>
 <p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
 <div class="math notranslate nohighlight">
-\[
-\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
-\]</div>
+\[\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}\]</div>
 <p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
 <div class="math notranslate nohighlight">
-\[
-\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-\]</div>
+\[\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}\]</div>
 <div class="math notranslate nohighlight">
-\[
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
-\]</div>
+\[\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}\]</div>
 </section>
 <section id="end-to-end-e2e-latency">
 <h4><a class="toc-backref" href="#id10" role="doc-backlink">End-to-End (E2E) Latency</a><a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
@@ -922,9 +924,7 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 <li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
 </ul>
 <div class="math notranslate nohighlight">
-\[
-\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+\[\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}\]</div>
 </section>
 <section id="tokens-per-second-tps-or-output-token-throughput">
 <h4><a class="toc-backref" href="#id12" role="doc-backlink">Tokens Per Second (TPS) or Output Token Throughput</a><a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
@@ -932,9 +932,7 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 <li><p>how many output tokens the system generates each second.</p></li>
 </ul>
 <div class="math notranslate nohighlight">
-\[
-\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+\[\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}\]</div>
 </section>
 </section>
 <section id="request-time-breakdown">
@@ -1039,7 +1037,7 @@ curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>
 </section>
 </section>
 <section id="about-config">
-<h2><a class="toc-backref" href="#id19" role="doc-backlink">About <code class="docutils literal notranslate"><span class="pre">--config</span></code></a><a class="headerlink" href="#about-config" title="Link to this heading">#</a></h2>
+<span id="about---config"></span><h2><a class="toc-backref" href="#id19" role="doc-backlink">About <code class="docutils literal notranslate"><span class="pre">--config</span></code></a><a class="headerlink" href="#about-config" title="Link to this heading">#</a></h2>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
@@ -1063,14 +1061,14 @@ Generally, we create a YAML file that contains various performance switches. For
 </div>
 <p>The following is a list of common performance switches.</p>
 <section id="kv-cache-config">
-<h3><a class="toc-backref" href="#id20" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h3>
+<span id="kv_cache_config"></span><h3><a class="toc-backref" href="#id20" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: A section for configuring the Key-Value (KV) cache.</p>
 <p> <strong>Options</strong>:</p>
 <p>  dtype: Sets the data type for the KV cache.</p>
 <p>  <strong>Default</strong>: auto (uses the data type specified in the model checkpoint).</p>
 </section>
 <section id="cuda-graph-config">
-<h3><a class="toc-backref" href="#id21" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
+<span id="cuda_graph_config"></span><h3><a class="toc-backref" href="#id21" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: A section for configuring CUDA graphs to optimize performance.</p>
 <p> <strong>Options</strong>:</p>
 <p>  enable_padding: If true, input batches are padded to the nearest cuda_graph_batch_size. This can significantly improve performance.</p>
@@ -1082,14 +1080,14 @@ Generally, we create a YAML file that contains various performance switches. For
 <p>  <strong>Default</strong>: None</p>
 </section>
 <section id="moe-config">
-<h3><a class="toc-backref" href="#id22" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
+<span id="moe_config"></span><h3><a class="toc-backref" href="#id22" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: Configuration for Mixture-of-Experts (MoE) models.</p>
 <p> <strong>Options</strong>:</p>
 <p>  backend: The backend to use for MoE operations.</p>
 <p>  <strong>Default</strong>: CUTLASS</p>
 </section>
 <section id="attn-backend">
-<h3><a class="toc-backref" href="#id23" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a><a class="headerlink" href="#attn-backend" title="Link to this heading">#</a></h3>
+<span id="attn_backend"></span><h3><a class="toc-backref" href="#id23" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a><a class="headerlink" href="#attn-backend" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: The backend to use for attention calculations.</p>
 <p> <strong>Default</strong>: TRTLLM</p>
 <p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">TorchLlmArgs class</a> for the full list of options which can be used in the <code class="docutils literal notranslate"><span class="pre">--config</span></code>.</p>
@@ -1428,9 +1426,9 @@ the profile command in AIPerf.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       
