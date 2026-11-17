@@ -170,6 +170,18 @@ class _Layer:
     def update_statistic_with_global_ids(self, ids, is_first_stage, is_last_stage):
         self.calls.append(("count", ids.tolist(), is_first_stage, is_last_stage))
 
+    def update_local_statistic(self, ids, is_first_stage, is_last_stage):
+        self.calls.append(("count_own", ids.tolist(), is_first_stage, is_last_stage))
+
+    def get_local_statistic_tensor(self):
+        self.calls.append("histogram")
+        return self.histogram
+
+    def update_statistic_with_gathered_statistic(self, statistic):
+        self.calls.append(("gathered", statistic.tolist()))
+
+    histogram = torch.tensor([3, 1, 0, 2, 0, 0, 0, 0], dtype=torch.int32)
+
     def start_set_cpu_stage(self):
         self.calls.append("set")
 
@@ -187,17 +199,26 @@ class _Layer:
 
 @pytest.fixture
 def no_route(monkeypatch):
-    """The routing op returns the ids it is given: the protocol is the subject here."""
-    monkeypatch.setattr(eplb_module, "eplb_route", lambda ids, layer, offset: ids)
+    """The routing op returns the ids it is given: the protocol is the subject here. The
+    fixture's list collects the `offset_by_ep_rank` of every call."""
+    offsets: list = []
+
+    def route(ids, layer, offset):
+        offsets.append(offset)
+        return ids
+
+    monkeypatch.setattr(eplb_module, "eplb_route", route)
+    return offsets
 
 
 def _ids(*rows):
     return torch.tensor(rows, dtype=torch.int32)
 
 
-def _online(**kwargs) -> tuple[EplbLayer, _Layer]:
-    layer = _Layer(online=True, **kwargs)
-    return EplbLayer(layer, EplbSlots.without_eplb(8, 2, 0)), layer
+def _online(load_expert_ids=(), **kwargs) -> tuple[EplbLayer, _Layer]:
+    """An online layer of 8 experts at EP 2 on rank 0, top-2; `kwargs` go to `EplbLayer`."""
+    layer = _Layer(online=True, load_expert_ids=load_expert_ids)
+    return EplbLayer(layer, EplbSlots.without_eplb(8, 2, 0), top_k=2, **kwargs), layer
 
 
 @pytest.mark.cpu_only
@@ -243,11 +264,12 @@ def test_a_layer_run_once_a_draft_step_completes_its_count_when_handed_back(no_r
 
 
 @pytest.mark.cpu_only
-def test_a_layer_that_ran_no_tokens_is_still_taken_and_handed_back(no_route):
-    """A forward that drafted nothing: the balancer waits for every layer every forward."""
+def test_a_layer_that_ran_no_tokens_is_still_taken_aged_and_handed_back(no_route):
+    """A forward that drafted nothing: the balancer waits for every layer every forward, and
+    the layer completes an empty statistic, so its window ages as for an empty batch."""
     eplb, layer = _online()
     eplb.close()
-    assert layer.calls == ["wait", "waited", "set", "done"]
+    assert layer.calls == ["wait", "waited", ("count", [[8, 8]], True, True), "set", "done"]
 
 
 @pytest.mark.cpu_only
@@ -264,6 +286,108 @@ def test_padding_rows_are_left_out_of_the_count(no_route):
         "waited",
         ("count", [[0, 1], [2, 3], [4, 5]], True, False),
         ("count", [[8, 8]], False, True),
+        "set",
+        "done",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_gathered_routing_ignores_the_rank_and_alltoall_routing_offsets_by_it(no_route):
+    """Gathered, the ranks route the same rows and must agree on every slot. Alltoall, each
+    rank routes its own tokens, and offsetting the replica choice by the rank spreads them
+    over an expert's replicas, as the built-in MoE does under attention DP. Static EPLB
+    routes the same way and records nothing."""
+    for alltoall in (False, True):
+        eplb, _ = _online(alltoall=alltoall)
+        eplb.route(_ids([0, 1]), last=True)
+        eplb.close()
+        layer = _Layer(online=False)
+        static = EplbLayer(layer, EplbSlots.without_eplb(8, 2, 0), alltoall=alltoall)
+        static.route(_ids([0, 1]), last=True)
+        assert static.local_statistic() is None
+        static.close()
+        assert layer.calls == []
+    assert no_route == [False, False, True, True]
+
+
+@pytest.mark.cpu_only
+def test_alltoall_counts_own_tokens_and_hands_the_histogram_to_the_last_dispatch(no_route):
+    """A trunk layer over two alltoall rounds: each round counts this rank's experts, the
+    histogram goes to the dispatch after the last round only, and the balancer takes every
+    rank's back. `close` then only hands the layer back."""
+    eplb, layer = _online(alltoall=True)
+    eplb.route(_ids([0, 1], [2, 3]))
+    assert eplb.local_statistic() is None
+    eplb.route(_ids([4, 5]), last=True)
+    histogram = eplb.local_statistic()
+    assert torch.equal(histogram, layer.histogram)
+    every_rank = torch.stack([histogram, histogram.flip(0)])
+    eplb.gathered(every_rank)
+    assert eplb.local_statistic() is None
+    with pytest.raises(AssertionError, match="once"):
+        eplb.gathered(every_rank)
+    eplb.close()
+    assert layer.calls == [
+        "wait",
+        "waited",
+        ("count_own", [[0, 1], [2, 3]], True, False),
+        ("count_own", [[4, 5]], False, True),
+        "histogram",
+        ("gathered", every_rank.tolist()),
+        "set",
+        "done",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_alltoall_draft_steps_add_up_to_one_histogram(no_route):
+    """The MTP layer under an alltoall: each draft step is a pass that ends on `last`, and
+    the histogram completes on the last of `repeat_count` passes, so one dispatch carries
+    every draft step's experts."""
+    eplb, layer = _online(alltoall=True, repeat_count=3)
+    for step in range(3):
+        eplb.route(_ids([step, 7]), last=True)
+        assert (eplb.local_statistic() is None) == (step < 2)
+    eplb.gathered(torch.zeros(2, 8, dtype=torch.int32))
+    eplb.close()
+    assert [c for c in layer.calls if isinstance(c, tuple)] == [
+        ("count_own", [[0, 7]], True, False),
+        ("count_own", [[1, 7]], False, False),
+        ("count_own", [[2, 7]], False, True),
+        ("gathered", [[0] * 8, [0] * 8]),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_an_alltoall_rank_without_tokens_still_carries_a_histogram(no_route):
+    """A rank with no tokens of its own counts a row no expert has, so it holds a histogram
+    of nothing when the dispatch carries every rank's."""
+    eplb, layer = _online(alltoall=True)
+    eplb.route(torch.empty((0, 2), dtype=torch.int32), last=True)
+    assert eplb.local_statistic() is not None
+    assert layer.calls[2] == ("count_own", [[8, 8]], True, True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("passes", [0, 1])
+def test_an_alltoall_histogram_no_dispatch_carried_is_completed_empty_on_every_rank(
+    no_route, passes
+):
+    """No rank ran the layer (a forward that drafted nothing), or every rank ran fewer passes
+    than `repeat_count`: no dispatch carried this forward's histogram, so every rank hands
+    the balancer the same empty one -- the window ages -- rather than each rank its own."""
+    eplb, layer = _online(alltoall=True, repeat_count=3)
+    for step in range(passes):
+        eplb.route(_ids([step, 7]), last=True)
+    eplb.close()
+    counted = [("count_own", [[0, 7]], True, False)] * passes
+    assert layer.calls == [
+        "wait",
+        "waited",
+        *counted,
+        ("count_own", [[8, 8]], passes == 0, True),
+        "histogram",
+        ("gathered", [[0] * 8, [0] * 8]),
         "set",
         "done",
     ]
