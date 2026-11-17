@@ -90,11 +90,22 @@ def _manager(
 
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.HALF, DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("heads", [1, 2, 4])
-def test_m3_resident_and_offloaded_transfer_views_match(dtype, heads):
+def test_m3_resident_and_offloaded_transfer_views_match(dtype, heads, monkeypatch):
     """Native transfer maps every dense, sparse and index pool in both directions."""
+    monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "zero")
     resident = _manager(dtype, heads, 40 * PAGE, offload=False)
     offloaded = _manager(dtype, heads, 40 * PAGE)
     try:
+        assert not set(offloaded._guard_page_by_layer) & set(SPARSE_LAYERS)
+        assert offloaded.get_cache_bytes_per_token() == sum(
+            offloaded.get_layer_bytes_per_token(layer, Role.ALL) for layer in range(4)
+        )
+        for layer in offloaded.impl.init_config.layers:
+            if int(layer.layer_id) not in SPARSE_LAYERS:
+                assert all(
+                    buffer.role not in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+                    for buffer in layer.buffers
+                )
         ranks = [
             RankInfo.from_kv_cache_manager(name, manager, device_id=0)
             for name, manager in (("context", resident), ("generation", offloaded))
@@ -678,3 +689,101 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             manager.free_resources(request)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "seq_lens,seq_lens_kv,contexts,device,error",
+    [
+        ([1], [0], 0, "cpu", NotImplementedError),
+        ([2], [2], 0, "cpu", NotImplementedError),
+        ([1], [1], 1, "cpu", NotImplementedError),
+        ([1], [1], 0, "cuda", ValueError),
+    ],
+)
+def test_m3_offload_rejects_unsupported_rows(seq_lens, seq_lens_kv, contexts, device, error):
+    metadata = SimpleNamespace(
+        sparse_offload_state=SimpleNamespace(prepared=True),
+        num_contexts=contexts,
+        seq_lens=torch.tensor(seq_lens, device=device),
+        seq_lens_kv=torch.tensor(seq_lens_kv, device=device),
+    )
+    with pytest.raises(error):
+        MiniMaxM3MsaSparseAttentionMetadata.prepare(metadata)
+    assert not metadata.sparse_offload_state.prepared
+
+
+def test_m3_offload_rejects_metadata_topk_mismatch():
+    manager = _manager(DataType.FP8, 2, 40 * PAGE)
+    try:
+        metadata = SimpleNamespace(
+            kv_cache_manager=manager,
+            _msa_params=MiniMaxM3SparseMetadataParams(global_num_kv_heads=1, topk=TOPK),
+            mapping=manager.mapping,
+            beam_width=1,
+            max_total_draft_tokens=0,
+            draft_kv_cache_manager=None,
+        )
+        with pytest.raises(ValueError, match="top-k"):
+            MiniMaxM3MsaSparseAttentionMetadata._init_sparse_offload_state(metadata)
+    finally:
+        manager.shutdown()
+
+
+def test_m3_selection_reuses_compilation_across_batch_sizes():
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload import (
+        _selection_kernel,
+        prepare_selection,
+    )
+
+    selected = torch.empty((16, 2 * TOPK), dtype=torch.int32, device="cuda")
+    units = torch.empty(16, dtype=torch.int32, device="cuda")
+    lengths = torch.full((16,), 3 * PAGE + 1, dtype=torch.int32, device="cuda")
+    compiled = []
+    for queries in (1, 2, 3, 7, 16):
+        topk = (
+            (torch.arange(2 * queries * TOPK, device="cuda", dtype=torch.int32) % 4)
+            .reshape(2, queries, TOPK)
+            .transpose(0, 1)
+        )
+        prepare_selection(topk, lengths, selected, units)
+        expected = torch.full((queries, 2 * TOPK), -1, dtype=torch.int32, device="cuda")
+        expected[:, :4] = torch.arange(4, dtype=torch.int32, device="cuda")
+        torch.testing.assert_close(selected[:queries], expected)
+        assert (units[:queries] == 4).all()
+        compiled.append(len(_selection_kernel.device_caches[torch.cuda.current_device()][0]))
+    assert len(set(compiled)) == 1, compiled
+
+
+def test_m3_sparse_block_table_checks_coverage(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload import (
+        build_block_table,
+    )
+
+    def device(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    fetched = device([[[-1, -1]]])
+    state = SimpleNamespace(
+        layers={1: SimpleNamespace(buffer_ids=[1], unit_tokens=PAGE, data_buffer_index=0)},
+        fetched_indices={1: fetched},
+        write_indices={1: device([[7]])},
+        batch_rows=device([0]),
+        active_request_count=device([1]),
+        history_lengths=device([PAGE]),
+        out_slots={1: [0]},
+        coverage=device([1]),
+    )
+    checks = []
+    # Observe the device flag without poisoning this process's CUDA context.
+    monkeypatch.setattr(
+        torch, "_assert_async", lambda flag, message: checks.append(int(flag.item()))
+    )
+    out = device([[-1, -1]])
+    selected = device([[0, 1]])
+    build_block_table(state, 1, selected, out)
+    assert checks == [0]
+    torch.testing.assert_close(out, device([[-1, 7]]))
+    fetched[0, 0, 0] = 3
+    build_block_table(state, 1, selected, out)
+    assert checks == [0, 1]
+    torch.testing.assert_close(out, device([[3, 7]]))

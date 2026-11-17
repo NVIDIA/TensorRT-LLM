@@ -55,6 +55,8 @@ struct SparseWorkList
     int32_t* slot = nullptr;
     //! [numLists] entries written so far. Zeroed before the producer runs; the consumer
     //! bounds its loop by it, which is why the count never crosses to the host.
+    //! Null for a single fixed list of `capacity` entries: each producer overwrites its
+    //! row's entry, using kNoSparseSlot when no partial-prefix restore is required.
     int32_t* total = nullptr;
 
     //! Entries one list holds, and the distance between consecutive lists. Zero for a single
@@ -67,9 +69,8 @@ struct SparseWorkList
 //! Fetch statistics, as the device counter and as its host copy.
 //!
 //! The two figures the resolve produces, not the two a reader wants: `hits()` is their
-//! difference and is never stored. `misses` is the row's claimed run in the compacted miss
-//! list -- the selected units that were not resident and so had to be copied from their
-//! host pages.
+//! difference and is never stored. `misses` counts selected units that were not resident
+//! and had to be copied from host. Partial-prefix restores are excluded from both figures.
 //!
 //! `unsigned long long` rather than `uint64_t` because the device side accumulates with
 //! `atomicAdd`, which has no overload for `unsigned long` on LP64.
@@ -133,8 +134,9 @@ struct SparseResolveArgs
     //! value rather than one baked in at capture.
     //!
     //! Ordinals below historyUnits are selectable history. Ordinals in
-    //! [historyUnits, capacityUnits) are in flight: the entry holds the only copy of their
-    //! data, so it is pinned against eviction and there is nothing to fetch for it. See
+    //! [historyUnits, capacityUnits) are in flight and pinned against eviction. With
+    //! includePartialUnits, a newly reserved cell restores the host prefix of the
+    //! partially filled history unit before the model appends data. See
     //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
     int32_t const* historyTokens;
     int32_t const* capacityTokens;
@@ -159,8 +161,9 @@ struct SparseResolveArgs
     //! since a call resolves one selection; every buffer of every layer naming that
     //! selection copies from it, each into its own mirror of the entry.
     //!
-    //! An in-flight unit that misses is allocated an entry but never appears here: its host
-    //! page is not written until the watermark passes it, so there is nothing to fetch.
+    //! With includePartialUnits, a missing in-flight unit with a nonempty host prefix
+    //! also appears here. Write preparation uses a separate fixed list indexed by row;
+    //! a selection resolve uses the compacted list.
     SparseWorkList work;
     //! [numRows] entries this row contributed. The copy does not read it -- it walks the
     //! compacted list -- but it is what makes a row's hit rate observable.
@@ -180,8 +183,8 @@ struct SparseResolveArgs
     //! Cumulative fetch statistics, which every row adds its own share of. Null skips it.
     //!
     //! Counted in the resolve because only the resolve can count either half: a padded
-    //! selection entry is negative and an in-flight unit is not a fetch, neither of which
-    //! the host can see. Both halves come from one pass, so they agree on what they count.
+    //! selection entry is negative and an in-flight unit is not a selected-history lookup,
+    //! neither of which the host can see. Both halves come from one pass, so they agree on what they count.
     //!
     //! A row adds its own contribution rather than anything reading a total afterwards. The
     //! step's counters are cleared once per publish, not per fetch, so a reader downstream

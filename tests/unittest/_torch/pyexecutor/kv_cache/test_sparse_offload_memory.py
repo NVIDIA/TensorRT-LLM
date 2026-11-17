@@ -472,9 +472,9 @@ def test_partial_blocks_reserve_a_prefix_fetch_per_batch_row() -> None:
 
     partial, complete = shape(True), shape(False)
     assert partial.partial_unit_groups == 1
-    # One row, ordinal and destination slot per request for a missing partial block.
-    assert partial.fetch_scratch_bytes - complete.fetch_scratch_bytes == 3 * 4 * 4
-    assert partial.device_bytes - complete.device_bytes == 3 * 4 * 4
+    # Separate fetch and write-preparation lists each hold a missing partial block.
+    assert partial.fetch_scratch_bytes - complete.fetch_scratch_bytes == 6 * 4 * 4
+    assert partial.device_bytes - complete.device_bytes == 6 * 4 * 4
     assert partial.flush_capacities == complete.flush_capacities == (4,)
 
 

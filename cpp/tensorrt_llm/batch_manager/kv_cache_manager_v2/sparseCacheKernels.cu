@@ -265,13 +265,19 @@ __device__ inline uint32_t victimKey(uint32_t staleness, int32_t slot) noexcept
 __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResolveArgs args)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);
+    gridDependencyWait();
+    if (args.includePartialUnits && threadIdx.x == 0)
+    {
+        args.work.row[row] = row;
+        args.work.ordinal[row] = 0;
+        args.work.slot[row] = kNoSparseSlot;
+    }
     SparseLeaseIndex const lease = args.leases[row];
     if (lease == kNoSparseLease)
     {
         return;
     }
 
-    gridDependencyWait();
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
     int32_t const capacity = args.capacityTokens[row];
     int32_t const capacityUnits = capacity / args.unitTokens
@@ -340,11 +346,8 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         args.inFlightSlot[row] = slot;
         if (args.includePartialUnits && matched == 0 && args.historyTokens[row] % args.unitTokens != 0)
         {
-            int32_t const index = atomicAdd(args.work.total, 1);
-            KVCM2_SPARSE_REQUIRE(index < args.work.capacity);
-            args.work.row[index] = row;
-            args.work.ordinal[index] = historyUnits;
-            args.work.slot[index] = slot;
+            args.work.ordinal[row] = historyUnits;
+            args.work.slot[row] = slot;
             args.missCount[row] = 1;
         }
     }
@@ -529,14 +532,20 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __syncthreads();
 
     // Claim this row's run in the compacted list now that the miss set is final, so the
-    // eviction loop below can write straight into it. Only a miss below the watermark is
-    // copied, which is the same test the loop applies, so counting it here costs one pass
-    // over a list already in shared memory and saves staging the entries anywhere.
+    // eviction loop below can write straight into it. Copyable misses include a partial
+    // host prefix when configured. Hit/miss statistics count only selected entries,
+    // excluding the write unit's restore.
     {
         int32_t mine = 0;
+        int32_t selectedMisses = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
             mine += missOrd[j] < copyableUnits ? 1 : 0;
+            selectedMisses += missOrd[j] < copyableUnits && missIdx[j] >= inFlight ? 1 : 0;
+        }
+        if (args.hitMiss != nullptr && selectedMisses > 0)
+        {
+            atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -550,7 +559,6 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
-                atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
             }
         }
     }
@@ -654,7 +662,7 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
     uint32_t const lane = threadIdx.x % kWarpSize;
     int32_t const stride = static_cast<int32_t>(gridDim.x) * kWarpsPerCopyCta;
     auto const listBase = static_cast<ptrdiff_t>(list) * args.work.capacity;
-    int32_t const count = args.work.total[list];
+    int32_t const count = args.work.total != nullptr ? args.work.total[list] : args.work.capacity;
 
     for (int32_t j = first; j < count; j += stride)
     {
@@ -662,6 +670,10 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         int32_t const row = args.work.row[index];
         int32_t const ordinal = args.work.ordinal[index];
         int32_t const slot = args.work.slot[index];
+        if (slot == kNoSparseSlot)
+        {
+            continue;
+        }
 
         // Read per item rather than per warp: the list is dense across rows, so consecutive
         // entries need not share one. A producer's CTA claims a contiguous run, so in
@@ -884,10 +896,10 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
 } // namespace
 
 //! Throw unless the work list is fully described.
-void checkWorkList(SparseWorkList const& work, char const* api)
+void checkWorkList(SparseWorkList const& work, char const* api, bool allowFixed = false)
 {
-    TLLM_CHECK_WITH_INFO(
-        work.row != nullptr && work.ordinal != nullptr && work.slot != nullptr && work.total != nullptr,
+    TLLM_CHECK_WITH_INFO(work.row != nullptr && work.ordinal != nullptr && work.slot != nullptr
+            && (work.total != nullptr || (allowFixed && work.numLists == 1)),
         std::string(api) + ": the work list's device arrays must be provided");
     TLLM_CHECK_WITH_INFO(work.capacity > 0 && work.numLists > 0,
         std::string(api) + ": the work list's capacity and list count must be positive");
@@ -976,7 +988,7 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         "launchSparseUnitCopy: rows, buffers, grid CTAs and units-per-page must be positive");
     TLLM_CHECK_WITH_INFO(args.copyDesc != nullptr && args.leases != nullptr,
         "launchSparseUnitCopy: every device array must be provided");
-    checkWorkList(args.work, "launchSparseUnitCopy");
+    checkWorkList(args.work, "launchSparseUnitCopy", true);
     TLLM_CHECK_WITH_INFO(args.work.numLists <= 1 || args.arena.bufferLayer != nullptr,
         "launchSparseUnitCopy: a per-layer work list needs the buffer-to-layer map");
 
@@ -1112,8 +1124,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     TLLM_CHECK_WITH_INFO(args.arena.numSelections > 0 && args.arena.entriesPerSelection > 0 && args.selectionWidth >= 0
             && args.numRows > 0,
         "launchSparseResolve: rows, selections and entries must be positive");
-    // A zero-width resolve is the write-index path: it makes the in-flight unit resident and
-    // nothing else, so it needs neither a selection to read nor a miss list to fill.
+    // A zero-width resolve reserves the write unit without reading a selection. Partial
+    // units also produce a fixed, row-indexed list of host prefixes to restore.
     TLLM_CHECK_WITH_INFO(args.selectionWidth != 0 || args.maxInFlightUnits != 0,
         "launchSparseResolve: a resolve with no selection must have an in-flight span");
     TLLM_CHECK_WITH_INFO(args.selectionSlot >= 0 && args.selectionSlot < args.arena.numSelections,
@@ -1128,7 +1140,14 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         "launchSparseResolve: the eviction clock is device-resident, so a captured graph reads the step's own value");
     if (args.selectionWidth > 0 || args.includePartialUnits)
     {
-        checkWorkList(args.work, "launchSparseResolve");
+        bool const fixedRestore = args.selectionWidth == 0 && args.includePartialUnits;
+        checkWorkList(args.work, "launchSparseResolve", fixedRestore);
+        if (fixedRestore)
+        {
+            TLLM_CHECK_WITH_INFO(
+                args.work.total == nullptr && args.work.capacity == args.numRows && args.maxInFlightUnits == 1,
+                "launchSparseResolve: partial write preparation needs one fixed restore entry per row");
+        }
         TLLM_CHECK_WITH_INFO(
             args.work.numLists == 1, "launchSparseResolve: a fetch resolves one selection, so it fills one list");
     }

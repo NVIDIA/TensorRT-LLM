@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -15,7 +16,6 @@ from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_t
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
-    BufferConfig,
     BufferId,
     KVCacheManagerConfig,
 )
@@ -25,6 +25,8 @@ from ..offload import (
     SparseOffloadCacheMixin,
     SparseOffloadLayerDescriptor,
 )
+
+__all__ = ["MiniMaxM3SparseOffloadMixin"]
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
@@ -67,35 +69,22 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
             ):
                 layers.append(layer)
                 continue
-            layers.append(
-                AttentionLayerConfig(
-                    layer_id=layer.layer_id,
-                    buffers=[
-                        BufferConfig(
-                            role=buffer.role,
-                            size=buffer.size,
-                            tokens_per_block_override=buffer.tokens_per_block_override,
-                            is_sparse=True,
-                            coalescing_group=buffer.coalescing_group,
-                            sparse_unit_chunks=buffer.sparse_unit_chunks,
-                            reuse_policy=buffer.reuse_policy,
-                        )
-                        if buffer.role in roles
-                        else buffer
-                        for buffer in layer.buffers
-                    ],
-                    sliding_window_size=layer.sliding_window_size,
-                    num_sink_tokens=layer.num_sink_tokens,
-                    reuse_policy=layer.reuse_policy,
-                    sparse_cache=sparse_cache_config(
-                        num_selected_units=self._sparse_offload_topk,
-                        unit_tokens=self.tokens_per_block,
-                        tokens_per_block=self.tokens_per_block,
-                        gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
-                        include_partial_units=True,
-                    ),
-                )
+            sparse_layer = copy(layer)
+            buffers = []
+            for buffer in layer.buffers:
+                sparse_buffer = copy(buffer)
+                if buffer.role in roles:
+                    sparse_buffer.is_sparse = True
+                buffers.append(sparse_buffer)
+            sparse_layer.buffers = buffers
+            sparse_layer.sparse_cache = sparse_cache_config(
+                num_selected_units=self._sparse_offload_topk,
+                unit_tokens=self.tokens_per_block,
+                tokens_per_block=self.tokens_per_block,
+                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                include_partial_units=True,
             )
+            layers.append(sparse_layer)
         return replace(config, layers=layers)
 
     def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:

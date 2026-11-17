@@ -186,22 +186,36 @@ def test_scheduler_gate_preserves_transfer_admission_and_request_objects(
             self.result = result
 
         def _schedule(self) -> tuple:
+            for request in self.result[0].generation_requests:
+                request.capacity += 1
+                request.inflight.append(0)
             return self.result
+
+        def _revert_unexecuted_alloc(self, batch) -> None:
+            for request in batch.generation_requests:
+                request.capacity -= 1 + request.inflight.pop()
 
     module = ModuleType("test_executor")
     module.PyExecutor = Executor
     observer["_observe_scheduler"](module)
-    short = SimpleNamespace(py_orig_prompt_len=4479, py_decoding_iter=1)
-    long = SimpleNamespace(py_orig_prompt_len=24749, py_decoding_iter=1)
+    short = SimpleNamespace(py_orig_prompt_len=4479, py_decoding_iter=1, capacity=4479, inflight=[])
+    long = SimpleNamespace(
+        py_orig_prompt_len=24749, py_decoding_iter=1, capacity=24749, inflight=[]
+    )
     batch = SimpleNamespace(generation_requests=[short])
     pending_transfers = [object()]
     executor = Executor((batch, pending_transfers, 2))
-    result = executor._schedule()
-    assert result[0] is batch and result[1] is pending_transfers and result[2] == 2
-    assert batch.generation_requests == []
+    for _ in range(3):
+        batch.generation_requests = [short]
+        result = executor._schedule()
+        assert result[0] is batch and result[1] is pending_transfers and result[2] == 2
+        assert batch.generation_requests == []
+        assert short.capacity == 4479 and short.inflight == []
     batch.generation_requests = [short, long]
     executor._schedule()
     assert batch.generation_requests[0] is long and batch.generation_requests[1] is short
+    assert short.capacity == 4480 and short.inflight == [0]
+    assert long.capacity == 24750 and long.inflight == [0]
 
 
 def _events() -> list[dict]:

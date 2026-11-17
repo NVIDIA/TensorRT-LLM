@@ -442,17 +442,30 @@ def _serve_schema() -> dict:
                 },
                 "required": ["implementation"],
             },
-            "else": {
-                "properties": {
-                    "kv_cache_offload_config": {
-                        "properties": {
-                            name: {"const": field["default"]} for name, field in sizing.items()
-                        },
-                    },
-                },
-            },
         }
     ]
+    # Offload sizing requires enablement on every backend that exposes the pair.
+    for config in schema["$defs"].values():
+        config_properties = config.get("properties", {})
+        if {"enable_kv_cache_offload", "kv_cache_offload_config"} <= config_properties.keys():
+            config.setdefault("allOf", []).append(
+                {
+                    "if": {
+                        "properties": {"enable_kv_cache_offload": {"const": True}},
+                        "required": ["enable_kv_cache_offload"],
+                    },
+                    "else": {
+                        "properties": {
+                            "kv_cache_offload_config": {
+                                "properties": {
+                                    name: {"const": field["default"]}
+                                    for name, field in sizing.items()
+                                },
+                            },
+                        },
+                    },
+                }
+            )
     # Mirror the MoE tactic validators of MoeConfig and of every decoding
     # config as far as a schema can, and that a tactic excludes any backend
     # but AUTO (or unset, where that is allowed).

@@ -3263,9 +3263,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
             "Give each request's in-flight unit a cell, and report where to write it.\n\n"
-            "The unit between the two watermarks is the one the model is about to produce. It has no "
-            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "The unit between the watermarks is the one the model is about to produce. With "
+            "include_partial_units, a newly reserved cell restores its host prefix before exposing "
+            "the write index; resident cells remain intact. Otherwise only a cell is reserved.\n\n"
             "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
             "which the indexer produces from the previous layer; a write needs only the watermarks, so "
             "it can run first, which is the order the model requires.\n\n"

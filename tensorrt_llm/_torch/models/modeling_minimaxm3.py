@@ -1092,13 +1092,20 @@ def minimax_m3_attn_custom_op_inplace(
             attn_metadata,
         )
         if horizontal is None:
-            raise RuntimeError(
-                "MiniMax-M3 fused horizontal producer is required inside the "
-                f"piecewise attention boundary for layer {layer_idx}, but its "
-                "runtime geometry or cache layout was unsupported."
+            main_size = attn_layer.q_size + 2 * attn_layer.kv_size
+            packed_qkv, packed_idx_qk = packed_qkv_index[:num_tokens].split(
+                [main_size, attn_layer.index_q_size + attn_layer.index_k_size], dim=-1
             )
-        q, idx_q = horizontal
-        k = v = idx_k = None
+            q, k, v, idx_q, idx_k = attn_layer._sparse_projection_norm_rope(
+                position_ids[..., :num_tokens] if position_ids is not None else None,
+                None,
+                attn_metadata,
+                packed_qkv,
+                packed_idx_qk,
+            )
+        else:
+            q, idx_q = horizontal
+            k = v = idx_k = None
     if q is None:
         raise RuntimeError(f"MiniMax-M3 attention layer {layer_idx} received no query tensor.")
     # The live token count is a host value, so the compiled graph above must
@@ -2258,6 +2265,97 @@ class MiniMaxM3Attention(Attention):
         self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
+    def _sparse_projection_norm_rope(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        packed_qkv: Optional[torch.Tensor] = None,
+        packed_idx_qk: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Normalize the main and index projections without requiring resident main KV."""
+
+        def _main_norm_rope():
+            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
+            )
+            if fused_qkv is not None:
+                return self._split_main_qkv(fused_qkv)
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.apply_qk_norm(q, k)
+            if self.rotary_emb is not None and position_ids is not None:
+                q, k = self.rotary_emb(position_ids, [q, k])
+            return q, k, v
+
+        def _index_norm_rope():
+            """Project and normalize index queries, with RoPE and cache updates."""
+            idx_qk = (
+                packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
+            )
+            graph_fp8_indexer = (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and self.attn.indexer_kv_dtype == "fp8"
+            )
+            if not graph_fp8_indexer:
+                fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+                if fp8_idx_q is not None:
+                    # Index-K was inserted directly into the paged side cache.
+                    return fp8_idx_q, None
+            # During compilation keep norm/RoPE/FP8 conversion captured, but
+            # leave dynamic index-K cache insertion in the attention boundary.
+            fused_idx = self._fused_qk_norm_rope(
+                idx_qk,
+                position_ids,
+                num_heads_q=self.sparse_num_index_heads,
+                num_heads_k=1,
+                num_heads_v=0,
+                head_dim=self.sparse_index_dim,
+                q_norm=self.index_q_norm,
+                k_norm=self.index_k_norm,
+                out_fp8=graph_fp8_indexer,
+            )
+            if fused_idx is not None:
+                return self._split_index_qk(fused_idx)
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
+                f"{self.sparse_index_dim}) but fell back to the separate path; idx "
+                f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
+            )
+            idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
+            idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+            if self.rotary_emb is not None and position_ids is not None:
+                idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+            return idx_q, idx_k
+
+        (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
+            _main_norm_rope,
+            _index_norm_rope,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
+
+        return q, k, v, idx_q, idx_k
+
     def _sparse_forward(
         self,
         position_ids: torch.IntTensor,
@@ -2377,86 +2475,8 @@ class MiniMaxM3Attention(Attention):
                 [main_size, self.index_q_size + self.index_k_size], dim=-1
             )
 
-        # Project, norm, and apply RoPE for the compatibility/fallback main and
-        # index branches. Both read only hidden_states and write disjoint
-        # outputs, so they overlap on the aux stream and join before attention.
-        def _main_norm_rope():
-            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
-            fused_qkv = self._fused_qk_norm_rope(
-                qkv,
-                position_ids,
-                num_heads_q=self.num_heads,
-                num_heads_k=self.num_key_value_heads,
-                num_heads_v=self.num_key_value_heads,
-                head_dim=self.head_dim,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-                out_fp8=self._emit_fp8_main_qkv(),
-            )
-            if fused_qkv is not None:
-                return self._split_main_qkv(fused_qkv)
-            assert not self._expect_fused_qk_norm_rope(position_ids), (
-                f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
-                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
-                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
-            )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.apply_qk_norm(q, k)
-            if self.rotary_emb is not None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k])
-            return q, k, v
-
-        def _index_norm_rope():
-            """Project and normalize index queries, with RoPE and cache updates."""
-            idx_qk = (
-                packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
-            )
-            graph_fp8_indexer = (
-                self.register_to_config
-                and is_torch_compiling()
-                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-                and self.attn.indexer_kv_dtype == "fp8"
-            )
-            if not graph_fp8_indexer:
-                fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
-                if fp8_idx_q is not None:
-                    # Index-K was inserted directly into the paged side cache.
-                    return fp8_idx_q, None
-            # During compilation keep norm/RoPE/FP8 conversion captured, but
-            # leave dynamic index-K cache insertion in the attention boundary.
-            fused_idx = self._fused_qk_norm_rope(
-                idx_qk,
-                position_ids,
-                num_heads_q=self.sparse_num_index_heads,
-                num_heads_k=1,
-                num_heads_v=0,
-                head_dim=self.sparse_index_dim,
-                q_norm=self.index_q_norm,
-                k_norm=self.index_k_norm,
-                out_fp8=graph_fp8_indexer,
-            )
-            if fused_idx is not None:
-                return self._split_index_qk(fused_idx)
-            assert not self._expect_fused_qk_norm_rope(position_ids), (
-                f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
-                f"{self.sparse_index_dim}) but fell back to the separate path; idx "
-                f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
-            )
-            idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
-            idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
-            if self.rotary_emb is not None and position_ids is not None:
-                idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
-            return idx_q, idx_k
-
-        (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
-            _main_norm_rope,
-            _index_norm_rope,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-            disable_on_compile=True,
+        q, k, v, idx_q, idx_k = self._sparse_projection_norm_rope(
+            position_ids, hidden_states, attn_metadata, packed_qkv, packed_idx_qk
         )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)

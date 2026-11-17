@@ -51,6 +51,7 @@ from ..offload import (
     SparseOffloadState,
     allocate_sparse_offload_state,
     get_sparse_offload_metadata_layers,
+    validate_sparse_offload_batch,
 )
 from .common import (
     MiniMaxM3SparseConfig,
@@ -188,6 +189,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
     sparse_offload_state: Optional[SparseOffloadState] = None
+    msa_sparse_write_slots: Optional[torch.Tensor] = None
+    msa_sparse_selected: Optional[torch.Tensor] = None
+    msa_sparse_unit_lengths: Optional[torch.Tensor] = None
+    msa_sparse_request_indices: Optional[torch.Tensor] = None
+    msa_sparse_block_table: Optional[torch.Tensor] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
     msa_layer_cache_tensors: Optional[
@@ -286,7 +292,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_offload_state = None
         if not getattr(manager, "_enable_kv_cache_offload", False):
             return
-        width = manager._sparse_offload_topk
+        if self._msa_params is None:
+            raise ValueError("MiniMax-M3 offload requires sparse metadata geometry")
+        _, local_kv_heads = self._msa_params.sharded_head_counts(self.mapping)
+        width = self._msa_params.topk * local_kv_heads
         layers = get_sparse_offload_metadata_layers(self, topk=width)
         batch = manager.max_batch_size
 
@@ -336,7 +345,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_sparse_request_indices,
             self.msa_sparse_unit_lengths,
         )
-        build_block_table(state, layer_idx, self.msa_sparse_selected, self.msa_sparse_block_table)
+        build_block_table(
+            state, layer_idx, self.msa_sparse_selected[: topk.shape[0]], self.msa_sparse_block_table
+        )
         return self.msa_sparse_block_table[: topk.shape[0]]
 
     @property
@@ -816,10 +827,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self) -> None:
         if self.sparse_offload_state is not None:
             self.sparse_offload_state.prepared = False
-            if self.num_contexts or not torch.all(self.seq_lens == 1):
-                raise NotImplementedError(
-                    "MiniMax-M3 sparse offload requires generation-only, single-token batches"
-                )
+            validate_sparse_offload_batch(self.num_contexts, self.seq_lens, self.seq_lens_kv)
             self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._check_beam_width()

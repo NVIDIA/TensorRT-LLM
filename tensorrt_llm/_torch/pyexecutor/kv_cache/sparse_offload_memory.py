@@ -488,7 +488,7 @@ class SparseBatchShape:
             total += 3 * rows * width + 1
             total += num_layers * (3 * flush_capacity + 1)
             total += rows * num_layers
-        return _INDEX_BYTES * (total + 3 * rows * self.partial_unit_groups)
+        return _INDEX_BYTES * (total + 6 * rows * self.partial_unit_groups)
 
 
 def sparse_batch_shape(

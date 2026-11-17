@@ -1102,6 +1102,38 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         return self
 
 
+class _SparseKvCacheOffloadConfigMixin(StrictBaseModel):
+    """Sizing and validation shared by backends with host-backed sparse history."""
+
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        description=
+        "Offload sparse attention history to host memory with KV cache "
+        "manager V2. Requires single-token decode on a disaggregated generation "
+        "worker; index keys and other resident caches remain on GPU.",
+        status="prototype",
+    )
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        description=
+        "GPU cache and host history sizing when enable_kv_cache_offload is enabled.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def _validate_offload_sizing(self):
+        if not self.enable_kv_cache_offload and self.kv_cache_offload_config != SparseKvCacheOffloadConfig(
+        ):
+            raise ValueError(
+                "kv_cache_offload_config requires enable_kv_cache_offload=True."
+            )
+        return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        return self.kv_cache_offload_config if self.enable_kv_cache_offload else None
+
+
 class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
     """Sparse attention config with sequence-length dependent behavior."""
 
@@ -1241,7 +1273,8 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
 
-class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
+class MiniMaxM3SparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
+                                     BaseSparseAttentionConfig):
     """Configuration for MiniMax-M3 block-sparse attention.
 
     Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
@@ -1261,21 +1294,6 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        description=
-        "Keep sparse main K/V history in host memory and fetch selected "
-        "blocks into a bounded GPU cache. Requires MSA, KV cache manager V2, "
-        "and single-token generation on a disaggregated generation worker. "
-        "Index keys and dense attention layers remain on the GPU.",
-        status="prototype",
-    )
-    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
-        default_factory=SparseKvCacheOffloadConfig,
-        description=
-        "GPU cache and host history sizing when enable_kv_cache_offload is enabled.",
-        status="prototype",
-    )
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description=
@@ -1368,10 +1386,6 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
                 raise ValueError(
                     "MiniMax-M3 KV cache offload requires positive sparse_topk_blocks."
                 )
-        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
-            raise ValueError(
-                "kv_cache_offload_config requires enable_kv_cache_offload=True."
-            )
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
@@ -1392,10 +1406,6 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "indexer_kv_dtype='fp8'.")
         return self
-
-    def get_kv_cache_offload_config(
-            self) -> Optional[SparseKvCacheOffloadConfig]:
-        return self.kv_cache_offload_config if self.enable_kv_cache_offload else None
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1512,7 +1522,8 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
 
-class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
+class DeepSeekSparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
+                                    SeqLenAwareSparseAttentionConfig):
     """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = Field(default="dsa")
     index_n_heads: Optional[int] = Field(
@@ -1600,21 +1611,6 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Offload the KV history sparse attention selects from to host memory "
-        "with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 "
-        "the ratio-4 compressed cache. Each decode step fetches the units the "
-        "indexer selects into a per-request GPU cache; the indexer and "
-        "sliding-window caches remain on GPU. Only a decode-only worker, such "
-        "as the generation worker of a disaggregated deployment, can offload.")
-    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
-        default_factory=SparseKvCacheOffloadConfig,
-        status="prototype",
-        description="Memory sizing for KV cache offload. Applies only with "
-        "enable_kv_cache_offload.")
 
     @model_validator(mode="after")
     def _validate_kv_cache_offload(self):
@@ -1626,16 +1622,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             if self.index_topk is not None and self.index_topk <= 0:
                 raise ValueError(
                     "KV cache offload requires a positive index_topk.")
-        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
-            raise ValueError("kv_cache_offload_config requires "
-                             "enable_kv_cache_offload=True.")
         return self
-
-    def get_kv_cache_offload_config(
-            self) -> Optional[SparseKvCacheOffloadConfig]:
-        if not self.enable_kv_cache_offload:
-            return None
-        return self.kv_cache_offload_config
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):

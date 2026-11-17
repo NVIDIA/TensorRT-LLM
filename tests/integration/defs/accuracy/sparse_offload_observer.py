@@ -60,6 +60,13 @@ def _observe_scheduler(module: ModuleType) -> None:
             request_lengths=[request.py_orig_prompt_len for request in requests],
             decoding_iters=[request.py_decoding_iter for request in requests],
         )
+        selected_indices = set(selected)
+        held = type(batch)()
+        held.generation_requests = [
+            request for index, request in enumerate(requests) if index not in selected_indices
+        ]
+        if held.generation_requests:
+            self._revert_unexecuted_alloc(held)
         batch.generation_requests = [requests[index] for index in selected]
         return result
 

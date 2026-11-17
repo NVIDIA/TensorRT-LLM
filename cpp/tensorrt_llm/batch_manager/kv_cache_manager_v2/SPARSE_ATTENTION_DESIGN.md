@@ -708,9 +708,8 @@ No host involvement, so the call enqueues and returns. Every shape is static acr
 The selection is not the only thing that needs a cell. The block being written needs one
 too, and needs it before the selection takes any victim. Both are resolved by the same
 probe, over one virtual list: the in-flight ordinals `[history_units, capacity_units)`
-first, then the selection. An in-flight unit differs in exactly one way — a miss allocates
-its cell but never joins the copy list, because its host page holds nothing to fetch until
-the watermark passes it.
+first, then the selection. A missing in-flight unit normally only reserves a cell.
+With `include_partial_units`, a nonempty host prefix is restored on its first reservation.
 
 ### Writing the in-flight unit
 
@@ -734,9 +733,13 @@ units produced only when all their input tokens are available.
 MiniMax-M3. History units use `floor(history / unit_tokens)` and capacity units use
 `ceil(capacity / unit_tokens)`, reserving the growing block on every step. A miss for that
 block restores its host prefix before exposing the write index; a hit leaves live writes
-intact. The fetch work list includes one extra entry per row for that prefix. Each advancing
-row flushes through `ceil(new_history / unit_tokens)` before resizing, so a request can
-leave its lease and later restore the partial block without losing appended tokens.
+intact. The fetch work list includes one extra entry per row for that prefix. Write
+preparation has a separate fixed list with one entry per row, overwritten on each call;
+empty entries use `kNoSparseSlot`. It needs no counter or per-call memset and cannot
+clobber a pending selection's fetch list. Each advancing row flushes through
+`ceil(new_history / unit_tokens)` before resizing. This also keeps host pages current for
+`commit_min_snapshot` and `stopCommitting()`, which can publish partial prefixes while a
+request is still seated. Flushing only on removal would leave those reusable prefixes stale.
 Layers using partial units must have independent selections (`selection_id=None`).
 
 `out` is `[batch][buffers]`, one entry per request: `resize` bounds `capacity - history_length`
@@ -862,14 +865,14 @@ rather than inferred.
 obvious denominator — rows times selection width, which the host knows for free — counts
 things that are neither. A selection entry may be padded, and padding is negative and lives
 on the device, chosen by whatever selected the units. An in-flight unit is resolved in the
-same pass but is not a fetch: its host page is not written until the watermark passes it,
-so there is nothing to copy and nothing to miss. Counting either as a hit inflates the rate,
+same pass but is excluded from selection hit/miss statistics. Partial-prefix restoration
+is write preparation, not a selected-history lookup. Counting either as a hit inflates the rate,
 and does so worst where histories are short — early decode, short prompts — which is
 exactly the regime someone reads the rate to understand.
 
 So the resolve counts the selection entries that named real history, in the pass that
-already classifies them. The miss half is `claimed`, the run the row takes in the compacted
-list, which it computes anyway. The two are produced together and agree by construction on
+already classifies them. The miss half counts selected-history misses, excluding partial-prefix restores even
+when a selection resolve also restores one. The two are produced together and agree by construction on
 what they count; hits are their difference and are never stored.
 
 **Each row adds its own contribution, rather than anything reading a total afterwards.**

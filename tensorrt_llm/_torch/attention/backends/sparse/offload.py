@@ -68,6 +68,18 @@ SPARSE_OFFLOAD_DEBUG_ASSERT = os.environ.get("TLLM_SPARSE_OFFLOAD_DEBUG_ASSERT",
 NVFP4_SCRATCH_TAIL_ROWS = 128
 
 
+def validate_sparse_offload_batch(
+    num_contexts: int, seq_lens: torch.Tensor, seq_lens_kv: torch.Tensor
+) -> None:
+    """Reject unsupported rows on the host before any model or cache writes."""
+    if num_contexts:
+        raise NotImplementedError("Sparse KV cache offload runs decode batches only")
+    if seq_lens.device.type != "cpu" or seq_lens_kv.device.type != "cpu":
+        raise ValueError("Sparse offload batch validation requires host sequence lengths")
+    if not torch.equal(seq_lens, seq_lens_kv) or not torch.all(seq_lens == 1):
+        raise NotImplementedError("Sparse offload decode requires one query per request")
+
+
 @dataclass(frozen=True, slots=True)
 class SparseOffloadPaddingRegion:
     """Unused buffer bytes across arena leases, initialized during manager construction."""

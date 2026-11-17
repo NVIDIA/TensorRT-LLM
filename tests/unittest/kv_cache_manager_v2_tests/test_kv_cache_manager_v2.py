@@ -4272,10 +4272,11 @@ class TestSparseWriteIndices(unittest.TestCase):
         init_cuda_once()
 
     @classmethod
-    def _manager(cls) -> KVCacheManager:
+    def _manager(cls, partial: bool = False) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=cls.TPB,
+                commit_min_snapshot=partial,
                 cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
                 constraints=[
                     BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
@@ -4298,6 +4299,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                             num_selected_blocks=cls.SELECTED,
                             max_cached_units=cls.CELLS,
                             unit_tokens=cls.TPB,
+                            include_partial_units=partial,
                         ),
                     )
                 ],
@@ -4374,6 +4376,93 @@ class TestSparseWriteIndices(unittest.TestCase):
                 self.assertEqual(landed, pattern, "the prepared cell was not the one written back")
                 batch.remove_kv_cache(cache)
         finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_partial_restore_preserves_pending_fetch_and_committed_prefix(self):
+        """Write preparation may interleave with a fetch; partial commits see current bytes."""
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager(partial=True)
+        cache = reused = None
+        try:
+            group = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            buffers = [BufferId(0, "key")]
+            history = self.TPB + 9
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                self.assertTrue(cache.resize(history + 1, history))
+                pages = [int(x) for x in cache.get_base_page_indices(group)]
+                patterns = [self._pattern(self.BUF, seed) for seed in (17, 29)]
+                for page, pattern in zip(pages, patterns):
+                    ctypes.memmove(pool + page * stride, pattern, self.BUF)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                batch.add_kv_cache(cache)
+                batch.publish()
+                arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+                fetched = torch.empty((2, 1, self.SELECTED), dtype=torch.int32, device="cuda")
+                out = torch.empty((2, 1), dtype=torch.int32, device="cuda")
+                torch.cuda.synchronize()
+                batch.resolve_sparse_selection(buffers, selected, handle)
+                batch.prepare_sparse_write_indices(buffers, out, handle)
+                batch.fetch_resolved_pages(buffers, selected, fetched, handle)
+                torch.cuda.synchronize()
+
+                def read_cell(index):
+                    data = (ctypes.c_ubyte * self.BUF)()
+                    (error,) = cudart.cudaMemcpy(
+                        ctypes.addressof(data),
+                        arena + index * self.BUF,
+                        self.BUF,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    )
+                    self.assertEqual(int(error), 0)
+                    return bytes(data)
+
+                self.assertEqual(batch.peek_hit_miss_counter(), (0, 1))
+                self.assertEqual(read_cell(int(fetched[0, 0, 0])), patterns[0])
+                index = int(out[0, 0])
+                self.assertEqual(read_cell(index), patterns[1])
+                self.assertEqual(int(out[1, 0]), BAD_PAGE_INDEX)
+                written = self._pattern(self.BUF, 53)
+                source = (ctypes.c_ubyte * self.BUF).from_buffer_copy(written)
+                (error,) = cudart.cudaMemcpy(
+                    arena + index * self.BUF,
+                    ctypes.addressof(source),
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                )
+                self.assertEqual(int(error), 0)
+                for _ in range(2):
+                    batch.prepare_sparse_write_indices(buffers, out, handle)
+                torch.cuda.synchronize()
+                self.assertEqual(read_cell(index), written)
+                batch.flush_sparse_units([history + 1, 0])
+                batch.wait_published()
+                self.assertTrue(cache.resize(history + 1, history + 1))
+                tokens = list(range(history + 1))
+                cache.commit(tokens)
+                reused = manager.create_kv_cache(None, tokens)
+                self.assertEqual(reused.history_length, history + 1)
+                self.assertTrue(reused.resume(handle))
+                torch.cuda.synchronize()
+                reused_page = int(reused.get_base_page_indices(group)[1])
+                self.assertEqual(ctypes.string_at(pool + reused_page * stride, self.BUF), written)
+                batch.remove_kv_cache(cache)
+        finally:
+            if reused is not None:
+                reused.close()
             if cache is not None:
                 cache.close()
             manager.shutdown()

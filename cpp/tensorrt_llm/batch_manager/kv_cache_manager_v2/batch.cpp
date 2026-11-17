@@ -297,18 +297,22 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     scratch.fetchWork.capacity
         = static_cast<int32_t>(rows) * (width + static_cast<int>(mManager->sparseCacheIncludesPartialUnits(lcId)));
     scratch.fetchWork.numLists = 1;
+    scratch.restoreWork.capacity = mManager->sparseCacheIncludesPartialUnits(lcId) ? mMaxBatchSize : 0;
+    scratch.restoreWork.numLists = 1;
     scratch.flushWork.capacity = _flushCapacity(lcId);
     scratch.flushWork.numLists = scratch.numLayers;
 
     auto const listEntries = [](SparseWorkList const& work)
     { return static_cast<size_t>(work.capacity) * static_cast<size_t>(work.numLists); };
     auto const fetchEntries = listEntries(scratch.fetchWork);
+    auto const restoreEntries = listEntries(scratch.restoreWork);
     auto const flushEntries = listEntries(scratch.flushWork);
     auto const outSlot = rows * static_cast<size_t>(width);
     auto const inFlightSlot = rows * static_cast<size_t>(scratch.maxInFlightUnits);
     auto const flushCount = rows * layers;
 
-    int32_t* cursor = co_yield outSlot + rows + inFlightSlot + 3 * fetchEntries + 3 * flushEntries + flushCount;
+    int32_t* cursor
+        = co_yield outSlot + rows + inFlightSlot + 3 * (fetchEntries + restoreEntries + flushEntries) + flushCount;
 
     auto const carve = [&cursor](size_t count)
     {
@@ -326,6 +330,7 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
         work.slot = carve(entries);
     };
     carveList(scratch.fetchWork, fetchEntries);
+    carveList(scratch.restoreWork, restoreEntries);
     carveList(scratch.flushWork, flushEntries);
     scratch.flushCount = carve(flushCount);
     // -1 so that "no write-back has run" stays distinguishable from "one ran and found
@@ -1699,14 +1704,9 @@ void Batch::prepareSparseWriteIndices(
     auto const marks = watermarks();
     auto const numRows = maxBatchSize();
 
-    // A resolve with no selection. It makes the in-flight unit resident -- reusing its entry
-    // when a previous step already pinned it -- and does nothing else: an in-flight unit's
-    // host page is not written until the watermark passes it, so there is nothing to copy.
-    //
-    // The selection and miss arrays are therefore left null, which the resolve tolerates only
-    // because it records a miss against the copy list under `ordinal < historyUnits`, and an
-    // in-flight ordinal never satisfies it. A change that made that write unconditional would
-    // fault here rather than quietly copying stale bytes over what the model wrote.
+    // A resolve with no selection reserves the in-flight unit. Partial units restore
+    // their host prefix on a miss, using a separate row-indexed list so a pending
+    // selection's copies remain intact. Hits never overwrite the model's live writes.
     SparseResolveArgs resolve;
     resolve.leases = leases;
     resolve.arena = arena;
@@ -1726,8 +1726,7 @@ void Batch::prepareSparseWriteIndices(
     resolve.outSlot = nullptr;
     if (resolve.includePartialUnits)
     {
-        resolve.work = _sparseFetchWork(scratch, span.selectionSlot);
-        cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(resolve.work.total), 0U, 1, stream));
+        resolve.work = scratch.restoreWork;
     }
     launchSparseResolve(resolve, stream);
 
@@ -1746,9 +1745,8 @@ void Batch::prepareSparseWriteIndices(
         copy.direction = SparseCopyDirection::kFetch;
         copy.unitsPerPage = unitsPerPage;
         copy.work = resolve.work;
-        copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
+        copy.gridCtas = sparseCopyGridCtas(numRows, mManager->_smCount());
         launchSparseUnitCopy(copy, stream);
-        cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(resolve.work.total), 0U, 1, stream));
     }
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the

@@ -114,6 +114,10 @@ struct SparseStepScratch
     //! selection, each copying the same units into its own cells.
     SparseWorkList fetchWork;
 
+    //! One optional partial-prefix restore per row. A fixed list, independent of a
+    //! pending selection, overwritten by every write-index preparation (no counter).
+    SparseWorkList restoreWork;
+
     //! The write-back's counterpart. A write-back crosses every layer of a row at once and
     //! the copy that consumes it walks buffers, so it takes one list per layer rather than
     //! the one the fetch folds away.
@@ -430,10 +434,9 @@ public:
     //! mis-serving them.
     //!
     //! `selected` is [maxBatchSize][selectionWidth] unit ordinals, negative where padded,
-    //! and must name only units below the history watermark -- a unit at or above it has
-    //! not been written back, so fetching it would copy stale bytes. That is a wrong
-    //! answer rather than a memory error, and the call cannot detect it, so it is the
-    //! selector's responsibility.
+    //! and must name only complete history units below the watermark. Partial-prefix
+    //! restoration is managed separately from the selection. The selector owns this
+    //! eligibility check; the fetch cannot distinguish stale or unwritten host bytes.
     //!
     //! `out` is [maxBatchSize][buffers.size()][selectionWidth], written in full, in the
     //! expanded index space getPageIndexConverter() produces: entry k is the index holding
@@ -490,10 +493,10 @@ public:
 
     //! Give the in-flight unit of each request a cell, and report where to write it.
     //!
-    //! The unit between the two watermarks is the one the model is about to produce. It has
-    //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
-    //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
-    //! to the model.
+    //! The unit between the watermarks is the one the model is about to produce.
+    //! With includePartialUnits, a newly reserved cell restores its host prefix before
+    //! exposing the write index. A resident cell is left intact. Other units have no
+    //! host contents until complete, so they only reserve a cell.
     //!
     //! Needs only the watermarks, not the selection, so it runs before fetchSparsePages.
     //!

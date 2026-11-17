@@ -28,9 +28,11 @@ Provides:
 
 from __future__ import annotations
 
-import dataclasses
 import os
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from collections.abc import Iterator
+from copy import copy
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -59,6 +61,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BufferConfig,
     DataRole,
+    LayerId,
     PageIndexMode,
 )
 
@@ -471,7 +474,7 @@ class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
         if layer_specs is not None and kwargs.get("dtype") == DataType.NVFP4:
             # The hybrid layout of _build_cache_config as specs: FP8 on the dense target layers.
             kwargs["layer_specs"] = tuple(
-                dataclasses.replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
+                replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
                 if spec.owner is KVCacheLayerOwner.TARGET
                 and spec.dtype == DataType.NVFP4
                 and spec.global_layer_id not in self.sparse_layer_ids
@@ -595,30 +598,32 @@ class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
             )
 
     def _build_cache_config(self, config):
-        """Separate sparse main K/V pools and keep dense/Eagle layers in FP8 for NVFP4.
-
-        M3's 57 sparse target layers have a native MSA NVFP4 consumer.  The
-        three dense target layers and the appended one-model Eagle layer do
-        not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
-        the proven FP8 representation.
-
-        Resident and offloaded workers must expose the same per-role layer
-        sets to disaggregated transfer. Sparse main K/V use their own
-        coalescing group even when their sizes match dense K/V or index keys.
-        """
+        """Keep dense and Eagle layers in FP8 when sparse layers use NVFP4."""
+        layers = []
         scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
-        main_roles = {Role.KEY, Role.VALUE, *scale_roles}
         for layer in config.layers:
-            sparse = int(self.pp_layers[int(layer.layer_id)]) in self.sparse_layer_ids
-            if self.dtype == DataType.NVFP4 and not sparse:
-                layer.buffers[:] = [
+            dense = int(self.pp_layers[int(layer.layer_id)]) not in self.sparse_layer_ids
+            if self.dtype == DataType.NVFP4 and dense:
+                layer = copy(layer)
+                layer.buffers = [
                     buffer for buffer in layer.buffers if buffer.role not in scale_roles
                 ]
-            for buffer in layer.buffers:
-                buffer.coalescing_group = 2 * buffer.coalescing_group + int(
-                    sparse and buffer.role in main_roles
-                )
-        return super()._build_cache_config(config)
+            layers.append(layer)
+        return super()._build_cache_config(replace(config, layers=layers))
+
+    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole) -> tuple:
+        """Match resident and offloaded transfer views without splitting resident pools."""
+        main_roles = {Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        sparse_main = (
+            int(self.pp_layers[int(layer_id)]) in self.sparse_layer_ids and role in main_roles
+        )
+        return super().get_disagg_pool_view_partition(layer_id, role), sparse_main
+
+    def _iter_guard_candidate_buffers(self) -> Iterator[tuple[int, torch.Tensor]]:
+        """Only resident pools have guard pages in the native host page-index space."""
+        for layer in self.pp_layers:
+            if not self.offloads_layer(layer):
+                yield layer, self.get_buffers(layer)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
@@ -653,12 +658,12 @@ class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
         return cache_bytes
 
     def get_cache_bytes_per_token(self) -> int:
-        """Bytes per token across the local layers, the sparse layers' index-K included.
-
-        The base sums the K/V roles only; the per-sparse-layer ``Role.INDEX_KEY``
-        buffers live in the same tiers, so the cache-created event's block count
-        divides each tier quota by this total. Layer specs carry no index-K either.
-        """
+        """GPU pool bytes per token, including index keys and excluding offloaded history."""
+        if self._enable_kv_cache_offload:
+            return sum(
+                self.get_layer_bytes_per_token(layer, Role.ALL)
+                for layer in range(self.num_local_layers)
+            )
         return super().get_cache_bytes_per_token() + sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
             for local_layer_idx in range(self.num_local_layers)

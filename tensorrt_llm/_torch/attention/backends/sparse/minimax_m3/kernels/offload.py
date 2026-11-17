@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 
 from ...offload import SparseOffloadState
+from ...offload_kernels import SPARSE_ARENA_COVERAGE_MESSAGE, sparse_arena_rows
+
+__all__ = ["build_block_table", "prepare_selection", "prepare_write_slots"]
 
 
 @triton.jit
@@ -50,16 +53,15 @@ def prepare_write_slots(state: SparseOffloadState, layer_idx: int, out: torch.Te
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_q", "stride_h", "stride_k"])
 def _selection_kernel(
     topk,
     lengths,
     selected,
     units,
-    STRIDE_Q: tl.constexpr,
-    STRIDE_H: tl.constexpr,
-    STRIDE_K: tl.constexpr,
-    QUERIES: tl.constexpr,
+    stride_q,
+    stride_h,
+    stride_k,
     TOPK: tl.constexpr,
     WIDTH: tl.constexpr,
     PAGE: tl.constexpr,
@@ -68,8 +70,8 @@ def _selection_kernel(
     query = tl.program_id(0)
     lane = tl.arange(0, BLOCK)
     block = tl.load(
-        topk + query * STRIDE_Q + (lane // TOPK) * STRIDE_H + (lane % TOPK) * STRIDE_K,
-        (query < QUERIES) & (lane < WIDTH),
+        topk + query * stride_q + (lane // TOPK) * stride_h + (lane % TOPK) * stride_k,
+        lane < WIDTH,
         other=-1,
     )
     # Keep the first occurrence across heads; all heads still read the original
@@ -82,7 +84,7 @@ def _selection_kernel(
         > 0
     )
     tl.store(selected + query * WIDTH + lane, tl.where(duplicate, -1, block), lane < WIDTH)
-    length = tl.load(lengths + query, query < QUERIES, other=0)
+    length = tl.load(lengths + query)
     tl.store(units + query, (length + PAGE - 1) // PAGE)
 
 
@@ -96,13 +98,12 @@ def prepare_selection(
     width = topk.shape[1] * topk.shape[2]
     if width != selected.shape[1] or topk.shape[0] > selected.shape[0]:
         raise ValueError("MiniMax-M3 selection does not match the sparse cache capacity")
-    _selection_kernel[(selected.shape[0],)](
+    _selection_kernel[(topk.shape[0],)](
         topk,
         seq_lens,
         selected,
         units,
         *topk.stride(),
-        topk.shape[0],
         topk.shape[2],
         width,
         128,
@@ -126,6 +127,8 @@ def _block_table_kernel(
     COLUMNS: tl.constexpr,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
+    coverage,
+    CHECK_COVERAGE: tl.constexpr,
 ):
     query = tl.program_id(0)
     row = tl.load(rows + query)
@@ -134,12 +137,19 @@ def _block_table_kernel(
     unit = tl.load(selected + query * WIDTH + lane, lane < WIDTH, other=-1)
     history_units = tl.load(history + row, live, other=0) // PAGE
     valid = live & (lane < WIDTH) & (unit >= 0) & (unit < COLUMNS) & (unit <= history_units)
-    page = tl.load(
-        fetched + row * FETCH_STRIDE + SLOT * WIDTH + lane, valid & (unit < history_units), other=-1
+    page = sparse_arena_rows(
+        unit,
+        lane < WIDTH,
+        live,
+        tl.minimum(COLUMNS, history_units + 1),
+        history_units,
+        fetched + row * FETCH_STRIDE + SLOT * WIDTH,
+        1,
+        lane,
+        tl.load(writes + row * WRITE_STRIDE + SLOT, live, other=-1),
+        coverage,
+        CHECK_COVERAGE,
     )
-    write_page = tl.load(writes + row * WRITE_STRIDE + SLOT, live, other=-1)
-    page = tl.where(unit == history_units, write_page, page)
-    tl.device_assert(~valid | (page >= 0), "MiniMax-M3 selected block has no sparse arena page")
     tl.store(table + query * COLUMNS + unit, page, valid)
 
 
@@ -150,6 +160,8 @@ def build_block_table(
     descriptor = state.layers[layer_idx]
     count = len(descriptor.buffer_ids)
     fetched, writes = state.fetched_indices[count], state.write_indices[count]
+    if state.coverage is not None:
+        state.coverage.fill_(1)
     _block_table_kernel[(selected.shape[0],)](
         selected,
         state.batch_rows,
@@ -165,4 +177,8 @@ def build_block_table(
         out.shape[1],
         descriptor.unit_tokens,
         triton.next_power_of_2(selected.shape[1]),
+        state.coverage if state.coverage is not None else out,
+        CHECK_COVERAGE=state.coverage is not None,
     )
+    if state.coverage is not None:
+        torch._assert_async(state.coverage, SPARSE_ARENA_COVERAGE_MESSAGE)

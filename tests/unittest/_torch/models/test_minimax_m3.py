@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
@@ -697,10 +697,15 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
 
 
 @pytest.mark.cpu_only
-def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> None:
+@pytest.mark.parametrize("horizontal_available", [True, False])
+def test_piecewise_attention_boundary_runs_horizontal_producer(
+    monkeypatch, horizontal_available
+) -> None:
     class FakeAttentionLayer:
         def __init__(self) -> None:
             self.producer_shapes = None
+            self.q_size, self.kv_size = 3, 1
+            self.index_q_size = self.index_k_size = 1
 
         def _fused_fp8_qkv_indexer_norm_rope_kv_insert(self, packed, position_ids, attn_metadata):
             self.producer_shapes = (
@@ -708,10 +713,18 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
                 tuple(position_ids.shape),
                 attn_metadata.num_tokens,
             )
-            return packed[:, :3].clone(), packed[:, :1].clone()
+            return (packed[:, :3].clone(), packed[:, :1].clone()) if horizontal_available else None
+
+        def _sparse_projection_norm_rope(self, positions, hidden, metadata, main, index):
+            assert hidden is None
+            assert positions.shape == (1, metadata.num_tokens)
+            return (*main.split([3, 1, 1], dim=-1), *index.split([1, 1], dim=-1))
 
         def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
-            assert k is None and v is None and idx_k is None
+            if horizontal_available:
+                assert k is None and v is None and idx_k is None
+            else:
+                assert k.shape == v.shape == idx_k.shape == (attn_metadata.num_tokens, 1)
             assert idx_q.shape == (attn_metadata.num_tokens, 1)
             output.copy_(q)
 
@@ -723,7 +736,7 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
         "_extract_minimax_m3_attention_extra_attrs",
         lambda layer_idx: (metadata, layer),
     )
-    packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    packed = torch.arange(28, dtype=torch.float32).reshape(4, 7)
     position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
     output = torch.full((4, 3), -1.0)
 
@@ -739,7 +752,7 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
         output,
     )
 
-    assert layer.producer_shapes == ((2, 5), (1, 2), 2)
+    assert layer.producer_shapes == ((2, 7), (1, 2), 2)
     torch.testing.assert_close(output[:2], packed[:2, :3])
     # The dispatch clips to the live tokens and leaves the pad rows as they came.
     torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
@@ -870,6 +883,7 @@ def test_piecewise_captures_horizontal_producer_before_attention(
         kv_cache_manager=None,
         msa_layer_cache_tensors={3: (kv_cache, index_cache, scale_cache)},
         msa_out_cache_loc=slots,
+        sparse_offload_state=None,
     )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
@@ -1084,6 +1098,9 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
+    )
+    layer._sparse_projection_norm_rope = MethodType(
+        MiniMaxM3Attention._sparse_projection_norm_rope, layer
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -2350,6 +2367,7 @@ def test_horizontal_producer_explicit_caches_match_manager(
         spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         kv_cache_manager=manager,
         msa_out_cache_loc=slots,
+        sparse_offload_state=None,
     )
     metadata.msa_idx_k_cache.return_value = index
 
@@ -2393,6 +2411,52 @@ def test_horizontal_producer_explicit_caches_match_manager(
     eager = snapshot(op(*args))
     for actual, reference in zip(replay, eager):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 offload producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_piecewise_offload_packed_projection_fallback(monkeypatch, kv_dtype):
+    """Compile the packed attention boundary with real norm/RoPE and index-cache writes."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    layer, _, index, _ = _make_horizontal_producer_layer(kv_dtype)
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        num_tokens=2,
+        sparse_offload_state=object(),
+        msa_idx_k_cache=lambda _: index,
+        msa_out_cache_loc=torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda"),
+    )
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, metadata) is None
+    main, idx = packed[:2].split([8 * 128, 3 * 128], dim=-1)
+    expected = layer._sparse_projection_norm_rope(positions[:2], None, metadata, main, idx)[0]
+    expected_index = index.view(torch.uint8).clone()
+    index.zero_()
+
+    def attention(q, k, v, idx_q, idx_k, meta, output):
+        assert k is not None and v is not None and idx_q is not None
+        output.copy_(q)
+
+    monkeypatch.setattr(layer, "_dispatch_attention_backend", attention)
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (metadata, layer)
+    )
+
+    @torch.compile(fullgraph=True)
+    def run(projection, positions):
+        output = projection.new_full((4, 4 * 128), -1)
+        torch.ops.trtllm.minimax_m3_attn_custom_op_inplace(
+            None, None, None, None, None, projection, positions, "3", output
+        )
+        return output
+
+    actual = run(packed, positions)
+    torch.testing.assert_close(actual[:2], expected.to(actual.dtype), rtol=0, atol=0)
+    assert (actual[2:] == -1).all()
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
 
 
 class _ReachedProducerLaunch(Exception):

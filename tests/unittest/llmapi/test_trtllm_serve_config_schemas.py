@@ -1463,6 +1463,29 @@ def test_minimax_m3_offload_schema_matches_validation(schemas, filename, values,
             MiniMaxM3SparseAttentionConfig.model_validate(sparse)
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    "config_name", ["DeepSeekSparseAttentionConfig", "DeepSeekV4SparseAttentionConfig"]
+)
+@pytest.mark.parametrize("enabled", [None, False, True])
+@pytest.mark.parametrize("sizing", [{}, {"gpu_cache_factor": 3.0}, {"host_history_size": 1 << 30}])
+def test_shared_sparse_offload_sizing_rule(schemas, filename, config_name, enabled, sizing):
+    from tensorrt_llm.llmapi import llm_args
+
+    config_cls = getattr(llm_args, config_name)
+    values = {"kv_cache_offload_config": sizing}
+    if enabled is not None:
+        values["enable_kv_cache_offload"] = enabled
+    valid = not sizing or enabled is True
+    schema = {"$ref": f"#/$defs/{config_name}", "$defs": schemas[filename]["$defs"]}
+    assert Draft202012Validator(schema).is_valid(values) == valid
+    if valid:
+        assert (config_cls(**values).get_kv_cache_offload_config() is not None) == bool(enabled)
+    else:
+        with pytest.raises(ValueError, match="requires enable_kv_cache_offload"):
+            config_cls(**values)
+
+
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
     class Config(BaseModel):
         plain: int
