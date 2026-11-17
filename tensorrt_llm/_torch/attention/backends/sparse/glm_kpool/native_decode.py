@@ -29,6 +29,8 @@ class GlmKpoolNativeDecode:
         # Largest query rows and heads the sizes cover.
         self._covered_rows = 0
         self._covered_heads = 0
+        # Device zero for discarding empty rows; a Python 0 would be filled per call.
+        self._zero: torch.Tensor | None = None
 
     def prepare_workspace(
         self,
@@ -70,6 +72,10 @@ class GlmKpoolNativeDecode:
                 )
             # TRTLLM-GEN resets its counters after each invocation.
             self._counter = torch.zeros(self._counter_size, dtype=torch.uint8, device=q.device)
+        if self._zero is None:
+            if capturing:
+                raise RuntimeError("glm_kpool native decode zero must be allocated before capture")
+            self._zero = torch.zeros((), dtype=torch.bfloat16, device=q.device)
 
     def __call__(
         self,
@@ -112,4 +118,4 @@ class GlmKpoolNativeDecode:
         ).squeeze(1)
         # Empty (padded) requests use a dummy selection to keep the kernel's
         # length positive; discard that output, matching FlashMLA's empty row.
-        return torch.where(nonempty[:, None, None], output, 0)
+        return torch.where(nonempty[:, None, None], output, self._zero)

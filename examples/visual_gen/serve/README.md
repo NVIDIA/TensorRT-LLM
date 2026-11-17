@@ -40,6 +40,8 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml
    trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --visual_gen_args ./configs/wan22.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --visual_gen_args ./configs/flux1.yml
+   # flux2.yml sets ulysses_size: 2 and therefore needs 2 GPUs; every other
+   # config in ./configs/ runs on a single GPU.
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --visual_gen_args ./configs/flux2.yml
    trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
    trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
@@ -51,7 +53,14 @@ Before running these examples, ensure you have:
    tail -f /tmp/serve.log
 
    ```
-   For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
+   LTX-2 needs a Gemma3 text encoder. `./configs/ltx2.yml` relies on the
+   built-in default (`google/gemma-3-12b-it`); to point at a local copy, set
+   `pipeline_config.text_encoder_path` — a nested key, not a top-level one:
+
+   ```yaml
+   pipeline_config:
+     text_encoder_path: /path/to/gemma-3-12b-it
+   ```
 
 ## Examples
 
@@ -350,7 +359,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `sigma_grid` (see the Cosmos3 example README), `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
 
 ##### Cosmos3 transfer hints
 
@@ -382,8 +391,9 @@ unsupported frame count fails fast; combinations that only make sense together
 auto-compute with no `video` — are still reported by the worker, as a client
 error, once the request is running.
 
-> **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
-> `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
+> **Note:** LTX-2 generates video **with audio**. Its Gemma3 text encoder defaults to
+> `google/gemma-3-12b-it`; override it with `pipeline_config.text_encoder_path` in
+> `ltx2.yml` when serving from a local copy.
 
 ## Quick Reference - curl Examples
 
@@ -422,6 +432,32 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "size=256x256" \
   -F "guidance_scale=5.0"
 ```
+
+### Omni inputs: text, image, video, and audio
+
+A single request can combine `prompt`, `image_reference`, `video_reference`, and
+`audio_reference`. This contract applies to any model that declares the relevant
+reference slots; unsupported modalities and model-specific reference limits are
+rejected. Both `/v1/videos` and `/v1/videos/sync` accept JSON reference objects
+(or lists of objects) and multipart uploads. Repeat a multipart reference field
+for multiple files. Uploads and JSON reference objects/lists can also be mixed
+under the same field, preserving their order within that modality.
+
+Start the server with a model and configuration that support the requested
+combination of inputs. Follow that model's setup instructions for media-decoding
+dependencies, supported formats, and sample rates. For example:
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos" \
+  -F 'prompt=Animate the subject using the reference motion and sound.' \
+  -F 'image_reference=@./subject.png' \
+  -F 'image_reference=@./style.png' \
+  -F 'video_reference=@./motion.mp4' \
+  -F 'audio_reference=@./sound.wav'
+```
+
+Reference roles, count limits, and cross-modality ordering are defined by the
+loaded model. Pass any supported model-specific options through `extra_params`.
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash

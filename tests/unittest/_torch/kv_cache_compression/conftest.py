@@ -467,19 +467,6 @@ def torch_tri_score_oracle(
     return scores
 
 
-def make_phase_table(offsets, omega, initial_rows):
-    """Build the semantic phase-table surface consumed by an eviction round."""
-    omega = omega.to(dtype=torch.float32).contiguous()
-    positions = torch.arange(max(int(initial_rows), 1), dtype=torch.float32, device=omega.device)
-    angles = (positions[:, None, None] + offsets[None, :, None]) * omega[None, None, :]
-    num_freqs = int(omega.numel())
-    return SimpleNamespace(
-        cos=torch.cos(angles).mean(dim=1).contiguous(),
-        sin=torch.sin(angles).mean(dim=1).contiguous(),
-        num_freqs=num_freqs,
-    )
-
-
 def make_cute_buffers(
     *,
     eviction_mode,
@@ -523,6 +510,7 @@ def make_cute_buffers(
     )
     manager = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
     manager.kv_cache_manager = SimpleNamespace(
+        max_seq_len=requested_tokens,
         num_pools=max(layer_pool_ids) + 1,
         tokens_per_block=tokens_per_block,
         max_blocks_per_seq=source_blocks,
@@ -536,7 +524,9 @@ def make_cute_buffers(
     manager.normalize_scores = normalize_scores
     manager._request_capacity = max_requests
     manager._selection_width_capacity = decode_width
-    manager._phase = make_phase_table(offsets, omega, seq_len)
+    manager._batch_workspace_attempts = 0
+    manager._batch_workspace_ooms = 0
+    manager._phase_omega = omega
     manager.budget = keep_count
     manager._protected_tail_capacity = protected_tail_capacity
     manager._freq_scale_sq = freq_scale_sq
@@ -563,7 +553,7 @@ def make_cute_buffers(
     manager._staging_reuse_event.record(torch.cuda.current_stream(layer_pools[0].device))
     manager._compaction_done_event = torch.cuda.Event()
     manager._compaction_done_event.record(torch.cuda.current_stream(layer_pools[0].device))
-    manager._build_score_runtime(score_token_capacity=seq_len)
+    manager._build_score_runtime(score_token_capacity=seq_len, resident_requests=max_requests)
     return manager
 
 
@@ -624,7 +614,9 @@ def launch_split_scores(
         )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
-    columns = prompt_lengths[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + torch.arange(
+    columns = (prompt_lengths[:request_count] % 128).to(torch.int64).view(
+        -1, 1, 1, 1, 1
+    ) + torch.arange(
         manager._selection_width_capacity,
         dtype=torch.int64,
         device=score_scratch.device,

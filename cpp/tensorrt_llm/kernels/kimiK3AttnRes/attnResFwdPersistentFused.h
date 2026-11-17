@@ -25,15 +25,19 @@ namespace kernels::kimiK3AttnRes
 
 //! Persistent-grid counterpart to invokeAttnResAddRmsNormFwd.
 //!
-//! Same contract and same AttnResFwdParams, different topology: one CTA per SM
-//! looping over tokens, instead of one CTA (or one cluster) per token. That
-//! makes it the shape to reach for when there are far more tokens than SMs --
-//! prefill -- where the per-token kernels stop being able to amortize the score
-//! projection load.
+//! Same AttnResFwdParams, different topology: one CTA per SM looping over
+//! tokens, instead of one CTA (or one cluster) per token. That makes it the
+//! shape to reach for when there are far more tokens than SMs -- prefill --
+//! where the per-token kernels stop being able to amortize the score
+//! projection load. The shape contract is below.
 //!
-//! Requires H == 7168 and N in [2, 9]. Unlike the per-token kernels there is no
-//! N == 1 case: the persistent kernel always has at least one snapshot plus the
-//! layer residual.
+//! Requires B == 1, H == 7168, N in [2, 9] and bf16 contiguous tensors. Unlike
+//! the per-token kernels there is no N == 1 case: the persistent kernel always
+//! has at least one snapshot plus the layer residual, and it produces no
+//! rsigma/probs/logits. T is bounded only by the int token index: offsets that
+//! grow with T are formed in 64 bits wherever they can pass INT_MAX, and the
+//! token index needs T - 1 + grid <= INT_MAX, where grid is the persistent grid
+//! size; the launch checks that bound.
 //!
 //! outputRmsWeight is required -- this entry point exists for the fully fused
 //! form. layerResidualAdd is optional: shapes with no residual add to fold
@@ -45,10 +49,18 @@ namespace kernels::kimiK3AttnRes
 //! shared-memory copy rather than a reload. Every in-tree caller passes a
 //! freshly allocated tensor, and attnResPersistentFusedSupported rejects the
 //! aliased form so a caller that stops doing so fails loudly.
-void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream);
+//!
+//! smReserve SMs are left out of the grid: a kernel resident for the whole
+//! step (the DWDP weight gather) holds them, and CTAs that landed there would
+//! run as a second, mostly idle wave. attn_res_add_rmsnorm_persistent_fwd
+//! rejects values outside [0, SM count); this launcher clamps to that range.
+void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, int smReserve, cudaStream_t stream);
 
-//! True when invokeAttnResPersistentFusedFwd can serve this shape, so callers
-//! can route without duplicating the constraints above.
+//! True when B, H, N, T >= 1, the required tensors and the aliasing rule above
+//! all hold, so callers can route without duplicating those checks.
+//! invokeAttnResPersistentFusedFwd also rejects non-null rsigma/probs/logits
+//! and, at launch, a T past the token index bound, which depends on the grid
+//! size.
 bool attnResPersistentFusedSupported(AttnResFwdParams const& params);
 
 } // namespace kernels::kimiK3AttnRes

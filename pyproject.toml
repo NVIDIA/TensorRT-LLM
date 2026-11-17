@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 ####################################################################################################
 ###############################  BUILD CONFIGURATION  ##############################################
 ####################################################################################################
@@ -335,7 +350,6 @@ exclude = [
     "tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py",
     "tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py",
     "tensorrt_llm/_torch/pyexecutor/llm_request.py",
-    "tensorrt_llm/_torch/pyexecutor/model_engine.py",
     "tensorrt_llm/_torch/pyexecutor/model_loader.py",
     "tensorrt_llm/_torch/pyexecutor/py_executor.py",
     "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py",
@@ -540,16 +554,13 @@ exclude = [
     "tests/integration/defs/local_venv.py",
     "tests/integration/defs/perf/__init__.py",
     "tests/integration/defs/perf/allowed_configs.py",
-    "tests/integration/defs/perf/create_perf_comparison_report.py",
     "tests/integration/defs/perf/data.py",
     "tests/integration/defs/perf/data_export.py",
-    "tests/integration/defs/perf/diff_tools.py",
     "tests/integration/defs/perf/gpu_clock_lock.py",
     "tests/integration/defs/perf/misc.py",
     "tests/integration/defs/perf/open_search_db_utils.py",
     "tests/integration/defs/perf/pytorch_model_config.py",
     "tests/integration/defs/perf/sampler_options_config.py",
-    "tests/integration/defs/perf/sanity_perf_check.py",
     "tests/integration/defs/perf/session_data_writer.py",
     "tests/integration/defs/perf/test_perf.py",
     "tests/integration/defs/perf/utils.py",
@@ -584,12 +595,6 @@ exclude = [
     "tests/unittest/_torch/attention/test_vanilla_attention.py",
     "tests/unittest/_torch/compilation/test_add_norm.py",
     "tests/unittest/_torch/debugger/test_debugger_addon.py",
-    "tests/unittest/_torch/executor/test_chunked_logits.py",
-    "tests/unittest/_torch/executor/test_executor_request_queue.py",
-    "tests/unittest/_torch/executor/test_overlap_scheduler.py",
-    "tests/unittest/_torch/executor/test_pytorch_model_engine.py",
-    "tests/unittest/_torch/executor/test_resource_manager.py",
-    "tests/unittest/_torch/executor/test_router_dealer_ipc.py",
     "tests/unittest/_torch/helpers.py",
     "tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py",
     "tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py",
@@ -660,6 +665,11 @@ exclude = [
     "tests/unittest/_torch/multimodal/test_multimodal_runtime.py",
     "tests/unittest/_torch/multimodal/test_share_multiparams.py",
     "tests/unittest/_torch/pattern_watcher.py",
+    "tests/unittest/_torch/pyexecutor/test_chunked_logits.py",
+    "tests/unittest/_torch/pyexecutor/test_executor_request_queue.py",
+    "tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py",
+    "tests/unittest/_torch/pyexecutor/test_resource_manager.py",
+    "tests/unittest/_torch/pyexecutor/test_router_dealer_ipc.py",
     "tests/unittest/_torch/ray_orchestrator/conftest.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py",
@@ -839,78 +849,141 @@ split-on-trailing-comma = false
 max-args = 10
 
 
-[tool.mypy]
-install_types = true
-non_interactive = true
-follow_imports = "silent"
-explicit_package_bases = true
-namespace_packages = true
-strict = true
-show_error_codes = true
-# Files checked when mypy runs with no explicit paths. This is the single source
-# of truth for the type-check file set. Both the CI build stage (which invokes
-# scripts/run_mypy.sh directly) and the local pre-commit hook run mypy without
-# explicit paths (the hook sets `pass_filenames: false`), so both read this list.
-files = [
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampling_resolution.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_features.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/seed_manager.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
-    "tests/unittest/_torch/sampler/test_torch_sampler.py",
-    "tests/unittest/_torch/sampler/test_token_ban.py",
-    "tests/unittest/_torch/sampler/test_beam_search.py",
-    "tests/unittest/_torch/sampler/test_beam_search_util.py",
+[tool.pyrefly]
+# Keep the existing diagnostic scope while adopting Pyrefly's error names.
+preset = "off"
+project-includes = ["tensorrt_llm"]
+# Shared by Pyrefly project checks and the changed-file/report filters.
+project-excludes = [
+    "tensorrt_llm/_torch/kernels/**",
+    "tensorrt_llm/_torch/visual_gen/kernels/**",
+    "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/**",
+    "tensorrt_llm/_torch/moe/kernels/**",
+    "tensorrt_llm/_torch/attention/kernels/**",
+    "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/**",
+    "tensorrt_llm/_torch/_experimental/**",
 ]
-# NB:
-#   .   -> 'tensorrt_llm'
-#   tests/unittest   -> 'utils'
-#   tests/unittest/_torch/sampler   -> for 'test_beam_search_util'
-mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
-
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.bindings.*"]
-ignore_errors = true
-
-# Generated pybind11 stub; DeepGEMM returns a bare py::dict from
-# get_bf16_mega_gate_config, which stubgen renders without type parameters.
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.deep_gemm_cpp_tllm", "deep_gemm_cpp_tllm"]
-disallow_any_generics = false
-
-[[tool.mypy.overrides]]
-module = [
-    "tensorrt_llm._torch.pyexecutor.sampler",
-    "tensorrt_llm._torch.pyexecutor.sampler.*",
+# Keep test helper paths out of product import resolution.
+search-path = ["."]
+enable-fallback-search-path = false
+python-version = "3.10"
+check-unannotated-defs = true
+infer-return-types = "never"
+# Tolerate unavailable optional modules while retaining types when installed.
+ignore-missing-imports = [
+    "torch.*",
+    "tensorrt_llm.bindings",
+    "tensorrt_llm.bindings.*",
+    "tensorrt_llm.llmapi.tracer",
+    "triton.language",
+    "triton.language.*",
+    "opentelemetry",
+    "opentelemetry.*",
+    "line_profiler",
+    "fmha_sm100",
+    "cutlass",
+    "cutlass.*",
+    "cute",
+    "cute.*",
+    "cuda",
+    "cuda.*",
+    "tensorrt_llm.deep_gemm",
+    "tensorrt_llm.deep_gemm.*",
+    "tensorrt_llm.deep_ep",
+    "tensorrt_llm.deep_ep.*",
+    "tensorrt_llm.flash_mla",
+    "tensorrt_llm.flash_mla.*",
+    "tensorrt_llm.flash_mla_cpp_tllm",
+    "tensorrt_llm.flash_mla_cpp_tllm.*",
+    "tensorrt_llm.tensorrt_llm_transfer_agent_binding",
+    "tensorrt_llm.tensorrt_llm_transfer_agent_binding.*",
+    "fast_hadamard_transform",
+    "fast_hadamard_transform.*",
+    "fmha_sm100.*",
+    "ray",
+    "ray.*",
+    "transformer_engine_torch",
+    "transformer_engine_torch.*",
+    "gpu_memory_service",
+    "gpu_memory_service.*",
+    "deep_gemm",
+    "deep_gemm.*",
+    "cosmos_guardrail",
+    "cosmos_guardrail.*",
+    "torchaudio",
+    "torchaudio.*",
+    "av",
+    "av.*",
+    "cv2",
+    "cv2.*",
+    "smg_grpc_proto",
+    "smg_grpc_proto.*",
+    "transformers_modules",
+    "transformers_modules.*",
+    "imageio",
+    "imageio.v3",
+    "causal_conv1d",
+    "mamba_ssm",
+    "nemo_rl.models.generation.trtllm.trtllm_backend",
+    "modelexpress.load_strategy",
+    "modelexpress.engines",
+    "bindings.internal.batch_manager.kv_cache_manager_v2",
 ]
-disable_error_code = [
-    "no-untyped-call",
-    # TODO(TRTLLM-15310): strict mode's warn_redundant_casts flags several cast(...) calls
-    # in the sampler package (introduced by #16620). Whether a cast is "redundant" is
-    # binding-dependent -- the full build check (compiled bindings + stubs) flags 2,
-    # the bindings-less local/pre-commit check flags ~20 -- so removing casts is a
-    # fragile WAR. Suppress redundant-cast for the sampler module until the casts are
-    # audited and the annotations tightened, rather than churn the source.
-    "redundant-cast",
-]
 
-[[tool.mypy.overrides]]
-module = [
-    "tests.*",
-    "_torch.*",  # tests/unittest/_torch/*, cf. mypy_path
-    "test_torch_sampler",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_token_ban",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_beam_search",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_beam_search_util",  # tests/unittest/_torch/sampler/..., cf. mypy_path
+[tool.pyrefly.errors]
+parse-error = "error"
+missing-import = "error"
+unknown-name = "error"
+unbound-name = "error"
+bad-argument-count = "error"
+missing-argument = "error"
+unexpected-keyword = "error"
+unexpected-positional-argument = "error"
+
+# Test settings are read by scripts/run_pyrefly.sh, not by Pyrefly directly.
+[tool.pyrefly-tests]
+project-includes = ["tests"]
+# Paths are relative to the repository root and apply only to the test pass.
+search-path = [
+    ".",
+    "tests",
+    "tests/unittest",
+    "tests/integration",
+    "examples",
+    "examples/llm-api",
+    "examples/llm-api/out_of_tree_example",
+    "examples/disaggregated/slurm/cache_transceiver_test",
+    "scripts",
+    "jenkins/scripts/cbts",
+    "tests/unittest/llmapi/apps",
+    "tests/unittest/_torch/pyexecutor",
+    "tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm",
+    "tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels",
+    "tests/integration/defs/disaggregated",
+    "tests/integration/defs/llmapi",
+    "tests/integration/defs/sysinfo",
+    "tests/integration/defs/utils",
+    "tests/scripts/perf-sanity/cache_transceiver_precheck",
 ]
-disable_error_code = [
-    "no-untyped-def",
-    "no-untyped-call",
+enable-fallback-search-path = true
+
+[tool.pyrefly-tests.errors]
+missing-argument = "ignore"
+unexpected-keyword = "ignore"
+bad-argument-count = "ignore"
+
+# Diagnostics for dynamically loaded modules and unresolved names.
+[tool.pyrefly-exclusions]
+symbols = [
+    "etcd3.*",
+    "PreTrainedConfig",
+    "CSA2TrtllmMetadata",
+    "MoEImplBase",
+    "BaseResourceManager",
+    "TrtllmAttentionMetadata",
+    "BaseWeightMapper",
+    "BaseMoeRoutingMethod",
+    "SpecMetadata",
+    "ParakeetEncoderConfig",
+    "AttentionMetadata",
 ]

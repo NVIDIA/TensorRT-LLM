@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
@@ -66,7 +67,7 @@ def _has_dsv4_indexer(self) -> bool:
 def _get_validated_sm_version() -> int:
     sm_version = get_sm_version()
     if sm_version < 90:
-        raise RuntimeError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
+        raise UnsupportedError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
     return sm_version
 
 
@@ -444,7 +445,10 @@ def project_sparse_attn_output(
     position_ids: Optional[torch.Tensor] = None,
     attn_metadata: Optional[AttentionMetadata] = None,
     all_reduce_params: Optional["AllReduceParams"] = None,
+    prequantized: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """``prequantized``: the FP8 data and scales the inverse-RoPE quantization below would make of
+    ``attn_output``, written by the attention kernel; ``attn_output`` is then not read."""
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
     # The fused epilogue already ran both O-LoRA projections inside the custom op
@@ -465,7 +469,7 @@ def project_sparse_attn_output(
     )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
-        attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
+        attn_fp8, attn_scale = prequantized or torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
             attn_output_tensor,
             position_ids.view(-1),
             self.inverse_rotary_emb.rotary_cos_sin,

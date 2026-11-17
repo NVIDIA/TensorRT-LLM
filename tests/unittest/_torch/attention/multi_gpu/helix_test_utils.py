@@ -14,7 +14,10 @@
 # limitations under the License.
 """Shared utilities for Helix context-parallelism unit tests (MHA & MLA)."""
 
+import sys
 import traceback
+from functools import partial
+from types import SimpleNamespace
 
 import torch
 from mpi4py.futures import MPIPoolExecutor
@@ -22,6 +25,7 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -36,6 +40,21 @@ CACHE_TYPE_SELFKONLY = tensorrt_llm.bindings.internal.batch_manager.CacheType.SE
 # ---------------------------------------------------------------------------
 # Weight helpers
 # ---------------------------------------------------------------------------
+
+
+def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
+    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    module = SimpleNamespace(
+        num_heads_tp=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        helix_v_b_proj_full=v_full,
+        use_cute_dsl_bf16_bmm=False,
+    )
+    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
+    return module
 
 
 def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
@@ -292,6 +311,17 @@ def run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
+def run_in_nccl_window_tensor_scope(rank, func, *args, **kwargs):
+    """Call ``func(rank, ...)`` inside an NCCL window-tensor scope.
+
+    The NCCL collectives may return NCCL-window tensors, whose leases must end in
+    a tensor scope (the model engine opens one around every forward). The scope
+    only becomes active with a CUDA tensor among its inputs.
+    """
+    with discard_nccl_window_tensor_outputs(torch.empty(1, device="cuda")):
+        return func(rank, *args, **kwargs)
+
+
 def parse_comms_medium(comms_medium: str):
     """Return ``(use_nccl_for_alltoall, fifo_version)`` for *comms_medium*."""
     if comms_medium == "nccl":
@@ -314,12 +344,14 @@ def run_helix_test(
     """Parse *comms_medium*, launch MPI workers, and assert mismatch ratio."""
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     print(f"Testing with comms_medium={comms_medium}.")
-    with MPIPoolExecutor(max_workers=world_size) as executor:
+    # Workers import the shared test helpers through the same paths as pytest.
+    with MPIPoolExecutor(max_workers=world_size, path=sys.path) as executor:
         results = executor.map(
             run_single_rank,
             *zip(
                 *[
                     (
+                        run_in_nccl_window_tensor_scope,
                         full_test_func,
                         world_size,
                         scenario,

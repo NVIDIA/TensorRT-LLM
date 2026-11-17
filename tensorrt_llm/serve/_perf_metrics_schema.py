@@ -16,6 +16,11 @@ from typing import List, Optional, Union
 
 from typing_extensions import NotRequired, TypedDict
 
+# HTTP response header carrying server-side timings; the LLM and VisualGen
+# servers both set it. Defined here, in a module with no TensorRT-LLM imports,
+# so neither serving path has to import the other's metrics module.
+SERVER_TIMING_HEADER = "Server-Timing"
+
 
 class StepMetrics(TypedDict):
     forward_start_time: float
@@ -50,6 +55,15 @@ class TimingMetrics(TypedDict):
 
 
 class KvCacheMetrics(TypedDict):
+    """Per-request KV cache block counts.
+
+    KV cache manager V2 counts a block once for every lifecycle (layer group)
+    of the cache. A cache with sliding-window layers, or an FP4 MLA cache with
+    its HP rings, therefore reports a multiple of the request's block count.
+    Compare prefix reuse across cache layouts with the response's
+    ``cached_tokens`` instead.
+    """
+
     num_total_allocated_blocks: int
     num_new_allocated_blocks: int
     num_reused_blocks: int
@@ -64,6 +78,7 @@ class SpeculativeDecodingMetrics(TypedDict):
 
 class PerfMetrics(TypedDict):
     timing_metrics: TimingMetrics
+    input_processing_metrics: NotRequired[dict[str, float]]
     first_iter: NotRequired[int]
     last_iter: NotRequired[int]
     kv_cache_metrics: NotRequired[KvCacheMetrics]

@@ -58,19 +58,6 @@ TEST(RequestTest, validInputs)
 
         {
             auto request = Request({1, 1, 2}, 1);
-            SizeType32 vocabSize = 100;
-            SizeType32 hiddenSize = 64;
-            auto embeddingTable = Tensor::cpu(DataType::kFP32, {vocabSize, hiddenSize});
-            PromptTuningConfig config(embeddingTable);
-            request.setPromptTuningConfig(config);
-
-            EXPECT_TRUE(request.getPromptTuningConfig());
-            EXPECT_EQ(request.getPromptTuningConfig().value().getEmbeddingTable().getShape().size(), 2);
-            EXPECT_EQ(request.getPromptTuningConfig().value().getEmbeddingTable().getShape()[0], vocabSize);
-            EXPECT_EQ(request.getPromptTuningConfig().value().getEmbeddingTable().getShape()[1], hiddenSize);
-        }
-        {
-            auto request = Request({1, 1, 2}, 1);
             IdType clientId = 1234;
             request.setClientId(clientId);
 
@@ -107,21 +94,6 @@ TEST(RequestTest, invalidInputs)
         lambdaErrMsgs.emplace_back(std::make_pair(lambda, ".size() == 1"));
     }
 
-    // Embedding table has wrong shape
-    {
-        auto lambda = []()
-        {
-            SizeType32 vocabSize = 100;
-            SizeType32 hiddenSize = 64;
-            auto embeddingTable = Tensor::cpu(DataType::kFP32, {vocabSize, hiddenSize, 64});
-            PromptTuningConfig config(embeddingTable);
-            auto request = Request({1, 1, 2}, 1);
-            request.setPromptTuningConfig(config);
-        };
-        lambdaErrMsgs.emplace_back(
-            std::make_pair(lambda, "Expected prompt embedding table to have shape [vocabSize, hiddenSize]"));
-    }
-
     for (auto& lambdaErrMsg : lambdaErrMsgs)
     {
         auto& lambda = lambdaErrMsg.first;
@@ -144,17 +116,9 @@ TEST(RequestTest, invalidInputs)
 
 TEST(RequestTest, serializeDeserialize)
 {
-    auto embeddingTable = Tensor::cpu(DataType::kFP32, {2, 2});
-    float* data = reinterpret_cast<float*>(embeddingTable.getData());
-    data[0] = 123;
-    data[1] = 456;
-    data[2] = 789;
-    data[3] = 10;
-
     auto request = Request({1, 2, 3, 4}, 11, true, SamplingConfig(), OutputConfig(), 112,
         std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), std::list<VecTokens>{{1, 2, 3}, {2, 3, 4}},
-        std::nullopt, std::nullopt, PromptTuningConfig(embeddingTable, VecTokenExtraIds({1, 2, 3, 4})), std::nullopt,
-        std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), std::nullopt, 1234,
         false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, std::nullopt, std::nullopt,
         GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
@@ -185,18 +149,4 @@ TEST(RequestTest, serializeDeserialize)
     EXPECT_TRUE(request.getGuidedDecodingParams().has_value());
     EXPECT_TRUE(newRequest.getGuidedDecodingParams().has_value());
     EXPECT_EQ(request.getGuidedDecodingParams(), newRequest.getGuidedDecodingParams());
-
-    EXPECT_TRUE(request.getPromptTuningConfig().has_value());
-    EXPECT_TRUE(newRequest.getPromptTuningConfig().has_value());
-    EXPECT_EQ(newRequest.getPromptTuningConfig()->getInputTokenExtraIds(),
-        request.getPromptTuningConfig()->getInputTokenExtraIds());
-    auto newEmbeddingTable = newRequest.getPromptTuningConfig()->getEmbeddingTable();
-    EXPECT_EQ(newEmbeddingTable.getShape().size(), embeddingTable.getShape().size());
-    EXPECT_EQ(newEmbeddingTable.getDataType(), embeddingTable.getDataType());
-    EXPECT_EQ(newEmbeddingTable.getMemoryType(), embeddingTable.getMemoryType());
-    float* newData = reinterpret_cast<float*>(newEmbeddingTable.getData());
-    EXPECT_EQ(data[0], newData[0]);
-    EXPECT_EQ(data[1], newData[1]);
-    EXPECT_EQ(data[2], newData[2]);
-    EXPECT_EQ(data[3], newData[3]);
 }

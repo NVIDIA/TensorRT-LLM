@@ -15,9 +15,9 @@
 """Contracts for declaring, selecting, and executing MoE implementations."""
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,9 @@ class MoEStaticCapability:
     # ``_supports_load_balancer()``, which TrtllmGenFusedMoEBase overrides to mean
     # "separated routing is used".
     supports_eplb: bool = False
+    # Whether the backend consumes a per-forward helper-slot plan whose live
+    # weights may be published concurrently with shared-expert computation.
+    supports_per_layer_dynamic_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.
@@ -64,6 +67,30 @@ class MoEStaticCapability:
     supports_deep_ep_direct_metadata: bool = False
 
 
+#: ``ModelConfig.extra_attrs`` key of a model's MoEDecodeOptions.
+MOE_DECODE_OPTIONS = "moe_decode_options"
+
+
+@dataclass(frozen=True)
+class MoEDecodeOptions:
+    """MoE decode kernels a model declares at construction (``extra_attrs[MOE_DECODE_OPTIONS]``); the defaults are the
+    stock paths every other model keeps."""
+
+    # trtllm-gen FP4 op: decode-step tuning buckets and decode kernels (trtllm_gen.decode_moe.select).
+    tuning: bool = False
+    # Rows from which the decode engine releases its dependents right after its own wait (0: never).
+    early_release_rows: int = 0
+    # CuTe DSL NVFP4 calls of up to this many rows load the FC2 weights evict-first (0: none).
+    fc2_weights_evict_first_rows: int = 0
+    # TRTLLM-Gen BF16: logits-routed un-finalized SwiGLU runs of up to 32 rows take the BF16 decode MoE engine.
+    bf16_decode_engine: bool = False
+
+    @classmethod
+    def of(cls, extra_attrs: Dict) -> "MoEDecodeOptions":
+        """The options declared in a model config's ``extra_attrs``, else the defaults."""
+        return extra_attrs.get(MOE_DECODE_OPTIONS, cls())
+
+
 @dataclass(frozen=True)
 class MoEInputRequirement:
     """Caller-side inputs the scheduler must prepare; not a selection filter."""
@@ -79,6 +106,13 @@ class MoEInputRequirement:
     # Overrides the NVLink one-sided combine payload dtype; None means the
     # buffer follows the model output dtype.
     onesided_workspace_dtype: Optional[torch.dtype] = None
+    # ``run_moe`` works in buffers the backend keeps across calls: the tensor it
+    # returns may be a view of one, overwritten by the next call, and two calls
+    # in flight on different streams would share the same scratch. A multi-chunk
+    # forward therefore runs every chunk on one stream and copies each chunk's
+    # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
+    # chunk output, so it refuses a backend that declares this.
+    run_moe_reuses_buffers: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
@@ -280,6 +314,8 @@ class MoEDeployment:
     cluster_size: int = 1
     # True only when an EPLB load balancer is registered.
     eplb_enabled: bool = False
+    # Unified EPLB mode: disabled, standard, or per_layer_dynamic.
+    eplb_mode: str = "disabled"
     # True only for routed-expert LoRA targets.
     moe_lora_enabled: bool = False
     # False when ``moe_disable_finalize_fusion`` is set or any LoRA is
@@ -327,6 +363,11 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The deployment forces per-call activation scales
+    # (``force_dynamic_quantization``) and the impl quantizes against scales
+    # fixed at load time. Distinct from QUANT_UNSUPPORTED: the impl serves the
+    # format, so the report must name this rejection as the degradation cause.
+    DYNAMIC_QUANT_UNSUPPORTED = "dynamic_quant_unsupported"
     # The impl only has a fused-finalize FC2 epilogue, and the caller disabled
     # finalize fusion (explicitly, or implicitly by configuring LoRA).
     FINALIZE_FUSION_REQUIRED = "finalize_fusion_required"
@@ -458,10 +499,17 @@ def nvfp4_fc1_row_alignment_rejection(
 
     ``W4A16_NVFP4`` is answered too: its weights go through the same CUTLASS
     NVFP4 loader, and the op then splits the dequantized buffer the same way.
+
+    ``NVFP4_PLUS`` needs 256 rows: with one scale per 32 values, the FC2 input
+    (``intermediate_size_per_partition`` wide) has whole 4-column scale tiles
+    only when that width is a multiple of 128.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
 
-    if p.identity_quant not in ("nvfp4", "w4a16_nvfp4") or p.intermediate_size is None:
+    if (
+        p.identity_quant not in ("nvfp4", "nvfp4_plus", "w4a16_nvfp4")
+        or p.intermediate_size is None
+    ):
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.
@@ -471,13 +519,14 @@ def nvfp4_fc1_row_alignment_rejection(
     if p.intermediate_size % tp_size != 0:
         # Uneven shards are a different concern; do not answer for them.
         return None
+    row_alignment = 256 if p.identity_quant == "nvfp4_plus" else 128
     fc1_rows_full = p.intermediate_size * 2
     fc1_rows = fc1_rows_full // tp_size
-    if fc1_rows % 128 == 0:
+    if fc1_rows % row_alignment == 0:
         return None
-    if fc1_rows_full % 128 == 0:
+    if fc1_rows_full % row_alignment == 0:
         hint = (
-            f"moe_tp_size must divide {fc1_rows_full // 128}; raise "
+            f"moe_tp_size must divide {fc1_rows_full // row_alignment}; raise "
             f"moe_expert_parallel_size to shrink moe_tp_size, which "
             f"non-ULYSSES CP multiplies by cp_size"
         )
@@ -486,7 +535,7 @@ def nvfp4_fc1_row_alignment_rejection(
     return MoEEligibility.no(
         MoERejectReason.SHAPE_UNALIGNED,
         f"{p.quant} MoE requires gated FC1 rows "
-        f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
+        f"(2 * intermediate_size_per_partition) to be a multiple of {row_alignment}, but "
         f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
     )
 
@@ -603,6 +652,7 @@ class MoEResolutionReport:
                 "use_dp": self.deployment.use_dp,
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
+                "eplb_mode": self.deployment.eplb_mode,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
                 "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
                 "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,
@@ -677,6 +727,116 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class MoERoutingTables:
+    """Routing tables in the kernel's layout, one entry per tile of ``tiles``; a tactic with
+    another tile routes itself."""
+
+    tables: torch.Tensor
+    tiles: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MoEFusedRouteQuant:
+    """``routing_method.apply`` and ``quantize_input`` results from one launch, plus the
+    backend kernel's optional routing tables."""
+
+    token_selected_experts: torch.Tensor
+    token_final_scales: torch.Tensor
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    routing_tables: Optional[MoERoutingTables] = None
+    # The launch also added its picks to the warmup expert placement's counters.
+    routes_counted: bool = False
+
+
+@dataclass(frozen=True)
+class PreroutedRouting:
+    """Routing the caller computed for one ``run_moe`` of an impl that declares
+    ``supports_prerouted_routing``: the routing tables of the kernels' tile
+    (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
+    the [tile, config] tactic they are built for, and the [num_tokens, top_k]
+    expert ids (int32) and BF16 weights. The impl runs that tactic and skips
+    its routing kernel."""
+
+    tables: torch.Tensor
+    tactic: List[int]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
+class EngineRouting(PreroutedRouting):
+    """Routing still to be done, by the decode MoE engine (``trtllm_gen.decode_moe``
+    ``ENGINE``, under ``engine_routes``): ``candidates`` ([num_tokens,
+    num_experts / 128, top_k] int32, the router GEMM's per-tile top-k keys).
+    ``tables``, ``topk_ids`` and ``topk_weights`` are buffers the engine writes
+    before it reads them: only the ENGINE path consumes this hand-off (the FP4
+    op raises for any other kernel), and nothing may read those buffers before
+    the op returns."""
+
+    candidates: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if self.candidates is None:
+            raise ValueError("EngineRouting needs the router GEMM's candidates")
+
+
+@dataclass(frozen=True)
+class MoEReplicaPlan:
+    """Per-forward physical replica layout produced by the EPLB layer.
+
+    The backend consumes these facts but does not own the planner, copy stream,
+    weight arena, or generation lifecycle.  The private wait callback preserves
+    the late dependency: independent input preparation remains overlapped until
+    the fused kernel is about to read the physical routes.
+    """
+
+    resident_experts_per_rank: int
+    compute_slots_per_rank: int
+    ready_flags: torch.Tensor
+    ready_generation: int
+    reserved_sms: int
+    _wait_for_routes: Callable[[], None] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        resident = int(self.resident_experts_per_rank)
+        compute = int(self.compute_slots_per_rank)
+        generation = int(self.ready_generation)
+        if resident <= 0 or compute <= resident:
+            raise ValueError(
+                "A replica plan requires compute slots M greater than resident "
+                f"experts H; got H={resident}, M={compute}."
+            )
+        if not 1 <= generation < (1 << 63):
+            raise ValueError(
+                f"A replica plan READY generation must be in [1, 2**63); got {generation}."
+            )
+        if int(self.reserved_sms) <= 0:
+            raise ValueError("A replica plan must reserve at least one auxiliary SM")
+
+    @property
+    def helper_slots_per_rank(self) -> int:
+        return int(self.compute_slots_per_rank) - int(self.resident_experts_per_rank)
+
+    def wait_for_routes(self) -> None:
+        """Order the first route consumer after the plan producer on device."""
+        self._wait_for_routes()
+
+
+@dataclass(frozen=True)
+class MoESortTables:
+    """This rank's ``moe_sort`` outputs, produced by the routing kernel itself.
+
+    ``outputs`` are the six tensors ``torch.ops.trtllm.moe_sort`` returns, in
+    its order, for the routed expert ids, the rank's expert range and
+    ``tile_size``.
+    """
+
+    tile_size: int
+    outputs: Tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -706,6 +866,22 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by a fused route+quant launch for the routing above
+    routing_tables: Optional[MoERoutingTables] = None
+    # produced by a decode front end: the routing it computed
+    # (PreroutedRouting), or, as an EngineRouting, left to the decode MoE
+    # engine, which writes it before it reads it; single chunk, no
+    # communication
+    prerouted: Optional[PreroutedRouting] = None
+    # produced by a caller whose all-reduce polls the un-finalized FC2 rows
+    # (trtllm_gen.decode_moe.LamportFc2Buffer); one un-finalized chunk of a
+    # backend that declares ``takes_lamport_fc2_out``
+    lamport_fc2_out: Optional[torch.Tensor] = None
+    # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
+    replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by routing when the impl's ``try_route_with_sort`` routed this
+    # forward: the ``moe_sort`` tables of ``token_selected_experts``.
+    sort_tables: Optional[MoESortTables] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

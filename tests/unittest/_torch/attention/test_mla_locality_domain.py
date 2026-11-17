@@ -31,6 +31,7 @@ from tensorrt_llm._torch.locality_domain.policy import (
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 
 class _FakeAttention(nn.Module):
@@ -65,6 +66,7 @@ def _make_bare_absorption_mla(
 ) -> tuple[MLA, _RecordingLocalityDomainRuntime]:
     mla = MLA.__new__(MLA)
     nn.Module.__init__(mla)
+    mla.mapping = Mapping()
     mla.is_deepseek_v4 = is_deepseek_v4
     mla.use_cute_dsl_bf16_bmm = use_cute_dsl_bf16_bmm
     mla._locality_domain_policy = LocalityDomainPolicy(
@@ -81,6 +83,7 @@ def _make_bare_absorption_mla(
     )
     mla.num_heads_tp = 2
     mla.num_heads_tp_cp = 2
+    mla.num_context_heads = mla.num_heads_tp
     mla.qk_nope_head_dim = qk_nope_head_dim
     mla.kv_lora_rank = 512
     mla.v_head_dim = 128

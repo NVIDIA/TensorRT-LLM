@@ -106,9 +106,25 @@ checkpoint bytes reach host memory:
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
-  After every rank finishes materialization, speculative read-ahead work that
-  is still queued or active can no longer improve first-token latency and is
-  stopped. A worker already blocked in a synchronous `pread` must finish its
+  The page cache can drop those pages before materialization reads them (for
+  example, when a Lustre client cancels aged DLM locks); when the node then
+  takes major page faults during materialization, the readers re-read their
+  extents. After the first refresh, the minimum delay from a completed refresh
+  to the next refresh is 10 seconds, then 20, 40, and at most 60 seconds.
+  Faults are still sampled every 5 seconds during the cooldown; a qualifying
+  burst queues one refresh for when the cooldown ends. The delay limits
+  refresh frequency, not the total number of refreshes. A warning is logged
+  once when the delay reaches 60 seconds. Before each refresh, the reader
+  rechecks available host memory against the full checkpoint size and startup
+  headroom. If admission fails or the memory probe fails, the refresh remains
+  pending and the check is retried on later polls. A warning is logged once
+  per deferral episode. This is a conservative check, not a memory reservation:
+  resident pages charged to a cgroup can cause deferral even when only a small
+  part of the checkpoint is missing. Normal weight materialization continues
+  while refresh is deferred. After every rank finishes
+  materialization, speculative read-ahead work that is still queued or active
+  can no longer improve first-token latency and is stopped.
+  A worker already blocked in a synchronous `pread` must finish its
   current 8 MiB read before shutdown, so degraded storage can delay the join.
 
 ```yaml
@@ -204,6 +220,56 @@ Even builds use native loading, while odd builds use auto. Before comparing
 performance, check that both groups use comparable runtime images, hardware,
 CI configurations, and cache conditions—otherwise, those differences could be
 mistaken for a loader improvement.
+
+The primary model's finalized policy is also published as
+`startup_metrics.model_loader.checkpoint_io_policy` in `/server_info`.
+This detached snapshot is captured after weight-session finalization, before a
+separate draft checkpoint can reuse the loader. It preserves activation even
+when a subsequent advisory read failure makes the effective policy native.
+HF-derived formats such as Mistral and MX also report observed native disk
+loads; this does not enable rank-striped read-ahead for those formats.
+GMS writers using the built-in HF disk path capture the native policy after
+target materialization, before draft loading; GMS readers remain unknown.
+Unsupported, preloaded, or unobserved paths report an explicit unknown (`null`),
+not an inferred native policy. The collector prefers this structured primary
+status; only older runtimes without the field use `legacy_logs` fallback.
+Draft statuses do not override the structured primary status.
+
+Use the following fields to qualify a comparison (with `ctx_` or `gen_`
+prefixes for disaggregated server roles):
+
+- `s_checkpoint_io_policy_source`: `server_info`, `legacy_logs`, or `unknown`.
+- `b_checkpoint_io_policy_complete`: every expected server provided one valid
+  structured primary policy. Legacy log attribution is not considered complete.
+- `b_startup_metrics_timing_complete`: every expected server provided finite,
+  nonnegative preparation, population, finalization, and total model-loading
+  times. The existing collection-complete flag only checks successful fetches
+  and server counts; it does not imply these fields were present.
+
+CI records include image provenance so startup comparisons can account for
+runtime-environment differences instead of attributing them to the loader.
+This describes the benchmark environment, not which images customers deploy.
+
+The existing `s_runtime_image`, `s_runtime_image_source`,
+`s_runtime_image_digest`, and `s_runtime_image_identity_strength` fields
+describe the original OCI/base-image reference selected for the test
+container, not the Jenkins dispatcher image. A valid digest-pinned reference
+reports `digest_pinned` for that OCI reference only; a tagged reference reports
+`reference_only` with an unknown digest. Missing provenance remains `unknown`.
+
+Enroot may launch a derived fat `.sqsh` with dependencies and TRT-LLM already
+installed. These fields do not identify or verify that derived artifact or
+the environment after package installation. A tag hash or `.sqsh` cache
+filename is not a content digest. Group comparisons by the recorded base
+reference as well as model/configuration, GPU and parallelism, but do not
+treat matching base references as proof of identical runtime environments.
+Final launch-artifact provenance remains a separate follow-up.
+
+These additions do not change loader policy or add startup collectives. Timing
+remains rank-0-based per server, and failed launches are not comprehensively
+persisted. Native counterfactual eligibility, checkpoint fingerprints,
+slowest-rank timing, and process-launch-to-first-token measurement remain
+separate follow-ups.
 
 This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without

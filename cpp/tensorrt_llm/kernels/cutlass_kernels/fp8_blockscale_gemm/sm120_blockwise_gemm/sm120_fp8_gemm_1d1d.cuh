@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -516,6 +516,12 @@ struct SM120BlockScaledKernel
             cutlass::arch::fence_barrier_init();
         }
         __syncthreads();
+
+        // Launched with programmatic dependent launch: wait for the producer's writes
+        // before the first global memory access.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaGridDependencySynchronize();
+#endif
 
         auto M = cute::get<0>(params.problem_shape);
         auto N = cute::get<1>(params.problem_shape);

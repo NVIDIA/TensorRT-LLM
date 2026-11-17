@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Coverage-based selection: changed core-Python files -> per-stage impacted/skippable sets."""
+"""Coverage-based selection: changed Python files -> per-stage impacted/skippable sets."""
 
 from __future__ import annotations
 
@@ -21,18 +21,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cbts.coverage.selection.pytest_change_analysis import PytestImpactIndex
 from cbts.coverage.selection.python_change_analysis import (
     ImportTarget,
     PythonChangeFacts,
     analyze_python_changes,
-    closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
 from cbts.coverage.selection.touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
-    _SERVING_PATH_MARKERS,
     _UNTRUSTED_STAGE_MARKERS,
     _WORKER_SENTINEL,
     TouchDB,
@@ -51,7 +50,7 @@ from cbts.rules._helpers import (
 
 @dataclass
 class CoverageResult:
-    """Per-stage-family coverage decision over a set of residual core-Python files."""
+    """Per-stage-family coverage decision over a set of residual Python files."""
 
     ok: bool
     reason: str
@@ -80,7 +79,6 @@ class CoverageSelector:
         *,
         worker_sentinel: str = _WORKER_SENTINEL,
         launch_markers: tuple[tuple[str, str], ...] = _LAUNCH_MARKERS,
-        serving_path_markers: tuple[str, ...] = _SERVING_PATH_MARKERS,
         min_funcs: int = _MIN_FUNCS,
         untrusted_stage_markers: tuple[str, ...] = _UNTRUSTED_STAGE_MARKERS,
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
@@ -92,7 +90,6 @@ class CoverageSelector:
         self.repo_root = Path(repo_root)
         self._worker_sentinel = worker_sentinel
         self._launch_markers = launch_markers
-        self._serving_path_markers = serving_path_markers
         self._min_funcs = min_funcs
         self._untrusted_stage_markers = untrusted_stage_markers
         self._no_data_policy = no_data_policy
@@ -105,6 +102,7 @@ class CoverageSelector:
         else:
             self._external_references = external_references
             self._external_reference_paths = external_reference_paths
+        self._pytest_impact = PytestImpactIndex(self.repo_root)
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -113,7 +111,6 @@ class CoverageSelector:
             self._untrusted = self.db.untrusted_tests(
                 self._worker_sentinel,
                 self._launch_markers,
-                self._serving_path_markers,
                 self._min_funcs,
                 self._untrusted_stage_markers,
             )
@@ -169,13 +166,20 @@ class CoverageSelector:
             if not lines:
                 continue  # selection diff has no remaining executable edits
             import_executed = import_executed_qualnames(source)
-            closures = closure_attributed_qualnames(source, lines)
             dependencies = analyze_python_changes(
                 source,
                 lines,
                 iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
+            pytest_reason = self._pytest_impact.decline_reason(
+                path,
+                source,
+                qualnames | dependencies.changed_bindings,
+                pre_source=reconstruct_diff_pre_image(source, diff),
+            )
+            if pytest_reason:
+                return impacted, sorted(no_data), sorted(caller_bounded), no_diff, pytest_reason
             if dependencies.new_class_bindings:
                 # Every method of an added data class is reached through a
                 # consumer of that new class binding. Its declaration has no
@@ -301,13 +305,6 @@ class CoverageSelector:
                                 if bounded:
                                     caller_bounded.add(f"{cf}::{consumer}")
                         import_resolved = True
-                    continue
-                if qualname in closures:
-                    tests = self._underrecorded_bound(cf, qualname)
-                    if tests is None:
-                        why = f"closure change, no wider row set: {path}::{qualname}"
-                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
-                    impacted |= tests
                     continue
                 tests, bounded, limitation = self._qualname_impact(
                     cf,
@@ -536,13 +533,6 @@ class CoverageSelector:
             bound |= transitive
         return bound or None, None
 
-    def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
-        """File row set when it is wider than a closure's enclosing qualname's, else None."""
-        file_tests = self.db.tests_touching_file(cf)
-        if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
-            return file_tests
-        return None
-
     def _no_data_fallback(self, cf: str) -> set[str]:
         """Tests to force-run for a changed function the DB never captured."""
         if self._no_data_policy == "file":
@@ -566,9 +556,8 @@ class CoverageSelector:
     ) -> CoverageResult:
         """Resolve impact from raw source images and optional executable selection diffs."""
         for path in residual_files:
-            # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
-            if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
-                return CoverageResult(ok=False, reason=f"non-core-Python residual file: {path}")
+            if not path.endswith(".py"):
+                return CoverageResult(ok=False, reason=f"non-Python residual file: {path}")
             cf = canon(path)
             if not self.db.file_has_touch_rows(cf):
                 return CoverageResult(

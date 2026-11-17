@@ -765,3 +765,125 @@ def test_full_dim_norm_packed_v_unchanged():
         interleave=False,
     )
     torch.testing.assert_close(qkv[:, 2 * hidden :], v_original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_per_head_rank_slice_matches_full(tp_size):
+    """A tensor-parallel rank holds a contiguous slice of the heads in its packed QKV.
+    With per-head norm weights the op on that slice, told the rank-local head counts,
+    equals the same columns of the op on the whole projection (Cosmos3 GQA layout:
+    q heads, then k heads, then v heads)."""
+    device = "cuda"
+    torch.random.manual_seed(7)
+    num_heads, num_kv_heads, head_dim, num_tokens = 32, 8, 128, 96
+    qkv = torch.randn(
+        num_tokens, (num_heads + 2 * num_kv_heads) * head_dim, dtype=torch.bfloat16, device=device
+    )
+    q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
+    full = qkv.clone()
+    _call_fused_kernel(
+        full,
+        num_heads,
+        num_kv_heads,
+        num_kv_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos_emb,
+        sin_emb,
+        -1,
+        interleave=False,
+    )
+    hq, hkv = num_heads // tp_size, num_kv_heads // tp_size
+    q0, k0 = 0, num_heads * head_dim
+    v0 = k0 + num_kv_heads * head_dim
+    for rank in range(tp_size):
+        cols = torch.cat(
+            [
+                torch.arange(q0 + rank * hq * head_dim, q0 + (rank + 1) * hq * head_dim),
+                torch.arange(k0 + rank * hkv * head_dim, k0 + (rank + 1) * hkv * head_dim),
+                torch.arange(v0 + rank * hkv * head_dim, v0 + (rank + 1) * hkv * head_dim),
+            ]
+        ).to(device)
+        local = qkv[:, cols].contiguous()
+        _call_fused_kernel(
+            local,
+            hq,
+            hkv,
+            hkv,
+            head_dim,
+            1e-6,
+            q_weight,
+            k_weight,
+            None,
+            None,
+            cos_emb,
+            sin_emb,
+            -1,
+            interleave=False,
+        )
+        torch.testing.assert_close(local, full[:, cols], rtol=0, atol=0)
+
+
+def _attention(qk_norm_mode, num_heads, num_kv_heads, head_dim, tp_size, rank=0):
+    """An Attention module as one rank of a ``tp_size``-way tensor-parallel model."""
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
+    config = DiffusionModelConfig(
+        mapping=Mapping(world_size=tp_size, rank=rank, tp_size=tp_size),
+        attention=AttentionConfig(backend="VANILLA"),
+    )
+    return Attention(
+        hidden_size=num_heads * head_dim,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        qk_norm_mode=qk_norm_mode,
+        interleave=False,
+        config=config,
+    ).cuda()
+
+
+def test_attention_under_tp_runs_on_rank_local_heads():
+    """Under tensor parallelism Attention hands the fused op its rank's head counts: a
+    rank of a 2-way model with per-head norm computes on its packed QKV exactly what a
+    model holding only that rank's heads computes."""
+    torch.random.manual_seed(11)
+    num_heads, num_kv_heads, head_dim, num_tokens, tp = 8, 4, 64, 32, 2
+    rank_attn = _attention("per_head", num_heads, num_kv_heads, head_dim, tp, rank=1)
+    local_attn = _attention("per_head", num_heads // tp, num_kv_heads // tp, head_dim, 1)
+    for norm in ("norm_q", "norm_k"):
+        weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+        for attn in (rank_attn, local_attn):
+            getattr(attn, norm).weight.data.copy_(weight)
+    local_width = (num_heads + 2 * num_kv_heads) // tp * head_dim
+    qkv = torch.randn(1, num_tokens, local_width, dtype=torch.bfloat16, device="cuda")
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, "cuda")
+    on_rank, on_local = qkv.clone(), qkv.clone()
+    rank_attn.apply_packed_qk_norm_rope(on_rank, cos_emb, sin_emb)
+    local_attn.apply_packed_qk_norm_rope(on_local, cos_emb, sin_emb)
+    assert not torch.equal(on_rank, qkv)
+    torch.testing.assert_close(on_rank, on_local, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [8, 2], ids=["four_local_heads", "one_local_head"])
+def test_attention_refuses_full_dim_norm_under_tp(num_heads):
+    """Full-dim QK norm takes its variance over every head, across ranks, which the fused
+    op does not reduce, so under TP Attention refuses the fused path, also when a rank
+    holds a single head and its norm weight is exactly head_dim long."""
+    head_dim, num_tokens, tp = 64, 16, 2
+    attn = _attention("full", num_heads, num_heads, head_dim, tp)
+    qkv = torch.zeros(
+        1, num_tokens, 3 * num_heads // tp * head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, "cuda")
+    with pytest.raises(NotImplementedError, match="qk_norm_mode='full'"):
+        attn.apply_packed_qk_norm_rope(qkv, cos_emb, sin_emb)

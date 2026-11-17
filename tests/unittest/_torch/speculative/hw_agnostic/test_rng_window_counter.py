@@ -56,6 +56,7 @@ def _request(
         py_decoding_iter=decoding_iter,
         seed=seed,
         py_request_id=request_id,
+        py_spec_sampling_params=None,
     )
 
 
@@ -257,7 +258,9 @@ ROWS = MAX_DRAFT_LEN + 1
 def _populated(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
     """Run _populate_request_rng_state on CPU buffers and return request_offsets."""
     for request in requests:
-        request.sampling_config = types.SimpleNamespace(seed=request.seed)
+        request.sampling_config = types.SimpleNamespace(
+            temperature=1.0, top_k=None, top_p=None, min_p=None, seed=request.seed
+        )
     normalized = [(0.0, 0, 1.0, 0.0, ROWS) for _ in requests]
     meta._populate_request_rng_state(requests, normalized)
     return meta.request_offsets[: len(requests)].tolist()
@@ -285,3 +288,27 @@ def test_all_greedy_batch_skips_the_copies_but_advances_the_windows() -> None:
     assert meta.offsets[: 2 * ROWS].tolist() == [
         base + row * _RNG_SLOT_SPAN for base in (WINDOW, BASE + WINDOW) for row in range(ROWS)
     ]
+
+
+def test_temperature_only_batch_uploads_the_philox_state() -> None:
+    # A temperature-only batch whose target head cannot be sharded (vocab padding) falls back to the
+    # stock sampler, which reads these buffers: every step uploads fresh state.
+    meta = _meta()
+    sentinel = -5
+    meta.temperatures = torch.ones(8 * ROWS)
+    meta.request_seeds = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.request_offsets = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.seeds = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
+    meta.offsets = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
+    meta.is_all_greedy_sample = False
+    meta.temperature_only = True
+
+    previous = None
+    for step in range(2):
+        offsets = _populated(meta, [_request(0, seed=7), _request(1)])
+        assert offsets[0] == step * WINDOW and offsets != previous
+        assert meta.request_seeds[:2].tolist() == [7, DEFAULT_SAMPLING_SEED]
+        assert meta.offsets[: 2 * ROWS].tolist() == [
+            base + row * _RNG_SLOT_SPAN for base in offsets for row in range(ROWS)
+        ]
+        previous = offsets

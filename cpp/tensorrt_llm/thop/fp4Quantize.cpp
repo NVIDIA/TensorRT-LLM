@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,8 +42,9 @@ namespace torch_ext
 // returns self_fp4, self_block_scale_factors
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
-    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self,
+    std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
+    int64_t reservedSms)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -88,6 +89,9 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
         = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+    TORCH_CHECK(reservedSms >= 0 && reservedSms < mMultiProcessorCount,
+        "reserved_sms must be nonnegative and smaller than the device SM count");
+    int const availableSms = mMultiProcessorCount - static_cast<int>(reservedSms);
 
     auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
                                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
@@ -95,7 +99,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                                     \
     tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
         globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
-        reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
+        reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, availableSms,                           \
         at::cuda::getCurrentCUDAStream(self.get_device()));
 
     if (sfUseUE8M0)
@@ -156,6 +160,12 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 
     return {valueE2M1, scaleFP8SF};
+}
+
+std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
+{
+    return fp4_quantize_sm_budget(self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, 0);
 }
 
 at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<at::Tensor> const& tokensPerBatch)
@@ -377,6 +387,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
+    m.def(
+        "fp4_quantize.sm_budget(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
+        "isSfSwizzledLayout=True, int reserved_sms=0) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
@@ -387,6 +400,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
+    m.impl("fp4_quantize.sm_budget", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_sm_budget));
     m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
     m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
     m.impl("fp4_quantize_with_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_residual));
