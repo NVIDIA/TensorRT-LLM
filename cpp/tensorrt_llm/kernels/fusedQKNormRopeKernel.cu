@@ -322,7 +322,7 @@ __global__ void fusedQKNormRopeKernel(
                 // linear_ramp_factor
                 if (fabsf(low - high) <= 1e-6f)
                 {
-                    high += 0.001; // Prevent singularity
+                    high += 0.001F; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
@@ -365,7 +365,7 @@ __global__ void fusedQKNormRopeKernel(
                 // linear_ramp_factor
                 if (fabsf(low - high) <= 1e-6f)
                 {
-                    high += 0.001; // Prevent singularity
+                    high += 0.001F; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
