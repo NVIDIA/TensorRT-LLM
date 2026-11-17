@@ -112,7 +112,12 @@ specific combinations:
   sampling picks for repeated contexts, which is the only source of divergence between candidates.
   With `algorithm="gumbel_dual_key"` and `alpha > 0` (the default), candidates and repeated requests
   diverge once one of them draws a token under the second key, after about `1 / alpha` tokens. A
-  request `seed` then selects, and reproduces, that choice.
+  request `seed` then selects, and reproduces, that choice. Without a seed, a request takes the next
+  stream of its process, so identical prompts diverge within one process; replicas or restarts number
+  their streams from the same start. A seed reproduces the choice for an uninterrupted request with the
+  same `deduplicate_contexts`; a request that is resumed with generated tokens (disaggregated serving,
+  preemption) restarts the stream. Speculative decoding with rejection sampling ignores `alpha`, so
+  this divergence does not apply there.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
 - A fixed key applies the same random values wherever a context recurs across requests. For answers
   of one token from a small set (multiple choice, labels) many requests share their context, so the key

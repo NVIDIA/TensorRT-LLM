@@ -287,6 +287,13 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             {"watermark_config": {"key": 0, "algorithm": "gumbel_dual_key", "context_width": 64}},
             True,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {"watermark_config": {"key": 0, "algorithm": "gumbel_dual_key", "alpha": 0.5}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 0, "alpha": 1.5}}, False),
+        (generator.SERVE_SCHEMA, {"watermark_config": {"key": 0, "alpha": -0.1}}, False),
         (generator.SERVE_SCHEMA, {"watermark_config": {"key": -1}}, False),
         (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64}}, False),
         (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "context_width": 0}}, False),
