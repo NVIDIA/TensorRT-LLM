@@ -9782,7 +9782,8 @@ class TorchLlmArgs(BaseLlmArgs):
                     # missing context changes proposals and acceptance, not the
                     # greedy verification rule: warn, do not reject.
                     logger.warning(
-                        "DFlash under disaggregated serving keeps the "
+                        "DFlash acceptance is degraded under disaggregated "
+                        "serving because it keeps the "
                         "drafter's KV private (attention_backend VANILLA or "
                         "FA4, or TRTLLM_DISAGG_SHARED_DRAFT_KV=0), so the "
                         "generation server drafts without the prompt "
