@@ -5,7 +5,7 @@
 
 Brings one deployment target — a ``(checkpoint, GPU arch, parallel
 config)`` triple — from a HuggingFace checkpoint to a gated
-``tensorrt_llm/_torch/_experimental/modeling_v2`` target::
+``tensorrt_llm/_torch/modeling_v2`` target::
 
     preflight -> execution stage (planner + workers; a tune task joins) -> delivery
 

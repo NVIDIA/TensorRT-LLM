@@ -6,6 +6,7 @@ from typing import Dict, List, Union
 
 import yaml
 
+from tensorrt_llm._errors import ConfigInputError
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
@@ -48,7 +49,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
         if not isinstance(llm_args_dict, dict):
-            raise TypeError(
+            raise ConfigInputError(
                 f"extra_llm_api_options must contain a YAML mapping, "
                 f"got {type(llm_args_dict)}")
         kv_cache_config = llm_args_dict.get("kv_cache_config", {

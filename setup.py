@@ -40,11 +40,6 @@ def parse_requirements(filename: os.PathLike):
             # handle -i and --extra-index-url options
             if "-i " in line or "--extra-index-url" in line:
                 extra_URLs.append(extract_url(line))
-            # handle URLs such as git+https://github.com/flashinfer-ai/flashinfer.git@e3853dd#egg=flashinfer-python
-            elif line.startswith("git+https"):
-                idx = line.find("egg=")
-                dep = line[idx + 4:]
-                deps.append(dep)
             else:
                 deps.append(line)
     return deps, extra_URLs
@@ -276,7 +271,7 @@ def warn_on_build_skew(precompiled_location: str) -> None:
         "scripts/build_wheel.py",
         "requirements.txt",
         # modeling_v2 families keep their native code with their Python code.
-        ":(glob)tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/**"
+        ":(glob)tensorrt_llm/_torch/modeling_v2/models/**/csrc/**"
     ]
 
     def head_of(checkout: str) -> str | None:

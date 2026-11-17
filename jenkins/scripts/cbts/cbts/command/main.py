@@ -72,7 +72,7 @@ from cbts.rules.visual_gen import VisualGenRule
 from cbts.rules.waives import WaivesRule
 
 # Files the coverage tier maps to qualnames; without their diffs it stays file-level.
-COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
+COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("**/*.py",)
 
 # --- Rule registry -----------------------------------------------------------
 
@@ -208,6 +208,8 @@ def _coverage_decline_category(reason: str) -> str:
         ("a rule forced fallback", "rule_forced_fallback"),
         ("no residual", "no_residual"),
         ("non-core-Python residual file", "non_core_python"),
+        ("non-Python residual file", "non_python"),
+        ("shared test infrastructure change", "shared_test_infrastructure"),
         ("zero-touch residual file", "zero_touch"),
         ("no usable diff", "no_usable_diff"),
         ("import-executed change", "import_executed"),

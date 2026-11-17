@@ -28,7 +28,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -68,7 +67,6 @@ def test_resolve_runner_dispatches_startup_families(
     ("runner_type", "initializer_name"),
     [
         (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
-        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
         (DecoderRunner, "_initialize_decoder_runner"),
         (ModelRunner, None),
     ],
