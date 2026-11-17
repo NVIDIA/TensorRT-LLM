@@ -43,7 +43,7 @@ cache holds post-norm, post-RoPE keys and projected values.
 """
 
 import math
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -76,7 +76,7 @@ def beam_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 
 def beam_rope_cos_sin(
     positions: torch.Tensor, head_dim: int, rope_theta: float, factor: float
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """fp32 ``(cos, sin)`` of shape ``positions.shape + (head_dim,)`` (NeoX halves).
 
     Linear position interpolation divides the inverse frequencies by ``factor``.
@@ -96,7 +96,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def beam_apply_rotary(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate ``q``/``k`` of shape ``(..., heads, head_dim)`` in fp32, then cast back.
 
     ``cos``/``sin`` have shape ``(..., head_dim)`` and broadcast over the head axis.
@@ -131,7 +131,7 @@ def beam_output_gate(
     return (attention_output * torch.sigmoid(gate)).to(output_dtype)
 
 
-def beam_depth_coefficients(layer_idx: int, is_attention: bool) -> Tuple[float, float]:
+def beam_depth_coefficients(layer_idx: int, is_attention: bool) -> tuple[float, float]:
     """``(x_scale, residual_scale)`` for the attention or FFN add of a zero-based layer."""
     one_based = layer_idx + 1
     num_adds = 2 * one_based if is_attention else 2 * one_based + 1
@@ -140,7 +140,7 @@ def beam_depth_coefficients(layer_idx: int, is_attention: bool) -> Tuple[float, 
 
 
 def beam_depth_residual(
-    x: torch.Tensor, residual: torch.Tensor, scales: Tuple[float, float]
+    x: torch.Tensor, residual: torch.Tensor, scales: tuple[float, float]
 ) -> torch.Tensor:
     """``x * x_scale + residual * residual_scale`` in the activation dtype."""
     x_scale, residual_scale = scales
@@ -266,7 +266,7 @@ class BeamRouter(nn.Module):
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return BeamRouting(logits, scores, group_scores, top_groups, excluded, indices, weights)
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         routing = self.route(hidden_states)
         return routing.weights, routing.indices
 
@@ -526,10 +526,10 @@ class BeamForCausalLM(DecoderModelForCausalLM[BeamModel, BeamConfig]):
 
     def load_weights(
         self,
-        weights: Dict[str, torch.Tensor],
+        weights: dict[str, torch.Tensor],
         weight_mapper=None,
-        skip_modules: Optional[List[str]] = None,
-        params_map: Optional[Dict[str, str]] = None,
+        skip_modules: Optional[list[str]] = None,
+        params_map: Optional[dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
         """Load a reference-layout state dict exactly (values and dtypes, no casts)."""
@@ -570,7 +570,7 @@ def pack_beam_qkv_gate(
 
 def unpack_beam_qkv_gate(
     fused: torch.Tensor, num_heads: int, num_kv_heads: int, head_dim: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Inverse of :func:`pack_beam_qkv_gate`: returns ``(q, gate, k, v)``."""
     q_width = num_heads * head_dim
     kv_width = num_kv_heads * head_dim
@@ -582,8 +582,8 @@ def unpack_beam_qkv_gate(
 
 
 def map_beam_attention_state(
-    state: Dict[str, torch.Tensor], config: BeamConfig, prefix: str = ""
-) -> Dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor], config: BeamConfig, prefix: str = ""
+) -> dict[str, torch.Tensor]:
     """Map one attention module's reference entries (under ``prefix``) to candidate names.
 
     The separate Q, gate, K and V projections become the fused ``qkv_proj``. With
@@ -592,7 +592,7 @@ def map_beam_attention_state(
     removed from ``state``.
     """
     heads, head_dim = config.num_attention_heads, config.head_dim
-    mapped: Dict[str, torch.Tensor] = {}
+    mapped: dict[str, torch.Tensor] = {}
     q = state.pop(prefix + "q_proj.weight")
     gate = state.pop(prefix + "gate_proj.weight")
     k = state.pop(prefix + "k_proj.weight")
@@ -613,11 +613,11 @@ def map_beam_attention_state(
 
 
 def map_beam_state_dict(
-    state: Dict[str, torch.Tensor],
+    state: dict[str, torch.Tensor],
     config: BeamConfig,
-    attention_prefixes: Optional[List[str]] = None,
+    attention_prefixes: Optional[list[str]] = None,
     tied_lm_head: bool = False,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Map reflection-core state-dict names to candidate parameter/buffer names.
 
     ``attention_prefixes`` lists the attention modules contained in ``state`` (default:
@@ -629,7 +629,7 @@ def map_beam_state_dict(
         attention_prefixes = [
             f"model.layers.{i}.self_attn." for i in range(config.num_hidden_layers)
         ]
-    mapped: Dict[str, torch.Tensor] = {}
+    mapped: dict[str, torch.Tensor] = {}
     for prefix in attention_prefixes:
         mapped.update(map_beam_attention_state(remaining, config, prefix))
     if tied_lm_head:
@@ -640,12 +640,12 @@ def map_beam_state_dict(
     return mapped
 
 
-def beam_state_targets(module: nn.Module, tied_lm_head: bool = False) -> Dict[str, torch.Tensor]:
+def beam_state_targets(module: nn.Module, tied_lm_head: bool = False) -> dict[str, torch.Tensor]:
     """Every loadable tensor of ``module``: all parameters plus router correction buffers.
 
     With ``tied_lm_head`` the LM-head weight is the embedding parameter and appears once.
     """
-    targets: Dict[str, torch.Tensor] = dict(module.named_parameters())
+    targets: dict[str, torch.Tensor] = dict(module.named_parameters())
     for name, buffer in module.named_buffers():
         if name.endswith("e_score_correction_bias"):
             targets[name] = buffer
@@ -656,10 +656,10 @@ def beam_state_targets(module: nn.Module, tied_lm_head: bool = False) -> Dict[st
 
 def load_beam_state_dict(
     module: nn.Module,
-    state: Dict[str, torch.Tensor],
+    state: dict[str, torch.Tensor],
     config: Optional[BeamConfig] = None,
-    attention_prefixes: Optional[List[str]] = None,
-) -> Dict[str, str]:
+    attention_prefixes: Optional[list[str]] = None,
+) -> dict[str, str]:
     """Copy a reference-layout state dict into ``module``; return each tensor's dtype.
 
     ``module`` is a ``BeamForCausalLM`` (default prefixes) or a standalone Beam module
@@ -677,7 +677,7 @@ def load_beam_state_dict(
     unexpected = sorted(set(mapped) - set(targets))
     if missing or unexpected:
         raise ValueError(f"state dict mismatch: missing={missing} unexpected={unexpected}")
-    accounting: Dict[str, str] = {}
+    accounting: dict[str, str] = {}
     activation_dtype = config.torch_dtype
     with torch.no_grad():
         for name, target in targets.items():

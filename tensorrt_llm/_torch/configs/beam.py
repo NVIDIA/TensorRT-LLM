@@ -14,7 +14,7 @@
 # limitations under the License.
 """Architecture configuration for Beam checkpoints."""
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
@@ -24,7 +24,7 @@ BEAM_MLP_LAYER_TYPES = ("dense", "sparse")
 BEAM_ROPE_TYPES = ("default", "linear")
 
 
-def _default_layer_types(num_hidden_layers: int) -> List[str]:
+def _default_layer_types(num_hidden_layers: int) -> list[str]:
     layer_types = [
         "sliding_attention" if (i + 1) % 6 else "full_attention" for i in range(num_hidden_layers)
     ]
@@ -33,7 +33,7 @@ def _default_layer_types(num_hidden_layers: int) -> List[str]:
     return layer_types
 
 
-def _default_mlp_layer_types(num_hidden_layers: int) -> List[str]:
+def _default_mlp_layer_types(num_hidden_layers: int) -> list[str]:
     num_dense = min(3, num_hidden_layers)
     return ["dense"] * num_dense + ["sparse"] * (num_hidden_layers - num_dense)
 
@@ -99,8 +99,8 @@ class BeamConfig(PretrainedConfig):
         topk_group: int = 4,
         routed_scaling_factor: float = 2.5,
         final_logit_softcapping: Optional[float] = 30.0,
-        layer_types: Optional[List[str]] = None,
-        mlp_layer_types: Optional[List[str]] = None,
+        layer_types: Optional[list[str]] = None,
+        mlp_layer_types: Optional[list[str]] = None,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
