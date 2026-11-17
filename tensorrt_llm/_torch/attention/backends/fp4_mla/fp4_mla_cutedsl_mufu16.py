@@ -3564,23 +3564,6 @@ def _finalize_p4_n256_score_half_psf_source(
 
 
 @cute.jit
-def _reload_p4_n256_owned_psf_word_after_ready(
-    sPSF,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-) -> ctm.Int32:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    return sPSF[word_offset]
-
-
-@cute.jit
 def _make_p4_n256_psf_bank_to_tmem_desc(
     sPSF, base_col_id: ctm.Int32, base_row_id: ctm.Int32, bank_idx: ctm.Int32
 ) -> tuple:
