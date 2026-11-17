@@ -122,8 +122,8 @@ struct SparseBufferPlan
     size_t size;         //!< One cell.
     uint32_t pageOffset; //!< Its offset within its hot slot.
     SelectionUnitLayout layout;
-    int32_t layerRow;   //!< Metadata row: the dense index of its layer in the group.
-    int32_t slotInPool; //!< Its index among the life cycle's buffers sharing its pool.
+    int32_t layerRow;    //!< Metadata row: the dense index of its layer in the group.
+    int32_t slotInPool;  //!< Its index among the life cycle's buffers sharing its pool.
 };
 
 class Batch;

@@ -426,8 +426,17 @@ void KvCache::_selectOptionalGroups(std::map<LifeCycleId, int> const& endpoints)
                 >= std::min(mTokensPerBlock, endpoint - ordinal.value() * mTokensPerBlock));
             if (newlySelected)
             {
-                auto const retention = getRetention(ordinal);
-                holder->page->claimRetention(retention.retentionPriority, retention.durationMs);
+                bool const partialCopy
+                    = !isSsm && endpoint % mTokensPerBlock != 0 && ordinal == BlockOrdinal{endpoint / mTokensPerBlock};
+                if (!partialCopy || !holder->page->hasRetentionConsumers())
+                {
+                    auto const retention = getRetention(ordinal);
+                    holder->page->claimRetention(retention.retentionPriority, retention.durationMs);
+                }
+                if (partialCopy)
+                {
+                    mPartialCopyRetentionHolds.push_back(holder->page->borrowRetentionForCopy());
+                }
             }
             auto& target = isSsm ? mSsmBlocks[kDefaultBeamIndex][lc] : mBlocks[ordinal].pages[kDefaultBeamIndex][lc];
             target = holder;
