@@ -778,27 +778,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        # Only the FP4 MLA decode declares graph variants.
         state = self.fp4_mla_state
         if state is not None:
-            state.kv_regime_max_kv = kv_regime
+            state.set_decode_graph_variant(name, value)
 
-    @property
-    def decode_kv_regime(self) -> Optional[int]:
+    def decode_graph_variant(self, name: str) -> Optional[int]:
         state = self.fp4_mla_state
-        return None if state is None else state.kv_regime_max_kv
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        # The FP4 MLA packed decode launches its split budget only when True.
-        state = self.fp4_mla_state
-        if state is not None:
-            state.packed_split = packed_split
-
-    @property
-    def decode_packed_split(self) -> Optional[bool]:
-        state = self.fp4_mla_state
-        return None if state is None else state.packed_split
+        return None if state is None else state.decode_graph_variant(name)
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative

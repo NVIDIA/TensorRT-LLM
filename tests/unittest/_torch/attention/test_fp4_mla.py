@@ -1919,14 +1919,17 @@ def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch) -> No
         assert eager_state is not None and graph_state is not None
         assert graph_state is not eager_state
 
-        graph_metadata.set_decode_kv_regime(8192)
-        assert graph_metadata.decode_kv_regime == 8192
+        graph_metadata.set_decode_graph_variant("kv_regime", 8192)
+        assert graph_metadata.decode_graph_variant("kv_regime") == 8192
         assert graph_state.kv_regime_max_kv == 8192
-        assert metadata.decode_kv_regime is None
+        assert metadata.decode_graph_variant("kv_regime") is None
         assert eager_state.kv_regime_max_kv is None
+        # a variant the decode does not declare is ignored
+        graph_metadata.set_decode_graph_variant("other", 1)
+        assert graph_metadata.decode_graph_variant("other") is None
 
-        graph_metadata.set_decode_kv_regime(None)
-        assert graph_metadata.decode_kv_regime is None
+        graph_metadata.set_decode_graph_variant("kv_regime", None)
+        assert graph_metadata.decode_graph_variant("kv_regime") is None
     finally:
         manager.shutdown()
 
@@ -1956,14 +1959,18 @@ def test_fp4_mla_decode_packed_split_stays_on_the_graph_metadata(monkeypatch) ->
         assert eager_state is not None and graph_state is not None
         assert graph_state is not eager_state
 
-        graph_metadata.set_decode_packed_split(False)
-        assert graph_metadata.decode_packed_split is False
+        # the runner passes the variant's integer value; the state keeps the decision
+        graph_metadata.set_decode_graph_variant("packed_split", 0)
+        assert graph_metadata.decode_graph_variant("packed_split") == 0
         assert graph_state.packed_split is False
-        assert metadata.decode_packed_split is None
+        assert metadata.decode_graph_variant("packed_split") is None
         assert eager_state.packed_split is None
 
-        graph_metadata.set_decode_packed_split(None)
-        assert graph_metadata.decode_packed_split is None
+        graph_metadata.set_decode_graph_variant("packed_split", 1)
+        assert graph_state.packed_split is True
+
+        graph_metadata.set_decode_graph_variant("packed_split", None)
+        assert graph_metadata.decode_graph_variant("packed_split") is None
     finally:
         manager.shutdown()
 

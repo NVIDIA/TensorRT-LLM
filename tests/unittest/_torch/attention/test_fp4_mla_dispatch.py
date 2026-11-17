@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import select_kv_regime_ceiling
+from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import select_kv_regime_ceiling
 
 SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
@@ -370,7 +370,7 @@ def test_kv_regimes_for_batch(monkeypatch):
 
 
 def test_kv_regime_for_step():
-    # the graph runner maps a step onto the regimes the dispatcher lists for its shape
+    # a step is keyed by the smallest of its shape's regimes that covers its longest KV
     ceilings = _regimes(128, 4, 30080)
     assert select_kv_regime_ceiling(1, ceilings) == 8191
     assert select_kv_regime_ceiling(8191, ceilings) == 8191

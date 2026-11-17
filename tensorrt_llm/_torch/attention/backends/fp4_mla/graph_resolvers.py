@@ -2,21 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the decode CUDA graphs of an FP4 MLA model are keyed by, besides their shape.
 
-The decoder graph runner asks this module once, at capture, when the KV cache
-exists. Both resolvers return None for a decode that needs no extra key, which
-is every decode without an FP4 MLA KV cache and, by default, most with one.
+The decoder graph runner asks ``resolve_fp4_mla_graph_variants`` once, at
+capture, when the KV cache exists. It gets a graph variant
+(``cuda_graph_runner.GraphVariant``) for each thing the FP4 MLA decode decides
+per step and a graph has to freeze: the KV regime the dispatcher chooses its
+kernel on, and whether the packed decode launches its KV split budget. A
+decode that needs neither gets none, which is every decode without an FP4 MLA
+KV cache and, by default, most with one.
 """
 
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import GraphVariant
+
 from . import config as _config
 from . import fp4_mla_dispatch, packed_plan
+from .state import KV_REGIME_VARIANT, PACKED_SPLIT_VARIANT
 
 if TYPE_CHECKING:
     from torch import nn
@@ -25,9 +32,19 @@ if TYPE_CHECKING:
 
 # Regime ceilings of one graph shape: (batch size, draft length) -> KV lengths in tokens.
 KvRegimeResolver = Callable[[int, int], tuple[int, ...]]
-# Split decisions of one graph shape, and the decision of one step from its rows' KV lengths.
-PackedSplitVariants = Callable[[int, int], tuple[bool, ...]]
-PackedSplitDecision = Callable[[int, int, list[int]], bool]
+
+
+class PackedSplitDecisions(NamedTuple):
+    """Split decisions of the packed decode that decode graphs are keyed by.
+
+    ``variants(batch_size, draft_len)`` lists the decisions the graphs of a
+    shape are captured for (``packed_plan.packed_split_variants``);
+    ``decide(batch_size, draft_len, kv_lens)`` is a step's decision from its
+    per-request KV lengths (``packed_plan.packed_split_needed``).
+    """
+
+    variants: Callable[[int, int], tuple[bool, ...]]
+    decide: Callable[[int, int, list[int]], bool]
 
 
 def fp4_mla_4x_unavailable() -> str | None:
@@ -111,7 +128,7 @@ def resolve_fp4_mla_packed_split(
     model: nn.Module,
     mapping: Mapping,
     sm_count_fn: Callable[[], int],
-) -> tuple[PackedSplitVariants, PackedSplitDecision] | None:
+) -> PackedSplitDecisions | None:
     """Packed split decisions the decode graphs are keyed by; None for every decode but the FP4 MLA packed one.
 
     The packed decode launches its KV split budget only for steps whose
@@ -121,8 +138,6 @@ def resolve_fp4_mla_packed_split(
     (``packed_plan.packed_split_variants``); each step replays the graph of its
     decision (``packed_plan.packed_split_needed``), agreed across attention-DP
     ranks by the graph runner.
-
-    Returns the decisions of a graph shape and the decision of a step.
     """
     if not _config.has_fp4_mla_cache_layout(kv_cache_manager):
         return None
@@ -165,4 +180,123 @@ def resolve_fp4_mla_packed_split(
             kv_lens, query_len=int(draft_len) + 1, m_tiles=tiles, sm_count=sm_count
         )
 
-    return variants, decide
+    return PackedSplitDecisions(variants=variants, decide=decide)
+
+
+def select_kv_regime_ceiling(max_kv_len: int, ceilings: Sequence[int]) -> int:
+    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
+
+    Shorter steps share the first regime; a step beyond the list (never, when
+    ``ceilings`` ends with the capacity) gets the last one, the graph of the
+    capacity.
+    """
+    for ceiling in ceilings:
+        if max_kv_len <= ceiling:
+            return int(ceiling)
+    return int(ceilings[-1])
+
+
+def kv_regime_capture_passes(
+    warmup_lengths: Sequence[int], ceilings: tuple[int, ...]
+) -> list[tuple[int, int]]:
+    """(warm-up length, KV regime) of every generation graph family a step can key, largest first.
+
+    For each warm-up length (the engine's maximum, plus the sparse short length when the
+    sparse attention keeps short and long graph families apart) a step can land in every
+    regime whose ceiling lies below that length and in the regime covering the length
+    itself. The warm-up request's longest row fills the regime, so the dispatcher decision
+    a graph captures is the one of its regime.
+    """
+    passes: set[tuple[int, int]] = set()
+    for max_seq_len in warmup_lengths:
+        passes.update((ceiling, ceiling) for ceiling in ceilings if ceiling < max_seq_len)
+        passes.add((max_seq_len, select_kv_regime_ceiling(max_seq_len, ceilings)))
+    return sorted(passes, reverse=True)
+
+
+def _replayable_kv_regime(regime: int, captured: Sequence[int]) -> int:
+    """Round the KV regime up to a captured one.
+
+    A graph of a larger regime is valid for the step: the kernels are planned
+    for the page-table capacity and only the dispatcher's decision is baked
+    in. A regime whose capture was skipped replays the next one up, or the
+    largest captured when none covers it.
+    """
+    if not captured:
+        return regime
+    covering = [ceiling for ceiling in captured if ceiling >= regime]
+    return min(covering) if covering else max(captured)
+
+
+def _replayable_packed_split(split: int, captured: Sequence[int]) -> int:
+    """Replay the split graph when the step's unsplit graph was not captured.
+
+    A split graph is valid for any step: its plan keeps every request whole
+    when the step needs no split, at the cost of the empty slots. Shapes with
+    a single (split) variant and skipped captures fall back to it.
+    """
+    return split if split or 0 in captured else 1
+
+
+def kv_regime_variant(ceilings: KvRegimeResolver) -> GraphVariant:
+    """The KV regime as a graph variant: the value is the regime's ceiling in tokens."""
+
+    def of_step(batch_size: int, draft_len: int, kv_lens: list[int]) -> int:
+        return select_kv_regime_ceiling(max(kv_lens, default=0), ceilings(batch_size, draft_len))
+
+    return GraphVariant(
+        name=KV_REGIME_VARIANT,
+        values=ceilings,
+        of_step=of_step,
+        replayable=_replayable_kv_regime,
+        capture_passes=kv_regime_capture_passes,
+    )
+
+
+def packed_split_variant(decisions: PackedSplitDecisions) -> GraphVariant:
+    """The packed split decision as a graph variant: 1 launches the split budget, 0 one task per request."""
+
+    def values(batch_size: int, draft_len: int) -> tuple[int, ...]:
+        return tuple(sorted(int(split) for split in decisions.variants(batch_size, draft_len)))
+
+    def of_step(batch_size: int, draft_len: int, kv_lens: list[int]) -> int:
+        return int(decisions.decide(batch_size, draft_len, kv_lens))
+
+    return GraphVariant(
+        name=PACKED_SPLIT_VARIANT,
+        values=values,
+        of_step=of_step,
+        replayable=_replayable_packed_split,
+    )
+
+
+def resolve_fp4_mla_graph_variants(
+    *,
+    kv_cache_manager: Any,
+    model: nn.Module,
+    mapping: Mapping,
+    sm_count_fn: Callable[[], int],
+    four_x_unavailable_fn: Callable[[], str | None] = fp4_mla_4x_unavailable,
+) -> list[GraphVariant]:
+    """The graph variants the decode graphs of this model are keyed by; none for most decodes.
+
+    The KV regime comes first: its capture passes are tied to the warm-up
+    lengths, and the packed split decision is settled before it when a step
+    replays a graph of another value.
+    """
+    variants = []
+    regimes = resolve_fp4_mla_kv_regimes(
+        kv_cache_manager=kv_cache_manager,
+        model=model,
+        mapping=mapping,
+        sm_count_fn=sm_count_fn,
+        four_x_unavailable_fn=four_x_unavailable_fn,
+    )
+    if regimes is not None:
+        variants.append(kv_regime_variant(regimes))
+    decisions = resolve_fp4_mla_packed_split(
+        kv_cache_manager=kv_cache_manager, model=model, mapping=mapping, sm_count_fn=sm_count_fn
+    )
+    if decisions is not None:
+        variants.append(packed_split_variant(decisions))
+    return variants

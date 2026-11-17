@@ -78,7 +78,8 @@ the device, today the shared memory a block may use), and every call then stays 
 runner on such a device keys its decode graphs by no KV regime, as it does for Helix.
 
 KV length used for the decision: ``live_max_kv``, the ceiling of the KV regime a CUDA graph runner keys its decode
-graphs by (``set_decode_kv_regime`` on the graph's attention metadata stores it in ``Fp4MlaState.kv_regime_max_kv``),
+graphs by (the ``kv_regime`` graph variant, which the graph's attention metadata stores in
+``Fp4MlaState.kv_regime_max_kv``),
 an upper bound of the step's longest live KV; without one, eager steps included, the page-table capacity.  The
 kernels themselves are always compiled and planned for the capacity.
 
@@ -119,8 +120,8 @@ PATH_TWO_STREAM = "twostream"
 PATHS = (PATH_2X, PATH_4X, PATH_TWO_STREAM)
 
 # KV regimes a graph runner can key its decode graphs by (tokens): ``kv_regimes_for_batch`` lists the regimes worth
-# a graph for one batch shape, and the graph runner maps a step's longest live KV onto the smallest one covering it
-# (``cuda_graph_runner.select_kv_regime_ceiling``); the page-table capacity itself is always the last regime, the
+# a graph for one batch shape, and a step's longest live KV maps onto the smallest one covering it
+# (``graph_resolvers.select_kv_regime_ceiling``); the page-table capacity itself is always the last regime, the
 # grid adds optional points between a batch's floor and the capacity.
 KV_REGIME_GRID_ENV = "TRTLLM_FP4_MLA_KV_REGIME_GRID"
 DEFAULT_KV_REGIME_GRID: tuple[int, ...] = ()
