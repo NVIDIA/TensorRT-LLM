@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Text watermarking on real Qwen3.5 weights, dense and MoE.
+"""Text watermarking on a representative real Qwen3.5 model.
 
 The watermarked text must be detected with the key and not with another key, requests that opt
 out or decode greedily must stay unmarked, and the text must not be degraded: the model's own
 log-probability of the watermarked tokens has to match that of ordinary sampling.
-``TLLM_WATERMARK_TEST_QWEN35_DENSE`` and ``TLLM_WATERMARK_TEST_QWEN35_MOE`` override the model
-directories under ``LLM_MODELS_ROOT``.
+``TLLM_WATERMARK_TEST_QWEN35_DENSE`` overrides the model directory under ``LLM_MODELS_ROOT``.
 """
 
 import os
@@ -34,7 +33,6 @@ from tensorrt_llm.watermark import GumbelWatermarkDetector, WatermarkConfig
 
 MODELS = {
     "dense": ("TLLM_WATERMARK_TEST_QWEN35_DENSE", "Qwen3.5-4B"),
-    "moe": ("TLLM_WATERMARK_TEST_QWEN35_MOE", "Qwen3.5-35B-A3B"),
 }
 PROMPTS = [
     "Write a short story about a robot who learns to paint.",
@@ -71,7 +69,9 @@ def _mean_logprob(output):
 
 
 @pytest.mark.high_cuda_memory
-@pytest.mark.parametrize("kind", ["dense", "moe"])
+# The shared sampler consumes logits independently of dense/MoE layers.
+# Keep one real-model probe; distribution and kernel checks live in test_watermark.py.
+@pytest.mark.parametrize("kind", ["dense"])
 def test_qwen35_watermark_detected_and_not_degraded(kind):
     config = WatermarkConfig(key=KEY, deduplicate_contexts="none")
     llm = LLM(

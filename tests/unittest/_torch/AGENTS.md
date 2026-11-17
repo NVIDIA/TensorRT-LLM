@@ -21,6 +21,10 @@ Scope: this directory and its descendants. Supplements `../../AGENTS.md`.
 
 ## GPU test cost and coverage
 
+- A deprecated configuration alias does not imply that its execution backend is
+  deprecated. Trace argument normalization and dispatch before removing coverage.
+- Check effective CI coverage after platform gates and waivers. A registered but
+  skipped case cannot replace a removed check.
 - Distinct parameters are not by themselves a reason to keep every cross-product
   combination. State the extra regression a costly case protects, check existing
   lower-level and integration coverage, and retain representatives for independent
