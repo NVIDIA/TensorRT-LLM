@@ -32,7 +32,6 @@ By NVIDIA TensorRT LLM team
     - [Accuracy](#accuracy)
     - [KV Cache Footprint](#kv-cache-footprint)
     - [Attention Kernel](#attention-kernel)
-    - [Generation Step](#generation-step)
     - [Disaggregated Serving Throughput](#disaggregated-serving-throughput)
     - [Agentic Multi-Turn Serving](#agentic-multi-turn-serving)
   - [Limitations and Future Work](#limitations-and-future-work)
@@ -186,7 +185,7 @@ A fast kernel is only part of the work. The FP4 cache also has to be written dur
 
 The cache is paged in blocks of 128 tokens, a page size that TensorRT LLM selects automatically for NVFP4 MLA. During prefill, context attention runs the existing FP8 MLA context kernel on an FP8 scratch cache, and a quantize-and-scatter kernel writes the completed 16-token blocks of the prompt into the paged NVFP4 cache. FP4 attention compute is used for decode, where cache reads and BMM work grow with every generated token.
 
-A 16×16 block can be quantized only once all 16 of its tokens exist, but decode adds one token per step. Each request therefore owns a slot in a **16-token BF16 tail**, a ring buffer that keeps the newest tokens at full precision. At each decode step, a fused pre-attention kernel applies RoPE, appends the new token to the tail, quantizes the queries, refreshes the active FP4 block from the BF16 values and writes the cache. Once a block has all 16 tokens, it is frozen. Every FP4 block is therefore quantized from BF16 values and never from FP4 values, and error cannot accumulate through repeated requantization. At 4K tokens of context and a batch of 128, this fused pre-attention kernel is 1.76x faster than the pre-attention work of FP8 MLA (see [Generation Step](#generation-step)).
+A 16×16 block can be quantized only once all 16 of its tokens exist, but decode adds one token per step. Each request therefore owns a slot in a **16-token BF16 tail**, a ring buffer that keeps the newest tokens at full precision. At each decode step, a fused pre-attention kernel applies RoPE, appends the new token to the tail, quantizes the queries, refreshes the active FP4 block from the BF16 values and writes the cache. Once a block has all 16 tokens, it is frozen. Every FP4 block is therefore quantized from BF16 values and never from FP4 values, and error cannot accumulate through repeated requantization.
 
 ### Speculative Decoding with MTP
 
@@ -276,7 +275,6 @@ All configurations keep the weight format of the checkpoint.
 | 8K/16K Reasoning | Problems from the same set packed into prompts of about 8K tokens, with about 16K output tokens per request. Decode contexts average about 16K tokens. | Two context workers (DEP2 each) and one generation worker with DEP16, DEP8 or TEP8, 20 or 12 GPUs |
 | AgentX, DeepSeek-R1 | 393 recorded multi-turn Claude Code sessions from the SemiAnalysis InferenceX AgentX benchmark, replayed with their recorded think times. Each operating point keeps a fixed number of sessions alive for 15 minutes. The context worker uses prefix reuse, chunked prefill and session affinity, with a KV cache budget of 43 or 12 GiB per GPU plus 8 GiB of host memory. | One context worker (DEP2) and one generation worker (DEP4) |
 | AgentX, Kimi-K3 | The same sessions, 128 of them kept alive for 30 minutes. Context serving only, with 47.4 GiB of KV cache memory per GPU, 41% of it for the state of the Kimi Delta Attention (KDA) layers, and no host cache. A cached prefix is reusable only if both its MLA cache and its KDA state remain. | 16 GPUs with [Distributed Weight Data Parallelism](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md) (DWDP16) |
-| Generation step | Aggregated server on one node. Each wave of 4*B* requests, with a per-GPU batch of *B* and *L* random input tokens per request, generates 1,024 tokens per request. We report the median device time of decode-only steps at the full batch. | DEP4 |
 | Attention kernel | One decode call of one MLA layer at 39 shapes per model: KV lengths from 2K to 128K tokens and per-GPU batches from 8 to 1,024 requests, with MTP=3 on DeepSeek-R1 (128 heads) and MTP=7 on Kimi-K3 (96 heads). Each measurement profiles a single attention kernel under a CUDA Graph, with equal KV lengths across requests, and includes the split-KV reduction. FP8 MLA uses the faster of its split-KV strategies for each shape, and NVFP4 MLA uses its best CTA scheduling for each shape. | One GPU |
 
 ### Accuracy
@@ -348,25 +346,6 @@ Kimi-K3, MTP=7:
 <p align="center"><sub><em>Speedup of one NVFP4 MLA decode call of one MLA layer over FP8 MLA on one Rubin GPU, with 128 heads on DeepSeek-R1 and 96 heads on Kimi-K3. Both kernels include their split-KV reduction. Shapes marked – were not measured.</em></sub></p>
 
 NVFP4 MLA is faster at every measured shape: by 1.31x to 2.82x, with a geometric mean of 1.87x, on the 39 DeepSeek-R1 shapes, and by 1.35x to 2.71x, with a geometric mean of 1.99x, on the 39 Kimi-K3 shapes. The speedup generally grows with the KV length, from 1.3x to 1.5x at 2K tokens, where the fixed cost per call dominates, to 2.2x to 2.8x at 128K tokens, where the attention work per token dominates.
-
-These are measurements of the kernel on its own: each shape replays a single attention kernel under a CUDA Graph, with nothing else running on the GPU. Inside a generation step, the kernel alternates with the rest of the step, and its speedup there can differ from the values above; the [next section](#generation-step) measures it for one shape.
-
-### Generation Step
-
-The next table breaks down a DeepSeek-R1 generation step at 4K input tokens and a per-GPU batch of 128, which is close to the MLPerf workload at its highest load. Each step verifies four tokens per request with MTP=3.
-
-| Component | NVFP4 MLA | FP8 MLA | Speedup |
-|---|---|---|---|
-| Fused pre-attention kernel | 0.037 | 0.065 | 1.76x |
-| Core attention | 0.213 | 0.273 | 1.28x |
-| Rest of the step | 0.662 | 0.662 | 1.00x |
-| **Full step** | **0.911** | **1.000** | **1.10x** |
-
-<p align="center"><sub><em>Generation step on four GPUs with DEP and MTP=3, in units of the FP8 MLA step (32.16 ms; NVFP4 MLA takes 29.31 ms). Full steps are median device times from an unprofiled run. The components come from a one-GPU Nsight Systems trace, counting overlaps once; the rest of the step is the remainder. Core attention includes the attention kernels, their helpers and the online quantization of the softmax scores; the rest of the step includes the mixture-of-experts (MoE) layers, projections, communication and sampling.</em></sub></p>
-
-Core attention and the fused pre-attention kernel are 1.28x and 1.76x faster. Together, they account for about a third of the FP8 step and make the whole step 1.10x faster at 4K input tokens. The rest of the step runs the same kernels in both precisions and takes the same time, so the step speedup grows with the share of attention in the step, and that share rises with the context length.
-
-This breakdown is measured inside a serving step, not on the kernel alone. At the same shape, 4K tokens and a batch of 128, the kernel sweep of the previous section gives 1.67x, compared with 1.28x for core attention here. The two measurements differ in their conditions, mainly for FP8 MLA, which takes less time per call inside the step than when it is replayed on its own.
 
 ### Disaggregated Serving Throughput
 
