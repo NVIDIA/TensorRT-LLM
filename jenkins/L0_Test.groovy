@@ -2282,6 +2282,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def artifactoryNetrcPathNode = "${jobWorkspace}/artifactory-netrc"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
+            // Single-node stages run through run_tests.py (isolation, rerun, merge).
+            // Multi-node and PerfSanity stages eval pytestCommand as one pytest session:
+            // trtllm-llmapi-launch must wrap a single pytest process on every rank,
+            // perf/submit.py derives its per-role commands from pytestCommand, and
+            // perf results must not be rerun.
+            def useRunTests = nodeCount <= 1 && !stageName.contains("PerfSanity")
+
             stage("Initialize Test") {
                 println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
@@ -2526,12 +2533,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     coverageConfigFile
                 )
 
-                // Single-node stages run through run_tests.py (isolation, rerun, merge).
-                // Multi-node and PerfSanity stages eval pytestCommand as one pytest session:
-                // trtllm-llmapi-launch must wrap a single pytest process on every rank,
-                // perf/submit.py derives its per-role commands from pytestCommand, and
-                // perf results must not be rerun.
-                def useRunTests = nodeCount <= 1 && !stageName.contains("PerfSanity")
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
