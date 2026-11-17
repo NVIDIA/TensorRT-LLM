@@ -3376,8 +3376,11 @@ def test_moe_profile_backend_literals_realize_one_implementation(
     for profile in moe_profiles:
         constraints = profile.runtime_constraints
         assert constraints.quant_algorithms == frozenset({"none"})
-        if mapping.tp_size not in constraints.tp_sizes:
-            continue
+        # Each MoE profile must admit every partition parametrized here, or it goes unchecked.
+        assert mapping.tp_size in constraints.tp_sizes, (
+            f"{profile.profile_id} does not admit TP={mapping.tp_size}; "
+            "parametrize this test with the partitions it admits"
+        )
         for moe_backend in constraints.moe_backends:
             model_config = ModelConfig(
                 pretrained_config=_MOE_PROFILE_CANARY_CONFIGS[profile.profile_id](),
