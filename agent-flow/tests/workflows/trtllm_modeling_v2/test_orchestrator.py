@@ -259,6 +259,53 @@ def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
     assert "0, the final tree" in c.measured_where(here, status, "m1")
 
 
+def test_a_failed_check_runs_again_after_a_repair_that_does_not_name_it(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("checks failed: core:boot@tp1" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(_task("fix", "assemble", touches=["models/core/"]))
+            return PlannerAnswer("GRAPH_UPDATED", "a repair that claims no check", graph)
+        if not repaired:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[0], "m1"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The task that claimed the boot failed with it, and the repair names no check. The boot
+    # still runs on what the repair left.
+    assert (_CORE[0], "m2") in services.ran and status.latest()[_CORE[0]].passed
+
+
+def test_the_checks_of_a_task_whose_work_did_not_finish_are_not_run_for_it(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("CEILING", "the core cannot be built")
+
+    ran = []
+    services = Services(
+        plan=plan,
+        work=lambda task: "BLOCKED",
+        check=lambda chk: ran.append(chk.key),
+        free_gpus=lambda: 4,
+    )
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "ceiling"
+    # No check ran and failed: there is nothing to run again.
+    assert ran == []
+
+
 def test_a_check_a_task_asked_for_runs_again_when_its_run_was_lost(tmp_path):
     contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
     plan = _plan_once(

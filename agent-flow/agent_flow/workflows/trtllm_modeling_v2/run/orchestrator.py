@@ -759,7 +759,9 @@ class GraphOrchestrator:
         - a check a finished task claims that has no verdict to stand on: it
           failed and the target has changed since, or its run recorded none
           (``_owed``: a run that recorded none is owed even where an earlier
-          pass stands).
+          pass stands);
+        - once no required task is open, any check that ran and failed and whose
+          target has changed since: the repairs are in, whoever claimed it.
           ``busy``, with foreground work running, these run once per landing;
           otherwise at once. A benchmark among them waits until no required
           task is open, unless the bring-up still needs it;
@@ -771,14 +773,19 @@ class GraphOrchestrator:
         They run on the check pool; :meth:`_settled` reads the verdicts once
         they are all in, and tells the planner what failed.
         """
+        open_work = self._required_open()
         claimed = {k for t in self.graph.tasks if t.status == "done" for k in t.satisfies}
         delivery = self._delivery_keys()
         marker, evaluation = self._evaluated()
-        due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
         with self._status_lock:
-            owed = set(self._owed) - delivery - set(due)
-        due += [c.key for c in self.contract.checks if c.key in owed]
-        open_work = self._required_open()
+            latest = self.status.latest()
+            owed = set(self._owed) - delivery
+        if not open_work:
+            # The repairs are in: a check that ran and failed runs again on what they
+            # left, whether or not a repair named it.
+            claimed |= {key for key, verdict in latest.items() if not verdict.passed}
+        due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
+        due += [c.key for c in self.contract.checks if c.key in owed - set(due)]
         if open_work:
             bringup = (
                 {c.key for c in contract_mod.bringup_checks(self.contract)}
