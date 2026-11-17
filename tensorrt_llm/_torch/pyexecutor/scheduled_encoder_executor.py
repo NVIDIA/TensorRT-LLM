@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import datetime
 import os
+import queue
 import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -63,6 +65,23 @@ _MULTIMODAL_INPUT_ERROR = (
     "Scheduled requests to a non-generation model cannot carry multimodal inputs."
 )
 
+# One forward runs while the next is launched; a third waits for the first to be published.
+_MAX_IN_FLIGHT = 2
+
+
+@dataclass(frozen=True)
+class _InFlight:
+    """A launched batch whose forward the completion thread still has to wait for and publish."""
+
+    requests: list[LlmRequest]
+    responses: list[tuple[int, LlmResponse]]
+    done: torch.cuda.Event
+    iteration: int
+    host_start: float
+    forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None
+    num_tokens: int
+    num_waiting: int
+
 
 def prompt_cost(item: RequestQueueItem) -> tuple[int, int]:
     """Rows and tokens of one queued request; each child request is another full row."""
@@ -92,13 +111,17 @@ class ScheduledEncoderExecutor:
     """Serve scheduled requests to a non-generation model: queue, admission, batching, one forward.
 
     Each request runs whole in one forward and completes with it, so there is no
-    sampler, KV cache, generation scheduler or overlap loop. Rank 0 receives requests
-    and publishes responses; every rank runs the same batches. Settings that only tune
-    generation are ignored: the overlap scheduler, chunked prefill, guided decoding,
-    ``scheduler_config``, the waiting-queue policy and the iteration-based batch waits.
-    Iteration statistics and KV cache events are always empty. With ``print_iter_log``
-    rank 0 logs one line per batch: its requests and prompt tokens, the requests still
-    waiting, the host time of the forward, sync and publish, and the GPU time of the forward.
+    sampler, KV cache or generation scheduler. Rank 0 receives requests and publishes
+    responses; every rank runs the same batches. The loop only launches: up to two
+    forwards are in flight, so the next batch is prepared and launched while the previous
+    one runs, and a completion thread publishes each batch as soon as its forward finishes.
+    A forward that fails on the device after its launch is not recoverable and ends the
+    loop like any other crash. Settings that only tune generation are ignored: the overlap
+    scheduler, chunked prefill, guided decoding, ``scheduler_config``, the waiting-queue
+    policy and the iteration-based batch waits. Iteration statistics and KV cache events
+    are always empty. With ``print_iter_log`` rank 0 logs one line per batch: its requests
+    and prompt tokens, the requests still waiting when it launched, the host time from
+    taking the batch to publishing it, and the GPU time of the forward.
     """
 
     is_generation_model = False
@@ -157,11 +180,11 @@ class ScheduledEncoderExecutor:
         self._error_budget = ErrorBudget()
         self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
         self._iter_log = llm_args.print_iter_log and dist.rank == 0
-        self._forward_events = (
-            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-            if self._iter_log
-            else None
-        )
+        self._slots = threading.BoundedSemaphore(_MAX_IN_FLIGHT)
+        self._in_flight: queue.SimpleQueue[_InFlight | None] = queue.SimpleQueue()
+        self._last_staged: torch.cuda.Event | None = None
+        self._completion_thread: threading.Thread | None = None
+        self._completion_error: BaseException | None = None
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
         self._profiler = ProfileController(
@@ -427,25 +450,47 @@ class ScheduledEncoderExecutor:
         torch.cuda.set_device(self._device_id)
         # Create the context before any MPI call.
         CUASSERT(cudart.cudaSetDevice(self._device_id))
-        with self._profiler.iterations(), self._hang_detector:
-            while True:
-                self._hang_detector.checkpoint()
-                self._profiler.end_iteration()
-                self._profiler.begin_iteration()
-                with nvtx_range("iteration"):
-                    self._receive()
-                    if self.is_shutdown and not self._waiting_queue:
-                        self._loop_completed = True
-                        break
-                    count = fit_batch(
-                        self._waiting_queue.peek_requests(self.max_batch_size),
-                        max_batch_size=self.max_batch_size,
-                        max_num_tokens=self.max_num_tokens,
-                    )
-                    if count:
-                        self._run([self._waiting_queue.pop_request() for _ in range(count)])
-                    # Every pass counts, idle ones too, so a stop requested while idle fires.
-                    self._iter_counter += 1
+        self._completion_thread = threading.Thread(
+            target=self._completion_loop, daemon=True, name="scheduled_encoder_completion"
+        )
+        self._completion_thread.start()
+        try:
+            with self._profiler.iterations(), self._hang_detector:
+                while True:
+                    self._hang_detector.checkpoint()
+                    self._profiler.end_iteration()
+                    self._profiler.begin_iteration()
+                    with nvtx_range("iteration"):
+                        self._receive()
+                        self._raise_completion_error()
+                        if self.is_shutdown and not self._waiting_queue:
+                            self._wait_in_flight()
+                            self._raise_completion_error()
+                            self._loop_completed = True
+                            break
+                        count = fit_batch(
+                            self._waiting_queue.peek_requests(self.max_batch_size),
+                            max_batch_size=self.max_batch_size,
+                            max_num_tokens=self.max_num_tokens,
+                        )
+                        if count:
+                            self._run([self._waiting_queue.pop_request() for _ in range(count)])
+                        # Every pass counts, idle ones too, so a stop requested while idle fires.
+                        self._iter_counter += 1
+        finally:
+            # The thread is a daemon: after a crash it may sit in a wedged device's wait.
+            self._in_flight.put(None)
+
+    def _wait_in_flight(self) -> None:
+        """Block until every launched batch has been published."""
+        for _ in range(_MAX_IN_FLIGHT):
+            self._slots.acquire()
+
+    def _raise_completion_error(self) -> None:
+        if self._completion_error is not None:
+            raise RuntimeError(
+                f"A forward failed on the device: {self._completion_error}"
+            ) from self._completion_error
 
     @nvtx_range("_receive")
     def _receive(self) -> None:
@@ -526,7 +571,7 @@ class ScheduledEncoderExecutor:
 
     @nvtx_range("_run")
     def _run(self, items: list[RequestQueueItem]) -> None:
-        """Run one forward over ``items`` and publish one final response per request."""
+        """Launch one forward over ``items``; the completion thread publishes its responses."""
         host_start = time.monotonic()
         requests = merge_requests_to_llm_requests(items, exclude_last_generation_logits=False)
         for request in requests:
@@ -534,21 +579,34 @@ class ScheduledEncoderExecutor:
                 request.set_first_scheduled_time()
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
+        staged = torch.cuda.Event()
         inputs = ScheduledInputs(
             batch=batch,
             gather_context_logits=any(request.py_return_context_logits for request in requests),
+            inputs_staged=staged,
         )
         gpu_forward_start, gpu_forward_end, _ = self._perf_manager.create_timing_events()
+        forward_events = (
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            if self._iter_log
+            else None
+        )
+        with nvtx_range("wait_in_flight"):
+            # The runner reuses its host staging memory, and only two forwards may be in flight.
+            if self._last_staged is not None:
+                self._last_staged.synchronize()
+            self._slots.acquire()
+        self._last_staged = staged
         try:
             with torch.cuda.stream(self._execution_stream):
                 with self._perf_manager.record_perf_events(
                     gpu_forward_start, gpu_forward_end
                 ) as timing:
-                    if self._iter_log:
-                        self._forward_events[0].record()
+                    if forward_events is not None:
+                        forward_events[0].record()
                     outputs = self._runner.forward(inputs, resource_manager=None)
-                    if self._iter_log:
-                        self._forward_events[1].record()
+                    if forward_events is not None:
+                        forward_events[1].record()
                 if self._perf_manager.enabled:
                     # There is no sampling: report a zero-length sample phase.
                     self._perf_manager.save_timing_to_requests(
@@ -562,28 +620,58 @@ class ScheduledEncoderExecutor:
                         timing.end_time,
                     )
                 responses = self._complete(requests, outputs)
-                # Responses carry device tensors that other threads and processes read.
-                with nvtx_range("synchronize"):
-                    self._execution_stream.synchronize()
+                done = torch.cuda.Event()
+                done.record()
         except Exception as error:
+            self._slots.release()
             self._fail(requests, error)
             return
-        if self.dist.rank == 0:
-            self._publish(responses, (request.py_request_id for request in requests))
-        if self._iter_log:
-            self._log_iteration(items, len(requests), host_start)
+        self._in_flight.put(
+            _InFlight(
+                requests=requests,
+                responses=responses,
+                done=done,
+                iteration=self._iter_counter,
+                host_start=host_start,
+                forward_events=forward_events,
+                num_tokens=sum(prompt_cost(item)[1] for item in items) if self._iter_log else 0,
+                num_waiting=len(self._waiting_queue),
+            )
+        )
 
-    def _log_iteration(
-        self, items: list[RequestQueueItem], num_requests: int, host_start: float
-    ) -> None:
-        """Log one batch: its size, the host time since it was taken and the GPU time of its forward."""
-        host_ms = (time.monotonic() - host_start) * 1000
-        device_ms = self._forward_events[0].elapsed_time(self._forward_events[1])
+    def _completion_loop(self) -> None:
+        """Publish each launched batch once its forward has finished, in launch order."""
+        torch.cuda.set_device(self._device_id)
+        while (flight := self._in_flight.get()) is not None:
+            try:
+                with nvtx_range("synchronize"):
+                    # Responses carry device tensors that other threads and processes read.
+                    flight.done.synchronize()
+                if self.dist.rank == 0:
+                    self._publish(
+                        flight.responses, (request.py_request_id for request in flight.requests)
+                    )
+                if self._iter_log:
+                    self._log_iteration(flight)
+            except Exception as error:
+                traceback.print_exc()
+                logger.error(f"A forward failed on the device: {error}")
+                if self._completion_error is None:
+                    self._completion_error = error
+                    # Wakes a loop that is waiting for requests so that it raises.
+                    self._request_queue.enqueue_shutdown_request()
+            finally:
+                self._slots.release()
+
+    def _log_iteration(self, flight: _InFlight) -> None:
+        """Log one batch: its size, the host time until it was published and the GPU time of its forward."""
+        host_ms = (time.monotonic() - flight.host_start) * 1000
+        device_ms = flight.forward_events[0].elapsed_time(flight.forward_events[1])
         logger.info(
-            f"iter = {self._iter_counter}, "
-            f"num_scheduled_requests = {num_requests}, "
-            f"num_tokens = {sum(prompt_cost(item)[1] for item in items)}, "
-            f"num_waiting = {len(self._waiting_queue)}, "
+            f"iter = {flight.iteration}, "
+            f"num_scheduled_requests = {len(flight.requests)}, "
+            f"num_tokens = {flight.num_tokens}, "
+            f"num_waiting = {flight.num_waiting}, "
             f"host_step_time = {host_ms}ms, "
             f"device_step_time = {device_ms}ms"
         )

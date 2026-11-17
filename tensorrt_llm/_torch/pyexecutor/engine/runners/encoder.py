@@ -1112,9 +1112,19 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     def forward_packed(
         self,
         inputs: PackedInputs,
+        *,
+        inputs_staged: torch.cuda.Event | None = None,
     ) -> dict[str, Any]:
-        """Execute packed inputs with their requested output options."""
+        """Execute packed inputs with their requested output options.
+
+        Args:
+            inputs: The packed batch.
+            inputs_staged: Recorded on the current stream once the host staging memory
+                this runner reuses across calls has been consumed.
+        """
         prepared = self._prepare_inputs(inputs)
+        if inputs_staged is not None:
+            inputs_staged.record()
         return self._execute_prepared(
             prepared,
             gather_context_logits=inputs.gather_context_logits,
@@ -1129,7 +1139,7 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     ) -> dict[str, Any]:
         """Execute scheduled requests by packing them for ``forward_packed``."""
         del resource_manager, is_dummy
-        return self.forward_packed(self._pack_scheduled(inputs))
+        return self.forward_packed(self._pack_scheduled(inputs), inputs_staged=inputs.inputs_staged)
 
     def _pack_scheduled(self, inputs: ScheduledInputs) -> PackedInputs:
         requests = inputs.batch.context_requests

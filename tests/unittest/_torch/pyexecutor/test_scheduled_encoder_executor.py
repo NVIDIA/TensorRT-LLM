@@ -80,6 +80,12 @@ class _Runner:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
+        # GPU time to stage the inputs and to compute, so that a batch stays in flight after
+        # its launch returns.
+        self.staging_cycles = 0
+        self.gpu_cycles = 0
+        self.on_forward = None
+        self.staged: list[torch.cuda.Event] = []
 
     def hold(self) -> None:
         self.entered.clear()
@@ -95,10 +101,19 @@ class _Runner:
         assert resource_manager is None
         requests = inputs.batch.context_requests
         self.batches.append([request.py_request_id for request in requests])
+        if self.on_forward is not None:
+            self.on_forward()
         self.entered.set()
         assert self.release.wait(timeout=30)
         if self.errors:
             raise self.errors.pop(0)
+        if self.staging_cycles:
+            torch.cuda._sleep(self.staging_cycles)
+        if inputs.inputs_staged is not None:
+            inputs.inputs_staged.record()
+            self.staged.append(inputs.inputs_staged)
+        if self.gpu_cycles:
+            torch.cuda._sleep(self.gpu_cycles)
         for row, request in enumerate(requests):
             self.output[row].fill_(request.py_request_id)
         return {"logits": self.output[: len(requests)]}
@@ -202,6 +217,65 @@ def test_results_are_pooled_rows_with_no_tokens_and_reason_length():
         for result in (first, second):
             assert result.output_token_ids == [[]]
             assert result.finish_reasons == [FinishReason.LENGTH]
+
+
+# Long enough that a launched batch is still running when the loop has launched the next one.
+GPU_CYCLES = 1_000_000_000
+
+
+def test_the_next_batch_is_launched_while_the_previous_one_runs_and_two_are_in_flight_at_most():
+    with _harness(max_batch_size=1) as h:
+        h.runner.gpu_cycles = GPU_CYCLES
+        published, published_at_launch = [], []
+        publish = h.executor._publish
+
+        def record_publish(responses, finished_ids):
+            finished_ids = list(finished_ids)
+            publish(responses, finished_ids)
+            published.extend(finished_ids)
+
+        h.executor._publish = record_publish
+        h.runner.on_forward = lambda: published_at_launch.append(list(published))
+        ids = [h.submit(), h.submit(), h.submit()]
+        h.executor.start_worker()
+
+        for request_id in ids:
+            h.result(request_id)
+
+        assert h.runner.batches == [[request_id] for request_id in ids]
+        # The second launch did not wait for the first batch; the third waited for its publish.
+        assert published_at_launch == [[], [], [ids[0]]]
+
+
+def test_the_next_forward_waits_until_the_previous_inputs_are_staged():
+    with _harness(max_batch_size=1) as h:
+        h.runner.staging_cycles = GPU_CYCLES
+        staged_at_launch = []
+        h.runner.on_forward = lambda: staged_at_launch.append(
+            [event.query() for event in h.runner.staged]
+        )
+        ids = [h.submit(), h.submit()]
+        h.executor.start_worker()
+
+        for request_id in ids:
+            h.result(request_id)
+
+        assert staged_at_launch == [[], [True]]
+
+
+def test_a_failure_after_the_launch_ends_the_loop_and_wakes_waiters():
+    with _harness() as h:
+
+        def fail(responses, finished_ids):
+            raise RuntimeError("the device was lost")
+
+        h.executor._publish = fail
+        pending = h.submit()
+        h.executor.start_worker()
+
+        with pytest.raises(RuntimeError, match="Event loop terminated") as raised:
+            h.executor.await_responses(pending, timeout=WAIT)
+        assert "the device was lost" in str(raised.value)
 
 
 def test_perf_metrics_record_when_the_request_was_scheduled():
