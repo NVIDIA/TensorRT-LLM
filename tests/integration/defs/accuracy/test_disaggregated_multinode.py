@@ -40,6 +40,7 @@ from typing import Iterator, Optional
 import openai
 import pytest
 import requests
+from test_common.cluster_env import apply_ucx_env
 
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
@@ -187,22 +188,19 @@ def _worker_env() -> dict[str, str]:
             "MASTER_ADDR",
             "MASTER_PORT",
             "UCX_TLS",
-            "UCX_NET_DEVICES",
         }
     }
-    # Pyxis starts these worker processes as root; preserve the explicit
-    # Open MPI container override for mpi4py dynamic worker spawn.
+    # Pyxis runs as root; dynamic MPI spawn needs these explicit overrides.
     env.update(
         {
             "OMPI_ALLOW_RUN_AS_ROOT": "1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
-            # Avoid auto-selecting an NVL72 RDMA VF whose container-visible
-            # IPv6 address UCX cannot bind; override UCX_NET_DEVICES where
-            # eth0 is not the right interface.
-            "UCX_NET_DEVICES": os.environ.get("UCX_NET_DEVICES", "eth0"),
-            "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
         }
+    )
+    apply_ucx_env(
+        env,
+        cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),
     )
     return env
 
@@ -363,7 +361,8 @@ def _accuracy_llm(
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(250000)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSparkMultinode(LlmapiAccuracyTestHarness):
     def test_gsm8k_1p1d_dep4(
