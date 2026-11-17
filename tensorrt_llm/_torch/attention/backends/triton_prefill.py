@@ -118,6 +118,7 @@ def _fwd_kernel(
     # Mask
     mask_ptr,
     mask_indptr,  # [batch+1] cumulative mask element counts
+    image_token_block_ids,  # [num_ctx_tokens] int32; 0 denotes text
     # Scalars
     sm_scale,
     kv_group_num,
@@ -152,6 +153,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    USE_IMAGE_BLOCK_IDS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -184,6 +186,13 @@ def _fwd_kernel(
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
+
+    if USE_IMAGE_BLOCK_IDS:
+        query_block_ids = tl.load(
+            image_token_block_ids + cur_seq_extend_start + cur_block_m * BLOCK_M + offs_m,
+            mask=mask_m,
+            other=0,
+        )
 
     # Load query tile
     offs_q = (
@@ -318,7 +327,13 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
+    extend_loop_lo = 0
+    if USE_IMAGE_BLOCK_IDS and WINDOW_LEFT >= 0:
+        # Text-only query tiles cannot see image tokens outside their window.
+        if tl.max(query_block_ids, axis=0) == 0:
+            extend_loop_lo = tl.maximum(0, cur_block_m * BLOCK_M - WINDOW_LEFT)
+            extend_loop_lo = (extend_loop_lo // BLOCK_N) * BLOCK_N
+    for start_n in range(extend_loop_lo, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -336,6 +351,20 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
+        elif USE_IMAGE_BLOCK_IDS:
+            key_block_ids = tl.load(
+                image_token_block_ids + cur_seq_extend_start + start_n + offs_n,
+                mask=mask_n,
+                other=0,
+            )
+            causal = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (start_n + offs_n[None, :])
+            same_image = (query_block_ids[:, None] != 0) & (
+                query_block_ids[:, None] == key_block_ids[None, :]
+            )
+            if WINDOW_LEFT >= 0:
+                distance = cur_block_m * BLOCK_M + offs_m[:, None] - (start_n + offs_n[None, :])
+                causal &= distance <= WINDOW_LEFT
+            final_mask &= causal | same_image
         elif IS_CAUSAL:
             mask_causal = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (start_n + offs_n[None, :])
             mask_causal &= mask_m[:, None] & mask_n[None, :]
@@ -343,13 +372,13 @@ def _fwd_kernel(
         else:
             final_mask &= mask_m[:, None] & mask_n[None, :]
 
-        if WINDOW_LEFT >= 0:
+        if WINDOW_LEFT >= 0 and not USE_IMAGE_BLOCK_IDS:
             q_pos_s2 = cur_block_m * BLOCK_M + offs_m[:, None]
             k_pos_s2 = start_n + offs_n[None, :]
             final_mask &= (q_pos_s2 - k_pos_s2) <= WINDOW_LEFT
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK:
+        if USE_CUSTOM_MASK or USE_IMAGE_BLOCK_IDS:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -436,6 +465,7 @@ def _extend_attention_fwd(
     window_left: int = -1,
     kv_scale_quant_orig: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
+    image_token_block_ids: Optional[torch.Tensor] = None,
 ):
     """Launch the Triton extend attention kernel.
 
@@ -462,6 +492,10 @@ def _extend_attention_fwd(
             A query at position p attends to keys in [p - window_left, p].
         kv_scale_quant_orig: Optional FP32 scalar dequantization scale for cached K/V.
         out_scale: Optional FP32 scalar quantization multiplier for the output.
+        image_token_block_ids: Optional contiguous int32 [num_ctx_tokens] tensor.
+            Positive equal IDs allow bidirectional attention within an image blob;
+            zero denotes text. IDs are scoped to each sequence. Image blobs override
+            the sliding window, matching Gemma3's dense mask. Exclusive with custom_mask.
     """
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
@@ -487,6 +521,7 @@ def _extend_attention_fwd(
         page_table_indptr,
         custom_mask,
         mask_indptr,
+        image_token_block_ids,
         sm_scale,
         kv_group_num,
         kv_scale_quant_orig,
@@ -519,6 +554,7 @@ def _extend_attention_fwd(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         USE_CUSTOM_MASK=custom_mask is not None,
+        USE_IMAGE_BLOCK_IDS=image_token_block_ids is not None,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=skip_prefix_custom_mask,
         WINDOW_LEFT=window_left,
@@ -546,6 +582,8 @@ def triton_prefill_with_custom_mask(
     window_left: int = -1,
     kv_scale_quant_orig: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
+    image_token_block_ids: Optional[torch.Tensor] = None,
+    max_len_extend: Optional[int] = None,
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
@@ -581,6 +619,11 @@ def triton_prefill_with_custom_mask(
         kv_scale_quant_orig: Optional FP32 scalar dequantization scale for cached K/V.
             Contiguous K/V for new tokens are already in the compute dtype.
         out_scale: Optional FP32 scalar quantization multiplier for the output.
+        max_len_extend: Optional host-side maximum query length, avoiding a GPU sync.
+        image_token_block_ids: Optional contiguous int32 [num_ctx_tokens] tensor.
+            Positive equal IDs allow bidirectional attention within an image blob;
+            zero denotes text. IDs are scoped to each sequence. Image blobs override
+            the sliding window, matching Gemma3's dense mask. Exclusive with custom_mask.
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
@@ -588,7 +631,7 @@ def triton_prefill_with_custom_mask(
 
     # Build causal mask when custom_mask is not provided
     total_kv_lens = prefix_lens + extend_lens
-    if custom_mask is None:
+    if custom_mask is None and image_token_block_ids is None:
         # Generate causal mask: each query at position i attends to
         # positions [0..prefix_len+i] (all prefix + causal extend)
         mask_parts = []
@@ -604,9 +647,24 @@ def triton_prefill_with_custom_mask(
         custom_mask = torch.cat(mask_parts)
 
     # Compute mask_indptr: each seq's mask is [extend_len, prefix_len + extend_len]
-    mask_sizes = extend_lens * total_kv_lens
-    mask_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
-    mask_indptr[1:] = torch.cumsum(mask_sizes, dim=0)
+    mask_indptr = None
+    if custom_mask is not None:
+        mask_sizes = extend_lens * total_kv_lens
+        mask_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
+        mask_indptr[1:] = torch.cumsum(mask_sizes, dim=0)
+    if image_token_block_ids is not None:
+        if custom_mask is not None:
+            raise ValueError("Pass either a dense mask or image block IDs, not both")
+        if (
+            image_token_block_ids.dtype != torch.int32
+            or image_token_block_ids.ndim != 1
+            or image_token_block_ids.numel() != q.shape[0]
+            or not image_token_block_ids.is_contiguous()
+            or image_token_block_ids.device != q.device
+        ):
+            raise ValueError(
+                "Image block IDs must be contiguous int32 context-token IDs on Q's device"
+            )
 
     # Compute prefix_indptr: cumulative prefix token counts
     prefix_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
@@ -625,7 +683,8 @@ def triton_prefill_with_custom_mask(
         k_buffer = torch.empty(1, num_kv_heads, 1, head_dim, dtype=k.dtype, device=device)
         v_buffer = torch.empty(1, num_kv_heads, 1, head_dim, dtype=v.dtype, device=device)
 
-    max_len_extend = int(extend_lens.max().item()) if num_contexts > 0 else 0
+    if max_len_extend is None:
+        max_len_extend = int(extend_lens.max().item()) if num_contexts > 0 else 0
 
     _extend_attention_fwd(
         q_extend=q,
@@ -649,4 +708,5 @@ def triton_prefill_with_custom_mask(
         window_left=window_left,
         kv_scale_quant_orig=kv_scale_quant_orig,
         out_scale=out_scale,
+        image_token_block_ids=image_token_block_ids,
     )

@@ -127,6 +127,30 @@ def build_gemma_attention_mask(
     return output
 
 
+_MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS = 8192
+
+
+def _use_compact_image_mask_for_lengths(context_lengths: list[int]) -> bool:
+    """Select compact masks using sum(length squared) / sum(length)."""
+    total_tokens = sum(context_lengths)
+    return total_tokens > 0 and sum(
+        length * length for length in context_lengths
+    ) >= _MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS * total_tokens
+
+
+def build_gemma_image_token_block_ids(
+        image_token_mask: torch.Tensor) -> torch.Tensor:
+    """Return contiguous int32 blob IDs for packed context tokens; text has ID 0.
+
+    Attention isolates requests through qo_indptr, so a run crossing a packed
+    request boundary does not allow attention between those requests.
+    """
+    previous = torch.cat((image_token_mask.new_zeros(1), image_token_mask[:-1]))
+    starts = image_token_mask & ~previous
+    block_ids = torch.cumsum(starts, dim=0, dtype=torch.int32)
+    return block_ids.masked_fill_(~image_token_mask, 0)
+
+
 class Gemma3TextScaledWordEmbedding(Embedding):
 
     def __init__(
@@ -392,6 +416,10 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+        self._use_compact_image_mask = all(
+            layer.self_attn.attn_backend == "FLASHINFER"
+            and layer.self_attn.attn.flashinfer_backend in ("fa2", "fa3")
+            for layer in self.model.layers)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,
@@ -473,17 +501,37 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
         local_attention_mask_data = None
         global_attention_mask_data = None
+        image_token_block_ids = None
         if image_token_mask is not None:
-            global_attention_mask_data = self.get_attention_mask(
-                image_token_mask=image_token_mask,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=None,
-            )
-            local_attention_mask_data = self.get_attention_mask(
-                image_token_mask=image_token_mask,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=self.config.sliding_window,
-            )
+            if (self._use_compact_image_mask
+                    and isinstance(attn_metadata, FlashInferAttentionMetadata)
+                    and attn_metadata.kv_cache_manager is not None
+                    and _use_compact_image_mask_for_lengths(
+                        attn_metadata.seq_lens[:attn_metadata.
+                                               num_contexts].tolist())
+                    and all(not layer.self_attn.attn.has_fp8_kv_cache
+                            for layer in self.model.layers)):
+                num_contexts = attn_metadata.num_contexts
+                assert num_contexts > 0
+                cached = attn_metadata.kv_cache_params
+                assert (
+                    cached is None or cached.num_cached_tokens_per_seq is None
+                    or not any(cached.num_cached_tokens_per_seq[:num_contexts])
+                ), ("Gemma3 image prefill requires chunking and KV reuse to be disabled"
+                    )
+                image_token_block_ids = build_gemma_image_token_block_ids(
+                    image_token_mask[:attn_metadata.num_ctx_tokens])
+            else:
+                global_attention_mask_data = self.get_attention_mask(
+                    image_token_mask=image_token_mask,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=None,
+                )
+                local_attention_mask_data = self.get_attention_mask(
+                    image_token_mask=image_token_mask,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=self.config.sliding_window,
+                )
 
         output = self.model(
             input_ids=input_ids,
@@ -492,6 +540,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
+            image_token_block_ids=image_token_block_ids,
             **kwargs,
         )
 

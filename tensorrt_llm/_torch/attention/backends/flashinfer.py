@@ -2651,7 +2651,21 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         latent_cache: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        image_token_block_ids: Optional[torch.Tensor] = None,
     ) -> None:
+        if image_token_block_ids is not None:
+            if (self.flashinfer_backend not in ("fa2", "fa3")
+                    or self.has_fp8_kv_cache
+                    or metadata.kv_cache_manager is None or k is None
+                    or v is None or metadata.num_contexts == 0
+                    or self.is_mla_enable):
+                raise ValueError(
+                    "Compact image masks require fa2/fa3 paged GQA prefill without FP8 KV"
+                )
+            if attention_mask_data is not None:
+                raise ValueError(
+                    "Compact and dense image masks are mutually exclusive")
+
         # MLA dispatch
         if self.is_mla_enable:
             if latent_cache is not None and k is not None and v is not None:
@@ -2790,10 +2804,12 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # (bidirectional) attention masks for head_dim>256 layers.  Use a
         # Triton prefill kernel for those layers during multimodal prefill,
         # while keeping FlashInfer for decode and all other cases.
+        # Compact Gemma3 image IDs also use Triton to avoid dense mask materialization.
         # KV-shared layers (k is None) keep the causal fallback below.
-        use_triton_prefill = (self.flashinfer_backend == "trtllm-gen"
-                              and attention_mask_data is not None
-                              and num_contexts > 0 and k is not None)
+        use_triton_prefill = (image_token_block_ids is not None
+                              or (self.flashinfer_backend == "trtllm-gen"
+                                  and attention_mask_data is not None
+                                  and num_contexts > 0 and k is not None))
 
         if use_triton_prefill:
             from .triton_prefill import triton_prefill_with_custom_mask
@@ -2820,6 +2836,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 _paged_kv_indices[:metadata.num_context_blocks],
                 page_size=metadata.page_size,
                 custom_mask=attention_mask_data,
+                image_token_block_ids=image_token_block_ids,
+                max_len_extend=(int(metadata.seq_lens[:num_contexts].max())
+                                if image_token_block_ids is not None else None),
                 sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
                 window_left=window_left,
             )
@@ -2832,7 +2851,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     q_dtype=q.dtype,
                     kv_dtype=kv_cache.dtype,
                     q_scaling=self.q_scaling,
-                    attention_window_size=None,
+                    attention_window_size=(attention_window_size
+                                           if image_token_block_ids is not None
+                                           else None),
                     attention_mask_type=int(AttentionMaskType.causal),
                     attention_mask_data=None,
                     flashinfer_backend=self.flashinfer_backend)
@@ -2932,6 +2953,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 output=output,
                 latent_cache=latent_cache,
                 attention_input_type=forward_args.attention_input_type,
+                image_token_block_ids=forward_args.image_token_block_ids,
             )
         except RuntimeError as exc:
             # Report the TRTLLM-convention (exclusive) window, not the

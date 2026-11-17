@@ -369,6 +369,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
+  - unittest/_torch/modeling/test_modeling_gemma3.py::test_gemma3_compact_mask_model_parity
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
