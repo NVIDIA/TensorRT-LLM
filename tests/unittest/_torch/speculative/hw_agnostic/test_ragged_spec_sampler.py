@@ -303,6 +303,8 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
         samples_from_vocab_shards=False,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         use_rejection_sampling=False,
         enable_penalty=False,
     )
