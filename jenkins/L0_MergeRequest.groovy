@@ -2341,34 +2341,25 @@ def readRunTestResults(String helper, Closure keep)
 }
 
 // Upload sqlite-only post-merge coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
-def uploadArchCoverage(String arch, pipeline, testFilter, boolean multiGpu = false) {
+def uploadArchCoverage(String arch, pipeline, testFilter) {
     if (!testFilter[(CBTS_COVERAGE)] || !testFilter[(IS_POST_MERGE)]) {
         return
     }
     // The results archives of SBSA stages; every other one is x86_64.
     def sbsaArchive = /results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\.tar\.gz/
-    def group = multiGpu ? "Multi-GPU" : "Single-GPU"
-    def artifactSuffix = multiGpu ? "_multi_gpu" : ""
     boolean interruptionWasActualInsideTimeout = false
     try {
         timeout(time: 15, unit: 'MINUTES') {
             try {
                 def podSpec = createKubernetesPodConfig("", "agent")
                 trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
-                    stage("Upload ${group} Coverage (${arch})") {
-                      dir(multiGpu ? "cbts-multi-${arch}" : ".") {
-                        if (multiGpu) {
-                            deleteDir()
-                        }
+                    stage("Upload Single-GPU Coverage (${arch})") {
                         sh "rm -rf cov && mkdir -p cov"
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         withTestResultsReader { helper ->
                             readRunTestResults(helper, { name ->
-                                def isMultiGpu = (name =~ /-[0-9]+_GPUs/).find()
-                                def excluded = ["_Nodes", "-Ray-", "Perf", "TensorRT", "CPP"].any { name.contains(it) }
-                                name ==~ /results-.*\.tar\.gz/ && (name ==~ sbsaArchive) == (arch == "SBSA") &&
-                                    (!multiGpu || (isMultiGpu && !excluded))
+                                name ==~ /results-.*\.tar\.gz/ && (name ==~ sbsaArchive) == (arch == "SBSA")
                             })
                         }
                         sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
@@ -2384,16 +2375,15 @@ def uploadArchCoverage(String arch, pipeline, testFilter, boolean multiGpu = fal
                                     --glob 'cov/.cbtscov.*.sqlite' \
                                     --out-sqlite cov/cbts_touchmap.sqlite
                             """
-                            sh "cd cov && tar czf cbts_pystart_report_${arch}${artifactSuffix}.tar.gz cbts_touchmap.sqlite"
+                            sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
                             def primary = llmArtifactsPrimary()
-                            trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz",
+                            trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz",
                                 testResultsDirTarget(primary, "cbts-coverage"), primary)
-                            echo "CBTS ${group} coverage (${arch}): " +
-                                llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz")
+                            echo "CBTS Single-GPU coverage (${arch}): " +
+                                llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
                         } else {
-                            echo "CBTS ${group} coverage (${arch}): no data files found, skipping."
+                            echo "CBTS Single-GPU coverage (${arch}): no data files found, skipping."
                         }
-                      }
                     }
                 })
             } catch (FlowInterruptedException e) {
@@ -2405,14 +2395,14 @@ def uploadArchCoverage(String arch, pipeline, testFilter, boolean multiGpu = fal
         // Jenkins marks this timeout non-actual only after leaving its own block.
         if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
             e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
-            echo "CBTS ${group} coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
+            echo "CBTS Single-GPU coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
         } else {
             throw e
         }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "CBTS ${group} coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
+        echo "CBTS Single-GPU coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
     }
 }
 
@@ -3121,12 +3111,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
 
                         launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
-                        uploadArchCoverage("x86_64", pipeline, testFilter, true)
 
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        uploadArchCoverage("x86_64", pipeline, testFilter, true)
                         if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
                             catchError(
                                 buildResult: 'SUCCESS',
@@ -3345,12 +3333,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
-                        uploadArchCoverage("SBSA", pipeline, testFilter, true)
 
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        uploadArchCoverage("SBSA", pipeline, testFilter, true)
                         if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
                             catchError(
                                 buildResult: 'SUCCESS',
