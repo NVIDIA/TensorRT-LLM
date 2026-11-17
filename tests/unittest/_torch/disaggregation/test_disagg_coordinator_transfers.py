@@ -1068,4 +1068,6 @@ def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
     assert executor.should_stop_processing
     executor.is_shutdown = False
     executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
-    executor.executor_request_queue.get_from_request_queue.assert_called_with(None)
+    executor.executor_request_queue.get_from_request_queue.assert_called_with(
+        None, wait_for_batch=True
+    )
