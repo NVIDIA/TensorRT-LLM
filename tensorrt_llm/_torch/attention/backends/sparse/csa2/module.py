@@ -14,6 +14,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import (
     _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE,
@@ -876,6 +877,7 @@ class DeepseekV41Attention(nn.Module):
             and positions.dtype in (torch.int32, torch.int64)
             and positions.is_contiguous()
             and is_sm_100f()
+            and (get_sm_version() != 107 or IS_CUTLASS_DSL_RUBIN_AVAILABLE)
         ):
             return None
         word = None
@@ -1642,6 +1644,7 @@ class DeepseekV41Attention(nn.Module):
             and self._can_fuse_prefill_projection(hidden_states)
             and not torch.cuda.is_current_stream_capturing()
             and is_sm_100f()
+            and (get_sm_version() != 107 or IS_CUTLASS_DSL_RUBIN_AVAILABLE)
         )
         # A direct-decode forward leaves the query RoPE to its attention launch.
         extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk

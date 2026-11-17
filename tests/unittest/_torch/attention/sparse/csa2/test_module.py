@@ -228,6 +228,75 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
     assert index_calls == [(0, count)] and entered == [0]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,rubin_available", [(100, False), (103, False), (107, False), (107, True)]
+)
+@torch.inference_mode()
+def test_fp8_query_requires_rubin_helpers_on_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    rubin_available: bool,
+) -> None:
+    """Both query entry points fall back when SM107's MMA helpers are missing."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module
+
+    monkeypatch.setattr(module, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(module, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        module, "_unwritten_rows", lambda device, *shape: torch.empty(shape, device=device)
+    )
+    model = module.DeepseekV41Attention.__new__(module.DeepseekV41Attention)
+    nn.Module.__init__(model)
+    model.layout = CSA2Layout((0,), (), ())
+    model.layer = model.layout.layer(0)
+    model.backend = SimpleNamespace(
+        compute_backend="trtllm",
+        native_fp8=True,
+        fused_decode=True,
+        sparse_params=CSA2Params(),
+        direct_decode_serves=lambda *args: False,
+    )
+    model.compressor = model.aux_stream = model._flash_attention = None
+    model._fp8_q_projection = model._fuse_q_rope_projection = model._fuse_q_norm_quant = True
+    model._fp8_q_min_tokens = 1
+    model.projection_quantization = "mxfp8"
+    model.num_heads_tp, model.qk_head_dim, model.qk_rope_head_dim = 1, 512, 64
+    model.dtype = torch.bfloat16
+    model.rotary_emb = SimpleNamespace(is_neox=False)
+    model.wq_a = SimpleNamespace(weight=torch.empty(128, 128))
+    model._can_fuse_prefill_projection = lambda hidden: True
+    model._gen_fmha_decode = lambda *args: False
+    hidden = torch.empty(1024, 128, dtype=torch.bfloat16)
+    positions = torch.arange(1024, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_ctx_tokens=0,
+        is_cuda_graph=False,
+        csa2_precomputed_kv_layers=set(),
+        get_compression_batch=lambda layer: None,
+    )
+    supported = sm != 107 or rubin_available
+    assert (model._fp8_query_request(hidden, positions, metadata) is not None) == supported
+
+    class ProjectionSelected(Exception):
+        pass
+
+    def fused(*args, **kwargs) -> None:
+        raise ProjectionSelected("fused")
+
+    def unfused(*args, **kwargs) -> None:
+        assert kwargs["fp8_query"] is None
+        raise ProjectionSelected("unfused")
+
+    model._project_prefill_query_and_swa = fused
+    model._project_query_and_swa = unfused
+    metadata.num_ctx_tokens = hidden.shape[0]
+    with pytest.raises(ProjectionSelected, match="^fused$" if supported else "^unfused$"):
+        model(hidden, positions, metadata)
+
+
 @pytest.fixture
 def module_cache(request):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager

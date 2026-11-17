@@ -195,12 +195,6 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
         if implementation == "self_sampling" or (implementation == "default" and is_prefill)
         else TopKImplementation.CUTE_DSL_RADIX
     )
-    if (
-        implementation == "self_sampling"
-        and not is_prefill
-        and torch.cuda.get_device_capability() == (10, 7)
-    ):
-        expected_impl = TopKImplementation.CUDA_RADIX
     assert (
         selector.prefill_implementation if is_prefill else selector.decode_implementation
     ) == expected_impl
@@ -229,6 +223,26 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             expected = scores[row, :length].topk(512).indices
             # These deterministic, continuous scores have no boundary ties.
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 decode routing requires SM107",
+)
+@pytest.mark.parametrize("consumer,heuristic", [(False, True), (True, True), (False, False)])
+def test_sm107_decode_topk_routing(consumer: bool, heuristic: bool) -> None:
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("Self-sampling requires CuTe DSL")
+    layout = CSA2Layout((1, 1), (0,), (0, 1), candidate_source_layer_id=0, index_topk=512)
+    options = CSA2Params(use_cute_dsl_topk=False, enable_heuristic_topk=heuristic)
+    indexer = CSA2Indexer(layout, int(consumer), 32, 128, options)
+    assert indexer.top_k.decode_implementation == (
+        TopKImplementation.CUTE_DSL_GVR
+        if heuristic and not consumer
+        else TopKImplementation.CUDA_RADIX
+    )
 
 
 def _reference_candidate_mask(
@@ -1085,6 +1099,23 @@ def test_packed_prefill_logits_schedule_matches_grid_stride(monkeypatch):
         grid_stride = run()
     torch.testing.assert_close(scheduled, grid_stride, atol=0, rtol=0)
     torch.testing.assert_close(again, grid_stride, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with monkeypatch.context() as context:
+        context.setattr(csa2_indexer, "get_mqa_logits_metadata", counted)
+        with torch.cuda.graph(graph):
+            captured = run()
+    # Capture must build a live schedule rather than reuse the eager schedule.
+    assert len(built) == 2
+    original_visible = visible.clone()
+    for shrink in (512, 0):
+        visible.copy_((original_visible - shrink).clamp_min(0))
+        graph.replay()
+        actual = captured.clone()
+        with monkeypatch.context() as context:
+            context.setattr(CSA2Indexer, "_packed_group_schedule", lambda *args: None)
+            expected = run()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _single_request_state(heads=8, two_owners=False):

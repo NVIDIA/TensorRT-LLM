@@ -218,21 +218,11 @@ class Sm107MXFP8GemmRunner(TunableRunner):
 
         if not hasattr(cute_dsl_custom_ops, "CuteDSLMXFP8RubinLinear"):
             return []
-        from .cute_dsl_custom_ops import _MXFP8_PREFILL_TILE_SM107
+        from .cute_dsl_custom_ops import _mxfp8_prefill_tactic_sm107
 
         runner, prepared = self._prepare(inputs)
-        tile, instruction, cluster = _MXFP8_PREFILL_TILE_SM107
-        return [
-            tactic
-            for tactic in runner.get_valid_tactics(prepared, profile)
-            if tactic[0] == "base"
-            and tuple(tactic[1]) == tile
-            and tuple(tactic[2]) == instruction
-            and tuple(tactic[3]) == cluster
-            and not tactic[4]
-            and tactic[5]
-            and tactic[6:] == ("static", "m", 1)
-        ]
+        tactic = _mxfp8_prefill_tactic_sm107(runner, prepared)
+        return [tactic] if tactic is not None else []
 
     def forward(self, inputs: list[torch.Tensor], tactic=-1) -> torch.Tensor:
         if not self._supports(inputs):

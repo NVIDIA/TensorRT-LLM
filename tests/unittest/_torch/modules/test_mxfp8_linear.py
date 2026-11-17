@@ -1185,6 +1185,146 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
     reloaded._profile_single_kernel.assert_not_called()
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rows,dtype,opt_in,available,sm,compiling,tile_fits",
+    [
+        (1023, torch.bfloat16, True, True, 107, False, True),
+        (1024, torch.bfloat16, True, True, 107, False, True),
+        (1985, torch.bfloat16, True, True, 107, False, True),
+        (1024, torch.float16, True, True, 107, False, True),
+        (1024, torch.bfloat16, False, True, 107, False, True),
+        (1024, torch.bfloat16, True, False, 107, False, True),
+        (1024, torch.bfloat16, True, True, 103, False, True),
+        (1024, torch.bfloat16, True, True, 107, True, True),
+        (1024, torch.bfloat16, True, True, 107, False, False),
+    ],
+)
+def test_sm107_mxfp8_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    dtype: torch.dtype,
+    opt_in: bool,
+    available: bool,
+    sm: int,
+    compiling: bool,
+    tile_fits: bool,
+) -> None:
+    """Exercise apply's eligibility gates and its native fallback on a rejected tile."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", available)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: compiling)
+    activation = torch.empty(rows, 128, dtype=dtype)
+    quantized = torch.empty(rows, 128, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(512, dtype=torch.uint8)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_activation", lambda x: (quantized, scales))
+    native_output = torch.empty(rows, 256, dtype=dtype)
+    cute_output = torch.empty_like(native_output)
+    native = Mock(return_value=native_output)
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm", native, raising=False)
+    cute = Mock(return_value=cute_output if tile_fits else None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops",
+        SimpleNamespace(cute_dsl_mxfp8_prefill_gemm_rubin=cute),
+    )
+    module = SimpleNamespace(
+        weight=torch.empty(256, 128, dtype=torch.float8_e4m3fn),
+        weight_scale=scales,
+        _mxfp8_alpha=torch.ones(1),
+        dtype=dtype,
+        use_sm107_mxfp8_prefill_gemm=opt_in,
+    )
+    eligible = (
+        rows >= 1024
+        and dtype == torch.bfloat16
+        and opt_in
+        and available
+        and sm == 107
+        and not compiling
+    )
+    actual = MXFP8LinearMethod().apply(module, activation, bias=None)
+    assert cute.call_count == int(eligible)
+    assert native.call_count == int(not (eligible and tile_fits))
+    assert actual is (cute_output if eligible and tile_fits else native_output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 prefill GEMM requires SM107",
+)
+@pytest.mark.parametrize(
+    "rows,reject_tile", [(1023, False), (1024, False), (1985, False), (1024, True)]
+)
+@torch.inference_mode()
+def test_sm107_mxfp8_prefill_linear_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    reject_tile: bool,
+) -> None:
+    """The opted-in Linear runs the prefill kernel or native fallback on quantized operands."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+    monkeypatch.delenv("TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER", raising=False)
+    torch.manual_seed(6312)
+    weight, scale = quant_bf16_to_mxfp8(torch.randn(512, 512, dtype=torch.bfloat16) * 0.02, 32)
+    linear = Linear(
+        512,
+        512,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    linear.load_weights([{"weight": weight, "weight_scale_inv": scale}])
+    assert linear.quant_method.use_cutlass
+    linear.use_sm107_mxfp8_prefill_gemm = True
+    inputs = torch.randn(rows, 512, dtype=torch.bfloat16, device="cuda")
+    original = cute_dsl_custom_ops.cute_dsl_mxfp8_prefill_gemm_rubin
+    cute_results = []
+
+    def observe(*args: torch.Tensor) -> torch.Tensor | None:
+        output = original(*args)
+        cute_results.append(output)
+        return output
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "cute_dsl_mxfp8_prefill_gemm_rubin", observe)
+    # Enumeration is never needed, even on the first shape or a rejected tile.
+    monkeypatch.setattr(
+        cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear,
+        "get_valid_tactics",
+        Mock(side_effect=AssertionError("Full tactic enumeration")),
+    )
+    if reject_tile:
+        monkeypatch.setattr(
+            cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear.kernel_class,
+            "can_implement",
+            staticmethod(lambda *args: False),
+        )
+    actual = linear(inputs)
+    assert len(cute_results) == int(rows >= 1024)
+    if cute_results:
+        assert (cute_results[0] is None) == reject_tile
+    if reject_tile:
+        linear.use_sm107_mxfp8_prefill_gemm = False
+        torch.testing.assert_close(actual, linear(inputs), atol=0, rtol=0)
+    quantized, packed = mxfp8_quantize_activation(inputs)
+    plain = unswizzle_sf(packed, ((rows + 127) // 128) * 128, 512, 32)[:rows, :16]
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = (
+            dequant_mxfp8_weight(quantized, plain).float()
+            @ dequant_mxfp8_weight(weight.cuda(), scale.cuda()).float().T
+        )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="SM107 native O-B GEMM requires SM107",
@@ -1224,7 +1364,18 @@ def test_sm107_mxfp8_o_b_loaded_tactic_graph(monkeypatch, tmp_path, rows):
         reloaded, "_profile_single_kernel", Mock(side_effect=AssertionError("Retuning"))
     )
     monkeypatch.setattr(cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear, "kernel_cache", {})
-    custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    monkeypatch.setattr(Sm107MXFP8GemmRunner, "_ALPHA", {})
+    selected = []
+    original_forward = Sm107MXFP8GemmRunner.forward
+
+    def observe_forward(self, operands: list[torch.Tensor], tactic=-1) -> torch.Tensor:
+        selected.append(tactic)
+        return original_forward(self, operands, tactic=tactic)
+
+    monkeypatch.setattr(Sm107MXFP8GemmRunner, "forward", observe_forward)
+    with flashinfer_mxfp8_autotune():
+        custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    assert any(key[1] == "MXFP8GemmUnifiedRunner" for key in reloaded._primed_cached_tactics)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = custom_ops_module.mxfp8_gemm_autotuned(
@@ -1244,4 +1395,5 @@ def test_sm107_mxfp8_o_b_loaded_tactic_graph(monkeypatch, tmp_path, rows):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     torch.testing.assert_close(captured.float(), expected, atol=2e-2, rtol=2e-2)
+    assert selected and all(tactic == tactics[0] for tactic in selected)
     reloaded._profile_single_kernel.assert_not_called()
