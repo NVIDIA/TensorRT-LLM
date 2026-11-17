@@ -1188,6 +1188,8 @@ class KvCacheCreator:
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
+    _encoder_profile_output: Optional[torch.Tensor] = None
+    _encoder_transient_bytes: int = 0
 
     # This rank's donation (remote_cache_config.donor), started before the
     # estimation so that clients do not wait out the warmup; the final target
@@ -2070,6 +2072,18 @@ class KvCacheCreator:
             # before budgeting, then restore it in configure_kv_cache_capacity().
             self._kv_cache_config.pool_ratio = None
             estimate_max_tokens = self._get_token_num_for_estimation()
+            if self._dummy_encoder_inputs:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                self._encoder_profile_output = self._encode_dummy_inputs()
+                torch.cuda.empty_cache()
+                encoder_stats = torch.cuda.memory_stats()
+                self._encoder_transient_bytes = (
+                    encoder_stats["allocated_bytes.all.peak"] -
+                    encoder_stats["allocated_bytes.all.current"])
+                logger.info(
+                    "Multimodal encoder transient memory during profiling: "
+                    f"{self._encoder_transient_bytes / GB:.2f} GiB")
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
@@ -2172,10 +2186,8 @@ class KvCacheCreator:
         profiled_output_bytes = 0
 
         if py_executor is not None and not self._skip_est:
-            # Run the MM encoder at its independent token budget, then keep the
-            # equivalent runtime-owned embeddings resident while the text-only
-            # LLM dummy fills max_num_tokens.
-            encoder_profile_output = self._encode_dummy_inputs()
+            encoder_profile_output = self._encoder_profile_output
+            self._encoder_profile_output = None
             if encoder_profile_output is not None:
                 profiled_output_bytes = (encoder_profile_output.numel() *
                                          encoder_profile_output.element_size())
@@ -2199,8 +2211,9 @@ class KvCacheCreator:
                         if response.has_error():
                             raise RuntimeError(response.error_msg)
 
-                torch_peak_memory = torch.cuda.memory_stats(
-                )["allocated_bytes.all.peak"]
+                torch_peak_memory = max(
+                    torch.cuda.memory_stats()["allocated_bytes.all.peak"],
+                    model_bytes + self._encoder_transient_bytes)
 
                 # Release before measuring current usage so the retained
                 # embeddings count toward the peak but not the steady state.

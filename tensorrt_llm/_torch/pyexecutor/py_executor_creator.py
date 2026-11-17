@@ -8,7 +8,7 @@ import importlib
 import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
@@ -939,7 +940,7 @@ def _create_py_executor(
             else:
                 restore_mode = sleep_config.restore_modes[current_stage]
                 with virtual_memory_scope(stage, restore_mode) as memory_pool:
-                    vm_pools[stage] = memory_pool
+                    vm_pools.setdefault(stage, []).append(memory_pool)
                     yield
 
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN):
@@ -1358,7 +1359,11 @@ def _create_py_executor(
         if not skip_est:
             log_memory_usage("after loading weights")
 
-        estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        estimation_scope = (allocation_scope(
+            ExecutorMemoryType.MODEL_EXTRA) if isinstance(
+                model_engine.model, MultimodalModelMixin) else nullcontext())
+        with estimation_scope:
+            estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache

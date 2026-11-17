@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._errors import ResourceError
@@ -48,7 +49,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -386,6 +387,141 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert creator._dummy_encoder_inputs == []
 
 
+@pytest.mark.parametrize(
+    ("fraction", "decoder_workspace", "expected_quota"),
+    [
+        pytest.param(0.5, 32 << 20, 396 << 20, id="encoder_peak"),
+        pytest.param(0.3, 1000 << 20, int(728 * 0.3 * (1 << 20)), id="decoder_peak_control"),
+    ],
+)
+def test_multimodal_profiling_sizes_cache_without_a_temporary_pool(
+    monkeypatch, fraction, decoder_workspace, expected_quota
+):
+    """Price both forward peaks without requiring the encoder to fit beside the probe cache."""
+    memory = SimpleNamespace(total=2048 << 20, current=128 << 20, peak=128 << 20, temporary_cache=0)
+
+    def record_workspace(size):
+        if memory.current + memory.temporary_cache + size > memory.total:
+            raise torch.OutOfMemoryError("Encoder workspace does not fit beside the probe cache")
+        memory.peak = max(memory.peak, memory.current + size)
+
+    class InputProcessor:
+        def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
+            return {"image": 4}
+
+        def get_dummy_mm_data(self, *, max_num_encoder_tokens, mm_counts, dtype):
+            return {"image": {"item_count": mm_counts["image"]}}
+
+    class Model(_MultimodalModel):
+        dtype = torch.float32
+        mm_encoder = object()
+
+        def encode_multimodal_inputs(self, multimodal_params):
+            assert multimodal_params[0].multimodal_data["image"]["item_count"] == 2
+            record_workspace(1000 << 20)
+            memory.current += 64 << 20
+            return torch.arange(256, dtype=self.dtype).reshape(2, 128)
+
+    model = Model(encoder_cache_max_bytes=0)
+    model.model_config.pretrained_config = PretrainedConfig(
+        vocab_size=128,
+        hidden_size=128,
+        num_hidden_layers=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=131072,
+    )
+    model.model_config.attn_backend = "TRTLLM"
+    model_engine = SimpleNamespace(
+        model=model,
+        input_processor=InputProcessor(),
+        encoder_batch_size=2,
+        encoder_max_num_tokens=8,
+        batch_size=2,
+        max_seq_len=131072,
+        max_cuda_graph_batch_size=2,
+        attn_runtime_features=AttentionRuntimeFeatures(chunked_prefill=False),
+        mm_encoder_cache=None,
+    )
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=fraction,
+        use_kv_cache_manager_v2=True,
+    )
+    llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
+    creator = KvCacheCreator(
+        model_engine=model_engine,
+        mapping=Mapping(),
+        net_max_seq_len=131072,
+        kv_connector_manager=None,
+        max_num_tokens=4,
+        max_beam_width=1,
+        tokens_per_block=64,
+        max_seq_len=131072,
+        max_batch_size=2,
+        kv_cache_config=kv_cache_config,
+        llm_args=llm_args,
+        speculative_config=None,
+        sparse_attention_config=None,
+        profiling_stage_data=None,
+        is_disagg=False,
+    )
+
+    def memory_stats():
+        return {
+            "allocated_bytes.all.current": memory.current,
+            "allocated_bytes.all.peak": memory.peak,
+        }
+
+    def reset_peak():
+        memory.peak = memory.current
+
+    def await_responses(request_ids):
+        record_workspace(decoder_workspace)
+        return []
+
+    def release_resources():
+        memory.temporary_cache = 0
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset_peak)
+    monkeypatch.setattr(torch.cuda, "memory_stats", memory_stats)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda: (memory.total - memory.current - memory.temporary_cache, memory.total),
+    )
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.prefer_pinned", lambda: False)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.discard_nccl_window_tensor_outputs",
+        lambda inputs: nullcontext(),
+    )
+
+    assert creator.try_prepare_estimation()
+    memory.temporary_cache = kv_cache_config.max_gpu_total_bytes
+    memory.current += 128 << 20
+    kv_manager = SimpleNamespace(
+        get_kv_cache_stats=lambda: SimpleNamespace(allocated_bytes=memory.temporary_cache)
+    )
+    executor = SimpleNamespace(
+        sampler=None,
+        enable_iter_perf_stats=False,
+        dist=SimpleNamespace(mapping=Mapping(), broadcast=lambda value, root: value),
+        resource_manager=SimpleNamespace(
+            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_manager}
+        ),
+        set_gather_responses=Mock(),
+        enqueue_requests=Mock(return_value=[1]),
+        warmup_scope=nullcontext,
+        start_worker=Mock(),
+        await_responses=await_responses,
+        release_resources=release_resources,
+    )
+    creator.configure_kv_cache_capacity(executor)
+    assert kv_cache_config.max_gpu_total_bytes == expected_quota
+
+
 def _make_creator(
     tokens_per_block,
     dummy_reqs,
@@ -409,6 +545,7 @@ def _make_creator(
     c._net_max_seq_len = 2048
     c._speculative_config = None
     c._dummy_reqs = dummy_reqs
+    c._dummy_encoder_inputs = []
 
     c._mapping = Mock(enable_attention_dp=enable_attention_dp, tp_size=tp_size, cp_config={})
 

@@ -16,6 +16,7 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/llmapi/test_memory_profiling.py::test_multimodal_encoder_profile_survives_release_resume
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_fp8_block_scales_skewed_routing

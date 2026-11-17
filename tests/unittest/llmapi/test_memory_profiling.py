@@ -15,13 +15,17 @@
 
 import pytest
 import torch
+from PIL import Image
+from transformers import AutoProcessor
 
+from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     create_py_executor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, DynamicBatchConfig,
-                                 SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, KvCacheConfig,
+                                 SamplingParams, SchedulerConfig)
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, ExecutorMemoryType,
+                                          KvCacheConfig, SleepConfig,
                                           TorchLlmArgs)
 
 # isort: off
@@ -86,6 +90,53 @@ def test_profile_kvcache():
     torch.cuda.empty_cache()
 
     assert vlm_activation_bytes_with_mm_reqs > vlm_activation_bytes_no_mm_reqs, f"Activation bytes should be higher with mm reqs, but got {vlm_activation_bytes_with_mm_reqs} for mm reqs and {vlm_activation_bytes_no_mm_reqs} without mm reqs"
+
+
+def test_multimodal_encoder_profile_survives_release_resume():
+    """Keep multimodal startup buffers usable after releasing their memory tag."""
+    model_path = get_model_path("Qwen3/Qwen3-VL-2B-Instruct")
+    processor = AutoProcessor.from_pretrained(model_path)
+    prompt = processor.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [{
+                "type": "image"
+            }, {
+                "type": "text",
+                "text": "Describe this image briefly."
+            }],
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    sampling_params = SamplingParams(max_tokens=8, temperature=0)
+    with Image.new("RGB", (32, 32), color=(0, 64, 128)) as image, LLM(
+            model_path,
+            max_batch_size=1,
+            max_num_tokens=128,
+            max_seq_len=2048,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1),
+            kv_cache_config=KvCacheConfig(max_tokens=4096,
+                                          free_gpu_memory_fraction=0.3,
+                                          enable_block_reuse=False),
+            sleep_config=SleepConfig(),
+    ) as llm:
+        request = {"prompt": prompt, "multi_modal_data": {"image": [image]}}
+        expected = llm.generate([request],
+                                sampling_params)[0].outputs[0].token_ids
+        assert expected
+        llm.release([ExecutorMemoryType.MODEL_EXTRA])
+        try:
+            status = llm.get_memory_status()
+            assert status.state == "parked"
+            assert status.parked_tags == [ExecutorMemoryType.MODEL_EXTRA]
+        finally:
+            llm.resume()
+        actual = llm.generate([request],
+                              sampling_params)[0].outputs[0].token_ids
+        assert actual == expected
+        assert llm.get_memory_status().state == "running"
 
 
 def test_pyexecutor_and_kvcache_share_execution_stream():
