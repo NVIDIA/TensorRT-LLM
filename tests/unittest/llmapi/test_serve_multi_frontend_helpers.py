@@ -1005,7 +1005,10 @@ async def _wait_for(predicate, timeout: float = 10.0) -> None:
         await asyncio.sleep(0.01)
 
 
-def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_path) -> None:
+@pytest.mark.parametrize("unhealthy_probes", [3, 6])
+def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
+    tmp_path, unhealthy_probes: int
+) -> None:
     path = str(tmp_path / "launcher.sock")
     deaths = []
 
@@ -1025,10 +1028,10 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
             # Neither refused probes nor 503s count until /health returned 200 once.
             await asyncio.sleep(0.5)
             launcher = await asyncio.to_thread(_FakeLauncher, path, 503)
-            await _wait_for(lambda: launcher.health_hits >= 3)
+            await _wait_for(lambda: launcher.health_hits >= unhealthy_probes)
             assert not deaths and not task.done()
             launcher.health_status = 200
-            await _wait_for(lambda: launcher.health_hits >= 4)
+            await _wait_for(lambda: watchdog._launcher_was_healthy)
             launcher.health_status = 503
             await asyncio.wait_for(task, timeout=10)
         finally:

@@ -4461,7 +4461,10 @@ class OpenAIServer(_VideoRoutesMixin):
             self.generator.args.serve_frontend_affinity_port_stride)[1:]
         if not ports:
             return
-        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(self.host, self.host)
+        host = {
+            "0.0.0.0": "127.0.0.1",  # nosec B104 - probe target, not binding
+            "::": "::1"
+        }.get(self.host, self.host)
 
         async def wait_for_port(port: int) -> None:
             while True:
