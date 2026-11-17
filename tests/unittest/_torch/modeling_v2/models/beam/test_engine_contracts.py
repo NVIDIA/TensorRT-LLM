@@ -9,19 +9,17 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import routing
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+from tensorrt_llm._torch.modeling_v2 import _router_index
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2.models.beam import routing
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
     layout as nvfp4_layout,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-    weights,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import weights
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
     MAX_NUM_TOKENS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.modeling import (
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.modeling import (
     ModelingV2BeamFullModelNvfp4Sm103Tp4 as Target,
 )
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM

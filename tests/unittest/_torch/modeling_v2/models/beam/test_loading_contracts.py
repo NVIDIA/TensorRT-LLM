@@ -13,10 +13,8 @@ import pytest
 import torch
 from _components.dense_block import block as dense  # noqa: E501
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (  # noqa: E501
-    component_bf16 as bf16,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
     component as nvfp4,
 )
 
