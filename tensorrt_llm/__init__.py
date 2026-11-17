@@ -19,14 +19,6 @@
 # replace it. The bootstrap mechanics live in `_bootstrap.py`, which keeps its
 # module scope to the standard library so that importing it here cannot pull in
 # torch ahead of the environment preparation it performs.
-import sys
-
-from ._bootstrap import _init, _prepare_environment
-
-# Phase 1: cache environment, DLL search path, Python-library preload and
-# vendored triton_kernels precedence. Must run before torch and before any
-# TensorRT-LLM shared object.
-_prepare_environment()
 
 # The package's public surface is loaded lazily (PEP 562): importing
 # tensorrt_llm no longer executes the whole product tree (previously ~99% of
@@ -35,12 +27,23 @@ _prepare_environment()
 # what that name needs. The TYPE_CHECKING block keeps the original imports
 # visible to static tooling.
 import importlib
+import sys
 from typing import TYPE_CHECKING
 
-# Need to import torch before tensorrt_llm library, otherwise some shared binary files
-# cannot be found for the public PyTorch, raising errors like:
-# ImportError: libc10.so: cannot open shared object file: No such file or directory
-import torch  # noqa
+from ._bootstrap import _init, _mimalloc_arenas_off_thp, _prepare_environment
+
+# Keeps torch's mimalloc arenas off transparent huge pages; the default it sets
+# must be in place when torch loads, so the torch import stays in this block.
+with _mimalloc_arenas_off_thp():
+    # Phase 1: cache environment, DLL search path, Python-library preload and
+    # vendored triton_kernels precedence. Must run before torch and before any
+    # TensorRT-LLM shared object.
+    _prepare_environment()
+
+    # Need to import torch before tensorrt_llm library, otherwise some shared binary files
+    # cannot be found for the public PyTorch, raising errors like:
+    # ImportError: libc10.so: cannot open shared object file: No such file or directory
+    import torch  # noqa
 
 from .logger import logger
 from .version import __version__
