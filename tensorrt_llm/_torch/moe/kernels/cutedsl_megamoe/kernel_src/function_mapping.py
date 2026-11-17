@@ -23,13 +23,17 @@ class CoordinateSpace:
         names = tuple(self.names)
         sizes = tuple(self.sizes)
         if not names or len(names) != len(sizes):
-            raise FunctionMappingError(f"Coordinate-space rank mismatch: {names!r}, {sizes!r}.")
+            raise FunctionMappingError(
+                f"Coordinate-space rank mismatch: {names!r}, {sizes!r}."
+            )
         if any(not isinstance(name, str) or not name for name in names):
             raise FunctionMappingError("Axis names must be non-empty strings.")
         if len(set(names)) != len(names):
             raise FunctionMappingError(f"Axis names must be unique: {names!r}.")
         if any(not isinstance(size, int) or size <= 0 for size in sizes):
-            raise FunctionMappingError(f"Axis sizes must be positive Python ints: {sizes!r}.")
+            raise FunctionMappingError(
+                f"Axis sizes must be positive Python ints: {sizes!r}."
+            )
         object.__setattr__(self, "names", names)
         object.__setattr__(self, "sizes", sizes)
 
@@ -45,7 +49,9 @@ class CoordinateSpace:
 
     def delinearize(self, linear_index: int) -> tuple[int, ...]:
         if linear_index < 0 or linear_index >= self.size:
-            raise FunctionMappingError(f"Linear index {linear_index} is outside [0, {self.size}).")
+            raise FunctionMappingError(
+                f"Linear index {linear_index} is outside [0, {self.size})."
+            )
         remaining = linear_index
         coordinate = []
         for size in self.sizes:
@@ -92,7 +98,9 @@ class FunctionMapping:
             or parameter.default is not inspect.Parameter.empty
         ]
         if unsupported:
-            raise FunctionMappingError(f"Unsupported mapping parameters {unsupported!r}.")
+            raise FunctionMappingError(
+                f"Unsupported mapping parameters {unsupported!r}."
+            )
         if set(parameters) != set(self.domain.names):
             raise FunctionMappingError(
                 f"Mapping parameters {tuple(parameters)!r} must match "
@@ -111,14 +119,17 @@ class FunctionMapping:
                     f"Mapping result keys {tuple(result)!r} must match "
                     f"codomain axes {self.codomain.names!r}."
                 )
-            coordinate = {name: result[name] for name in self.codomain.names}
+            coordinate = {
+                name: result[name] for name in self.codomain.names
+            }
         elif isinstance(result, Sequence) and not isinstance(
             result,
             (str, bytes),
         ):
             if len(result) != len(self.codomain.names):
                 raise FunctionMappingError(
-                    f"Mapping result rank {len(result)} must equal {len(self.codomain.names)}."
+                    f"Mapping result rank {len(result)} must equal "
+                    f"{len(self.codomain.names)}."
                 )
             coordinate = dict(zip(self.codomain.names, result))
         elif len(self.codomain.names) == 1:

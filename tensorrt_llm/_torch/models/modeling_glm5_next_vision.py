@@ -647,6 +647,7 @@ class Glm5NextVisionModelBase(nn.Module):
         vlm_base_model: Optional[type[nn.Module]] = None,
     ) -> None:
         super().__init__()
+        model_config = model_config.with_encoder_attention_backend("vision")
         self.model_config = model_config
         self.model_dtype = _text_dtype(model_config)
         # The tower is excluded from checkpoint quantization (BF16 in
@@ -936,8 +937,9 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if not images and not video_datas:
             # Text-only fast path: identical to the tokenizer and no
             # multimodal payload, so the tower is never touched.
-            input_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids
-            return input_ids[0].to(torch.int32).tolist(), None
+            # A Python list straight from the tokenizer: a tensor round trip costs
+            # milliseconds on long prompts.
+            return self._tokenizer(text_prompt).input_ids, None
 
         # Media loaders may deliver pre-rescaled float tensors (the server
         # default) instead of PIL / uint8; tell the HF processor not to
@@ -1026,6 +1028,8 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     The inner decoder owns recurrent/KV state and speculative decoding. Text-only
     requests bypass the vision tower, which runs full attention without KV cache.
     """
+
+    supported_encoder_attention_backends = {"vision": frozenset({"TRTLLM"})}
 
     _supports_flash_attn = True
     _supports_sdpa = True

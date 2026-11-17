@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"

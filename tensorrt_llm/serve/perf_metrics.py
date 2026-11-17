@@ -52,6 +52,10 @@ import json
 import math
 import os
 import socket
+import threading
+import traceback
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,7 +64,9 @@ from typing import Any, Dict, List, Literal, Optional
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve._perf_metrics_schema import (
+    SERVER_TIMING_HEADER,
     DisaggPerfMetricsRecord,
     PerfMetrics,
     PerfMetricsRecord,
@@ -194,7 +200,6 @@ class DisaggPerfMetricsCollector:
         return self._metrics[key]
 
 
-SERVER_TIMING_HEADER = "Server-Timing"
 START_END_TIME_HEADER = "X-TRTLLM-Start-End-Time"
 STEP_METRICS_HEADER = "X-TRTLLM-Step-Metrics"
 CTX_CHUNK_METRICS_HEADER = "X-TRTLLM-Ctx-Chunk-Metrics"
@@ -277,6 +282,10 @@ def build_request_metrics_record(
         "timing_metrics": timing_metrics,
         "kv_cache_metrics": {name: getattr(metrics.kv_cache_metrics, name) for name in _KV_FIELDS},
     }
+    if raw_request is not None:
+        input_metrics = getattr(raw_request.state, "input_processing_metrics", None)
+        if input_metrics:
+            phase_record["input_processing_metrics"] = dict(input_metrics)
     speculative = metrics.speculative_decoding
     if speculative.total_draft_tokens > 0:
         phase_record["speculative_decoding"] = {
@@ -357,6 +366,11 @@ def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
                 duration = _elapsed_ms(timing, start, end)
                 if duration is not None:
                     values[SERVER_TIMING_HEADER].append(f"{phase}_{name};dur={duration:.6f}")
+
+            for name, seconds in phase_record.get("input_processing_metrics", {}).items():
+                values[SERVER_TIMING_HEADER].append(
+                    f"{phase}_input_{name};dur={seconds * 1000:.6f}"
+                )
 
             breakdown = phase_record.get("time_breakdown_metrics") or {}
             for header, key, label in (
@@ -444,6 +458,13 @@ def build_metrics_record_from_headers(
                 timing_metrics.setdefault(field, arrival_time + durations[name])
 
     phase_record = {"metrics_headers": metrics_headers}
+    input_metrics = {
+        name[len("input_") :]: seconds
+        for name, seconds in durations.items()
+        if name.startswith("input_")
+    }
+    if input_metrics:
+        phase_record["input_processing_metrics"] = input_metrics
     if timing_metrics:
         phase_record["timing_metrics"] = timing_metrics
     return {
@@ -560,6 +581,8 @@ def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
         perf_metrics["kv_cache_metrics"] = phase_record["kv_cache_metrics"]
     if "speculative_decoding" in phase_record:
         perf_metrics["speculative_decoding"] = phase_record["speculative_decoding"]
+    if "input_processing_metrics" in phase_record:
+        perf_metrics["input_processing_metrics"] = phase_record["input_processing_metrics"]
 
     timing_metrics = dict(perf_metrics.get("timing_metrics", {}))
     if not timing_metrics.get("kv_cache_size"):
@@ -658,6 +681,7 @@ class PerfMetricsJsonlWriter:
         self._path: Optional[Path] = None
         self.dropped_records = 0
         self._write_error_count = 0
+        self._unexpected_error_counts: dict[str, int] = {}
 
     async def start(self) -> None:
         if self._output_dir is None or self._task is not None:
@@ -705,6 +729,13 @@ class PerfMetricsJsonlWriter:
             self._task = None
 
     async def _run(self) -> None:
+        """Drain queued records into the JSONL file until ``close()`` stops the writer.
+
+        This task is the queue's only consumer: if an exception ended it, ``submit()`` would
+        keep accepting records that are never written. A record or batch that fails for an
+        unexpected reason is therefore dropped and logged, and the loop goes on.
+        ``asyncio.CancelledError`` is not an ``Exception``, so ``close()`` can still cancel it.
+        """
         stop = False
         while not stop:
             item = await self._queue.get()
@@ -731,6 +762,8 @@ class PerfMetricsJsonlWriter:
                     self.dropped_records += 1
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
                         logger.warning("Dropped malformed performance metrics record: %s", error)
+                except Exception as error:
+                    self._drop_after_unexpected_error(1, "serialize", error)
             if not serialized:
                 continue
             try:
@@ -741,6 +774,27 @@ class PerfMetricsJsonlWriter:
                 self._write_error_count += 1
                 if self._write_error_count == 1:
                     logger.warning("Failed to write performance metrics JSONL: %s", error)
+            except Exception as error:
+                self._drop_after_unexpected_error(len(serialized), "write", error)
+
+    def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
+        """Count records lost to an unexpected exception and log it, rate-limited.
+
+        Each stage has its own rate limit so its first failure is always logged.
+        The message carries the traceback, which shows where serializing or writing failed.
+        """
+        self.dropped_records += num_records
+        count = self._unexpected_error_counts.get(stage, 0) + 1
+        self._unexpected_error_counts[stage] = count
+        if count == 1 or count % 1000 == 0:
+            logger.error(
+                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
+                num_records,
+                stage,
+                type(error).__name__,
+                error,
+                "".join(traceback.format_exception(error)).rstrip(),
+            )
 
     def _write(self, data: str) -> None:
         if self._path is not None:
@@ -756,6 +810,31 @@ def build_metrics_sse_event(headers: Dict[str, str]) -> bytes:
     return (f"event: {SSE_METRICS_EVENT}\ndata: {payload}\n\n").encode()
 
 
+@contextmanager
+def _input_processing_context(
+    state: dict[str, Any],
+    observer: Callable[[str, float, str | None], None] | None = None,
+) -> Iterator[None]:
+    """Keep input timings local to one HTTP request or background batch item."""
+    input_metrics: dict[str, float] = {}
+    state["input_processing_metrics"] = input_metrics
+    input_lock = threading.Lock()
+
+    def observe_input(stage: str, seconds: float, modality: str | None) -> None:
+        name = f"media_{stage}_{modality}" if modality is not None else stage
+        # Concurrent media decode workers share this bounded request record.
+        with input_lock:
+            input_metrics[name] = input_metrics.get(name, 0.0) + seconds
+        if observer is not None:
+            observer(stage, seconds, modality)
+
+    token = _input_processing_observer.set(observe_input)
+    try:
+        yield
+    finally:
+        _input_processing_observer.reset(token)
+
+
 class PerfMetricsMiddleware:
     """Expose request metrics and optionally persist completed records."""
 
@@ -765,11 +844,13 @@ class PerfMetricsMiddleware:
         expose_headers: bool,
         writer: Optional[PerfMetricsJsonlWriter] = None,
         adjusted_clock: Optional[AdjustedSteadyClock] = None,
+        input_processing_observer: Callable[[str, float, str | None], None] | None = None,
     ):
         self._app = app
         self._expose_headers = expose_headers
         self._writer = writer
         self._adjusted_clock = adjusted_clock
+        self._input_processing_observer = input_processing_observer
 
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -825,4 +906,9 @@ class PerfMetricsMiddleware:
                         return
             await send(message)
 
-        await self._app(scope, receive, send_metrics)
+        # Keep liveness probes out of the input-processing histograms.
+        input_observer = (
+            self._input_processing_observer if scope.get("path") != "/health_generate" else None
+        )
+        with _input_processing_context(scope["state"], input_observer):
+            await self._app(scope, receive, send_metrics)

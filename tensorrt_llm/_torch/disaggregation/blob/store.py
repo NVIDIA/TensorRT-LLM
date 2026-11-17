@@ -73,7 +73,9 @@ class RowStatus(enum.Enum):
     READY = "ready"
     """For a get: the payload landed whole and intact, and the driver will not write the row again.
     For a put: a complete object is readable under the key by any reader now, whoever wrote it. A
-    store's "already exists" counts only once that object is committed."""
+    store's "already exists" counts only once that object is committed. Now, not for good: a
+    store may evict the object later, and one that keeps it in a process loses it when that
+    process exits; a get after that reports MISS or FAULT."""
 
     MISS = "miss"
     """For a get: the store reported that it holds no object under the key, and the row's memory
@@ -498,8 +500,9 @@ class StoreDriver(Protocol):
 
         Raises:
             DriverRejected: ``put`` is not declared, the driver is draining or closed, ``rows``
-                exceed ``max_rows_per_op``, or an extent lies outside every live registration;
-                nothing escaped.
+                exceed ``max_rows_per_op``, an extent lies outside every live registration, or
+                the driver can serve no more, as once its store failed under it; nothing
+                escaped.
         """
         ...
 
@@ -572,6 +575,13 @@ class StoreDriver(Protocol):
         prove its end remains.
         True when nothing can still touch memory and nothing is left running; False means keep
         everything registered and try again. Never forces an end.
+
+        The budget is the most a call may wait, not a wait the driver can count on: the backend
+        calls ``drain(0.0)`` every round of its teardown and never waits inside it. A call with
+        no budget must not reset what the driver has established since its first ``drain``: once
+        every operation and every piece of the driver's own work ended, and the evidence of that
+        is in, a call with no budget observes True. A driver that could turn True only inside a
+        call with a budget never drains under the backend.
         """
         ...
 

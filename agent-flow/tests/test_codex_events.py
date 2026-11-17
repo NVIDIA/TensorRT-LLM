@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import pytest
@@ -138,6 +141,25 @@ async def test_token_counter_reset_never_reports_negative_usage():
     client = CodexClient(Transport([tokens(4), completed()], [tokens(1), completed()]), "main")
     await collect(client)
     assert (await collect(client))[-1].usage.total_tokens == 100
+
+
+async def test_result_exposes_the_thread_id_needed_to_reuse_a_primer():
+    client = CodexClient(Transport([completed()]), "main")
+    result = (await collect(client))[-1]
+    assert result.session_id == "main"
+
+
+async def test_fork_does_not_charge_inherited_history_as_new_turn_usage():
+    client = CodexClient(
+        Transport([tokens(20, 1), completed()], [tokens(22, 2), completed()]),
+        "main",
+        inherited_history=True,
+    )
+    first = (await collect(client))[-1].usage
+    assert first.input_tokens is None and first.total_tokens is None
+    assert first.context_tokens == 100
+    second = (await collect(client))[-1].usage
+    assert second.total_tokens == 200 and second.output_tokens == 40
 
 
 async def test_session_inventory_is_emitted_once_without_an_extra_model_turn():

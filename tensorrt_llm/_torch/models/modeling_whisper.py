@@ -598,6 +598,13 @@ class WhisperInputProcessor(InputProcessor):
     # Marks this model as feature-driven for the encoder side: prompts
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
+    # The text prompt selects the decoder language/task; pre-tokenized prompt
+    # IDs are not consumed by this processor.
+    supports_token_ids_input = False
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        return frozenset({"audio"})
 
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path
@@ -633,6 +640,9 @@ class WhisperInputProcessor(InputProcessor):
                 f"positions, but config.max_source_positions is "
                 f"{self.config.max_source_positions}."
             )
+        # Encoder positions every request produces; requests carry it and the
+        # cross-KV pool is sized from it.
+        self.encoder_output_len = encoder_positions
         self._decoder_prompt = self._build_decoder_prompt()
 
     # The decoder prompt contains no multimodal placeholder tokens (the audio
@@ -793,7 +803,7 @@ class WhisperInputProcessor(InputProcessor):
                     "encoder_input_features": input_features.contiguous(),
                     # Post-conv position count (mel frames // 2): the cross-KV
                     # capacity every downstream consumer sizes against.
-                    "encoder_output_len": int(self.config.max_source_positions),
+                    "encoder_output_len": self.encoder_output_len,
                 }
             }
         }
@@ -858,6 +868,9 @@ class WhisperModel(nn.Module):
 @register_auto_model("WhisperForConditionalGeneration")
 class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     """Whisper encoder-decoder model with LM head."""
+
+    # The native audio path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"audio": frozenset()}
 
     def __init__(self, model_config: ModelConfig[WhisperConfig]):
         super().__init__()

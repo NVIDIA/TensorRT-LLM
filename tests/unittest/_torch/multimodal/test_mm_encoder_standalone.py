@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import functools
 import json
 import os
@@ -22,6 +23,7 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Generator
 
+import numpy as np
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -31,6 +33,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
@@ -46,6 +49,7 @@ example_images = [
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+_QWEN_2_5_VL_3B_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
@@ -313,7 +317,7 @@ def _expected_mm_event_hashes(inp: TextPrompt,
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
 @pytest.mark.parametrize("use_uuids", [False, True])
 def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
-    """V2 emits item digests; V1 preserves the optional UUID event label."""
+    """V2 emits digest plus UUID; V1 preserves the UUID as its hash label."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -370,6 +374,10 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
     assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
 
     assert {mm_key["hash"] for mm_key in mm_keys_found} == expected_hashes
+    expected_uuids = {test_uuid
+                      } if use_uuids and use_kv_cache_manager_v2 else set()
+    assert {mm_key["uuid"]
+            for mm_key in mm_keys_found if "uuid" in mm_key} == expected_uuids
 
 
 def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
@@ -446,17 +454,23 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == ({uuid
+                             for uuid in uuids if uuid is not None}
+                            if use_kv_cache_manager_v2 else set())
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
@@ -512,22 +526,26 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts(use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
 def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
-    """Long UUIDs remain intact in V1 labels and contribute to V2 digests."""
+    """Long UUIDs remain intact in V1 labels and V2 UUID fields."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -591,17 +609,21 @@ def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
+    mm_key_uuids = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
                         mm_key_hashes.add(mm_key["hash"])
+                        if "uuid" in mm_key:
+                            mm_key_uuids.add(mm_key["uuid"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
     assert mm_key_hashes == expected_hashes
+    assert mm_key_uuids == (set(uuids) if use_kv_cache_manager_v2 else set())
 
 
 @pytest.fixture(scope="module",
@@ -861,6 +883,78 @@ def test_single_request_chat_multiple_images(
             if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                 assert ref_gen.logprobs == test_gen.logprobs, \
                     f"Log probabilities don't match for output {i}, generation {j}"
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize("frame_counts", [(8, ), (40, ), (8, 8)])
+@pytest.mark.threadleak(enabled=False)
+def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
+                                                    frame_counts):
+    """E/PD must consume the same timestamped prompt as aggregated inference."""
+    (llm, _), encoder = llms_and_encoder
+    videos = []
+    for count in frame_counts:
+        indices = np.linspace(0, 239, count).astype(int).tolist()
+        frames = []
+        for index in indices:
+            frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            frame[:, :, 0 if index < 120 else 2] = 255
+            frames.append(frame)
+        videos.append(
+            VideoData(frames=frames,
+                      metadata={
+                          "fps": 24.0,
+                          "total_num_frames": 240,
+                          "duration": 10.0,
+                          "frames_indices": indices,
+                      }))
+    prompt = llm.tokenizer.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [
+                *({
+                    "type": "video"
+                } for _ in videos),
+                {
+                    "type": "text",
+                    "text": "Describe the events and their times in seconds."
+                },
+            ]
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = {
+        "prompt": prompt,
+        "multi_modal_data": {
+            "video": videos
+        },
+        "mm_processor_kwargs": {
+            "do_sample_frames": False
+        }
+    }
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=64)
+    reference = llm.generate_async(copy.deepcopy(inputs),
+                                   sampling_params=sampling).result()
+    encoded = encoder.generate_async(copy.deepcopy(inputs)).result()
+    handoff = encoded.disaggregated_params
+    assert handoff.multimodal_input_layout.prompt_token_ids == reference.prompt_token_ids
+    assert handoff.mrope_position_ids_handle["tensor_size"][-1] == len(
+        reference.prompt_token_ids)
+    # Exercise a wire round trip without resending the raw video to prefill.
+    handoff = DisaggregatedParams(
+        **json.loads(json.dumps(dataclasses.asdict(handoff))))
+    handoff.request_type = "context_and_generation"
+    output = llm.generate_async({
+        "prompt": prompt
+    },
+                                sampling_params=sampling,
+                                disaggregated_params=handoff).result()
+    assert output.prompt_token_ids == reference.prompt_token_ids
+    assert output.outputs[0].token_ids == reference.outputs[0].token_ids
 
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
@@ -1330,3 +1424,46 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
             assert len(decode_outputs[0].outputs) > 0
             text = decode_outputs[0].outputs[0].text
             assert len(text) > 0, f"[req {req_num}] empty output"
+
+
+def _encode_images(model_dir: Path, attn_backend: str,
+                   media: list[list[str]]) -> list[torch.Tensor]:
+    encoder = MultimodalEncoder(model=model_dir,
+                                attn_backend=attn_backend,
+                                max_batch_size=len(media))
+    with encoder:
+        inputs = _load_inputs(encoder, ["Describe the image."] * len(media),
+                              media)
+        outputs = encoder.generate(inputs)
+        embeddings = []
+        for output in outputs:
+            handles = output.disaggregated_params.multimodal_embedding_handles
+            assert handles is not None
+            embeddings.append(
+                torch.cat([
+                    SharedTensorContainer.from_dict(
+                        handle).get_local_view().float().cpu()
+                    for handle in handles
+                ]))
+    return embeddings
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_encoder_flashinfer_attention_matches_trtllm():
+    """The encoder-only engine runs with FLASHINFER attention and matches TRTLLM."""
+    # get_attention_backend() falls back to TRTLLM when FlashInfer cannot be
+    # imported, which would turn this test into a TRTLLM self-comparison.
+    pytest.importorskip("flashinfer")
+    if not _QWEN_2_5_VL_3B_DIR.is_dir():
+        pytest.skip(f"Checkpoint not found: {_QWEN_2_5_VL_3B_DIR}")
+    media = [[image] for image in example_images]
+    reference = _encode_images(_QWEN_2_5_VL_3B_DIR, "TRTLLM", media)
+    flashinfer = _encode_images(_QWEN_2_5_VL_3B_DIR, "FLASHINFER", media)
+
+    assert len(flashinfer) == len(reference) == len(media)
+    for ref, test in zip(reference, flashinfer):
+        assert test.shape == ref.shape
+        cos = torch.nn.functional.cosine_similarity(ref.flatten(),
+                                                    test.flatten(),
+                                                    dim=0)
+        assert cos.item() > 0.99, f"cosine similarity {cos.item():.6f}"

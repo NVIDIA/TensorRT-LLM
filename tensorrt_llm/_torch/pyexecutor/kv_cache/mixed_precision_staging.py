@@ -24,10 +24,14 @@ class MixedPrecisionKVStaging:
         layout: str,
         pool_layout: str,
         tokens_per_block: int,
+        name: str = "mixed",
     ) -> None:
         """Allocate the per-rank staging copy for the largest batch and longest sequence."""
         self.manager = manager
         self.buffers = buffers
+        # Prefix of this staging copy's buffer names, so the target manager and a draft manager
+        # with mixed-precision KV each get their own buffers.
+        self.name = name
         self.rows = rows
         self.layout = layout
         self.block_size = manager.tokens_per_block
@@ -41,7 +45,7 @@ class MixedPrecisionKVStaging:
         pools: Dict[int, Tuple[List[int], torch.Tensor, torch.Tensor]] = {}
         self.max_page_bytes = 0
         for layer_idx, local in manager.layer_offsets.items():
-            if local not in manager.high_layers:
+            if local not in manager.mixed_precision_high_layers:
                 continue
             low, high = (
                 manager.get_buffers(layer_idx, pool_layout, mixed_precision_pool=pool)
@@ -56,7 +60,7 @@ class MixedPrecisionKVStaging:
                 self.max_page_bytes, math.prod(shape[1:]) * high.element_size()
             )
         self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
-        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, "mixed_kv_staging", True)
+        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, f"{name}_kv_staging", True)
         # Zero once: the per-batch gather only writes real tokens, and attention
         # may load the padding of a request's last page before masking it.
         storage.zero_()
@@ -64,22 +68,17 @@ class MixedPrecisionKVStaging:
             layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
             for layer_idx, (shape, low, high) in pools.items()
         }
-        # Layers that draw from the same two pools have identical page tables, so
-        # each batch builds one table per pool pair and every layer shares it.
+        # Layers with equal keys share their page tables, so each batch builds one table per key.
         self.table_owner: Dict[int, int] = {}
-        owners: Dict[Tuple[int, int], int] = {}
+        owners: dict[tuple[tuple[int, int], ...], int] = {}
         for layer_idx in self.pools:
-            local = manager.layer_offsets[layer_idx]
-            key = tuple(
-                int(manager.impl.get_layer_group_id(layer))
-                for layer in (local, manager.high_layers[local])
-            )
+            key = manager.mixed_precision_page_table_key(layer_idx)
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
         # Cache manager interface read by the attention backends.
         self.layer_offsets = {layer: layer for layer in self.pools}
         self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
         self.dtype = manager.dtype
-        self.low_precision_dtype = manager.low_precision_dtype
+        self.mixed_precision_low_dtype = manager.mixed_precision_low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((max(self.pools) + 1, 2), dtype=torch.int32)
         self.page_counts: List[int] = []
@@ -87,6 +86,9 @@ class MixedPrecisionKVStaging:
         self.lengths: Optional[torch.Tensor] = None
         self.max_new_tokens_per_request = 0
         self.read_capacity = 0
+        # Staging-page block offsets: the TRTLLM backend fills them per batch and swaps them in
+        # for kv_cache_block_offsets while a mixed-precision layer runs.
+        self.block_offsets: Optional[torch.Tensor] = None
 
     def update(
         self,
@@ -100,7 +102,12 @@ class MixedPrecisionKVStaging:
         manager = self.manager
         buffers = self.buffers
         lengths = [cached + new for cached, new in zip(cached_lengths, seq_lens)]
-        self.page_counts = [-(-length // self.tokens_per_block) for length in lengths]
+        self.page_counts = []
+        for request_id, length in zip(request_ids, lengths):
+            # Cover the allocated capacity: an MTP draft loop appends past this batch's lengths.
+            tokens = max(length, manager.kv_cache_map[request_id].capacity)
+            pages = math.ceil(tokens / self.tokens_per_block)
+            self.page_counts.append(min(pages, self.max_blocks_per_seq))
         batch = len(lengths)
         max_pages = -(-self.max_seq_len // self.block_size)
         self.page_tables = {}
@@ -116,12 +123,12 @@ class MixedPrecisionKVStaging:
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
-                f"mixed_page_tables_{owner}",
+                f"{self.name}_page_tables_{owner}",
                 capture_graph,
             )[:, :batch]
             self.page_tables[layer_idx].copy_(tables, non_blocking=True)
         self.lengths = buffers.get_buffer(
-            (2, self.rows), torch.int32, "mixed_lengths", capture_graph
+            (2, self.rows), torch.int32, f"{self.name}_lengths", capture_graph
         )[:, :batch]
         self.lengths.copy_(
             torch.tensor(
@@ -153,7 +160,7 @@ class MixedPrecisionKVStaging:
             self.page_tables[layer_idx],
             self.lengths,
             self.layout,
-            low_dtype=self.low_precision_dtype,
+            low_dtype=self.mixed_precision_low_dtype,
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:

@@ -40,7 +40,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    disable_v2_by_default,
+    step_contract_enabled,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -119,7 +122,7 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         kv_cache_block_offsets=md.kv_cache_block_offsets,
         host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        workspace_=md.effective_workspace,
+        workspace=md.effective_workspace,
         tokens_per_block=md.tokens_per_block,
         max_num_requests=md.max_num_requests,
         max_context_length=md.max_context_length,
@@ -177,7 +180,7 @@ _CALL_INERT = dict(
     use_spec_decoding=False,
     is_spec_dec_tree=False,
     spec_decoding_generation_lengths=None,
-    spec_decoding_position_offsets_for_cpp=None,
+    spec_decoding_position_offsets=None,
     spec_decoding_packed_mask=None,
     spec_decoding_bl_tree_mask_offset=None,
     spec_decoding_bl_tree_mask=None,
@@ -1903,6 +1906,7 @@ class DraftModel:
         return self.core.w["embed"]
 
 
+@disable_v2_by_default
 class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
     DecoderModelForCausalLM[DeepseekV3DefaultModelingV2, PretrainedConfig]
 ):

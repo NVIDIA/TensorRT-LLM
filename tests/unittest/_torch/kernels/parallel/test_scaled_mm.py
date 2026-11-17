@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,35 @@ import numpy as np
 import pytest
 import torch
 from utils.util import getSMVersion
+
+
+@pytest.mark.skipif(getSMVersion() != 103,
+                    reason="the exact-m cuBLASLt configs are tuned for SM 10.3")
+@pytest.mark.parametrize("m", [224, 448, 504, 672, 896])
+def test_fp8_scaled_mm_exact_m_configs(m):
+    """Shapes with an exact-m entry in cublas_lut::sm103_fp8_exact_m_algo_list run their config and match torch."""
+    k, n = 4096, 2560
+    torch.random.manual_seed(0)
+    x = torch.rand((m, k), device="cuda").to(torch.float8_e4m3fn)
+    w = torch.rand((n, k), device="cuda").to(torch.float8_e4m3fn)
+    scale_x = torch.rand(1, device="cuda")
+    scale_w = torch.rand(1, device="cuda")
+    output = torch.ops.trtllm.cublas_scaled_mm(x,
+                                               w.t(),
+                                               scale_x,
+                                               scale_w,
+                                               bias=None,
+                                               out_dtype=torch.bfloat16)
+    ref = torch._scaled_mm(x,
+                           w.t(),
+                           out_dtype=torch.bfloat16,
+                           scale_a=scale_x,
+                           scale_b=scale_w,
+                           use_fast_accum=True)
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               atol=0.01,
+                               rtol=0.01)
 
 
 @pytest.mark.skipif(

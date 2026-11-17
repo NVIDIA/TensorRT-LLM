@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 
 from ..attention.backends import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
@@ -312,9 +312,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no 1D repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no 1D repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
         # No draft-side buffers needed: target-only rejection sampling does not
         # require unique draft logits, topk score indices, or draft prob indices.
@@ -322,7 +322,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """XQA indexes mask flat via cuQSeqLens with per-request stride
         n_tok * ceil(n_tok/32) (C++ sets mPackedMaskMaxSeqLenQ from
-        spec_decoding_position_offsets_cpp.sizes()[1]).
+        the phase position-offset view's size(1)).
         The padded buffer is [n_req, buf_dim, ceil(buf_dim/32)] with a
         larger row stride, so when n_tok < buf_dim and n_req > 1 packed
         reads see misaligned rows. Copy the meaningful
@@ -339,9 +339,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         flat[:total_elems] = scratch.view(-1)
 
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
-        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
+        """Set the current speculative query lengths and position-offset layout."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.spec_decoding_query_len = query_len
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
@@ -599,6 +599,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_accepted_tokens,
         original_all_rank_num_tokens,
         resource_manager,
+        accepted_tokens,
+        pre_draft_seq_lens,
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
@@ -759,7 +761,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             gen_slots = slot_storage.all_ids_buf[num_contexts:batch_size]
             spec_tree_manager.scatter_to_slot_storage(slot_storage, gen_slots, num_gens)
 
-        return real_draft_tokens
+        return real_draft_tokens, None
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens

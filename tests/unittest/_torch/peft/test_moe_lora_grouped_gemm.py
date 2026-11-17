@@ -32,6 +32,7 @@ import torch
 from utils.util import skip_pre_ada
 
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassFp8Impl
+from tensorrt_llm._torch.peft.lora.manager import supports_native_fp8_lora
 from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora, reference_swiglu_moe_lora
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -40,6 +41,13 @@ _TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "
 requires_cuda_and_op = pytest.mark.skipif(
     not torch.cuda.is_available() or not _TRTLLM_AVAILABLE,
     reason="Requires CUDA and built TensorRT-LLM C++ extension (torch.ops.trtllm.fused_moe).",
+)
+
+
+requires_native_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not supports_native_fp8_lora(torch.cuda.get_device_capability()),
+    reason="Native FP8 LoRA requires SM90/SM100 kernels.",
 )
 
 
@@ -102,6 +110,17 @@ def _make_adapter_set(num_experts, rank, hidden_size, inter_size, dtype, device,
     gated = _scaled(num_experts, rank, hidden_size, inter_size, seed=base_seed + 1)
     fc2 = _scaled(num_experts, rank, inter_size, hidden_size, seed=base_seed + 2)
     return {"fc1": fc1, "gated": gated, "fc2": fc2}
+
+
+def _adapter_set_to_fp8(adapters):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    return {
+        module: {
+            name: tensor.clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn).contiguous()
+            for name, tensor in weights.items()
+        }
+        for module, weights in adapters.items()
+    }
 
 
 def _per_request_kwargs(num_tokens, adapters, rank):
@@ -335,6 +354,186 @@ def test_cuda_graph_replay_multiple_calls_shared_runner(distinct_layers: bool) -
 
     for replay_output, eager_output in zip(captured_outputs, eager_outputs):
         torch.testing.assert_close(replay_output, eager_output, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_cuda_graph_activates_empty_slot_on_replay():
+    """Engine warmup captures empty LoRA slots before adapters enter the PEFT cache."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    adapters = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=425
+    )
+    active_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    active_tables = {
+        key: value.clone()
+        for key, value in active_kwargs.items()
+        if isinstance(value, torch.Tensor) and ("ranks" in key or "weight_ptrs" in key)
+    }
+    replay_kwargs = active_kwargs
+    for key, value in replay_kwargs.items():
+        if isinstance(value, torch.Tensor) and ("ranks" in key or "weight_ptrs" in key):
+            value.zero_()
+
+    def call():
+        return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, replay_kwargs)
+
+    graph, captured = _warmup_and_capture(call)
+    for key, value in active_tables.items():
+        replay_kwargs[key].copy_(value)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    out_ref = _reference(x, w3_w1, w2, topk_ids, topk_scores, adapters)
+    torch.testing.assert_close(captured, out_ref, rtol=_RTOL, atol=_ATOL)
+
+
+@requires_cuda_and_op
+@requires_native_fp8
+def test_fp8_adapter_cuda_graph_replay_matches_eager():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 16
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    adapters = _adapter_set_to_fp8(
+        _make_adapter_set(num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=450)
+    )
+    slot_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    slot_kwargs["lora_dtype"] = torch.float8_e4m3fn
+
+    def call():
+        return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(slot_kwargs))
+
+    baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, {})
+    out_eager = call().clone()
+    graph, captured = _warmup_and_capture(call)
+    graph.replay()
+    torch.cuda.synchronize()
+    out_replay = captured.clone()
+
+    assert torch.isfinite(out_replay).all()
+    assert (out_replay.float() - baseline.float()).abs().mean().item() > 1e-3
+    torch.testing.assert_close(out_replay, out_eager, rtol=0, atol=0)
+    reference = _reference(x.float(), w3_w1, w2, topk_ids, topk_scores, adapters)
+    zero_adapters = {
+        module: {name: torch.zeros_like(weight) for name, weight in weights.items()}
+        for module, weights in adapters.items()
+    }
+    reference_base = _reference(x.float(), w3_w1, w2, topk_ids, topk_scores, zero_adapters)
+    reference_delta = reference - reference_base
+    actual_delta = out_eager.float() - baseline.float()
+    relative_error = torch.linalg.vector_norm(
+        actual_delta - reference_delta
+    ) / torch.linalg.vector_norm(reference_delta)
+    assert relative_error < 0.10
+
+
+@requires_cuda_and_op
+@requires_native_fp8
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
+def test_fp8_moe_delta_matches_fp32_without_output_clipping(dtype, schema):
+    """Bound delta error while forcing the final GEMM result above E4M3's range."""
+    device = torch.device("cuda")
+    num_tokens, hidden_size, inter_size, num_experts, top_k, rank = 4, 128, 128, 4, 2, 16
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    x.fill_(1)
+    w3_w1.zero_()
+    w3_w1[:, :, 0] = 1
+    w2.zero_()
+    adapters = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=475
+    )
+    for module in ("fc1", "gated"):
+        adapters[module]["A"].zero_()
+        adapters[module]["B"].zero_()
+    adapters["fc2"]["A"].fill_(1 / 16)
+    adapters["fc2"]["B"].fill_(16)
+    adapters = _adapter_set_to_fp8(adapters)
+    if schema == "per_request":
+        kwargs = _per_request_kwargs(num_tokens, adapters, rank)
+    else:
+        kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    kwargs["lora_dtype"] = torch.float8_e4m3fn
+    baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, {})
+    actual = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, kwargs)
+    # Passing float32 inputs keeps the independent reference's output in FP32.
+    expected = _reference(x.float(), w3_w1, w2, topk_ids, topk_scores, adapters)
+    delta = actual.float() - baseline.float()
+    assert expected.abs().min() > torch.finfo(torch.float8_e4m3fn).max
+    assert torch.isfinite(delta).all()
+    torch.testing.assert_close(delta, expected, atol=0, rtol=0.05)
+
+
+@requires_cuda_and_op
+@requires_native_fp8
+def test_fp8_scratch_growth_preserves_compute_dtype_capacity():
+    """A larger FP8 run must retain scratch width reserved by an earlier BF16 run."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    hidden_size, inter_size, num_experts, top_k, rank = 128, 256, 4, 2, 16
+    adapters = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=480
+    )
+    fp8_adapters = _adapter_set_to_fp8(adapters)
+    small = _build_base_inputs(2, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    large = _build_base_inputs(16, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    small_kwargs = _slot_kwargs(torch.zeros(2, dtype=torch.int32), [adapters], rank)
+    _call_fused_moe(*small, dtype, small_kwargs)
+    fp8_kwargs = _slot_kwargs(torch.zeros(16, dtype=torch.int32), [fp8_adapters], rank)
+    fp8_kwargs["lora_dtype"] = torch.float8_e4m3fn
+    graph, captured = _warmup_and_capture(lambda: _call_fused_moe(*large, dtype, fp8_kwargs))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_fp8 = captured.clone()
+    bf16_kwargs = _slot_kwargs(torch.zeros(16, dtype=torch.int32), [adapters], rank)
+    actual_bf16 = _call_fused_moe(*large, dtype, bf16_kwargs)
+    expected_bf16 = _reference(*large, adapters)
+    torch.testing.assert_close(actual_bf16, expected_bf16, rtol=_RTOL, atol=_ATOL)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected_fp8, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+@requires_native_fp8
+@pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
+@pytest.mark.parametrize("max_rank", [8, 16])
+def test_fp8_moe_rejects_misaligned_rank(schema, max_rank):
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size, num_experts, top_k, rank = 4, 128, 256, 4, 2, 8
+    inputs = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    adapters = _adapter_set_to_fp8(
+        _make_adapter_set(num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=490)
+    )
+    kwargs = (
+        _per_request_kwargs(num_tokens, adapters, rank)
+        if schema == "per_request"
+        else _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+    )
+    kwargs["lora_dtype"] = torch.float8_e4m3fn
+    kwargs["lora_max_low_rank"] = max_rank
+    error = (
+        "requires rank and hidden dimensions divisible by 16"
+        if max_rank == 8
+        else "requires active ranks divisible by 16"
+    )
+    with pytest.raises(RuntimeError, match=error):
+        _call_fused_moe(*inputs, dtype, kwargs)
 
 
 @requires_cuda_and_op

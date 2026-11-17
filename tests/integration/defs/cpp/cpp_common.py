@@ -14,10 +14,12 @@
 # limitations under the License.
 
 import datetime
+import importlib.metadata
 import logging as _logger
 import os as _os
 import pathlib as _pl
 import subprocess as _sp
+import sys as _sys
 from typing import Optional, Sequence
 
 from build_wheel import get_build_dir as get_trt_llm_build_dir
@@ -55,8 +57,40 @@ def find_build_dir(build_type: str) -> _pl.Path:
         Absolute path to the C++ build directory.
     """
     root_dir = find_root_dir()
-    build_dir = get_trt_llm_build_dir(None, build_type)
+    build_root = _os.environ.get("TRTLLM_BUILD_ROOT") or None
+    build_dir = get_trt_llm_build_dir(None, build_type, build_root=build_root)
     return build_dir if build_dir.is_absolute() else root_dir / build_dir
+
+
+def find_test_bundle(build_type: str) -> Optional[_pl.Path]:
+    if (_sys.platform != "linux" or build_type != "Release"
+            or _os.environ.get("TRTLLM_BUILD_ROOT")):
+        return None
+    bundle = find_build_dir(build_type)
+    return bundle if (bundle / "CTestTestfile.cmake.in").is_file() else None
+
+
+def prepare_test_bundle(build_type: str) -> bool:
+    bundle = find_test_bundle(build_type)
+    if bundle is None:
+        return False
+    library_dir = importlib.metadata.distribution("tensorrt_llm").locate_file(
+        "tensorrt_llm/libs")
+    library_link = bundle / "lib"
+    if library_link.is_symlink() and library_link.readlink() != library_dir:
+        library_link.unlink()
+    if not library_link.is_symlink():
+        library_link.symlink_to(library_dir, target_is_directory=True)
+    source_root = str(find_root_dir())
+    for template in bundle.rglob("*.cmake.in"):
+        content = template.read_text().replace("__TRTLLM_CPP_BUNDLE_ROOT__",
+                                               str(bundle))
+        content = content.replace("__TRTLLM_CPP_SOURCE_ROOT__", source_root)
+        destination = template.with_suffix("")
+        if not destination.exists() or destination.read_text() != content:
+            destination.write_text(content)
+    _logger.info("Using packaged C++ tests: %s", bundle)
+    return True
 
 
 def run_command(command: Sequence[str],
@@ -144,6 +178,12 @@ def parallel_run_ctest(
     timeout=None,
     parallel=default_test_parallel,
 ) -> None:
+    try:
+        report = cwd / command[command.index("--output-junit") + 1]
+    except (IndexError, ValueError):
+        report = None
+    if report is not None:
+        report.unlink(missing_ok=True)
     if parallel == 1:
         return run_ctest(command,
                          cwd=cwd,
@@ -154,25 +194,12 @@ def parallel_run_ctest(
     env = {} if env is None else env
     env['CTEST_PARALLEL_LEVEL'] = str(parallel)
 
-    def get_report():
-        try:
-            report = cwd / command[command.index("--output-junit") + 1]
-        except (IndexError, ValueError):
-            return None
-        return report if report.is_file() else None
-
-    stale_report = get_report()
-    if stale_report is not None:
-        stale_report.unlink()
-
-    report = None
     try:
         run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
     # except _sp.TimeoutExpired:
     # Deliberately let timeout propagate. We don't want to retry on timeout
     except _sp.CalledProcessError:
-        report = get_report()
-        if report is None:
+        if report is None or not report.is_file():
             # Some catastrophic fail happened that there's no report generated
             raise
 
@@ -197,7 +224,5 @@ def parallel_run_ctest(
                 _os.rename(report, retry_report)
                 merge_report(parallel_report, retry_report, report)
     finally:
-        if report is None:
-            report = get_report()
-        if report:
+        if report is not None and report.is_file():
             add_parallel_info(report, parallel)

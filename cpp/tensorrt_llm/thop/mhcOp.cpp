@@ -18,6 +18,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <torch/extension.h>
 
 namespace tk = tensorrt_llm::kernels::mhc;
@@ -60,6 +61,13 @@ void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residu
             "mhc_big_fuse: pre_mix_out must be a contiguous fp32 [M, 4] tensor");
         pre_out_ptr = pre_mix_out->data_ptr<float>();
     }
+
+    // The kernel sums one partial per split: y_acc [num_splits, M, 24] and r_acc [num_splits, M] (hc_mult = 4).
+    int64_t constexpr kNumMixes = 4 * (2 + 4);
+    TORCH_CHECK(num_splits >= 1, "mhc_big_fuse: num_splits must be >= 1, got ", num_splits);
+    TORCH_CHECK(y_acc.numel() >= num_splits * M * kNumMixes && r_acc.numel() >= num_splits * M,
+        "mhc_big_fuse: num_splits=", num_splits, " needs y_acc of ", num_splits * M * kNumMixes, " and r_acc of ",
+        num_splits * M, " fp32 elements, got ", y_acc.numel(), " and ", r_acc.numel());
 
     tk::mhcBigFuseLaunch(y_acc.data_ptr<float>(), r_acc.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16 const*>(residual.data_ptr<at::BFloat16>()), hc_scale.data_ptr<float>(),
@@ -160,6 +168,24 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
         TORCH_CHECK(norm_weight->numel() == hidden_size,
             "mhc_fused_hc: norm_weight numel=%ld must equal hidden_size=%ld", norm_weight->numel(), hidden_size);
         norm_weight_ptr = reinterpret_cast<__nv_bfloat16 const*>(norm_weight->data_ptr<at::BFloat16>());
+    }
+
+    TORCH_CHECK(backend >= 0 && backend <= 3, "mhc_fused_hc: unknown backend code ", backend, " (expected 0..3)");
+
+    // Backends 0 (fused_half_mma), 1 (fused_half_fma) and 2 (fused_all_mma) store one partial per split, so the
+    // workspaces must hold [ks, M, hc_mult * (2 + hc_mult)] and [ks, M] for the split count the launcher actually
+    // runs with. Path F (3) accumulates its at most two splits into one zeroed [M, ...] slot.
+    if (backend != 3)
+    {
+        // Only fused_half_mma resolves num_k_splits <= 0 with a heuristic; the other two run max(num_k_splits, 1).
+        int64_t const numSplits = backend == 0
+            ? tk::mhcFusedHcMmaKSplits(static_cast<int>(M), static_cast<int>(num_k_splits), /*allInOne=*/false)
+            : std::max<int64_t>(num_k_splits, 1);
+        int64_t const shapeN = hc_mult * (2 + hc_mult);
+        TORCH_CHECK(y_acc_workspace.numel() >= numSplits * M * shapeN && r_acc_workspace.numel() >= numSplits * M,
+            "mhc_fused_hc: backend ", backend, " with num_k_splits=", num_k_splits, " runs ", numSplits,
+            " splits and needs y_acc_workspace of ", numSplits * M * shapeN, " and r_acc_workspace of ", numSplits * M,
+            " fp32 elements, got ", y_acc_workspace.numel(), " and ", r_acc_workspace.numel());
     }
 
     // backend codes:

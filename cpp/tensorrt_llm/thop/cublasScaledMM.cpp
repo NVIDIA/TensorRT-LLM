@@ -72,12 +72,28 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         && compType == CUBLAS_COMPUTE_32F)
     {
         // TODO: remove this after cublas fix the heuristic for Spark
-        algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-            ? &cublas_lut::spark_bf16_algo_list
-            : &cublas_lut::bf16_algo_list;
+        algo_list = tensorrt_llm::common::getSMVersion() == 121 ? &cublas_lut::spark_bf16_algo_list
+                                                                : &cublas_lut::bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
+        if (tensorrt_llm::common::getSMVersion() == 103)
+        {
+            // Configs for an exact m take precedence on the architecture they were tuned on.
+            if (auto exact_iter = cublas_lut::sm103_fp8_exact_m_algo_list.find({m, k, n});
+                exact_iter != cublas_lut::sm103_fp8_exact_m_algo_list.end())
+            {
+                check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                    bType, outType, outType, exact_iter->second[0], &algo));
+                set_algo_attr(algo, exact_iter->second);
+                // The exact-m configs were tuned with the inner shape left undefined.
+                uint16_t const innerShape = CUBLASLT_MATMUL_INNER_SHAPE_UNDEFINED;
+                check_cuda_error(cublasLtMatmulAlgoConfigSetAttribute(
+                    &algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &innerShape, sizeof(innerShape)));
+                TLLM_LOG_DEBUG("Found exact-m cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+                return true;
+            }
+        }
         algo_list = &cublas_lut::fp8_algo_list;
     }
     else

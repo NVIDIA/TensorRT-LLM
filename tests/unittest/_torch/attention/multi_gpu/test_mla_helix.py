@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import pickle
 import sys
 import weakref
@@ -26,6 +27,7 @@ import pytest
 import torch
 from _torch.attention.multi_gpu.helix_test_utils import (
     CACHE_TYPE_SELFKONLY,
+    _v_up_projector,
     activate_all_ranks_for_context,
     compute_mismatch_ratio,
     copy_weights_for_cp,
@@ -35,6 +37,7 @@ from _torch.attention.multi_gpu.helix_test_utils import (
     split_inputs_for_rank,
 )
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -47,6 +50,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
@@ -94,6 +98,9 @@ class Scenario:
     # a lot of precision and we're using bf16 here.
     atol: float = 1e-1
     rtol: float = 5e-2
+    # Give the module every head's V weight, so generation applies the V
+    # up-projection before the CP all-to-all.
+    helix_v_up: bool = False
 
     @property
     def max_position_embeddings(self) -> int:
@@ -358,9 +365,12 @@ def _run_mla_distributed(
         dtype=scenario.dtype,
         config=config,
     ).cuda()
+    full_v_b_proj = weights["v_b_proj"]
     copy_weights_for_cp(weights, "o_proj.weight", 1, rank, world_size)
     copy_weights_for_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
+    if scenario.helix_v_up:
+        mla._bind_helix_v_up_weight(full_v_b_proj.to(device="cuda", dtype=scenario.dtype))
 
     # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
@@ -377,13 +387,15 @@ def _run_mla_distributed(
         input_ctx, position_ids_ctx, scenario, rank, world_size
     )
 
-    # Context step — populate KV cache only; output is discarded.
-    # We call forward_impl directly instead of mla.forward() because
-    # o_proj is sized for helix-gen (num_heads_tp_cp * v_head_dim) and would
-    # crash on the full-width context attention output.
+    # This decode fixture populates each rank's cache from a different token
+    # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
+    # This disaggregated decode fixture already supplies rank-local token
+    # shards. Populate them directly; applying the aggregated owner plan
+    # again would shard the fixture's history twice.
+    attn_metadata.helix_context_local_slots = None
     ctx_output = input_ctx_rank.new_empty(
-        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+        [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 
@@ -406,8 +418,12 @@ def _run_mla_distributed(
         enable_context_mla_with_cached_kv=True,
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with model_extra_attrs(extra_attrs):
-        output = mla(position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen)
+    # The o_proj all-reduce returns NCCL-window tensors, whose leases must be released by a
+    # scope rather than a tensor destructor. The clone outlives the scope for the accuracy check.
+    with model_extra_attrs(extra_attrs), nccl_window_tensor_scope(input_gen):
+        output = mla(
+            position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen
+        ).clone()
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()
@@ -577,3 +593,119 @@ def test_mla_helix_fifo_v2_unaligned_softmax_stats():
     # row, exercising the float2 fallback used by Kimi K3 over CP32.
     scenario = Scenario(num_heads=6, num_kv_heads=6, batch=1, ctx_len=64)
     run_helix_test(_full_test_multi_gpu, scenario, "fifo_v2")
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "scenario",
+    [dataclasses.replace(s, helix_v_up=True) for s in test_scenarios],
+    ids=lambda x: f"scenario: {x}",
+)
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
+def test_mla_helix_v_up_before_alltoall(scenario: Scenario, comms_medium: str):
+    run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+def _alltoall_after_v_up_gemm(rank: int, world_size: int, num_replays: int) -> int:
+    """Count wrong (token, source rank) rows of the fifo_v2 exchange of V-projected partials.
+
+    The V up-projection GEMM and the all-to-all are captured in one CUDA graph,
+    so the all-to-all launches while the GEMM still runs on the SMs
+    (programmatic dependent launch). Every replay checks the received partials
+    and softmax stats bit for bit.
+    """
+    from tensorrt_llm._torch.distributed.ops import HelixAllToAllNative
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        cp_size=world_size,
+        cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": False, "fifo_version": 2},
+    )
+    helix = HelixAllToAllNative.get(mapping)
+    comm = MPI.COMM_WORLD
+    heads_per_rank, kv_lora_rank, v_head_dim = 24, 512, 128
+    num_heads = heads_per_rank * world_size
+    torch.manual_seed(rank)
+    v_full = (
+        torch.randn(num_heads, v_head_dim, kv_lora_rank, device="cuda") / kv_lora_rank**0.5
+    ).to(torch.bfloat16)
+    projector = _v_up_projector(num_heads, kv_lora_rank, v_head_dim, v_full)
+
+    num_bad = 0
+    for num_tokens in (224, 448):
+        latent = torch.empty(
+            num_tokens, num_heads * kv_lora_rank, device="cuda", dtype=torch.bfloat16
+        )
+        stats = torch.empty(num_tokens, num_heads, 2, device="cuda")
+        zero_kv_mask = torch.empty(num_tokens, device="cuda", dtype=torch.bool)
+
+        def fill_inputs():
+            latent.copy_(torch.randn_like(latent, dtype=torch.float32))
+            stats.copy_(torch.randn_like(stats))
+            zero_kv_mask.copy_(torch.rand(num_tokens, device="cuda") < 0.25)
+
+        def exchange():
+            partial_v = MLA._helix_project_v_partials(projector, latent)
+            partial_v_out, stats_out = helix.alltoall_native(
+                partial_v.view(num_tokens, world_size, heads_per_rank * v_head_dim),
+                stats.view(num_tokens, world_size, heads_per_rank * 2),
+                zero_kv_mask,
+            )
+            return partial_v, partial_v_out, stats_out
+
+        fill_inputs()
+        exchange()
+        torch.cuda.synchronize()
+        comm.Barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            partial_v, partial_v_out, stats_out = exchange()
+        comm.Barrier()
+        for _ in range(num_replays):
+            fill_inputs()
+            comm.Barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            # What this rank must hold: its head chunk from every rank, with the
+            # rows a source rank owns no KV for replaced by the no-op contribution.
+            sent = comm.allgather((partial_v.cpu(), stats.cpu(), zero_kv_mask.cpu()))
+            expected_v = torch.stack(
+                [p.view(num_tokens, world_size, -1)[:, rank] for p, _, _ in sent], dim=1
+            )
+            expected_stats = torch.stack(
+                [s.view(num_tokens, world_size, heads_per_rank, 2)[:, rank] for _, s, _ in sent],
+                dim=1,
+            )
+            for src, (_, _, mask) in enumerate(sent):
+                expected_v[mask, src] = 0
+                expected_stats[mask, src, :, 0] = float("-inf")
+                expected_stats[mask, src, :, 1] = 0
+            bad_rows = (partial_v_out.cpu() != expected_v).any(-1) | (
+                stats_out.cpu().view_as(expected_stats) != expected_stats
+            ).flatten(2).any(-1)
+            num_bad += int(bad_rows.sum())
+        del graph
+    return num_bad
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_helix_alltoall_after_v_up_gemm_in_cuda_graph(world_size: int):
+    """The exchange stays exact when it overlaps the V up-projection GEMM.
+
+    The receiver restores each 128-byte line's flagged u64 with ordinary
+    shared-memory stores and then writes the line out with a bulk copy, which
+    only sees those stores after a proxy fence. The overlap with the GEMM makes
+    a missing fence show up as flag values in the received partials or stats.
+    """
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs to run this test")
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            helix_utils.run_single_rank,
+            *zip(*[(_alltoall_after_v_up_gemm, world_size, 20)] * world_size),
+        )
+        num_bad = list(results)
+    assert num_bad == [0] * world_size, f"wrong (token, source) rows per rank: {num_bad}"

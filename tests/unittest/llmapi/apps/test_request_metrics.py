@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
+import logging
+import threading
+from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
+from tensorrt_llm.serve import perf_metrics as perf_metrics_module
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
@@ -33,6 +40,83 @@ from tensorrt_llm.serve.perf_metrics import (
 from tensorrt_llm.serve.scripts.time_breakdown import RequestDataParser
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_input_metrics_survive_headers_disagg_and_jsonl():
+    record = _record()
+    inputs = {
+        "total": 0.15,
+        "media_load": 0.1,
+        "processor": 0.04,
+        "media_download_image": 0.08,
+        "media_decode_image": 0.02,
+    }
+    record["phases"]["server"]["input_processing_metrics"] = inputs
+    headers = build_metrics_headers([record])
+    assert "server_input_total;dur=150.000000" in headers[SERVER_TIMING_HEADER]
+    ctx = build_metrics_record_from_headers(headers, "ctx", request_id="42")
+    assert ctx["phases"]["ctx"]["input_processing_metrics"] == pytest.approx(inputs)
+    assert _jsonl_record(record)["perf_metrics"]["input_processing_metrics"] == inputs
+    combined = combine_disagg_metrics("1", {"timing_metrics": {}}, ctx, None)
+    assert combined["phases"]["ctx"]["input_processing_metrics"] == pytest.approx(inputs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/health_generate"])
+async def test_input_metrics_are_request_local_and_exported(stream, path):
+    async def app(scope, receive, send):
+        await asyncio.sleep(0)
+        observer = _input_processing_observer.get()
+        await asyncio.to_thread(observer, "decode", scope["seconds"], "image")
+        record = _record()
+        record["phases"]["server"]["input_processing_metrics"] = dict(
+            scope["state"]["input_processing_metrics"]
+        )
+        scope["state"]["perf_metrics_records"].append(record)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/event-stream" if stream else b"application/json")
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"data: [DONE]\n\n" if stream else b"{}"})
+
+    collector = MagicMock()
+    middleware = PerfMetricsMiddleware(
+        app, expose_headers=True, input_processing_observer=collector
+    )
+
+    async def request(seconds):
+        messages = []
+
+        async def capture(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http",
+            "path": path,
+            "headers": [(RETURN_METRICS_HEADER.encode(), b"1")],
+            "seconds": seconds,
+        }
+        await middleware(scope, None, capture)
+        assert scope["state"]["input_processing_metrics"] == {"media_decode_image": seconds}
+        if stream:
+            data = messages[-1]["body"].split(b"data: ")[-1].strip()
+            headers = json.loads(data)
+        else:
+            headers = {key.decode(): value.decode() for key, value in messages[0]["headers"]}
+        assert (
+            f"server_input_media_decode_image;dur={seconds * 1000:.6f}"
+            in headers[SERVER_TIMING_HEADER]
+        )
+
+    await asyncio.gather(request(0.1), request(0.2))
+    assert collector.call_count == (0 if path == "/health_generate" else 2)
+    assert _input_processing_observer.get() is None
 
 
 def _record(status="complete"):
@@ -457,3 +541,142 @@ async def test_jsonl_writer_drops_only_malformed_record(tmp_path):
     records = [json.loads(line) for line in output_file.read_text().splitlines()]
     assert writer.dropped_records == 1
     assert records[0]["request_id"] == 42
+
+
+async def _wait_until(predicate, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
+def _written_request_ids(tmp_path):
+    output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
+    return [json.loads(line)["request_id"] for line in output_file.read_text().splitlines()]
+
+
+@pytest.fixture()
+def logged_errors():
+    """Capture the error messages the TRT-LLM logger emits."""
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.ERROR)
+    logger._logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger._logger.removeHandler(handler)
+
+
+class TestJsonlWriterSurvival:
+    """An unexpected failure costs the record or batch it hit, never the writer task.
+
+    The task is the queue's only consumer: once it ends, every later record is queued
+    without being written until the queue fills, and then dropped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_record_failing_unexpectedly_is_dropped_not_fatal(
+        self, tmp_path, logged_errors
+    ):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        # A phase that is not a mapping makes serialization raise AttributeError.
+        writer.submit(
+            {
+                "schema_version": 1,
+                "request_id": "1",
+                "status": "complete",
+                "phases": {"server": "not-a-mapping"},
+            }
+        )
+        writer.submit(_record())
+        await writer.close()
+
+        assert _written_request_ids(tmp_path) == [42], (
+            "a record that fails to serialize must be dropped alone; the records after it "
+            "must still be written"
+        )
+        assert writer.dropped_records == 1
+        assert any("AttributeError" in message for message in logged_errors)
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_write_failure_drops_one_batch_not_the_writer(
+        self, tmp_path, monkeypatch, logged_errors
+    ):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        real_write = writer._write
+        failures = [RuntimeError("cannot schedule new futures after shutdown")]
+
+        def write_failing_once(data):
+            if failures:
+                raise failures.pop()
+            real_write(data)
+
+        monkeypatch.setattr(writer, "_write", write_failing_once)
+        # Both records are queued before the writer task next runs, so they share one batch.
+        first = _record()
+        first["request_id"] = "41"
+        writer.submit(first)
+        writer.submit(_record())
+        await _wait_until(lambda: writer.dropped_records > 0 or writer._task.done())
+        assert not writer._task.done(), "a failed batch write must not end the writer task"
+
+        survivor = _record()
+        survivor["request_id"] = "43"
+        writer.submit(survivor)
+        await writer.close()
+
+        assert _written_request_ids(tmp_path) == [43]
+        assert writer.dropped_records == 2, "every record in the failed batch counts as dropped"
+        assert any(
+            "Dropped 2 performance metrics record(s) that failed to write (RuntimeError" in message
+            # The traceback shows where the write failed.
+            and "Traceback (most recent call last)" in message
+            and "write_failing_once" in message
+            for message in logged_errors
+        )
+
+    def test_unexpected_errors_are_logged_first_then_every_thousandth(self, logged_errors):
+        writer = PerfMetricsJsonlWriter(None, "test")
+        logged_at = []
+        for count in range(1, 2001):
+            for stage in ("serialize", "write"):
+                num_logged = len(logged_errors)
+                writer._drop_after_unexpected_error(1, stage, RuntimeError("failed"))
+                if len(logged_errors) > num_logged:
+                    logged_at.append((stage, count))
+
+        assert logged_at == [
+            (stage, count) for count in (1, 1000, 2000) for stage in ("serialize", "write")
+        ]
+        assert writer.dropped_records == 4000
+
+    @pytest.mark.asyncio
+    async def test_close_still_cancels_a_stuck_write(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(perf_metrics_module, "_WRITER_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_write(data):
+            entered.set()
+            release.wait(timeout=5)
+
+        monkeypatch.setattr(writer, "_write", stuck_write)
+        writer.submit(_record())
+        await _wait_until(entered.is_set)
+        task = writer._task
+        try:
+            await writer.close()
+        finally:
+            release.set()
+
+        assert task.cancelled(), "close() must still be able to cancel a stuck writer task"

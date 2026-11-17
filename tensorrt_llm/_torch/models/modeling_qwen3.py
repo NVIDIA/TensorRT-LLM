@@ -1,4 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import copy
+import json
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -18,7 +22,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -38,6 +42,11 @@ class Qwen3Attention(QKNormRoPEAttention):
         disable_deep_gemm: bool = False,
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
+        fp8_output_gate: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -83,6 +92,12 @@ class Qwen3Attention(QKNormRoPEAttention):
             disable_deep_gemm=disable_deep_gemm,
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
+            use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
+            fp8_output_gate=fp8_output_gate,
+            context_fmha_head_dim_per_stage_kv=
+            context_fmha_head_dim_per_stage_kv,
+            context_last_rows_only=context_last_rows_only,
         )
 
 
@@ -208,14 +223,24 @@ class Qwen3Model(DecoderModel):
         config = self.model_config
         self.mapping_with_cp = mapping_with_cp
 
-        self.embed_tokens = Embedding(
-            config.pretrained_config.vocab_size,
-            config.pretrained_config.hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        # Under attention DP each rank embeds its own tokens, so the embedding
+        # is replicated like the attention-DP lm_head it may be tied to.
+        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                allreduce_strategy=config.allreduce_strategy,
+            )
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 model_config,
@@ -359,7 +384,123 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         # packed [total_tokens, hidden] tensor; take each sequence's final token.
         # Normalize in fp32 (matching sentence-transformers / the HF reference)
         # then cast back, so the unit-norm is precise even for bf16/fp16 weights.
-        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        end_indices = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         pooled = hidden_states[end_indices]
         normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
         return normalized.to(pooled.dtype)
+
+
+@register_auto_model("Qwen3ForTextReranking")
+class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+    """Qwen3-Reranker family exposed as a scalar text-reranking model.
+
+    The published checkpoints are causal language models whose relevance
+    probability is the two-token softmax over ``yes`` and ``no``. A one-row
+    head with ``W_yes - W_no`` produces the equivalent pre-sigmoid logit while
+    avoiding a full vocabulary projection during inference.
+    """
+
+    # Published checkpoints record these values in 1_LogitScore/config.json.
+    _YES_TOKEN_ID = 9693
+    _NO_TOKEN_ID = 2152
+
+    def __init__(self, model_config: ModelConfig[Qwen3Config]) -> None:
+        nn.Module.__init__(self)
+        self.model_config = model_config
+
+        config = model_config.pretrained_config
+        self._yes_token_id, self._no_token_id = self._load_score_token_ids(
+            config)
+        self.model = Qwen3Model(model_config)
+        self.score = Linear(config.hidden_size,
+                            1,
+                            bias=False,
+                            dtype=config.torch_dtype)
+        self.prologue = []
+        self.epilogue = [self.score]
+
+    @classmethod
+    def _load_score_token_ids(cls, config: Qwen3Config) -> tuple[int, int]:
+        checkpoint_dir = getattr(config, "_name_or_path", None)
+        if not checkpoint_dir:
+            return cls._YES_TOKEN_ID, cls._NO_TOKEN_ID
+
+        score_config_path = (Path(checkpoint_dir) / "1_LogitScore" /
+                             "config.json")
+        try:
+            with score_config_path.open(encoding="utf-8") as config_file:
+                score_config = json.load(config_file)
+        except FileNotFoundError:
+            return cls._YES_TOKEN_ID, cls._NO_TOKEN_ID
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Could not read Qwen3 reranker score config at "
+                             f"{score_config_path}: {error}") from error
+
+        try:
+            yes_token_id = score_config["true_token_id"]
+            no_token_id = score_config["false_token_id"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"Qwen3 reranker score config at {score_config_path} must "
+                "define true_token_id and false_token_id.") from error
+
+        for field_name, token_id in (("true_token_id", yes_token_id),
+                                     ("false_token_id", no_token_id)):
+            if (not isinstance(token_id, int) or isinstance(token_id, bool)
+                    or token_id < 0):
+                raise ValueError(
+                    f"{field_name} in {score_config_path} must be a "
+                    f"non-negative integer; got {token_id!r}.")
+
+        return yes_token_id, no_token_id
+
+    @staticmethod
+    def _derive_score_weight(
+            weights: dict,
+            tie_word_embeddings: bool,
+            yes_token_id: int = _YES_TOKEN_ID,
+            no_token_id: int = _NO_TOKEN_ID) -> tuple[str, torch.Tensor]:
+        """Build the scalar head from the checkpoint's yes/no token rows."""
+        source_names = ["lm_head.weight"]
+        if tie_word_embeddings:
+            source_names.append("model.embed_tokens.weight")
+        for source_name in source_names:
+            if source_name in weights:
+                source = weights[source_name]
+                yes = source[yes_token_id:yes_token_id + 1]
+                no = source[no_token_id:no_token_id + 1]
+                return source_name, yes - no
+        raise ValueError(
+            "Qwen3 reranker checkpoint must contain lm_head.weight unless "
+            "tie_word_embeddings is enabled and model.embed_tokens.weight "
+            "is present.")
+
+    def load_weights(self, weights: dict, **kwargs) -> None:
+        source_name, score_weight = self._derive_score_weight(
+            weights, self.model_config.pretrained_config.tie_word_embeddings,
+            self._yes_token_id, self._no_token_id)
+        weights["score.weight"] = score_weight
+        # An untied LM head is not otherwise consumed by this model. Releasing
+        # it here keeps peak host memory bounded for the 8B checkpoint.
+        if (source_name == "lm_head.weight"
+                and hasattr(weights, "mark_consumed")):
+            weights.mark_consumed("lm_head")
+        elif source_name == "lm_head.weight":
+            del weights[source_name]
+        super().load_weights(weights, **kwargs)
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        return self.score(hidden_states[end_indices])

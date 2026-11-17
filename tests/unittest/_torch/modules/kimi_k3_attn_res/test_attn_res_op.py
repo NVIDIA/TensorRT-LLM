@@ -51,6 +51,9 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
         (1024, 11),
         (300, 5),
         (16384, 11),
+        # Above the op's 16384-token limit the wrapper runs it in slices.
+        (24576, 7),
+        (32768, 3),
     ],
 )
 @torch.no_grad()
@@ -91,12 +94,66 @@ def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: 
     assert relative_l2 < 3e-2
 
 
+@pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
+)
+@torch.no_grad()
+def test_fused_attn_res_slices_match_single_calls() -> None:
+    """Above the op's token limit each slice gives what a single call on it gives."""
+    torch.manual_seed(0)
+    limit = kimi_modeling._ATTN_RES_OP_MAX_TOKENS
+    num_tokens, num_snapshots = 2 * limit + 300, 5
+    projection = nn.Linear(HIDDEN_SIZE, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+    norm = KimiK3RMSNorm(HIDDEN_SIZE, eps=RMS_EPS).to(device="cuda", dtype=torch.bfloat16)
+    projection.weight.mul_(0.02)
+    prefix_sum = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+    block_residual = (
+        torch.randn(num_snapshots, num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+
+    actual = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+
+    assert actual is not None
+    for start in range(0, num_tokens, limit):
+        end = min(num_tokens, start + limit)
+        expected = _apply_attn_res_fused(
+            prefix_sum[start:end], block_residual[:, start:end], projection, norm
+        )
+        torch.testing.assert_close(actual[start:end], expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
+)
+@torch.no_grad()
+def test_attn_res_op_token_limit_matches_the_slice_size() -> None:
+    """The wrapper's slice size is the largest token count the op accepts."""
+    limit = kimi_modeling._ATTN_RES_OP_MAX_TOKENS
+    weight = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    for num_tokens in (limit, limit + 1):
+        args = (
+            torch.zeros(num_tokens, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"),
+            torch.zeros(1, num_tokens, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"),
+            weight,
+            weight,
+            RMS_EPS,
+        )
+        if num_tokens == limit:
+            torch.ops.trtllm.attn_res_fwd(*args)
+        else:
+            with pytest.raises(RuntimeError, match="unsupported T"):
+                torch.ops.trtllm.attn_res_fwd(*args)
+
+
 class _AddConstant(nn.Module):
     def __init__(self, value: float) -> None:
         super().__init__()
         self.value = value
 
-    def forward(self, hidden_states: torch.Tensor, *_args) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
         return hidden_states + self.value
 
 
