@@ -107,6 +107,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
+  - unittest/_torch/sampler/test_stop_criteria.py
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
@@ -121,6 +122,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
   - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_package_location.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
   - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
@@ -293,6 +295,7 @@ l0_cpu:
   - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
+  - unittest/llmapi/test_disagg_worker_role.py
   - unittest/llmapi/test_session_reuse.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py

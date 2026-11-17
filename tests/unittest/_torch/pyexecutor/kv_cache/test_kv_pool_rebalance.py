@@ -612,6 +612,7 @@ class TestConsumePreviousBatch:
                 wraps=MethodType(PyExecutor._process_previous_batch, exe)
             )
             exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
+            exe._create_request_response = MethodType(PyExecutor._create_request_response, exe)
             exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
             exe._gather_and_publish_responses = MethodType(
                 PyExecutor._gather_and_publish_responses, exe
@@ -1207,9 +1208,15 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.resource_manager = MagicMock()
     exe.wait_on_pp_send_handles = MagicMock()
     exe.kv_cache_transceiver = None
-    # Empty: the loop's idle recompute-pause progress hook must find nothing
-    # pending, so it never reaches the PP termination handler.
+    # Empty: an idle iteration finds no deferred recompute pause, so it needs no
+    # PP termination handler.
     exe._pending_recompute_pause_ids = set()
+    # An iteration that executes no batch flushes responses buffered outside a
+    # batch and advances deferred PP terminations; none are pending here.
+    exe._pending_transfer_responses = []
+    exe._pending_response_terminations = []
+    exe._disagg_pp_termination_handler = None
+    exe.enable_attention_dp = False
 
     # Loop termination: the loop breaks when should_stop_processing goes true,
     # which is a property over these three.

@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     KeyType,
     PackedSplitResolver,
+    sampling_variant,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
@@ -61,7 +62,12 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
-from .metadata import DecoderMetadata, resolve_mamba_metadata_cls, supports_advanced_draft_sampling
+from .metadata import (
+    DecoderMetadata,
+    resolve_mamba_metadata_cls,
+    supports_advanced_draft_sampling,
+    supports_temperature_only_graphs,
+)
 from .warmup import WarmupAgreement
 
 # Context requests per warmup batch whose breakable prefill graph breaks get
@@ -261,6 +267,8 @@ class DecoderCudaGraphs:
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
         self._inforward_split_warmed = False
+        # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
+        self._sampling_variants: frozenset[str] | None = None
 
     def forward_discarded_warmup(
         self,
@@ -1269,10 +1277,12 @@ class DecoderCudaGraphs:
             #
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
-            _capture_variant("greedy")
-            if supports_advanced_draft_sampling(self._config.spec_config):
+            variants = self._sampling_variants_to_capture(temperature_only_graphs)
+            if "greedy" in variants:
+                _capture_variant("greedy")
+            if "advanced" in variants:
                 _capture_variant("advanced sampling", force_non_greedy=True)
-            if temperature_only_graphs:
+            if "temperature_only" in variants:
                 # Temperature-only batches replay the vocabulary-sharded Gumbel-max
                 # target sampling (the advanced pass records the stock sampler: its
                 # params enable top-k / top-p / min-p).
@@ -1303,6 +1313,45 @@ class DecoderCudaGraphs:
             self._metadata.spec_metadata.is_all_greedy_sample = True
             self._metadata.spec_metadata.is_all_temperature_only = False
             self._metadata.spec_metadata.temperature_only = False
+
+    def _sampling_variants_to_capture(self, temperature_only_graphs: bool) -> frozenset[str]:
+        """One-engine sampling variants to capture; cuda_graph_config.sampling_variants narrows them."""
+        listed = getattr(self._config.cuda_graph_config, "sampling_variants", None)
+        if listed is not None:
+            # Judged from the config: the speculative metadata may not exist before the first pass.
+            # Batches never select temperature_only with rejection sampling or penalties, which
+            # the vocabulary-shard sampler (DSpark) excludes too.
+            spec_config = self._config.spec_config
+            temperature_only_graphs = self._config.samples_from_vocab_shards or (
+                supports_temperature_only_graphs(self._config, self.mapping)
+                and not (spec_config.use_rejection_sampling or spec_config.enable_penalty)
+            )
+        supported = {"greedy"}
+        if supports_advanced_draft_sampling(self._config.spec_config):
+            supported.add("advanced")
+        if temperature_only_graphs:
+            supported.add("temperature_only")
+        if listed is None:
+            return frozenset(supported)
+        if not supported.issuperset(listed):
+            raise ValueError(
+                f"cuda_graph_config.sampling_variants lists {sorted(set(listed) - supported)}, "
+                f"but this engine can capture only {sorted(supported)}"
+            )
+        self._sampling_variants = frozenset(listed)
+        return self._sampling_variants
+
+    def warn_uncaptured_sampling_variant(self, spec_metadata: SpecMetadata) -> None:
+        """Log once per variant that a decode batch runs eagerly because its variant is not listed."""
+        if self._sampling_variants is None:
+            return
+        variant = sampling_variant(spec_metadata)
+        if variant not in self._sampling_variants:
+            logger.warning_once(
+                f"A decode batch with {variant} sampling runs eagerly: "
+                f"cuda_graph_config.sampling_variants captured {sorted(self._sampling_variants)}",
+                key=f"uncaptured_sampling_variant_{variant}",
+            )
 
     def _capture_break_graphs(
         self,

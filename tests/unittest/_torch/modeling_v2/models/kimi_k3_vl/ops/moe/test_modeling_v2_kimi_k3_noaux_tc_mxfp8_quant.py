@@ -7,11 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization import (
-    mxfp8_quantize as mxfp8,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
+from tensorrt_llm._torch.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
+from tensorrt_llm._torch.modeling_v2.catalog.quantization import mxfp8_quantize as mxfp8
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
     kimi_k3_noaux_tc_mxfp8_quant,
 )
 

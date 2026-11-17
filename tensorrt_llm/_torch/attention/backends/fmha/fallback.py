@@ -607,6 +607,12 @@ class FallbackFmha(PhasedFmha):
                         f"({max_past_kv_len})."
                     )
             params = phase_params(0, num_ctx_tokens, 0, num_contexts)
+            if is_mla_enable and k is not None:
+                # MLA's separate K / V hold KV tokens, not one row per query token: context
+                # attention over a cached prefix reads host_total_kv_lens[0] rows of them.
+                kv_rows = max(num_ctx_tokens, int(host_total_kv_lens[0]))
+                params.key_input = k[:kv_rows]
+                params.value_input = v[:kv_rows]
             params.input_seq_length = max_context_q_len
             params.max_past_kv_length = max_past_kv_len
             # The context call reserves the generation phase's workspace as well.

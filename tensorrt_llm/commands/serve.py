@@ -801,8 +801,16 @@ def launch_server(
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
-        os.environ[
-            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+        role = server_role.name.lower()
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role
+        # MPI workers can predate this process (trtllm-llmapi-launch) and then
+        # never see the variable above; forward it through worker_main's
+        # explicit environment overrides as well.
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE.value:
+            role,
+        }
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]

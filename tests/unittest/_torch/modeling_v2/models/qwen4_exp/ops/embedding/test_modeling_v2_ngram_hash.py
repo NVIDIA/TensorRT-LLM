@@ -13,7 +13,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
     CKPT_CONTEXT_LEN,
     CKPT_EOS_TOKEN_ID,
     CKPT_HEAD_OFFSETS,
@@ -21,7 +21,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embeddin
     CKPT_MULTIPLIERS,
     CKPT_VOCAB_SIZE,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
     ngram_hash as op,
 )
 

@@ -208,8 +208,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+from tensorrt_llm._torch.attention.backends.interface import RopeParams
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
     MLA_CONTEXT,
     MLA_GENERATION,
     QM_FP8_KV_CACHE,
@@ -218,10 +219,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     QWEN4_VISION,
     STANDARD,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention as op,
-)
-from tensorrt_llm._torch.attention.backends.interface import RopeParams
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention as op
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.functional import RotaryScalingType

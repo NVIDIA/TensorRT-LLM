@@ -12,7 +12,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
         "cute_dsl_shared_gate_up_swiglu runs an sm_103 CuTe DSL kernel", allow_module_level=True
     )
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_shared_gate_up_swiglu import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_shared_gate_up_swiglu import (  # noqa: E402, E501
     MTP_ROWS,
     PREFILL_MAX_ROWS,
     PREFILL_MIN_ROWS,
@@ -22,7 +22,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     prefill_family,
     prepare_weight,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_shared_gate_up_swiglu import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_shared_gate_up_swiglu import (  # noqa: E402, E501
     cute_dsl_shared_gate_up_swiglu as op,
 )
 

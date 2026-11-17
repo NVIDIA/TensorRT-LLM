@@ -17,10 +17,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernels,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_draft_step import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_draft_step import (  # noqa: E501
     DRAFT_LEN,
     DRAFT_SHARD,
     HIDDEN,
@@ -30,10 +30,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     head_weight,
     shard_logits,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_draft_step import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_draft_step import (  # noqa: E501
     m3_draft_step as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
     exchange_tokens,
     local_argmax,
     make_keys,
@@ -584,7 +584,7 @@ def test_prepare_head_streams_the_bf16_fragments_at_every_k() -> None:
         assert torch.equal(head_weight(prepared.wf, k).view(torch.int16), w.view(torch.int16))
     with pytest.raises(NotImplementedError):
         head_weight(prepared.wf, 96, torch.zeros(2, dtype=torch.int32, device="cuda"))
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
         modeling,
     )
 

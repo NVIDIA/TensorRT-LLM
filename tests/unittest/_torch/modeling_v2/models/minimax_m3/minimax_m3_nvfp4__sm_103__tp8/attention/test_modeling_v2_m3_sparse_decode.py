@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_sparse_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_sparse_decode import (  # noqa: E501
     m3_sparse_decode as op,
 )
 
@@ -125,7 +125,7 @@ def test_guard_refuses_a_false_identity_promise() -> None:
 def test_a_selected_step_the_lc8_kernel_declines_is_a_miss() -> None:
     """A selected table at the TP8 heads is the one-launch kernel's (modeling's SPARSE_DECODE_LC8): an output it
     cannot write (here a strided view) raises under require instead of silently taking the split-K chain."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
         modeling as dispatch,
     )
 
