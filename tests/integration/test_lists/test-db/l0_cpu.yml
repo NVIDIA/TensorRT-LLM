@@ -17,6 +17,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_dspark_worker_hooks.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
   # MiniMax-M3 family code shared with MiniMax-M3.1-Flash: the CuTe DSL object cache, the draft prob1 worker and
   # the MSA backend's host logic.
