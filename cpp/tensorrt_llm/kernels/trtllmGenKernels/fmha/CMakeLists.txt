@@ -47,7 +47,8 @@ configure_file(
   ${CMAKE_CURRENT_BINARY_DIR}/KernelParamsDecl.h COPYONLY)
 
 set(SRC_CPP ${CMAKE_CURRENT_SOURCE_DIR}/fmhaRunner.cpp)
-set(SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/fmhaReduction.cu)
+set(SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/fmhaReduction.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/fmhaSoftmaxStatsToLse.cu)
 
 filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
 
