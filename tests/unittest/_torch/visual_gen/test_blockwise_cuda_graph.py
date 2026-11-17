@@ -181,6 +181,103 @@ def test_blocks_keep_identity_and_signature(model):
     assert list(model.blocks) == blocks_before
     assert inspect.signature(model.blocks[0].forward) == signature_before
     assert all(isinstance(runner, BlockCUDAGraphRunner) for runner in runners.values())
+    # Calls are tracked with hooks: Cache-DiT restores a saved model.forward as a
+    # method when it is disabled, which an instance-level wrapper would break.
+    assert "forward" not in vars(model)
+
+
+# ---------------------------------------------------------------------------
+# Chained and shared input buffers
+# ---------------------------------------------------------------------------
+
+
+class _InPlaceInputBlock(_RopeLikeBlock):
+    """Writes into its ``hidden_states`` input, which a chained buffer must not allow."""
+
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale=1.0):
+        hidden_states.mul_(0.5)
+        return super().forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale)
+
+
+def _clone_call(call):
+    return {
+        name: tuple(t.clone() for t in value) if isinstance(value, tuple) else value.clone()
+        for name, value in call.items()
+    }
+
+
+@torch.inference_mode()
+def test_chained_and_shared_inputs_skip_copies(model):
+    """Only the first block copies; the second reads the first block's output
+    buffers and the shared temb / rotary buffers in place."""
+    call = _inputs(1)
+    expected = model(**call)
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    _assert_same(model(**call), expected)  # capture
+    _assert_same(model(**call), expected)  # replay
+    assert runners["transformer.blocks.0"].last_replay_copies == 5
+    assert runners["transformer.blocks.1"].last_replay_copies == 0
+
+
+@torch.inference_mode()
+def test_block_writing_its_input_keeps_a_private_buffer():
+    torch.manual_seed(0)
+    model = _TwoBlockModel().cuda().eval()
+    model.blocks[1] = _InPlaceInputBlock().cuda().eval()
+    call = _inputs(1)
+    expected = model(**_clone_call(call))
+    expected_first_block = model.blocks[0](**_clone_call(call))
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    for _ in range(2):
+        _assert_same(model(**_clone_call(call)), expected)
+    # The first block's output buffer was not halved by the second block.
+    (first_block_output,) = runners["transformer.blocks.0"].graph_outputs.values()
+    _assert_same(first_block_output, expected_first_block)
+    assert runners["transformer.blocks.1"].last_replay_copies == 1
+
+
+@torch.inference_mode()
+def test_eager_tensor_at_chained_input_is_copied(model):
+    """Like Cache-DiT's add-back result arriving at the next block."""
+    call = _inputs(1)
+    other = _inputs(2)
+    second_block_call = dict(
+        call,
+        hidden_states=other["hidden_states"],
+        encoder_hidden_states=other["encoder_hidden_states"],
+    )
+    expected = model.blocks[1](**second_block_call)
+    wrap_blocks_with_cuda_graphs(model, ["blocks"])
+    model(**call)  # capture both blocks, chaining the second to the first
+
+    _assert_same(model.blocks[1](**second_block_call), expected)
+
+
+@torch.inference_mode()
+def test_shared_input_is_copied_once_per_forward(model):
+    """The same temb tensor with new contents in the next forward call is copied again."""
+    call = _inputs(1)
+    expected_before = model(**call)
+    expected_after = model(**dict(call, temb=call["temb"] * 2))
+    wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    _assert_same(model(**call), expected_before)
+    call["temb"].mul_(2)
+    _assert_same(model(**call), expected_after)
+
+
+@torch.inference_mode()
+def test_chain_buffers_off_copies_every_input(model, monkeypatch):
+    monkeypatch.setattr(BlockCUDAGraphRunner, "CHAIN_BUFFERS", False)
+    call = _inputs(1)
+    expected = model(**call)
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    for _ in range(2):
+        _assert_same(model(**call), expected)
+    assert all(runner.last_replay_copies == 5 for runner in runners.values())
 
 
 # ---------------------------------------------------------------------------
