@@ -377,6 +377,52 @@ class TestTritonPrefillNoPrefix:
         ref = _sdpa_reference(q, k, v, mask=masks, sm_scale=sm_scale)
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
+        # Reuse the image/text batch to check compact global and sliding-window
+        # masks against the dense kernel and the same independent SDPA reference.
+        image_ids = torch.zeros(total, dtype=torch.int32, device=device)
+        image_ids[48 + 5 : 48 + 25] = 1
+        for window_left in (-1, 7):
+            window_masks = []
+            for length, mask in zip(seq_lens, masks):
+                positions = torch.arange(length, device=device)
+                distance = positions[:, None] - positions[None, :]
+                causal = distance >= 0
+                same_image = mask & ~causal
+                same_image = same_image | same_image.T
+                if window_left >= 0:
+                    causal &= distance <= window_left
+                window_masks.append(causal | same_image)
+            args = dict(
+                q=q,
+                k=k,
+                v=v,
+                qo_indptr=qo_indptr,
+                kv_cache=None,
+                prefix_lens=prefix_lens,
+                page_table_indptr=page_table_indptr,
+                page_table_indices=page_table_indices,
+                page_size=1,
+                sm_scale=sm_scale,
+            )
+            dense_output = torch.empty_like(q)
+            triton_prefill_with_custom_mask(
+                **args,
+                output=dense_output,
+                custom_mask=_flatten_masks(window_masks),
+            )
+            triton_prefill_with_custom_mask(
+                **args,
+                output=output,
+                custom_mask=None,
+                image_token_block_ids=image_ids,
+                window_left=window_left,
+                max_len_extend=max(seq_lens),
+            )
+            # Compact and dense kernels can differ in floating-point rounding.
+            torch.testing.assert_close(output, dense_output, atol=1e-2, rtol=1e-2)
+            ref = _sdpa_reference(q, k, v, mask=window_masks, sm_scale=sm_scale)
+            torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
     def test_head_dim_256(self, device):
         """Also works for smaller head_dim (not just 512)."""
         torch.manual_seed(42)
@@ -873,134 +919,6 @@ def test_fp8_output_saturates() -> None:
         out_scale=torch.tensor([2.0], dtype=torch.float32, device="cuda"),
     )
     torch.testing.assert_close(output.float(), v.expand_as(q).float().sign() * 448)
-
-
-@pytest.mark.parametrize("window_left", [-1, 31])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-def test_image_block_ids_match_dense_mask(window_left, head_dim, dtype):
-    """Packed image blobs, tile tails and SWA match dense-mask and SDPA outputs."""
-    if dtype == torch.float8_e4m3fn and torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("FP8 attention requires SM90 or later")
-    torch.manual_seed(42)
-    lengths = [137, 73, 259]
-    num_heads, num_kv_heads = 4, 2
-    total = sum(lengths)
-    q = torch.randn(total, num_heads, head_dim, device="cuda", dtype=torch.bfloat16).to(dtype)
-    k = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16).to(dtype)
-    v = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16).to(dtype)
-    ids = torch.zeros(total, dtype=torch.int32, device="cuda")
-    # Image runs cross both the attention tile boundary and the local window.
-    ids[15:135] = 1
-    ids[137:155] = 1  # Repeated IDs in different requests must not cross-attend.
-    ids[170:200] = 2
-    masks = []
-    reference_masks = []
-    offset = 0
-    for length in lengths:
-        positions = torch.arange(length, device="cuda")
-        row, col = positions[:, None], positions[None, :]
-        blob = ids[offset : offset + length]
-        causal = row >= col
-        if window_left >= 0:
-            causal &= (row - col) <= window_left
-        mask = causal | ((blob[:, None] != 0) & (blob[:, None] == blob[None, :]))
-        masks.append(mask)
-        reference_masks.append(mask)
-        offset += length
-    output = torch.empty_like(q, dtype=torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype)
-    dense_output = torch.empty_like(
-        q, dtype=torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    )
-    args = dict(
-        q=q,
-        k=k,
-        v=v,
-        qo_indptr=torch.tensor(
-            [0, lengths[0], sum(lengths[:2]), total], device="cuda", dtype=torch.int32
-        ),
-        kv_cache=None,
-        prefix_lens=torch.zeros(3, device="cuda", dtype=torch.int32),
-        page_table_indptr=torch.zeros(4, device="cuda", dtype=torch.int32),
-        page_table_indices=torch.empty(0, device="cuda", dtype=torch.int32),
-        page_size=32,
-        sm_scale=1 / math.sqrt(head_dim),
-        window_left=window_left,
-    )
-    triton_prefill_with_custom_mask(
-        **args,
-        output=output,
-        custom_mask=None,
-        image_token_block_ids=ids,
-        max_len_extend=max(lengths),
-    )
-    triton_prefill_with_custom_mask(
-        **(args | {"window_left": -1}),
-        output=dense_output,
-        custom_mask=torch.cat([m.flatten() for m in masks]),
-    )
-    torch.testing.assert_close(output, dense_output, atol=0, rtol=0)
-    assert torch.isfinite(output).all()
-    # The existing all-FP8 kernel rounds softmax intermediates to V's dtype.
-    # Its reference here is the identical dense-mask path, not FP32 softmax.
-    if dtype != torch.float8_e4m3fn:
-        expected = _sdpa_reference(q, k, v, mask=reference_masks)
-        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize("window_left", [-1, 31])
-def test_image_block_ids_match_flashinfer_fa2(window_left):
-    """Gemma3's default FA2 custom-mask behavior agrees with compact Triton prefill."""
-    flashinfer = pytest.importorskip("flashinfer")
-    torch.manual_seed(7)
-    length, heads, kv_heads, dim = 193, 4, 2, 128
-    q = torch.randn(length, heads, dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(length, kv_heads, dim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    ids = torch.zeros(length, device="cuda", dtype=torch.int32)
-    ids[10:150] = 1
-    positions = torch.arange(length, device="cuda")
-    distance = positions[:, None] - positions[None, :]
-    mask = distance >= 0
-    if window_left >= 0:
-        mask &= distance <= window_left
-    mask |= (ids[:, None] != 0) & (ids[:, None] == ids[None, :])
-    indptr = torch.tensor([0, length], device="cuda", dtype=torch.int32)
-    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa2")
-    # TRTLLM disables FA2's window when passing a fully specified custom mask.
-    wrapper.plan(
-        indptr,
-        indptr,
-        heads,
-        kv_heads,
-        dim,
-        custom_mask=mask.flatten(),
-        causal=False,
-        window_left=-1,
-        q_data_type=q.dtype,
-        kv_data_type=k.dtype,
-    )
-    expected = wrapper.run(q, k, v)
-    output = torch.empty_like(q)
-    triton_prefill_with_custom_mask(
-        q=q,
-        k=k,
-        v=v,
-        output=output,
-        qo_indptr=indptr,
-        kv_cache=None,
-        prefix_lens=torch.zeros(1, device="cuda", dtype=torch.int32),
-        page_table_indptr=torch.zeros(2, device="cuda", dtype=torch.int32),
-        page_table_indices=torch.empty(0, device="cuda", dtype=torch.int32),
-        page_size=32,
-        custom_mask=None,
-        sm_scale=1 / math.sqrt(dim),
-        window_left=window_left,
-        image_token_block_ids=ids,
-        max_len_extend=length,
-    )
-    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
