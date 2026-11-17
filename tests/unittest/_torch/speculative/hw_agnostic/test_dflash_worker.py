@@ -176,7 +176,11 @@ def _make_worker(monkeypatch):
 
 
 class _FakeDraftCacheManager:
-    """Unified manager whose draft layer 61 lives in pool 1 with two KV planes."""
+    """Unified manager whose draft layer 61 lives in pool 1 with two KV planes.
+
+    A ``page_expansion`` above one models Helix: each ledger block then holds
+    that many consecutive pages per plane, numbered from the block's K offset.
+    """
 
     draft_layer_ids = [61]
     layer_offsets = {61: 7}
@@ -184,8 +188,9 @@ class _FakeDraftCacheManager:
     _index_scale_ints = [1, 1]
     enable_swa_scratch_reuse = False
 
-    def __init__(self, pages):
+    def __init__(self, pages, page_expansion=1):
         self.pages = pages
+        self._draft_page_expansion = page_expansion
         self.kv_cache_map = {
             request_id: SimpleNamespace(num_blocks=len(request_pages), is_active=True)
             for request_id, request_pages in pages.items()
@@ -197,8 +202,15 @@ class _FakeDraftCacheManager:
     def get_layer_kv_factor(self, layer_idx):
         return 2
 
-    def get_batch_cache_indices(self, request_ids, layer_idx):
-        return [list(self.pages[request_id]) for request_id in request_ids]
+    def get_draft_block_indices(self, request_ids):
+        """The host table: a view page per block, or under Helix each block's K pages."""
+        expansion = self._draft_page_expansion
+        if expansion == 1:
+            return [list(self.pages[request_id]) for request_id in request_ids]
+        return [
+            [page * 2 * expansion + i for page in self.pages[request_id] for i in range(expansion)]
+            for request_id in request_ids
+        ]
 
     def block_offsets(self, request_ids, width):
         """The target's [pool, batch, plane, block] offsets: K at page * 2, V at page * 2 + 1."""
@@ -213,25 +225,37 @@ class _FakeDraftCacheManager:
 
 def _bind_device_tables(worker, manager):
     worker._ctx_kv_manager = manager
-    worker._init_ctx_block_tables(num_slots=3, max_blocks=4)
+    # Four ledger blocks per sequence, as draft_max_blocks_per_seq counts them.
+    worker._init_ctx_block_tables(num_slots=3, max_blocks=4 * manager._draft_page_expansion)
     worker._init_unified_draft_tables(manager)
 
 
-def test_unified_draft_tables_are_decoded_from_target_block_offsets(monkeypatch):
+@pytest.mark.parametrize(
+    "page_expansion, divisor, rows",
+    [
+        (1, 2, [[5, 9, 2], [7]]),
+        # Helix: each block's two K pages, from its K offset (page * 2) times two.
+        (2, 1, [[20, 21, 36, 37, 8, 9], [28, 29]]),
+    ],
+)
+def test_unified_draft_tables_are_decoded_from_target_block_offsets(
+    monkeypatch, page_expansion, divisor, rows
+):
     worker = _make_worker(monkeypatch)
-    manager = _FakeDraftCacheManager({11: [5, 9, 2], 12: [7]})
+    manager = _FakeDraftCacheManager({11: [5, 9, 2], 12: [7]}, page_expansion)
     _bind_device_tables(worker, manager)
     assert worker._device_draft_tables
-    assert (worker._ctx_pool_idx, worker._ctx_block_divisor) == (1, 2)
+    assert (worker._ctx_pool_idx, worker._ctx_block_divisor) == (1, divisor)
 
     attn_metadata = SimpleNamespace(kv_cache_block_offsets=manager.block_offsets([11, 12], 4))
     assert worker._refresh_unified_block_tables(attn_metadata, 2, [11, 12])
 
     tables = worker._ctx_block_tables.cpu()
-    assert tables[0, :3].tolist() == [5, 9, 2]
-    assert tables[1, :1].tolist() == [7]
-    assert worker._ctx_block_counts[:2].tolist() == [3, 1]
-    # The startup check compared the rows with the manager's page lists.
+    counts = [len(row) for row in rows]
+    assert [tables[i, :count].tolist() for i, count in enumerate(counts)] == rows
+    assert worker._ctx_block_counts[:2].tolist() == counts
+    assert worker._ctx_block_counts_host == counts
+    # The startup check compared the rows with the host path's page lists.
     assert worker._device_draft_tables
     assert worker._draft_table_checks_left == 7
 
