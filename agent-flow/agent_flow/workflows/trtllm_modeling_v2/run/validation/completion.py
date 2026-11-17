@@ -33,8 +33,8 @@ from ...spec.task_schema import (
 )
 from ..records.state import WorkflowState
 from . import contract as contract_mod
-from . import regression as regression_mod
 from . import requirements as requirements_mod
+from . import test_jobs
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,6 @@ class Completion:
 
     evaluation: contract_mod.Evaluation
     files: tuple[str, ...] = ()
-    unreviewed: tuple[str, ...] = ()
     required_open: bool = False
     unread_reports: bool = False
 
@@ -52,8 +51,6 @@ class Completion:
         if not self.evaluation.holds:
             return ["the contract does not hold"]
         gaps = []
-        if self.unreviewed:
-            gaps.append(f"no regression check covers {', '.join(self.unreviewed)}")
         if self.files:
             gaps.append("delivery files: " + "; ".join(self.files))
         return gaps
@@ -71,7 +68,7 @@ class Completion:
         return (
             self.evaluation.holds
             and bool(self.files)
-            and not (self.unreviewed or self.required_open or self.unread_reports)
+            and not (self.required_open or self.unread_reports)
         )
 
 
@@ -79,11 +76,10 @@ def assess(
     evaluation: contract_mod.Evaluation,
     *,
     files: Sequence[str] = (),
-    unreviewed: Sequence[str] = (),
     required_open: bool = False,
     unread_reports: bool = False,
 ) -> Completion:
-    return Completion(evaluation, tuple(files), tuple(unreviewed), required_open, unread_reports)
+    return Completion(evaluation, tuple(files), required_open, unread_reports)
 
 
 def run_deliver_phase(
@@ -220,7 +216,7 @@ def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> Deliv
     The target's own tests, and the catalog entries' tests it is delivered
     with (the report's ``test:`` checks), each by its result at ``HEAD``
     (``checks/test_results.py``). With ``run``, those with no result there run
-    first (``regression.record_at``), and the check holds only on none
+    first (``test_jobs.record_at``), and the check holds only on none
     failing, none left unrun and one at least passed. Without, it reads
     what is recorded and fails only on a test that fails there: a test
     that has not run at ``HEAD`` yet runs at delivery. ``None`` when there
@@ -241,12 +237,12 @@ def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> Deliv
     cache_dir = workflow.workspace / test_results.CACHE_DIRNAME
     ran = ""
     if run:
-        tree_at, run_job, python = regression_mod.job_runner(workflow, "delivery-tests")
-        results, jobs, code, tail = regression_mod.record_at(
+        tree_at, run_job, python = test_jobs.job_runner(workflow, "delivery-tests")
+        results, jobs, code, tail = test_jobs.record_at(
             head,
             files,
             cache_dir=cache_dir,
-            out=workflow.workspace / regression_mod.SELECTIONS_DIRNAME / "delivery",
+            out=workflow.workspace / test_jobs.SELECTIONS_DIRNAME / "delivery",
             tree_at=tree_at,
             run_job=run_job,
             python=python,

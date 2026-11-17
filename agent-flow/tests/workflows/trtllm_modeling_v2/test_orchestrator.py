@@ -22,7 +22,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
     Services,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import test_jobs
 from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import TaskNotStarted
 
 _orchestrator_CONTRACT = c.Contract(
@@ -327,153 +327,7 @@ def test_a_burst_of_operator_steers_reaches_the_planner_as_one(tmp_path):
 _WAIT = 10.0
 
 
-_PKG = "tensorrt_llm/_torch/modeling_v2"
-
-
-_TARGET = f"{_PKG}/models/fam/newmodel__sm_100__unified"
-
-
-_OWN = g.own_paths(_TARGET)
-
-
-_BOOT = "core:boot@tp1"
-
-
-_regression_batches_CONTRACT = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
-
-
-def _shared(tid, status="pending", **kw):
-    return g.Task(
-        id=tid,
-        kind="kernel",
-        goal=f"do {tid}",
-        touches=[f"{_PKG}/catalog/{tid}.py"],
-        status=status,
-        **kw,
-    )
-
-
-def _core(**kw):
-    return g.Task(
-        id="core",
-        kind="assemble",
-        goal="core",
-        touches=[f"{_TARGET}/modeling.py"],
-        satisfies=[_BOOT],
-        **kw,
-    )
-
-
-def _review(tid, deps=(), status="pending", **kw):
-    return g.Task(
-        id=tid,
-        kind=g.CHECK_KIND,
-        goal="regression check",
-        depends_on=list(deps),
-        regression=True,
-        status=status,
-        **kw,
-    )
-
-
-def _regression_batches_orchestrator(tmp_path, plan, work, regression=None, **kw):
-    services = Services(
-        plan=plan,
-        work=work,
-        check=lambda chk: SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail=""),
-        free_gpus=lambda: 8,
-        regression=regression or (lambda task: []),
-    )
-    kw.setdefault("poll_s", 0.01)
-    status = c.ContractStatus.load(tmp_path)
-    return GraphOrchestrator(
-        services, _regression_batches_CONTRACT, status, tmp_path, own_paths=_OWN, **kw
-    )
-
-
-def _plan(*answers):
-    """A planner whose turns answer in order; DONE once they run out."""
-    turns = []
-
-    def plan(turn):
-        turns.append(turn)
-        if len(turns) <= len(answers):
-            answer = answers[len(turns) - 1]
-            return answer(turn) if callable(answer) else answer
-        return PlannerAnswer("DONE", "all green")
-
-    plan.turns = turns  # type: ignore[attr-defined]
-    return plan
-
-
-def _graph(*tasks):
-    return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=list(tasks)))
-
-
-def _wait_for(predicate):
-    deadline = time.monotonic() + _WAIT
-    while not predicate():
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-
-
-def test_one_check_runs_at_a_time_and_the_next_takes_what_landed_meanwhile(tmp_path):
-    orchestrator, reviewed = None, []
-
-    def work(task):
-        if task.id == "k2":
-            # k2 lands while r1 runs: it is r1's to leave for the next check.
-            _wait_for(lambda: orchestrator.graph.by_id()["r1"].status == "running")
-        return "LANDED" if task.kind == "kernel" else "UNIT_READY"
-
-    def regression(task):
-        if task.id == "r1":
-            _wait_for(lambda: orchestrator.graph.by_id()["k2"].status == "done")
-        reviewed.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _shared("k2"), _core(), _review("r1", ["k1"]),
-                        _review("r2", ["k2"]), _review("r3", ["k2"])))  # fmt: skip
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, work, regression=regression)
-    assert orchestrator.run() == "delivered"
-    by_id = orchestrator.graph.by_id()
-    assert reviewed == ["r1", "r2"]
-    assert by_id["r1"].covers == ["k1@1"] and by_id["r2"].covers == ["k2@1"]
-    assert by_id["r3"].status == "done" and by_id["r3"].covers == []
-    events = [
-        *(e for t in plan.turns for e in t.events),
-        *(event.text for event in orchestrator.events),
-    ]
-    said = [e for e in events if e.startswith("task r3")]
-    assert said == [
-        "task r3 (regression check) closed: no change to shared code was left for it to "
-        "check: r2 covered what it follows"
-    ]
-
-
-def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):
-    orchestrator, order = None, []
-
-    def check(chk):
-        _wait_for(lambda: orchestrator.graph.by_id()["k1"].status == "done")
-        time.sleep(0.2)  # long enough for a regression check to have started beside it
-        assert orchestrator.graph.by_id()["r1"].status == "pending"
-        order.append(chk.key if hasattr(chk, "key") else "gate")
-        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
-
-    def regression(task):
-        order.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _core(), _review("r1", ["k1"])))
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, lambda task: "LANDED" if task.kind == "kernel"
-                                 else "UNIT_READY", regression=regression)  # fmt: skip
-    orchestrator.s.check = check
-    assert orchestrator.run() == "delivered"
-    assert order[-1] == "r1" and len(order) >= 2
-
-
-def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
+def test_test_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
     # Two-hour allocations handing over 30 min before their end: a two-hour job never starts.
     sessions = (
         SessionSpec("gates", "/g", time_limit_s=7200, handover_lead_s=1800),
@@ -489,9 +343,9 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
                 returncode=0, stdout="MV2FLOW_TEST_ENV 0123456789abcdef\n", stderr=""
             )
 
-    monkeypatch.setattr(regression, "select_command_executor", lambda *args, **kwargs: Executor())
+    monkeypatch.setattr(test_jobs, "select_command_executor", lambda *args, **kwargs: Executor())
     wf = SimpleNamespace(task_data={"trtllm_repo_path": str(tmp_path)}, _gate_env=lambda: env)
-    tree_at, run, python = regression.job_runner(wf, "regression")
+    tree_at, run, python = test_jobs.job_runner(wf, "delivery-tests")
     files = [f"tests/test_{i}.py" for i in range(6)]
 
     def recorded(cache, commit, env_digest=""):
@@ -500,7 +354,7 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         return test_results.Results(commit, env_digest, {f: {"outcome": "passed"} for f in done})
 
     monkeypatch.setattr(test_results, "recorded", recorded)
-    results, jobs, _, _ = regression.record_at(
+    results, jobs, _, _ = test_jobs.record_at(
         "c0ffee",
         files,
         cache_dir=tmp_path,
@@ -510,7 +364,7 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         python=python,
     )
     # The probe is short, and the three two-hour jobs' budget is four 90-minute ones.
-    assert [r.timeout_s for r in observed] == [regression.PROBE_TIMEOUT_S, *[5400] * 4]
+    assert [r.timeout_s for r in observed] == [test_jobs.PROBE_TIMEOUT_S, *[5400] * 4]
     assert jobs == 4 and results.unrun(files) == files[4:]
     assert "--selection" in observed[1].argv
     # A shorter declared default wall bounds the window; off a spool a job runs two hours.
@@ -518,14 +372,14 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         "g", "/g", time_limit_s=7200, handover_lead_s=1800, scheduler={"default_wall": "75m"}
     )
     walled_env = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled,))
-    assert regression.job_timeout(walled_env) == 4500
-    assert regression.job_timeout(RunEnvironment("local", "p")) == regression.JOB_TIMEOUT_S
+    assert test_jobs.job_timeout(walled_env) == 4500
+    assert test_jobs.job_timeout(RunEnvironment("local", "p")) == test_jobs.JOB_TIMEOUT_S
     # Only the sessions gate jobs reach size them: a longer `work` session on another spool
     # never receives one, while an `any` session on its own spool does.
     longer = SessionSpec("other", "/o", role="work", time_limit_s=4 * 3600, handover_lead_s=600)
     both = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, longer))
-    assert regression.job_timeout(both) == 4500
+    assert test_jobs.job_timeout(both) == 4500
     shared = replace(longer, role="any")
     pooled = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, shared))
-    assert regression.job_timeout(pooled) == regression.JOB_TIMEOUT_S
-    assert regression.max_jobs(regression.JOB_TIMEOUT_S) == 3
+    assert test_jobs.job_timeout(pooled) == test_jobs.JOB_TIMEOUT_S
+    assert test_jobs.max_jobs(test_jobs.JOB_TIMEOUT_S) == 3

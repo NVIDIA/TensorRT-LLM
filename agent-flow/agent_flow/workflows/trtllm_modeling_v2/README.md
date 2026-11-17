@@ -88,7 +88,7 @@ a container runtime, a shell). The run needs:
   directory, checkout and checkpoints at the same paths as every session.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
-hand-over with no newer session on its spool. A gate, substrate or regression job the run has
+hand-over with no newer session on its spool. A gate, substrate or test job the run has
 waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
 when, why the session holds it when its `status.json` says, and for a queued job what runs on its
 spool meanwhile; then at most one every 15 minutes while the wait lasts.
@@ -108,11 +108,8 @@ must change before that.
    feature; a member is a parallel configuration; their pairing defines a coverage cell.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
-   target. Commits are audited and integrated; shared-code changes require regression coverage.
-   A regression check runs only when no contract check runs or waits, and only on the test files
-   the change can reach (those it changed, those importing a module it changed, the claims
-   gates; every file when it touches code the whole package shares). A test that already fails
-   at the check's base cannot regress, so the head does not run it. A kernel task on a shared
+   target. Commits are audited and integrated. What a change to shared code does to other
+   models is the pull request's CI to show, not the run's. A kernel task on a shared
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
@@ -132,7 +129,7 @@ must change before that.
 | `run/workflow.py`, `orchestrator.py`, `graph.py`, `inbox.py` | Lifecycle; scheduling; graph rules; operator input |
 | `run/startup/` | Bootstrap, preflight, agent probes and role primers |
 | `run/execution/` | Task dispatch, kernel-specific preparation and decision/receipt handoffs |
-| `run/validation/` | Contract, check runner, regression, completion and verified runtime summaries |
+| `run/validation/` | Contract, check runner, test jobs, completion and verified runtime summaries |
 | `run/workspace/`, `run/records/` | Worktrees/snapshots; recovery state, journal and metrics |
 | `checks/`, `checks/harness/` | Verdict rules and evidence; programs executed in the measured environment |
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |

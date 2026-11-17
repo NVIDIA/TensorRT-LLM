@@ -130,7 +130,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   keep model-specific logic at the narrowest target or family scope that uses
   it, and make a shared runtime change the smallest general one, never a
   branch on this model. Name each such file and
-  why in your report; the regression check follows it.
+  why in your report.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not
