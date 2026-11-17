@@ -309,6 +309,21 @@ The core contract is:
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
 an explicit `forward_args`.
 
+FlashInfer also exposes `supports_variable_window(metadata)` as a request-time
+probe for its Triton prefill fallback. The inclusive per-query KV bounds use
+`AttentionForwardArgs.variable_window_token_starts/ends`; they replace prefill
+causal/window masking, while generation retains its normal sliding window.
+Gemma3 uses this path for sufficiently long image contexts and shares its bound
+construction with Gemma4. Eligibility is checked again by the backend, including
+mutable KV quantization settings.
+
+Text-only warmup does not exercise variable-window Triton prefill. If its JIT
+cache entry is absent, the first eligible image request compiles the variant
+synchronously. Steady-state measurements exclude this cost; this path does not
+currently register an explicit startup precompile. Window sizes are encoded in
+the bounds, so local/global bounds share a kernel specialization when the other
+kernel parameters match.
+
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
 

@@ -957,6 +957,41 @@ class TestFlashInferAttention(unittest.TestCase):
                         result_3[context_sequence_lengths[1]:, :],
                     )))
 
+            # Reuse the final context+generation batch to exercise variable
+            # prefill bounds without losing the sliding window on decode.
+            window = 8
+            length = context_sequence_lengths[1]
+            prefix = past_seen_tokens[1]
+            positions = torch.arange(prefix,
+                                     prefix + length,
+                                     device=device,
+                                     dtype=torch.int32)
+            starts = (positions - window + 1).clamp_min(0)
+            for attn_layer_idx, flashinfer_attn in enumerate(layers):
+                context_qs, context_ks, context_vs = contexts_per_layer[
+                    attn_layer_idx]
+                gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
+                q = torch.cat((context_qs[1], gen_qs[1]))
+                k = torch.cat((context_ks[1], gen_ks[1]))
+                v = torch.cat((context_vs[1], gen_vs[1]))
+                reference = flashinfer_attn.forward(
+                    q, k, v, attn_metadata, attention_window_size=window)
+                self.assertTrue(
+                    flashinfer_attn.supports_variable_window(attn_metadata))
+                actual = flashinfer_attn.forward(
+                    q,
+                    k,
+                    v,
+                    attn_metadata,
+                    attention_window_size=window,
+                    variable_window_token_starts=starts,
+                    variable_window_token_ends=positions)
+                torch.testing.assert_close(actual[:length],
+                                           reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(actual[length:], reference[length:])
+
         finally:
             kv_cache_manager.shutdown()
 

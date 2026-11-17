@@ -4,6 +4,7 @@
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import torch
 from _torch.helpers import make_hf_hybrid_cache_for_tests
@@ -364,6 +365,37 @@ class TestGemma3(unittest.TestCase):
                                           rtol=0.4,
                                           max_failed_fraction=0.001)
             self._verify_params_flushed_upon_prepare(attn_metadata)
+
+            if backend == "FLASHINFER":
+                # Reuse this model/cache setup to compare both representations
+                # for actual image tokens, including local and global layers.
+                image_token_mask[1:4] = True
+                dense = gemma3.forward(input_ids=input_ids,
+                                       position_ids=position_ids,
+                                       attn_metadata=attn_metadata,
+                                       image_token_mask=image_token_mask)
+                with patch(
+                        "tensorrt_llm._torch.models.modeling_gemma3._MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS",
+                        1), patch.object(
+                            gemma3,
+                            "get_attention_mask",
+                            side_effect=AssertionError("Dense mask allocated")):
+                    compact = gemma3.forward(input_ids=input_ids,
+                                             position_ids=position_ids,
+                                             attn_metadata=attn_metadata,
+                                             image_token_mask=image_token_mask)
+                # Reuse this model test's multilayer BF16 comparison policy.
+                self._assert_most_elems_close(actual_value=compact,
+                                              ref_value=dense,
+                                              atol=0.4,
+                                              rtol=0.4,
+                                              max_failed_fraction=0.001)
+                # Restore the text prefill cache used by the HF decode comparison.
+                image_token_mask.zero_()
+                gemma3.forward(input_ids=input_ids,
+                               position_ids=position_ids,
+                               attn_metadata=attn_metadata,
+                               image_token_mask=image_token_mask)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)

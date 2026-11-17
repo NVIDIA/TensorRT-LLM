@@ -104,7 +104,6 @@ def attn_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
-    image_token_block_ids: Optional[torch.Tensor] = None,
 ) -> None:
     metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
     assert isinstance(
@@ -129,7 +128,6 @@ def attn_custom_op_inplace(
         variable_window_token_ends=variable_window_token_ends,
         output=output,
         output_sf=output_sf,
-        image_token_block_ids=image_token_block_ids,
         attention_sinks=attention_sinks,
         relative_attention_bias=relative_attention_bias,
         relative_attention_max_distance=relative_attention_max_distance,
@@ -1011,7 +1009,6 @@ class Attention(nn.Module):
         kv_append: Optional[KvAppendPlan] = None,
         variable_window_token_starts: Optional[torch.Tensor] = None,
         variable_window_token_ends: Optional[torch.Tensor] = None,
-        image_token_block_ids: Optional[torch.Tensor] = None,
     ):
         """Run the attention backend; with output_gate, the returned output has the gate applied (by the backend or
         here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
@@ -1096,7 +1093,6 @@ class Attention(nn.Module):
             mrope_position_deltas=mrope_position_deltas,
             attention_window_size=attention_window_size,
             attention_mask_data=attention_mask_data,
-            image_token_block_ids=image_token_block_ids,
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks,
@@ -1149,7 +1145,6 @@ class Attention(nn.Module):
         kv_append: Optional[KvAppendPlan] = None,
         variable_window_token_starts: Optional[torch.Tensor] = None,
         variable_window_token_ends: Optional[torch.Tensor] = None,
-        image_token_block_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -1211,7 +1206,6 @@ class Attention(nn.Module):
                 self.layer_idx_str,
                 output,
                 output_sf,
-                image_token_block_ids,
             )
         else:
             output, output_sf = self._attn_impl(
@@ -1232,7 +1226,6 @@ class Attention(nn.Module):
                 has_lora=has_lora,
                 output_gate=backend_gate,
                 kv_append=kv_append,
-                image_token_block_ids=image_token_block_ids,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)

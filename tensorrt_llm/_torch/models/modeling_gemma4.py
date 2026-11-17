@@ -65,7 +65,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_gemma3 import build_gemma_attention_mask
+from .modeling_gemma3 import build_gemma_attention_mask, build_gemma_context_variable_window
 from .modeling_speculative import (
     _SPECULATIVE_POSITION_HEADROOM,
     SpecDecOneEngineForCausalLM,
@@ -1483,42 +1483,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         prefix_len: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build inclusive KV bounds for each packed context query token."""
-        extend_len = mm_token_type_ids.numel()
-        positions = torch.arange(
-            prefix_len,
-            prefix_len + extend_len,
-            device=mm_token_type_ids.device,
-            dtype=torch.int32,
+        return build_gemma_context_variable_window(
+            mm_token_type_ids, effective_sliding_window, prefix_len
         )
-        if effective_sliding_window is None:
-            starts = torch.zeros_like(positions)
-        else:
-            starts = torch.clamp(positions - effective_sliding_window + 1, min=0)
-        ends = positions.clone()
-
-        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
-        previous_types = torch.cat((mm_token_type_ids.new_full((1,), -1), mm_token_type_ids[:-1]))
-        next_types = torch.cat((mm_token_type_ids[1:], mm_token_type_ids.new_full((1,), -1)))
-        blob_starts = is_vision & (mm_token_type_ids != previous_types)
-        blob_ends = is_vision & (mm_token_type_ids != next_types)
-
-        local_positions = torch.arange(
-            extend_len, device=mm_token_type_ids.device, dtype=torch.int32
-        )
-        start_candidates = torch.where(blob_starts, local_positions, -1)
-        vision_starts = torch.cummax(start_candidates, dim=0).values + prefix_len
-        end_candidates = torch.where(blob_ends, local_positions, extend_len)
-        vision_ends = (
-            torch.flip(
-                torch.cummin(torch.flip(end_candidates, dims=(0,)), dim=0).values,
-                dims=(0,),
-            )
-            + prefix_len
-        )
-
-        starts = torch.where(is_vision, torch.minimum(starts, vision_starts), starts)
-        ends = torch.where(is_vision, torch.maximum(ends, vision_ends), ends)
-        return starts.contiguous(), ends.contiguous()
 
     def get_attention_variable_window(
         self,

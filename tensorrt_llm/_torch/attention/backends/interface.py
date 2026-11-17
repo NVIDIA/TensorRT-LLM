@@ -1139,9 +1139,6 @@ class AttentionForwardArgs:
     attention_input_type: AttentionInputType = AttentionInputType.mixed
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = cpp_field(dtype=torch.bool)
-    # Packed context-token int32 IDs: 0 for text, positive for each image blob.
-    # FlashInfer fa2/fa3 unquantized-KV prefill; exclusive with the dense mask.
-    image_token_block_ids: Optional[torch.Tensor] = None
     relative_attention_max_distance: int = 0
     chunked_prefill_buffer_batch_size: int = 1
     skip_mla_rope_generation: bool = False
@@ -1294,6 +1291,14 @@ class AttentionBackend(Generic[TMetadata]):
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """
         raise NotImplementedError
+
+    def supports_variable_window(self, metadata: AttentionMetadata) -> bool:
+        """Whether this backend can consume per-context-query inclusive KV bounds.
+
+        This request-time probe must reflect mutable quantization and metadata.
+        Backends with a separate native kernel probe may retain that richer probe.
+        """
+        return False
 
     @classmethod
     def support_fused_rope(cls) -> bool:

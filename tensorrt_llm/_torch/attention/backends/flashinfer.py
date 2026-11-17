@@ -2385,6 +2385,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.v_head_dim = mla_params.v_head_dim
 
+    def supports_variable_window(self, metadata: AttentionMetadata) -> bool:
+        return (self.flashinfer_backend in ("fa2", "fa3")
+                and isinstance(metadata, FlashInferAttentionMetadata)
+                and metadata.kv_cache_manager is not None
+                and metadata.num_contexts > 0 and not self.has_fp8_kv_cache
+                and not self.is_mla_enable)
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
@@ -2651,20 +2658,22 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         latent_cache: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
-        image_token_block_ids: Optional[torch.Tensor] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
-        if image_token_block_ids is not None:
-            if (self.flashinfer_backend not in ("fa2", "fa3")
-                    or self.has_fp8_kv_cache
-                    or metadata.kv_cache_manager is None or k is None
-                    or v is None or metadata.num_contexts == 0
-                    or self.is_mla_enable):
+        has_variable_window = variable_window_token_starts is not None
+        if has_variable_window != (variable_window_token_ends is not None):
+            raise ValueError(
+                "Variable-window starts and ends must be provided together")
+        if has_variable_window:
+            if not self.supports_variable_window(
+                    metadata) or k is None or v is None:
                 raise ValueError(
-                    "Compact image masks require fa2/fa3 paged GQA prefill without FP8 KV"
+                    "Variable windows require fa2/fa3 paged GQA prefill without FP8 KV"
                 )
             if attention_mask_data is not None:
                 raise ValueError(
-                    "Compact and dense image masks are mutually exclusive")
+                    "Variable windows and dense masks are mutually exclusive")
 
         # MLA dispatch
         if self.is_mla_enable:
@@ -2804,9 +2813,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # (bidirectional) attention masks for head_dim>256 layers.  Use a
         # Triton prefill kernel for those layers during multimodal prefill,
         # while keeping FlashInfer for decode and all other cases.
-        # Compact Gemma3 image IDs also use Triton to avoid dense mask materialization.
+        # Per-query variable windows also use Triton to avoid dense mask materialization.
         # KV-shared layers (k is None) keep the causal fallback below.
-        use_triton_prefill = (image_token_block_ids is not None
+        use_triton_prefill = (has_variable_window
                               or (self.flashinfer_backend == "trtllm-gen"
                                   and attention_mask_data is not None
                                   and num_contexts > 0 and k is not None))
@@ -2836,14 +2845,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 _paged_kv_indices[:metadata.num_context_blocks],
                 page_size=metadata.page_size,
                 custom_mask=attention_mask_data,
-                image_token_block_ids=image_token_block_ids,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 max_len_extend=(int(metadata.seq_lens[:num_contexts].max())
-                                if image_token_block_ids is not None else None),
-                sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
+                                if has_variable_window else None),
+                sm_scale=1 /
+                (math.sqrt(self.head_dim) *
+                 (self.q_scaling if self.q_scaling is not None else 1.0)),
                 window_left=window_left,
             )
 
             if num_generations > 0:
+                # Per-query bounds apply only to prefill; decode retains the
+                # normal fa2/fa3 sliding window. Preserve the existing
+                # trtllm-gen dense-custom-mask fallback's planning behavior.
                 decode_plan_params = metadata.plan(
                     self.num_heads,
                     self.num_kv_heads,
@@ -2852,8 +2867,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     kv_dtype=kv_cache.dtype,
                     q_scaling=self.q_scaling,
                     attention_window_size=(attention_window_size
-                                           if image_token_block_ids is not None
-                                           else None),
+                                           if has_variable_window else None),
                     attention_mask_type=int(AttentionMaskType.causal),
                     attention_mask_data=None,
                     flashinfer_backend=self.flashinfer_backend)
@@ -2953,7 +2967,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 output=output,
                 latent_cache=latent_cache,
                 attention_input_type=forward_args.attention_input_type,
-                image_token_block_ids=forward_args.image_token_block_ids,
+                variable_window_token_starts=forward_args.
+                variable_window_token_starts,
+                variable_window_token_ends=forward_args.
+                variable_window_token_ends,
             )
         except RuntimeError as exc:
             # Report the TRTLLM-convention (exclusive) window, not the
