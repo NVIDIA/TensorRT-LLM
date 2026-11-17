@@ -248,6 +248,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
             head_dim=self.head_dim,
             device=self.input_layernorm.device,
             max_tokens=MAX_TOKENS,
+            attention_window=self.window,
         )
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:

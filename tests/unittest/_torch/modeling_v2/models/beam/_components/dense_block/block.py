@@ -220,6 +220,7 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
             head_dim=self.head_dim,
             device=self.input_layernorm.device,
             max_tokens=MAX_TOKENS,
+            attention_window=self.window,
         )
         if not self._loaded:
             raise ValueError("load_weights must complete before running the block")

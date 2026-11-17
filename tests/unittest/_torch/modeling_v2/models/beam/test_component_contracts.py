@@ -515,3 +515,79 @@ def test_bringup_helpers_and_tensor_captures_are_not_runtime_apis():
                 assert not names.intersection({"capture", "layer_capture"}), source
             elif isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("_components"), source
+
+
+@pytest.mark.parametrize(
+    "ids,error",
+    [
+        ([[1, 0], [0, 2]], None),
+        ([[-1, 0]], "nonnegative"),
+        ([[1, 1]], "distinct within each token"),
+    ],
+)
+def test_dispatch_routing_preconditions(ids, error):
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
+        beam_dispatch_combine as op,
+    )
+
+    ids = torch.tensor(ids, dtype=torch.int64)
+    hidden = torch.ones(ids.shape[0], 4, dtype=torch.bfloat16)
+    weights = torch.full(ids.shape, 0.5, dtype=torch.float32)
+
+    def provider(expert, rows):
+        return rows * (expert + 1)
+
+    args = (hidden, ids, weights, provider, 2.5)
+    if error is not None:
+        with pytest.raises(AssertionError, match=error):
+            op.is_valid(*args)
+    else:
+        op.is_valid(*args)
+        assert torch.equal(op(*args), op.reference(*args))
+
+
+@pytest.mark.parametrize(
+    "attention_window,max_seq_len,retained,accepted",
+    [
+        (512, 8192, 511, False),
+        (512, 8192, 512, True),
+        (512, 8192, 1024, True),
+        (512, 128, 128, True),
+        (512, 128, 127, False),
+        (512, 8192, None, True),
+        (None, 8192, 512, False),
+        (None, 8192, 8192, True),
+        (None, 8192, None, True),
+    ],
+)
+def test_standalone_block_cache_retention(
+    monkeypatch, attention_window, max_seq_len, retained, accepted
+):
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+
+    # Metadata geometry is checked separately; use a non-identity logical-to-local mapping.
+    monkeypatch.setattr(_attention, "check_metadata", lambda *args, **kwargs: 0)
+    md = NS(
+        kv_cache_manager=NS(
+            layer_offsets={5: 1}, max_attention_window_vec=[0, retained], max_seq_len=max_seq_len
+        )
+    )
+    args = (torch.ones(1, 2, 4, dtype=torch.bfloat16), torch.arange(2).reshape(1, 2), md)
+    kwargs = dict(
+        layer_idx=5,
+        hidden_size=4,
+        num_kv_heads=2,
+        head_dim=128,
+        device=torch.device("cpu"),
+        max_tokens=17,
+        attention_window=attention_window,
+    )
+    if accepted:
+        _attention.check_step(*args, **kwargs)
+    else:
+        with pytest.raises(ValueError, match="requires cache retention"):
+            _attention.check_step(*args, **kwargs)
