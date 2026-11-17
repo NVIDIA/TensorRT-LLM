@@ -31,6 +31,16 @@ class PlainRopeProcessor(Processor):
     config = SimpleNamespace(text_config=SimpleNamespace(rope_scaling={"rope_type": "llama3"}))
 
 
+class VocabProcessor(Processor):
+    """Reports no media token IDs; media tokens are at or above the vocabulary size."""
+
+    def get_mm_token_ids(self):
+        return None
+
+    def get_vocab_size(self):
+        return 100
+
+
 @pytest.fixture
 def llm():
     llm = BaseLLM.__new__(BaseLLM)
@@ -40,11 +50,11 @@ def llm():
     return llm
 
 
-def params():
+def params(prompt_len=3):
     return DisaggregatedParams(
         request_type="generation_only",
         mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
-            torch.arange(9).reshape(3, 1, 3)
+            torch.arange(3 * prompt_len).reshape(3, 1, prompt_len)
         ).dump_to_dict(),
         mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
             torch.tensor([-128], dtype=torch.int32)
@@ -83,6 +93,49 @@ def test_cuda_ipc_mrope_is_rejected(llm, processor):
     disagg.mrope_position_ids_handle = {"method_key": 1}
     with pytest.raises(ValueError, match="requires portable mRoPE"):
         llm._preprocess({"prompt_token_ids": [1, 91, 2]}, SamplingParams(max_tokens=4), disagg)
+
+
+@pytest.mark.parametrize("key", ["tensor_size", "dtype", "data"])
+def test_incomplete_byte_mrope_is_rejected(llm, key):
+    disagg = params()
+    del disagg.mrope_position_deltas_handle[key]
+    with pytest.raises(ValueError, match="requires portable mRoPE"):
+        llm._preprocess({"prompt_token_ids": [1, 91, 2]}, SamplingParams(max_tokens=4), disagg)
+
+
+@pytest.mark.parametrize(
+    "prompt, name, mutate, error",
+    [
+        ([1, 91, 2], "mrope_position_ids_handle", {"tensor_size": [3, 1, 4]}, "shape"),
+        ([1, 91, 2], "mrope_position_deltas_handle", {"tensor_size": [2]}, "shape"),
+        ([1, 91, 2], "mrope_position_ids_handle", {"dtype": "torch.float32"}, "integers"),
+        ([1, 91, 2], "mrope_position_ids_handle", {"dtype": "torch.int32"}, "of 36 bytes"),
+        ([1, 91, 2], "mrope_position_ids_handle", lambda data: data + "AAAA", "of 72 bytes"),
+        ([1, 91, 2], "mrope_position_ids_handle", lambda data: "*" + data[1:], "of 72 bytes"),
+        ([1, 2, 3], "mrope_position_ids_handle", lambda data: data + "AAAA", "of 72 bytes"),
+    ],
+    ids=["ids-shape", "delta-shape", "float", "dtype-size", "too-long", "not-base64", "text-only"],
+)
+def test_malformed_byte_mrope_is_rejected_before_decoding(llm, prompt, name, mutate, error):
+    disagg = params()
+    handle = getattr(disagg, name)
+    if callable(mutate):
+        handle["data"] = mutate(handle["data"])
+    else:
+        handle.update(mutate)
+    with pytest.raises(ValueError, match=f"{name}.*{error}"):
+        llm._preprocess({"prompt_token_ids": prompt}, SamplingParams(max_tokens=4), disagg)
+
+
+def test_media_tokens_above_vocab_are_detected(llm):
+    llm.input_processor = VocabProcessor()
+    disagg = DisaggregatedParams(request_type="generation_only")
+    with pytest.raises(ValueError, match="requires portable mRoPE"):
+        llm._preprocess({"prompt_token_ids": [1, 101, 2]}, SamplingParams(max_tokens=4), disagg)
+    _, _, mm, _ = llm._preprocess(
+        {"prompt_token_ids": [1, 2, 99]}, SamplingParams(max_tokens=4), disagg
+    )
+    assert mm is None
 
 
 def test_text_only_does_not_require_mrope(llm):
@@ -133,7 +186,7 @@ def test_generation_only_preserves_multimodal_cache_identity(llm):
     identity = MultimodalInput.from_components(
         [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"], [0, 2], [1, 3], [1, 1]
     )
-    disagg = params()
+    disagg = params(4)
     disagg.multimodal_input = asdict(identity)
     ids, _, mm, _ = llm._preprocess(
         {"prompt_token_ids": [1, 91, 2, 91], "multi_modal_data": None},
@@ -197,3 +250,27 @@ def test_generation_only_cache_reuse_requires_multimodal_identity(llm):
             SamplingParams(max_tokens=4),
             params(),
         )
+
+
+@pytest.mark.parametrize(
+    "update, error",
+    [
+        ({"multimodal_hashes": [[1] * 7]}, "eight int32"),
+        ({"multimodal_hashes": [[2**31] + [1] * 7]}, "eight int32"),
+        ({"multimodal_positions": [3]}, "exceed the prompt"),
+        ({"multimodal_run_positions": [1, 4]}, "exceed the prompt"),
+    ],
+    ids=["hash-width", "hash-int32", "span", "run"],
+)
+def test_invalid_multimodal_identity_is_rejected(llm, update, error):
+    from dataclasses import asdict
+
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    identity = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"], [0, 2], [1, 3], [1, 1]
+    )
+    disagg = params(4)
+    disagg.multimodal_input = {**asdict(identity), **update}
+    with pytest.raises(ValueError, match=error):
+        llm._preprocess({"prompt_token_ids": [1, 91, 2, 91]}, SamplingParams(max_tokens=4), disagg)

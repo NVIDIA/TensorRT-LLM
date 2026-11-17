@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+_INT32_MIN = -2**31
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
@@ -731,6 +732,27 @@ class MultimodalInput:
                    multimodal_item_run_cu_offsets=mm_item_run_cu_offsets,
                    multimodal_run_positions=mm_run_positions,
                    multimodal_run_lengths=mm_run_lengths)
+
+    def validate_for_prompt(self, prompt_len: int) -> None:
+        """Check an identity relayed from another worker against its prompt.
+
+        The KV cache key takes eight int32 words per digest, and every item
+        span and run must lie inside the prompt of ``prompt_len`` tokens.
+        """
+        if any(
+                len(digest) != 8 or any(
+                    type(word) is not int
+                    or not _INT32_MIN <= word <= _INT32_MAX for word in digest)
+                for digest in self.multimodal_hashes):
+            raise ValueError(
+                "multimodal_hashes must hold eight int32 values per item")
+        spans = list(zip(self.multimodal_positions, self.multimodal_lengths))
+        if self.multimodal_run_positions is not None:
+            spans += zip(self.multimodal_run_positions,
+                         self.multimodal_run_lengths)
+        if any(position + length > prompt_len for position, length in spans):
+            raise ValueError(
+                f"multimodal spans exceed the prompt of {prompt_len} tokens")
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""

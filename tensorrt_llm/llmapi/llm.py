@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import atexit
+import base64
+import math
 import os
 import socket
 import threading
@@ -32,7 +34,8 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
+                                            _compute_mm_masks)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -349,6 +352,42 @@ def _config_uses_mrope(config: Any) -> bool:
                                            or rope.get("type") == "mrope"):
                 return True
     return False
+
+
+def _check_mrope_bytes_handle(name: str, handle: Dict[str, Any],
+                              prompt_len: int) -> None:
+    """Check a portable mRoPE handle from the context worker before decoding.
+
+    Position IDs are [3, 1, prompt_len] and the delta is one value, so the
+    payload size is bounded by the prompt.
+    """
+    from tensorrt_llm._torch.shared_tensor.shared_tensor import (
+        DTYPE_MAPPING, _SharedTensorRebuildMethodRegistry)
+
+    if (not handle or handle.get("method_key")
+            != _SharedTensorRebuildMethodRegistry.REBUILD_BYTES
+            or not {"tensor_size", "dtype", "data"}.issubset(handle)):
+        raise ValueError(
+            "Generation-only multimodal input requires portable "
+            "mRoPE position IDs and deltas from the context worker")
+    shape = list(handle["tensor_size"])
+    if (shape != [3, 1, prompt_len] if name == "mrope_position_ids_handle" else
+            any(size != 1 for size in shape)):
+        raise ValueError(f"{name} shape {shape} does not match the prompt of "
+                         f"{prompt_len} tokens")
+    dtype = DTYPE_MAPPING.get(handle["dtype"])
+    if dtype is None or dtype.is_floating_point or dtype == torch.bool:
+        raise ValueError(f"{name} must hold integers, got {handle['dtype']}")
+    num_bytes = math.prod(shape) * dtype.itemsize
+    data = handle["data"]
+    try:
+        # Check the encoded length before decoding.
+        valid = (isinstance(data, str) and len(data) == (num_bytes + 2) // 3 * 4
+                 and len(base64.b64decode(data, validate=True)) == num_bytes)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{name} data must be base64 of {num_bytes} bytes")
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -1094,26 +1133,33 @@ class BaseLLM:
             if is_gen_only:
                 get_mm_token_ids = getattr(self.input_processor,
                                            "get_mm_token_ids", None)
+                get_vocab_size = getattr(self.input_processor, "get_vocab_size",
+                                         None)
                 mm_token_ids = (get_mm_token_ids()
                                 if callable(get_mm_token_ids) else None)
-                has_mm_tokens = (mm_token_ids is not None and not set(
-                    mm_token_ids.tolist()).isdisjoint(prompt_token_ids))
+                vocab_size = (get_vocab_size() if mm_token_ids is None
+                              and callable(get_vocab_size) else None)
+                has_mm_tokens = False
+                if mm_token_ids is not None or vocab_size is not None:
+                    # Same media token rule as the prefill path.
+                    mm_mask, _, _ = _compute_mm_masks(
+                        torch.tensor(prompt_token_ids, dtype=torch.long),
+                        vocab_size, mm_token_ids, None)
+                    has_mm_tokens = bool(mm_mask.any())
+                has_mrope = (disaggregated_params.mrope_position_ids_handle or
+                             disaggregated_params.mrope_position_deltas_handle)
+                needs_mrope = has_mm_tokens and (
+                    has_mrope or _config_uses_mrope(
+                        getattr(self.input_processor, "config", None)))
+                for name in ("mrope_position_ids_handle",
+                             "mrope_position_deltas_handle"):
+                    handle = getattr(disaggregated_params, name) or {}
+                    # Byte handles are checked on text-only prompts too.
+                    if needs_mrope or handle.get("method_key") == (
+                            _SharedTensorRebuildMethodRegistry.REBUILD_BYTES):
+                        _check_mrope_bytes_handle(name, handle,
+                                                  len(prompt_token_ids))
                 if has_mm_tokens:
-                    has_mrope = (
-                        disaggregated_params.mrope_position_ids_handle
-                        or disaggregated_params.mrope_position_deltas_handle)
-                    if has_mrope or _config_uses_mrope(
-                            getattr(self.input_processor, "config", None)):
-                        for name in ("mrope_position_ids_handle",
-                                     "mrope_position_deltas_handle"):
-                            handle = getattr(disaggregated_params, name)
-                            if (not handle or handle.get("method_key")
-                                    != _SharedTensorRebuildMethodRegistry.
-                                    REBUILD_BYTES):
-                                raise ValueError(
-                                    "Generation-only multimodal input requires "
-                                    "portable mRoPE position IDs and deltas "
-                                    "from the context worker")
                     kv_config = getattr(self.args, "kv_cache_config", None)
                     if (getattr(kv_config, "enable_block_reuse", False)
                             and disaggregated_params.multimodal_input is None):
@@ -1139,6 +1185,7 @@ class BaseLLM:
                     and disaggregated_params.multimodal_input is not None):
                 multimodal_input = MultimodalInput(
                     **disaggregated_params.multimodal_input)
+                multimodal_input.validate_for_prompt(len(prompt_token_ids))
             if multimodal_data or multimodal_input is not None:
                 multimodal_params = MultimodalParams(
                     multimodal_input=multimodal_input,
