@@ -83,11 +83,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducesca
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
-from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import (
-    EplbLayer,
-    Rows,
-    rows_within,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer, Rows, rows_within
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )

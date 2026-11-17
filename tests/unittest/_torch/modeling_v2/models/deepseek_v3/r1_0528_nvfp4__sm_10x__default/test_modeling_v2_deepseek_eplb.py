@@ -19,6 +19,7 @@ import torch
 from transformers import DeepseekV3Config
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling import (  # noqa: E501
     DeepseekV3DefaultModelingV2,
 )

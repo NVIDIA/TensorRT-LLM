@@ -381,7 +381,7 @@ EPLB places a MoE layer's experts in slots split evenly over the EP ranks,
 with spare slots holding more copies of the hot experts, so a rank's load
 follows its share of the slots rather than of the experts. Deployments
 configure it with `moe_config.load_balancer`; see the
-[EPLB example](../../../../examples/wide_ep/ep_load_balancer/README.md).
+[EPLB example](../../../examples/wide_ep/ep_load_balancer/README.md).
 
 The engine owns the load balancer. A target that implements EPLB plugs its
 MoE layers into it:
