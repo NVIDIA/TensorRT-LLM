@@ -597,6 +597,18 @@ def test_list_test_db_names_rejects_invalid_input(mod, tmp_path, files, error):
         mod.list_test_db_names(str(tmp_path))
 
 
+@pytest.mark.parametrize("condition", ["", "[]", "pre_merge"], ids=["null", "list", "scalar"])
+def test_list_test_db_names_rejects_non_mapping_condition(mod, tmp_path, condition):
+    path = tmp_path / "l0_a.yml"
+    path.write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    error = f"{path}: context 'l0_a' has a block whose 'condition' is not a mapping"
+    with pytest.raises(ValueError, match=re.escape(error)):
+        mod.list_test_db_names(str(tmp_path))
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
