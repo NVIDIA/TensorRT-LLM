@@ -25,7 +25,6 @@ remembered here.
 
 from __future__ import annotations
 
-import ast
 import math
 import re
 from dataclasses import dataclass, field
@@ -468,24 +467,6 @@ def survey_block(found: PriorArt | None, limits: Sequence[EngineLimit], *, limit
     return "\n".join(lines) + "\n"
 
 
-#: The value of the PyTorch loader's list of ``kv_cache_config.dtype`` values.
-_KV_DTYPES = re.compile(r"_VALID_KV_CACHE_DTYPES\s*(?::[^=]*)?=\s*(\([^)]*\)|\[[^\]]*\])")
-
-
-def engine_kv_dtypes(repo: str | Path | None) -> tuple[tuple[str, ...], str] | None:
-    """The KV-cache dtypes the engine accepts and where that was read, or ``None`` when unknown."""
-    found = tree_anchors.read(repo, "kv_cache_dtypes")
-    if found is None:
-        return None
-    text, marker, where = found
-    match = _KV_DTYPES.match(text, marker.start())
-    try:
-        values = tuple(str(v) for v in ast.literal_eval(match.group(1))) if match else ()
-    except (ValueError, SyntaxError):
-        return None
-    return (values, where) if values else None
-
-
 __all__ = [
     "ENGINE_ANCHORS",
     "ENGINE_RULES",
@@ -495,7 +476,6 @@ __all__ = [
     "PriorArt",
     "config_words",
     "engine_constraints",
-    "engine_kv_dtypes",
     "engine_limits",
     "find_prior_art",
     "fmha_head_dims",

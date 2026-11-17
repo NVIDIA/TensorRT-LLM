@@ -4,27 +4,30 @@
 """The contract: every check a run must pass, compiled from the resolved task spec.
 
 The contract is the run's definition of "done". It names each check by unit,
-gate and member, with a tier that says when it runs:
+gate and member, with a tier:
 
-- ``inner``: after every change to the target (boot, accuracy, and the serve
+- ``inner``: what shows a unit runs and scores (boot, accuracy, and the serve
   gate where the spec turns it on or can derive it);
 - ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
   test), and the checks of each configuration variant (``spec/variants.py``);
 - ``delivery``: once, on the tree being delivered (the
   serve gate at one rank).
 
-Verdicts are appended to ``contract_status.jsonl`` as gates return, keyed by
-unit. Delivery evaluates the contract: every required check's latest verdict
-must have passed, on the target as it is now. A verdict recorded against an
-earlier state of the target (its ``marker``), or with other ``inputs``
-(:func:`check_inputs`), is stale and counts as missing. Checks that carry one
-``equivalence`` key (:func:`equivalence_key`) share a pass on the target as it
-is now.
+A check runs when the task that claims it lands. Verdicts are appended to
+``contract_status.jsonl`` as gates return, keyed by unit. Delivery evaluates
+the contract (:func:`evaluate`): every required check's latest verdict must
+have passed. A check that passed stands, whatever landed after it. A verdict
+that failed counts on the state of the target it measured (its ``marker``):
+once the target has changed the check is missing, and runs again. A verdict
+recorded with other ``inputs`` (:func:`check_inputs`) is dropped. Checks that
+carry one ``equivalence`` key (:func:`equivalence_key`) share a pass measured
+on the target as it is now. Before delivery one check has passed on the final
+tree (:func:`confirmed`).
 
-The first state of the target on which the first unit's boot and accuracy
-hold at the member its accuracy runs at is where the bring-up was delivered
-(:func:`bringup_checks`). The first on which every required check holds is
-where correctness was delivered. Both are appended to ``correctness.jsonl``.
+The first state of the target on which the first unit's bring-up checks hold
+(:func:`bringup_checks`) is where the bring-up was delivered. The first on
+which every required check has passed and the tree is confirmed is where
+correctness was delivered. Both are appended to ``correctness.jsonl``.
 """
 
 from __future__ import annotations
@@ -400,7 +403,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
 
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
+    ``certified`` the serve gate and each variant's benchmark at every member. ``disagg`` owes its
     disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
     accuracy would run one aggregated engine, which the units before it prove.
     A storage or scheduling variant (one with no acceptance gate) boots at

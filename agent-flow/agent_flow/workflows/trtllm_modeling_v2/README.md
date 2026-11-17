@@ -17,7 +17,7 @@ Agents write code; Python owns scheduling, integration and correctness verdicts.
 | Target | Model implementation for a checkpoint family and supported deployment configurations |
 | Unit | Core implementation or one feature added to it |
 | Member | One parallel configuration, such as `tp4`, `tep4` or `dep4` |
-| Coverage cell | One unit or variant at one member, with the required checks that prove it |
+| Coverage | Each requested unit or variant, with the required checks behind it |
 | Entry | A kernel wrapper with executable input, architecture and correctness contracts |
 | Receipt | A task's recorded decision, commits and checks |
 | Session | A process on a compute node that watches a spool and runs its queued commands |
@@ -126,7 +126,7 @@ must change before that.
 | `run/workflow.py`, `orchestrator.py`, `graph.py`, `inbox.py` | Lifecycle; scheduling; graph rules; operator input |
 | `run/startup/` | Bootstrap, preflight, agent probes and role primers |
 | `run/execution/` | Task dispatch, kernel-specific preparation and decision/receipt handoffs |
-| `run/validation/` | Contract, check runner, test jobs, completion and verified runtime summaries |
+| `run/validation/` | Contract, check runner, test jobs, completion and coverage |
 | `run/workspace/`, `run/records/` | Worktrees/snapshots; recovery state, journal and metrics |
 | `checks/`, `checks/harness/` | Verdict rules and evidence; programs executed in the measured environment |
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |

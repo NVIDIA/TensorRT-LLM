@@ -45,8 +45,7 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
 def sampling_for(base: Any, max_tokens: int, ignore_eos: bool, logprobs: int = 0) -> Any:
     """A copy of the declared sampling parameters with this request's budget.
 
-    ``logprobs`` asks for each generated token's top-k log-probs, as a request
-    whose tokens a gate compares up to a near-tie does.
+    ``logprobs`` asks for each generated token's top-k log-probs.
     """
     params = copy.deepcopy(base)
     params.max_tokens = int(max_tokens)

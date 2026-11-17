@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Accuracy evaluation, reference lookup and cross-member findings."""
+"""Accuracy evaluation and reference lookup."""
 
 from __future__ import annotations
 

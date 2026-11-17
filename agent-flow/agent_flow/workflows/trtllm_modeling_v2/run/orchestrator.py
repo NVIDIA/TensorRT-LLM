@@ -146,7 +146,7 @@ class Services:
     held_gpus: Callable[[graph_mod.Task], int] = lambda task: task.gpus
     checkpoint: Callable[[], None] = lambda: None
     log: Callable[[str], None] = lambda message: None
-    #: The target's identity now; a verdict recorded under another is stale.
+    #: The target's identity now: the state a verdict is recorded under.
     marker: Callable[[], str] = lambda: ""
     #: The loop has recorded how a task's turn ended (done, failed, abandoned, or pending
     #: again after a failure of the infrastructure): its answer is consumed.
@@ -287,7 +287,7 @@ class GraphOrchestrator:
         #: How many worker runs one task gets (``graph.apply_revision``).
         self.max_attempts = max(1, max_attempts)
         self.max_parallel = max_parallel
-        #: Checks running at once, across every task and the re-checks of an idle run.
+        #: Checks running at once, across every task and the checks the loop runs itself.
         self.max_parallel_checks = max(1, max_parallel_checks)
         #: How long the loop waits between looks while ready work waits for devices.
         self.poll_s = poll_s
@@ -385,7 +385,7 @@ class GraphOrchestrator:
         self._foreground_demand = 0
         #: When each ready task was first seen ready, for the order they start in.
         self._ready_since: dict[str, float] = {}
-        #: Re-checks of an idle run in flight: what the planner is told if one fails, and the checks.
+        #: The loop's own checks in flight: what the planner is told if one fails, and the checks.
         self._settling: tuple[str, list[tuple[str, Future]]] | None = None
         #: The task whose change landed on the target last, in this process, and the
         #: target's marker just after it.
@@ -544,7 +544,7 @@ class GraphOrchestrator:
         Safe to call from several task threads at once: their checks share one
         bounded pool. Each verdict is recorded under the target as it was when
         its check started: a check that overlapped another task's integration
-        is stale, not wrong.
+        measured the earlier state.
         """
         keys = list(keys)
         if self._check_pool is None:
@@ -611,7 +611,7 @@ class GraphOrchestrator:
             self._integrated[task_id] = attempt
             task = self.graph.by_id().get(task_id)
             if task is not None:
-                # What landed last: stale checks run again beside the work once per landing.
+                # What landed last: the checks that are due run beside the work once per landing.
                 self._landed, self._landed_marker = task, self.s.marker()
             self._ended.notify_all()
 
@@ -807,7 +807,7 @@ class GraphOrchestrator:
         except ChecksRaised as exc:
             # No verdict was recorded for these: they are still due and run again.
             failed = exc.failed
-            self.s.log(f"[settle] re-checks raised, to run again: {exc}")
+            self.s.log(f"[settle] checks raised, to run again: {exc}")
         if failed:
             self._note(what + ", ".join(failed), urgent=True)
             self._save_events()
@@ -1102,7 +1102,7 @@ class GraphOrchestrator:
                     else f"task {task.id} ({task.kind}) {decision}; "
                     + (f"checks failed: {', '.join(failed)}" if failed else "its checks passed")
                     + (
-                        f"; some checks could not run ({unknown}): they run again as re-checks"
+                        f"; some checks could not run ({unknown}): they run again"
                         if unknown
                         else ""
                     ),
@@ -1244,7 +1244,7 @@ class GraphOrchestrator:
         """With no required task open, the pending ``nice_to_have`` tasks that would change the tree.
 
         The run is closing: what is left is checking the target as it is, and
-        a landing now would make every check stale again. They wait for a
+        a landing now would leave the final tree unchecked again. They wait for a
         planner turn to require them or for the run to end.
         """
         if self._required_open():
@@ -1550,9 +1550,9 @@ class GraphOrchestrator:
                     ]
                 )
             )
-            # The target is kept verified as it changes: beside running work the
-            # riskiest stale checks and the delivery rehearsals, and once nothing
-            # runs the rest.
+            # What is due with no task to ask for it: a failed check once the target
+            # has changed, a check whose run was lost, and, once no required task is
+            # open, the delivery tier and the check of the final tree.
             if self._settling is None:
                 self._settle(busy=bool(running))
             spent = not running and self._settling is None and self._planner is None
@@ -1637,10 +1637,10 @@ class GraphOrchestrator:
             time.sleep(timeout)
 
     def _in_flight(self, running: dict[str, Future]) -> list[Future]:
-        """The tasks, re-checks and planner turn in flight, as futures to wait on.
+        """The tasks, the loop's own checks and the planner turn in flight, as futures to wait on.
 
         A task or planner turn that ended since the loop looked
-        ends the wait at once, and is recorded. A batch of re-checks is read
+        ends the wait at once, and is recorded. A batch of checks is read
         once all of it is in, so until then only its members still out are
         waited on: one already in would end every wait at once.
         """

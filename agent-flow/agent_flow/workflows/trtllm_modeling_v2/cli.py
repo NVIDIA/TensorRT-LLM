@@ -111,7 +111,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SECONDS",
         help="While work is in flight, batch ordinary reports, green finishes and nonblocking "
         "task failures for this many seconds. Failures blocking pending hard dependencies, "
-        "operator messages, failed re-checks, or an idle graph wake the planner at once. "
+        "operator messages, failed checks, or an idle graph wake the planner at once. "
         f"Default {DEFAULT_EVENT_WINDOW_S:g}.",
     )
     parser.add_argument(
@@ -134,9 +134,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run preflight, resolve the environment, print the plan of "
-        "record, and stop before the first agent turn. The fastest way to "
-        "find out whether this host can host this run.",
+        help="Run preflight, resolve the environment, prove each agent with one "
+        "short turn, print the plan of record, and stop before the planner's first "
+        "turn. The fastest way to find out whether this host can host this run.",
     )
     parser.add_argument(
         "--wait-for-spool",
