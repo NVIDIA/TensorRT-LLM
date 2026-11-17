@@ -16,16 +16,16 @@ import pytest
 import torch
 from cuda.bindings import runtime as cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
     CKPT_HEAD_OFFSETS,
     CKPT_HEAD_VOCAB_SIZES,
     CKPT_MULTIPLIERS,
     ngram_hash,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (  # noqa: E501
     CKPT_EOS_TOKEN_ID,
     CKPT_HEAD_DIM,
     CKPT_SCALE,
@@ -33,7 +33,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     ENGINE_SLOTS,
     TEP4_SLOTS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (  # noqa: E501
     ple_ngram_embed as op,
 )
 from tensorrt_llm._utils import CUASSERT

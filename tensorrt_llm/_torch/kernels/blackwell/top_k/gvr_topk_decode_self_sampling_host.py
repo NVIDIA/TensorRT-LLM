@@ -1735,6 +1735,17 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
     return _VARLEN_CACHE
 
 
+# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows whose plan is the
+# non-split gvr_main with 512-thread CTAs (two per SM) run it as one 1,024-thread CTA per row: twice
+# the loads in flight per row, so the batch's longest rows finish sooner. Same exact Top-K.
+_WIDE_CTA_ROWS = (149, 296)
+
+
+def _varlen_key_flags(det: bool, wide_cta_rows: bool) -> tuple:
+    """``_VARLEN_CACHE`` key suffix of the opt-in launch flags (empty for the default launch)."""
+    return ((True,) if det else ()) + (("wide_cta_rows",) if wide_cta_rows else ())
+
+
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
 # launcher depends only on the row tier, k, the envelope bucket, the dtype and (16-bit
@@ -2137,6 +2148,7 @@ def _varlen_launcher(
     dtype: torch.dtype = torch.float32,
     device_index: int | None = None,
     det: bool = False,
+    wide_cta_rows: bool = False,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
@@ -2155,7 +2167,9 @@ def _varlen_launcher(
             raise RuntimeError("16-bit launcher requires a device index")
         key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
     else:
-        key = (num_rows, npad, k, n_env, next_n, cr, profile) + ((True,) if det else ())
+        key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
+            det, wide_cta_rows
+        )
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
     if hit is not None:
@@ -2996,6 +3010,10 @@ def _varlen_launcher(
                 n4 = n_route >> 2
                 if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
                     tpl = (256, 4, 4, tpl[3], 2, False, False)
+            wide_min, wide_max = _WIDE_CTA_ROWS
+            if wide_cta_rows and wide_min <= num_rows <= wide_max and tpl[0] < 1024 and not tpl[5]:
+                kpt = 1 if k <= 1024 else (2 if k <= 2048 else (4 if k <= 4096 else 8))
+                tpl = (1024, tpl[1], 1, tpl[3], kpt, tpl[5], tpl[6])
             main_options.update(
                 det=det,
                 fused_k=k,
@@ -3644,12 +3662,15 @@ def run_varlen(
     workspace: torch.Tensor | None = None,
     deterministic: bool = False,
     sorting: str | None = None,
+    wide_cta_rows: bool = False,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
 
     ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
     every row (requires deterministic). The default path is the original kernel, unchanged.
+    ``wide_cta_rows=True`` runs the non-split gvr_main plan of ``_WIDE_CTA_ROWS``-row batches with
+    1,024-thread CTAs.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -3803,7 +3824,7 @@ def run_varlen(
     n_env = min(max(n_env, 1), npad)
     det = _check_det_args(deterministic, sorting)
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + ((True,) if det else ())
+    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(det, wide_cta_rows)
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -3812,7 +3833,16 @@ def run_varlen(
             )
         num_sms, sm_version = _unpack_device_profile(profile)
         lc = _varlen_launcher(
-            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, **({"det": True} if det else {})
+            num_rows,
+            npad,
+            k,
+            n_env,
+            nn,
+            cr,
+            num_sms,
+            sm_version,
+            det=det,
+            wide_cta_rows=wide_cta_rows,
         )
     idx = indices
     if idx.shape[1] != k:
@@ -4147,12 +4177,13 @@ def varlen_ready(
     compress_ratio: int = 1,
     max_seq_len: int | None = None,
     deterministic: bool = False,
+    wide_cta_rows: bool = False,
 ) -> bool:
     """True iff ``run_varlen(logits, kv_lens, indices, next_n, compress_ratio,
-    max_seq_len=max_seq_len, deterministic=deterministic)`` without a workspace would
-    launch without compiling: the launcher key it looks up (rows, row stride, k,
-    envelope, next_n, compression, device profile, dtype, det) is cached and the
-    device's default workspace exists, so a caller can route around the engine under
+    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows)``
+    without a workspace would launch without compiling: the launcher key it looks up (rows, row
+    stride, k, envelope, next_n, compression, device profile, dtype, det, wide_cta_rows) is cached
+    and the device's default workspace exists, so a caller can route around the engine under
     CUDA graph capture. Host-only. Without ``max_seq_len`` run_varlen reads
     ``kv_lens.max()`` on the host, so the answer is False."""
     if logits.dim() != 2 or indices.dim() != 2:
@@ -4175,7 +4206,9 @@ def varlen_ready(
     if low:
         key = (num_rows, npad, k, n_env, nn, cr, d, profile)
     else:
-        key = (num_rows, npad, k, n_env, nn, cr, profile) + ((True,) if deterministic else ())
+        key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
+            deterministic, wide_cta_rows
+        )
     return key in _varlen_cache_for(logits.dtype) and d in _ws_hot
 
 
@@ -4228,6 +4261,7 @@ def warmup_varlen(
     deterministic: bool = False,
     *,
     dtype: torch.dtype = torch.float32,
+    wide_cta_rows: bool = False,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -4242,7 +4276,8 @@ def warmup_varlen(
     compiles a variant dispatch never looks up. Callers that know the
     producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
     must pass it; the 64-element default only matches producers that round
-    the same way.
+    the same way. ``deterministic`` and ``wide_cta_rows`` are launcher-key
+    parts too and must match the dispatch's.
 
     ``dtype`` (keyword-only) selects the float32, bfloat16 or float16 engines. The 16-bit
     dtypes launch every requested row count (no band enumeration), need a row stride that is
@@ -4352,6 +4387,7 @@ def warmup_varlen(
             npad,
             profile,
             bool(deterministic),
+            bool(wide_cta_rows),
         )
         # The done key covers the GPU band launches only (one per engine compile
         # key). The exact-row launcher population below is keyed by the requested
@@ -4377,6 +4413,7 @@ def warmup_varlen(
                 compress_ratio=int(compress_ratio),
                 max_seq_len=int(max_seq_len),
                 deterministic=deterministic,
+                wide_cta_rows=wide_cta_rows,
             )
         del logits, kv_lens, out
         torch.cuda.synchronize()
@@ -4398,6 +4435,7 @@ def warmup_varlen(
             num_sms,
             sm_version,
             det=deterministic,
+            wide_cta_rows=wide_cta_rows,
         )
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:

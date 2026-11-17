@@ -256,17 +256,25 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         hosts_unified_draft_layers=hosts,
     )
     manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
+    # The drafter declares an FP8 pool (draft_kv_dtype); the target keeps HALF.
+    manager.get_layer_dtype = lambda layer_id: bindings.DataType.FP8
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.num_draft_layers == expected
-    restored = RankInfo.from_bytes(info.to_bytes())
-    assert restored.num_draft_layers == expected
+    assert info.draft_kv_dtype == ("FP8" if expected else None)
     assert info.draft_layers_reshard_across_tp is reshards
-    assert restored.draft_layers_reshard_across_tp is reshards
-    # Peers without draft layers that reshard keep the wire shape older releases read.
     payload = msgpack.unpackb(info.to_bytes(), strict_map_key=False)
+    # Without shared draft layers the wire shape is unchanged, and only a hosting
+    # manager's peers carry the reshard flag.
+    assert ("draft_kv_dtype" in payload) == bool(expected)
     assert ("draft_layers_reshard_across_tp" in payload) is reshards
+    restored = RankInfo.from_bytes(info.to_bytes())
+    assert (
+        restored.num_draft_layers,
+        restored.draft_kv_dtype,
+        restored.draft_layers_reshard_across_tp,
+    ) == (expected, info.draft_kv_dtype, reshards)
 
 
 def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:

@@ -763,6 +763,39 @@ def test_receiver_rejects_view_mismatch_before_registration(
         receiver.shutdown()
 
 
+def test_receiver_registers_with_sender_lacking_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A generation rank with a drafter layer the context server does not send
+    # still registers; only the shared layers are transferred.
+    from tensorrt_llm._torch.disaggregation.native.transfer import MessageType
+
+    local_ri, sender_ri = [
+        make_rankinfo(
+            instance_name=name,
+            tp_size=1,
+            tokens_per_block=2,
+            dims_per_head=2,
+            layer_num_per_pp=layers,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        for name, layers in (("receiver", [3]), ("sender", [2]))
+    ]
+    sender_ri.sender_endpoints = ["tcp://sender"]
+    registrar = _make_peer_registrar(local_ri)
+    receiver, messengers, _ = _make_receiver_for_view_validation(
+        monkeypatch, registrar, {"tcp://info": sender_ri}, enforce_physical_ownership=False
+    )
+    try:
+        params = SimpleNamespace(ctx_info_endpoint="tcp://info", ctx_dp_rank=0)
+        sender_info = receiver._get_sender_info(params)
+        assert sender_info.layer_num_per_pp == [2]
+        assert receiver._incompatible_peers == {}
+        messengers["tcp://sender"].send.assert_called_once_with(
+            [MessageType.REGISTER_RANK_INFO, local_ri.to_bytes()]
+        )
+    finally:
+        receiver.shutdown()
+
+
 def test_view_validation_allows_nonoverlapping_pp_stage() -> None:
     local_page_table = _make_per_view_page_table([2, 1], MapperKind.INDEXED)
     local_page_table.layer_groups[0].local_layers = [LocalLayer(0, 2), LocalLayer(1, 3)]
@@ -937,6 +970,33 @@ def test_peer_registrar_rejects_mismatched_protocol_version():
     peer_ri.protocol_version = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
     with pytest.raises(ValueError, match="protocol version"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+@pytest.mark.parametrize(("self_layers", "peer_layers"), [([3], [2]), ([2], [3]), ([3], [1, 1])])
+def test_peer_registrar_layer_count_mismatch_warns(monkeypatch, self_layers, peer_layers):
+    # Either side may hold layers the other lacks, e.g. a drafter whose cache the
+    # context server does not transfer; only the shared layers are mapped.
+    reg = _make_peer_registrar(make_rankinfo(instance_name="gen", layer_num_per_pp=self_layers))
+    peer_ri = make_rankinfo(
+        instance_name="ctx",
+        instance_rank=1,
+        pp_size=len(peer_layers),
+        layer_num_per_pp=peer_layers,
+        page_table=make_page_table(),
+    )
+    warnings = []
+    monkeypatch.setattr(peer_module.logger, "warning", lambda *message: warnings.append(message))
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    assert reg.get_peer_rank_info("ctx", 1) is peer_ri
+    assert [m for m in warnings if "layer count differs" in " ".join(map(str, m))] == [
+        (
+            "PeerRegistrar: layer count differs "
+            f"(local={sum(self_layers)}, peer={sum(peer_layers)}), "
+            "allowing partial layer transfer.",
+        )
+    ]
 
 
 def test_peer_registrar_self_rank_info_property():
@@ -1865,6 +1925,33 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
         with pytest.raises(
             ValueError,
             match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize(("local_dtype", "peer_dtype"), [("FP8", "FP8"), ("FP8", "BF16")])
+def test_peer_registrar_requires_matching_unified_draft_kv_dtype(
+    local_dtype: str, peer_dtype: str
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = 1
+    self_rankinfo.draft_kv_dtype = local_dtype
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = 1
+    peer_ri.draft_kv_dtype = peer_dtype
+    if local_dtype != peer_dtype:
+        with pytest.raises(
+            ValueError, match=f"draft KV dtype differs.*local={local_dtype}, peer={peer_dtype}"
         ):
             reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
         return
