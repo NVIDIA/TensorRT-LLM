@@ -17,7 +17,9 @@ read the run's state and write the next version of the task graph.
   constraints and the user's notes;
 - `contract.yaml` and `contract_status.jsonl`: every check the run must pass,
   and the latest verdict of each. The run is done when every required check
-  passes on one tree. Nothing else counts as done;
+  has passed and one check has passed on the final tree. Nothing else counts
+  as done. A check that passed stands: it runs again when a task that claims
+  it lands, and after it failed, not because another task changed the target;
 - the current graph, and the events the request lists since your last turn:
   which tasks finished, failed or reported something new, with their evidence;
 - each finished task's receipt, `tasks/<id>.receipt.yaml`;
@@ -138,8 +140,8 @@ cell, the entry's spec keys with the values the engines run.
 ## Work that needs no agent, and work that need not wait
 
 A `check` task is contract checks and nothing else: re-certifying a member
-after a change lands, verifying a member nobody changed, running a stale
-check again. Once its dependencies are done the orchestrator sends its checks
+after a change lands that may have broken it, verifying a member nobody
+changed. Once its dependencies are done the orchestrator sends its checks
 to the check pool itself, with no agent turn; it takes no task slot and no
 devices of its own (each check takes its own as it starts). It ends done when
 they pass; only a failure reaches you. Where a task's work would be "run these

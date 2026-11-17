@@ -45,6 +45,9 @@ class Completion:
     files: tuple[str, ...] = ()
     required_open: bool = False
     unread_reports: bool = False
+    #: The check that confirms the final tree, while no check has passed on the
+    #: target as it is (``contract.confirmed``); empty once one has.
+    unconfirmed: str = ""
 
     @property
     def gaps(self) -> list[str]:
@@ -53,6 +56,11 @@ class Completion:
         gaps = []
         if self.files:
             gaps.append("delivery files: " + "; ".join(self.files))
+        if self.unconfirmed:
+            gaps.append(
+                f"no check has run on the target as it is: {self.unconfirmed} confirms it once "
+                "no required task is open"
+            )
         return gaps
 
     @property
@@ -78,8 +86,9 @@ def assess(
     files: Sequence[str] = (),
     required_open: bool = False,
     unread_reports: bool = False,
+    unconfirmed: str = "",
 ) -> Completion:
-    return Completion(evaluation, tuple(files), required_open, unread_reports)
+    return Completion(evaluation, tuple(files), required_open, unread_reports, unconfirmed)
 
 
 def run_deliver_phase(
@@ -98,6 +107,20 @@ def run_deliver_phase(
     marker = workflow._target_marker()
     workflow.journal.section(
         "contract", contract_mod.standing(result.evaluation, workflow.workspace, marker)
+    )
+    repo = str(workflow.task_data.get("trtllm_repo_path") or "")
+    workflow.journal.section(
+        "where each check was measured",
+        contract_mod.measured_where(
+            result.evaluation,
+            workflow._contract_status(),
+            marker,
+            lambda tree: (
+                (workflow._git(repo, "rev-list", "--count", f"{tree}..HEAD") or "").strip()
+                if repo and tree
+                else ""
+            ),
+        ),
     )
     if result.ready:
         print_message(f"[bold green]✔ contract: {result.evaluation.render()}[/bold green]", log)

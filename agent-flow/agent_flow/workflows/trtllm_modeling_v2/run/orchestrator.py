@@ -72,9 +72,6 @@ DEFAULT_MAX_PARALLEL_CHECKS = 8
 INFRA_RETRIES = 1
 #: A state write that fails with one of these waits for room instead of ending the run.
 STORAGE_FULL = frozenset({errno.EDQUOT, errno.ENOSPC})
-#: How many stale checks run again, in the contract's order, beside running work each
-#: time the target changes; the rest wait for the graph to run out of work.
-RECHECKS_WHILE_BUSY = 4
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
 #: past the wake-up each recorded outcome gives it.
 SOFT_POLL_S = 5.0
@@ -360,11 +357,9 @@ class GraphOrchestrator:
         #: The delivery files that last kept a holding contract from full support, per
         #: marker, as the planner heard them.
         self._files_said: tuple[str, tuple[str, ...]] | None = None
-        #: The target's marker and the landing the last re-checks beside running work
+        #: The target's marker and the landing the last checks beside running work
         #: were chosen on.
         self._rechecked_at: tuple[str, str] | None = None
-        #: Delivery-tier checks rehearsed in this process.
-        self._rehearsed: set[str] = set()
         #: The task threads in flight, by task id, as the loop drives them.
         self._running: dict[str, Future] = {}
         #: Tasks whose work finished but some of whose checks raised: why, until recorded.
@@ -490,9 +485,12 @@ class GraphOrchestrator:
     def _run_check(self, check: contract_mod.Check) -> bool:
         """One check, in a pool thread, recorded under the target as it was when it started.
 
-        A check the contract already counts as passed on this very target (its
-        own verdict, or an equivalent check's) does not run again; that is
-        asked as the check starts, and the target is read then. A check that
+        A check that already passed on this very target (its own verdict, or an
+        equivalent check's) does not run again; that is asked as the check
+        starts, and the target is read then. A pass on an earlier state of the
+        target stands for the contract (``contract.evaluate``) and does not
+        stop the check from running here: whoever asks for it has a reason, a
+        task that claims it and has just landed, or the final tree. A check that
         needs another's verdict first (:attr:`Check.after`: a relative
         variant's benchmark, judged against its unit's) has it on this target
         before it starts, the other run here if it has none.
@@ -512,10 +510,10 @@ class GraphOrchestrator:
         marker = self.s.marker()
         if marker:
             with self._status_lock:
-                evaluation = contract_mod.evaluate(
-                    self.contract, self.status, marker=marker, holds=self.s.holds
+                here = contract_mod.passed_here(
+                    self.contract, self.status, check, marker, self.s.holds
                 )
-            if check.key in {c.key for c in evaluation.passed}:
+            if here:
                 return True
         result = self.s.check(check)
         reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
@@ -635,6 +633,7 @@ class GraphOrchestrator:
             files=missing,
             required_open=self._required_open(),
             unread_reports=self.unread_reports,
+            unconfirmed="" if self._confirmed(marker) else self.contract.confirm,
         )
         said = (marker, tuple(missing))
         if evaluation.holds and missing and said != self._files_said:
@@ -648,6 +647,11 @@ class GraphOrchestrator:
             )
             self._save_events()
         return result
+
+    def _confirmed(self, marker: str) -> bool:
+        """Whether some required check passed on the target as it is (``contract.confirmed``)."""
+        with self._status_lock:
+            return contract_mod.confirmed(self.contract, self.status, marker, self.s.holds)
 
     def completion(self, files: Sequence[str]) -> Completion:
         """Final delivery re-evaluates current verdicts and the graph."""
@@ -727,82 +731,59 @@ class GraphOrchestrator:
         )
 
     def _settle(self, busy: bool = False) -> None:
-        """Keep the target verified as it changes; then, with no required task open, the delivery tier.
+        """Run the checks that are due with no task to ask for them.
 
-        ``busy``, with work running: each time a change lands, the
-        first :data:`RECHECKS_WHILE_BUSY` stale checks in the contract's order
-        run again beside it, and the delivery tier of a member whose other
-        checks all hold is rehearsed once (:meth:`_rehearsal`). Otherwise every
-        stale check runs again; and once every other required check holds and
-        no required task is open, the delivery tier runs on the
-        target as it is. Both run on the check pool; :meth:`_settled` reads the
-        verdicts once they are all in, and tells the planner what failed.
+        A check that passed stands (``contract.evaluate``), and a task that
+        finishes runs the checks it claims, so what is left is:
 
-        A stale accuracy check runs again at a milestone only: once no required
-        task is open, or for the bring-up before it was named. Until then the
-        cheaper checks of each landing (the boots) stand watch.
+        - a check a finished task claims that has no verdict to stand on: it
+          failed and the target has changed since, or its run recorded none.
+          ``busy``, with foreground work running, these run once per landing;
+          otherwise at once. A benchmark among them waits until no required
+          task is open, unless the bring-up still needs it;
+        - with no required task open and every other required check passed,
+          the delivery tier, on the target as it is;
+        - then, when no check has passed on the target as it is, the one check
+          that confirms the final tree (:attr:`~.contract.Contract.confirm`).
+
+        They run on the check pool; :meth:`_settled` reads the verdicts once
+        they are all in, and tells the planner what failed.
         """
         claimed = {k for t in self.graph.tasks if t.status == "done" for k in t.satisfies}
         delivery = self._delivery_keys()
         marker, evaluation = self._evaluated()
-        stale = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
-        if self._required_open():
+        due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
+        open_work = self._required_open()
+        if open_work:
             bringup = (
                 {c.key for c in contract_mod.bringup_checks(self.contract)}
                 if contract_mod.bringup_milestone(self.workspace) is None
                 else set()
             )
-            stale = [k for k in stale if k not in self._accuracy_keys or k in bringup]
-        if busy or (not stale and self._required_open()):
-            keys: list[str] = []
+            due = [k for k in due if k not in self._accuracy_keys or k in bringup]
+        what = "checks that failed before failed again on the current target: "
+        keys: list[str] = []
+        if busy or (not due and open_work):
             # Once per landing the loop knows made the target what it is.
             landed = (marker, self._landed.id if self._landed is not None else "")
             known = self._landed is not None and self._landed_marker == marker
-            if stale and known and landed != self._rechecked_at:
+            if due and known and landed != self._rechecked_at:
                 self._rechecked_at = landed
-                keys = stale[:RECHECKS_WHILE_BUSY]
-            keys += self._rehearsal(evaluation)
-            what = "checks run beside the work in flight failed on the current target: "
+                keys = due
+        elif due:
+            keys = due
         else:
-            what, keys = (
-                "checks that held before failed on the current target: ",
-                stale,
-            )
-            if not stale:
-                # A check that already failed on this very target stays failed until
-                # the target changes; running it again would measure the same thing.
-                missing = {c.key for c in evaluation.missing}
-                failed_here = {c.key for c, _ in evaluation.failed}
-                if not missing or not (missing | failed_here) <= delivery:
-                    return
+            # A check that already failed on this very target stays failed until
+            # the target changes; running it again would measure the same thing.
+            missing = {c.key for c in evaluation.missing}
+            failed_here = {c.key for c, _ in evaluation.failed}
+            if missing and (missing | failed_here) <= delivery:
                 what, keys = "delivery checks failed: ", sorted(missing)
+            elif evaluation.holds and self.contract.confirm and not self._confirmed(marker):
+                what, keys = "the check of the final tree failed: ", [self.contract.confirm]
         submitted = self._submit_checks(self._check_pool, keys) if keys else []
         if submitted:
             self._settling = (what, submitted)
-
-    def _rehearsal(self, evaluation: contract_mod.Evaluation) -> list[str]:
-        """Delivery-tier checks to rehearse now, each once: those whose member is otherwise green.
-
-        A member whose every other required check passed on the target as it
-        is gets its delivery-tier checks run once, ahead of the final tree,
-        as advisory: a failure reaches the planner, and the final tree runs
-        them again whatever they found.
-        """
-        passed = {c.key for c in evaluation.passed}
-        required = self.contract.required()
-        due = []
-        for check in self.contract.by_tier(contract_mod.TIER_DELIVERY):
-            if check.key in self._rehearsed or check.key in passed:
-                continue
-            before = [
-                c
-                for c in required
-                if c.member == check.member and c.tier != contract_mod.TIER_DELIVERY
-            ]
-            if before and all(c.key in passed for c in before):
-                self._rehearsed.add(check.key)
-                due.append(check.key)
-        return due
 
     def _settled(self) -> None:
         what, submitted = self._settling

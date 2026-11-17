@@ -107,6 +107,10 @@ class Contract:
     checks: tuple[Check, ...]
     #: Why a unit or variant owes less than every check at every member, one line each.
     notes: tuple[str, ...] = ()
+    #: The key of the check that confirms the final tree when no check has run
+    #: on it (:func:`confirmed`): the benchmark of the last unit that owes one,
+    #: at its cheapest member.
+    confirm: str = ""
 
     def required(self) -> tuple[Check, ...]:
         return tuple(c for c in self.checks if c.required)
@@ -127,6 +131,8 @@ class Contract:
         }
         if self.notes:
             out["notes"] = list(self.notes)
+        if self.confirm:
+            out["confirm"] = self.confirm
         return out
 
     def render(self) -> str:
@@ -404,6 +410,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
     checks: list[Check] = []
     notes: list[str] = []
+    confirm = ""
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
         members = order_members_by_cost(members_for(task_data, unit, world_size))
@@ -435,9 +442,13 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         add("boot", TIER_INNER)
         if level == PROFILE_SMOKE:
             notes.append(f"{unit}: the smoke profile owes its boot alone")
+            confirm = Check(unit, "boot", members[0], TIER_INNER).key if members else confirm
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
-        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmark_members(task_data, unit, members))
+        benchmarked = benchmark_members(task_data, unit, members)
+        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmarked)
+        if benchmarked:
+            confirm = Check(unit, f"accuracy[{benchmark}]", benchmarked[0], TIER_INNER).key
         if serving:
             add(serve.GATE_NAME, TIER_INNER, at=[serve.serve_member(members)])
         # Speculative decoding preserves the output distribution by construction, so a
@@ -503,7 +514,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if single is not None:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
             checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
-    return Contract(checks=tuple(checks), notes=tuple(notes))
+    return Contract(checks=tuple(checks), notes=tuple(notes), confirm=confirm)
 
 
 def write_contract(workspace: Path, contract: Contract) -> Path:
@@ -671,16 +682,16 @@ def evaluate(
 ) -> Evaluation:
     """Each required check against its latest verdict.
 
-    With ``marker``, a verdict recorded against another state of the target is
-    stale and the check counts as missing, unless ``holds`` says it holds there
-    still (what it read of the tree is unchanged: :attr:`Verdict.reads`); so is
-    one whose :attr:`Verdict.inputs` are not the check's (one without inputs
-    counts as the check's). With an established ``marker``, a check with no
-    verdict of its own passes when an equivalent check (the same
-    :attr:`Check.equivalence`) passed on this state of the target. A check's own
-    verdict always wins over an equivalent's, so a check that failed here stays
-    failed, and two verdicts recorded where the marker was not established are
-    never taken to be about one tree.
+    A check that passed stands, whatever the target has become since. With
+    ``marker``, the target's state now, a verdict that failed or is void counts
+    on the state it measured only (or where ``holds`` says what it read of the
+    tree is unchanged: :attr:`Verdict.reads`): once the target has changed, the
+    check is missing and runs again. A verdict whose :attr:`Verdict.inputs` are
+    not the check's is dropped too (one without inputs counts as the check's).
+    With an established ``marker``, a check with no verdict of its own passes
+    when an equivalent check (the same :attr:`Check.equivalence`) passed. A
+    check's own verdict always wins over an equivalent's, so a check that
+    failed here stays failed.
     """
     latest = (
         verdicts.latest()
@@ -688,11 +699,7 @@ def evaluate(
         else {f"{v.unit}:{v.gate}@{v.member}": v for v in verdicts}
     )
     if marker is not None:
-        latest = {
-            k: v
-            for k, v in latest.items()
-            if v.marker == marker or (marker and holds is not None and holds(v))
-        }
+        latest = {k: v for k, v in latest.items() if v.passed or _here(v, marker, holds)}
     checks = {c.key: c for c in contract.checks}
     latest = {
         k: v
@@ -721,6 +728,90 @@ def evaluate(
     return Evaluation(tuple(passed), tuple(failed), tuple(missing), tuple(shared))
 
 
+def _here(verdict: Verdict, marker: str, holds: Callable[[Verdict], bool] | None) -> bool:
+    """Whether ``verdict`` is about the target at ``marker``."""
+    return verdict.marker == marker or bool(marker and holds is not None and holds(verdict))
+
+
+def passed_here(
+    contract: Contract,
+    status: ContractStatus,
+    check: Check,
+    marker: str,
+    holds: Callable[[Verdict], bool] | None = None,
+) -> bool:
+    """Whether ``check`` passed on the target at ``marker``, by its own verdict or an equivalent's.
+
+    Its own verdict on this state wins: a check that failed here did not pass
+    here, whatever an equivalent check found.
+    """
+    latest = status.latest()
+
+    def on_this_state(candidate: Check) -> Verdict | None:
+        verdict = latest.get(candidate.key)
+        if verdict is None or not _here(verdict, marker, holds):
+            return None
+        same_inputs = (
+            not verdict.inputs or not candidate.inputs or verdict.inputs == candidate.inputs
+        )
+        return verdict if same_inputs else None
+
+    own = on_this_state(check)
+    if own is not None:
+        return own.passed
+    if not check.equivalence:
+        return False
+    return any(
+        (verdict := on_this_state(other)) is not None and verdict.passed
+        for other in contract.checks
+        if other.equivalence == check.equivalence
+    )
+
+
+def confirmed(
+    contract: Contract,
+    status: ContractStatus,
+    marker: str,
+    holds: Callable[[Verdict], bool] | None = None,
+) -> bool:
+    """Whether the target at ``marker`` was measured: some required check passed on this very state.
+
+    The checks that passed earlier stand (:func:`evaluate`); this is the one
+    measurement the final tree owes before delivery. A contract that names no
+    confirmation check (:attr:`Contract.confirm`) owes none.
+    """
+    if not contract.confirm:
+        return True
+    return any(passed_here(contract, status, check, marker, holds) for check in contract.required())
+
+
+def measured_where(
+    evaluation: Evaluation,
+    status: ContractStatus,
+    marker: str,
+    since: Callable[[str], str] = lambda tree: "",
+) -> str:
+    """A table of where each passed check was measured, for the delivery report.
+
+    A pass stands whatever landed after it (:func:`evaluate`), so the report
+    says which commit each check measured (:attr:`Verdict.tree_state`) and,
+    through ``since``, how many commits the target has taken on top of it.
+    """
+    latest = status.latest()
+    holder = {check.key: by.key for check, by in evaluation.shared}
+    lines = ["| check | measured at | commits since |", "|---|---|---|"]
+    for check in evaluation.passed:
+        verdict = latest.get(holder.get(check.key, check.key))
+        if verdict is None:
+            continue
+        tree = verdict.tree_state or "unknown"
+        if check.key in holder:
+            tree += f" (by {holder[check.key]})"
+        after = "0, the final tree" if verdict.marker == marker else since(verdict.tree_state)
+        lines.append(f"| {check.key} | {tree} | {after or 'unknown'} |")
+    return "\n".join(lines)
+
+
 def verdict_on(
     status: ContractStatus,
     key: str,
@@ -729,11 +820,7 @@ def verdict_on(
 ) -> Verdict | None:
     """``key``'s latest verdict if it is about the target at ``marker``, as :func:`evaluate` reads it."""
     verdict = status.latest().get(key)
-    if verdict is None:
-        return None
-    if verdict.marker == marker or (marker and holds is not None and holds(verdict)):
-        return verdict
-    return None
+    return verdict if verdict is not None and _here(verdict, marker, holds) else None
 
 
 def measured_commit(

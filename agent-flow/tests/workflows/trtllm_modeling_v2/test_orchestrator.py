@@ -118,6 +118,145 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
     assert "FAILED core:accuracy[gsm8k]@tp1" in turns[1].evaluation.render()
 
 
+_STANDING = c.Contract(
+    checks=(
+        c.Check("core", "boot", "tp1", c.TIER_INNER),
+        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("mtp", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
+    ),
+    confirm="mtp:accuracy[gsm8k]@tp1",
+)
+_CORE = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
+_MTP = ["mtp:accuracy[gsm8k]@tp1", "mtp:acceptance@tp1"]
+
+
+def _moving_target(plan, *, failing=lambda key, marker: False):
+    """Services whose target changes each time a task's work ends; ``ran`` is (check, state) pairs."""
+    landed = []
+    ran = []
+
+    def work(task):
+        landed.append(task.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        marker = f"m{len(landed)}"
+        ran.append((chk.key, marker))
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not failing(chk.key, marker))  # fmt: skip
+
+    services = Services(
+        plan=plan, work=work, check=check, free_gpus=lambda: 4, marker=lambda: f"m{len(landed)}"
+    )
+    services.ran = ran  # type: ignore[attr-defined]
+    return services
+
+
+def _standing_run(tmp_path, services) -> str:
+    status = c.ContractStatus.load(tmp_path)
+    return GraphOrchestrator(services, _STANDING, status, tmp_path, poll_s=0).run()
+
+
+def test_a_check_that_passed_stands_when_a_later_task_lands(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE), _task("mtp", "feature", _MTP, deps=["core"])
+    )
+    services = _moving_target(plan)
+    assert _standing_run(tmp_path, services) == "delivered"
+    # Each check ran once, where its own task landed. The core's were not run again on
+    # the state mtp left, and mtp's own checks, which ran on the final tree, confirm it.
+    assert sorted(services.ran) == sorted([(k, "m1") for k in _CORE] + [(k, "m2") for k in _MTP])
+
+
+def test_the_final_tree_is_confirmed_by_one_check_when_none_ran_on_it(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("mtp", "feature", _MTP, deps=["core"]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+    services = _moving_target(plan)
+    assert _standing_run(tmp_path, services) == "delivered"
+    # `tidy` claims no check and changed the target last: one check runs on what it left.
+    assert services.ran[-1] == ("mtp:accuracy[gsm8k]@tp1", "m3")
+    assert sorted(services.ran[:-1]) == sorted(
+        [(k, "m1") for k in _CORE] + [(k, "m2") for k in _MTP]
+    )
+
+
+def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            tasks = [
+                _task("core", "assemble", _CORE),
+                _task("mtp", "feature", _MTP, deps=["core"]),
+                _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        if any(
+            f"the check of the final tree failed: {_STANDING.confirm}" in e for e in turn.events
+        ):
+            return PlannerAnswer("CEILING", "the last change broke the drafter")
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: marker == "m3")
+    assert _standing_run(tmp_path, services) == "ceiling"
+    assert services.ran[-1] == (_STANDING.confirm, "m3")
+
+
+def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
+    boot, benchmark = _STANDING.checks[:2]
+    contract = c.Contract(checks=(boot, benchmark), confirm=benchmark.key)
+    status = c.ContractStatus.load(tmp_path)
+
+    def result(check, passed):
+        return SimpleNamespace(name=check.gate, member=check.member, passed=passed, detail="")
+
+    status.record("core", result(boot, True), marker="m1")
+    status.record("core", result(benchmark, False), marker="m1")
+    here = c.evaluate(contract, status, marker="m1")
+    assert [x.key for x in here.passed] == [boot.key]
+    assert [x.key for x, _ in here.failed] == [benchmark.key]
+    # On the state a later change left, the pass stands and the failure is due again.
+    later = c.evaluate(contract, status, marker="m2")
+    assert [x.key for x in later.passed] == [boot.key]
+    assert not later.failed and [x.key for x in later.missing] == [benchmark.key]
+    # Standing is not having run there: only m1 was measured.
+    assert c.confirmed(contract, status, "m1") and not c.confirmed(contract, status, "m2")
+    assert c.passed_here(contract, status, boot, "m1")
+    assert not c.passed_here(contract, status, boot, "m2")
+    # The delivery report says where the standing pass was measured.
+    table = c.measured_where(later, status, "m2", since=lambda tree: "3")
+    assert "| core:boot@tp1 | unknown | 3 |" in table
+    assert "0, the final tree" in c.measured_where(here, status, "m1")
+
+
+def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("checks failed: core:boot@tp1" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(_task("fix", "assemble", _CORE[:1], touches=["models/core/"]))
+            return PlannerAnswer("GRAPH_UPDATED", "repair", graph)
+        if not repaired:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[0], "m1"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The repair claims the boot, which runs on what it left. The benchmark that passed
+    # beside the failure stands, and the boot's pass confirms the final tree.
+    assert sorted(services.ran) == [(_CORE[1], "m1"), (_CORE[0], "m1"), (_CORE[0], "m2")]
+
+
 @pytest.mark.parametrize(
     "decision, retried",
     [("raised TimeoutError: no answer from the driver", True), ("BLOCKED", False)],
