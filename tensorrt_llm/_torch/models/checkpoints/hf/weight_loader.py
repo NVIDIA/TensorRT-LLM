@@ -37,8 +37,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
     CheckpointCatalog
-from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import \
-    build_safetensors_checkpoint_catalog
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import (
+    _read_safetensors_header, build_safetensors_checkpoint_catalog)
 from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
     RankStripedReadAheadSession, build_local_plan, close_node_communicator,
     coordinate_error, effective_available_host_memory, memory_admission)
@@ -676,6 +676,30 @@ class HfWeightLoader(BaseWeightLoader):
         ]
         return filtered_weight_files or weight_files
 
+    def _files_with_key_prefixes(
+            self, weight_files: list[str],
+            key_prefixes: tuple[str, ...] | None) -> list[str]:
+        """Return the files whose SafeTensors headers hold keys under ``key_prefixes``.
+
+        Every file is returned if none holds such a key; an unreadable header raises ``ValueError``.
+        """
+        # The raw weight cache is keyed by file set; a full read lets the draft reuse the target's entry.
+        if (not key_prefixes or not weight_files
+                or (self._is_weight_cache_enabled()
+                    and self._weight_cache_max_entries() > 0)):
+            return weight_files
+        selected = []
+        for path in weight_files:
+            _, _, header = _read_safetensors_header(path)
+            if any(key != "__metadata__" and key.startswith(key_prefixes)
+                   for key in header):
+                selected.append(path)
+        if not selected:
+            return weight_files
+        logger.debug(f"Reading {len(selected)} of {len(weight_files)} "
+                     f"checkpoint files that hold {key_prefixes} keys.")
+        return selected
+
     def build_checkpoint_catalog(
             self,
             checkpoint_dir: str,
@@ -853,8 +877,10 @@ class HfWeightLoader(BaseWeightLoader):
                 eligibility_reason = (
                     "the checkpoint requires model-specific lazy SafeTensors loading"
                 )
-            weight_files = self._selected_safetensors_files(
-                checkpoint_dir, use_consolidated)
+            weight_files = self._files_with_key_prefixes(
+                self._selected_safetensors_files(checkpoint_dir,
+                                                 use_consolidated),
+                kwargs.get("key_prefixes"))
             stats = [(path, os.stat(path)) for path in weight_files]
             if not weight_files:
                 eligibility_reason = "no SafeTensors checkpoint files were found"
@@ -1012,6 +1038,7 @@ class HfWeightLoader(BaseWeightLoader):
                              *,
                              _local_communicator=None,
                              _allow_prefetch: bool = True,
+                             key_prefixes: tuple[str, ...] | None = None,
                              **kwargs) -> dict[str, Any]:
         """Load weights with the native (no read-ahead) I/O policy."""
         if self._requires_lazy_safetensors(checkpoint_dir):
@@ -1026,6 +1053,16 @@ class HfWeightLoader(BaseWeightLoader):
         ]
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
+        try:
+            weight_files = self._files_with_key_prefixes(
+                weight_files, key_prefixes)
+        except ValueError as error:
+            # Ranks may select different files here; the native collectives don't depend on them.
+            cause = "" if error.__cause__ is None else f" ({error.__cause__})"
+            logger.warning_once(
+                "Reading every checkpoint file because a SafeTensors header "
+                f"could not be read: {error}{cause}.",
+                key="hf_weight_loader_key_prefix_header")
         if weight_files:
             if _local_communicator is None and _allow_prefetch:
                 return self._with_weight_cache(
