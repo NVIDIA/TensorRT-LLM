@@ -958,6 +958,13 @@ class CUDAGraphRunner:
             self._can_run_cuda_graph_batch(batch) and
             (spec_metadata is None or self.config.sampling_variants is None or
              sampling_variant(spec_metadata) in self.config.sampling_variants))
+        if can_run_cuda_graph and getattr(
+                attn_metadata, "beam_shared_prefix_enabled", False) is True:
+            # A beam longer than the library's captured tail runs this step eagerly.
+            from ..attention.backends.fmha.beam_shared_prefix import \
+                tail_exceeds_cuda_graph
+            can_run_cuda_graph = not tail_exceeds_cuda_graph(
+                batch.generation_requests)
         batch_size = batch.batch_size
         shapes_agree, forced_sample_type, forced_variants = self._agree_graph_shape(
             batch, can_run_cuda_graph, promoted_context_request_ids,
