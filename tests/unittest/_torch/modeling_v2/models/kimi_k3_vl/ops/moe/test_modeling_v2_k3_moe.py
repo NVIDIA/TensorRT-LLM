@@ -163,7 +163,7 @@ def _bias() -> torch.Tensor:
     return _experts()[2]
 
 
-def _weights(p):
+def _weights(p) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """A layer's four TRTLLM-Gen buffers, in K3MoeState.layer's argument order."""
     return p["w31"], p["w31s"], p["w2"], p["w2s"]
 
@@ -227,7 +227,7 @@ def _draw(seed: int, rows: int):
     return logits, torch.randn(rows, H, generator=gen, device=DEV).bfloat16()
 
 
-def _routed_zeros(rows: int):
+def _routed_zeros(rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """k3_moe's inputs for ``rows`` tokens, all zero: (x_fp8, x_sf, topk_ids, topk_weights)."""
     return (
         torch.zeros(rows, H, dtype=torch.float8_e4m3fn, device=DEV),

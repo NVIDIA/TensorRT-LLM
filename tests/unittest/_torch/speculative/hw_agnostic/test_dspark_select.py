@@ -11,6 +11,8 @@ from tensorrt_llm._torch.speculative.dspark_select import (
     select_windows_device,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_fresh_confidence_spends_budget_on_the_best_real_row():
     result = select_windows_device(

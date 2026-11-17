@@ -33,7 +33,7 @@ def _compiled(topk: int, max_blocks: int):
     return _COMPILED[key]
 
 
-def _build(spec, seed):
+def _build(spec, seed) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     """`(req_id, block_table, token_indices, block_size, stride_factor)` for one cell.
 
     Request `s` contributes `seq_rows[s]` query rows; row `j` sees positions
@@ -96,7 +96,10 @@ def test_certified_cells(cell) -> None:
         out = op(*args, spec["layer_id"], compiled=compiled)
     for a, s in zip(args[:3], snap):
         assert torch.equal(a, s), "an input tensor was mutated"
-    _compare(out, op.reference(*args, spec["layer_id"], compiled=compiled))
+    _compare(
+        out,
+        op.reference(*args, spec["layer_id"], compiled=compiled),
+    )
     # The padding has to survive as -1, not as a row computed from -1.
     assert bool((out[args[2] < 0] == -1).all())
     if spec.get("pad_block_table"):
@@ -120,7 +123,7 @@ def test_hand_worked_rows() -> None:
     assert out[1, :4].tolist() == [191, 352, 33, -1]
 
 
-def _small():
+def _small() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     return _build(
         dict(topk=2048, pool_layers=79, seq_rows=[2], kv_lens=[3000], max_blocks=512), seed=7
     )

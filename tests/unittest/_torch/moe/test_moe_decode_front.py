@@ -158,7 +158,9 @@ def _ref_route(
         E=E, K=K, KP=16, TILE=tile, NL=nl, NLP=nlp,
         EXPANDED_PAD=triton.next_power_of_2(m * K),
         MAX_CTAS_PER_EXPERT=triton.cdiv(m, tile),
-        USE_PDL=False, QUANT_H=h if quant else 0, num_warps=4,
+        USE_PDL=False, QUANT_H=h if quant else 0,
+        # pyrefly: ignore [unexpected-keyword]
+        num_warps=4,
     )  # fmt: skip
     return ids, wts, flat, xq, xsf
 
@@ -734,11 +736,26 @@ def test_pdl_delayed_producer(m=7, nl=128, ls=128, inter=512, tile=8):
     def producer():
         x.fill_(3.0e4)
         grid = (triton.cdiv(n, 4096),)
-        _delayed_producer_kernel[grid](x_src, x, n, 50000, BLOCK=4096, launch_pdl=True)
+        _delayed_producer_kernel[grid](
+            x_src,
+            x,
+            n,
+            50000,
+            BLOCK=4096,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=True,
+        )
 
     def control():
         producer()
-        _nowait_copy_kernel[(triton.cdiv(n, 4096),)](x, y, n, BLOCK=4096, launch_pdl=True)
+        _nowait_copy_kernel[(triton.cdiv(n, 4096),)](
+            x,
+            y,
+            n,
+            BLOCK=4096,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=True,
+        )
 
     def step():
         producer()

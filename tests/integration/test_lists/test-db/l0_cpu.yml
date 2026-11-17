@@ -126,6 +126,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
   - unittest/_torch/modeling_v2/test_modeling_v2_fp4_test_helpers.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
@@ -143,56 +144,22 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
+  - unittest/_torch/models/test_minimax_m3.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
-  - unittest/_torch/models/test_minimax_m3.py::test_validate_sparse_attention_runtime_config_backend_selection
-  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_cache_fused_layout_validation
-  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage
-  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_quantized_main_kv_cache
-  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_preserves_index_head_groups
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shards_index_rows
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_head_range_rejects_invalid_geometry
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
-  - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
-  - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_preserves_symbolic_shapes
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captures_horizontal_producer_before_attention
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_rejects_unavailable_fusion
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_declares_cache_mutations
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_unfused_indexer_keeps_cache_write_eager
-  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
   # leaves the checkpoint-backed tests out.
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
-  # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: config expansion and
-  # index-projection quantization.
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_declares_its_checkpoint_names
-  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_expands_to_mixed_precision
-  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_a_quantized_head
-  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_partly_excluded_fused_projections
-  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_unsupported_expert_recipes
-  - unittest/_torch/models/test_minimax_m3.py::test_uniform_mxfp8_and_bf16_configs_are_unchanged
-  - unittest/_torch/models/test_minimax_m3.py::test_modelopt_mixed_precision_map_is_normalized
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -215,6 +182,7 @@ l0_cpu:
   - unittest/_torch/models/test_qwen3next_moe_input_dual_quant.py
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
   - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
+  - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_moe_deterministic_config.py
@@ -242,6 +210,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_flux2_load_weights.py
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
+  - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_ltx23_registry.py
@@ -342,6 +311,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
+  - unittest/llmapi/apps/test_openai_input_metrics.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
   - unittest/llmapi/apps/test_openai_server_graceful_shutdown.py
@@ -357,6 +327,8 @@ l0_cpu:
   - unittest/llmapi/apps/test_request_metrics.py::test_header_derived_record_keeps_kv_transfer_without_kv_cache_size
   - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_request_metrics.py::TestJsonlWriterSurvival
+  - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_survive_headers_disagg_and_jsonl
+  - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_are_request_local_and_exported
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py

@@ -110,7 +110,11 @@ init_ubuntu() {
     pigz \
     libzmq3-dev \
     libssl3t64 \
-    openssl
+    openssl \
+    apt \
+    apt-utils \
+    libbrotli1 \
+    libapt-pkg6.0t64
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
