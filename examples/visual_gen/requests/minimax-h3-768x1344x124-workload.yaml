@@ -10,7 +10,7 @@ common_params:
   height: 768
   num_frames: 124
   frame_rate: 24
-  num_inference_steps: 28
+  num_inference_steps: 50
   seed: 42
 requests:
   - prompt_file: minimax-h3-768x1344x124.json
