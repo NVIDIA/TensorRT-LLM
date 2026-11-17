@@ -34,12 +34,14 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -329,9 +331,17 @@ struct FmhaParams
         {
             return static_cast<kernels::KVBlockArray::DataType*>(kv_block_table.value().data_ptr());
         }
-        return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
-                   meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
-                                                       : nullptr;
+        if (!meta.kv_cache_block_offsets.has_value())
+        {
+            return nullptr;
+        }
+        auto const& offsets = meta.kv_cache_block_offsets.value();
+        TORCH_CHECK(offsets.dim() >= 2 && offsets.element_size() == sizeof(kernels::KVBlockArray::DataType),
+            "kv_cache_block_offsets must be a [num_pools, num_seqs, ...] tensor of KV block indices.");
+        TORCH_CHECK(poolIndex >= 0 && poolIndex < offsets.size(0) && seq_offset >= 0 && seq_offset < offsets.size(1),
+            "kv_cache_block_offsets has no row for pool ", poolIndex, " and sequence ", seq_offset, ".");
+        return static_cast<kernels::KVBlockArray::DataType*>(offsets.data_ptr()) + poolIndex * offsets.stride(0)
+            + seq_offset * offsets.stride(1);
     }
 
     // Quantization scales and output quantization.
@@ -373,6 +383,10 @@ struct FmhaParams
         {
             return 0;
         }
+        if (auto const* lengths = hostInt32Range(meta.kv_lens_runtime, seqOffset, numSeqs))
+        {
+            return *std::max_element(lengths, lengths + numSeqs);
+        }
         return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
     }
 
@@ -381,6 +395,10 @@ struct FmhaParams
         if (numSeqs <= 0)
         {
             return 0;
+        }
+        if (auto const* lengths = hostInt32Range(meta.prompt_lens_cpu_runtime, seqOffset, numSeqs))
+        {
+            return *std::max_element(lengths, lengths + numSeqs);
         }
         return meta.prompt_lens_cpu_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
     }
@@ -395,9 +413,32 @@ struct FmhaParams
         }
         if (host_total_kv_lens.has_value())
         {
+            if (auto const* totals = hostInt32Range(host_total_kv_lens.value(), 0, 2))
+            {
+                return totals[isGen ? 1 : 0];
+            }
             return host_total_kv_lens.value().select(0, isGen ? 1 : 0).item<int32_t>();
         }
+        if (auto const* lengths = hostInt32Range(meta.kv_lens_runtime, seqOffset, numSeqs))
+        {
+            return static_cast<int32_t>(std::accumulate(lengths, lengths + numSeqs, int64_t{0}));
+        }
         return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).sum().item<int32_t>();
+    }
+
+    /// Elements [offset, offset + count) of a contiguous 1-D CPU int32 tensor, read in place, or
+    /// null for another layout. Every layer reads its phase's host lengths, where an ATen
+    /// reduction costs more host time than the few values it reads.
+    [[nodiscard]] static int32_t const* hostInt32Range(torch::Tensor const& tensor, int64_t offset, int64_t count)
+    {
+        if (!tensor.defined() || !tensor.device().is_cpu() || tensor.scalar_type() != torch::kInt32 || tensor.dim() != 1
+            || tensor.stride(0) != 1)
+        {
+            return nullptr;
+        }
+        TORCH_CHECK(offset >= 0 && count >= 0 && offset + count <= tensor.size(0), "Host length range [", offset, ", ",
+            offset + count, ") is outside a tensor of ", tensor.size(0), " elements.");
+        return tensor.data_ptr<int32_t>() + offset;
     }
 
     [[nodiscard]] int getCacheIndirectionWindowSize(int defaultValue) const
@@ -448,16 +489,22 @@ struct FmhaParams
     // differ for draft / MTP models, whose mapping holds only their own layers.
     [[nodiscard]] int32_t getKvCachePoolIndex(int64_t localLayerIdx) const
     {
-        return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 0}).item<int32_t>()
-            : 0;
+        return meta.host_kv_cache_pool_mapping.has_value() ? readPoolMapping(localLayerIdx, 0) : 0;
     }
 
     [[nodiscard]] int32_t getLayerIdxInCachePool(int64_t localLayerIdx) const
     {
-        return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 1}).item<int32_t>()
-            : 0;
+        return meta.host_kv_cache_pool_mapping.has_value() ? readPoolMapping(localLayerIdx, 1) : 0;
+    }
+
+    /// Column \p column (pool index, or layer index within the pool) of a layer's row.
+    [[nodiscard]] int32_t readPoolMapping(int64_t localLayerIdx, int64_t column) const
+    {
+        auto const& mapping = checkedPoolMapping(localLayerIdx);
+        TORCH_CHECK(mapping.device().is_cpu() && mapping.scalar_type() == torch::kInt32 && mapping.dim() == 2
+                && mapping.size(1) >= 2,
+            "host_kv_cache_pool_mapping must be a CPU int32 [num_layers, >= 2] tensor.");
+        return mapping.data_ptr<int32_t>()[localLayerIdx * mapping.stride(0) + column * mapping.stride(1)];
     }
 
     [[nodiscard]] torch::Tensor const& checkedPoolMapping(int64_t localLayerIdx) const
