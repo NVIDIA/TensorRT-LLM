@@ -188,12 +188,6 @@ class CuteDslLocalityDomainMixin:
         if self._locality_domain_weight_shards is not None:
             self.pre_reload_weights()
         super().load_weights(weights, allow_partial_loading=allow_partial_loading)
-        # Keep DWDP registration after base weight loading. This preserves
-        # loaded tensors for collector setup and remains compatible with the
-        # later locality domain transform_weights splitting flow.
-        dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
-        if dwdp_handle_collector is not None:
-            dwdp_handle_collector.register_weights(self)
 
     def transform_weights(self) -> None:
         """Run the base transform, then split the weights into localized shards."""

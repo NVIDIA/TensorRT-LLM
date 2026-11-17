@@ -281,15 +281,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         the tuned tile; not with a slot remap."""
         return self.num_slots == self.num_experts
 
-    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
-        super().load_weights(weights, allow_partial_loading=allow_partial_loading)
-        # DWDP registers the freshly loaded expert weights with its handle
-        # collector; same hook TrtllmCutedslGroupedGemmNvfp4Impl exposes
-        # (supports_dwdp=True).
-        dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
-        if dwdp_handle_collector is not None:
-            dwdp_handle_collector.register_weights(self)
-
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
         return NvFp4WeightView(

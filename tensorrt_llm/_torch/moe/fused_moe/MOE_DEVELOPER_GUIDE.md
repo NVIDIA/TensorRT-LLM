@@ -517,7 +517,9 @@ kernel segment says how much of the expert MLP one launch covers:
 `grouped_gemm` runs FC1 and FC2 as two grouped GEMMs, `fused_fc12` runs both in
 one persistent kernel, and `dense_gemm` packs every expert into one dense matrix
 for small token counts. Inheritance stays inside a kernel; kernels share only the
-package-level modules. `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
+package-level modules, which may include a mixin such as
+`CuteDslLocalityDomainMixin` that leaves of different kernels take (never a
+kernel root). `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
 `fused_moe_densegemm.py` above it hold no code: they define `CuteDslFusedMoE`,
 `CuteDslFc12FusedMoE` and `DenseGEMMFusedMoE`. The grouped-GEMM lookups,
 `cutedsl_grouped_gemm_leaf` / `find_cutedsl_grouped_gemm_leaf`, are exported by
