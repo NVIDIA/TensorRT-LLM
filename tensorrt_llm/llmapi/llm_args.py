@@ -6380,7 +6380,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "hook is skipped entirely and pool ratios remain at their "
         "warmup-derived values. Beta: enable at your own risk. Only used when "
         "using KV cache manager v2 (experimental). This option is incompatible "
-        "with dtype='fp8_ds_mla' and with CSA2 sparse attention.")
+        "with dtype='fp8_ds_mla' and with CSA2 sparse attention. Disaggregated "
+        "serving: context servers rebalance, draining in-flight KV sends first "
+        "(a drain that does not finish in time skips the rebalance and backs "
+        "off). A server is vetoed for good, on every rank, once it registers "
+        "with a context peer (it receives KV, so a peer holds its pool layout), "
+        "which turns rebalancing off on generation servers in practice, and "
+        "once a peer on another node registers unless "
+        "``kv_pool_rebalance_config.allow_cross_node_disagg`` is set. "
+        "Transceivers that cannot support it (e.g. pipelined transfer) refuse "
+        "rebalancing.")
 
     kv_pool_rebalance_config: KvPoolRebalanceConfig = Field(
         default_factory=KvPoolRebalanceConfig,

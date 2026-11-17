@@ -707,6 +707,8 @@ private:
 
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
+    // getQuota without taking the API lock; the caller must hold it.
+    size_t _getQuota(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
 

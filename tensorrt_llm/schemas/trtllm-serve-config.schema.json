@@ -3694,7 +3694,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention. Disaggregated serving: context servers rebalance, draining in-flight KV sends first (a drain that does not finish in time skips the rebalance and backs off). A server is vetoed for good, on every rank, once it registers with a context peer (it receives KV, so a peer holds its pool layout), which turns rebalancing off on generation servers in practice, and once a peer on another node registers unless ``kv_pool_rebalance_config.allow_cross_node_disagg`` is set. Transceivers that cannot support it (e.g. pipelined transfer) refuse rebalancing.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -4119,6 +4119,13 @@
       "additionalProperties": false,
       "description": "Tuning for the KV cache manager v2 pool rebalance auto-tuner.\n\nOnly used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.",
       "properties": {
+        "allow_cross_node_disagg": {
+          "default": false,
+          "description": "Disaggregated context servers: keep rebalancing after a KV transfer peer is found on another node. Rebalancing there is validated for intra-node transfers only, so by default it is switched off on every rank once a peer on another host registers.",
+          "status": "prototype",
+          "title": "Allow Cross Node Disagg",
+          "type": "boolean"
+        },
         "check_interval": {
           "default": 10,
           "description": "Number of PyExecutor iterations between checks of whether a pool rebalance should be attempted.",

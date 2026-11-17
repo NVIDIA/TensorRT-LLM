@@ -1021,6 +1021,11 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 size_t KvCacheManager::getQuota(CacheLevel level) const
 {
     auto const apiLock = lockShared();
+    return _getQuota(level);
+}
+
+size_t KvCacheManager::_getQuota(CacheLevel level) const
+{
     auto const& storage = *mStorage->mLevels.at(level).storage;
     return storage.roundedNumBytes(storage.cacheTier());
 }
@@ -1646,7 +1651,9 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::plannedSlotCounts() const
             current[pgIdx] = mStorage->numSlots(pgIdx, kHotLevel);
         return current;
     }
-    return mStorage->planCacheLevel(kHotLevel, getQuota(kHotLevel), _getTargetRatioList(kHotLevel));
+    // _getQuota, not getQuota: the shared lock is already held, and a nested shared
+    // acquisition can deadlock behind a queued writer.
+    return mStorage->planCacheLevel(kHotLevel, _getQuota(kHotLevel), _getTargetRatioList(kHotLevel));
 }
 
 void KvCacheManager::adjust()

@@ -879,6 +879,11 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.allow_cross_node_disagg"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
