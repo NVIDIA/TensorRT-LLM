@@ -1285,6 +1285,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         )
 
         spec_config = kwargs.get("spec_config")
+        gen_preemption_headroom = int(kwargs.get("gen_preemption_headroom", 0))
         _, _, local_attention_layers = _get_local_mamba_cache_layout(
             model_config,
             mapping,
@@ -1300,9 +1301,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             max_batch_size=max_batch_size,
             spec_config=spec_config,
             is_disagg=kwargs.get("is_disagg", False),
+            gen_preemption_headroom=gen_preemption_headroom,
         )
         attention_page_bytes = 0
-        max_resident_sequences = max_batch_size * mapping.pp_size
+        # GEN slot preemption pauses residents in place, so the headroom keeps HP rings too.
+        max_resident_sequences = max_batch_size * mapping.pp_size + gen_preemption_headroom
         if max_resident_sequences > 0:
             attention_page_bytes = attention_intercept // max_resident_sequences
         return attention_slope, attention_intercept, attention_page_bytes

@@ -1394,6 +1394,17 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
     # cache manager __init__ coerces a positive spec recompute tail to a full
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
+    # The GDN layers it serves verify drafts without the fused kernels.
+    gdn_fused_verify = False
+
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay; smaller batches commit inside each layer."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        )
+
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     def __init__(
         self,

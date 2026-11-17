@@ -688,6 +688,31 @@ def test_family_managers_name_their_family_mamba_metadata():
         assert getattr(object.__new__(manager_cls), "mamba_metadata_cls", None) is None
 
 
+def test_gdn_serving_managers_choose_the_replay_partition():
+    """Every manager that serves GDN layers tells them whether a decode batch takes the
+    partitioned replay; the fused target verify commits in-layer at every batch size."""
+    from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        CppMambaHybridCacheManager,
+        MixedMambaHybridCacheManager,
+    )
+
+    # The V1 Mixed manager never receives the flag, so its GDN layers keep the unfused verify.
+    assert object.__new__(MixedMambaHybridCacheManager).gdn_fused_verify is False
+    for manager_cls in (
+        MixedMambaHybridCacheManager,
+        CppMambaHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+    ):
+        manager = object.__new__(manager_cls)
+        manager.gdn_fused_verify = False
+        assert not manager.gdn_replay_partitioned(CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE - 1)
+        assert manager.gdn_replay_partitioned(CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE)
+        manager.gdn_fused_verify = True
+        assert not manager.gdn_replay_partitioned(CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE)
+
+
 def test_family_metadata_classes_are_independent():
     """The Mamba2 and GDN metadata classes extend the generic Mamba2Metadata side by side."""
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -2522,7 +2547,8 @@ def test_kimi_k3_estimates_the_fp4_mla_attention_cost(monkeypatch):
 
     def fp4_cost(model_config, mapping, num_layers=None, **kwargs):
         calls.append((num_layers, kwargs))
-        return 40, 4 * 1000
+        # One 1000-byte HP ring per resident sequence, the GEN preemption headroom included.
+        return 40, (kwargs["max_batch_size"] + kwargs.get("gen_preemption_headroom", 0)) * 1000
 
     monkeypatch.setattr(
         fp4_mla.Fp4MlaKVCacheManagerV2, "get_cache_size_per_token", staticmethod(fp4_cost)
@@ -2546,6 +2572,16 @@ def test_kimi_k3_estimates_the_fp4_mla_attention_cost(monkeypatch):
     ((num_layers, kwargs),) = calls
     assert num_layers == 3
     assert kwargs["tokens_per_block"] == 128 and kwargs["is_disagg"] is True
+    # The paused residents of GEN slot preemption keep their HP rings: six rings for
+    # four requests and a headroom of two, and still one ring per sequence.
+    assert KimiK3HybridCacheManager._estimate_attention_cache_cost(
+        model_config(True),
+        mapping,
+        max_batch_size=4,
+        tokens_per_block=128,
+        gen_preemption_headroom=2,
+    ) == (40, 6000, 1000)
+    assert calls[-1][1]["gen_preemption_headroom"] == 2
     assert KimiK3HybridCacheManager._estimate_attention_cache_cost(
         model_config(False), mapping, max_batch_size=4, tokens_per_block=128
     ) == (None, 0, 0)

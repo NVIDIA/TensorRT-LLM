@@ -22,7 +22,7 @@ _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
 # Decode batch size from which the partitioned replay and one all-layer checkpoint commit are used; smaller
-# batches commit inside each layer's replay (see MambaHybridCacheManager.gdn_replay_partitioned).
+# batches commit inside each layer's replay (see gdn_replay_partitioned of the cache managers serving GDN layers).
 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
 
 

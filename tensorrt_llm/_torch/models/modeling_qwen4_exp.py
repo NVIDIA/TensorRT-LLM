@@ -37,7 +37,7 @@ from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fla.gdn_metadata import GDNMambaMetadata
+from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
@@ -791,23 +791,7 @@ class Qwen4ExpModel(DecoderModel):
                 "same time, and must specify either one"
             )
 
-        # Refresh mamba metadata for the batch size, mirroring Qwen3NextModel.
-        mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
-        if (
-            mamba_metadata is not None
-            and getattr(mamba_metadata, "max_batch_size", None) != attn_metadata.max_num_requests
-        ):
-            # Attention metadata without a Mamba cache manager holds False instead of metadata;
-            # the GDN layers read the GDN metadata's state.
-            metadata_cls = (
-                type(mamba_metadata)
-                if isinstance(mamba_metadata, GDNMambaMetadata)
-                else GDNMambaMetadata
-            )
-            attn_metadata.mamba_metadata = metadata_cls(
-                attn_metadata.max_num_requests, chunk_size=128
-            )
-            mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata = gdn_metadata_for_batch(attn_metadata)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

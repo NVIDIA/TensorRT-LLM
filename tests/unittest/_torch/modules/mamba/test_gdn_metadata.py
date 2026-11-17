@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fla import gdn_metadata
-from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
 from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
@@ -126,6 +126,57 @@ def test_warmup_split_reaches_prepare_from_any_resolved_class():
     # Both requests with room for the longest tail are split, the 2-token one is not.
     assert split.k == 2
     assert split.stage_rows.tolist() == [0, 1]
+    # Requests 10 and 12 are split: their tails are tokens 16-19 and 48-51 of the batch.
+    assert split.tail_tok.tolist() == [16, 17, 18, 19, 48, 49, 50, 51]
 
     metadata.prepare(attn)
     assert metadata.inforward_split is None
+
+
+class _ModelMetadata(GDNMambaMetadata):
+    pass
+
+
+@pytest.mark.parametrize("metadata_cls", [GDNMambaMetadata, _ModelMetadata])
+def test_metadata_rebuilt_for_the_batch_capacity_is_prepared_and_shared(metadata_cls):
+    """A rebuilt metadata keeps the GDN class in use and is prepared for the batch, and the
+    attention metadata holds the instance the model hands its layers."""
+    manager = _CacheManager({10: 4, 11: 1})
+    attn = _attn_metadata(manager, [], cached=[], num_decodes=2)
+    attn.max_num_requests = 2
+    attn.mamba_metadata = metadata_cls(max_batch_size=1, chunk_size=128)
+
+    metadata = gdn_metadata_for_batch(attn)
+    torch.cuda.synchronize()
+
+    assert type(metadata) is metadata_cls
+    assert metadata.max_batch_size == 2
+    assert attn.mamba_metadata is metadata
+    # Prepared for this batch: the decode rows carry the requests' state slots.
+    assert metadata.state_indices[:2].tolist() == [4, 1]
+
+
+def test_metadata_without_a_mamba_cache_manager_is_rebuilt_unprepared(monkeypatch):
+    """Attention metadata without a Mamba cache manager holds False and has no state to prepare."""
+    monkeypatch.setattr(
+        GDNMambaMetadata, "prepare", lambda self, attn_metadata: pytest.fail("prepared")
+    )
+    attn = SimpleNamespace(mamba_metadata=False, max_num_requests=2)
+
+    metadata = gdn_metadata_for_batch(attn)
+
+    assert type(metadata) is GDNMambaMetadata
+    assert metadata.max_batch_size == 2
+    assert attn.mamba_metadata is metadata
+
+
+def test_metadata_of_the_batch_capacity_is_kept():
+    manager = _CacheManager({10: 4})
+    attn = _attn_metadata(manager, [], cached=[], num_decodes=1)
+    attn.max_num_requests = 2
+    current = GDNMambaMetadata(max_batch_size=2, chunk_size=128)
+    attn.mamba_metadata = current
+
+    assert gdn_metadata_for_batch(attn) is current
+    attn.mamba_metadata = None
+    assert gdn_metadata_for_batch(attn) is None

@@ -350,7 +350,31 @@ class GDNMambaMetadata(Mamba2Metadata):
         return plan
 
 
+def gdn_metadata_for_batch(attn_metadata: AttentionMetadata) -> GDNMambaMetadata | None:
+    """The attention metadata's GDN Mamba metadata, rebuilt when its capacity is not the batch's.
+
+    A rebuilt instance keeps the GDN metadata class in use and replaces
+    ``attn_metadata.mamba_metadata``, so the GDN layers and the cache manager's
+    acceptance update read the same instance; it is prepared for this batch.
+    Attention metadata without a Mamba cache manager holds ``False``: it is
+    rebuilt too, with no state to prepare. None (not yet prepared) is returned
+    as is.
+    """
+    metadata = attn_metadata.mamba_metadata
+    if metadata is None or (
+        getattr(metadata, "max_batch_size", None) == attn_metadata.max_num_requests
+    ):
+        return metadata
+    metadata_cls = type(metadata) if isinstance(metadata, GDNMambaMetadata) else GDNMambaMetadata
+    rebuilt = metadata_cls(attn_metadata.max_num_requests, chunk_size=128)
+    if metadata is not False:
+        rebuilt.prepare(attn_metadata)
+    attn_metadata.mamba_metadata = rebuilt
+    return rebuilt
+
+
 __all__ = [
     "GDNMambaMetadata",
     "InforwardSnapshotSplit",
+    "gdn_metadata_for_batch",
 ]
