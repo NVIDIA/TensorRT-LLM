@@ -87,15 +87,18 @@ def _common_prefix(a, b):
 
 
 @pytest.mark.high_cuda_memory
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph):
+@pytest.mark.parametrize("use_cuda_graph, dual_key", [(False, False), (True, False), (True, True)])
+def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph, dual_key):
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load target + draft model")
     # Without context deduplication every position is keyed, so the comparison is exact
     # up to numerical differences between the verification and the decoding kernels.
-    config = WatermarkConfig(key=0x5EED5EED, deduplicate_contexts="none")
+    # With dual keys, exact-match speculation routes tokens between the two keys exactly as plain
+    # decoding does for the same seed.
+    dual = dict(algorithm="gumbel_dual_key", alpha=0.25) if dual_key else {}
+    config = WatermarkConfig(key=0x5EED5EED, deduplicate_contexts="none", **dual)
     sampling_params = SamplingParams(
-        max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True
+        max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True, seed=11
     )
     plain = _generate(config, False, use_cuda_graph, sampling_params)
     speculative = _generate(config, True, use_cuda_graph, sampling_params)

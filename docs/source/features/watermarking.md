@@ -25,7 +25,7 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `algorithm` | `"gumbel"` | `"gumbel"` or `"gumbel_dual_key"`. Dual-key additionally supports speculative decoding with rejection sampling (see below). |
-| `alpha` | 0.1 | Only for `"gumbel_dual_key"`. Probability that a token of ordinary decoding (and of exact-match speculative decoding) is drawn under the second key instead of the first. The choice comes from a random stream of the request, so requests with the same prompt diverge; a request with a `seed` reproduces it. `0` uses the first key for every such token. Rejection-sampling speculative decoding ignores it: the speculative protocol picks the key of each token. |
+| `alpha` | 0.1 | Only used by `"gumbel_dual_key"` (ignored otherwise); range `[0, 1]`. Probability that a token of ordinary decoding (and of exact-match speculative decoding) is drawn under the second key instead of the first. The choice comes from a random stream of the request, so requests with the same prompt diverge; a request with a `seed` reproduces it. `0` uses the first key for every such token, which restores the behavior before routing existed. About `alpha` of the tokens carry only the second key, so detection power is somewhat lower than with `"gumbel"`; raise `alpha` for more diversity, lower it for more power. Rejection-sampling speculative decoding ignores it: the speculative protocol picks the key of each token. |
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
 | `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
 | `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
@@ -61,7 +61,7 @@ share their verification).
   - `algorithm="gumbel_dual_key"` draws the draft tokens under the key and the token that follows the
     accepted prefix under a second key derived from it. The two draws and the accept decisions are
     independent, so the output distribution stays exact. The detector tests the first key alone and
-    both keys together and reports the smaller p-value, doubled for the two tests. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
+    both keys together (for ordinary decoding too, since `alpha` routes some tokens to the second key) and reports the smaller p-value, doubled for the two tests. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
   - `allow_target_only_watermarking=True` leaves accepted draft tokens unmarked and watermarks only the
     token that follows them. The signal weakens as the acceptance rate rises.
 
