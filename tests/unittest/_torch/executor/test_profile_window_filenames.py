@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import profiling
+from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -63,6 +64,7 @@ class _Executor:
         self._runtime_profile_pending_stop_iter = None
         self._profile_state_lock = threading.Lock()
         self._profile_enabled = False
+        self.hang_detector = HangDetector()
 
 
 @pytest.fixture
