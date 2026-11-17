@@ -185,6 +185,9 @@ The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub
 
 ## CI / Testing
 
+Before adding or changing tests, CI registrations or waivers, read the shared
+[test guidance](tests/AGENTS.md) and the applicable scoped guides it links to.
+
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 | Layer | Location | Notes |

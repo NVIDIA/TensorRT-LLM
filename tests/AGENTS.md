@@ -37,20 +37,27 @@ regression. Prune redundant cases while preserving meaningful failure modes.
 For Python unit-test case design and parameter matrices, follow
 the [unit-test guidance](unittest/AGENTS.md). For C++ targets, build artifacts and
 execution, follow the [C++ test guidance](../cpp/tests/AGENTS.md).
+Before changing CI registrations or waivers, read the
+[test-list guidance](integration/test_lists/AGENTS.md).
 
 ## Build test helpers before the test stage
 
-For CI tests that need native helpers or executables, build them in the
-build stage and consume matching artifacts in the test stage. Do not introduce
-ad hoc compiler, CMake, or extension builds during test discovery, setup, or
-execution merely to prepare a helper. Reuse the existing build targets and
-artifact flow. For C++ executables and their packaging, follow the
-[C++ test build guidance](../cpp/tests/AGENTS.md#build-and-execution).
+Build new CI test helpers and executables in the build stage and consume
+matching artifacts in the test stage. Do not add ad hoc compiler, CMake, or
+extension builds during test discovery, setup, or execution merely to prepare a
+helper. Extend the existing build targets and artifact flow for new requirements.
+
+Existing documented source-build fallbacks are supported exceptions, including
+CI configurations without a usable prebuilt bundle. For the C++ fixtures and
+their exact fallback conditions, read
+[Existing source-build fallback](../cpp/tests/AGENTS.md#existing-source-build-fallback).
+Preserve those paths and explicit local/source-build workflows. Outside these
+exceptions, do not bypass available matching artifacts to rebuild ordinary
+helpers on each test node.
 
 Keep intentional runtime compilation when it is part of the behavior under
 test (for example, a JIT kernel), and account for its cost when choosing the CI
-layer. Preserve explicit local/source-build workflows; these are not a reason
-to rebuild ordinary test helpers on every CI test node.
+layer.
 
 ## Whether a new test runs in CI
 

@@ -31,7 +31,7 @@ New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
 CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
-C++ integration fixtures build the collected tests with incremental native targets.
+C++ source-build fallbacks build the collected tests with incremental native targets.
 `cpp-tests-<directory>` targets (for example `cpp-tests-common` or
 `cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
 legacy and full-stack executables. OWNER aggregates are component subsets and
@@ -52,5 +52,24 @@ come from the matching installed wheel. Test artifacts keep symbols but omit
 BOLT's extra relocation records.
 CPP stages collect only `tests/integration/defs/cpp` and use the standard test
 environment setup. CTest discovers cases on the test node, so the build stage
-does not need a GPU. Without a bundle, or with
-an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
+does not need a GPU.
+
+### Existing source-build fallback
+
+The existing `build_google_tests`, `build_kv_cache_compression_tests`, and
+`build_fmha_head104_tests` fixtures in
+[`conftest.py`](../../tests/integration/defs/cpp/conftest.py) are supported
+exceptions to the shared rule against adding test-stage helper compilation.
+Each calls `prepare_test_bundle(build_type)` first and returns when it succeeds.
+
+[`find_test_bundle`](../../tests/integration/defs/cpp/cpp_common.py) selects a
+bundle only on Linux with the `Release` build type, no explicit
+`TRTLLM_BUILD_ROOT`, and a `CTestTestfile.cmake.in` in the resolved build directory.
+Otherwise, the fixtures retain their source-build path, including in CI.
+
+The fallback configures with `configure_only=True`, then builds selected native
+targets: `selected_build_targets` for `build_google_tests`,
+`nvfp4ColdPageKernelsTest` for the compression fixture, and `fmhaHead104Test` for
+the head-104 fixture. Preserve these bounded builds and bundle reuse. New helper
+requirements should extend build-stage packaging rather than introduce another
+test-node build path.
