@@ -51,6 +51,12 @@ def _cuda_cc():
     return -1, -1
 
 
+def _skip_unsupported_int8(sage_attn_qk_int8: bool) -> None:
+    """Skip INT8 SageAttention on SM103 and SM107."""
+    if sage_attn_qk_int8 and _cuda_cc() in ((10, 3), (10, 7)):
+        pytest.skip("INT8 SageAttention kernels are unavailable on SM103 and SM107.")
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
     """Clean up TLLM_DISABLE_MPI env var after tests complete."""
@@ -203,8 +209,7 @@ class TestSageUlyssesAttention:
     @pytest.mark.parametrize("sage_attn_qk_int8", [True, False])
     def test_sage_ulysses_forward(self, sage_attn_qk_int8: bool):
         """Forward pass runs without error and produces finite output."""
-        if sage_attn_qk_int8 and _cuda_cc()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        _skip_unsupported_int8(sage_attn_qk_int8)
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(
@@ -224,8 +229,7 @@ class TestSageUlyssesAttention:
         self, sage_attn_qk_int8: bool, sage_attn_num_elts_per_blk_k: int
     ):
         """Ulysses+SageAttention output matches full-sequence SDPA within approximation tolerance."""
-        if sage_attn_qk_int8 and _cuda_cc()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        _skip_unsupported_int8(sage_attn_qk_int8)
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(
