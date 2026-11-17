@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import re
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -15,21 +13,10 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import prior_art
-from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.records.state import STAGE_EXECUTION
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
-from ._helpers import (
-    Script,
-    _install,
-    _state,
-    _substrate_boot,
-    _workflow,
-    _write_vocabulary,
-    passing_shell,
-    plan_every_unit,
-)
+from ._helpers import Script, _install, _state, _workflow, _write_vocabulary
 
 
 def test_the_feature_skill_names_only_paths_the_tree_has():
@@ -69,50 +56,6 @@ def test_preflight_failure_ends_the_run_before_any_agent(tmp_path, task_file, mo
         workflow.run(task_file)
     assert calls == []
     assert "preflight failed" in (tmp_path / "ws" / "journal.md").read_text()
-
-
-def test_the_substrate_gate_runs_beside_the_first_turns_and_its_failure_leaves_the_run_open(
-    tmp_path, task_file, monkeypatch
-):
-    planner_called, booted = threading.Event(), []
-
-    def failing(command, env=None, timeout=0):
-        if _substrate_boot(command):
-            booted.append(command)
-            # The gate answers only once the first turn is under way: it does not hold it back.
-            planner_called.wait(10)
-            return CommandResult(returncode=1, stdout="MPI_ERR_SPAWN: could not spawn processes")
-        return passing_shell()(command, env, timeout)
-
-    workspace = (tmp_path / "ws").resolve()
-
-    def planner(turn, prompt):
-        planner_called.set()
-        deadline = time.monotonic() + 10
-        while not orchestrator_mod._STOPS[workspace].done():
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        return plan_every_unit(turn, prompt)
-
-    workflow = _workflow(tmp_path, shell_runner=failing, skip_substrate_gate=False)
-    calls = _install(monkeypatch, workflow, Script(None, planner=planner))
-    with workflow:
-        workflow.run(task_file)
-    assert booted, "the substrate gate never ran"
-    # The graph the turn wrote is never adopted: nothing starts after the stop.
-    assert [name for name, _ in calls] == ["planner"]
-    state = _state(tmp_path)
-    assert not state.done and state.verdict == "" and state.stage == STAGE_EXECUTION
-    journal = (tmp_path / "ws" / "journal.md").read_text()
-    assert "substrate gate failed" in journal and "stopped: the substrate gate failed" in journal
-    assert "run closed" not in journal
-
-    # Fixed outside the run, the same command proves the host again and goes on.
-    second = _workflow(tmp_path, skip_substrate_gate=False)
-    _install(monkeypatch, second, Script(None))
-    with second:
-        second.run(task_file)
-    assert _state(tmp_path).verdict == "delivered"
 
 
 def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task_file, monkeypatch):

@@ -12,32 +12,6 @@ from typing import Any, Mapping, Sequence
 from .check_config import format_batches, has_snapshot_policy
 from .harness import workload_io
 
-#: How the stock path says *"I have never heard of this architecture"*: the
-#: invariant half of each message, matched in the engine's log.
-UNSUPPORTED_ARCHITECTURE_MARKERS: tuple[str, ...] = (
-    # `AutoModelForCausalLM` / the multimodal encoder (`_torch/models/modeling_auto.py`)
-    # and `tensorrt_llm/models/automodel.py`.
-    "Unknown architecture for AutoModelForCausalLM",
-    "Unknown architecture for AutoModelForMultimodalEncoder",
-    "is not supported in TRT-LLM yet",
-    # `get_model_architecture`'s registry miss (`_torch/models/modeling_utils.py`).
-    "Unknown model architecture:",
-    # `transformers`' refusal of a checkpoint that ships its own code (`auto_map`).
-    "contains custom code which must be executed to correctly load the model",
-    # `transformers`' refusal of an unknown `model_type` with no code to fall back on.
-    "but Transformers does not recognize this architecture",
-    # A registration shim: a name registered only so the runtime finds something
-    # keyed on it, which raises when built without a modeling_v2 target.
-    "has no built-in implementation",
-)
-
-
-def reports_unsupported_architecture(detail: str, output: str) -> bool:
-    """Whether this text says *"the stock path does not know this model"*."""
-    haystack = f"{detail}\n{output}"
-    return any(marker in haystack for marker in UNSUPPORTED_ARCHITECTURE_MARKERS)
-
-
 #: The head of what the engine logs when it turns block reuse off for a hybrid
 #: model with no snapshot policy: "Disabling KV cache block reuse for the hybrid
 #: Mamba model because no Mamba state snapshot policy is configured. ..." The
@@ -671,7 +645,6 @@ __all__ = [
     "SOURCE_PROBE",
     "SOURCE_RANKS",
     "SOURCE_WORKER",
-    "UNSUPPORTED_ARCHITECTURE_MARKERS",
     "attest_engine",
     "describe_engine",
     "engine_failure",
@@ -681,7 +654,6 @@ __all__ = [
     "parse_rank_records",
     "parse_recurrent_slots",
     "parse_reuse_records",
-    "reports_unsupported_architecture",
     "reuse_disabled_detail",
     "reuse_evidence",
     "reuse_shortfall",

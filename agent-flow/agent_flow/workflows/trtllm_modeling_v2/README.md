@@ -39,8 +39,10 @@ what would stop preflight (uncovered requested cells, a KV-cache dtype the engin
 and prints the contract's checks per unit and variant, the
 engine's constraints for this geometry and the prior art the tree already holds. The spec should be
 the smallest contract that covers the request. Launch only once the lint is clean or its findings
-are accepted in `notes`. Preflight's substrate gate boots a GPU beside the run's first turns; its
-failure stops the run, which the same command resumes once the host is fixed.
+are accepted in `notes`. Preflight probes the host with small scripts (the devices, the
+checkpoint, an NCCL collective and an MPI spawn across the ranks) and loads no model: a host
+fault those do not show appears at the first load, where the first thing to settle is whether
+it is the host's or the target's.
 
 **Example prompt** — replace placeholders and omit requirements you do not need.
 
@@ -88,7 +90,7 @@ a container runtime, a shell). The run needs:
   directory, checkout and checkpoints at the same paths as every session.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
-hand-over with no newer session on its spool. A gate, substrate or test job the run has
+hand-over with no newer session on its spool. A gate or test job the run has
 waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
 when, why the session holds it when its `status.json` says, and for a queued job what runs on its
 spool meanwhile; then at most one every 15 minutes while the wait lasts.

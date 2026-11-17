@@ -217,15 +217,6 @@ class ExecutionStage:
             f"execution stage: {verdict}",
             contract_mod.standing(evaluation, self.workflow.workspace, marker),
         )
-        if verdict.startswith("stopped"):
-            # Preflight's substrate gate, running beside the first turns, found the run
-            # cannot go on here: nothing is closed, and the same command resumes once fixed.
-            print_message(
-                f"[bold yellow]⚠ execution stage {escape_markup(verdict)}; the run stays open: "
-                f"re-run the same command once the cause is fixed[/bold yellow]",
-                log,
-            )
-            return False
         if verdict not in ("delivered", "delivery-blocked"):
             self.workflow._close_run(state, log, verdict=verdict)
             return False

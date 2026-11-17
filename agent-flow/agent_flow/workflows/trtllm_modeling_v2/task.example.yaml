@@ -119,11 +119,6 @@ environment:
     TMPDIR: /path/to/scratch/tmp
     CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
 
-  # A checkpoint the STOCK modeling path supports, booted by the substrate gate when the stock path
-  # does not know the run's own architecture (and only then). Prefer it to `--skip-substrate-gate`,
-  # which also gives up the MPI spawn and NVRTC checks.
-  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
-
   # --- session_spool ------------------------------------------------------
   # REQUIRED with session_spool: the gate spool, a directory a running session watches.
   # spool: /path/to/scratch/spool

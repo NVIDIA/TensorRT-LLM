@@ -9,8 +9,7 @@ they live in code; judgement -- how to derive a forward, what to build next
 dispatch and close:
 
 1. ``preflight`` -- Python, plus one probe turn per agent configuration.
-   A broken host fails here; the substrate gate, which boots a GPU, runs
-   beside the first turns of the next stage and stops them when it fails.
+   A broken host fails here.
 2. ``execution`` -- the planner's task graph, driven until the contract holds
    (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. The
    run ends there: performance work is not the flow's.
@@ -28,7 +27,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, Sequence
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -133,7 +132,6 @@ class TrtllmModelingV2Workflow:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clean: bool = False,
         dry_run: bool = False,
-        skip_substrate_gate: bool = False,
         prompts: PromptBundle | None = None,
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
@@ -164,7 +162,6 @@ class TrtllmModelingV2Workflow:
         self.revision_cap = max(1, revision_cap)
         self.max_attempts = max(1, max_attempts)
         self.dry_run = dry_run
-        self.skip_substrate_gate = skip_substrate_gate
         self._prompts_override = prompts
 
         # Injected so every stage is testable without a GPU, a cluster, or a
@@ -535,10 +532,7 @@ class TrtllmModelingV2Workflow:
         self._role_agents()
 
         try:
-            # A substrate gate that fails while the first turns run stops them.
-            with orchestrator_mod.stoppable(self.workspace) as stop:
-                self._run_stages(state, log, stop)
-            bootstrap._await_substrate(self)
+            self._run_stages(state, log)
         except KeyboardInterrupt:
             print_message(
                 "[bold yellow]⚠ interrupted — re-run the same command to continue "
@@ -549,21 +543,15 @@ class TrtllmModelingV2Workflow:
             self.journal.event("run interrupted", f"stage={state.stage}")
             raise
 
-    def _run_stages(
-        self, state: WorkflowState, log, stop: Callable[[str], None] | None = None
-    ) -> None:
+    def _run_stages(self, state: WorkflowState, log) -> None:
         """Preflight, then the stage the run is at, to its close.
 
-        Toward the execution stage the substrate gate runs beside its first
-        turns (``stop`` ends them when it fails), and an execution stage with no
-        graph yet starts with the survey (:meth:`_start_with_the_survey`). A run
-        the failed gate stopped is left open, as a failed preflight is:
-        re-running the same command proves the substrate again and resumes.
+        An execution stage with no graph yet starts with the survey
+        (:meth:`_start_with_the_survey`).
         """
         self._state = state
-        beside = stop if not state.done else None
         if state.stage == STAGE_PREFLIGHT:
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(
@@ -577,7 +565,7 @@ class TrtllmModelingV2Workflow:
         else:
             # Resuming past preflight still needs the resolved
             # environment, since every prompt and every gate carries it.
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(

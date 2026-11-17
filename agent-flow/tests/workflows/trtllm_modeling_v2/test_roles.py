@@ -197,7 +197,6 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     shells: list[str] = []
     workflow = _workflow(
         tmp_path,
-        skip_substrate_gate=False,
         shell_runner=lambda command, env=None, timeout=0: shells.append(command),
     )
     log = get_logger().console
@@ -208,7 +207,7 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert "did not run the command" in journal
     assert "workflow does not change that policy" in journal
     assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
-    # Nothing past it ran: not the substrate gate, not the survey.
+    # Nothing past it ran.
     assert shells == []
 
 

@@ -145,10 +145,6 @@ benchmark you start by hand runs captured too.
 
 - `environment.python` exists before launch: the editable install the gates measure, or an
   interpreter the image already has. Every gate's command runs under it.
-- `environment.substrate_checkpoint` is required when the stock modeling path does not register the
-  checkpoint's architecture (the lint checks): a small checkpoint the stock path supports, on this
-  cluster. Preflight's substrate gate boots it instead; skipping the gate also drops its MPI and
-  NVRTC checks.
 - A `session_spool` environment's spools exist once their sessions run. Until then lint with
   `--sessions-planned`; start the sessions before launch.
 - Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
