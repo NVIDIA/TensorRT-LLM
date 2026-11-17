@@ -955,11 +955,10 @@ def _load_video_by_cv2(
                         frame_values = num_frames_to_sample * H * W * 3
                         retained_frame_bytes = frame_values * (4 if format == "pt" else 1)
                         if format == "pt":
-                            # uint8 RGB stack + float32 NumPy normalization
-                            # buffer + contiguous float32 CHW tensor. A
+                            # uint8 RGB stack + one float32 CHW tensor. A
                             # non-CPU destination briefly adds another tensor.
                             peak_item_size = (
-                                np.dtype(np.uint8).itemsize + 2 * np.dtype(np.float32).itemsize
+                                np.dtype(np.uint8).itemsize + np.dtype(np.float32).itemsize
                             )
                             peak_item_size += (
                                 np.dtype(np.float32).itemsize
@@ -1015,14 +1014,15 @@ def _load_video_by_cv2(
             stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
-            stacked_f32 = stacked_rgb.astype(np.float32)
-            stacked_f32 *= 1.0 / 255.0
-            tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
+            src_nchw = torch.from_numpy(stacked_rgb).permute(0, 3, 1, 2)
+            tensor_nchw = torch.empty(src_nchw.shape, dtype=torch.float32, device="cpu")
+            tensor_nchw.copy_(src_nchw)
+            tensor_nchw.mul_(1.0 / 255.0)
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
             del tensor_nchw
-            del stacked_f32
+            del src_nchw
             del stacked_rgb
         elif format == "np":
             loaded_frames = stacked_rgb
