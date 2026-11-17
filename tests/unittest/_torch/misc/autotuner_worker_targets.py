@@ -32,3 +32,19 @@ class RecordingRunner(TunableRunner):
 
     def forward(self, inputs, tactic=-1, **kwargs):
         return inputs[0] * 2
+
+
+class PrebuiltRunner(TunableRunner):
+    """A runner whose kernel ships prebuilt (as cuBLAS's): its build does nothing."""
+
+    def unique_id(self):
+        return ()
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0]
+
+    def build(self, inputs, *, tactic=-1, **kwargs) -> None:
+        """Nothing to build."""
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return inputs[0] * 2

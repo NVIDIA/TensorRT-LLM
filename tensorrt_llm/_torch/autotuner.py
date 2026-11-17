@@ -192,9 +192,9 @@ class TuningConfig:
             several threads (CuTe DSL), which ``parallel_jit_warmup`` cannot take, and whose
             builds are small: each worker allocates its build's inputs and outputs on the
             rank's GPU. The runners and their tactics must pickle, and must not be collective.
-            The workers take the builds only when they take long enough to repay a worker
-            (``RankWorker.worth_a_worker``): until the op's builds are measured, tune mode
-            builds one itself, timed; shorter ones build as the op profiles.
+            The workers take a runner's builds only when they take long enough to repay a
+            worker (``RankWorker.worth_a_worker``): until a runner's builds are measured, tune
+            mode builds one of them itself, timed; shorter ones build as the op profiles.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -1631,17 +1631,17 @@ class AutoTuner:
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
 
-    def _measure_build(self, custom_op: str, runners: List[TunableRunner],
+    def _measure_build(self, family: str, runners: List[TunableRunner],
                        pending: List[OptimizationProfile],
                        inputs: List[torch.Tensor], tuning_config: TuningConfig,
                        item: Tuple[int, int,
                                    int], prepare: bool, **kwargs) -> bool:
-        """For an op whose builds are not measured yet: build ``item`` (profile, runner,
-        tactic) here, timed, and tell whether its builds take long enough for the rank's
-        workers (``RankWorker.worth_a_worker``). An op already measured as too short builds
-        nothing here: its profiling builds its kernels."""
+        """For a runner whose builds (``family``) are not measured yet: build ``item``
+        (profile, runner, tactic) here, timed, and tell whether its builds take long enough
+        for the rank's workers (``RankWorker.worth_a_worker``). A runner already measured as
+        too short builds nothing here: its profiling builds its kernels."""
         worker = RankWorker.get()
-        if worker.build_seconds(custom_op) is not None:
+        if worker.build_seconds(family) is not None:
             return False
         i, r, tactic = item
         runner = runners[r]
@@ -1653,11 +1653,11 @@ class AutoTuner:
             runner.build(tensors, tactic=tactic, **kwargs)
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001 - the profiling reports a tactic that fails
-            logger.debug(f"[Autotuner] {custom_op}: measuring a build failed: "
+            logger.debug(f"[Autotuner] {family}: measuring a build failed: "
                          f"{type(e).__name__}: {e}")
             return False
-        worker.record_build(custom_op, time.perf_counter() - t0)
-        return worker.worth_a_worker(custom_op)
+        worker.record_build(family, time.perf_counter() - t0)
+        return worker.worth_a_worker(family)
 
     def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
         """Whether tune mode builds the op's kernels in the rank's worker processes before it
@@ -1681,9 +1681,10 @@ class AutoTuner:
         profiles (PARALLEL), since any of them may win. With shared JIT builds the ranks claim
         the items, and each builds the ones it claims; the profiling waits for the others.
         Returns False, before claiming any item, when the runners cannot go to a worker (they
-        do not pickle) and when the op's builds are too short for one (:meth:`_measure_build`),
-        and the caller builds as without workers. An item whose inputs cannot go to a worker
-        is left to the profiling.
+        do not pickle) and when every runner's builds are too short for one
+        (:meth:`_measure_build`), and the caller builds as without workers. The items of a
+        runner whose builds are too short, and an item whose inputs cannot go to a worker, are
+        left to the profiling.
         """
         pending = [p for p in profiles if is_pending(p)]
         items = []
@@ -1715,24 +1716,41 @@ class AutoTuner:
                 "processes; its kernels build as it profiles.",
                 key=(custom_op, "builds_in_pool_refused"))
             return False
-        if not worker.worth_a_worker(custom_op) and not self._measure_build(
-                custom_op, runners, pending, inputs, tuning_config,
-                items[start], prepares[items[start][1]], **kwargs):
+        order = list(range(start, len(items))) + list(range(start))
+        # Each runner's builds are measured, and go to the workers, on their own: a runner
+        # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
+        families = [
+            f"{custom_op}|{type(runner).__name__}" for runner in runners
+        ]
+        in_workers = set()
+        for r in range(len(runners)):
+            first = next((k for k in order if items[k][1] == r), None)
+            if first is None:
+                continue
+            if worker.worth_a_worker(families[r]) or self._measure_build(
+                    families[r], runners, pending, inputs, tuning_config,
+                    items[first], prepares[r], **kwargs):
+                in_workers.add(r)
+        if not in_workers:
             return False
         task_keys = []
         refused = 0
         begin = time.perf_counter()
-        for k in list(range(start, len(items))) + list(range(start)):
+        for k in order:
+            i, r, tactic = items[k]
+            if r not in in_workers:
+                continue  # Its profiling builds it.
             if sweep is not None and not sweep.claim(k):
                 continue
-            i, r, tactic = items[k]
             runner = runners[r]
             task_key = "autotuner|" + repr(
                 (custom_op, type(runner).__name__, str(
                     runner.unique_id()), runner.build_key(pending[i], tactic)))
             future = worker.run(
-                task_key, "tensorrt_llm._torch.autotuner:_build_in_worker",
-                (runner, tactic, specs[i], kwarg_specs, prepares[r]))
+                task_key,
+                "tensorrt_llm._torch.autotuner:_build_in_worker",
+                (runner, tactic, specs[i], kwarg_specs, prepares[r]),
+                family=families[r])
             if future is None:
                 # The profiling compiles it; no rank waits for it.
                 refused += 1

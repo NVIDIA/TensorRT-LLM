@@ -201,22 +201,46 @@ def test_ranks_split_parallel_builds(builder, shared, tmp_path):
     assert other.stats("op").elsewhere == 1
 
 
-def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_path):
+def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_path, monkeypatch):
+    rank_a = RankWorker.get()
+    rank_b = RankWorker(workers=1, enabled=True, store=str(tmp_path / "store_b"))
     other = KernelBuilder(enabled=True)
-    with builder.build_pass("a"), other.build_pass("b"):
-        assert builder.submit(
-            "op", "k", BuildTask(_RECORD, (str(tmp_path / "a"), 1)), _parallel("a")
-        )
-        # Another scope, another claim: the second rank builds the kernel rather than wait.
-        assert other.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "b"), 1)), _parallel("b"))
-        assert other.stats("op").elsewhere == 0
-        RankWorker.get().join()
-    claims = [name for name in os.listdir(shared / "kernel_builder") if name.endswith(".claim")]
-    assert len(claims) == 2
+    try:
+        with builder.build_pass("a"):
+            task = BuildTask(_RECORD, (str(tmp_path / "a"), 1))
+            assert builder.submit("op", "k", task, _parallel("a"))
+            # Another rank, with workers of its own and another scope: it builds the kernel
+            # rather than wait for the first rank's.
+            monkeypatch.setattr(RankWorker, "_instance", rank_b)
+            with other.build_pass("b"):
+                task = BuildTask(_RECORD, (str(tmp_path / "b"), 1))
+                assert other.submit("op", "k", task, _parallel("b"))
+                assert other.state("op", "k") != "elsewhere"
+            monkeypatch.setattr(RankWorker, "_instance", rank_a)
+    finally:
+        rank_b.stop()
+    assert (tmp_path / "a").exists() and (tmp_path / "b").exists()
+
+
+def _wait_in_thread(builder, op, key, monkeypatch):
+    """Start ``builder.wait(op, key)`` on a thread, and return it once the wait for another
+    rank's build has begun."""
+    began = threading.Event()
+    wait = _jit_share._wait
+
+    def waiting(result, failed):
+        began.set()
+        return wait(result, failed)
+
+    monkeypatch.setattr(_jit_share, "_wait", waiting)
+    thread = threading.Thread(target=builder.wait, args=(op, key))
+    thread.start()
+    assert began.wait(60)
+    return thread
 
 
 def test_a_rank_waits_for_a_build_another_started_and_makes_one_it_has_not(
-    builder, shared, tmp_path
+    builder, shared, tmp_path, monkeypatch
 ):
     RankWorker.get().max_workers = 1
     other = KernelBuilder(enabled=True)
@@ -243,15 +267,17 @@ def test_a_rank_waits_for_a_build_another_started_and_makes_one_it_has_not(
             # Not started by the rank that claimed it: the op makes it now.
             assert other.wait("op", "queued") == 0.0
             # Started there: the op waits for it.
-            threading.Timer(0.5, release.touch).start()
-            assert other.wait("op", "busy") >= 0.3
+            waiter = _wait_in_thread(other, "op", "busy", monkeypatch)
+            release.touch()
+            waiter.join(60)
+            assert not waiter.is_alive() and other.state("op", "busy") == "done"
         finally:
             release.touch()
     assert not (tmp_path / "x").exists() and not (tmp_path / "y").exists()
 
 
 def test_a_parallel_build_a_rank_takes_back_is_waited_for_until_it_is_made(
-    builder, shared, tmp_path
+    builder, shared, tmp_path, monkeypatch
 ):
     RankWorker.get().max_workers = 1
     other = KernelBuilder(enabled=True)
@@ -270,8 +296,10 @@ def test_a_parallel_build_a_rank_takes_back_is_waited_for_until_it_is_made(
             )
             # This rank takes its queued build back to make it: the other rank waits for it.
             assert builder.wait("op", "k") == 0.0
-            threading.Timer(0.5, builder.op_compiled, ("op", "k", 2.0)).start()
-            assert other.wait("op", "k") >= 0.3
+            waiter = _wait_in_thread(other, "op", "k", monkeypatch)
+            builder.op_compiled("op", "k", 2.0)
+            waiter.join(60)
+            assert not waiter.is_alive() and other.state("op", "k") == "done"
             assert RankWorker.get().build_seconds("op") == 2.0
         finally:
             release.touch()

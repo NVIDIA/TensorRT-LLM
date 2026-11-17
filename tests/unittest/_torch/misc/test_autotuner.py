@@ -3284,6 +3284,37 @@ def test_tune_mode_measures_a_build_before_the_workers_take_any(
     tuner.clear_cache()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
+                                                     tmp_path):
+    """A runner whose kernels ship prebuilt, timed first, does not keep a JIT
+    runner's long builds from the workers."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.min_build_s = 0.2
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    jit = targets.RecordingRunner(str(tmp_path), 0.4)
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one("test::prebuilt_then_jit",
+                         [targets.PrebuiltRunner(), jit], config, [x])
+    builders = {
+        name: (tmp_path / name).read_text().split()
+        for name in os.listdir(tmp_path)
+    }
+    assert sorted(builders) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
+                                      for t in (0, 1))
+    here = str(os.getpid())
+    assert sum(pids[0] == here for pids in builders.values()) == 1
+    assert all(pids[-1] != here for pids in builders.values())
+    tuner.clear_cache()
+
+
 def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
     """A worker's input has the tensor's storage, padding included, and its view of it, as a
     TMA-aligned scale is a column-major view of a padded buffer, and a small tensor's values; a

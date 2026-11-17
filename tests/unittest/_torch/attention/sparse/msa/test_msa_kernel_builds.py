@@ -6,6 +6,7 @@ A stand-in package picks one of two variants by the longest query segment, so no
 compiled and no build reaches a worker process.
 """
 
+import os
 import types
 
 import pytest
@@ -136,3 +137,23 @@ def test_in_inference_mode_a_lookup_waits_for_its_build_once(package, monkeypatc
         ("lookup", (64, False)),
         ("lookup", (64, False)),
     ]
+
+
+def test_ranks_split_variant_builds_only_over_one_cache_directory_of_one_host(
+    monkeypatch, tmp_path
+):
+    cache, elsewhere = tmp_path / "cache", tmp_path / "elsewhere"
+    cache.mkdir()
+    elsewhere.mkdir()
+    (tmp_path / "link").symlink_to(cache)
+
+    def scope(base, host="node-0"):
+        jit = types.SimpleNamespace(_jit_base=lambda: base)
+        monkeypatch.setattr(msa_kernel_builds, "_package", types.SimpleNamespace(jit=jit))
+        monkeypatch.setattr(os, "uname", lambda: types.SimpleNamespace(nodename=host))
+        return msa_kernel_builds._cache_scope()
+
+    # One directory, however a rank names it.
+    assert scope(cache) == scope(tmp_path / "link")
+    assert scope(cache) != scope(elsewhere)
+    assert scope(cache) != scope(cache, host="node-1")
