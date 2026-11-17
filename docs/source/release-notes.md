@@ -18,6 +18,8 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Infrastructure Changes
 
+- Single-worker MPI pools and single-rank `trtllm-llmapi-launch` invocations now isolate FlashInfer workspaces by default. Their cache moves from `~/.cache/flashinfer` to lifetime-locked slots under `~/.cache/tensorrt_llm/flashinfer/rank-N` (or `$TRTLLM_CACHE_DIR/flashinfer/rank-N`), without migrating the old cache. For offline use, pre-populate an explicit `FLASHINFER_CUBIN_DIR` and set `FLASHINFER_NO_DOWNLOAD=1`, or set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to retain the shared default cache with its concurrent-writer risks. See [FlashInfer JIT workspaces](llm-api/index.md#flashinfer-jit-workspaces-for-mpi-workers).
+
 ### API Changes
 
 - `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.

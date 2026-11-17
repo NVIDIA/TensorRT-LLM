@@ -679,6 +679,7 @@ _LAUNCHER_ENV_SCRUB = (
     "FLASHINFER_CUBIN_DIR",
     "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
     "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    "TRTLLM_CACHE_DIR",
 )
 
 
@@ -749,6 +750,29 @@ def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
     assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
     # The artifact cache must follow the per-rank workspace, so the launcher
     # must not pin FLASHINFER_CUBIN_DIR to a shared directory.
+    assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("isolation_disabled", [False, True])
+def test_llmapi_launch_single_rank_without_pmi(
+        tmp_path: Path, isolation_disabled: bool) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+    env.pop("PMI_RANK")
+    if isolation_disabled:
+        env["TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"] = "0"
+
+    result = _run_launcher_env(env)
+
+    if isolation_disabled:
+        assert "FLASHINFER_WORKSPACE_BASE=" not in result.stdout
+        assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=" not in result.stdout
+    else:
+        workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
+        assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+        assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
     assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
 
 

@@ -39,6 +39,7 @@ def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         _FLASHINFER_CUBIN_ENV,
         _FLASHINFER_ISOLATION_ENV,
         _FLASHINFER_MANAGED_ENV,
+        "TRTLLM_CACHE_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -213,6 +214,7 @@ _ISOLATED_WORKER_ARGS = [
     [
         (1, {}, _ISOLATED_WORKER_ARGS),
         (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _ISOLATED_WORKER_ARGS),
+        (1, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (4, {}, _ISOLATED_WORKER_ARGS),
         (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (
@@ -243,19 +245,18 @@ def test_mpi_pool_configures_worker_bootstrap(
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
 
+        def shutdown(self, wait: bool = True) -> None:
+            pass
+
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
-    session = SimpleNamespace(
-        n_workers=n_workers,
-        _env_overrides=env_overrides,
-        mpi_pool=None,
-    )
-
-    mpi_session.MpiPoolSession._start_mpi_pool(session)
-
-    assert captured["python_args"] == expected
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert all(env[key] == value for key, value in env_overrides.items())
+    session = mpi_session.MpiPoolSession(n_workers=n_workers, env_overrides=env_overrides)
+    try:
+        assert captured["python_args"] == expected
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert all(env[key] == value for key, value in env_overrides.items())
+    finally:
+        session.shutdown()
 
 
 @pytest.mark.parametrize(

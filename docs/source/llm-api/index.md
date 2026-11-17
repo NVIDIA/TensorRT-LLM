@@ -216,7 +216,7 @@ configured environment variable takes precedence.
 | `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
 | `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
 | `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` for MPI sessions; `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` for MPI sessions; `flashinfer` otherwise |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
 | `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
@@ -353,13 +353,19 @@ Python launcher.
 ### FlashInfer JIT workspaces for MPI workers
 
 `trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
-isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+isolate FlashInfer JIT workspaces by default, including single-GPU sessions
+and single-rank launcher invocations. Each process claims a locked,
 persistent cache slot under `~/.cache/tensorrt_llm/flashinfer` that holds its
 generated sources, compiled modules and downloaded FlashInfer artifacts, so
 concurrent MPI processes never write to each other's compiler inputs while JIT
 artifacts stay warm across launches. Set
 `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
+
+Single-worker sessions previously used `~/.cache/flashinfer` by default. Files
+in that directory are not copied into the isolated slots, so the first launch
+or an additional concurrent replica can need downloads even when an earlier
+single-GPU run populated the old default cache.
 
 Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
 loads them and never compiles them, so ranks with persistent slots share them
@@ -380,12 +386,20 @@ process-unique temporary workspace that is removed, artifacts included, when
 the process exits.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
-unchanged to every rank and is the way to share downloaded artifacts between
-ranks; populate it before the multi-rank launch, either by installing the
-`flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
-warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
-instead of being downloaded concurrently into the shared directory.
+launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configured
+`FLASHINFER_CUBIN_DIR` is propagated unchanged to every rank and is the way to
+share downloaded artifacts between ranks.
+
+For offline use on one GPU or multiple GPUs, populate an explicit
+`FLASHINFER_CUBIN_DIR` before starting the processes, either by installing the
+`flashinfer-cubin` package matching `flashinfer-python` or with an online warm-up
+run using the same explicit directory. Then set `FLASHINFER_NO_DOWNLOAD=1` so a
+missing artifact fails instead of being downloaded concurrently into the shared
+directory. This also makes the pre-populated artifacts available to new replica
+slots. Alternatively, set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to retain
+the shared default cache (`~/.cache/flashinfer`, or
+`$TRTLLM_CACHE_DIR/flashinfer` when configured); concurrent writers can contend
+in that cache.
 
 ## Tips and Troubleshooting
 
