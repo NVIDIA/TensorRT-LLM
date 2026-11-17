@@ -518,6 +518,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             extra_state_bytes_per_rank=cls._extra_state_bytes_per_rank(
                 model_config, mapping, **kwargs
             ),
+            states_bytes_per_layer=lambda params: cls._states_bytes_per_layer(
+                params, mapping, kv_cache_config=kv_cache_config
+            ),
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
             attention_slope_override=attention_slope_override,
@@ -569,6 +572,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
         return 0
+
+    @classmethod
+    def _states_bytes_per_layer(cls, params, mapping: Mapping, *, kv_cache_config) -> int:
+        """One recurrent layer's state bytes on this rank, as this manager stores them."""
+        return params.get_states_bytes_per_layer(mapping)
 
     @classmethod
     def _estimate_fixed_region_bytes(

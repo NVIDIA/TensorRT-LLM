@@ -20,7 +20,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Protocol, Tuple
 
 import torch
 
@@ -44,6 +44,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -549,6 +550,7 @@ def _estimate_mamba_hybrid_cache_cost(
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
     extra_state_bytes_per_rank: int = 0,
+    states_bytes_per_layer: Optional[Callable[[MambaKVCacheParams], int]] = None,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
     attention_slope_override: Optional[int] = None,
@@ -561,6 +563,8 @@ def _estimate_mamba_hybrid_cache_cost(
     ``draft_scratch_tokens`` is the capacity each request holds beyond its
     history for a drafter whose layers share the manager; it is charged to the
     attention layers here, and the caller charges the draft layers.
+    ``states_bytes_per_layer`` gives one layer's state bytes when the manager
+    stores them differently from ``MambaKVCacheParams``.
     """
     spec_config = kwargs.get("spec_config")
     params, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
@@ -582,7 +586,12 @@ def _estimate_mamba_hybrid_cache_cost(
             if local_attention_layers > 0
             else 0
         )
-    state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
+    state_bytes_per_layer = (
+        params.get_states_bytes_per_layer(mapping)
+        if states_bytes_per_layer is None
+        else states_bytes_per_layer(params)
+    )
+    state_bytes_per_rank = local_mamba_layers * state_bytes_per_layer
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size + int(
         kwargs.get("gen_preemption_headroom", 0)
