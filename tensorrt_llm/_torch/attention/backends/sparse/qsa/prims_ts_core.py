@@ -419,7 +419,12 @@ class _PrimsTSSparseCore:
                 *metadata_args,
                 ("out", run_out),
             )
+            abi = _run_abi(run_args)
+            previous = self._last_abi.get(key)
             try:
+                # The wrapper's per-call validation costs host time; the plan key
+                # fixes K/V and qo_indptr storage, so a repeat of a validated ABI
+                # can skip it.
                 wrapper.run(
                     route_q,
                     (k_cache, v_cache),
@@ -431,17 +436,16 @@ class _PrimsTSSparseCore:
                     qo_indptr=qo_indptr,
                     sm_scale=softmax_scale,
                     out=run_out,
+                    validate=previous != abi,
                 )
             except RuntimeError as error:
-                previous = self._last_abi.get(key)
                 changed = (
-                    [(a, b) for a, b in zip(previous, _run_abi(run_args)) if a != b]
+                    [(a, b) for a, b in zip(previous, abi) if a != b]
                     if previous
                     else [("no eager run for this plan key", None)]
                 )
                 raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
-            if key not in self._last_abi:
-                self._last_abi[key] = _run_abi(run_args)
+            self._last_abi[key] = abi
         if result is None:
             return out[:rows]
         if result is not out:
