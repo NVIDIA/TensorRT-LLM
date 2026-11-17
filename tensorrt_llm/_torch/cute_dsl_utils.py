@@ -21,6 +21,7 @@ import types
 from typing import TYPE_CHECKING, Optional, Union
 
 from ..logger import logger
+from .cute_dsl_file_cache import install_cute_dsl_file_cache
 
 if TYPE_CHECKING:
     import torch
@@ -63,6 +64,9 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    install_cute_dsl_file_cache()
 
 
 class _GraphSafeDlpack:
