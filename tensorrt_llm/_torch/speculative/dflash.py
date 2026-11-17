@@ -933,6 +933,10 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_partial = None
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
+        # Unified draft pool under Helix: draft pages per ledger block, and
+        # their offsets within it (see _init_unified_draft_tables).
+        self._ctx_page_expansion = 1
+        self._ctx_subpage_offsets = None
         self._ctx_kv_indptr = None
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
@@ -1566,12 +1570,22 @@ class DFlashWorker(SpecWorkerBase):
             )
             return
         self._ctx_pool_idx = pool
-        self._ctx_block_divisor = manager.get_layer_kv_factor(layer)
+        # Under Helix each ledger block holds several draft pages, addressed by
+        # KEY page as in the host table (get_draft_block_indices). Otherwise a
+        # block is one page of the draft view, holding both K/V planes.
+        self._ctx_page_expansion = manager._draft_page_expansion
+        if self._ctx_page_expansion > 1:
+            self._ctx_block_divisor = 1
+            self._ctx_subpage_offsets = torch.arange(
+                self._ctx_page_expansion, dtype=torch.int32, device="cuda"
+            )
+        else:
+            self._ctx_block_divisor = manager.get_layer_kv_factor(layer)
         self._device_draft_tables = True
         self._draft_table_checks_left = 8
         logger.info(
             f"DFlash: draft block tables decoded on the device from pool {pool} "
-            f"(divisor {self._ctx_block_divisor})"
+            f"(divisor {self._ctx_block_divisor}, {self._ctx_page_expansion} pages per block)"
         )
 
     def _refresh_unified_block_tables(
@@ -1581,21 +1595,25 @@ class DFlashWorker(SpecWorkerBase):
 
         The target metadata already uploads every pool's offsets for this
         batch, so the draft rows need one device divide plus the per-request
-        block counts, rather than a host table rebuilt from page lists.
+        block counts, rather than a host table rebuilt from page lists. Under
+        Helix each ledger block also expands to its consecutive draft pages.
         Returns False when the host path must build this iteration's table.
         """
         src = getattr(attn_metadata, "kv_cache_block_offsets", None)
         if src is None or src.size(0) <= self._ctx_pool_idx:
             return False
-        width = min(src.size(-1), self._ctx_block_tables.size(1))
+        expansion = self._ctx_page_expansion
+        width = min(src.size(-1), self._ctx_block_tables.size(1) // expansion)
         encoded = src[self._ctx_pool_idx, :num_seqs, 0, :width]
         decoded = torch.div(encoded.clamp(min=0), self._ctx_block_divisor, rounding_mode="floor")
-        self._ctx_block_tables[:num_seqs, :width].copy_(decoded)
+        if expansion > 1:
+            decoded = (decoded.unsqueeze(-1) * expansion + self._ctx_subpage_offsets).flatten(1)
+        self._ctx_block_tables[:num_seqs, : width * expansion].copy_(decoded)
         cache_map = self._ctx_kv_manager.kv_cache_map
         counts = []
         for request_id in request_ids[:num_seqs]:
             cache = cache_map.get(request_id)
-            counts.append(cache.num_blocks if cache is not None else 0)
+            counts.append(cache.num_blocks * expansion if cache is not None else 0)
         stage_or_copy(
             self._ctx_block_counts[:num_seqs],
             torch.tensor(counts, dtype=torch.long, pin_memory=prefer_pinned()),
@@ -1610,7 +1628,7 @@ class DFlashWorker(SpecWorkerBase):
     def _check_device_block_tables(
         self, num_seqs: int, request_ids: list[int], counts: list[int]
     ) -> bool:
-        """Compare device-decoded rows with the manager's page lists (startup only)."""
+        """Compare device-decoded rows with the host path's page lists (startup only)."""
         manager = self._ctx_kv_manager
         rows = []
         for row, request_id in enumerate(request_ids[:num_seqs]):
@@ -1619,9 +1637,7 @@ class DFlashWorker(SpecWorkerBase):
                 rows.append(row)
         if not rows:
             return True
-        expected = manager.get_batch_cache_indices(
-            [request_ids[row] for row in rows], manager.draft_layer_ids[0]
-        )
+        expected = manager.get_draft_block_indices([request_ids[row] for row in rows])
         device_rows = self._ctx_block_tables[rows].cpu()
         for k, row in enumerate(rows):
             got = device_rows[k, : counts[row]].tolist()

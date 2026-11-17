@@ -44,7 +44,7 @@ from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.spec_tail_kernels import dflash_paged_latent_prepare
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -399,7 +399,7 @@ def test_fused_gen_prepare_matches_the_eager_unified_path(unified):
 # ---------------------------------------------------------------------------
 
 
-def _unified_manager(max_tokens=1024):
+def _unified_manager(max_tokens=1024, mapping=None):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     return KVCacheManagerV2(
@@ -411,7 +411,7 @@ def _unified_manager(max_tokens=1024):
         tokens_per_block=PAGE,
         max_seq_len=MAX_SEQ_LEN,
         max_batch_size=4,
-        mapping=Mapping(),
+        mapping=mapping or Mapping(),
         dtype=DataType.HALF,
         is_disagg=True,
         draft_num_layers=LAYERS,
@@ -503,6 +503,50 @@ def _draft_pages(manager, request_id):
         manager.get_draft_buffers(layer, kv_layout="HND")[pages, 0, 0].reshape(-1, LATENT)
         for layer in range(LAYERS)
     ]
+
+
+@needs_cuda
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_device_decoded_draft_tables_match_the_host_tables(cp_size):
+    """The drafter decodes its draft table from the target's device block
+    offsets. Under Helix each rank keeps cp_size draft pages per ledger block,
+    so the decoded rows and page counts must expand like the host table."""
+    mapping = (
+        Mapping(
+            world_size=cp_size,
+            rank=cp_size - 1,
+            cp_size=cp_size,
+            cp_config={"cp_type": CpType.HELIX},
+        )
+        if cp_size > 1
+        else Mapping()
+    )
+    manager = _unified_manager(mapping=mapping)
+    request_ids = [1, 2]
+    try:
+        manager.add_dummy_requests(
+            request_ids, token_nums=[150, 40], is_gen=True, materialize_history=True
+        )
+        offsets = torch.zeros(
+            (manager.num_pools, len(request_ids), 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        manager.copy_batch_block_offsets(offsets, request_ids, 1, 0, len(request_ids))
+        worker = _worker()
+        worker._ctx_kv_manager = manager
+        worker._init_ctx_block_tables(len(request_ids), manager.draft_max_blocks_per_seq)
+        worker._init_unified_draft_tables(manager)
+        # The first refreshes also check their rows against the host table.
+        attn = SimpleNamespace(kv_cache_block_offsets=offsets)
+        assert worker._refresh_unified_block_tables(attn, len(request_ids), request_ids)
+
+        host = manager.get_draft_block_indices(request_ids)
+        tables = worker._ctx_block_tables.cpu()
+        assert [tables[row, : len(pages)].tolist() for row, pages in enumerate(host)] == host
+        assert worker._ctx_block_counts_host == [len(pages) for pages in host]
+    finally:
+        manager.shutdown()
 
 
 @needs_cuda
