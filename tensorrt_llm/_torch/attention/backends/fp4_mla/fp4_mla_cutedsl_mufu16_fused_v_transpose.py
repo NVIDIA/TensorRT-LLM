@@ -6,7 +6,6 @@ import math
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -28,9 +27,7 @@ from .cutedsl_common import (
     INT32_MAX,
     LOG2_6,
     LOG2_E,
-    KvCache3DLayout,
     _ceil_div,
-    _compact_sfb_copy_cols_per_scale_chunk,
     _compact_sfb_mma_cols_per_scale_chunk,
     _cutlass_output_dtype,
     _derive_qk_scale_burst_kblocks,
@@ -41,8 +38,6 @@ from .cutedsl_common import (
     _mma_block_scale_kind,
     _mma_scale_format,
     _mma_scale_vec_size_enum,
-    _mma_sf_ids_per_scale_atom,
-    _ordered_u32_to_float_after_atomic_max,
     _p4_n256_prequant_rowsum_from_f16x2_psf,
     _pack_e2m1x8_from_f16x2,
     _pack_e4m3x4_natural,
@@ -68,6 +63,33 @@ from .cutedsl_common import (
 )
 from .cutedsl_common import _pack_p4_16_scores_with_sum as _pack_p4_16_scores_from_group
 from .cutedsl_common import _tcgen05_ld_red_32x32b_x16_max_f32 as _tcgen05_ld_red_x16_max_f32
+
+# Defined once in the 2x kernel module: these read nothing the two kernels define differently.
+from .fp4_mla_cutedsl_mufu16 import (
+    _class_defines_callables,
+    _compute_smem_p4_lazy_rebase_scale,
+    _finalize_p4_n256_score_half_psf_source,
+    _issue_mxf4nvf4_mma_tile_from_base,
+    _issue_p4_n256_psf_bank_to_tmem_from_desc,
+    _issue_smem_p4_qk_score_slot_from_base,
+    _kv_cache_3d_layout,
+    _load_global_page_native_tile_pair,
+    _load_p4_n256_atomic_running_rowmax,
+    _load_p4_n256_atomic_running_rowmax_with_validity,
+    _load_staged_page_native_tile_pair,
+    _lookup_physical_page,
+    _make_smem_p4_qk_ksf_stage_desc,
+    _permute_raw_trtllm_q_tail_in_smem,
+    _prepare_p4_n256_score_half_tmem_addresses,
+    _PreparedFusedCall,
+    _qk_compact_ring_stage_byte_offset,
+    _rescale_smem_p4_resident_o_in_tmem,
+    _select_runtime_kv_profile,
+    _smem_p4_n256_psf_source_word_offset,
+    _stage_smem_p4_runtime_scale_pair,
+    _store_prepacked_p4_n256_score_half_to_direct_a,
+    _store_raw_trtllm_qsf_128dp_unique_owner_to_tmem_from_smem,
+)
 
 M_TILE = 256
 KV_TILE = 256
@@ -728,14 +750,6 @@ def _refresh_sf_vec_config(sf_vec_size: int) -> None:
 _refresh_sf_vec_config(SF_VEC_SIZE)
 
 
-def _qk_compact_ring_stage_byte_offset(
-    stage: int, full_stage_bytes: int, compact_slot_bytes: int
-) -> int:
-    slot = stage // SMEM_P4_QK_DATA_STAGES
-    local_stage = stage % SMEM_P4_QK_DATA_STAGES
-    return slot * compact_slot_bytes + local_stage * full_stage_bytes
-
-
 TMEM_BAR_ID = 1
 TMEM_BAR_THREADS = 32 * (1 + SMEM_P4_TOTAL_PRODUCER_WARPS)
 O_STORE_BAR_ID = 2
@@ -751,26 +765,6 @@ SMEM_P4_DUAL_HALF_BAR_ID = SMEM_P4_P_SFA_OWNER_BAR_ID
 SMEM_P4_DUAL_HALF_BAR_THREADS = 32 * SMEM_P4_TOTAL_PRODUCER_WARPS
 O_STORE_BAR_THREADS = 32 * SMEM_P4_STORE_WARPS
 SMEM_P4_QSF_OWNER_BAR_THREADS = 32 * (SMEM_P4_COMPUTE_WARPS + 1)
-
-
-def _select_runtime_kv_profile(max_kv_len: int) -> int:
-    if type(max_kv_len) is not int:
-        raise TypeError(f"max_kv_len must be an int, got {type(max_kv_len).__name__}")
-    if max_kv_len <= 0:
-        raise ValueError(f"max_kv_len must be positive, got {max_kv_len}")
-    if max_kv_len > SMEM_P4_RUNTIME_MAX_KV:
-        raise ValueError(
-            "max_kv_len exceeds the Int32-safe runtime-KV limit: "
-            f"{max_kv_len} > {SMEM_P4_RUNTIME_MAX_KV}"
-        )
-    if max_kv_len <= SMEM_P4_PAGE_PLAN_PROFILE_KV:
-        return SMEM_P4_PAGE_PLAN_PROFILE_KV
-    # Eager execution can report a different batch maximum on every step.
-    # Shifted power-of-two buckets bound the number of compiled variants and
-    # retain the established 1 Mi-token plus four-page-reserve profile.
-    profile_payload = max_kv_len - SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
-    profile_kv = (1 << (profile_payload - 1).bit_length()) + (SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT)
-    return min(profile_kv, SMEM_P4_RUNTIME_MAX_KV)
 
 
 @cute.jit
@@ -1244,59 +1238,6 @@ def _load_qk_qonly_kblock_stage(
             while not prims.mbarrier_try_wait_parity(q_tma_mbar, q_tma_phase, time_limit=10000000):
                 pass
         prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-
-
-@cute.jit
-def _lookup_physical_page(
-    mPageTable_pl: cute.Tensor,
-    logical_page: ctm.Int32,
-    batch: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> ctm.Int32:
-    has_pages = ctm.Int32(page_count > ctm.Int32(0))
-    last_logical_page = ctm.max(page_count - ctm.Int32(1), ctm.Int32(0))
-    safe_logical_page = ctm.min(logical_page, last_logical_page)
-    page_table_idx = (page_begin + safe_logical_page) * has_pages
-    return ctm.Int32(mPageTable_pl[page_table_idx])
-
-
-@cute.jit
-def _load_global_page_native_tile_pair(
-    mPageTable_pl: cute.Tensor,
-    kv_tile_idx: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> tuple:
-    tile_page_idx = ctm.Int32(kv_tile_idx * SMEM_P4_PAGES_PER_KV_TILE)
-    # Keep these as two scalar loads: a CSR row may start at an odd Int32, and
-    # the second logical page must clamp to the first for a one-page tail.
-    physical_page0 = _lookup_physical_page(
-        mPageTable_pl, tile_page_idx, ctm.Int32(0), page_begin, page_count
-    )
-    physical_page1 = _lookup_physical_page(
-        mPageTable_pl,
-        tile_page_idx + ctm.Int32(1),
-        ctm.Int32(0),
-        page_begin,
-        page_count,
-    )
-    physical_page0 = cute.arch.make_warp_uniform(physical_page0)
-    physical_page1 = cute.arch.make_warp_uniform(physical_page1)
-    return (physical_page0, physical_page1)
-
-
-@cute.jit
-def _load_staged_page_native_tile_pair(sPageIdPlan, kv_tile_idx: ctm.Int32) -> tuple:
-    physical_page0 = ctm.Int32(0)
-    physical_page1 = ctm.Int32(0)
-    tile_page_idx = ctm.Int32(kv_tile_idx * SMEM_P4_PAGES_PER_KV_TILE)
-    staged_page_pair = (sPageIdPlan.data_ptr() + tile_page_idx).load(count=2, alignment=8)
-    physical_page0 = staged_page_pair[0]
-    physical_page1 = staged_page_pair[1]
-    physical_page0 = cute.arch.make_warp_uniform(physical_page0)
-    physical_page1 = cute.arch.make_warp_uniform(physical_page1)
-    return (physical_page0, physical_page1)
 
 
 @cute.jit
@@ -2428,55 +2369,6 @@ def _load_vsf_tile_stage_only(
 
 
 @cute.jit
-def _permute_raw_trtllm_q_tail_in_smem(sQ, local_warp_idx: ctm.Int32, lane_idx: ctm.Int32) -> None:
-    tail_stage_word_offset: ctm.Constexpr = (
-        SMEM_P4_QK_FULL_DATA_STAGES * QK_A_STAGE_BYTES // ctm.Int32.bytes
-    )
-    tail_words_per_row: ctm.Constexpr = QK_TAIL_DATA_STAGE_K_DIM // 8
-    words_per_group: ctm.Constexpr = SF_VEC_SIZE // 8
-    local_row = local_warp_idx * ctm.Int32(32) + lane_idx
-    row_word_offset = local_row * ctm.Int32(tail_words_per_row)
-    tail_row_ptr = sQ.data_ptr() + ctm.Int32(tail_stage_word_offset) + row_word_offset
-    tail_swizzle = ctm.Swizzle.from_name("s64b")
-    raw_group1 = (tail_row_ptr + ctm.Int32(1 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    raw_group2 = (tail_row_ptr + ctm.Int32(2 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    raw_group4 = (tail_row_ptr + ctm.Int32(4 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    (tail_row_ptr + ctm.Int32(4 * words_per_group)).store_swizzled(
-        raw_group1, swizzle=tail_swizzle, alignment=8
-    )
-    (tail_row_ptr + ctm.Int32(1 * words_per_group)).store_swizzled(
-        raw_group2, swizzle=tail_swizzle, alignment=8
-    )
-    (tail_row_ptr + ctm.Int32(2 * words_per_group)).store_swizzled(
-        raw_group4, swizzle=tail_swizzle, alignment=8
-    )
-    raw_group3 = (tail_row_ptr + ctm.Int32(3 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    raw_group5 = (tail_row_ptr + ctm.Int32(5 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    raw_group6 = (tail_row_ptr + ctm.Int32(6 * words_per_group)).load_swizzled(
-        tail_swizzle, alignment=8, count=words_per_group
-    )
-    (tail_row_ptr + ctm.Int32(5 * words_per_group)).store_swizzled(
-        raw_group3, swizzle=tail_swizzle, alignment=8
-    )
-    (tail_row_ptr + ctm.Int32(6 * words_per_group)).store_swizzled(
-        raw_group5, swizzle=tail_swizzle, alignment=8
-    )
-    (tail_row_ptr + ctm.Int32(3 * words_per_group)).store_swizzled(
-        raw_group6, swizzle=tail_swizzle, alignment=8
-    )
-
-
-@cute.jit
 def _pack_p4_16_scores_from_group_packed_f16x2(
     group_scores,
     group_base: ctm.Int32,
@@ -2528,651 +2420,6 @@ def _pack_p4_16_scores_from_group_packed_f16x2(
         )
     p_sum = p_sum_pair[0] + p_sum_pair[1]
     return (words[0], words[1], p_sum)
-
-
-@cute.jit
-def _issue_mxf4nvf4_mma_tile_from_base(
-    sA,
-    sB,
-    sSFA,
-    sSFB,
-    base_col_id: ctm.Int32,
-    base_row_id: ctm.Int32,
-    stage: ctm.Int32,
-    clear_accumulator: ctm.Boolean,
-    acc_col_offset: ctm.Int32 = SMEM_P4_QK_ACC_COL_OFFSET,
-    sfa_col_offset: ctm.Int32 = SMEM_P4_SCALE_A_COL_OFFSET,
-    sfb_col_offset: ctm.Constexpr = SMEM_P4_SCALE_B_COL_OFFSET,
-    n_dim: ctm.Constexpr = SMEM_P4_BMM2_N,
-    m_dim: ctm.Constexpr = SMEM_P4_CTA_GROUP_M,
-    mma_kblock_start: ctm.Constexpr = 0,
-    mma_kblocks: ctm.Constexpr = MMA_KBLOCKS_PER_TILE,
-    stage_sfa_from_smem: ctm.Constexpr = True,
-    stage_sfb_from_smem: ctm.Constexpr = True,
-    a_from_tmem: ctm.Constexpr = False,
-    a_tmem_col_offset: ctm.Int32 = SMEM_P4_QK_ACC_COL_OFFSET,
-    mma_kblock_dim: ctm.Constexpr = MMA_KBLOCK_DIM,
-    mma_kblock_idesc_k_dim: ctm.Constexpr = MMA_KBLOCK_IDESC_K_DIM,
-    mma_scale_chunks_per_kblock: ctm.Constexpr = MMA_SCALE_CHUNKS_PER_KBLOCK,
-    mma_scale_vec_elements: ctm.Constexpr = SF_VEC_SIZE,
-    mma_scale_vec_size: ctm.Constexpr = MMA_SCALE_VEC_SIZE,
-    a_tmem_kblock_cols: ctm.Constexpr = SMEM_P4_P_TMEM_KBLOCK_COLS,
-    sfb_mma_col_delta: ctm.Constexpr = 0,
-    sfb_mma_kblock_stride_cols: ctm.Constexpr = -1,
-    compact_sfb_words_per_row: ctm.Constexpr = 0,
-    compact_sfb_extra_row_stride: ctm.Constexpr = 0,
-    compact_sfb_extra_col_stride: ctm.Constexpr = -1,
-    compact_sfb_cp_group_one: ctm.Constexpr = False,
-    compact_sfb_warpx2_mode: ctm.Constexpr = 0,
-    use_split_operand_stages: ctm.Constexpr = False,
-    a_stage: ctm.Int32 = 0,
-    b_stage: ctm.Int32 = 0,
-    use_split_scale_stages: ctm.Constexpr = False,
-    sfa_stage: ctm.Constexpr = 0,
-    sfb_stage: ctm.Constexpr = 0,
-    b_major: ctm.Constexpr = 0,
-    a_stage_words: ctm.Constexpr = A_STAGE_BYTES // 4,
-    b_stage_words: ctm.Constexpr = B_STAGE_BYTES // 4,
-    b_mma_smem_word_delta: ctm.Constexpr = 0,
-    a_mma_leading_byte_offset: ctm.Constexpr = 16,
-    a_mma_stride_byte_offset: ctm.Constexpr = 1024,
-    a_mma_layout: ctm.Constexpr = 2,
-    b_mma_leading_byte_offset: ctm.Constexpr = 16,
-    b_mma_stride_byte_offset: ctm.Constexpr = 1024,
-    b_mma_layout: ctm.Constexpr = 2,
-    b_mma_k_segment_offset: ctm.Constexpr = 0,
-    sfa_stage_bytes: ctm.Constexpr = SFA_STAGE_BYTES,
-    sfb_stage_bytes: ctm.Constexpr = SFB_STAGE_BYTES,
-    a_stage_word_offset: ctm.Constexpr = -1,
-    b_stage_word_offset: ctm.Constexpr = -1,
-    sfa_stage_byte_offset: ctm.Constexpr = -1,
-    sfb_stage_byte_offset: ctm.Constexpr = -1,
-    use_a_stage_word_offset: ctm.Constexpr = False,
-    use_b_stage_word_offset: ctm.Constexpr = False,
-    use_sfa_stage_byte_offset: ctm.Constexpr = False,
-    use_sfb_stage_byte_offset: ctm.Constexpr = False,
-    sfb_s2t_stride_byte_offset: ctm.Constexpr = 128,
-    use_split_mma_kblock_start: ctm.Constexpr = False,
-    a_mma_kblock_start: ctm.Constexpr = 0,
-    b_mma_kblock_start: ctm.Constexpr = 0,
-    reuse_b_first_kblock: ctm.Constexpr = False,
-    first_order_residual_tail: ctm.Constexpr = False,
-    tmem_lane_offset: ctm.Constexpr = 0,
-    a_tmem_lane_offset: ctm.Constexpr = -1,
-    scale_smem_kblock_start: ctm.Constexpr = -1,
-    scale_mma_kblock_start: ctm.Constexpr = -1,
-    a_sf_layout: ctm.Constexpr = SMEM_P4_SFA_LAYOUT,
-    a_collector_op: ctm.Constexpr = None,
-) -> None:
-    if cutlass.const_expr(
-        first_order_residual_tail
-        and (
-            not use_split_mma_kblock_start
-            or mma_kblocks != QK_TAIL_EFFECTIVE_MMA_KBLOCKS
-            or scale_mma_kblock_start < 0
-        )
-    ):
-        raise ValueError("first-order tail requires three stage-local MMAs and explicit scales")
-    issue_this_cta = ctm.Boolean(True)
-    idesc = prims.Tcgen05MxOmmaInstrDesc.build(
-        a_dtype=ctm.Float4E2M1FN,
-        b_dtype=ctm.Float4E2M1FN,
-        scale_format=MMA_SCALE_FORMAT,
-        n_dim=n_dim,
-        m_dim=m_dim,
-        k_dim=mma_kblock_idesc_k_dim,
-        b_major=b_major,
-        a_sf_layout=a_sf_layout,
-    )
-    sfa_s2t_shape, _ = prims.S2TCopyMode.S2T_128x128b
-    sfb_s2t_shape, sfb_s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
-    acc_col_id = base_col_id + ctm.Int32(acc_col_offset)
-    sfa_col_id = base_col_id + ctm.Int32(sfa_col_offset)
-    sfb_col_id = base_col_id + ctm.Int32(sfb_col_offset)
-    operand_tmem_mma_row_id = base_row_id + ctm.Int32(tmem_lane_offset)
-    a_effective_tmem_lane_offset: ctm.Constexpr = (
-        tmem_lane_offset if a_tmem_lane_offset < 0 else a_tmem_lane_offset
-    )
-    a_tmem_mma_row_id = base_row_id + ctm.Int32(a_effective_tmem_lane_offset)
-    acc_tmem_addr = operand_tmem_mma_row_id << ctm.Int32(16) | acc_col_id
-    sfa_tmem_addr_base = operand_tmem_mma_row_id << ctm.Int32(16) | sfa_col_id
-    sfb_tmem_addr_base = base_row_id << ctm.Int32(16) | sfb_col_id
-    acc_tmem_ptr = ctm.inttoptr(acc_tmem_addr, 6, ctm.Int32)
-    if cutlass.const_expr(use_b_stage_word_offset):
-        sB_stage = sB.subview(b_stage_word_offset)
-    elif cutlass.const_expr(use_split_operand_stages):
-        sB_stage = sB.subview(b_stage_words * b_stage)
-    else:
-        sB_stage = sB.subview(b_stage_words * stage)
-    if cutlass.const_expr(stage_sfb_from_smem):
-        if cutlass.const_expr(use_sfb_stage_byte_offset):
-            sSFB_stage = sSFB.subview(sfb_stage_byte_offset)
-        elif cutlass.const_expr(use_split_scale_stages):
-            sSFB_stage = sSFB.subview(sfb_stage_bytes * sfb_stage)
-        else:
-            sSFB_stage = sSFB.subview(sfb_stage_bytes * stage)
-    if cutlass.const_expr(stage_sfa_from_smem):
-        if cutlass.const_expr(use_sfa_stage_byte_offset):
-            sSFA_stage = sSFA.subview(sfa_stage_byte_offset)
-        elif cutlass.const_expr(use_split_scale_stages):
-            sSFA_stage = sSFA.subview(sfa_stage_bytes * sfa_stage)
-        else:
-            sSFA_stage = sSFA.subview(sfa_stage_bytes * stage)
-        desc_a_s2t_base = prims.Tcgen05SmemDesc.build(
-            sSFA_stage, leading_byte_offset=16, stride_byte_offset=128, layout=0
-        )
-    if cutlass.const_expr(stage_sfb_from_smem):
-        desc_b_s2t_base = prims.Tcgen05SmemDesc.build(
-            sSFB_stage,
-            leading_byte_offset=16,
-            stride_byte_offset=sfb_s2t_stride_byte_offset,
-            layout=0,
-        )
-    if cutlass.const_expr(not a_from_tmem):
-        if cutlass.const_expr(use_a_stage_word_offset):
-            sA_stage = sA.subview(a_stage_word_offset)
-        elif cutlass.const_expr(use_split_operand_stages):
-            sA_stage = sA.subview(a_stage_words * a_stage)
-        else:
-            sA_stage = sA.subview(a_stage_words * stage)
-        desc_a_mma_base = prims.Tcgen05SmemDesc.build(
-            sA_stage,
-            leading_byte_offset=a_mma_leading_byte_offset,
-            stride_byte_offset=a_mma_stride_byte_offset,
-            layout=a_mma_layout,
-        )
-    desc_b_mma_base = prims.Tcgen05SmemDesc.build(
-        sB_stage.subview(b_mma_smem_word_delta),
-        leading_byte_offset=b_mma_leading_byte_offset,
-        stride_byte_offset=b_mma_stride_byte_offset,
-        layout=b_mma_layout,
-        k_segment_offset=b_mma_k_segment_offset,
-    )
-    scale_source_kblock_start: ctm.Constexpr = (
-        mma_kblock_start if scale_smem_kblock_start < 0 else scale_smem_kblock_start
-    )
-    sfa_s2t_count: ctm.Constexpr = mma_kblocks * mma_scale_chunks_per_kblock
-    if cutlass.const_expr(stage_sfa_from_smem):
-        source_scale_begin: ctm.Constexpr = scale_source_kblock_start * mma_scale_chunks_per_kblock
-        source_scale_end: ctm.Constexpr = source_scale_begin + sfa_s2t_count
-        source_scale_atom_begin: ctm.Constexpr = (
-            source_scale_begin
-            // SMEM_P4_SFA_UNIQUE_CHUNKS_PER_UTCCP
-            * SMEM_P4_SFA_UNIQUE_CHUNKS_PER_UTCCP
-        )
-        source_scale_atom_count: ctm.Constexpr = _ceil_div(
-            source_scale_end - source_scale_atom_begin,
-            SMEM_P4_SFA_UNIQUE_CHUNKS_PER_UTCCP,
-        )
-        for s2t_atom_idx in ctm.range_constexpr(source_scale_atom_count):
-            source_scale_atom_idx: ctm.Constexpr = (
-                source_scale_atom_begin + s2t_atom_idx * SMEM_P4_SFA_UNIQUE_CHUNKS_PER_UTCCP
-            )
-            sfa_tmem_ptr = ctm.inttoptr(
-                sfa_tmem_addr_base + ctm.Int32(source_scale_atom_idx), 6, ctm.Int32
-            )
-            if prims.elect_sync():
-                prims.tcgen05_cp(
-                    sfa_s2t_shape,
-                    sfa_tmem_ptr,
-                    desc_a_s2t_base + ctm.Int64(32 * source_scale_atom_idx),
-                    group=prims.CTAGroup.CTA_2,
-                )
-    mma_nblocks: ctm.Constexpr = _ceil_div(n_dim, 128)
-    if cutlass.const_expr(stage_sfb_from_smem):
-        compact_sfb_copy_cols_per_scale_chunk: ctm.Constexpr = (
-            _compact_sfb_copy_cols_per_scale_chunk(m_dim, n_dim)
-        )
-        burst_words_per_row: ctm.Constexpr = mma_kblocks * mma_scale_chunks_per_kblock
-        words_per_row: ctm.Constexpr = (
-            compact_sfb_words_per_row if compact_sfb_words_per_row != 0 else burst_words_per_row
-        )
-        if cutlass.const_expr(m_dim == 128):
-            if cutlass.const_expr(compact_sfb_warpx2_mode != 0):
-                if cutlass.const_expr(compact_sfb_warpx2_mode == 2):
-                    sfb_s2t_shape_x2, sfb_s2t_multicast_x2 = (
-                        prims.S2TCopyMode.S2T_64x128b_WARPX2_02_13
-                    )
-                else:
-                    sfb_s2t_shape_x2, sfb_s2t_multicast_x2 = (
-                        prims.S2TCopyMode.S2T_64x128b_WARPX2_01_23
-                    )
-                compact_sfb_mma_cols_per_scale_chunk: ctm.Constexpr = (
-                    _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-                )
-                for s2t_idx in ctm.range_constexpr(burst_words_per_row):
-                    source_word_idx: ctm.Constexpr = (
-                        scale_source_kblock_start * mma_scale_chunks_per_kblock + s2t_idx
-                    )
-                    sfb_tmem_ptr = ctm.inttoptr(
-                        sfb_tmem_addr_base
-                        + ctm.Int32(s2t_idx * compact_sfb_mma_cols_per_scale_chunk),
-                        6,
-                        ctm.Int32,
-                    )
-                    increment_s2t: ctm.Constexpr = (
-                        source_word_idx * SMEM_P4_QK_SFB_N_CHUNKS * (512 // 16)
-                        + SMEM_P4_QK_COMPACT_SFB_S2T_BYTE_OFFSET
-                    )
-                    if prims.elect_sync():
-                        prims.tcgen05_cp(
-                            sfb_s2t_shape_x2,
-                            sfb_tmem_ptr,
-                            desc_b_s2t_base + ctm.Int64(increment_s2t),
-                            group=prims.CTAGroup.CTA_2,
-                            multicast=sfb_s2t_multicast_x2,
-                        )
-            else:
-                compact_sfb_cols_per_nblock: ctm.Constexpr = (
-                    compact_sfb_copy_cols_per_scale_chunk // mma_nblocks
-                )
-                for s2t_idx in ctm.range_constexpr(burst_words_per_row):
-                    source_word_idx: ctm.Constexpr = (
-                        scale_source_kblock_start * mma_scale_chunks_per_kblock + s2t_idx
-                    )
-                    for nblock_idx in ctm.range_constexpr(mma_nblocks):
-                        sfb_tmem_ptr = ctm.inttoptr(
-                            sfb_tmem_addr_base
-                            + ctm.Int32(
-                                s2t_idx * compact_sfb_copy_cols_per_scale_chunk
-                                + nblock_idx * compact_sfb_cols_per_nblock
-                            ),
-                            6,
-                            ctm.Int32,
-                        )
-                        increment_s2t: ctm.Constexpr = (
-                            source_word_idx * (512 // 16)
-                            + nblock_idx * words_per_row * (512 // 16)
-                            + SMEM_P4_QK_COMPACT_SFB_S2T_BYTE_OFFSET
-                        )
-                        if prims.elect_sync():
-                            if cutlass.const_expr(compact_sfb_cp_group_one):
-                                prims.tcgen05_cp(
-                                    sfb_s2t_shape,
-                                    sfb_tmem_ptr,
-                                    desc_b_s2t_base + ctm.Int64(increment_s2t),
-                                    group=prims.CTAGroup.CTA_1,
-                                )
-                            else:
-                                prims.tcgen05_cp(
-                                    sfb_s2t_shape,
-                                    sfb_tmem_ptr,
-                                    desc_b_s2t_base + ctm.Int64(increment_s2t),
-                                    group=prims.CTAGroup.CTA_2,
-                                    multicast=sfb_s2t_multicast,
-                                )
-                        if cutlass.const_expr(
-                            compact_sfb_extra_row_stride != 0 and compact_sfb_extra_col_stride >= 0
-                        ):
-                            if cutlass.const_expr(nblock_idx != 0):
-                                extra_sfb_tmem_addr = base_row_id + ctm.Int32(
-                                    nblock_idx * compact_sfb_extra_row_stride
-                                ) << ctm.Int32(16) | sfb_col_id + ctm.Int32(
-                                    s2t_idx * compact_sfb_copy_cols_per_scale_chunk
-                                    + nblock_idx * compact_sfb_extra_col_stride
-                                )
-                                extra_sfb_tmem_ptr = ctm.inttoptr(extra_sfb_tmem_addr, 6, ctm.Int32)
-                                if prims.elect_sync():
-                                    if cutlass.const_expr(compact_sfb_cp_group_one):
-                                        prims.tcgen05_cp(
-                                            sfb_s2t_shape,
-                                            extra_sfb_tmem_ptr,
-                                            desc_b_s2t_base + ctm.Int64(increment_s2t),
-                                            group=prims.CTAGroup.CTA_1,
-                                        )
-                                    else:
-                                        prims.tcgen05_cp(
-                                            sfb_s2t_shape,
-                                            extra_sfb_tmem_ptr,
-                                            desc_b_s2t_base + ctm.Int64(increment_s2t),
-                                            group=prims.CTAGroup.CTA_2,
-                                            multicast=sfb_s2t_multicast,
-                                        )
-        else:
-            compact_sfb_nblocks: ctm.Constexpr = _ceil_div(n_dim, SMEM_P4_SFB_ATOM_ROWS)
-            compact_sfb_cols_per_nblock: ctm.Constexpr = (
-                compact_sfb_copy_cols_per_scale_chunk // compact_sfb_nblocks
-            )
-            for s2t_idx in ctm.range_constexpr(burst_words_per_row):
-                source_word_idx: ctm.Constexpr = (
-                    mma_kblock_start * mma_scale_chunks_per_kblock + s2t_idx
-                )
-                for nblock_idx in ctm.range_constexpr(compact_sfb_nblocks):
-                    sfb_tmem_ptr = ctm.inttoptr(
-                        sfb_tmem_addr_base
-                        + ctm.Int32(
-                            s2t_idx * compact_sfb_copy_cols_per_scale_chunk
-                            + nblock_idx * compact_sfb_cols_per_nblock
-                        ),
-                        6,
-                        ctm.Int32,
-                    )
-                    increment_s2t: ctm.Constexpr = (
-                        32 * source_word_idx + 32 * words_per_row * nblock_idx
-                    )
-                    if prims.elect_sync():
-                        prims.tcgen05_cp(
-                            sfb_s2t_shape,
-                            sfb_tmem_ptr,
-                            desc_b_s2t_base + ctm.Int64(increment_s2t),
-                            group=prims.CTAGroup.CTA_2,
-                            multicast=sfb_s2t_multicast,
-                        )
-    if cutlass.const_expr(stage_sfa_from_smem or stage_sfb_from_smem):
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-        cute.arch.fence_view_async_tmem_store()
-    for kblock_idx in ctm.range_constexpr(mma_kblocks):
-        source_kblock_idx: ctm.Constexpr = mma_kblock_start + kblock_idx
-        if cutlass.const_expr(first_order_residual_tail):
-            a_tail_kblock_idx: ctm.Constexpr = FIRST_ORDER_TAIL_A_LOCAL_KBLOCKS[kblock_idx]
-            b_tail_kblock_idx: ctm.Constexpr = FIRST_ORDER_TAIL_B_LOCAL_KBLOCKS[kblock_idx]
-            scale_mma_source_kblock_idx: ctm.Constexpr = scale_mma_kblock_start + a_tail_kblock_idx
-        else:
-            a_tail_kblock_idx: ctm.Constexpr = kblock_idx
-            b_tail_kblock_idx: ctm.Constexpr = kblock_idx
-            scale_mma_source_kblock_idx: ctm.Constexpr = (
-                source_kblock_idx
-                if scale_mma_kblock_start < 0
-                else scale_mma_kblock_start + kblock_idx
-            )
-        b_sf_ids_per_scale_atom: ctm.Constexpr = _mma_sf_ids_per_scale_atom(
-            mma_kblock_dim, mma_scale_vec_elements
-        )
-        b_sf_id: ctm.Constexpr = scale_mma_source_kblock_idx % b_sf_ids_per_scale_atom
-        a_sf_id: ctm.Constexpr = 0
-        sfa_scale_col: ctm.Constexpr = scale_mma_source_kblock_idx * mma_scale_chunks_per_kblock
-        idesc_updated = idesc.set_sf_ids(a_sf_id=a_sf_id, b_sf_id=b_sf_id)
-        enable_input_d = ctm.Boolean(True)
-        if cutlass.const_expr(kblock_idx == 0):
-            enable_input_d = ~ctm.Boolean(clear_accumulator)
-        sfa_mma_addr = sfa_tmem_addr_base + ctm.Int32(sfa_scale_col)
-        sfa_tmem_ptr = ctm.inttoptr(sfa_mma_addr, 6, ctm.Int32)
-        sfb_kblock_stride_cols: ctm.Constexpr = (
-            mma_scale_chunks_per_kblock * _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-            if sfb_mma_kblock_stride_cols < 0
-            else sfb_mma_kblock_stride_cols
-        )
-        sfb_tmem_ptr = ctm.inttoptr(
-            sfb_tmem_addr_base
-            + ctm.Int32(sfb_mma_col_delta)
-            + ctm.Int32(b_tail_kblock_idx * sfb_kblock_stride_cols),
-            6,
-            ctm.Int32,
-        )
-        if cutlass.const_expr(use_split_mma_kblock_start):
-            increment_mma_a: ctm.Constexpr = (
-                mma_kblock_dim // 32 * (a_mma_kblock_start + a_tail_kblock_idx)
-            )
-            b_local_kblock_idx: ctm.Constexpr = (
-                b_tail_kblock_idx
-                if first_order_residual_tail
-                else 0
-                if reuse_b_first_kblock
-                else kblock_idx
-            )
-            increment_mma_b: ctm.Constexpr = (
-                mma_kblock_dim // 32 * (b_mma_kblock_start + b_local_kblock_idx)
-            )
-        else:
-            increment_mma_a: ctm.Constexpr = mma_kblock_dim // 32 * source_kblock_idx
-            increment_mma_b: ctm.Constexpr = mma_kblock_dim // 32 * source_kblock_idx
-        if cutlass.const_expr(a_from_tmem):
-            if cutlass.const_expr(use_split_mma_kblock_start):
-                a_tmem_kblock_idx: ctm.Constexpr = a_mma_kblock_start + a_tail_kblock_idx
-            else:
-                a_tmem_kblock_idx: ctm.Constexpr = source_kblock_idx
-            a_col_id = base_col_id + ctm.Int32(
-                a_tmem_col_offset + a_tmem_kblock_idx * a_tmem_kblock_cols
-            )
-            a_tmem_addr = a_tmem_mma_row_id << ctm.Int32(16) | a_col_id
-            a_mma_operand = ctm.inttoptr(a_tmem_addr, 6, ctm.Int32)
-        else:
-            a_mma_operand = desc_a_mma_base + ctm.Int64(increment_mma_a)
-        if issue_this_cta:
-            if prims.elect_sync():
-                prims.tcgen05_mma_block_scale(
-                    MMA_BLOCK_SCALE_KIND,
-                    prims.CTAGroup.CTA_2,
-                    acc_tmem_ptr,
-                    a_mma_operand,
-                    desc_b_mma_base + ctm.Int64(increment_mma_b),
-                    idesc_updated,
-                    enable_input_d=enable_input_d,
-                    scale_a=sfa_tmem_ptr,
-                    scale_b=sfb_tmem_ptr,
-                    scale_vec_size=mma_scale_vec_size,
-                    collector_op=a_collector_op,
-                )
-
-
-@cute.jit
-def _issue_smem_p4_qk_score_slot_from_base(
-    sQ,
-    sK,
-    sQSF,
-    sKSF,
-    base_col_id: ctm.Int32,
-    base_row_id: ctm.Int32,
-    stage: ctm.Constexpr,
-    score_slot_idx: ctm.Int32,
-    clear_accumulator: ctm.Constexpr,
-    qk_kblock_idx: ctm.Constexpr,
-    qk_kblocks: ctm.Constexpr = 1,
-    acc_col_offset: ctm.Int32 = SMEM_P4_QK_ACC_COL_OFFSET,
-    sfa_col_offset: ctm.Constexpr = SMEM_P4_SCALE_A_COL_OFFSET,
-    sfb_col_offset: ctm.Constexpr = SMEM_P4_SCALE_B_COL_OFFSET,
-    stage_sfa_from_smem: ctm.Constexpr = True,
-    stage_sfb_from_smem: ctm.Constexpr = True,
-    use_split_operand_stages: ctm.Constexpr = False,
-    a_stage: ctm.Constexpr = 0,
-    b_stage: ctm.Int32 = 0,
-    use_stage_local_operand_kblock_start: ctm.Constexpr = False,
-    stage_local_operand_kblock_start: ctm.Constexpr = -1,
-    stage_local_scale_kblock_start: ctm.Constexpr = -1,
-    reuse_b_first_kblock: ctm.Constexpr = False,
-    first_order_residual_tail: ctm.Constexpr = False,
-    b_smem_is_compact_slot_base: ctm.Constexpr = False,
-) -> None:
-    normalized_score_slot_idx = ctm.Int32(score_slot_idx) % ctm.Int32(SMEM_P4_QK_SCORE_SLOTS)
-    qk_stage_acc_col_offset = acc_col_offset + normalized_score_slot_idx * ctm.Int32(
-        SMEM_P4_QK_PIPELINE_SLOT_STRIDE
-    )
-    if cutlass.const_expr(stage_local_operand_kblock_start >= 0):
-        qk_stage_local_kblock_idx: ctm.Constexpr = stage_local_operand_kblock_start
-    else:
-        qk_stage_local_kblock_idx: ctm.Constexpr = qk_kblock_idx % SMEM_P4_QK_DATA_STAGE_KBLOCKS
-    if cutlass.const_expr(qk_kblock_idx >= SMEM_P4_QK_TAIL_STAGE_KBLOCK_START):
-        qk_a_mma_leading_byte_offset: ctm.Constexpr = QK_TAIL_MMA_LEADING_BYTE_OFFSET
-        qk_a_mma_stride_byte_offset: ctm.Constexpr = QK_TAIL_MMA_STRIDE_BYTE_OFFSET
-        qk_a_mma_layout: ctm.Constexpr = QK_TAIL_MMA_LAYOUT
-        qk_b_mma_leading_byte_offset: ctm.Constexpr = QK_K_TAIL_MMA_LEADING_BYTE_OFFSET
-        qk_b_mma_stride_byte_offset: ctm.Constexpr = QK_K_TAIL_MMA_STRIDE_BYTE_OFFSET
-        qk_b_mma_layout: ctm.Constexpr = QK_K_TAIL_MMA_LAYOUT
-    else:
-        qk_a_mma_leading_byte_offset: ctm.Constexpr = QK_FULL_MMA_LEADING_BYTE_OFFSET
-        qk_a_mma_stride_byte_offset: ctm.Constexpr = QK_FULL_MMA_STRIDE_BYTE_OFFSET
-        qk_a_mma_layout: ctm.Constexpr = QK_FULL_MMA_LAYOUT
-        qk_b_mma_leading_byte_offset: ctm.Constexpr = SMEM_P4_QK_B_MMA_LEADING_BYTES
-        qk_b_mma_stride_byte_offset: ctm.Constexpr = SMEM_P4_QK_B_MMA_STRIDE_BYTES
-        qk_b_mma_layout: ctm.Constexpr = SMEM_P4_QK_B_MMA_LAYOUT
-    physical_a_stage: ctm.Constexpr = a_stage if use_split_operand_stages else stage
-    q_stage_word_offset: ctm.Constexpr = physical_a_stage * QK_A_STAGE_BYTES // 4
-    qsf_stage_byte_offset: ctm.Constexpr = physical_a_stage * QK_SFA_STAGE_BYTES
-    if cutlass.const_expr(b_smem_is_compact_slot_base):
-        k_stage_word_offset: ctm.Constexpr = stage * QK_B_STAGE_BYTES // 4
-        ksf_stage_byte_offset: ctm.Constexpr = stage * QK_SFB_STAGE_BYTES
-    else:
-        physical_b_stage: ctm.Constexpr = b_stage if use_split_operand_stages else stage
-        k_stage_word_offset: ctm.Constexpr = (
-            _qk_compact_ring_stage_byte_offset(
-                physical_b_stage, QK_B_STAGE_BYTES, SMEM_P4_K_COMPACT_SLOT_BYTES
-            )
-            // 4
-        )
-        ksf_stage_byte_offset: ctm.Constexpr = _qk_compact_ring_stage_byte_offset(
-            physical_b_stage, QK_SFB_STAGE_BYTES, SMEM_P4_KSF_COMPACT_SLOT_BYTES
-        )
-    _issue_mxf4nvf4_mma_tile_from_base(
-        sQ,
-        sK,
-        sQSF,
-        sKSF,
-        base_col_id,
-        base_row_id,
-        stage,
-        clear_accumulator=clear_accumulator,
-        acc_col_offset=qk_stage_acc_col_offset,
-        sfa_col_offset=sfa_col_offset,
-        sfb_col_offset=sfb_col_offset,
-        n_dim=SMEM_P4_QK_SCORE_SLOT_N,
-        m_dim=SMEM_P4_CTA_GROUP_M,
-        mma_kblock_start=qk_kblock_idx,
-        mma_kblocks=qk_kblocks,
-        mma_kblock_dim=SMEM_P4_QK_MMA_KBLOCK_DIM,
-        mma_kblock_idesc_k_dim=SMEM_P4_QK_MMA_KBLOCK_IDESC_K_DIM,
-        mma_scale_chunks_per_kblock=SMEM_P4_QK_MMA_SCALE_CHUNKS_PER_KBLOCK,
-        mma_scale_vec_size=MMA_SCALE_VEC_SIZE,
-        stage_sfa_from_smem=stage_sfa_from_smem,
-        stage_sfb_from_smem=stage_sfb_from_smem,
-        use_split_operand_stages=use_split_operand_stages,
-        a_stage=a_stage,
-        b_stage=b_stage,
-        a_stage_words=QK_A_STAGE_BYTES // 4,
-        b_stage_words=QK_B_STAGE_BYTES // 4,
-        sfa_stage_bytes=QK_SFA_STAGE_BYTES,
-        sfb_stage_bytes=QK_SFB_STAGE_BYTES,
-        a_stage_word_offset=q_stage_word_offset,
-        b_stage_word_offset=k_stage_word_offset,
-        sfa_stage_byte_offset=qsf_stage_byte_offset,
-        sfb_stage_byte_offset=ksf_stage_byte_offset,
-        use_a_stage_word_offset=True,
-        use_b_stage_word_offset=True,
-        use_sfa_stage_byte_offset=True,
-        use_sfb_stage_byte_offset=True,
-        compact_sfb_words_per_row=SMEM_P4_QK_MMA_KBLOCKS * SMEM_P4_QK_MMA_SCALE_CHUNKS_PER_KBLOCK,
-        compact_sfb_extra_row_stride=SMEM_P4_QK_SFB_EXTRA_ROW_STRIDE,
-        compact_sfb_extra_col_stride=SMEM_P4_QK_SFB_EXTRA_COL_STRIDE,
-        compact_sfb_cp_group_one=SMEM_P4_QK_SFB_CP_GROUP_ONE,
-        compact_sfb_warpx2_mode=SMEM_P4_QK_SFB_WARPX2_MODE,
-        sfb_mma_col_delta=SMEM_P4_QK_SFB_MMA_COL_DELTA,
-        use_split_mma_kblock_start=use_split_operand_stages or use_stage_local_operand_kblock_start,
-        a_mma_kblock_start=qk_stage_local_kblock_idx,
-        b_mma_kblock_start=qk_stage_local_kblock_idx,
-        reuse_b_first_kblock=reuse_b_first_kblock,
-        first_order_residual_tail=first_order_residual_tail,
-        scale_smem_kblock_start=stage_local_scale_kblock_start,
-        scale_mma_kblock_start=stage_local_scale_kblock_start,
-        a_mma_leading_byte_offset=qk_a_mma_leading_byte_offset,
-        a_mma_stride_byte_offset=qk_a_mma_stride_byte_offset,
-        a_mma_layout=qk_a_mma_layout,
-        b_mma_leading_byte_offset=qk_b_mma_leading_byte_offset,
-        b_mma_stride_byte_offset=qk_b_mma_stride_byte_offset,
-        b_mma_layout=qk_b_mma_layout,
-        b_mma_smem_word_delta=SMEM_P4_QK_B_MMA_SMEM_WORD_DELTA,
-        b_mma_k_segment_offset=SMEM_P4_QK_B_MMA_K_SEGMENT_OFFSET,
-        sfb_s2t_stride_byte_offset=SMEM_P4_QK_SFB_S2T_STRIDE_BYTES,
-    )
-
-
-@cute.jit
-def _store_raw_trtllm_qsf_128dp_unique_owner_to_tmem_from_smem(
-    sQSF,
-    base_col_id: ctm.Int32,
-    base_row_id: ctm.Int32,
-    cta_rank: ctm.Int32,
-    local_warp_idx: ctm.Int32,
-    lane_idx: ctm.Int32,
-    qk_kblocks: ctm.Constexpr = QK_MMA_KBLOCKS,
-) -> None:
-    qsf_col_id = base_col_id + ctm.Int32(SMEM_P4_RESIDENT_Q_SF_COL_OFFSET)
-    qsf_subp = cta_rank * ctm.Int32(SMEM_P4_BMM1_M // 32) + (local_warp_idx & ctm.Int32(1))
-    qsf_row_subp = qsf_subp
-    if cutlass.const_expr(qk_kblocks != QK_MMA_KBLOCKS):
-        raise ValueError("raw TRT QSF publication requires the complete resident QK tile")
-    for qk_kblock_idx in ctm.range_constexpr(QK_MMA_KBLOCKS):
-        if cutlass.const_expr(qk_kblock_idx < QK_MMA_KBLOCKS - 2):
-            qsf_stage: ctm.Constexpr = qk_kblock_idx // SMEM_P4_QK_DATA_STAGE_KBLOCKS
-            qsf_stage_chunk: ctm.Constexpr = qk_kblock_idx % SMEM_P4_QK_DATA_STAGE_KBLOCKS
-            sQSF_stage = sQSF.subview(QK_SFA_STAGE_BYTES * qsf_stage)
-            qsf_stage_ptr = ctm.Int64(sQSF_stage.data_ptr().toint())
-            qsf_word_offset = (
-                ctm.Int32(qsf_stage_chunk * 512)
-                + lane_idx * ctm.Int32(16)
-                + qsf_subp * ctm.Int32(4)
-            )
-            qsf_word_ptr = ctm.inttoptr(qsf_stage_ptr + ctm.Int64(qsf_word_offset), 3, ctm.Int32)
-            qsf_word = qsf_word_ptr.load()
-            qsf_row_id = base_row_id + qsf_row_subp * ctm.Int32(32)
-            qsf_tmem_addr = qsf_row_id << ctm.Int32(16) | qsf_col_id + ctm.Int32(qk_kblock_idx)
-            qsf_tmem = ctm.inttoptr(qsf_tmem_addr, 6, ctm.Int32)
-            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, qsf_tmem, qsf_word)
-    tail_stage: ctm.Constexpr = SMEM_P4_QK_FULL_DATA_STAGES
-    sQSF_tail = sQSF.subview(QK_SFA_STAGE_BYTES * tail_stage)
-    qsf_tail_ptr = ctm.Int64(sQSF_tail.data_ptr().toint())
-    row_byte_offset = lane_idx * ctm.Int32(16) + qsf_subp * ctm.Int32(4)
-    raw_even_ptr = ctm.inttoptr(qsf_tail_ptr + ctm.Int64(row_byte_offset), 3, ctm.Int32)
-    raw_odd_ptr = ctm.inttoptr(
-        qsf_tail_ptr + ctm.Int64(ctm.Int32(512) + row_byte_offset), 3, ctm.Int32
-    )
-    raw_even_word = raw_even_ptr.load()
-    raw_odd_word = raw_odd_ptr.load()
-    logical_even_word = prims.prmt(
-        raw_even_word,
-        TRTLLM_QSF_EVEN_PRMT_SELECTOR,
-        prims.PermuteMode.DEFAULT,
-        hi=raw_odd_word,
-    )
-    logical_odd_word = prims.prmt(
-        raw_even_word,
-        TRTLLM_QSF_ODD_PRMT_SELECTOR,
-        prims.PermuteMode.DEFAULT,
-        hi=raw_odd_word,
-    )
-    qsf_row_id = base_row_id + qsf_row_subp * ctm.Int32(32)
-    for tail_kblock_idx in ctm.range_constexpr(2):
-        logical_word = logical_even_word
-        if cutlass.const_expr(tail_kblock_idx == 1):
-            logical_word = logical_odd_word
-        qsf_tmem_addr = qsf_row_id << ctm.Int32(16) | qsf_col_id + ctm.Int32(
-            QK_MMA_KBLOCKS - 2 + tail_kblock_idx
-        )
-        qsf_tmem = ctm.inttoptr(qsf_tmem_addr, 6, ctm.Int32)
-        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, qsf_tmem, logical_word)
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    cute.arch.fence_view_async_tmem_store()
-
-
-@cute.jit
-def _make_smem_p4_qk_ksf_stage_desc(
-    sKSF,
-    sfb_stage_base: ctm.Int32,
-    qk_stage_idx: ctm.Constexpr,
-    sksf_is_compact_slot_base: ctm.Constexpr = False,
-    page_major_ksf: ctm.Constexpr = False,
-):
-    if cutlass.const_expr(sksf_is_compact_slot_base):
-        ksf_stage_byte_offset: ctm.Constexpr = qk_stage_idx * QK_SFB_STAGE_BYTES
-    else:
-        physical_ksf_stage = sfb_stage_base + ctm.Int32(qk_stage_idx)
-        ksf_stage_byte_offset = _qk_compact_ring_stage_byte_offset(
-            physical_ksf_stage, QK_SFB_STAGE_BYTES, SMEM_P4_KSF_COMPACT_SLOT_BYTES
-        )
-    page_scale_chunks: ctm.Constexpr = (
-        SMEM_P4_QK_DATA_STAGE_SF_CHUNKS
-        if qk_stage_idx < SMEM_P4_QK_FULL_DATA_STAGES
-        else SMEM_P4_QK_K_TAIL_DATA_STAGE_SF_CHUNKS
-    )
-    s2t_stride_bytes: ctm.Constexpr = (
-        SMEM_P4_QK_SFB_S2T_STRIDE_BYTES * page_scale_chunks
-        if page_major_ksf
-        else SMEM_P4_QK_SFB_S2T_STRIDE_BYTES
-    )
-    return prims.Tcgen05SmemDesc.build(
-        sKSF.subview(ksf_stage_byte_offset),
-        leading_byte_offset=16,
-        stride_byte_offset=s2t_stride_bytes,
-        layout=0,
-    )
 
 
 @cute.jit
@@ -3548,24 +2795,6 @@ if (
 
 
 @cute.jit
-def _smem_p4_n256_psf_source_word_offset(
-    bank_idx: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    local_warp_idx: ctm.Int32,
-    lane_idx: ctm.Int32,
-) -> ctm.Int32:
-    row_band = local_warp_idx & ctm.Int32(1)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    return (
-        bank_idx * ctm.Int32(SMEM_P4_N256_PSF_S2T_BANK_WORDS)
-        + local_row * ctm.Int32(SMEM_P4_N256_PSF_S2T_COLS)
-        + col_band * ctm.Int32(SMEM_P4_N256_SCORE_HALVES)
-        + score_half_idx
-    )
-
-
-@cute.jit
 def _cross_arrive_smem_p4_cta2_mbar(mbar) -> None:
     for peer_cta_rank in ctm.range_constexpr(CLUSTER_SHAPE_MNK[0]):
         peer_mbar = _mapa_shared_cluster(mbar, peer_cta_rank)
@@ -3612,52 +2841,6 @@ def _load_smem_p4_n256_rowsum_part(
         col_band_idx * SMEM_P4_BMM1_M
     )
     return sRowSumParts[row_state_offset + local_row]
-
-
-@cute.jit
-def _smem_p4_qk_score_group_col(
-    score_slot_idx: ctm.Constexpr, col_band: ctm.Int32, local_group_idx: ctm.Constexpr
-) -> ctm.Int32:
-    return ctm.Int32(score_slot_idx * SMEM_P4_QK_SCORE_SLOT_STRIDE + local_group_idx * SF_VEC_SIZE)
-
-
-@cute.jit
-def _smem_p4_p4_materialize_group_col(
-    score_slot_idx: ctm.Constexpr, col_band: ctm.Int32, local_group_idx: ctm.Constexpr
-) -> ctm.Int32:
-    group_col = _smem_p4_qk_score_group_col(score_slot_idx, col_band, local_group_idx)
-    if cutlass.const_expr(local_group_idx == 1):
-        group_col = ctm.Int32(SMEM_P4_P4_SCORE_READ_GROUP1_COL)
-    elif cutlass.const_expr(local_group_idx == 2):
-        group_col = ctm.Int32(SMEM_P4_P4_SCORE_READ_GROUP2_COL)
-    return group_col
-
-
-@cute.jit
-def _prepare_p4_n256_score_half_tmem_addresses(
-    warp_idx: ctm.Int32,
-    base_col_id: ctm.Int32,
-    base_row_id: ctm.Int32,
-    score_bank_col_offset: ctm.Int32,
-) -> tuple:
-    local_warp_idx = warp_idx & ctm.Int32(3)
-    row_band = local_warp_idx & ctm.Int32(1)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    score_half_idx = warp_idx >> ctm.Int32(2)
-    row_id_with_warp_offset = base_row_id + col_band * ctm.Int32(64) + row_band * ctm.Int32(32)
-    score_half_tmem_cols: ctm.Constexpr = SMEM_P4_BMM1_ACC_TMEM_COLS // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    score_half_col_offset = ctm.Int32(score_bank_col_offset) + score_half_idx * ctm.Int32(
-        score_half_tmem_cols
-    )
-    score_tmem_addresses = []
-    for local_group_idx in ctm.range_constexpr(score_half_groups_per_col_band):
-        group_col = _smem_p4_p4_materialize_group_col(0, col_band, local_group_idx)
-        col_id = base_col_id + score_half_col_offset + ctm.Int32(group_col)
-        score_tmem_addresses.append(row_id_with_warp_offset << ctm.Int32(16) | col_id)
-    return tuple(score_tmem_addresses)
 
 
 @cute.jit
@@ -3815,37 +2998,6 @@ def _runtime_load_final_p4_n256_score_half_from_tmem(
 
 
 @cute.jit
-def _load_p4_n256_atomic_running_rowmax(
-    sAtomicRunningRowMax,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-) -> ctm.Float32:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    return _ordered_u32_to_float_after_atomic_max(sAtomicRunningRowMax[local_row])
-
-
-@cute.jit
-def _load_p4_n256_atomic_running_rowmax_with_validity(
-    sAtomicRunningRowMax,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-) -> tuple:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    ordered_rowmax = sAtomicRunningRowMax[local_row]
-    new_row_valid = ordered_rowmax != ctm.Uint32(8388607)
-    new_row_max = _ordered_u32_to_float_after_atomic_max(ordered_rowmax)
-    return (new_row_max, new_row_valid)
-
-
-@cute.jit
 def _select_smem_p4_lazy_anchor_with_validity(
     new_row_max: ctm.Float32,
     new_row_valid: ctm.Boolean,
@@ -3882,65 +3034,6 @@ def _select_smem_p4_lazy_anchor_runtime(
     if ~has_previous_tile | lane_rebase:
         new_row_anchor = new_row_max
     return (new_row_anchor, lane_rebase, anchor_delta_log2)
-
-
-@cute.jit
-def _compute_smem_p4_lazy_rebase_scale(
-    lane_rebase: ctm.Boolean, anchor_delta_log2: ctm.Float32
-) -> ctm.Float32:
-    rebase_scale = ctm.Float32(1.0)
-    if lane_rebase:
-        rebase_scale = cute.exp2(-anchor_delta_log2, fastmath=True)
-    return rebase_scale
-
-
-@cute.jit
-def _smem_p4_direct_a_word_offset(
-    p_stage_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    local_row: ctm.Int32,
-    col_band: ctm.Int32,
-    local_chunk_idx: ctm.Constexpr,
-) -> ctm.Int32:
-    physical_k64_band = score_half_idx
-    raw_word = (
-        p_stage_base * ctm.Int32(SMEM_P4_P4_SMEM_STAGE_WORDS)
-        + col_band * ctm.Int32(SMEM_P4_P4_SMEM_STAGE_WORDS)
-        + local_row * ctm.Int32(SMEM_P4_P4_SMEM_ROW_STRIDE_BYTES // 4)
-        + physical_k64_band * ctm.Int32(SMEM_P4_BMM2_STAGE_K // 16)
-        + ctm.Int32(local_chunk_idx * 4)
-    )
-    raw_byte = raw_word << ctm.Int32(2)
-    swizzle = (raw_byte >> ctm.Int32(7) & ctm.Int32(3)) << ctm.Int32(4)
-    return (raw_byte ^ swizzle) >> ctm.Int32(2)
-
-
-@cute.jit
-def _store_p4_n256_score_half_to_direct_a(
-    sP,
-    p_stage_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    local_row: ctm.Int32,
-    col_band: ctm.Int32,
-    p4_chunk0_word0: ctm.Int32,
-    p4_chunk0_word1: ctm.Int32,
-    p4_chunk0_word2: ctm.Int32,
-    p4_chunk0_word3: ctm.Int32,
-    p4_chunk1_word0: ctm.Int32,
-    p4_chunk1_word1: ctm.Int32,
-    p4_chunk1_word2: ctm.Int32,
-    p4_chunk1_word3: ctm.Int32,
-) -> None:
-    word_base0 = _smem_p4_direct_a_word_offset(p_stage_base, score_half_idx, local_row, col_band, 0)
-    sP[word_base0 + ctm.Int32(0)] = p4_chunk0_word0
-    sP[word_base0 + ctm.Int32(1)] = p4_chunk0_word1
-    sP[word_base0 + ctm.Int32(2)] = p4_chunk0_word2
-    sP[word_base0 + ctm.Int32(3)] = p4_chunk0_word3
-    word_base1 = word_base0 ^ ctm.Int32(4)
-    sP[word_base1 + ctm.Int32(0)] = p4_chunk1_word0
-    sP[word_base1 + ctm.Int32(1)] = p4_chunk1_word1
-    sP[word_base1 + ctm.Int32(2)] = p4_chunk1_word2
-    sP[word_base1 + ctm.Int32(3)] = p4_chunk1_word3
 
 
 @cute.jit
@@ -4012,155 +3105,6 @@ def _prepack_p4_n256_score_half_before_rowmax(
         ctm.Vector.from_elements(tuple(packed_p4_words), dtype=ctm.Int32),
         ctm.Vector.from_elements(tuple(group_p_sums), dtype=ctm.Float32),
     )
-
-
-@cute.jit
-def _store_prepacked_p4_n256_score_half_to_direct_a(
-    sP,
-    packed_p4_words,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    p_stage_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-) -> None:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    source_row = row_band * ctm.Int32(32) + lane_idx
-    _store_p4_n256_score_half_to_direct_a(
-        sP,
-        p_stage_base,
-        score_half_idx,
-        source_row,
-        col_band,
-        packed_p4_words[0],
-        packed_p4_words[1],
-        packed_p4_words[2],
-        packed_p4_words[3],
-        packed_p4_words[4],
-        packed_p4_words[5],
-        packed_p4_words[6],
-        packed_p4_words[7],
-    )
-
-
-@cute.jit
-def _finalize_p4_n256_score_half_psf_source(
-    sPSF,
-    group_max_values,
-    group_p_sums,
-    new_row_max: ctm.Float32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    softmax_scale_log2: ctm.Float32,
-    pv_psf_rescale: ctm.Float32,
-    kv_tile_idx: ctm.Int32,
-    valid_k: ctm.Int32,
-    mask_valid_k: ctm.Constexpr,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-    use_mixed_imlp: ctm.Constexpr,
-) -> tuple:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    score_half_n: ctm.Constexpr = SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        score_half_n // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    tile_base = kv_tile_idx * ctm.Int32(SMEM_P4_BMM1_N)
-    sf_bias = -new_row_max * softmax_scale_log2 - ctm.Float32(LOG2_6)
-    if cutlass.const_expr(score_half_groups_per_col_band != 4):
-        raise ValueError("packed P_SFA conversion requires four groups per col band")
-    prequant_row_sum = ctm.Float32(0.0)
-    if cutlass.const_expr(mask_valid_k):
-        sf_exact_0 = ctm.Float32(0.0)
-        sf_exact_1 = ctm.Float32(0.0)
-        sf_exact_2 = ctm.Float32(0.0)
-        sf_exact_3 = ctm.Float32(0.0)
-        for local_group_idx in ctm.range_constexpr(score_half_groups_per_col_band):
-            group_base = (
-                tile_base
-                + col_band * ctm.Int32(SMEM_P4_N256_SCORE_N_PER_COL_BAND)
-                + score_half_idx * ctm.Int32(SMEM_P4_N256_SCORE_N_PER_PRODUCER)
-                + ctm.Int32(local_group_idx * SF_VEC_SIZE)
-            )
-            group_valid = ctm.Boolean(group_base < valid_k)
-            sf_exact = ctm.Float32(0.0)
-            if group_valid:
-                sf_exact = cute.exp2(
-                    group_max_values[local_group_idx] * softmax_scale_log2 + sf_bias,
-                    fastmath=True,
-                )
-                prequant_row_sum += sf_exact * group_p_sums[local_group_idx]
-            if cutlass.const_expr(local_group_idx == 0):
-                sf_exact_0 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 1):
-                sf_exact_1 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 2):
-                sf_exact_2 = sf_exact
-            else:
-                sf_exact_3 = sf_exact
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-    elif cutlass.const_expr(use_mixed_imlp):
-        sf_h2_01 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[0], group_max_values[1], softmax_scale_log2, sf_bias
-        )
-        sf_h2_23 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[2], group_max_values[3], softmax_scale_log2, sf_bias
-        )
-        denominator_sf_word = _pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23)
-        pv_sf_word = _scale_pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23, pv_psf_rescale)
-        prequant_row_sum = _p4_n256_prequant_rowsum_from_f16x2_psf(sf_h2_01, sf_h2_23, group_p_sums)
-    else:
-        sf_args_01 = nvvm_fma_packed_f32x2(
-            (group_max_values[0], group_max_values[1]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_args_23 = nvvm_fma_packed_f32x2(
-            (group_max_values[2], group_max_values[3]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_exact_0 = cute.exp2(sf_args_01[0], fastmath=True)
-        sf_exact_1 = cute.exp2(sf_args_01[1], fastmath=True)
-        sf_exact_2 = cute.exp2(sf_args_23[0], fastmath=True)
-        sf_exact_3 = cute.exp2(sf_args_23[1], fastmath=True)
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-        row_sum_parts01 = nvvm_mul_packed_f32x2(
-            (sf_exact_0, sf_exact_1), (group_p_sums[0], group_p_sums[1])
-        )
-        row_sum_parts23 = nvvm_mul_packed_f32x2(
-            (sf_exact_2, sf_exact_3), (group_p_sums[2], group_p_sums[3])
-        )
-        prequant_row_sum = _sum_p4_n256_psf_row_parts(
-            row_sum_parts01[0],
-            row_sum_parts01[1],
-            row_sum_parts23[0],
-            row_sum_parts23[1],
-        )
-    psf_source_word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    sPSF[psf_source_word_offset] = pv_sf_word
-    prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    return (denominator_sf_word, prequant_row_sum)
 
 
 @cute.jit
@@ -4274,23 +3218,6 @@ def _runtime_finalize_final_p4_n256_score_half_psf_source(
 
 
 @cute.jit
-def _reload_p4_n256_owned_psf_word_after_ready(
-    sPSF,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-) -> ctm.Int32:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    return sPSF[word_offset]
-
-
-@cute.jit
 def _make_p4_n256_psf_bank_to_tmem_desc(
     sPSF, base_col_id: ctm.Int32, base_row_id: ctm.Int32, bank_idx: ctm.Int32
 ) -> tuple:
@@ -4306,19 +3233,6 @@ def _make_p4_n256_psf_bank_to_tmem_desc(
     p_sfa_tmem_addr = base_row_id << ctm.Int32(16) | p_sfa_col_id
     p_sfa_tmem = ctm.inttoptr(p_sfa_tmem_addr, 6, ctm.Int32)
     return (desc_psf_s2t, p_sfa_tmem)
-
-
-@cute.jit
-def _issue_p4_n256_psf_bank_to_tmem_from_desc(desc_psf_s2t, p_sfa_tmem) -> None:
-    psf_s2t_shape, psf_s2t_multicast = prims.S2TCopyMode.S2T_64x128b_WARPX2_02_13
-    if prims.elect_sync():
-        prims.tcgen05_cp(
-            psf_s2t_shape,
-            p_sfa_tmem,
-            desc_psf_s2t,
-            group=prims.CTAGroup.CTA_2,
-            multicast=psf_s2t_multicast,
-        )
 
 
 @cute.jit
@@ -4463,28 +3377,6 @@ def _issue_smem_p4_pv_score_slot_from_base(
         a_sf_layout=SMEM_P4_P_SFA_LAYOUT,
         a_collector_op=a_collector_op,
     )
-
-
-@cute.jit
-def _rescale_smem_p4_resident_o_in_tmem(o_acc_tmem, old_scale: ctm.Float32) -> None:
-    scaled_accum = ctm.Array(ctm.Float32, 128, space=ctm.AddressSpace.rmem)
-    c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, o_acc_tmem, num=128)
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-    old_scale_f32x2 = (old_scale, old_scale)
-    for pair_idx in ctm.range_constexpr(64):
-        elem_idx: ctm.Constexpr = pair_idx * 2
-        scaled_pair = nvvm_mul_packed_f32x2(
-            (c_rmem[elem_idx], c_rmem[elem_idx + 1]), old_scale_f32x2
-        )
-        scaled_accum[elem_idx] = scaled_pair[0]
-        scaled_accum[elem_idx + 1] = scaled_pair[1]
-    prims.tcgen05_st(
-        prims.Tcgen05LdStShape.SHAPE_32X32B,
-        o_acc_tmem,
-        scaled_accum.load(0, 128, alignment=32),
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
 @cute.jit
@@ -5775,26 +4667,6 @@ def _runtime_t336_producer_tile_v23(
 
 
 @cute.jit
-def _stage_smem_p4_runtime_scale_pair(
-    mQGlobalScale: cute.Tensor,
-    mKvGlobalScale: cute.Tensor,
-    sRuntimeScalePair,
-    softmax_scale_log2: ctm.Float32,
-) -> None:
-    q_global_scale = mQGlobalScale[0]
-    kv_global_scale = mKvGlobalScale[0]
-    runtime_scale_pair = ctm.Vector.from_elements(
-        (
-            softmax_scale_log2 / (q_global_scale * kv_global_scale),
-            ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) / kv_global_scale,
-        ),
-        dtype=ctm.Float32,
-    )
-    if prims.elect_sync():
-        sRuntimeScalePair.data_ptr().store(runtime_scale_pair, alignment=8)
-
-
-@cute.jit
 def _stage_smem_p4_page_id_plan(
     mPageTable_pl: cute.Tensor,
     mPageIndptr_s: cute.Tensor,
@@ -7069,60 +5941,14 @@ def _make_fused_ptrs(
     )
 
 
-def _kv_cache_3d_layout(kv_cache: torch.Tensor, page_size: int) -> KvCache3DLayout:
-    if kv_cache.dtype != torch.uint8:
-        raise TypeError(f"kv_cache must be torch.uint8, got {kv_cache.dtype}")
-    if page_size <= 0 or page_size % 2 != 0:
-        raise ValueError(f"page_size must be a positive even integer, got {page_size}")
-    if kv_cache.dim() == 3:
-        num_pages, actual_page_size, packed_dim = kv_cache.shape
-        stride_page, stride_token, stride_packed_dim = kv_cache.stride()
-    elif kv_cache.dim() >= 5:
-        num_pages = kv_cache.shape[0]
-        actual_page_size = kv_cache.shape[2]
-        packed_dim = kv_cache.shape[4]
-        stride_page = kv_cache.stride(0)
-        stride_token = kv_cache.stride(2)
-        stride_packed_dim = kv_cache.stride(4)
-    else:
-        raise ValueError(
-            f"kv_cache must be shaped as [num_pages, page_size, packed_dim] or expose TRT-LLM's 5D paged layout with page/token/packed-dim axes at 0/2/4, got shape={tuple(kv_cache.shape)}"
-        )
-    if actual_page_size != page_size:
-        raise ValueError(f"page_size mismatch: argument={page_size}, cache={actual_page_size}")
-    return KvCache3DLayout(
-        num_pages=int(num_pages),
-        packed_dim=int(packed_dim),
-        stride_page=int(stride_page),
-        stride_token=int(stride_token),
-        stride_packed_dim=int(stride_packed_dim),
-    )
-
-
 _FUSED_COMPILE_CACHE: dict[tuple[object, ...], Callable] = {}
 _PREPARED_FUSED_CALL_CACHE_CAPACITY = 256
 _FUSED_EXECUTOR_CACHE_CAPACITY = 256
 
 
-@dataclass
-class _PreparedFusedCall:
-    executor: Any
-    runtime_args: tuple[object, ...]
-    execution_args: list[Any]
-    adapted_args: list[Any]
-
-    def run(self) -> int | None:
-        return self.executor.run_compiled_program(self.execution_args)
-
-
 _PREPARED_FUSED_CALL_CACHE: OrderedDict[tuple[object, ...], _PreparedFusedCall] = OrderedDict()
 _FUSED_EXECUTOR_CACHE: OrderedDict[tuple[object, ...], Any] = OrderedDict()
 _PREPARED_FUSED_CALL_CACHE_LOCK = threading.Lock()
-
-
-def _class_defines_callables(value: object, *names: str) -> bool:
-    value_type = type(value)
-    return all((callable(getattr(value_type, name, None)) for name in names))
 
 
 def _get_fused_executor(cache_key: tuple[object, ...]) -> Any | None:
