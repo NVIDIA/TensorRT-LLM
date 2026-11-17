@@ -121,13 +121,20 @@ def test_rank_info_exchange_rejects_key_mismatch(receiver_key, server_key, match
     assert not receiver._incompatible_peers
 
 
+def _wait_for_auth_failures(server, count, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    while server._messenger.auth_failures < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return server._messenger.auth_failures
+
+
 def test_signed_server_drops_unsigned_rank_info_request():
     with _rank_info_server(_MASTER_KEY) as server:
         with ZMQMessenger("DEALER", server.endpoint, signer=None) as unsigned:
             unsigned.send([MessageType.REQUEST_INSTANCE_INFO])
+            auth_failures = _wait_for_auth_failures(server, 1)
             with pytest.raises(TimeoutError):
                 unsigned.receive(timeout_ms=300)
-        auth_failures = server._messenger.auth_failures
     assert auth_failures == 1
     server._rank_info.to_bytes.assert_not_called()
 
@@ -142,9 +149,7 @@ def test_signed_server_drops_message_without_payload_and_keeps_serving():
         )
         with ZMQMessenger("DEALER", server.endpoint, signer=None) as raw:
             raw.send(auth_frames)
-            deadline = time.monotonic() + 5
-            while server._messenger.auth_failures < 1 and time.monotonic() < deadline:
-                time.sleep(0.01)
+            assert _wait_for_auth_failures(server, 1) == 1
         _fetch(_make_receiver(_MASTER_KEY), server)
         auth_failures = server._messenger.auth_failures
     assert auth_failures == 1
