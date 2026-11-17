@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default.modeling import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default.modeling import (  # noqa: E501
     ModelingV2Glm53FlashNvfp4Sm100Default as Target,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
