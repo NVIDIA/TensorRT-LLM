@@ -589,9 +589,15 @@ an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
     the padding rows, and `close()` hands each layer back once, after its last
     expert kernel and before the next layer routes. A draft layer is closed
     after the worker's last draft step, also when the worker drafts nothing.
+  - A target whose ranks route their own tokens and exchange them with
+    `comm/moe_alltoall` registers with `alltoall=True`: each rank counts its
+    own tokens, the forward's last dispatch carries `local_statistic()`, and
+    `gathered()` hands the balancer every rank's histogram. The replica
+    choice is then offset by the rank.
 
 **Grep.** `EPLB_MODES`, `moe_eplb_mode`, `eplb_slots`, `EplbLayer`,
 `eplb_route`, `share_experts`, `bind_slots`, `close_draft_eplb`,
+`local_statistic`, `gathered`, `moe_alltoall_dispatch`,
 `moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
 `MoeLoadBalancerConfig`, `initial_global_assignments`, `num_slots`,
 `layer_updates_per_iter`.
@@ -631,6 +637,10 @@ not report the registered layers, so the target's own tests carry that.
   from the default in every layer, with an expert held twice on one rank.
 - Attention-DP dummy requests count in the statistic like real tokens;
   only the padding rows a target names in `route` are left out.
+- Under an alltoall, a rank that counts only its own tokens but hands the
+  balancer its own histogram instead of the gathered one places experts by a
+  different statistic on every rank. Nothing fails; the ranks' placements
+  drift apart, and the route sends tokens to slots that hold other experts.
 - A layer that is registered but never runs, for example after the loader
   builds the model twice, changes nothing under static EPLB. Under online
   EPLB the balancer waits for it, and so does every later forward: a missed

@@ -469,6 +469,17 @@ target does three more, and lists `"online"` in `EPLB_MODES`:
    layer routes. A layer the forward did not run is closed as well, such as a
    draft layer when the worker drafts nothing. A layer that runs once per
    draft step is closed after the last draft step.
+8. **Under an alltoall.** A target whose ranks route their own tokens and
+   exchange them with an alltoall (`comm/moe_alltoall`) registers its layers
+   with `EplbLayer.register(..., alltoall=True)`. Each rank then counts only
+   its own tokens' experts, so the histogram the balancer places by is the
+   sum the forward's last dispatch gathers: pass `EplbLayer.local_statistic()`
+   to that dispatch, and the dispatch's gathered statistic to
+   `EplbLayer.gathered()`. Every rank routes every round, also with no tokens
+   of its own, so every rank carries its histogram on the same dispatch. The
+   replica choice is offset by the rank, which spreads the ranks' tokens over
+   an expert's replicas; a target that gathers its tokens keeps it
+   rank-independent, since there every rank has to pick the same slot.
 
 ### Testing EPLB
 

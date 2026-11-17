@@ -85,6 +85,10 @@ _EPLB_LAYOUTS = frozenset(
     }
 )
 
+# From this EP size on, over multi-node NVLink, the default target's routed experts
+# exchange tokens with an alltoall rather than gather every rank's tokens.
+ALLTOALL_MIN_EP = 16
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs

@@ -755,3 +755,50 @@ def test_an_online_balancer_moves_experts_into_slots() -> None:
         assert torch.equal(slot_expert[routed.long()], hot)
     finally:
         balancer.shutdown()
+
+
+@requires_host_accessible
+def test_an_alltoall_layer_places_by_every_ranks_histogram() -> None:
+    """Rank 0 of two under online EPLB and an alltoall: its own tokens pick only experts 0
+    and 1, and the histogram the dispatch brings back from rank 1 picks only 6 and 7. The
+    balancer places by their sum, so rank 0 ends up holding replicas of 6 or 7 as well -- what
+    no rank's own tokens would have shown it -- and every slot holds the host copy of the
+    expert placed there."""
+    experts, ep_size, top_k = 8, 2, 2
+    config = MoeLoadBalancerConfig(num_slots=12, layer_updates_per_iter=1)
+    slots = EplbSlots.from_config(config, 3, experts, ep_size, 0)
+
+    def expert_weight(name: str, expert: int) -> torch.Tensor:
+        return torch.full((4, 16), 10 + expert, dtype=torch.uint8, device="cuda")
+
+    weights = {"w": torch.stack([expert_weight("w", e) for e in slots.slot_experts]).contiguous()}
+    balancer = MoeLoadBalancer(0, ep_size, 1, shared_memory_base_name=f"mv2_eplb_a2a_{os.getpid()}")
+    try:
+        with balancer:
+            eplb = EplbLayer.register(slots, top_k, alltoall=True)
+        eplb.share_experts(weights, expert_weight)
+        eplb.bind_slots(weights)
+        balancer.register_weight_slots_after_to_cuda()
+        balancer.finalize_model()
+
+        own = torch.tensor([[0, 1]] * 8, dtype=torch.int32, device="cuda")
+        theirs = torch.zeros(experts, dtype=torch.int32, device="cuda")
+        theirs[6] = theirs[7] = 4096
+        for updates in (True, False):
+            balancer.set_iter_info(enable_statistic=True, enable_update_weights=updates)
+            with MoeLoadBalancerIterContext(balancer):
+                routed = eplb.route(own, last=True)
+                mine = eplb.local_statistic()
+                assert mine is not None
+                eplb.gathered(torch.stack([mine, theirs]))
+                eplb.close()
+        torch.cuda.synchronize()
+
+        placement = eplb.balancer_layer.get_old_rank_expert_ids()
+        assert {6, 7} & set(placement[0]), placement
+        for local, expert in enumerate(placement[0]):
+            assert torch.equal(weights["w"][local], expert_weight("w", expert)), (local, expert)
+        slot_expert = torch.tensor(sum(placement, []), dtype=torch.int32, device="cuda")
+        assert torch.equal(slot_expert[routed.long()], own)
+    finally:
+        balancer.shutdown()

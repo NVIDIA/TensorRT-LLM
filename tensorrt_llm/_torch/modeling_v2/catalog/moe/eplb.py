@@ -414,6 +414,9 @@ class EplbLayer:
                     self._remember(ids)
                     self._count_closed = last
                     self._sentinel(ids)
+        if token_selected_experts.shape[0] == 0:
+            # A rank with no tokens this round under an alltoall: nothing to route.
+            return token_selected_experts
         return eplb_route(token_selected_experts, self.balancer_layer, self.alltoall)
 
     def _count_own(self, token_selected_experts: torch.Tensor, rows: Optional[Rows], last: bool):
