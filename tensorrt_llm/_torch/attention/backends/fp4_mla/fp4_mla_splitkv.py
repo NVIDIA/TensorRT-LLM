@@ -154,7 +154,7 @@ def run_fp4_mla_splitkv(
     if q_batch_capacity < queries:
         raise ValueError("Q capacity must cover the active query count")
     tasks = splits * queries
-    # Size metadata-owned workspaces for the Q capacity before capture.
+    # Reserve per-forward scratch for the Q capacity before capture.
     workspace_queries = q_batch_capacity
     task_capacity = splits * workspace_queries
     if splits < 2 or tasks > 65535:
@@ -190,7 +190,7 @@ def run_fp4_mla_splitkv(
             (capacity,),
             dtype=dtype,
             device=output.device,
-            shared=False,
+            shared=True,
             capacity_numel=capacity,
         )[:count]
 
