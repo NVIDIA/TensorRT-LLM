@@ -1,0 +1,31 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Keep PRE_TEST discovery and properties from the original CTest registration.
+# The consumer fills in paths after extracting the bundle next to its sources.
+file(GLOB_RECURSE metadata
+     "@CMAKE_BINARY_DIR@/tests/CTestTestfile.cmake"
+     "@CMAKE_BINARY_DIR@/tests/*_include.cmake")
+foreach(path IN LISTS metadata)
+  file(READ "${path}" content)
+  string(REPLACE "@CMAKE_BINARY_DIR@" "__TRTLLM_CPP_BUNDLE_ROOT__" content
+                 "${content}")
+  string(REPLACE "@cpp_test_source_root@" "__TRTLLM_CPP_SOURCE_ROOT__" content
+                 "${content}")
+  file(RELATIVE_PATH relative_path "@CMAKE_BINARY_DIR@" "${path}")
+  file(WRITE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/${relative_path}.in"
+             "${content}")
+endforeach()
+file(WRITE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/CTestTestfile.cmake.in"
+           "subdirs(tests)\n")

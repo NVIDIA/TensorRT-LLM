@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
 import shlex
@@ -178,6 +179,13 @@ def _parallel_config_key(case: str) -> str:
     return re.sub(r'\s+--ignore=\S+', '', case).strip()
 
 
+def _unittest_case_filename(case: str) -> str:
+    """Keep artifacts readable and distinguish full entries with a shared prefix."""
+    prefix = re.sub(r'[/\s"\']+', '-', case)[:63]
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -254,9 +262,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 f"({case_markexpr}) and ({unittest_markexpr})")
         else:
             arg_list += ["-m", unittest_markexpr]
-    case_fn = re.sub(r'[/\s"\']+', '-', case)
-    if len(case_fn) > 80:
-        case_fn = case_fn[:80]
+    case_fn = _unittest_case_filename(case)
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting

@@ -18,18 +18,19 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
-def _make_server(*, max_batch_size=None, kv_cache_config=None):
+def _make_server(*, max_batch_size=None, kv_cache_config=None, cache_transceiver_config=None):
     server = object.__new__(OpenAIServer)
     server.generator = SimpleNamespace(
         disaggregated_params=None,
         args=SimpleNamespace(
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
+            cache_transceiver_config=cache_transceiver_config,
         ),
     )
     return server
@@ -107,3 +108,26 @@ async def test_server_info_preserves_configured_tokens_per_block_on_live_lookup_
 
     content = json.loads(response.body)
     assert content["tokens_per_block"] == 32
+
+
+@pytest.mark.cpu_only
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transceiver", "expected"),
+    [
+        (None, "absent"),
+        (CacheTransceiverConfig(), 60000),
+        (CacheTransceiverConfig(transceiver_runtime="CPP", kv_transfer_timeout_ms=None), None),
+    ],
+    ids=["no_transceiver", "default", "null"],
+)
+async def test_server_info_reports_a_null_kv_transfer_timeout(transceiver, expected):
+    """A null timeout is reported as null, so a pooled router can tell it from not reported."""
+    server = _make_server(cache_transceiver_config=transceiver)
+
+    content = json.loads((await server.get_server_info()).body)
+
+    if expected == "absent":
+        assert "kv_transfer_timeout_ms" not in content
+    else:
+        assert content["kv_transfer_timeout_ms"] == expected

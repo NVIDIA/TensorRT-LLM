@@ -59,6 +59,7 @@ KV_CACHE_ITERATION_STATS_COLD_POOL_GROUP_KEYS = (
     "secondaryPeakFreeNumBlocks",
     "secondaryPeakUsedNumBlocks",
     "secondaryPeakEvictableNumBlocks",
+    "secondaryRetainedCopyNumBlocks",
 )
 
 
@@ -160,6 +161,7 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "secondaryPeakFreeNumBlocks": stats.secondary_peak_free_num_blocks,
         "secondaryPeakUsedNumBlocks": stats.secondary_peak_used_num_blocks,
         "secondaryPeakEvictableNumBlocks": stats.secondary_peak_evictable_num_blocks,
+        "secondaryRetainedCopyNumBlocks": stats.secondary_retained_copy_num_blocks,
         "iterAllocTotalBlocks": stats.iter_alloc_total_blocks,
         "iterAllocNewBlocks": stats.iter_alloc_new_blocks,
         "iterReusedBlocks": stats.iter_reused_blocks,

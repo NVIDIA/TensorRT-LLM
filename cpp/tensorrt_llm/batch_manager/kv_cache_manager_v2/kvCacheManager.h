@@ -201,12 +201,14 @@ public:
     // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
-    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+    // Matches under the shared lock. Once a remote level has failed, the first probe after it takes the exclusive lock
+    // to unlink that level's pages, as createKvCache does, so that no probe counts them.
+    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
     std::optional<BlockKey> probeFirstNewBlockKey(
-        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -567,6 +569,13 @@ public:
     friend class Batch;
 
 private:
+    //! Unlink the committed pages of newly failed remote levels from the radix tree, so that no new match reads them;
+    //! a request still holding such a page fails its next resume (RemoteMemError). Caller holds the exclusive lock.
+    void _unlinkPagesOfFailedRemoteLevels();
+    //! _unlinkPagesOfFailedRemoteLevels() under the exclusive lock if a remote client failed since the last unlink; for
+    //! the probes, which otherwise match under the shared lock. Without a failure it reads only atomics.
+    void _unlinkPagesIfARemoteLevelFailed();
+
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.
@@ -721,6 +730,8 @@ private:
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;
+    //! StorageManager::numFailedRemoteClients() as of the last _unlinkPagesOfFailedRemoteLevels().
+    std::atomic<size_t> mNumFailedRemoteClientsUnlinked{0};
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;

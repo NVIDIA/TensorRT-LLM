@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -151,6 +152,36 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
+    if (numIoThreads < 0 || numIoThreads > kMaxIoThreads)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be between 0 and 256");
+    }
+    if (writeThrough && numIoThreads == 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires numIoThreads > 0");
+    }
+    if (!(protectedCopyFraction >= 0.0F && protectedCopyFraction <= 1.0F)) // also rejects NaN
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: protectedCopyFraction must be between 0 and 1");
+    }
+}
+
+void RemoteCacheTierConfig::validate() const
+{
+    TLLM_CHECK_WITH_INFO(quota > 0, "RemoteCacheTierConfig: quota must be > 0");
+    TLLM_CHECK_WITH_INFO(std::filesystem::is_directory(path),
+        "RemoteCacheTierConfig: rendezvous directory '%s' is not a directory", path.c_str());
+    TLLM_CHECK_WITH_INFO(0 < waitTimeoutMs && waitTimeoutMs <= kMaxRemoteTimeoutMs,
+        "RemoteCacheTierConfig: wait_timeout_ms (donor_wait_timeout_s) must be in (0, %lld], got %lld",
+        static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(waitTimeoutMs));
+    // The fabric transport's copies are stream-ordered and never timed.
+    TLLM_CHECK_WITH_INFO(transfer.transport != RemoteTransport::kNixl
+            || (0 < transfer.timeoutMs && transfer.timeoutMs <= kMaxRemoteTimeoutMs),
+        "RemoteCacheTierConfig: the NIXL transfer timeout_ms (transfer_timeout_s) must be in (0, %lld], got %lld",
+        static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(transfer.timeoutMs));
+    TLLM_CHECK_WITH_INFO(std::all_of(poolRatio.begin(), poolRatio.end(),
+                             [](double weight) { return std::isfinite(weight) && weight > 0.0; }),
+        "RemoteCacheTierConfig: pool ratio entries must be positive and finite");
 }
 
 namespace
@@ -293,6 +324,7 @@ void KVCacheManagerConfig::validate() const
     }
 
     poolRebalance.validate();
+    hostMemBacking.validate();
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.
@@ -304,6 +336,31 @@ void KVCacheManagerConfig::validate() const
     for (auto const& tier : cacheTiers)
     {
         std::visit([](auto const& cfg) { cfg.validate(); }, tier);
+    }
+
+    // Remote levels move pages through the page staging buffer, which cannot reach a file-backed disk level, and share
+    // one transport, so that their copies are either all stream-ordered or all host-synchronous.
+    std::optional<RemoteTransport> remoteTransport;
+    bool hasFileDisk = false;
+    for (auto const& tier : cacheTiers)
+    {
+        if (std::holds_alternative<DiskCacheTierConfig>(tier))
+        {
+            hasFileDisk = true;
+        }
+        else if (auto const* remote = std::get_if<RemoteCacheTierConfig>(&tier))
+        {
+            if (remoteTransport.value_or(remote->transfer.transport) != remote->transfer.transport)
+            {
+                throw AssertionError("KVCacheManagerConfig: remote cache levels must share one transport");
+            }
+            remoteTransport = remote->transfer.transport;
+        }
+    }
+    if (remoteTransport.has_value() && hasFileDisk)
+    {
+        throw AssertionError(
+            "KVCacheManagerConfig: a remote cache level cannot be combined with a file-backed disk level");
     }
 
     // Zero asks for host-backed pools with no room for a single slot. It is not a way to turn

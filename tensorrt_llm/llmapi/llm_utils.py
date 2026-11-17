@@ -229,7 +229,8 @@ class ModelLoader:
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                    self.llm_args.moe_config.backend)
+                    self.llm_args.moe_config.backend,
+                    moe_tactic=self.llm_args.moe_config.tactic)
                 quant_config.group_size = 32
                 quant_config.exclude_modules = [
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
@@ -533,8 +534,29 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
+
+    # A user's ``moe_config.tactic`` already names the implementation, so a
+    # model's preferred ``moe_config.backend`` yields to it instead of being
+    # merged into a combination that MoeConfig rejects.
+    user_moe_config = user_overrides.get("moe_config")
+    default_moe_config = model_defaults_dict.get("moe_config")
+    if (isinstance(user_moe_config, dict)
+            and user_moe_config.get("tactic") is not None
+            and isinstance(default_moe_config, dict)
+            and "backend" in default_moe_config):
+        model_defaults_dict = {
+            **model_defaults_dict,
+            "moe_config": {
+                key: value
+                for key, value in default_moe_config.items() if key != "backend"
+            },
+        }
+
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+    # Model defaults cannot change this config; retain its private launcher state,
+    # which is intentionally excluded from model_dump().
+    merged_state["cache_transceiver_config"] = llm_args.cache_transceiver_config
 
     new_args = llm_args.__class__(**merged_state)
 
@@ -575,9 +597,10 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     auto setting must be resolved first.
 
     The fallback only reaches models whose manager class is selected by
-    ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
-    -- sparse attention picks its class from the algorithm alone -- keep a V2
-    manager after the demotion, so the arm does not protect them.
+    ``use_kv_cache_manager_v2``, such as dense models and Skip Softmax. Models
+    whose manager class ignores the setting -- variable per-layer KV geometry
+    and sparse algorithms with a fixed manager -- keep that manager after the
+    demotion, so the arm does not protect them.
 
     A model whose ``requires_kv_cache_manager_v2`` hook returns True has no
     supported V1 route: the disaggregated-serving arm raises instead of

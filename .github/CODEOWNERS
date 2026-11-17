@@ -104,7 +104,7 @@
 /tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
-/tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
+/tests/integration/test_lists/qa/functional/ @NVIDIA/trt-llm-qa-function
 
 # ===== RUNTIME =====
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
@@ -324,6 +324,7 @@
 /tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
+/scripts/trtllm_gen_fmha_stage_kv @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 # The kernel-ownership question this test was waiting on is settled: the top-k
 # kernel has two production consumers (Attention and KV-cache compression), so it
@@ -355,6 +356,8 @@
 /cpp/tensorrt_llm/nanobind/runtime/moe* @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/moe @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/kernels/blackwell/moe_* @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/modules/expert_l2_prefetch.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe_comm.py @NVIDIA/trt-llm-moe-devs
@@ -523,6 +526,8 @@
 # GLM SM107 target and its native kernels/bindings
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
 
 # GLM-5.3-Flash (glm5_next)
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next @zhaoyangwang-nvidia

@@ -49,6 +49,16 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
+[`nvidia/Cosmos3-Edge-FP8`](https://huggingface.co/nvidia/Cosmos3-Edge-FP8) is
+the same static ModelOpt FP8 recipe on the Edge Nemotron-dense backbone, but it
+is published as its own repository rather than an `fp8` revision. Pass that ID
+(or a local checkout) to `--model` and do not set `--revision`. It has no audio
+tower. Its `diffusion_step_policy` runs W8A16 on the first 3 and last 3
+denoising steps and keeps W8A8 in between; the reasoner tower stays W8A16.
+Sampling stays on the Edge defaults (832×480, shift 3.0, guidance 5.0 for
+video). The checkpoint's quantization metadata records the calibration
+sampler, which is not the inference recipe.
+
 `../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
@@ -58,11 +68,12 @@ refused, with an explicit error. Note that CFG parallelism is irrelevant to the
 distilled checkpoints — they bake guidance into the weights (guidance 1.0, one
 branch per step).
 
-These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+The Nano, Super, and distilled checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
 rather than being refused — audio is quantized and generated like any other
 supported task. It simply has not been exercised as thoroughly as the four
 video/image tasks above, and no FP8 audio quality claim is made. FP8 output
-quality in general has not been benchmarked against BF16.
+quality in general has not been benchmarked against BF16. Edge-FP8 has
+`sound_gen: false` and does not run the audio path.
 
 ## Guardrails
 

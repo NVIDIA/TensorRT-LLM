@@ -57,6 +57,7 @@ from ._mtp_config import (
     _copy_model_config_with_moe_backend,
     _enable_trtllm_moe_preload_for_draft,
     _get_mtp_moe_quant_config,
+    _mtp_moe_backend,
 )
 
 
@@ -371,7 +372,7 @@ class Glm52MTPForCausalLM(nn.Module):
 def build_mtp_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
     mtp_model_config = draft_config if draft_config is not None else model_config
-    requested_moe_backend = getattr(model_config.spec_config, "moe_backend", None)
+    requested_moe_backend = _mtp_moe_backend(model_config)
     if requested_moe_backend is not None:
         start_layer_idx = model_config.pretrained_config.num_hidden_layers
         mtp_model_config = _copy_model_config_with_moe_backend(
