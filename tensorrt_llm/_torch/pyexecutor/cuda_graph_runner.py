@@ -170,7 +170,12 @@ def _largest_kv_regime(regimes) -> Optional[int]:
 
 
 def select_kv_regime_ceiling(max_kv_len: int, ceilings: Sequence[int]) -> int:
-    """Return the smallest decode KV-regime ceiling covering ``max_kv_len``."""
+    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
+
+    Shorter steps share the first regime; a step beyond the list (never, when
+    ``ceilings`` ends with the capacity) gets the last one, the graph of the
+    capacity.
+    """
     for ceiling in ceilings:
         if max_kv_len <= ceiling:
             return int(ceiling)

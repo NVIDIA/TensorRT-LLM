@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import select_kv_regime_ceiling
 
 SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
@@ -369,25 +370,30 @@ def test_kv_regimes_for_batch(monkeypatch):
 
 
 def test_kv_regime_for_step():
+    # the graph runner maps a step onto the regimes the dispatcher lists for its shape
     ceilings = _regimes(128, 4, 30080)
-    assert dp.kv_regime_for_step(1, ceilings) == 8191
-    assert dp.kv_regime_for_step(8191, ceilings) == 8191
-    assert dp.kv_regime_for_step(8192, ceilings) == 30080
-    assert dp.kv_regime_for_step(30080, ceilings) == 30080
-    assert dp.kv_regime_for_step(40000, ceilings) == 30080
-    assert dp.kv_regime_for_step(5000, (30080,)) == 30080
+    assert select_kv_regime_ceiling(1, ceilings) == 8191
+    assert select_kv_regime_ceiling(8191, ceilings) == 8191
+    assert select_kv_regime_ceiling(8192, ceilings) == 30080
+    assert select_kv_regime_ceiling(30080, ceilings) == 30080
+    assert select_kv_regime_ceiling(40000, ceilings) == 30080
+    assert select_kv_regime_ceiling(5000, (30080,)) == 30080
     # the graph of a regime decides the way the eager call would for every step in it: 2x for every KV under the
     # floor, 4x-eligible from the floor up
     for kv in (1, 5000, 8191):
-        assert _choose(128, 4, 30080, live=dp.kv_regime_for_step(kv, ceilings)).path == dp.PATH_2X
+        assert (
+            _choose(128, 4, 30080, live=select_kv_regime_ceiling(kv, ceilings)).path == dp.PATH_2X
+        )
         assert _choose(128, 4, 30080, live=kv).path == dp.PATH_2X
     for kv in (8192, 16384, 30080):
-        assert _choose(128, 4, 30080, live=dp.kv_regime_for_step(kv, ceilings)).path != dp.PATH_2X
+        assert (
+            _choose(128, 4, 30080, live=select_kv_regime_ceiling(kv, ceilings)).path != dp.PATH_2X
+        )
         assert _choose(128, 4, 30080, live=kv).path != dp.PATH_2X
     # one wave: the single regime decides 4x, as the eager call does at every KV
     for kv in (1, 1024, 30080):
         assert (
-            _choose(16, 4, 30080, live=dp.kv_regime_for_step(kv, _regimes(16, 4, 30080))).path
+            _choose(16, 4, 30080, live=select_kv_regime_ceiling(kv, _regimes(16, 4, 30080))).path
             == dp.PATH_4X
         )
         assert _choose(16, 4, 30080, live=kv).path == dp.PATH_4X

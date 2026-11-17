@@ -13,7 +13,6 @@ from typing import Any, NamedTuple, Protocol
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
@@ -886,12 +885,19 @@ class DecoderCudaGraphs:
     def _kv_regime_resolver(
         self, resource_manager: ResourceManager
     ) -> Callable[[int, int], tuple[int, ...]] | None:
-        """Return per-shape decode KV-regime ceilings from the attention backend, or None."""
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        return TrtllmAttention.resolve_decode_kv_regimes(
-            kv_cache_manager=kv_cache_manager,
+        """KV regimes the decode graphs are keyed by, per graph shape; None for every decode but FP4 MLA 4x.
+
+        Resolved at capture, once the KV cache exists. The FP4 MLA backend
+        owns the rule (``graph_resolvers.resolve_fp4_mla_kv_regimes``) and
+        returns None for any other KV cache before it reads a switch or probes
+        the device.
+        """
+        from tensorrt_llm._torch.attention.backends.fp4_mla import graph_resolvers
+
+        return graph_resolvers.resolve_fp4_mla_kv_regimes(
+            kv_cache_manager=resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            ),
             model=self.model,
             mapping=self.mapping,
             sm_count_fn=self._decode_sm_count,
@@ -901,17 +907,25 @@ class DecoderCudaGraphs:
     def _packed_split_resolver(
         self, resource_manager: ResourceManager
     ) -> PackedSplitResolver | None:
-        """Return per-step decode split-budget decisions from the attention backend, or None."""
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        return TrtllmAttention.resolve_decode_packed_split(
-            kv_cache_manager=kv_cache_manager,
+        """Packed split decisions the decode graphs are keyed by; None for every decode but the FP4 MLA packed one.
+
+        Resolved at capture, like the KV regimes
+        (``graph_resolvers.resolve_fp4_mla_packed_split``).
+        """
+        from tensorrt_llm._torch.attention.backends.fp4_mla import graph_resolvers
+
+        resolved = graph_resolvers.resolve_fp4_mla_packed_split(
+            kv_cache_manager=resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            ),
             model=self.model,
             mapping=self.mapping,
             sm_count_fn=self._decode_sm_count,
-            resolver_cls=PackedSplitResolver,
         )
+        if resolved is None:
+            return None
+        variants, decide = resolved
+        return PackedSplitResolver(variants=variants, decide=decide)
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
