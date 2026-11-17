@@ -20,7 +20,10 @@ from tensorrt_llm._torch.modules.low_m_gemm import (
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    lowm_fp8_supported,
+    mxfp8_lowm_linear,
 )
+from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
 from tensorrt_llm._utils import is_sm_100f
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,10 @@ _skip_no_cuda = pytest.mark.skipif(
 _skip_non_sm10x = pytest.mark.skipif(
     torch.cuda.device_count() == 0 or not is_sm_100f(),
     reason="requires SM10x GPU (SM100/SM103)",
+)
+_skip_no_lowm_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not lowm_fp8_supported(),
+    reason="needs SM100/SM103",
 )
 
 # ---------------------------------------------------------------------------
@@ -96,6 +103,20 @@ def test_attach_reaches_the_router_gate(monkeypatch) -> None:
     assert root.gate._low_m_gemm_name == "gate"
 
 
+def test_a_later_attach_keeps_the_models_own_dispatcher(monkeypatch) -> None:
+    """The loader's prepare_low_m_gemm after load must not replace a dispatcher the model attached itself
+    (Qwen3.5: limit_rows, whole_bucket_direct_tiles, per_rank_tuning); new modules still get the later one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.own = torch.nn.Linear(8, 8)
+    model_dispatcher = _mod.prepare_low_m_gemm(root, force=True, whole_bucket_direct_tiles=True)
+    root.later = torch.nn.Linear(8, 8)
+    loader_dispatcher = _mod.prepare_low_m_gemm(root)
+
+    assert root.own._low_m_gemm_dispatcher is model_dispatcher
+    assert root.later._low_m_gemm_dispatcher is loader_dispatcher
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
@@ -106,6 +127,52 @@ def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
 
     assert _mod._should_apply_low_m_gemm(torch.empty((32, 128)))
     assert not _mod._should_apply_low_m_gemm(torch.empty((33, 128)))
+
+
+def test_takes_rows_follows_the_module_ceiling(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", False)
+    dispatcher = LowMGemmDispatcher()
+    plain, limited = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+    for module in (plain, limited):
+        module._low_m_gemm_dispatcher = dispatcher
+    dispatcher.limit_rows(limited, 14)
+
+    assert not _mod.low_m_gemm_takes_rows(torch.nn.Linear(8, 8), 4)
+    assert _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M)
+    assert not _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M + 1)
+    assert _mod.low_m_gemm_takes_rows(limited, 14)
+    assert not _mod.low_m_gemm_takes_rows(limited, 15)
+
+
+def test_static_fp8_input_scale_is_one_decision(monkeypatch) -> None:
+    """Linear.static_fp8_input_scale: the scale where an FP8 QDQ layer takes an E4M3 input at these rows, else
+    None (another quantization, LoRA, bias, a non-scalar scale, or rows on the low-M path)."""
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear, W8A16FP8LinearMethod
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def layer(**overrides):
+        fields = dict(
+            quant_method=FP8QDQLinearMethod(),
+            lora=None,
+            bias=None,
+            input_scale=scale,
+            force_dynamic_quantization=False,
+        )
+        fields.update(overrides)
+        return MagicMock(
+            spec=[*fields, "_low_m_gemm_dispatcher"], _low_m_gemm_dispatcher=None, **fields
+        )
+
+    rows = _mod._MAX_M + 1
+    assert Linear.static_fp8_input_scale(layer(), rows) is scale
+    assert Linear.static_fp8_input_scale(layer(), _mod._MAX_M) is None
+    assert Linear.static_fp8_input_scale(layer(quant_method=W8A16FP8LinearMethod()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(lora=object()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(bias=torch.zeros(4)), rows) is None
+    assert Linear.static_fp8_input_scale(layer(force_dynamic_quantization=True), rows) is None
+    assert Linear.static_fp8_input_scale(layer(input_scale=scale.half()), rows) is None
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +569,44 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 4
         assert all(isinstance(v, int) for v in t)
+
+
+# Small-M FP8 warp-MMA GEMM (CuTe DSL) against a dequantized reference. Its split-output, grouped and
+# RoPE variants serve DSpark's TP attention, which test_dspark_cute_dsl_attention.py covers.
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [1, 64])
+def test_fp8_lowm_matches_dequant_reference(m):
+    n, k = 1792, 5120
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ dequant_mxfp8_weight(w, s).t()
+    # BF16 output rounding only: the kernel accumulates the exact dequantized products in FP32.
+    torch.testing.assert_close(
+        mxfp8_lowm_linear(x, w, s).float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+    )
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [1, 16])
+def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
+    """The A RMS norm projects ``rms_norm(x) * gamma`` with the row scale applied in FP32 after
+    the MMA; a separate BF16 norm and the same kernel differ by BF16 rounding of A only."""
+    n, k, eps = 4096, 1280, 1e-6
+    g = torch.Generator(device="cuda").manual_seed(m)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    x = (torch.randn(m, k, device="cuda", generator=g) * 3).to(torch.bfloat16)
+    gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+    ref = (normalized * gamma.float()) @ dequant_mxfp8_weight(w, s).t()
+    actual = mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, eps)).float()
+    torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+    separate = mxfp8_lowm_linear((normalized * gamma.float()).to(torch.bfloat16), w, s).float()
+    torch.testing.assert_close(actual, separate, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
 
 
 # ---------------------------------------------------------------------------

@@ -1209,12 +1209,17 @@ def _run_test_for_backend(backend_name,
                     q = inputs_per_layer[layer_idx]["ctx_q"]
                     k = inputs_per_layer[layer_idx]["ctx_k"]
                     v = inputs_per_layer[layer_idx]["ctx_v"]
+                    # Reuse the layer-count scenarios to cover both V layouts without
+                    # adding cases: one layer uses compact V, multiple layers use
+                    # the joint-projection view. Preserve both layouts if the
+                    # layer-count parametrization changes.
+                    if num_layers == 1:
+                        v = v.contiguous()
                     compressed_kv = inputs_per_layer[layer_idx][
                         "ctx_compressed_kv"]
                     k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
                     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                     # q/k will be modified in the forward pass, so we need to clone them
-                    # we should not clone v because we need to keep the stride of v
                     if backend_name == "FLASHINFER":
                         # FlashInfer MLA does not fuse RoPE; pre-apply it here.
                         ctx_positions = [
@@ -1320,13 +1325,12 @@ def _run_test_for_backend(backend_name,
                         num_seqs = len(context_sequence_lengths)
                         cu_q_seqlens = torch.empty(num_seqs + 1,
                                                    dtype=torch.int32,
-                                                   device=q.device)
+                                                   device=fused_q.device)
                         cu_kv_seqlens = torch.empty(num_seqs + 1,
                                                     dtype=torch.int32,
-                                                    device=q.device)
-                        fmha_scheduler_counter = torch.empty(1,
-                                                             dtype=torch.uint32,
-                                                             device=q.device)
+                                                    device=fused_q.device)
+                        fmha_scheduler_counter = torch.empty(
+                            1, dtype=torch.uint32, device=fused_q.device)
                         has_fp8_kv_cache = gen_layers[
                             layer_idx].has_fp8_kv_cache if hasattr(
                                 gen_layers[layer_idx],
@@ -1335,15 +1339,15 @@ def _run_test_for_backend(backend_name,
                         if has_fp8_kv_cache:
                             mla_bmm1_scale = torch.empty(2,
                                                          dtype=torch.float32,
-                                                         device=q.device)
+                                                         device=fused_q.device)
                             mla_bmm2_scale = torch.empty(1,
                                                          dtype=torch.float32,
-                                                         device=q.device)
+                                                         device=fused_q.device)
                             quant_q_buffer = torch.empty(
                                 num_tokens,
                                 num_heads * (kv_lora_rank + qk_rope_head_dim),
                                 dtype=torch.uint8,
-                                device=q.device)
+                                device=fused_q.device)
                         else:
                             mla_bmm1_scale = None
                             mla_bmm2_scale = None
@@ -1621,6 +1625,8 @@ def _context_projection(device: str,
         mla_module.MLA._use_kvbproj_strided_out, model)
     model._get_kvbproj_head_weights = types.MethodType(
         mla_module.MLA._get_kvbproj_head_weights, model)
+    model._project_context_kv_strided = types.MethodType(
+        mla_module.MLA._project_context_kv_strided, model)
     model._project_context_kv = types.MethodType(
         mla_module.MLA._project_context_kv, model)
     return model
@@ -1706,12 +1712,14 @@ def test_kvb_context_layout(monkeypatch, device, num_tokens, case,
     if apply_rope:
         torch.testing.assert_close(k[..., 16:], k_pe[:,
                                                      None, :].expand(-1, 4, -1))
-    # The FP8 consumer assumes the original KV token stride, including the unused K half.
+    # Eligible projections own only V; fallback projections retain the joint KV storage.
     assert captured["k"].stride() == (96, 1)
     assert k[..., :16].transpose(0, 1).stride() == (24, 96, 1)
-    assert captured["v"].stride() == (128, 1)
+    v_stride = 64 if use_strided else 128
+    assert captured["v"].stride() == (v_stride, 1)
+    assert captured["v"].untyped_storage().nbytes() == num_tokens * v_stride * 2
     # Unflatten may normalize the stride of a singleton token dimension.
-    v_out_token_stride = 64 if num_tokens == 1 else 128
+    v_out_token_stride = 64 if num_tokens == 1 else v_stride
     v_out = captured["v"].unflatten(-1, (4, 16)).transpose(0, 1)
     assert v_out.stride() == (16, v_out_token_stride, 1)
     assert captured["latent"] is latent_cache

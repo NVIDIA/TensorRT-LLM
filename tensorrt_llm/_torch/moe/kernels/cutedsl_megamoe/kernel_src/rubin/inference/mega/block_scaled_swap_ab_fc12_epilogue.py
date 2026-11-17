@@ -43,7 +43,8 @@ from .....helpers.ptx_helpers import (
 )
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from ....function_mapping import CoordinateSpace, FunctionMapping
-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
+from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+from ....schedulers.base import SchedulerConsumer
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 
 
@@ -872,6 +873,10 @@ class SwapABGatedActEpilogue(KernelComponent):
     TMA store commit / drain, per-subtile dispatch) lives inside this class.
     """
 
+    # Default for subclasses with their own __init__ (local_mega): the plain combine plane. The
+    # gen-phase kernel opts into the bit-inverted, self-validating plane through impl_desc.
+    combine_ll_encoded: bool = False
+
     _EpilogueSyncWaitBarId = 1  # Arrive and wait only
     _EpilogueAsyncBarIdBase = 4  # Some arrive, the others arrive and wait
     _EpilogueFc1GateUpInterleave = 16
@@ -919,6 +924,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             "reduce_topk_in_kernel": OptionalRequirement(bool),
             "token_back_push_data": OptionalRequirement(bool),
             "token_back_ready_granularity": OptionalRequirement(str),
+            "combine_ll_encoded": OptionalRequirement(bool),
         }
 
     def _make_fc2_epilogue(self, *args) -> "SwapABFc2Epilogue":
@@ -1007,6 +1013,19 @@ class SwapABGatedActEpilogue(KernelComponent):
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires a BF16 combine format.")
         self.reduce_topk_in_epilogue = self.reduce_topk_in_kernel and not self.token_back_push_data
+        # A plain (not reduce-add) bf16 bulk store into the peers' (token, topk, hidden)
+        # plane writes every element exactly once, so it carries its own arrival: the
+        # store writes ``bits ^ 0xFFFF`` into a zeroed plane and the standalone reduce
+        # polls for nonzero halves (0xFFFF is a NaN ``cvt.rn.bf16`` never produces).
+        # Opt-in: only a kernel whose standalone reduce decodes the plane (the generation-phase
+        # kernel) asks for it; every other user of this epilogue keeps the plain combine plane.
+        self.combine_ll_encoded = bool(impl_desc.get("combine_ll_encoded", False))
+        if self.combine_ll_encoded and not (
+            self.fc2_use_ublk and not self.reduce_topk_in_epilogue and not self.combine_format.is_quantized
+        ):
+            raise ValueError(
+                "combine_ll_encoded needs the plain bf16 UBLK combine store with a standalone top-k reduce."
+            )
         if (
             not 1 <= self.fc1_epi_flag_batch <= self._EpilogueWarpCnt
             or not 1 <= self.fc2_epi_flag_batch <= self._EpilogueWarpCnt
@@ -1342,7 +1361,16 @@ class SwapABGatedActEpilogue(KernelComponent):
             work_tile_info = sched_consumer.consume_work()
 
             # Every asynchronous store commits at issue; drain before completion or scratch reuse.
-            cute.arch.cp_async_bulk_wait_group(0)
+            if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
+                # An FC2 tile publishes nothing and its peer stores carry their own
+                # arrival (self-validating plane), so only the scratch reuse needs a
+                # drain: waiting for the reads, not for the NVLink writes to land.
+                if cur_was_linear1:
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+            else:
+                cute.arch.cp_async_bulk_wait_group(0)
             # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
 
@@ -1353,6 +1381,9 @@ class SwapABGatedActEpilogue(KernelComponent):
                 flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
         # Tail flush
         flag_tracker.fire()
+        if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
+            # The FC2 tiles above drained only their reads; leave with every write landed.
+            cute.arch.cp_async_bulk_wait_group(0)
 
 
 class _ImmutableAfterInit:
@@ -2745,6 +2776,11 @@ def fc2_ublk_store_function_impl(
     else:
         if cutlass.const_expr(cute.size(data_subtile) != epi._EpilogueTokenTileSize):
             raise ValueError("BF16 UBLK staging requires one register per token in the 64-token subtile.")
+        if cutlass.const_expr(epi.combine_ll_encoded):
+            # Flip every bit: a stored zero half then means "not arrived yet".
+            packed_pairs = cute.recast_tensor(data_subtile, cutlass.Int32)
+            for pair_idx in cutlass.range_constexpr(cute.size(packed_pairs)):
+                packed_pairs[pair_idx] = packed_pairs[pair_idx] ^ cutlass.Int32(-1)
         warp_hidden_base = cutlass.Int32(warp_idx * 32)
         for token_idx in cutlass.range_constexpr(epi._EpilogueTokenTileSize):
             smem_stage[token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]

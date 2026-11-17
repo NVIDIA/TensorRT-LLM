@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -31,6 +32,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -71,7 +73,7 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratchRange.contains(ordinal))
+        if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value() && scratchRange.contains(ordinal))
         {
             // Scratch block: its slot comes from the request's own scratch slots, not from
             // base_indices.
@@ -138,9 +140,13 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
-    mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
+    mStorage
+        = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, std::move(coldPageCodec),
+            mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink,
+            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.coldTypicalStep);
+    // The context the storage above lives in; teardown pushes it on threads that have none.
+    cuCheck(cuCtxGetCurrent(&mCudaContext));
+    TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");
 
     _computeSparseCacheShape();
 
@@ -158,6 +164,60 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
+    if (mShutDown)
+    {
+        return;
+    }
+    // Finalized rather than shut down, on a thread that may have no CUDA context. shutdown()
+    // makes every driver call of the teardown, so the scope only has to cover it: after
+    // shutdown() no member destructor touches the driver.
+    CudaContextScope const context(mCudaContext);
+    if (!context.usable())
+    {
+        // The context or the driver is already gone, so nothing of this manager can be released.
+        // Its storage and tree are handed to allocations that are never freed, which keeps their
+        // destructors -- and the driver calls in them -- from running at all. That is deliberately
+        // not a poisoning: no structure is left half-torn, and the managers that follow in this
+        // process stay usable. The leaked objects still refer to mLifeCycles, which is destroyed
+        // with the rest of the manager; the reference dangles but is unreachable, since no code
+        // holds the leaked pointers and no destructor or method of theirs runs again.
+        //
+        // A deinitialized driver means the process is exiting: a leak at that point costs nothing
+        // and is only worth a warning. Any other failure is a live process without its context.
+        char const* errorName = nullptr;
+        cuGetErrorName(context.error(), &errorName);
+        if (context.error() == CUDA_ERROR_DEINITIALIZED)
+        {
+            TLLM_LOG_WARNING(
+                "KVCacheManagerV2 is being finalized after the CUDA driver was deinitialized; its memory is left "
+                "to the exiting process. Call shutdown() before interpreter exit to release it explicitly.");
+        }
+        else
+        {
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 is being finalized without a usable CUDA context (%s (%d)); its memory is leaked. "
+                "Call shutdown() from the thread that drives the manager.",
+                errorName != nullptr ? errorName : "unknown CUDA driver error", static_cast<int>(context.error()));
+        }
+        auto* const tree = new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
+        auto* const storage = new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
+        if (tree == nullptr || storage == nullptr)
+        {
+            // A failed nothrow allocation leaves its argument unmoved, so that member is destroyed
+            // below after all; its destructor then fails for want of a context and poisons KVCM2.
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 could not even leak its memory (allocation failed); its destructors "
+                "run without a CUDA context and may poison KVCacheManagerV2.");
+        }
+        return;
+    }
+    if (context.pushed())
+    {
+        TLLM_LOG_WARNING(
+            "KVCacheManagerV2 is being finalized without shutdown() on a thread that does not have its CUDA context "
+            "current; call shutdown() from the thread that drives the manager. Tearing it down with its own "
+            "context.");
+    }
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 
@@ -190,7 +250,7 @@ void KvCacheManager::_computeSparseCacheShape()
 
         // Layers of one life cycle must currently declare the same sparse_cache. The arena
         // is per life cycle and its metadata is one stride: a selection's rows are found at
-        // `residentOrdinal + slot * entriesPerSelection`, so a single entry count serves
+        // `entry + slot * entriesPerSelection`, so a single entry count serves
         // them all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
         // See SPARSE_ATTENTION_DESIGN.md.
         auto& shape = mSparseCacheShape[lcId];
@@ -423,8 +483,11 @@ void KvCacheManager::shutdown()
     // The latch is read under the lock because it is normally set by a thread holding it: a read
     // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
-    if (Poison::poisoned())
+    if (Poison::poisoned() || mShutDown)
     {
+        // Recorded on the poisoned path too: nothing will be released later either way, and the
+        // destructor should not then report a missing shutdown() to a caller who made it.
+        mShutDown = true;
         return;
     }
     _checkNoLivingKvCaches("shutdown()");
@@ -442,6 +505,7 @@ void KvCacheManager::shutdown()
     }
 
     mStorage->destroy();
+    mShutDown = true;
 }
 
 void KvCacheManager::clearReusableBlocks()
@@ -456,7 +520,7 @@ void KvCacheManager::clearReusableBlocks()
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
-    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool inputKnownNoDigest)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -476,11 +540,79 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
     if (inputTokens.size() != 0)
     {
-        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
+        _unlinkPagesOfFailedRemoteLevels();
+        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()) || inputKnownNoDigest);
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
         std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+}
+
+void KvCacheManager::_unlinkPagesIfARemoteLevelFailed()
+{
+    if (mStorage->numFailedRemoteClients() <= mNumFailedRemoteClientsUnlinked.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    auto const apiLock = lockExclusive();
+    _unlinkPagesOfFailedRemoteLevels();
+}
+
+void KvCacheManager::_unlinkPagesOfFailedRemoteLevels()
+{
+    // Counted before the levels are taken: a client failing in between is unlinked by the next call.
+    auto const numFailed = mStorage->numFailedRemoteClients();
+    auto const levels = mStorage->takeNewlyFailedRemoteLevels();
+    mNumFailedRemoteClientsUnlinked.store(numFailed, std::memory_order_release);
+    if (levels.empty())
+    {
+        return;
+    }
+    // The evictable pages there are dropped already; the rest are held by requests. Collect first: unlinking can
+    // detach subtrees.
+    std::vector<std::pair<SharedPtr<Block>, LifeCycleId>> onFailedLevel;
+    std::vector<SharedPtr<Block>> pending;
+    for (auto const& [key, root] : mRadixTree->roots())
+    {
+        for (auto const& [childKey, child] : root->next)
+        {
+            pending.push_back(child);
+        }
+    }
+    auto const onFailed = [&levels](CommittedPage const* page)
+    { return page != nullptr && std::find(levels.begin(), levels.end(), page->cacheLevel) != levels.end(); };
+    while (!pending.empty())
+    {
+        auto block = std::move(pending.back());
+        pending.pop_back();
+        for (auto const& [childKey, child] : block->next)
+        {
+            pending.push_back(child);
+        }
+        for (LifeCycleId lc{0}; lc < block->numLifeCycles(); ++lc)
+        {
+            if (onFailed(block->getPage(lc)))
+            {
+                onFailedLevel.emplace_back(block, lc);
+            }
+        }
+    }
+    // Detached blocks stay alive until every unlink is done.
+    std::vector<SharedPtr<Block>> detached;
+    for (auto const& [block, lc] : onFailedLevel)
+    {
+        auto* const page = block->getPage(lc);
+        if (!onFailed(page))
+        {
+            continue;
+        }
+        block->unlinkPage(lc, page);
+        auto cleared = Block::clearStaleBlocksAfterPageUnlink(*block, lc, mStorage->lifeCycles().getLifeCycle(lc));
+        detached.insert(
+            detached.end(), std::make_move_iterator(cleared.begin()), std::make_move_iterator(cleared.end()));
+    }
+    TLLM_LOG_WARNING(
+        "KVCM2 remote level(s) failed: %zu page(s) requests hold there left the reuse tree", onFailedLevel.size());
 }
 
 void KvCacheManager::refreshRetention()
@@ -496,6 +628,7 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
     auto const apiLock = lockExclusive();
     if (target < kHotLevel || target >= mStorage->numCacheLevels())
         throw std::out_of_range("Prefetch target is outside the configured cache tiers");
+    _unlinkPagesOfFailedRemoteLevels();
     auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
     auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
         KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
@@ -510,17 +643,20 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
     KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
 std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
-    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
+    KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // The matched Block* remain protected until the key has been copied out.
     // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
     auto const apiLock = lockShared();
@@ -818,6 +954,11 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
+}
+
+CacheGroupId KvCacheManager::getRegionGroupId(std::string const& name) const
+{
+    return mLifeCycles.regionLifeCycleId(name);
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const

@@ -310,9 +310,20 @@ Qwen/Qwen3.8-2.4T-A95B:
     accuracy: 93.80
 Qwen/Qwen3.8-Flash-Next:
   - accuracy: 95.72
+  # Block FP8 without speculative decoding, under the protocol of the FP8 MTP row (chat
+  # template, thinking with a short-reasoning system prompt, 512 output tokens), measured on
+  # the built-in implementation: TEP4 on GB300, TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.34
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 95.11
+  # FP8 KV cache over the checkpoint's bf16 KV, measured on the modeling_v2 FP8 target: TEP4 on
+  # GB300, MTP draft length 3, the breakable prefill graph, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 95.15
   - quant_algo: MIXED_PRECISION
     accuracy: 96.36
   - quant_algo: MIXED_PRECISION
@@ -393,6 +404,10 @@ google/gemma-3n-E2B-it:
   - accuracy: 72.176
 google/gemma-4-E2B-it:
   - accuracy: 85.709
+swiss-ai/Apertus-8B-Instruct-2509:
+  - accuracy: 57.56
+swiss-ai/Apertus-v1.5-8B:
+  - accuracy: 77.56
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8
@@ -628,4 +643,9 @@ zai-org/GLM-5.3-Flash:
   # RTX PRO 6000 TP4/EP4, NVFP4 checkpoint with FP8 KV cache, harness protocol.
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
+    accuracy: 92.87
+  # MTP with strict acceptance uses the same regression gate as no speculation.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
     accuracy: 92.87

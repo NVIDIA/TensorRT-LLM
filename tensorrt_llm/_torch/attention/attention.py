@@ -96,6 +96,8 @@ def attn_custom_op_inplace(
     mrope_position_deltas: Optional[torch.Tensor],
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
+    variable_window_token_starts: Optional[torch.Tensor],
+    variable_window_token_ends: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
     relative_attention_bias: Optional[torch.Tensor],
     relative_attention_max_distance: int,
@@ -122,6 +124,8 @@ def attn_custom_op_inplace(
         mrope_position_deltas,
         attention_window_size,
         attention_mask_data,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         output=output,
         output_sf=output_sf,
         attention_sinks=attention_sinks,
@@ -245,7 +249,11 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
         "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
 
 
-@torch.compile(dynamic=False)
+# NCCL needs each all-to-all chunk to be contiguous. Inductor can pad the
+# transposed buffers that the chunks are split from, even with
+# ``pad_outputs=False``, so turn padding off for this helper. This keeps the
+# fused kernels and avoids a copy of each chunk after the compiled call.
+@torch.compile(dynamic=False, options={"comprehensive_padding": False})
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
@@ -488,6 +496,9 @@ def maybe_allgather_for_helix_cp(
 
 
 class Attention(nn.Module):
+    # A gated layer offers o_proj's static FP8 input scale to the KV-replica GQA decode, whose merge then writes
+    # o_proj's E4M3 input (AttentionForwardArgs.gated_out_scale).
+    offers_gated_fp8_out: bool = False
 
     def __init__(
         self,
@@ -513,6 +524,8 @@ class Attention(nn.Module):
         head_dim: Optional[int] = None,
         use_gqa_decode_fmha: bool = False,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -537,6 +550,8 @@ class Attention(nn.Module):
             use_gqa_decode_fmha (bool): With the TRTLLM backend, serve generation calls with the GQA decode FMHA
                 library (backends/fmha/gqa_decode.py), offering it the output gate and the prologue's FP8 KV append.
             cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
+            context_fmha_head_dim_per_stage_kv (int): See TrtllmAttention; 0 keeps the default context kernel.
+            context_last_rows_only (bool): See TrtllmAttention; the layer reads only each context request's last row.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -659,11 +674,13 @@ class Attention(nn.Module):
                 # Ray); without it the rank decodes its whole KV head.
                 if not TPGroupExchange.is_supported(self.mapping, kv_replicas):
                     kv_replicas = 1
+            self.offers_gated_fp8_out = kv_replicas > 1
             gqa_decode = GqaDecodeSetup(
                 kv_replicas=kv_replicas,
                 mapping=self.mapping,
                 tokens_per_gen_step=(config.spec_config.tokens_per_gen_step
-                                     if config.spec_config is not None else 1))
+                                     if config.spec_config is not None else 1),
+                max_graph_batch=max(config.cuda_graph_batch_sizes, default=0))
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
@@ -736,6 +753,7 @@ class Attention(nn.Module):
             use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
+        self._preserve_kv_cache_quant_algo = config._preserve_kv_cache_quant_algo
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config
@@ -826,6 +844,9 @@ class Attention(nn.Module):
             sparse_params=sparse_params,
             gqa_decode=gqa_decode,
             cache_context_plan=cache_context_plan,
+            context_fmha_head_dim_per_stage_kv=
+            context_fmha_head_dim_per_stage_kv,
+            context_last_rows_only=context_last_rows_only,
         )
         self.cache_context_plan = cache_context_plan
         # (_use_quantize_output(), FP4 KV cache) once the weights are loaded, with cache_context_plan.
@@ -987,6 +1008,8 @@ class Attention(nn.Module):
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
         kv_append: Optional[KvAppendPlan] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ):
         """Run the attention backend; with output_gate, the returned output has the gate applied (by the backend or
         here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
@@ -1023,6 +1046,8 @@ class Attention(nn.Module):
                     mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
+                    variable_window_token_starts=variable_window_token_starts,
+                    variable_window_token_ends=variable_window_token_ends,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
                     relative_attention_bias=relative_attention_bias,
@@ -1076,7 +1101,13 @@ class Attention(nn.Module):
             relative_attention_max_distance=relative_attention_max_distance,
             output_gate=output_gate,
             kv_append=kv_append,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
         )
+        if (self.offers_gated_fp8_out and output_gate is not None
+                and out_scale is None and not has_lora):
+            forward_args.gated_out_scale = self.o_proj.static_fp8_input_scale(
+                num_tokens)
         with attn_metadata.mixed_precision_kv_staging(self.attn.layer_idx):
             attn_output = self.attn.forward(q,
                                             k,
@@ -1089,6 +1120,10 @@ class Attention(nn.Module):
                 attn_output
             ) == 2, "attn_output should be a tuple of (output, output_sf)"
             attn_output, attn_output_sf = attn_output
+        if forward_args.output_fp8 is not None:
+            # the library applied the gate and wrote o_proj's FP8 input itself (gated_out_scale)
+            assert forward_args.output_gate_applied and attn_output_sf is None
+            return forward_args.output_fp8, None
         if output_gate is not None and not forward_args.output_gate_applied:
             attn_output = self.apply_output_gate(attn_output, output_gate)
         return attn_output, attn_output_sf
@@ -1109,6 +1144,8 @@ class Attention(nn.Module):
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
         kv_append: Optional[KvAppendPlan] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -1127,6 +1164,8 @@ class Attention(nn.Module):
                 relative_attention_max_distance,
                 has_lora,
                 output_gate,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 **kwargs,
             )
             if sparse_output is not None:
@@ -1160,6 +1199,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts,
+                variable_window_token_ends,
                 attention_sinks,
                 relative_attention_bias,
                 relative_attention_max_distance,
@@ -1178,6 +1219,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
@@ -1216,6 +1259,8 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1289,6 +1334,8 @@ class Attention(nn.Module):
             has_lora=bool(lora_params),
             output_gate=gate,
             kv_append=kv_append,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
 

@@ -15,7 +15,7 @@ from _m3_test_inputs import num_sms as num_sms
 from _m3_test_inputs import randn as randn
 from _m3_test_inputs import seed_of as seed_of  # noqa: E402
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_shard_accept import (  # noqa: E501
     SHARD_ROWS,
     make_keys,
 )

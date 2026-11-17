@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -46,6 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
                                           DSparkDecodingConfig, DwdpConfig,
@@ -63,10 +65,12 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
-                                          SleepConfig, SpeculativeConfig,
-                                          StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs,
+                                          SleepConfig,
+                                          SparseKvCacheOffloadConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
                                           UserProvidedDecodingConfig,
+                                          auto_moe_backend_for_load_balancer,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
 # fmt: on
@@ -106,6 +110,26 @@ def test_iter_perf_stats_interval_defaults_and_validation() -> None:
 
 
 @pytest.mark.cpu_only
+def test_checkpoint_format_accepts_builtin_and_custom_strings() -> None:
+    assert public_llmapi.CheckpointFormat is CheckpointFormat
+    # A built-in format string becomes the enum member with that value.
+    # "mistral" is not the member name MISTRAL, so this checks a value lookup.
+    args = TorchLlmArgs(model=llama_model_path, checkpoint_format="mistral")
+    assert args.checkpoint_format is CheckpointFormat.MISTRAL
+    assert json.loads(args.model_dump_json(include={"checkpoint_format"})) == {
+        "checkpoint_format": "mistral"
+    }
+    # A custom registered format stays a plain string.
+    args = TorchLlmArgs(model=llama_model_path,
+                        checkpoint_format="custom_format")
+    assert type(args.checkpoint_format) is str
+    assert args.checkpoint_format == "custom_format"
+    # A value that is not a string is still rejected.
+    with pytest.raises(ValidationError, match="checkpoint_format"):
+        TorchLlmArgs(model=llama_model_path, checkpoint_format=123)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
 @pytest.mark.parametrize("as_string", [False, True])
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
@@ -121,7 +145,8 @@ def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
         args.model_dump_json(include={"checkpoint_io_policy"})) == {
             "checkpoint_io_policy": policy.value
         }
-    assert args.checkpoint_format == "HF"
+    # The default checkpoint format is the enum member, not a plain string.
+    assert args.checkpoint_format is CheckpointFormat.HF
 
 
 @pytest.mark.cpu_only
@@ -273,6 +298,30 @@ class TestMoeConfigPerLayerDynamicEplb:
         with pytest.raises(ValidationError,
                            match=r"EPLB requires backend='MEGAMOE_CUTEDSL'"):
             MoeConfig(backend=backend, load_balancer=self._per_layer_dynamic())
+
+    @pytest.mark.parametrize(
+        "load_balancer, backend",
+        [
+            (None, "AUTO"),
+            ({
+                "num_slots": 72
+            }, "AUTO"),
+            ({
+                "mode": "per_layer_dynamic",
+                "num_slots": 72
+            }, "MEGAMOE_CUTEDSL"),
+        ],
+        ids=["none", "standard", "per_layer_dynamic"],
+    )
+    def test_auto_backend_follows_the_load_balancer(self,
+                                                    load_balancer: dict | None,
+                                                    backend: str) -> None:
+        """The rule drafts sharing the target's balancer resolve AUTO by."""
+        config = MoeConfig(load_balancer=load_balancer)
+
+        assert auto_moe_backend_for_load_balancer(
+            config.load_balancer) == backend
+        assert config.backend == backend
 
     @pytest.mark.parametrize("backend", [None, "AUTO", "MEGAMOE_CUTEDSL"])
     def test_resolves_auto_and_accepts_compatible_backend(
@@ -483,6 +532,219 @@ class TestMoeConfigPerLayerDynamicEplb:
                 ValidationError,
                 match=r"Failed to load MoE load balancer config file:"):
             MoeConfig(load_balancer=str(config_path))
+
+
+@pytest.mark.cpu_only
+class TestDecodingBaseConfigMoeTactic:
+    """``speculative_config.moe_tactic`` is checked as ``moe_config.tactic`` is."""
+
+    def test_is_stored_stripped_and_in_lowercase(self) -> None:
+        config = MTPDecodingConfig(max_draft_len=1,
+                                   moe_tactic=" CUTLASS.Grouped_GEMM ")
+
+        assert config.moe_tactic == "cutlass.grouped_gemm"
+
+    @pytest.mark.parametrize(
+        "moe_tactic, message",
+        [("cutlass.", "malformed segment"), ("a.b.c.d.e", "5 segments")],
+        ids=["trailing_dot", "five_segments"],
+    )
+    def test_rejects_malformed_ids_at_construction(self, moe_tactic: str,
+                                                   message: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=f"speculative_config.moe_tactic.*{message}"):
+            DecodingBaseConfig(moe_tactic=moe_tactic)
+
+    @pytest.mark.parametrize(
+        "moe_tactic, message",
+        [
+            ("cutlas", "unknown MoE impl token 'cutlas' in 'cutlas'. "
+             "Closest known values: ['cutlass'"),
+            ("*", "constrains no field"),
+            ("cutlass.mega_moe", "matches no registered implementation"),
+        ],
+        ids=["unknown_segment", "wildcards_only", "no_match"],
+    )
+    def test_rejects_ids_naming_no_implementation(self, moe_tactic: str,
+                                                  message: str) -> None:
+        with pytest.raises(
+                ValidationError,
+                match=f"speculative_config.moe_tactic.*{re.escape(message)}"):
+            DecodingBaseConfig(moe_tactic=moe_tactic)
+
+    @pytest.mark.parametrize("moe_backend", [None, "AUTO"])
+    def test_accepts_a_backend_that_names_no_implementation(
+            self, moe_backend: str | None) -> None:
+        config = DecodingBaseConfig(moe_backend=moe_backend,
+                                    moe_tactic="cutlass")
+
+        assert config.moe_tactic == "cutlass"
+
+    def test_rejects_a_concrete_backend_next_to_it(self) -> None:
+        with pytest.raises(ValidationError, match="both choose"):
+            DecodingBaseConfig(moe_backend="CUTLASS", moe_tactic="cutlass")
+
+    def test_yaml_round_trip(self) -> None:
+        restored = TypeAdapter(SpeculativeConfig).validate_python(
+            yaml.safe_load("""
+decoding_type: MTP
+max_draft_len: 1
+moe_tactic: cutlass.nvfp4
+"""))
+
+        assert isinstance(restored, MTPDecodingConfig)
+        assert restored.moe_tactic == "cutlass.nvfp4"
+        assert restored.model_dump()["moe_tactic"] == "cutlass.nvfp4"
+
+
+@pytest.mark.cpu_only
+class TestMoeConfigTactic:
+    """``MoeConfig.tactic`` is checked by MoE resolution's request parsing when built.
+
+    ``test_moe_impl.py`` covers what is checked only at resolution.
+    """
+
+    @pytest.mark.parametrize(
+        "tactic",
+        [
+            "trtllm.cutlass.grouped_gemm.nvfp4",
+            "trtllm.trtllm_gen",
+            "cutlass",
+            "grouped_gemm.nvfp4",
+            "*.cutlass.*.nvfp4",
+        ],
+        ids=["full", "truncated", "one_segment", "partial", "wildcards"],
+    )
+    def test_accepts_well_formed_ids(self, tactic: str) -> None:
+        assert MoeConfig(tactic=tactic).tactic == tactic
+
+    @pytest.mark.parametrize("tactic", ["CUTLASS", " Cutlass "])
+    def test_is_stored_stripped_and_in_lowercase(self, tactic: str) -> None:
+        assert MoeConfig(tactic=tactic).tactic == "cutlass"
+
+    @pytest.mark.parametrize(
+        "tactic, message",
+        [
+            ("", "malformed segment"),
+            ("cutlass.", "malformed segment"),
+            ("cutlass..nvfp4", "malformed segment"),
+            ("cut-lass", "malformed segment"),
+            ("cut lass", "malformed segment"),
+            ("_cutlass", "malformed segment"),
+            ("cut__lass", "malformed segment"),
+            ("cutlass\n.nvfp4", "malformed segment"),
+            ("a.b.c.d.e", "5 segments"),
+        ],
+        ids=[
+            "empty", "trailing_dot", "empty_segment", "hyphen", "space",
+            "leading_underscore", "double_underscore", "embedded_newline",
+            "five_segments"
+        ],
+    )
+    def test_rejects_malformed_ids_at_construction(self, tactic: str,
+                                                   message: str) -> None:
+        with pytest.raises(ValidationError, match=message):
+            MoeConfig(tactic=tactic)
+
+    @pytest.mark.parametrize(
+        "tactic, message",
+        [
+            ("cutlas", "unknown MoE impl token 'cutlas' in 'cutlas'. "
+             "Closest known values: ['cutlass'"),
+            ("Auto", "unknown MoE impl token 'auto'"),
+            ("nosuchprovider.nvfp4", "unknown MoE impl token 'nosuchprovider'"),
+            ("*", "constrains no field"),
+            ("*.*.*.*", "constrains no field"),
+            ("cutlass.mega_moe", "'*.cutlass.mega_moe.*' matches no registered "
+             "implementation"),
+            ("nvfp4.fp8", "sets field 'quant' twice"),
+        ],
+        ids=[
+            "typo", "auto", "unknown_provider", "wildcard", "wildcards",
+            "no_match", "field_twice"
+        ],
+    )
+    def test_rejects_ids_naming_no_implementation(self, tactic: str,
+                                                  message: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=f"moe_config.tactic.*{re.escape(message)}"):
+            MoeConfig(tactic=tactic)
+
+    def test_rejects_a_concrete_backend_next_to_a_tactic(self) -> None:
+        with pytest.raises(ValidationError, match="both choose"):
+            MoeConfig(backend="CUTLASS", tactic="cutlass")
+
+    def test_accepts_an_explicit_auto_backend_next_to_a_tactic(self) -> None:
+        config = MoeConfig(backend="AUTO", tactic="cutlass")
+
+        assert config.backend == "AUTO"
+        assert config.tactic == "cutlass"
+
+    @pytest.mark.parametrize("tactic",
+                             ["trtllm.cutedsl.mega_moe.nvfp4", "mega_moe"])
+    def test_per_layer_dynamic_eplb_leaves_backend_to_the_tactic(
+            self, tactic: str) -> None:
+        """Resolution picks the match that consumes per-layer dynamic plans."""
+        config = MoeConfig(tactic=tactic,
+                           load_balancer={
+                               "mode": "per_layer_dynamic",
+                               "num_slots": 72
+                           })
+
+        assert config.backend == "AUTO"
+        assert config.tactic == tactic
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+
+    @pytest.mark.parametrize("tactic", ["cutlass", "deepgemm.mega_moe"])
+    def test_per_layer_dynamic_eplb_rejects_tactics_that_cannot_consume_it(
+            self, tactic: str) -> None:
+        with pytest.raises(ValidationError,
+                           match="per-layer dynamic EPLB requires a "
+                           "moe_config.tactic"):
+            MoeConfig(tactic=tactic,
+                      load_balancer={
+                          "mode": "per_layer_dynamic",
+                          "num_slots": 72
+                      })
+
+    def test_survives_a_rebuild_from_its_own_dump(self) -> None:
+        """A full dump marks ``backend`` as set; the rebuild must still pass."""
+        config = MoeConfig(tactic="Cutlass", max_num_tokens=64)
+
+        rebuilt = MoeConfig(**config.model_dump())
+
+        assert rebuilt == config
+        assert "backend" in rebuilt.model_fields_set
+
+    def test_reaches_the_model_config(self) -> None:
+        """The loader hands ``tactic`` to the checkpoint loader as ``moe_tactic``."""
+
+        class _StopAfterLoadConfig(Exception):
+            pass
+
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            moe_config=MoeConfig(tactic="Grouped_GEMM.NVFP4"))
+        checkpoint_loader = create_autospec(HfCheckpointLoader,
+                                            instance=True,
+                                            spec_set=True)
+        checkpoint_loader.load_config.side_effect = _StopAfterLoadConfig
+        loader = model_loader_mod.ModelLoader(
+            args,
+            args.parallel_config.to_mapping(),
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=args.max_num_tokens,
+            max_seq_len=args.max_seq_len,
+        )
+
+        with pytest.raises(_StopAfterLoadConfig):
+            loader._load_and_validate_config("/tmp/dummy_model",
+                                             checkpoint_loader)
+
+        kwargs = checkpoint_loader.load_config.call_args.kwargs
+        assert kwargs["moe_tactic"] == "grouped_gemm.nvfp4"
+        assert kwargs["moe_backend"] == "AUTO"
 
 
 @pytest.mark.cpu_only
@@ -1089,11 +1351,129 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
+    @pytest.mark.parametrize("key", [None, b"deployment-key"])
+    def test_model_defaults_preserve_private_transceiver_key(self, key):
+        config = CacheTransceiverConfig(backend="NIXL",
+                                        transceiver_runtime="PYTHON")
+        config._rank_info_auth_key = key
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            cache_transceiver_config=config)
+
+        applied = apply_model_defaults_to_llm_args(
+            args, {"enable_chunked_prefill": False})
+
+        assert applied == {"enable_chunked_prefill": False}
+        assert args.cache_transceiver_config._rank_info_auth_key == key
+        assert args.cache_transceiver_config.backend == "NIXL"
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert "_rank_info_auth_key" not in args.model_dump(
+        )["cache_transceiver_config"]
+
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
+
+    def test_applied_defaults_leave_other_fields_unset(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model", max_batch_size=8)
+        before = set(llm_args.model_fields_set)
+        apply_model_defaults_to_llm_args(llm_args, {
+            "enable_chunked_prefill": False,
+            "max_batch_size": 4,
+        })
+        assert llm_args.max_batch_size == 8
+        assert not llm_args.enable_chunked_prefill
+        assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
+        assert "modeling_v2" not in llm_args.model_fields_set
+
+    def test_applied_defaults_leave_nested_fields_unset(self):
+        """Nested configs keep only the fields the user set or a default applied."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config={"free_gpu_memory_fraction": 0.5},
+            sparse_attention_config={
+                "algorithm": "deepseek_v4",
+                "index_n_heads": 64,
+            },
+        )
+        sparse_before = set(llm_args.sparse_attention_config.model_fields_set)
+        assert "index_topk" not in sparse_before
+        scheduler_before = set(llm_args.scheduler_config.model_fields_set)
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "kv_cache_config": {
+                    "tokens_per_block": 128,
+                    "free_gpu_memory_fraction": 0.9,
+                }
+            })
+        assert llm_args.kv_cache_config.free_gpu_memory_fraction == 0.5
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.model_fields_set == {
+            "free_gpu_memory_fraction", "tokens_per_block"
+        }
+        assert llm_args.sparse_attention_config.model_fields_set == sparse_before
+        assert llm_args.scheduler_config.model_fields_set == scheduler_before
+
+    def test_applied_defaults_leave_configs_in_containers_unset(self):
+        """Configs held in a dict keep only the fields the user set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                multimodal_config={
+                                    "encoder_side_stream_max_ahead": 0,
+                                    "encoder_cuda_graph": {
+                                        "image": {
+                                            "max_batch_size": 4
+                                        }
+                                    },
+                                })
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+        image = llm_args.multimodal_config.encoder_cuda_graph["image"]
+        assert image.max_batch_size == 4
+        assert image.model_fields_set == {"max_batch_size"}
+
+    def test_config_object_default_keeps_its_nested_fields_set(self):
+        """A default given as a config object counts its nested fields as set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "scheduler_config":
+                SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+            })
+        scheduler_config = llm_args.scheduler_config
+        assert scheduler_config.gen_preemption.tpot_budget == 0.1
+        assert scheduler_config.model_fields_set == {"gen_preemption"}
+        assert scheduler_config.gen_preemption.model_fields_set == {
+            "tpot_budget"
+        }
+        assert llm_args.model_dump(exclude_unset=True)["scheduler_config"] == {
+            "gen_preemption": {
+                "tpot_budget": 0.1
+            }
+        }
+
+    def test_empty_nested_default_counts_as_set(self):
+        """An empty nested default still counts as set.
+
+        It constructs the config, so the field must survive
+        ``model_dump(exclude_unset=True)``.
+        """
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert llm_args.attention_dp_config is None
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {"attention_dp_config": {}}
+        assert llm_args.attention_dp_config is not None
+        assert "attention_dp_config" in llm_args.model_fields_set
+        assert "attention_dp_config" in llm_args.model_dump(exclude_unset=True)
+
+    def test_empty_nested_default_under_a_user_setting_applies_nothing(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                attention_dp_config={"enable_balance": True})
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {}
+        assert llm_args.attention_dp_config.enable_balance
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -1190,6 +1570,45 @@ class TestModelDefaults:
         # Check that the error message is helpful
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
+
+    def test_user_tactic_supersedes_a_model_backend_default(self):
+        """A model's preferred backend yields to a pinned tactic, not the rest."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                moe_config=MoeConfig(tactic="Cutlass"))
+
+        applied = apply_model_defaults_to_llm_args(
+            llm_args,
+            {"moe_config": {
+                "backend": "MARLIN",
+                "max_num_tokens": 64
+            }})
+
+        assert llm_args.moe_config.tactic == "cutlass"
+        assert llm_args.moe_config.backend == "AUTO"
+        assert llm_args.moe_config.max_num_tokens == 64
+        assert applied == {"moe_config": {"max_num_tokens": 64}}
+
+    def test_model_backend_default_applies_without_a_tactic(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        applied = apply_model_defaults_to_llm_args(
+            llm_args, {"moe_config": {
+                "backend": "MARLIN"
+            }})
+
+        assert llm_args.moe_config.backend == "MARLIN"
+        assert applied == {"moe_config": {"backend": "MARLIN"}}
+
+    def test_tactic_survives_an_unrelated_defaults_rebuild(self):
+        """Applying any default rebuilds every nested config from a full dump."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                moe_config=MoeConfig(tactic="cutlass"))
+
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+
+        assert llm_args.moe_config.tactic == "cutlass"
+        assert llm_args.moe_config.backend == "AUTO"
 
 
 @pytest.mark.cpu_only
@@ -1609,6 +2028,21 @@ def test_KvCacheConfig_declaration(offload_field):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_defer_generation_only_release():
+    assert KvCacheConfig().defer_generation_only_release is False
+    for v2 in (True, "auto"):
+        assert KvCacheConfig(
+            defer_generation_only_release=True,
+            use_kv_cache_manager_v2=v2).defer_generation_only_release is True
+    assert KvCacheConfig(use_kv_cache_manager_v2=False,
+                         defer_generation_only_release=False)
+    with pytest.raises(ValidationError,
+                       match="defer_generation_only_release requires"):
+        KvCacheConfig(defer_generation_only_release=True,
+                      use_kv_cache_manager_v2=False)
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",
@@ -2017,6 +2451,358 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_remote_cache_validation(tmp_path):
+    remote = llm_args_mod.RemoteCacheConfig
+    config = KvCacheConfig(
+        remote_cache_config={
+            "directory": str(tmp_path),
+            "transport": {
+                "kind": "fabric"
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
+        })
+    level = config.remote_cache_config.level
+    assert level.size == 200 << 30
+    assert level.donor_wait_timeout_s == 900.0
+    assert isinstance(config.remote_cache_config.transport,
+                      llm_args_mod.RemoteFabricTransportConfig)
+    assert config.remote_cache_config.donor is None
+    # The default transport is NIXL with its defaults.
+    nixl = remote(directory=str(tmp_path), donor={"size": 1 << 30}).transport
+    assert (nixl.kind, nixl.transfer_timeout_s,
+            nixl.ucx_devices) == ("nixl", 30.0, None)
+    assert KvCacheConfig().remote_cache_config is None
+
+    for bad in (
+        {},  # neither a donor nor a level
+        {
+            "level": {
+                "size": 1,
+                "expected": {
+                    "num_donors": 8
+                }
+            }
+        },
+            # Each transport's fields only on that transport.
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "fabric",
+                "ucx_devices": "mlx5_0:1"
+            }
+        },
+        {
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "fabric",
+                "transfer_timeout_s": 10.0
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "donor_reserve_size": 8 << 30
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "rdma"
+            }
+        },
+        {
+            "level": {
+                "size": 1,
+                "pool_ratio": [0.5, 0.0]
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:2"  # NIXL's UCX backend uses port 1
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:1,,mlx5_1:1"
+            }
+        },
+        {
+            "donor": {
+                "size": (1 << 30) - 1  # below the donor's 1 GiB chunk
+            }
+        },
+        {
+            "level": {
+                "size": 0
+            }
+        },
+        {
+            "level": {
+                "size": 1,
+                "donor_wait_timeout_s": 0
+            }
+        },
+        {
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "nixl",
+                "transfer_timeout_s": float("inf")
+            }
+        },
+            # The old flat fields are gone.
+        {
+            "cache_size": 1
+        },
+        {
+            "donate_size": 1 << 30
+        },
+    ):
+        with pytest.raises(ValidationError):
+            remote(directory=str(tmp_path), **bad)
+    # A dumped config, defaults included, validates again.
+    for good in (
+            config.remote_cache_config,
+            remote(directory=str(tmp_path), donor={"size": 1 << 30}),
+            remote(directory=str(tmp_path),
+                   donor={"size": 1 << 30},
+                   transport={
+                       "kind": "fabric",
+                       "donor_reserve_size": 8 << 30
+                   }),
+    ):
+        assert remote(**good.model_dump()) == good
+    assert remote(directory=str(tmp_path),
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "fabric",
+                      "donor_reserve_size": 8 << 30
+                  }).transport.donor_reserve_size == 8 << 30
+    assert remote(directory=str(tmp_path),
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "nixl",
+                      "ucx_devices": "rdma_vf_rail{GPU}:1, mlx5_1"
+                  }).transport.ucx_devices
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "donor": {
+                "size": 1 << 30
+            }
+        },
+                      use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "level": {
+                "size": 1
+            }
+        },
+                      disk_cache_size=1,
+                      disk_cache_path=str(tmp_path))
+    # A rebalance would claim donor chunks inside adjust(), which holds every request.
+    with pytest.raises(ValidationError, match="enable_kv_pool_rebalance"):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "level": {
+                "size": 1
+            }
+        },
+                      enable_kv_pool_rebalance=True)
+    assert KvCacheConfig(remote_cache_config={
+        "directory": str(tmp_path),
+        "donor": {
+            "size": 1 << 30
+        }
+    },
+                         enable_kv_pool_rebalance=True).enable_kv_pool_rebalance
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "remote_config",
+    [
+        # CTX style: a remote level and a donation.
+        {
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 8 << 30
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
+        },
+        # GEN style: donation only.
+        {
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 160 << 30
+            },
+        },
+    ],
+    ids=["ctx", "gen"])
+def test_remote_cache_config_survives_model_defaults(tmp_path, remote_config):
+    # apply_model_defaults_to_llm_args rebuilds the args from a full dump, defaults included.
+    remote_config = dict(remote_config, directory=str(tmp_path))
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(remote_cache_config=remote_config))
+    expected = llm_args.kv_cache_config.remote_cache_config
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {
+            "enable_block_reuse": False
+        }})
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.remote_cache_config == expected
+    rebuilt = TorchLlmArgs(**llm_args.model_dump())
+    assert rebuilt.kv_cache_config.remote_cache_config == expected
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_disk_offload_options(tmp_path):
+    default = KvCacheConfig()
+    assert default.disk_io_threads == 0
+    assert default.disk_keep_copy_after_restore is False
+    assert default.disk_write_through is False
+    assert default.disk_protected_copy_fraction == 1.0
+
+    config = KvCacheConfig(disk_cache_size=2048,
+                           disk_cache_path=str(tmp_path),
+                           disk_io_threads=16,
+                           disk_keep_copy_after_restore=True,
+                           disk_write_through=True)
+    assert config.disk_io_threads == 16
+    assert config.disk_keep_copy_after_restore is True
+    assert config.disk_write_through is True
+
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    # Write-through does not need keep-copy, only the I/O pool.
+    config = KvCacheConfig(**disk, disk_io_threads=4, disk_write_through=True)
+    assert config.disk_write_through is True
+    assert config.disk_keep_copy_after_restore is False
+
+    with pytest.raises(ValidationError,
+                       match="disk_write_through requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_through=True)
+
+    # The options do nothing without a disk tier or with KV cache manager v1.
+    with pytest.raises(ValidationError,
+                       match="disk_io_threads requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4)
+    with pytest.raises(
+            ValidationError,
+            match="disk_keep_copy_after_restore requires disk_cache_size"):
+        KvCacheConfig(disk_keep_copy_after_restore=True)
+    with pytest.raises(ValidationError,
+                       match="requires use_kv_cache_manager_v2"):
+        KvCacheConfig(**disk, disk_io_threads=4, use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=257)
+    KvCacheConfig(**disk, disk_io_threads=256)
+    # Without block reuse they only warn: there is nothing for them to act on.
+    KvCacheConfig(**disk,
+                  disk_keep_copy_after_restore=True,
+                  enable_block_reuse=False)
+
+    with pytest.raises(ValidationError):
+        KvCacheConfig(disk_io_threads=-1)
+
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=4,
+                           disk_write_through=True,
+                           disk_protected_copy_fraction=0.25)
+    assert config.disk_protected_copy_fraction == 0.25
+    for fraction in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, disk_protected_copy_fraction=fraction)
+    with pytest.raises(
+            ValidationError,
+            match="disk_protected_copy_fraction requires disk_cache_size"):
+        KvCacheConfig(disk_protected_copy_fraction=0.5)
+    # Without retained copies it only warns: there is nothing for it to limit.
+    KvCacheConfig(**disk, disk_protected_copy_fraction=0.5)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
+
+    tier = DiskCacheTierConfig(2048, str(tmp_path))
+    assert tier.num_io_threads == 0
+    assert tier.keep_copy_after_restore is False
+    assert tier.write_through is False
+    assert tier.protected_copy_fraction == 1.0
+    tier.validate()
+
+    tier = DiskCacheTierConfig(2048,
+                               str(tmp_path),
+                               num_io_threads=16,
+                               keep_copy_after_restore=True,
+                               write_through=True)
+    tier.validate()
+    assert tier.num_io_threads == 16
+
+    DiskCacheTierConfig(2048,
+                        str(tmp_path),
+                        num_io_threads=4,
+                        write_through=True).validate()
+    with pytest.raises(ValueError, match="writeThrough requires numIoThreads"):
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=257).validate()
+    DiskCacheTierConfig(2048, str(tmp_path),
+                        protected_copy_fraction=0.0).validate()
+    for fraction in (-0.5, 1.5, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="protectedCopyFraction must be between 0 and 1"):
+            DiskCacheTierConfig(2048,
+                                str(tmp_path),
+                                protected_copy_fraction=fraction).validate()
+    DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=256).validate()
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):
@@ -2116,6 +2902,7 @@ class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().vision_gpu_normalize is False
+        assert MultimodalConfig().encoder_attention_backend is None
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
@@ -2126,6 +2913,7 @@ class TestMultimodalConfig:
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.vision_gpu_normalize is False
+        assert args.multimodal_config.encoder_attention_backend is None
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
@@ -2160,6 +2948,7 @@ class TestMultimodalConfig:
             multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
             trust_remote_code=True,
             enable_tokenization_cache=False,
+            prompt_token_cache_config=None,
         )
         llm._hf_model_dir = "unused"
         for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
@@ -2170,8 +2959,12 @@ class TestMultimodalConfig:
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
         with patch.object(BaseLLM, "_build_model"), patch(
-                f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                side_effect=ValueError("input processor boundary")) as factory:
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
@@ -2447,6 +3240,62 @@ def test_SchedulerConfig_declaration() -> None:
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
     assert pybind_config.enable_prefix_aware_scheduling is False
+
+
+@pytest.mark.cpu_only
+def test_gen_preemption_config() -> None:
+    assert not SchedulerConfig().gen_preemption.enabled
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 32.5
+"""))
+    config = SchedulerConfig(**merged["scheduler_config"]).gen_preemption
+    assert config.target_output_tps == 32.5 and config.enabled
+    assert SchedulerConfig(gen_preemption={
+        "tpot_budget": 0.1
+    }).gen_preemption.enabled
+    for bad in ({
+            "target_output_tps": 0
+    }, {
+            "tpot_budget": 1.0
+    }, {
+            "tpot_budget": 0.1,
+            "target_output_tps": 40
+    }, {
+            "policy": "wait"
+    }):
+        with pytest.raises(ValidationError):
+            llm_args_mod.GenPreemptionConfig(**bad)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel", [{
+    "pipeline_parallel_size": 2
+}, {
+    "tensor_parallel_size": 2,
+    "enable_attention_dp": True
+}])
+def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
+    on = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    with pytest.raises(ValueError, match="does not support"):
+        TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
+    TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loop", [{
+    "pipeline_parallel_size": 2
+}, {
+    "disable_overlap_scheduler": True
+}])
+def test_defer_generation_only_release_needs_the_overlap_loop(loop) -> None:
+    """Rejected at parse time, before any rank loads the checkpoint."""
+    defer = KvCacheConfig(defer_generation_only_release=True)
+    with pytest.raises(ValueError, match="overlap scheduler loop"):
+        TorchLlmArgs(model=llama_model_path, kv_cache_config=defer, **loop)
+    TorchLlmArgs(model=llama_model_path, kv_cache_config=defer)
 
 
 @pytest.mark.cpu_only
@@ -3579,6 +4428,7 @@ class TestTorchLlmArgs:
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
@@ -3909,8 +4759,10 @@ class TestStrictBaseModelArbitraryArgs:
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TorchLlmArgs(model=llama_model_path,
-                         unsupported_option="should_fail")
+            TorchLlmArgs(
+                model=llama_model_path,
+                # pyrefly: ignore [unexpected-keyword]
+                unsupported_option="should_fail")
         assert "unsupported_option" in str(exc_info.value)
 
     def test_nested_config_arbitrary_args(self):
@@ -4758,7 +5610,10 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
+        "mixed_precision_first_n": 0,
+        "mixed_precision_last_n": 0,
     }
+    assert cold_config.mixed_precision_high_window is None
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert cold_config.supports_speculative_decoding()
@@ -4810,6 +5665,63 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "quant": "fp8",
             },
         )
+
+    cold_window = {
+        "algorithm": "quantization_for_cold_page",
+        "mixed_precision_first_n": 64,
+        "mixed_precision_last_n": 256,
+    }
+
+    def cold(**overrides):
+        kwargs = dict(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            kv_cache_compression_config=cold_window)
+        return TorchLlmArgs(**{**kwargs, **overrides})
+
+    assert cold().kv_cache_compression_config.mixed_precision_high_window == (
+        64, 256)
+    # The limits of mixed-precision KV, narrowed to the TRTLLM backend.
+    for match, overrides in (
+        ("use_kv_cache_manager_v2",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))),
+        ("TRTLLM attention backend;", dict(attn_backend="VANILLA")),
+        ("TRTLLM attention backend;", dict(attn_backend="FLASHINFER")),
+        ("kv_cache_compression_config",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="mixed_nvfp4_fp8"))),
+        ("fp8_ds_mla",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="fp8_ds_mla"))),
+        ("sparse KV cache offload",
+         dict(sparse_attention_config=DeepSeekSparseAttentionConfig(
+             index_head_dim=128, enable_kv_cache_offload=True))),
+        ("dynamic-tree",
+         dict(
+             speculative_config={
+                 "decoding_type": "MTP",
+                 "num_nextn_predict_layers": 1,
+                 "max_draft_len": 1,
+                 "use_dynamic_tree": True,
+                 "dynamic_tree_max_topK": 2
+             })),
+    ):
+        with pytest.raises(ValueError, match=match):
+            cold(**overrides)
+    cold(speculative_config={
+        "decoding_type": "MTP",
+        "num_nextn_predict_layers": 1
+    })
+    for sparse in (DeepSeekSparseAttentionConfig(index_head_dim=128),
+                   DeepSeekV4SparseAttentionConfig(index_head_dim=128,
+                                                   window_size=128,
+                                                   compress_ratios=[1, 4])):
+        cold(sparse_attention_config=sparse)
+    # Plain cold-page compression keeps its unrestricted backend choice.
+    TorchLlmArgs(
+        model="/tmp/dummy_model",
+        attn_backend="VANILLA",
+        kv_cache_compression_config={"algorithm": "quantization_for_cold_page"})
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:
@@ -5168,6 +6080,40 @@ sparse_attention_config:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("config_cls", [
+    llm_args_mod.DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+])
+class TestSparseOffloadIndexerDefault:
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("requested", [None, False, True])
+    def test_default_override_and_round_trip(
+        self,
+        config_cls: type[llm_args_mod.DeepSeekSparseAttentionConfig],
+        enabled: bool,
+        requested: bool | None,
+    ) -> None:
+        kwargs = {"enable_kv_cache_offload": enabled}
+        if requested is not None:
+            kwargs["use_cute_dsl_paged_mqa_logits"] = requested
+        expected = True if requested is None else requested
+        config = config_cls(**kwargs)
+
+        for resolved in (
+                config,
+                config_cls.model_validate_json(config.model_dump_json()),
+                config_cls.model_validate(
+                    config.model_dump(exclude_unset=True)),
+        ):
+            assert resolved.use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+            assert resolved.to_sparse_metadata_params(
+            ).use_cute_dsl_paged_mqa_logits is expected
+
+
+@pytest.mark.cpu_only
 class TestDeepSeekV4SparseAttentionConfig:
 
     def test_zero_compress_ratios_are_normalized(self):
@@ -5226,6 +6172,54 @@ class TestDeepSeekV4SparseAttentionConfig:
         with pytest.raises(ValidationError, match="positive index_topk"):
             DeepSeekV4SparseAttentionConfig(index_topk=index_topk,
                                             enable_kv_cache_offload=True)
+
+    def test_kv_cache_offload_size_defaults_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig()
+
+        assert config.kv_cache_offload_config == SparseKvCacheOffloadConfig()
+        assert config.kv_cache_offload_config.gpu_cache_factor == 2.0
+        assert config.kv_cache_offload_config.host_history_size is None
+        assert config.get_kv_cache_offload_config() is None
+        # Defaults stay valid when a dump passes every field back explicitly.
+        DeepSeekV4SparseAttentionConfig(**config.model_dump())
+
+    def test_kv_cache_offload_sizes_round_trip(self):
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
+                                                 kv_cache_offload_config={
+                                                     "gpu_cache_factor": 3.0,
+                                                     "host_history_size":
+                                                     1 << 30
+                                                 })
+
+        restored = DeepSeekV4SparseAttentionConfig.model_validate_json(
+            config.model_dump_json())
+
+        assert restored.get_kv_cache_offload_config(
+        ) == SparseKvCacheOffloadConfig(gpu_cache_factor=3.0,
+                                        host_history_size=1 << 30)
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 0.5),
+                                              ("host_history_size", -1)])
+    def test_kv_cache_offload_sizes_reject_out_of_range(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            SparseKvCacheOffloadConfig(**{field: value})
+
+    @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 3.0),
+                                              ("host_history_size", 1 << 30)])
+    def test_kv_cache_offload_sizes_require_offload(self, field, value):
+        with pytest.raises(ValidationError,
+                           match="requires enable_kv_cache_offload"):
+            DeepSeekV4SparseAttentionConfig(
+                kv_cache_offload_config={field: value})
+
+    def test_only_offloading_configs_report_kv_cache_offload(self):
+        assert llm_args_mod.DeepSeekSparseAttentionConfig(
+        ).get_kv_cache_offload_config() is None
+        assert SkipSoftmaxAttentionConfig().get_kv_cache_offload_config(
+        ) is None
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+        assert config.get_kv_cache_offload_config(
+        ) is config.kv_cache_offload_config
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):
@@ -5667,6 +6661,32 @@ class TestTransceiverRuntimeAutoResolution:
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_model_loader_applies_defaults_from_architecture_override(
+            self, monkeypatch):
+        """Early config loading must include model_kwargs for class defaults."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _PreferFlashinferModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {"attn_backend": "FLASHINFER"}
+
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class",
+                            staticmethod(lambda config: _PreferFlashinferModel))
+        fake_loader = self._fake_checkpoint_loader(["PplxDeciderForDecision"])
+        model_kwargs = {"architectures": ["PplxDeciderForDecision"]}
+        args = TorchLlmArgs(model="/tmp/dummy_model", model_kwargs=model_kwargs)
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+        assert fake_loader.load_config.call_args.kwargs[
+            "model_kwargs"] == model_kwargs
+        assert args.attn_backend == "FLASHINFER"
 
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "CPP"),
