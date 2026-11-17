@@ -72,8 +72,11 @@ _REPLAY_HOT_RANKS = (1, 2, 3, 0)
 # The hot rank of each eager forward; None leaves the routing as drawn (HALO-R may still move a
 # few routes to helper slots, but no helper route is required).
 _EAGER_HOT_RANKS = (None, 0, 1)
-_WORKER_TIMEOUT_S = 900
-# A rank's log starts with its pid; a failed rank writes the marker before it aborts the ranks.
+# A rank dumps its stacks and exits after this long, and the pytest process fails with the rank
+# logs within one poll (or 120 s later if no rank dumps): both inside the GB200 entry's TIMEOUT (10),
+# so a hang in CI still ends with them.
+_WORKER_TIMEOUT_S = 420
+# A rank's log starts with its pid; a failed rank writes the marker after its traceback.
 _PID_LINE = "HALO_R_RANK_PID "
 _FAILED_MARKER = "HALO_R_RANK_FAILED"
 # Log text that means the rank is failing or gone: the marker, a fatal signal, or the timeout dump.
@@ -695,8 +698,9 @@ def test_halo_r_breakable_cuda_graph(tmp_path: Path) -> None:
     if torch.cuda.device_count() < _EP_SIZE:
         _skip(f"needs {_EP_SIZE} GPUs")
     unittest_root = str(Path(__file__).resolve().parents[3])
-    # The last resort if this process itself hangs: it outlasts the rank timers and the poll's
-    # deadline, and writes its stacks to a file, since pytest drops captured output on an exit.
+    # The last resort if this process itself hangs, for runs outside CI (CI's TIMEOUT ends first):
+    # it outlasts the rank timers and the poll's deadline, and writes its stacks to a file, since
+    # pytest drops captured output on an exit.
     parent_log = open(tmp_path / "pytest_process.log", "a", buffering=1)
     faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S + 240, exit=True, file=parent_log)
     # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.

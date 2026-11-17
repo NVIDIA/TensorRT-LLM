@@ -2165,6 +2165,8 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/kernels/serial]": 72.27185294117648,
    "unittest/_torch/moe/multi_gpu -m \"not post_merge\"": 49.71688607594937,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/multi_gpu -m \"not post_merge\"]": 49.71688607594937,
+   "unittest/_torch/moe/multi_gpu/test_halo_r_breakable_graph.py": 47.1,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/multi_gpu/test_halo_r_breakable_graph.py]": 47.1,
    "unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_q_cases -k \"[halo_q_reference]\"": 39.0,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_q_cases -k \"[halo_q_reference]\"]": 39.0,
    "unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_q_cases -k \"not [halo_q_reference]\"": 54.0,
