@@ -381,7 +381,8 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
 
 def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> None:
     """Without the CUDA graph runner the layer drops the value grouping of a previous
-    K/V shape; under the runner every captured shape keeps its grouping."""
+    K/V shape; under the runner every captured shape keeps its grouping. The grouped
+    token range of a call reaches the preprocessor."""
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
@@ -409,6 +410,35 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
         operands(512)
         operands(256)
     assert attention._vc_preprocessor is second
+    # The grouped token range of a forward call reaches the preprocessor. A call
+    # without one groups the whole sequence. Under the runner the resolved phase
+    # names the preprocessor path in place of a step.
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention.quantization import (
+        VCAttentionPreprocessor,
+    )
+
+    seen = []
+
+    def prepare(self, k, v, *, q=None, denoise_step=None, grouped_tokens=None, mode=None):
+        seen.append((grouped_tokens, denoise_step, mode))
+        return Mock()
+
+    monkeypatch.setattr(VCAttentionPreprocessor, "prepare", prepare)
+    monkeypatch.setattr(
+        visual_trtllm.TrtllmAttention,
+        "_prepare_metadata",
+        lambda self, batch_size, seq_len: _make_core_forward_metadata(),
+    )
+    attention._fmha_manager = SimpleNamespace(
+        fmha_libs=[object()], select=Mock(side_effect=_StopAtFmhaDispatch)
+    )
+    x = torch.randn(1, 256, 2, 128, device="cuda", dtype=torch.bfloat16)
+    for grouped_tokens in (None, (0, 128)):
+        with pytest.raises(_StopAtFmhaDispatch):
+            attention.forward(x, x, x, batch_size=1, seq_len=256, grouped_tokens=grouped_tokens)
+    with resolved_extra_keys_scope({"vc_smooth_phase": 3}), pytest.raises(_StopAtFmhaDispatch):
+        attention.forward(x, x, x, batch_size=1, seq_len=256)
+    assert seen == [(None, None, None), ((0, 128), None, None), (None, None, "cold")]
 
 
 @_REQUIRES_SM100
