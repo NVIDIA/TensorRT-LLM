@@ -585,7 +585,10 @@ def test_qwen3_5_vl_source_identity_binds_runtime_max_num_tokens(tmp_path: Path)
             )
         )
 
-    decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
+    call_local, call_source = identities
+    decision = check_weight_sharing_compatibility(
+        call_local, call_source, IdentityCheckPolicy.WARN_FALLBACK
+    )
 
     assert not decision.should_share
     assert decision.match_result.mismatched_fields == ["shard_fingerprint"]
@@ -784,6 +787,16 @@ def test_qwen3_5_vl_profile_ignores_moe_only_runtime_dimensions(
     decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(**runtime_overrides))
 
     assert decision.qualified
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 103, 120])
+def test_qwen3_5_vl_profile_qualifies_on_any_sm_version(sm_version: int | None) -> None:
+    """The BF16 profile pins no SM version, so the device architecture never blocks it."""
+    decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(sm_version=sm_version))
+
+    assert decision.qualified
+    assert decision.profile.runtime_constraints.sm_versions is None
 
 
 @pytest.mark.cpu_only

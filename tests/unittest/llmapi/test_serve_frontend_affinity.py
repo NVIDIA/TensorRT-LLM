@@ -106,6 +106,7 @@ def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
 
     class FakeServer:
         def __init__(self, **kwargs):
+            served["multi_frontend_serving"] = kwargs["multi_frontend_serving"]
             self.app = Mock()
 
         def __call__(self, host, port, sockets):
@@ -128,6 +129,13 @@ def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
     )
 
     assert served["ports"] == [base, base + stride]
+    # Tokenization routing needs the launcher's frontend id and the frontend count.
+    serving = served["multi_frontend_serving"]
+    assert (serving.is_launcher, serving.frontend_id, serving.num_frontends) == (
+        True,
+        0,
+        num_frontends,
+    )
     assert served["uds"] == [str(tmp_path / serve.LAUNCHER_UDS_NAME)]
     assert handed_off == {1: base + 2 * stride, 2: base + 3 * stride}
     # Everything the launcher bound is released once it stops serving.

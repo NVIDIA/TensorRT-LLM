@@ -549,17 +549,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
     if (versionOverride) {
-        def resolvedVersionOverride = versionOverride
-        if (versionOverride.startsWith(".")) {
-            def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
-            def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
-            if (!versionMatcher.find()) {
-                error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
-            }
-            resolvedVersionOverride =
-                "${versionMatcher.group(1)}${versionOverride}"
-        }
-        env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
+        env.TRTLLM_VERSION_OVERRIDE = versionOverride
         args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
     }
 

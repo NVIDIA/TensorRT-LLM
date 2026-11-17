@@ -55,7 +55,10 @@ from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
 # to most of the (very large B200) device memory, leaving nothing for the other
 # executor components -> OOM at executor creation. Cap it so the whole pipeline
 # fits regardless of card size.
-_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5)
+# These tests never offload KV pages, so also skip the host tier that KV cache
+# manager V2 otherwise sizes to match the device pool: tens of GiB of pinned
+# host memory that executor startup must populate and shutdown must release.
+_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5, host_cache_size=0)
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {

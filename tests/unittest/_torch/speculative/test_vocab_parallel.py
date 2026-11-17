@@ -23,13 +23,16 @@ full-vocab chain that also returns the biased logits.
 
 import pytest
 import torch
-from _torch.helpers import dspark_markov_chain_logits_reference
+from _torch.helpers import dspark_markov_chain_logits_reference, triton_num_compiled
 
 from tensorrt_llm._torch.speculative.vocab_parallel import (
     _local_argmax_kernel,
     _local_sample_kernel,
+    _markov_add_local_argmax_kernel,
     _markov_chain_tokens,
+    _markov_reduce_embed_kernel,
     _PairExchange,
+    _reduce_pairs_kernel,
     _select_tokens,
     markov_chain_logits,
 )
@@ -450,3 +453,57 @@ def test_markov_chain_logits_ties_and_nan():
     expected = dspark_markov_chain_logits_reference(base, anchors, w1, w2)
     biased = markov_chain_logits(base, anchors, w1, w2)
     assert torch.equal(biased.view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.parametrize(
+    "exchange, col_base, expected",
+    [
+        # A single shard's pair buffer is 2 * splits wide, so its row stride
+        # follows the row count.
+        (_SINGLE, 0, {(0, 16, 32), (0, 11, 22)}),
+        # Rank 1 of 2 (identity all-reduce): the row stride is the ZERO_WIDTH.
+        (_PairExchange(lambda pairs: pairs, 2, 1), 32 * 2048, {(64, 16, 64), (64, 11, 64)}),
+    ],
+    ids=["single_shard", "tp2_rank1"],
+)
+def test_new_row_counts_reuse_the_compiled_kernels(exchange, col_base, expected):
+    """A 65536-column shard takes 16 splits for 9-17 rows and 11 for 18-25: one
+    ZERO_WIDTH / BLOCK_SLOTS bucket in which the pair offsets, the slot count,
+    the row count and a single shard's pair-buffer row stride are and are not
+    multiples of 16."""
+    n_cols, rank, block = 32 * 2048, 8, 2
+    row_counts = (9, 16, 17, 18, 24)
+    layouts = [exchange.layout(rows, n_cols, torch.device("cuda")) for rows in row_counts]
+    assert {
+        (layout.zero_width, layout.splits, layout.buffer.stride(0)) for layout in layouts
+    } == expected
+    w1 = torch.zeros(2 * n_cols, rank, device="cuda")
+    w2_rows = torch.zeros(n_cols, rank, device="cuda")
+    kernels = (
+        _local_argmax_kernel,
+        _local_sample_kernel,
+        _reduce_pairs_kernel,
+        _markov_reduce_embed_kernel,
+        _markov_add_local_argmax_kernel,
+    )
+
+    def select(rows):
+        logits = torch.zeros(rows, block, n_cols, device="cuda")
+        zeros = torch.zeros(rows, dtype=torch.int64, device="cuda")
+        temperatures = torch.ones(rows, device="cuda")
+        _select_tokens(_local_argmax_kernel, logits[:, 0], (), col_base, exchange, torch.int64)
+        _select_tokens(
+            _local_sample_kernel,
+            logits[:, 0],
+            (temperatures, zeros, zeros, 1e-4),
+            col_base,
+            exchange,
+            torch.int64,
+        )
+        _markov_chain_tokens(logits, zeros, w1, w2_rows, col_base, exchange)
+
+    select(row_counts[0])
+    compiled = [triton_num_compiled(kernel) for kernel in kernels]
+    for rows in row_counts[1:]:
+        select(rows)
+    assert [triton_num_compiled(kernel) for kernel in kernels] == compiled

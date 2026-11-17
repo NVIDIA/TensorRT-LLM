@@ -78,6 +78,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ANY_MOE_IMPL,
     ModelingV2Mode,
     NoTarget,
     resolved_mode,
@@ -112,8 +113,9 @@ from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllRed
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
+    _draft_loader_moe_kwargs,
+    _draft_moe_selection,
     _ensure_draft_vocab_size,
-    _get_requested_draft_moe_backend,
     _set_draft_kv_cache_quant_algo,
     _slice_spec_position_ids,
 )
@@ -855,7 +857,7 @@ class MxMode:
     decode_graph: bool  # inside a decode CUDA-graph warmup or capture
     autotune: bool  # inside the engine's FlashInfer MXFP8 tuning pass
     tuned_quantize_gemm: (
-        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_decode_graph_backends)
+        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_mxfp8_backends)
     )
     flashinfer: bool  # FlashInfer's MXFP8 GEMM on the quantized activation
     native_tuning: (
@@ -870,7 +872,7 @@ def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,
-        tuned_quantize_gemm=method.tune_decode_graph_backends and decode_graph,
+        tuned_quantize_gemm=method.tune_mxfp8_backends and decode_graph,
         flashinfer=method.backend == "flashinfer"
         or (
             method.backend == "auto"
@@ -3709,6 +3711,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             )
 
         if self._uses_external_shared_target_kv:
+            next_new_tokens = None
             next_draft_tokens = self._forward_external_shared_target_kv_draft_loop(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -3721,6 +3724,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size=batch_size,
             )
         else:
+            # Retain the sequence lengths before draft preparation replaces them.
+            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
             # Save the old attn_metadata and spec_metadata
             self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
@@ -3743,7 +3748,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             # Get the draft KV cache manager if using separate layouts
             draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            next_draft_tokens = self._forward_draft_loop(
+            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -3755,6 +3760,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
                 resource_manager,
+                accepted_tokens=accepted_tokens,
+                pre_draft_seq_lens=pre_draft_seq_lens,
             )
             # restore attn_metadata to support cuda graph
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -3763,10 +3770,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
-        if self._m3_next_new_tokens is not None:
-            # Filled in place by the fused verify or the seed (column 0) and the fused draft passes (columns 1..).
-            next_new_tokens = self._m3_next_new_tokens
-        else:
+        if next_new_tokens is None:
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
                 next_draft_tokens,
@@ -4290,10 +4294,17 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         num_accepted_tokens,
         original_all_rank_num_tokens,
         resource_manager,
+        accepted_tokens,
+        pre_draft_seq_lens,
     ):
-        """The fused draft loop on a step it covers (``_m3_fused_loop_ok``), else the in-tree loop."""
+        """Run the fused draft loop on a covered step, otherwise the in-tree loop.
+
+        Returns:
+            (next_draft_tokens, next_new_tokens): the fused loop's draft and next-input
+            buffers, or the in-tree loop's pair. A None next-input buffer is built by the caller.
+        """
         if self._m3_fused_loop_ok(attn_metadata, spec_metadata, batch_size, draft_model):
-            return self._m3_fused_draft_loop(
+            next_draft_tokens = self._m3_fused_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -4302,6 +4313,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size,
                 num_accepted_tokens,
             )
+            return next_draft_tokens, self._m3_next_new_tokens
         return super()._forward_draft_loop(
             inputs,
             attn_metadata,
@@ -4314,6 +4326,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             num_accepted_tokens,
             original_all_rank_num_tokens,
             resource_manager,
+            accepted_tokens=accepted_tokens,
+            pre_draft_seq_lens=pre_draft_seq_lens,
         )
 
     def _m3_fused_draft_loop(
@@ -4439,7 +4453,9 @@ def _build_speculation(shell, model_config: ModelConfig):
         spec.speculative_model,
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=_get_requested_draft_moe_backend(model_config, spec),
+        **_draft_loader_moe_kwargs(
+            model_config, _draft_moe_selection(model_config, spec, load_balancer=None)
+        ),
         mapping=model_config.mapping,
         spec_config=model_config.spec_config,
         max_num_tokens=model_config.max_num_tokens,
@@ -4506,6 +4522,11 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
+    # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
+    # moe_config.tactic names, so it declares no moe_impls_honored.
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

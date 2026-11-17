@@ -116,8 +116,15 @@ class MlaRopeSpecialization:
     # False drops the q-base copy groups (the K-B GEMM emits the FP8 q-base).
     emit_q_base: bool = True
     full_token_tiles: bool = True
+    # decode K-B / RoPE overlap: PDL wait at the end of the kernel (after a the K-B GEMM compiled with
+    # early_signal); requires emit_q_base=False (nothing then reads the K-B GEMM's output).
+    late_wait: bool = False
 
     def validate(self) -> None:
+        if self.late_wait and self.emit_q_base:
+            raise ValueError(
+                "late_wait requires emit_q_base=False (the q-base copy reads the K-B GEMM)"
+            )
         if self.predicted_tokens_per_seq <= 0:
             raise ValueError(
                 f"predicted_tokens_per_seq must be positive, got {self.predicted_tokens_per_seq}"
@@ -384,6 +391,7 @@ def _mla_rope_generation_kernel(
     pdl_wait: cutlass.Constexpr[bool],
     full_token_tiles: cutlass.Constexpr[bool],
     emit_q_base: cutlass.Constexpr[bool],
+    late_wait: cutlass.Constexpr[bool],
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     token_tile, work_group, _ = cute.arch.block_idx()
@@ -413,7 +421,12 @@ def _mla_rope_generation_kernel(
     # Scheduler/scaling initialization and integer launch setup do not consume
     # the K-B GEMM output, so keep them ahead of the PDL wait. Every predecessor-owned
     # q/latent load is below this point.
-    if cutlass.const_expr(pdl_wait):
+    # late_wait (decode K-B / RoPE overlap, F16 only): the predecessor is a the K-B GEMM that signals right after
+    # its own activation wait, so the q_b GEMM (q_pe) and C1/C2 (latent) are complete when this
+    # grid launches and nothing here reads the K-B GEMM's output; the wait moves to the end of
+    # the kernel, where it keeps this grid alive until the K-B GEMM completes, so the FMHA's
+    # wait on this grid still covers the K-B GEMM's q-base bytes.
+    if cutlass.const_expr(pdl_wait and not late_wait):
         prims.griddepcontrol(prims.GridDepAction.WAIT)
 
     # emit_q_base=False: the q-base groups are not launched (grid_y 25)
@@ -661,6 +674,8 @@ def _mla_rope_generation_kernel(
     if cutlass.const_expr(pdl_wait):
         if tidx == 0:
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
+    if cutlass.const_expr(late_wait):
+        prims.griddepcontrol(prims.GridDepAction.WAIT)
 
 
 @cute.jit
@@ -691,6 +706,7 @@ def _launch_mla_rope_generation(
     pdl_wait: cutlass.Constexpr[bool],
     full_token_tiles: cutlass.Constexpr[bool],
     emit_q_base: cutlass.Constexpr[bool],
+    late_wait: cutlass.Constexpr[bool] = False,
 ) -> None:
     num_tokens = fused_q.shape[0]
     num_generations = sequence_length.shape[0]
@@ -732,6 +748,7 @@ def _launch_mla_rope_generation(
         pdl_wait,
         full_token_tiles,
         emit_q_base,
+        late_wait,
     ).launch(
         grid=(grid_x, grid_y, 1),
         block=(THREADS, 1, 1),
@@ -841,6 +858,7 @@ def _compile_for(specialization: MlaRopeSpecialization, device_index: int):
         specialization.q_pe_stride,
         specialization.latent_cache_stride,
         specialization.emit_q_base,
+        specialization.late_wait,
     )
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
@@ -865,6 +883,7 @@ def _compile_for(specialization: MlaRopeSpecialization, device_index: int):
         True,  # PDL consumers must wait before reading producer outputs.
         specialization.full_token_tiles,
         specialization.emit_q_base,
+        specialization.late_wait,
         options=_compile_options(),
     )
     _COMPILE_CACHE[key] = compiled
@@ -1341,6 +1360,7 @@ def _make_runtime_and_specialization(
     quant_mode: int,
     split_source: bool,
     emit_q_base: bool,
+    late_wait: bool = False,
 ) -> tuple[MlaRopeRuntimeShape, MlaRopeSpecialization]:
     if not quant_mode & FP8_KV_CACHE_QUANT_MODE:
         raise ValueError("the deployed specialization requires FP8 Q/KV")
@@ -1356,6 +1376,7 @@ def _make_runtime_and_specialization(
         q_pe_stride=int(q_pe.stride(0)),
         latent_cache_stride=(int(latent_cache.stride(0)) if split_source else HEAD_SIZE),
         emit_q_base=emit_q_base,
+        late_wait=late_wait,
         full_token_tiles=runtime_shape.num_tokens % TOKENS_PER_CTA == 0,
     )
     runtime_shape.validate(specialization.predicted_tokens_per_seq)
@@ -1394,6 +1415,7 @@ def prepare_runner(
     refresh_stream: bool = False,
     split_source: bool = False,
     emit_q_base: bool = True,
+    late_wait: bool = False,
 ) -> PreparedMlaRopeRunner:
     """Prepare the zero-adaptation-overhead hot launch path.
 
@@ -1448,6 +1470,7 @@ def prepare_runner(
         quant_mode=quant_mode,
         split_source=split_source,
         emit_q_base=emit_q_base,
+        late_wait=late_wait,
     )
     device_index = _device_index(fused_q)
     compiled = _compile_for(specialization, device_index)
@@ -1529,6 +1552,7 @@ def prepare_runner_from_serving_abi(
     refresh_stream: bool = False,
     split_source: bool = False,
     emit_q_base: bool = True,
+    late_wait: bool = False,
 ) -> PreparedMlaRopeRunner:
     """Prepare the fixed GLM kernel directly from TRT-LLM's serving ABI.
 
@@ -1640,6 +1664,7 @@ def prepare_runner_from_serving_abi(
         refresh_stream=refresh_stream,
         split_source=split_source,
         emit_q_base=emit_q_base,
+        late_wait=late_wait,
     )
     prepared.owners = (
         kv_cache_block_offsets,

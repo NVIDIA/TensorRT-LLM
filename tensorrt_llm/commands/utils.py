@@ -91,16 +91,10 @@ def has_registered_llm_architecture(model_path: str) -> bool:
     with open(config_path) as f:
         architectures = json.load(f).get("architectures") or []
 
-    # The model zoo is imported lazily, so MODEL_CLASS_MAPPING only holds what
-    # has been resolved so far; the static index knows every built-in
-    # architecture without importing anything. Imported here (not at module
-    # load) to sidestep circular imports via commands.serve.
-    from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    # Imported here (not at module load) to sidestep circular imports via commands.serve.
+    from tensorrt_llm._torch.models.modeling_utils import is_model_arch_known
 
-    return any(
-        arch in MODEL_CLASS_MAPPING or arch in MODEL_ARCH_TO_MODULE for arch in architectures
-    )
+    return any(is_model_arch_known(arch) for arch in architectures)
 
 
 def get_is_diffusion_only_model(model_path: str):
