@@ -30,16 +30,9 @@ checkout and workspace paths, compute configuration, feature/parallelism scope a
 The agent prepares the spec and launches the workflow; missing inputs must be resolved, not guessed.
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
-derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
-it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a member too
-narrow for one engine, disaggregation wider than a session, variant cross products, variants that
-boot at every member, a feature proven
-at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
-what would stop preflight (uncovered requested cells, a KV-cache dtype the engine does not load),
-and prints the contract's checks per unit and variant, the
-engine's constraints for this geometry and the prior art the tree already holds. The spec should be
-the smallest contract that covers the request. Launch only once the lint is clean or its findings
-are accepted in `notes`. Preflight probes the host with small scripts (the devices, the
+derive` writes a starting spec (no `site.yaml` needed). The spec should be the smallest contract
+that covers the request: one check of any kind covers a feature, and `--dry-run` journals the
+contract's checks per unit and variant before anything is spent. Preflight probes the host with small scripts (the devices, the
 checkpoint, an NCCL collective and an MPI spawn across the ranks) and loads no model: a host
 fault those do not show appears at the first load, where the first thing to settle is whether
 it is the host's or the target's.

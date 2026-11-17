@@ -277,12 +277,12 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "env",
     "spool",
     # The image the GPU jobs run in, if any, and how host paths appear inside it
-    # (`host:inside`): the intake lint checks the run's paths through them.
+    # (`host:inside`).
     "container_image",
     "mounts",
     "time_limit",
     "gpus_per_node",
-    # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
+    # Each device's memory, GiB: engines and disaggregation are sized by it.
     "gpu_memory_gib",
     # The compute sessions the run stands on.
     "sessions",

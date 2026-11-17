@@ -43,7 +43,7 @@ class Anchor:
     """One thing the workflow reads or points at, and how to find it after it moves."""
 
     key: str
-    #: What it is, as ``tree_map.md`` and the lint say it.
+    #: What it is, as ``tree_map.md`` says it.
     concept: str
     #: Repository-relative path it was last seen at; looked at first.
     hint: str
@@ -61,7 +61,7 @@ class Anchor:
     many: bool = False
     #: How a person or an agent finds it by hand, for ``tree_map.md``.
     search: str = ""
-    #: What a run loses when it is missing, for the lint.
+    #: What a run loses when it is missing.
     consequence: str = ""
 
     def matches(self, text: str) -> re.Match[str] | None:

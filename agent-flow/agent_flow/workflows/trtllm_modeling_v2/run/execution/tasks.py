@@ -40,7 +40,7 @@ from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
 from ...operators import survey_review
 from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, queue_item_from_ref
-from ...spec import lint as lint_mod
+from ...spec import sizing
 from ...spec import variants as variants_mod
 from ...spec.task_schema import assembly_units, members_for, parse_parallel_segment
 from .. import graph as graph_mod
@@ -480,8 +480,8 @@ class ExecutionStage:
     def _start_member(self, contract: contract_mod.Contract) -> str:
         """Where the core and each feature's first task work: the cheapest member one engine fits.
 
-        Sized as the intake lint sizes members (``spec.lint.engine_width``): the
-        checkpoint's weight bytes against ``environment.gpu_memory_gib``.
+        Sized from the checkpoint's weight bytes against ``environment.gpu_memory_gib``
+        (``spec.sizing.engine_width``).
         """
         cached = getattr(self, "_start_line", None)
         if cached:
@@ -492,9 +492,9 @@ class ExecutionStage:
             list(dict.fromkeys(c.member for c in contract.checks if c.unit == first))
             or members_for(task, first, self.workflow._gate_env().world_size)
         )
-        weights = lint_mod.checkpoint_weight_bytes(task.get("checkpoint_path"))
+        weights = sizing.checkpoint_weight_bytes(task.get("checkpoint_path"))
         memory = (task.get("environment") or {}).get("gpu_memory_gib")
-        width = lint_mod.engine_width(weights, memory)
+        width = sizing.engine_width(weights, memory)
         if width is None:
             line = (
                 f"`{members[0]}`: the cheapest member the contract checks the core at (the run "
@@ -505,7 +505,7 @@ class ExecutionStage:
             start = fits[0] if fits else members[-1]
             line = (
                 f"`{start}`: one engine of the checkpoint takes {width} device(s) (its weights "
-                f"at most {lint_mod.ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device), "
+                f"at most {sizing.ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device), "
                 f"and `{start}` is the cheapest member the contract checks the core at that "
                 "holds it. A narrower one cannot load the model."
             )

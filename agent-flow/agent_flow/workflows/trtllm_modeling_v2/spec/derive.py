@@ -734,11 +734,11 @@ def disagg_layout(
     """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
 
     One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
+    the checkpoint's weights (``sizing.engine_width``): on one node when both fit,
     as the tree's own disaggregated accuracy tests run (context and generation
     sharing a node); else one engine per node, or as many nodes as an engine needs.
     """
-    from .lint import engine_width
+    from .sizing import engine_width
 
     width = engine_width(weight_bytes, gpu_memory_gib)
     if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
@@ -771,7 +771,7 @@ def _disagg(
     if block:
         note("accuracy.disagg", dict(block), "site")
     if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        from .lint import checkpoint_weight_bytes
+        from .sizing import checkpoint_weight_bytes
 
         environment = site.get("environment") or {}
         per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(

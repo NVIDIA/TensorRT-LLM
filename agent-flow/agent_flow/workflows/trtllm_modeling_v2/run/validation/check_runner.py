@@ -402,13 +402,11 @@ class CheckRunner:
         anchor there (``validation/anchors.py``); every later benchmark of the unit at
         that member is held to that score, as a variant is to its unit's.
         """
-        from ...spec.lint import PLAUSIBLE_ANCHOR
-
         spec = self._with_dataset(spec, check.gate)
         unit, member = check.unit, check.member
         reference = self._reference_score(unit, spec)
         benchmark = check.gate[len("accuracy[") : -1]
-        plausible = PLAUSIBLE_ANCHOR.get(benchmark)
+        plausible = anchors_mod.PLAUSIBLE_ANCHOR.get(benchmark)
         placeholder = plausible is not None and reference < plausible
         own = (
             anchors_mod.measured(self.workspace, unit, check.gate, member) if placeholder else None

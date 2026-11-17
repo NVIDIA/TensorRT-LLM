@@ -40,8 +40,8 @@ trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm checkout> \
     --out <dir>
 ```
 
-It writes `task.derived.yaml`, `derive.report.md` (every value the goal did not state and where
-it came from) and `intake.report.md` (the lint below, with prior art). With a `site.yaml` pass
+It writes `task.derived.yaml` and `derive.report.md` (every value the goal did not state and where
+it came from). With a `site.yaml` pass
 `--site` instead of `--repo`. Edit the derived spec; copy `task.example.yaml` only for what the
 goal words cannot say.
 
@@ -61,7 +61,7 @@ goal words cannot say.
 | "Y only aggregate / text-only" | Y in `members.default` for core alone | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
-| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
+| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined unless the request names the combination |
 | disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
@@ -83,11 +83,10 @@ the checks behind each (`coverage.yaml`):
   combination, added only when the request names it. A variant of disagg owes nothing.
 - Leave the profile at `standard` unless the request asks.
 
-The lint prints the checks per unit and variant; past ~30 deserves a second look.
+`--dry-run` journals the contract's checks per unit and variant; past ~30 deserves a second look.
 
 **The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
-will have, say in `notes` which task writes it (the lint's `disagg-test-pending` notes it until
-it exists), and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
+will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
 devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
 than two engines at its member's width.
 
@@ -96,9 +95,8 @@ than two engines at its member's width.
 `cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
 (the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
 is 10-50x slower, each fix-and-recheck pays it, and it scores a path the target does not serve.
-The lint blocks a unit or variant whose accuracy runs eager unless the notes keep it on purpose
-(`intake-accept: accuracy-eager -- <why>`: a short subset, a capture still being built); a
-benchmark you start by hand runs captured too.
+Run a unit or variant's accuracy eager only on purpose (a short subset, a capture still being
+built), and say so in `notes`; a benchmark you start by hand runs captured too.
 
 ## 5. Accuracy and boot
 
@@ -145,8 +143,8 @@ benchmark you start by hand runs captured too.
 
 - `environment.python` exists before launch: the editable install the gates measure, or an
   interpreter the image already has. Every gate's command runs under it.
-- A `session_spool` environment's spools exist once their sessions run. Until then lint with
-  `--sessions-planned`; start the sessions before launch.
+- A `session_spool` environment's spools exist once their sessions run: start the sessions
+  before launch.
 - Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
   only what a worker submits to it.
 
@@ -180,10 +178,11 @@ what the roles need while they work:
 - **Reference** — where it is, what it supports, how it loads this checkpoint's weights.
 - **Architecture** — layer pattern, attention kinds with head dims, sparse/indexer configuration,
   MoE (experts, top-k, clamps, router), norm and residual dtypes, towers.
-- **Prior art in this tree worth surveying** — the top leads of each kind in `intake.report.md`
-  (attention backends, custom ops, other targets' `ops/`, catalog entries), one line each named by
-  its `<dir>/<file>.py`: what it offers, or why it does not fit.
-- **Engine constraints** — from `intake.report.md` and the design they imply.
+- **Prior art in this tree worth surveying** — the leads you know (attention backends, custom
+  ops, other targets' `ops/`, catalog entries), one line each named by its `<dir>/<file>.py`: what
+  it offers, or why it does not fit. The run writes its own list, with the engine's limits for
+  this checkpoint, into `prior_art.md` when it starts.
+- **Engine constraints** — those you know, and the design they imply.
 - **Scope decisions** — what is gated where, what is checked outside the flow, and why.
 - **References outside the tree** — where you know them: another engine's implementation of
   this model (a checkout path, a package, a URL) and the kernels it uses.
@@ -195,17 +194,9 @@ Nothing about the intake itself: what intake may or may not do, launch blockers,
 provenance and questions for the user belong in your own summary beside the spec. Notes are read
 as standing orders, so "no build is allowed" written for the intake stops the run's own builds.
 
-## 9. Lint, then launch
+## 9. Dry run, then launch
 
-```bash
-trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md [--sessions-planned]
-```
-
-Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:
-`intake-accept: <rule>[, <rule>] -- <why>`. A `block` is what preflight or the first boot would stop
-on (a requested cell no check covers, a KV-cache dtype the engine does not load) and cannot be
-accepted, except a cross product of variants the request names and an accuracy check run eager on
-purpose. The report also prints the contract size; a contract past ~30 checks
-deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
-what was accepted. Once it runs, steer it only through `feedback` (the README's "While it runs"):
+`trtllm-modeling-v2 --task task.yaml --workspace W --dry-run` resolves the spec, probes the host
+and the agents, and journals the contract and the checks behind each feature, without an agent
+turn. Then launch. Once it runs, steer it only through `feedback` (the README's "While it runs"):
 cancelling the run's own jobs proves nothing and costs them again.

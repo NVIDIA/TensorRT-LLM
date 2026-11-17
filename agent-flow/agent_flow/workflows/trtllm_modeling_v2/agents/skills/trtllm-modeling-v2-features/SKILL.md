@@ -61,9 +61,8 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 1. **Source and CPU (seconds).** Grep the forward for what the feature forbids:
    host syncs or value-dependent Python branches under graphs, a context
    assumed to start at position 0, state in target-owned tensors. Run
-   `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py` (no GPU)
-   and `trtllm-modeling-v2 intake lint` on the spec. *Blind to* numerics and to whether the engine turned the
-   feature on.
+   `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py` (no GPU).
+   *Blind to* numerics and to whether the engine turned the feature on.
 2. **In-tree unit tests to imitate (minutes, one GPU).** Each section names the
    op-, cache- or transfer-level test that already exercises the feature. Copy
    its shape for the target's own case: an op cell with a cached prefix, a
@@ -78,7 +77,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    not evidence. *Blind to* accuracy: boot checks only that a few short
    continuations are not empty.
 4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
-   with CUDA graphs (lint blocks an eager accuracy check) and re-attests each
+   with CUDA graphs and re-attests each
    rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's
    disaggregated-serving test as CI does; `gate acceptance` judges
    speculators. *Blind spots* are per feature in the reference; they are why

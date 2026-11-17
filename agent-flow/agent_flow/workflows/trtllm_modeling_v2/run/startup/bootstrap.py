@@ -337,23 +337,6 @@ def _write_contract(workflow) -> None:
         "coverage: the checks behind each feature",
         requirements_mod.render(workflow._coverage),
     )
-    _write_intake_lint(workflow)
-
-
-def _write_intake_lint(workflow) -> None:
-    """Journal the intake lint of the spec the run starts from; a finding never stops the run."""
-    from ...spec import lint as lint_mod
-
-    try:
-        report = lint_mod.lint_task(
-            workflow.task_data,
-            contract=workflow._contract,
-            world_size=workflow._gate_env().world_size,
-        )
-    except Exception as exc:  # the lint is advice: it must not cost the run its start
-        workflow.journal.section("intake lint: not run", f"{type(exc).__name__}: {exc}")
-        return
-    workflow.journal.section(f"intake lint: {report.summary()}", report.render(prior_art_limit=8))
 
 
 def _write_host_facts(workflow, result) -> None:
