@@ -13,11 +13,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     SCALE_ULP_GATE,
     block_scales,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128 as op,
 )
 

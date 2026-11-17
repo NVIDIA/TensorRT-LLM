@@ -38,7 +38,8 @@ from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          ModelExpressConfig,
+                                          ModelExpressConfig, MultimodalConfig,
+                                          PrefillCudaGraphBackend,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -49,9 +50,9 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
-from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
+from ..modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
@@ -204,6 +205,56 @@ _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
                                   {90}))
 
 
+def _validate_encoder_attention_backend_support(
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
+    """Reject unsupported encoder selections before allocating model weights."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    supported = getattr(model_cls, "supported_encoder_attention_backends", {})
+    model_name = model_cls.__name__ if model_cls is not None else "The model"
+    for encoder, backend in mm_config.encoder_attention_backend.items():
+        if not supported or encoder in supported and not supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder's attention backend cannot be changed "
+                f"for {model_name}")
+        if encoder not in supported:
+            raise ValueError(f"Unknown encoder {encoder!r} for {model_name}; "
+                             f"available encoders: {sorted(supported)}")
+        if backend not in supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder does not support attention backend {backend!r}; "
+                f"supported backends: {sorted(supported[encoder])}")
+        if backend == "FLASHINFER":
+            from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+            if not IS_FLASHINFER_AVAILABLE:
+                raise ValueError(
+                    f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
+                )
+
+
+def _validate_encoder_attention_backend_enabled(
+        mm_config: MultimodalConfig | None,
+        pretrained_config: object,
+        *,
+        disable_mm_encoder: bool = False) -> None:
+    """Reject selections for encoders that the effective model config omits."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    if disable_mm_encoder:
+        # Text-only runs, such as trtllm-bench without --modality, reuse
+        # serving configs. A skipped encoder never applies the selection, and
+        # models that ignore disable_mm_encoder still build it with the setting.
+        logger.info(
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True")
+        return
+    for encoder in mm_config.encoder_attention_backend:
+        if getattr(pretrained_config, f"{encoder}_config", None) is None:
+            raise ValueError(
+                f"The {encoder} encoder is not enabled in the model config")
+
+
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
                                                llm_args: TorchLlmArgs) -> None:
     """Validate snapshot reuse after the model and V2 setting are resolved."""
@@ -288,6 +339,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                            and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
+            and not getattr(getattr(model_config, "modeling_v2_target", None),
+                            "supports_nvfp4_kv_cache", False)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
@@ -939,6 +992,28 @@ def _checkpoint_io_policy_metadata(
     }
 
 
+def captured_cuda_graph_batch_sizes(
+        llm_args: TorchLlmArgs, max_num_tokens: int,
+        spec_config: Optional[DecodingBaseConfig]) -> Tuple[int, ...]:
+    """The decode CUDA-graph batch sizes the engine captures
+    (``engine.cuda_graph.plan_cuda_graphs``): the configured ones within
+    max_batch_size and max_num_tokens // tokens per request; () without
+    CUDA graphs. Sizes above them never run, so buffers sized by the largest
+    graph batch (``ModelConfig.cuda_graph_batch_sizes``) stop there."""
+    config = llm_args.cuda_graph_config
+    if config is None or not config.batch_sizes:
+        return ()
+    from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+    max_batch_size = (llm_args.max_batch_size if llm_args.max_batch_size
+                      is not None else max(config.batch_sizes))
+    tokens_per_request = (spec_config.tokens_per_gen_step
+                          if spec_config is not None else 1)
+    return tuple(
+        filter_cuda_graph_batch_sizes(list(config.batch_sizes), max_batch_size,
+                                      max_num_tokens, tokens_per_request,
+                                      config.enable_padding))
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -1176,6 +1251,9 @@ class ModelLoader:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
 
+        _validate_encoder_attention_backend_support(preference_cls,
+                                                    llm_args.multimodal_config)
+
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
         if model_cls and hasattr(model_cls, 'get_model_defaults'):
@@ -1246,6 +1324,18 @@ class ModelLoader:
         strict gate), so default HF/AUTO paths should not even build one.
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
+
+    def _megamoe_fuse_shared_expert(
+            self, checkpoint_loader: BaseCheckpointLoader) -> bool:
+        """The moe_config switch, off when the weights are shared: the fused copy is per process."""
+        requested = self.llm_args.moe_config.megamoe_fuse_shared_expert
+        if requested and self._needs_source_identity(checkpoint_loader,
+                                                     self.llm_args.load_format):
+            logger.warning(
+                "megamoe_fuse_shared_expert is off: shared weights (GMS / MX) "
+                "keep the separate shared expert")
+            return False
+        return requested
 
     @staticmethod
     def _build_source_identity(
@@ -2348,9 +2438,8 @@ class ModelLoader:
             mnnvl_allreduce_fp8_payload=self.llm_args.
             mnnvl_allreduce_fp8_payload,
             replicate_embedding=self.llm_args.replicate_embedding,
-            cuda_graph_batch_sizes=tuple(
-                self.llm_args.cuda_graph_config.batch_sizes or
-                ()) if self.llm_args.cuda_graph_config else (),
+            cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
+                self.llm_args, self.max_num_tokens, self.spec_config),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
@@ -2358,8 +2447,11 @@ class ModelLoader:
                 self.llm_args.mla_skip_correction_threshold
                 if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
+            moe_tactic=self.llm_args.moe_config.tactic,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
+            megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(
+                checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
@@ -2385,6 +2477,11 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Check after model_kwargs, which can remove an encoder.
+        _validate_encoder_attention_backend_enabled(
+            self.llm_args.multimodal_config,
+            config.pretrained_config,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder)
 
         # Decided here, after `load_config_and_apply_defaults` resolved the
         # built-in class and applied its model defaults to `llm_args`: a
@@ -2409,6 +2506,9 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        config.extra_attrs["breakable_prefill_cuda_graph"] = (
+            self.llm_args.prefill_cuda_graph_backend ==
+            PrefillCudaGraphBackend.BREAKABLE)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

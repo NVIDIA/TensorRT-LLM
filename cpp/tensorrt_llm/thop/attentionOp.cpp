@@ -812,9 +812,59 @@ void MHA::enqueueFusedContext(
         fmhaParams.chunkedAttentionSize = *p.attn.attention_chunk_size;
     }
 
+    // The layer's staged trtllm-gen kernel for FP8 paged causal context attention with a BF16 output.
+    if (p.attn.context_fmha_head_dim_per_stage_kv > 0 && mFP8ContextFMHA && enablePagedKVContextFMHA
+        && quant_mode.hasFp8KvCache() && !cross_attention && mask_type == AttentionMaskType::CAUSAL
+        && p.getAttentionSinks() == nullptr && p.cyclic_attention_window_size >= p.max_past_kv_length
+        && p.getType() == tensorrt_llm::DataType::kBF16 && !is_fp8_out && !is_fp4_out && !useTllmGenSparseAttention()
+        && !use_variable_window)
+    {
+        fmhaParams.headDimPerStageKv = static_cast<int>(p.attn.context_fmha_head_dim_per_stage_kv);
+    }
+
+    // A context-only step of a layer whose callers read only each request's last output row: attend from those
+    // rows alone (preprocessing wrote every row's K/V to the cache) and zero the other rows.
+    bool const lastRowsOnly = p.attn.context_last_rows_only && enablePagedKVContextFMHA && !cross_attention
+        && p.num_gen_tokens == 0 && p.num_tokens > p.batch_size && !useSageAttnSeparateQkv && !use_variable_window
+        && !useTllmGenSparseAttention() && !is_fp4_out && p.getSoftmaxStatsTensor() == nullptr;
+    at::Tensor lastRows;
+    at::Tensor lastOutput;
+    at::Tensor lastQuery;
+    at::Tensor lastCuQSeqlens;
+    if (lastRowsOnly)
+    {
+        auto const options = at::TensorOptions().device(p.getQueryInput().device());
+        // Written before the query gather: the FMHA, launched with PDL, may read its sequence offsets before its
+        // dependency wait, and reads the query that the kernel right before it writes after that wait.
+        lastCuQSeqlens = at::arange(p.batch_size + 1, options.dtype(at::kInt));
+        auto const cuQSeqlens
+            = at::from_blob(const_cast<int32_t*>(contextCuQSeqlens), {p.batch_size + 1}, options.dtype(at::kInt));
+        lastRows = (cuQSeqlens.slice(0, 1) - 1).to(at::kLong);
+        auto const query = at::from_blob(static_cast<void*>(workspaceViews.qBuf),
+            {p.num_tokens, static_cast<int64_t>(mNumAttnHeads), static_cast<int64_t>(headSize)},
+            options.dtype(mFP8ContextFMHA ? at::kFloat8_e4m3fn : p.getQueryInput().scalar_type()));
+        lastQuery = query.index_select(0, lastRows);
+        auto const& output = p.output.value();
+        auto lastOutputSizes = output.sizes().vec();
+        lastOutputSizes[0] = p.batch_size;
+        lastOutput = at::empty(lastOutputSizes, output.options());
+        fmhaParams.qPtr = lastQuery.data_ptr();
+        fmhaParams.cuQSeqLenPtr = lastCuQSeqlens.data_ptr<int32_t>();
+        fmhaParams.qSeqLen = 1;
+        fmhaParams.totalQSeqLen = static_cast<int>(p.batch_size);
+        fmhaParams.outputPtr = lastOutput.data_ptr();
+    }
+
     // Run the fmha kernel.
     launch(fmhaParams);
     sync_check_cuda_error(stream);
+
+    if (lastRowsOnly)
+    {
+        auto const& output = p.output.value();
+        output.zero_();
+        output.index_copy_(0, lastRows, lastOutput);
+    }
 
     invokeKvCachePostprocessing(preprocessingParams, stream);
     sync_check_cuda_error(stream);
@@ -1547,6 +1597,46 @@ void MLA::prepareInputs(FmhaParams& p, bool isGen)
                 "Separate-K context FMHA requires contiguous K features within each token");
             TORCH_CHECK(p.value_input->strides()[1] == 1,
                 "Separate-V context FMHA requires contiguous V features within each token");
+            auto const& k = p.key_input.value();
+            auto const& v = p.value_input.value();
+            TORCH_CHECK(k.scalar_type() == v.scalar_type(), "MLA context k and v must have the same dtype.");
+            // FP8 k / v (and an FP8 Q in quant_q_buffer, if given with quant_scale_qkv): the caller already
+            // quantized them for the FP8 context FMHA, which reads them instead of quantizing BF16 inputs.
+            if (k.scalar_type() == torch::kFloat8_e4m3fn)
+            {
+                TORCH_CHECK(mFP8ContextMLA, "FP8 MLA context k / v require the FP8 context MLA FMHA.");
+                TORCH_CHECK(!p.fwd.latent_cache.has_value(),
+                    "FP8 MLA context k / v are for cached-KV context attention, without latent_cache.");
+                TORCH_CHECK(k.is_contiguous() && v.is_contiguous(), "FP8 MLA context k and v must be contiguous.");
+                TORCH_CHECK(k.size(1) == num_heads * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)
+                        && v.size(1) == num_heads * mMLAParams.v_head_dim,
+                    "FP8 MLA context k / v must be [kv_tokens, num_heads * qk_head_dim] / [kv_tokens, num_heads * "
+                    "v_head_dim].");
+                // The FMHA reads p.total_kv_len rows straight out of the caller's k / v;
+                // reject a short tensor instead of reading past its end.
+                TORCH_CHECK(k.size(0) >= p.total_kv_len && v.size(0) >= p.total_kv_len,
+                    "FP8 MLA context k / v must hold at least total_kv_len (", p.total_kv_len, ") tokens.");
+                if (p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value())
+                {
+                    auto const& quantQ = p.fwd.quant_q_buffer.value();
+                    TORCH_CHECK(quantQ.scalar_type() == torch::kFloat8_e4m3fn && quantQ.is_contiguous()
+                            && quantQ.numel() >= p.getQueryInput().numel(),
+                        "The FP8 MLA context quant_q_buffer must be a contiguous FP8 copy of q.");
+                    // The value is not read as a scale here; the FMHA dequantizes
+                    // Q / K / V with the kv cache scale, so it must equal
+                    // kv_scale_orig_quant. The mixed path (BF16 Q, FP8 k / v)
+                    // also quantizes Q with it.
+                    auto const& quantScaleQkv = p.fwd.quant_scale_qkv.value();
+                    TORCH_CHECK(quantScaleQkv.is_cuda() && quantScaleQkv.is_contiguous()
+                            && quantScaleQkv.scalar_type() == at::ScalarType::Float && quantScaleQkv.numel() >= 1,
+                        "The FP8 MLA context quant_scale_qkv must be a contiguous CUDA float scalar.");
+                }
+            }
+            else
+            {
+                TORCH_CHECK(k.scalar_type() == p.getQueryInput().scalar_type(),
+                    "MLA context k / v must be FP8 E4M3 or have the dtype of q.");
+            }
         }
     }
     else
@@ -1771,6 +1861,12 @@ void MLA::enqueueFusedContext(
     {
         mla.k_buf = p.getK<T>();
         mla.v_buf = p.getV<T>();
+        mla.fp8_kv_input = p.key_input.has_value() && p.key_input->scalar_type() == torch::kFloat8_e4m3fn;
+        // `quant_scale_qkv` is a presence flag for caller-quantized FP8 Q; its value
+        // is not read on this branch. The FP8 context FMHA dequantizes Q with the
+        // kv cache dequant scale (see the context scale comment below), so the
+        // caller must have quantized `quant_q_buffer` with kv_scale_orig_quant.
+        mla.fp8_q_input = mla.fp8_kv_input && p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value();
         mla.helix_position_offsets = p.getHelixPositionOffsets();
         mla.helix_is_inactive_rank = p.getHelixIsInactiveRank();
     }
@@ -1888,6 +1984,20 @@ void MLA::enqueueFusedContext(
     mla.quant_scale_kv = p.getKvScaleOrigQuant();
     mla.dequant_scale_q = p.getKvScaleQuantOrig();
     mla.dequant_scale_kv = cache_type == KvCacheDataType::NVFP4 ? nullptr : p.getKvScaleQuantOrig();
+    // The FP8 context FMHA dequantizes Q / K / V with the kv cache dequant
+    // scale: quantizeCopyInputToFp8Kernel folds dequant_scale_q / dequant_scale_kv
+    // into bmm1_scale / bmm2_scale, and the FMHA reads those. Everything that
+    // reaches it must have been quantized with the cache quant scale -- the
+    // copies the op makes of BF16 Q / K / V, and any caller-quantized FP8 k / v
+    // or `quant_q_buffer`. On the non-sparse branch `quant_scale_qkv` only flags
+    // caller-quantized FP8 Q (its value is not read), so the copies take
+    // `quant_scale_kv` here. NVFP4 keeps a unit scale: its fp8 context buffers are
+    // an uncalibrated scratch quantization (nullptr dequant above). Sparse keeps
+    // the caller's scale set above, which its fused RoPE kernel quantizes Q with.
+    if (!use_sparse_attention && cache_type == KvCacheDataType::FP8)
+    {
+        mla.quant_scale_qkv = mla.quant_scale_kv;
+    }
     mla.host_bmm1_scale = 1 / (q_scaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
     // The sparse MLA is in the absorption mode for the context phase.
     mla.absorption_mode = useSparseMLA();
@@ -1933,8 +2043,21 @@ void MLA::enqueueFusedContext(
             "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
         fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
-        fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
-        fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        if (useSparseMLA())
+        {
+            fmhaParams.kPtr = nullptr;
+            fmhaParams.vPtr = nullptr;
+        }
+        else if (mla.fp8_kv_input)
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(mla.k_buf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(mla.v_buf);
+        }
+        else
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        }
     }
     else
     {

@@ -217,7 +217,14 @@ class _Run:
         return self.stdout + self.stderr
 
 
-def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int = 1) -> _Run:
+def _run_slurm_install(
+    tmp_path: Path,
+    statuses: list[int],
+    step_num_nodes: int = 1,
+    *,
+    cpp_bundle: bool = False,
+    fat: bool = False,
+) -> _Run:
     """Run slurm_install.sh as a node of a Slurm job does, up to extracting the downloaded package.
 
     The script, bash_utils.sh, and a stub read helper sit in a job workspace under one per-job
@@ -230,7 +237,11 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
     workspace = tmp_path / "job-workspace"
     workspace.mkdir()
     install = workspace / f"{JOB_PREFIX}slurm_install.sh"
-    shutil.copy(SLURM_INSTALL, install)
+    install.write_text(
+        SLURM_INSTALL.read_text().replace(
+            "resourcePathNode=/tmp", 'resourcePathNode="$TEST_RESOURCE_DIR"'
+        )
+    )
     shutil.copy(BASH_UTILS, workspace / f"{JOB_PREFIX}bash_utils.sh")
     stub_script = tmp_path / "fetch_stub.py"
     stub_script.write_text(_FETCH_STUB, encoding="utf-8")
@@ -244,8 +255,15 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
     _write_executable(
         bin_dir / "tar",
         '#!/bin/bash\nprintf "%s\\n" "$@" > "$TAR_STUB_LOG"\n'
-        'if [ -e "$TAR_STUB_NETRC" ]; then touch "$TAR_STUB_NETRC_SEEN"; fi\nexit 42\n',
+        'if [ -e "$TAR_STUB_NETRC" ]; then touch "$TAR_STUB_NETRC_SEEN"; fi\n'
+        'if [[ "$TEST_CPP_BUNDLE" == 1 && "$2" == */TensorRT-LLM.tar.gz ]]; then\n'
+        '  mkdir -p "$TEST_RESOURCE_DIR/TensorRT-LLM/src"\n  exit 0\nfi\nexit 42\n',
     )
+    for command in ("apt-get", "pip3"):
+        _write_executable(
+            bin_dir / command,
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$INSTALL_STUB_LOG"\nexit 0\n',
+        )
     _write_executable(bin_dir / "sleep", '#!/bin/bash\necho "$@" >> "$SLEEP_STUB_LOG"\n')
     _write_executable(
         bin_dir / "timeout", '#!/bin/bash\necho "$1" >> "$TIMEOUT_STUB_LOG"\nshift\nexec "$@"\n'
@@ -260,6 +278,7 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
 
     resource_dir = tmp_path / "resource"
     resource_dir.mkdir()
+    cpp_artifact_path = ARTIFACT_PATH.rsplit("/", 1)[0] + "/cpp-tests-TensorRT-LLM.tar.gz"
     fetch_log = tmp_path / "fetch_calls.jsonl"
     env = {
         name: value
@@ -274,8 +293,13 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
             "tarName": "TensorRT-LLM.tar.gz",
             "llmTarArtifactPath": ARTIFACT_PATH,
             "resourcePathNode": str(resource_dir),
-            "stageName": "test-stage",
+            "stageName": "RTX5090-CPP-1" if cpp_bundle else "test-stage",
             "pytestCommand": "pytest",
+            "cppTestTarArtifactPath": cpp_artifact_path if cpp_bundle else "",
+            "SKIP_INSTALL": "1" if fat else "0",
+            "TEST_CPP_BUNDLE": "1" if cpp_bundle else "0",
+            "TEST_RESOURCE_DIR": str(resource_dir),
+            "INSTALL_STUB_LOG": str(tmp_path / "install_args.txt"),
             "SLURM_LOCALID": "0",
             "SLURM_JOB_ID": "4321",
             "SLURM_STEP_ID": "0",
@@ -317,7 +341,11 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
     assert any(line.startswith("+") for line in run.stderr.splitlines())
     assert NETRC_PASSWORD not in run.output
     for call in run.fetch_calls:
-        assert call["args"] == [ARTIFACT_PATH, f"{run.archive}.tmp.4321.2"]
+        expected_destinations = {
+            ARTIFACT_PATH: f"{run.archive}.tmp.4321.2",
+            cpp_artifact_path: str(resource_dir / "cpp-tests-TensorRT-LLM.tar.gz"),
+        }
+        assert call["args"][1] == expected_destinations[call["args"][0]]
         assert call["env"] == {
             "LLM_ARTIFACTS_PRIMARY": "aws",
             "ARTIFACTORY_NETRC": str(netrc),
@@ -327,6 +355,34 @@ def _run_slurm_install(tmp_path: Path, statuses: list[int], step_num_nodes: int 
         assert call["netrc_present"]
     assert list(resource_dir.glob("*.tmp.*")) == []
     return run
+
+
+@pytest.mark.parametrize("fat", (False, True))
+def test_slurm_install_cpp_bundle_uses_existing_credentials(tmp_path: Path, fat: bool) -> None:
+    run = _run_slurm_install(tmp_path, [0], cpp_bundle=True, fat=fat)
+    assert run.returncode == 42, run.output
+    assert len(run.fetch_calls) == (1 if fat else 2)
+    cpp_archive = run.archive.parent / "cpp-tests-TensorRT-LLM.tar.gz"
+    assert cpp_archive.read_text() == PAYLOAD
+    assert (tmp_path / "tar_args.txt").read_text().splitlines() == [
+        "-zxf",
+        str(cpp_archive),
+        "-C",
+        str(run.archive.parent / "TensorRT-LLM/src"),
+    ]
+    assert not run.netrc_at_extraction
+    assert not run.netrc.exists()
+    if not fat:
+        assert "requirements-grpc-smg.txt" in (tmp_path / "install_args.txt").read_text()
+
+
+def test_slurm_install_missing_cpp_bundle_fails(tmp_path: Path) -> None:
+    run = _run_slurm_install(tmp_path, [0, 2], cpp_bundle=True)
+    assert run.returncode == 1, run.output
+    assert len(run.fetch_calls) == 2
+    assert "C++ test artifact download failed:" in run.stdout
+    assert not (tmp_path / "tar_args.txt").exists()
+    assert not run.netrc.exists()
 
 
 def test_slurm_install_setup_downloads_package_through_retries(tmp_path: Path) -> None:

@@ -440,7 +440,7 @@ def test_a_burst_of_operator_steers_reaches_the_planner_as_one(tmp_path):
 _WAIT = 10.0
 
 
-_PKG = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PKG = "tensorrt_llm/_torch/modeling_v2"
 
 
 _TARGET = f"{_PKG}/models/fam/newmodel__sm_100__unified"

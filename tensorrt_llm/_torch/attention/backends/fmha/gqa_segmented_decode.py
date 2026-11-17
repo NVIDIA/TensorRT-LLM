@@ -317,6 +317,7 @@ def segment_attention(
             prepared_bmm2_scale=bmm2_scale,
             kv_block_table=seg_table,
             multi_ctas_kv_counter=counter,
+            multi_processor_count=0,
             softmax_lse=seg_lse,
             output=seg_out,
             sequence_lengths=seg_lens,

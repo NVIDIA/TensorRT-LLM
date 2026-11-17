@@ -37,6 +37,8 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.bindings.internal import thop
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _MinimalFmha(Fmha):
     def forward(

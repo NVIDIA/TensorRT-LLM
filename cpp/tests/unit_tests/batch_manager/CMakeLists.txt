@@ -388,8 +388,33 @@ add_tllm_gtest(
   LABELS
   "unit;batch-manager;gpu")
 
-add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
+set(TRTLLM_RNN_TEST_LIBRARY
+    ""
+    CACHE FILEPATH "Installed library from the matching CI build")
+if(TRTLLM_RNN_TEST_LIBRARY)
+  add_tllm_gtest(
+    rnnCacheFormatterTest
+    SOURCES
+    rnnCacheFormatterTest.cpp
+    LINK_LIBRARIES
+    "${TRTLLM_RNN_TEST_LIBRARY}"
+    CUDA::cudart
+    LABELS
+    "unit;full-stack;host")
+  # Load the same library used at link time.
+  get_filename_component(rnn_library_dir "${TRTLLM_RNN_TEST_LIBRARY}" DIRECTORY)
+  set_target_properties(rnnCacheFormatterTest PROPERTIES BUILD_RPATH
+                                                         "${rnn_library_dir}")
+  target_link_options(rnnCacheFormatterTest PRIVATE
+                      "LINKER:--disable-new-dtags")
+  if(ENABLE_MULTI_DEVICE)
+    target_compile_definitions(rnnCacheFormatterTest
+                               PRIVATE ENABLE_MULTI_DEVICE)
+  endif()
+else()
+  add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
+                 FULL_STACK LABELS "unit;full-stack;host")
+endif()
 
 add_tllm_gtest(
   agentTreeTest

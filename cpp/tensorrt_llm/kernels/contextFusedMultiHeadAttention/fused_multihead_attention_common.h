@@ -360,6 +360,9 @@ struct MHARunnerParams
     float skipSoftmaxThresholdScaleFactor = 0;
     // Skip correction when the row-max increase is within this base-2 threshold.
     float skipCorrectionThreshold = 0;
+    // trtllm-gen context only: the head dim per K/V stage of the kernel to run when a precompiled
+    // kernel exists for it; 0: the kernel's own staging.
+    int headDimPerStageKv = 0;
 #ifdef SKIP_SOFTMAX_STAT
     // Statistics of skip-softmax, pointers of device memory for output
     uint32_t* skipSoftmaxTotalBlocks;

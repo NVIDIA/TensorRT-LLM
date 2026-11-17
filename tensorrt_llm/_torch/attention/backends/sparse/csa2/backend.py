@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -19,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream, private_stream
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -42,6 +44,46 @@ _SWA_TILE = 128
 _CONTEXT_STAGE_SCALE_MAX_EXPONENT = 3
 _CSA2_KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_ds_mla")
 _CSA2_FP8_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla")
+# From here a ratio-2 staging group's decode step is faster on the ``gen_fmha`` core than on the fused
+# decode (GB300, independent or shared selections); ratio-1 groups are slower at any row count.
+_GEN_FMHA_MIN_ROWS = 1024  # 1K rows per rank
+_GEN_FMHA_COMPRESS_RATIO = 2
+
+
+def _fresh_forward_args(args: AttentionForwardArgs) -> AttentionForwardArgs:
+    """``dataclasses.replace(args)`` without re-running its init: every field of the slots
+    dataclass is an init field, so copying the slots is the same shallow copy."""
+    fresh = object.__new__(AttentionForwardArgs)
+    for name in AttentionForwardArgs.__slots__:
+        setattr(fresh, name, getattr(args, name))
+    return fresh
+
+
+@functools.cache
+def _fused_context_supported(device: int) -> bool:
+    if not hasattr(torch.ops.trtllm, "csa2_sparse_context"):
+        return False
+    with torch.cuda.device(device):
+        return torch.ops.trtllm.csa2_sparse_context_supported()
+
+
+@functools.cache
+def _fused_decode_supported(device: int) -> bool:
+    if not hasattr(torch.ops.trtllm, "csa2_sparse_decode"):
+        return False
+    with torch.cuda.device(device):
+        return torch.ops.trtllm.csa2_sparse_decode_supported()
+
+
+@functools.cache
+def _fused_decode_workspace(device: int) -> torch.Tensor:
+    """Scratch of ``csa2_sparse_decode`` shared by every layer on ``device``; its size
+    depends only on the SM count."""
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm up CSA2 fused decode before CUDA Graph capture")
+        size = torch.ops.trtllm.csa2_sparse_decode_workspace_size()
+        return torch.empty(size, dtype=torch.uint8, device=device)
 
 
 def _csa2_kv_cache_algo(quant_config) -> QuantAlgo | None:
@@ -81,7 +123,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
-        return CSA2TrtllmMetadata.cache_gather_bytes_per_token(model_config)
+        return CSA2TrtllmMetadata.context_workspace_bytes_per_token(model_config)
 
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(cls, model_config) -> bool:
@@ -130,6 +172,29 @@ class CSA2TrtllmAttention(TrtllmAttention):
         reserve = arena_bytes(min(max_num_tokens, query_capacity), eager_pages)
         if enable_cuda_graph:
             reserve += arena_bytes(query_capacity, pages)
+        if layout.index_head_dim == 128:
+            from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET
+
+            # Eager prefill holds one indexer group's FP32 logits at a time, plus
+            # the candidate source's block maxima. A group spans at most the
+            # step's query rows and the MQA logits element budget (or one row).
+            columns = -(-max_positions // 256) * 256
+            elements = min(max(_INDEXER_MQA_LOGITS_ELEM_BUDGET, columns), max_num_tokens * columns)
+            reserve += 4 * (elements + -(-elements // layout.candidate_block_size))
+            candidate = layout.candidate_source_layer_id
+            if candidate is not None:
+                # The candidate source publishes, for each of up to max_num_tokens decoder rows,
+                # its candidate positions, selected blocks and sparse blocks for its consumers.
+                block = layout.candidate_block_size
+                sparse = next((b for b in (16, 8) if block % b == 0), 0)
+                positions = max(1, max_seq_len // layout.compress_ratios[candidate])
+                width = min(layout.candidate_topk_blocks, -(-positions // block)) * block
+                if sparse:
+                    width = -(-width // (4 * sparse)) * 4 * sparse
+                sparse_words = width // sparse + 1 if sparse else 0
+                reserve += (
+                    4 * max_num_tokens * (width + layout.candidate_topk_blocks + sparse_words)
+                )
         return reserve
 
     def __init__(
@@ -218,6 +283,37 @@ class CSA2TrtllmAttention(TrtllmAttention):
             **kwargs,
         )
         self.local_layer_idx = 0  # one physical compute-pool slot in this view
+        # FP8 context tiles that stage the shared E4M3 bank run one fused kernel
+        # (``forward_fused_context``) instead of the trtllm-gen context FMHA.
+        self.fused_context = (
+            self.native_fp8
+            and num_heads == 64
+            and _fused_context_supported(torch.cuda.current_device())
+        )
+        # Module generation tiles read the packed pools with one fused kernel
+        # (``forward_fused_decode``) instead of staging. It takes 64 query heads,
+        # an even SWA window and main selections in 64-key blocks.
+        layout = sparse_params.layout
+        self.fused_decode = (
+            staging_supported
+            and num_heads == 64
+            and layout is not None
+            and layout.window_size % 2 == 0
+            and layout.index_topk % 64 == 0
+            and _fused_decode_supported(torch.cuda.current_device())
+        )
+        # The layers of ratio-2 staging groups (an index source and its Reuse layers) stage
+        # generation tiles of _GEN_FMHA_MIN_ROWS rows and more in one E4M3 bank for the ``gen_fmha`` core.
+        layer = (
+            layout.layer(layer_idx)
+            if layout is not None and 0 <= layer_idx < len(layout.compress_ratios)
+            else None
+        )
+        self.gen_fmha_layer = (
+            self.native_fp8
+            and layer is not None
+            and layer.compress_ratio == _GEN_FMHA_COMPRESS_RATIO
+        )
 
     @property
     def native_fp8(self) -> bool:
@@ -250,15 +346,233 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if not self.native_fp8:
             return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         args = merge_attention_forward_args(forward_args, kwargs)
+        if self.direct_decode_applies(q, metadata, args):
+            return self._forward_direct(q, metadata, args)
+        state = getattr(args.sparse_backend_args, "state", None)
+        if state is not None and state.query_rope is not None:
+            raise ValueError("Only the CSA2 direct decode applies the query RoPE itself")
+        if self.gen_fmha_applies(q, metadata, args):
+            return self._forward_gen_fmha(q, metadata, args)
         if args.attention_input_type == AttentionInputType.context_only:
             if args.quant_scale_qkv is not None or args.quant_q_buffer is not None:
                 raise ValueError("CSA2 FP8 context expects unquantized BF16 Q")
-            # The native context quantizer needs quant_scale_qkv without a
-            # caller quant_q_buffer (which would select fused-Q and skip it).
-            # Inject the scale only after parent admission, in the sparse hook.
+            # The sparse hook derives the live Q/KV scale and resolves an
+            # optional projection epilogue's FP8 Q after parent admission.
             # A fresh carrier keeps repeated caller args safe, including errors.
-            args = replace(args)
+            args = _fresh_forward_args(args)
+            if self.runs_fused_context(metadata):
+                return self.forward_fused_context(q, metadata, args)
         return super().forward(q, k, v, metadata, forward_args=args)
+
+    def runs_fused_context(self, metadata: CSA2TrtllmMetadata) -> bool:
+        """Whether a context tile with this metadata runs ``forward_fused_context``."""
+        return self.native_fp8 and self.fused_context and metadata.shared_plan is not None
+
+    def direct_decode_applies(self, q, metadata, forward_args) -> bool:
+        """Whether this tile takes the direct sparse decode (``direct_decode.py``) instead of
+        FP8 staging and the native FMHA.
+
+        The single decision point, a pure function of what a captured graph fixes: generation
+        tiles of forwards without context tokens (which keeps the decoder passes of context
+        workers out) with at most ``MAX_ROWS`` query rows on this rank. Every layer of such a
+        forward takes it, so a staging group never sees part of a forward staged.
+        """
+        inputs = forward_args.sparse_backend_args
+        state = getattr(inputs, "state", None)
+        context_tokens = metadata.num_contexts if state is None else state.metadata.num_ctx_tokens
+        return (
+            isinstance(inputs, CSA2BackendForwardArgs)
+            and forward_args.attention_input_type == AttentionInputType.generation_only
+            and metadata.num_contexts == 0
+            and metadata.shared_plan is None
+            and self.direct_decode_serves(
+                metadata.num_tokens,
+                context_tokens,
+                metadata.num_sparse_topk - _SWA_TILE,
+                q.device,
+            )
+        )
+
+    def direct_decode_serves(self, rows, context_tokens, main_width, device) -> bool:
+        """The forward-level part of ``direct_decode_applies``: the module asks it before
+        projecting, to leave the query RoPE to the launch."""
+        from .direct_decode import MAX_ROWS, direct_decode_device_supported, direct_decode_fits
+
+        return (
+            self.native_fp8
+            and not self.sparse_params.use_packed_sparse_attention
+            and context_tokens == 0
+            and 0 < rows <= MAX_ROWS
+            and direct_decode_fits(self.num_heads, _SWA_TILE, main_width)
+            and direct_decode_device_supported(device)
+        )
+
+    def gen_fmha_applies(self, q, metadata, forward_args) -> bool:
+        """Whether this staged tile runs the ``gen_fmha`` generation core instead of the
+        native cubin: a ``gen_fmha_layer``'s generation tile of a forward without context tokens
+        (see ``gen_fmha_serves``) whose staging pools the metadata allocated as one bank. Like
+        ``direct_decode_applies``, a pure function of what a captured graph fixes."""
+        from .gen_fmha import staging_bank
+
+        inputs = forward_args.sparse_backend_args
+        state = getattr(inputs, "state", None)
+        context_tokens = metadata.num_contexts if state is None else state.metadata.num_ctx_tokens
+        return (
+            isinstance(inputs, CSA2BackendForwardArgs)
+            and forward_args.attention_input_type == AttentionInputType.generation_only
+            and metadata.num_contexts == 0
+            and metadata.shared_plan is None
+            and self.gen_fmha_serves(
+                metadata.num_tokens,
+                context_tokens,
+                metadata.num_sparse_topk - _SWA_TILE,
+                q.device,
+            )
+            and staging_bank(metadata) is not None
+        )
+
+    def gen_fmha_serves(self, rows, context_tokens, main_width, device) -> bool:
+        """The forward-level part of ``gen_fmha_applies``: the module asks it before projecting, to
+        stage the tile for the core (instead of the fused decode) and have the core write the O-A
+        input. A ``gen_fmha_layer``'s tiles from _GEN_FMHA_MIN_ROWS rows."""
+        return (
+            self.gen_fmha_layer
+            and rows >= _GEN_FMHA_MIN_ROWS
+            and context_tokens == 0
+            and CSA2TrtllmMetadata.gen_fmha_tile(
+                self.num_heads, _SWA_TILE + main_width, self.staging_dtype, device
+            )
+        )
+
+    def _forward_gen_fmha(self, q, metadata, forward_args):
+        """Stage this tile with its indices as bank rows, then attend with the ``gen_fmha`` core."""
+        from .gen_fmha import gen_sparse_attention
+
+        if forward_args.output is None:
+            forward_args.output = torch.empty_like(q)
+        self.sparse_attn_predict(q, None, metadata, forward_args, bank=True)
+        count = metadata.num_tokens
+        state = getattr(forward_args.sparse_backend_args, "state", None)
+        mxfp8 = None if state is None else state.output_mxfp8
+        gen_sparse_attention(
+            forward_args.quant_q_buffer.view(count, self.num_heads, _HEAD_DIM),
+            metadata,
+            forward_args.attention_sinks,
+            None
+            if mxfp8 is not None
+            else forward_args.output.view(count, self.num_heads, _HEAD_DIM),
+            mxfp8,
+        )
+        return forward_args.output
+
+    def _forward_direct(self, q, metadata, forward_args):
+        """Publish this layer's rows (and run its indexer), then attend the selected packed rows
+        in one launch. Nothing is staged, so no staging scale is derived."""
+        from .direct_decode import direct_sparse_decode
+
+        self._validate_helper_output(q, forward_args)
+        module = forward_args.sparse_backend_args
+        rows_written = module.state is not None and module.query_start == 0
+        inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
+        ready = rows_written
+        if module.query_ready is not None:
+            module.query_ready.wait()
+            ready = False
+        layout = self.sparse_params.layout
+        reuse = layout is not None and layout.layer(self.layer_idx).mode == CSA2Mode.REUSE
+        query = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
+        output = forward_args.output
+        state = module.state
+        # Exported slots are final like the selections they map, so readiness keeps the mapping's.
+        main_ready = ready and reuse and inputs.main_mapping is not None
+        inputs, slots_out = self._exported_slots(inputs, metadata, module)
+        result = direct_sparse_decode(
+            query,
+            inputs.swa_pool,
+            inputs.swa_indices,
+            inputs.main_pool,
+            inputs.topk_indices,
+            forward_args.attention_sinks,
+            1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
+            main_mapping=inputs.main_mapping,
+            output=None if output is None else output.view_as(query),
+            inputs_ready=ready,
+            main_ready=main_ready,
+            query_rope=None if state is None else state.query_rope,
+            slots_out=slots_out,
+        )
+        return result.flatten(1)
+
+    def _exported_slots(self, inputs, metadata, module):
+        """An index-source layer's direct decode stores the slots its mapped selections resolve to
+        (returned as ``slots_out``), and a Reuse layer whose source exported them this forward
+        attends those slots unmapped instead (``inputs`` updated); the layout gives both layers one
+        cache owner and compression ratio, so the same visible lengths."""
+        layout = self.sparse_params.layout
+        state = module.state
+        if layout is None or state is None or inputs.main_mapping is None:
+            return inputs, None
+        source = state.metadata
+        exported = source.csa2_direct_slots
+        layer = layout.layer(self.layer_idx)
+        start, count = module.query_start, metadata.num_tokens
+        if layer.mode == CSA2Mode.REUSE:
+            slots = exported.get(layer.index_source)
+            if slots is None or slots.shape[1] != inputs.topk_indices.shape[1]:
+                return inputs, None
+            inputs = replace(inputs, topk_indices=slots[start : start + count], main_mapping=None)
+            return inputs, None
+        slots = source._get_csa2_buffer(
+            f"direct_slots/{self.layer_idx}",
+            (state.swa_kv.shape[0], inputs.topk_indices.shape[1]),
+            torch.int64,
+        )
+        exported[self.layer_idx] = slots
+        return inputs, slots[start : start + count]
+
+    def forward_fused_context(self, q, metadata, forward_args):
+        """FP8 context attention of a shared-bank tile with one fused kernel.
+
+        Staging is the trtllm-gen path's; the kernel then attends each query to
+        its bank rows, quantizing BF16 Q with the staging scale on load to the
+        bytes the context FP8 quantizer writes. Returns BF16 [count, heads * 512],
+        or None after writing the module's FP8 projection input (``output_fp8``).
+        """
+        self.sparse_attn_predict(q, None, metadata, forward_args)
+        count = metadata.num_tokens
+        quant_q = forward_args.quant_q_buffer
+        state = getattr(forward_args.sparse_backend_args, "state", None)
+        if state is not None and state.output_fp8 is not None:
+            data, scale, positions, cos_sin = state.output_fp8
+            torch.ops.trtllm.csa2_sparse_context(
+                metadata.shared_pool,
+                (q if quant_q is None else quant_q).view(count, self.num_heads, _HEAD_DIM),
+                forward_args.quant_scale_qkv if quant_q is None else None,
+                metadata.prepared_indices,
+                metadata.prepared_lens,
+                metadata.mla_bmm1_scale,
+                metadata.mla_bmm2_scale,
+                forward_args.attention_sinks,
+                data,
+                scale,
+                positions,
+                cos_sin,
+            )
+            state.output_fp8_written = True
+            return None
+        output = forward_args.output if forward_args.output is not None else torch.empty_like(q)
+        torch.ops.trtllm.csa2_sparse_context(
+            metadata.shared_pool,
+            (q if quant_q is None else quant_q).view(count, self.num_heads, _HEAD_DIM),
+            forward_args.quant_scale_qkv if quant_q is None else None,
+            metadata.prepared_indices,
+            metadata.prepared_lens,
+            metadata.mla_bmm1_scale,
+            metadata.mla_bmm2_scale,
+            forward_args.attention_sinks,
+            output.view(count, self.num_heads, _HEAD_DIM),
+        )
+        return output
 
     def create_output(self, q, *, is_quantize_output, **kwargs):
         if self.native_fp8 and (is_quantize_output or q.dtype != torch.bfloat16):
@@ -281,9 +595,6 @@ class CSA2TrtllmAttention(TrtllmAttention):
             raise ValueError("CSA2 native FP8 attention requires unquantized BF16 output")
         if metadata.swa_pool.dtype != self.staging_dtype:
             raise ValueError("CSA2 tile staging dtype must match its attention backend")
-        inputs = forward_args.sparse_backend_args
-        if not isinstance(inputs, CSA2BackendForwardArgs):
-            raise TypeError("CSA2 requires CSA2BackendForwardArgs")
         count = metadata.num_tokens
         if (
             q.shape != (count, self.num_heads * _HEAD_DIM)
@@ -291,6 +602,18 @@ class CSA2TrtllmAttention(TrtllmAttention):
             or metadata.num_query_heads != self.num_heads
         ):
             raise ValueError("CSA2 Q geometry/dtype must match its BF16 metadata")
+        inputs = self._resolve_sparse_inputs(count, forward_args)
+        if metadata.swa_pool.device != q.device:
+            raise ValueError("CSA2 Q and metadata must be on the same CUDA device")
+        return inputs
+
+    def _resolve_sparse_inputs(
+        self, count: int, forward_args: AttentionForwardArgs
+    ) -> CSA2BackendForwardArgs:
+        """Publish a module tile's cache rows, run its indexer and return its selections."""
+        inputs = forward_args.sparse_backend_args
+        if not isinstance(inputs, CSA2BackendForwardArgs):
+            raise TypeError("CSA2 requires CSA2BackendForwardArgs")
         if forward_args.attention_input_type not in (
             AttentionInputType.context_only,
             AttentionInputType.generation_only,
@@ -391,6 +714,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
                         self.layer_idx, start, end, logical, visible_lengths=visible
                     )
             inputs = CSA2BackendForwardArgs(
+                projected_quant_q=inputs.projected_quant_q,
+                projected_q_unit_scale=inputs.projected_q_unit_scale,
+                projected_q_amax=inputs.projected_q_amax,
                 swa_pool=manager.get_swa_buffer(self.layer_idx),
                 swa_indices=source.csa2_swa_indices[self.layer_idx][start:end],
                 main_pool=None if logical is None else manager.get_main_buffer(layer.kv_source),
@@ -410,9 +736,47 @@ class CSA2TrtllmAttention(TrtllmAttention):
             inputs.output_position_ids is not None or inputs.output_rotary_cos_sin is not None
         ) and not self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 fused output RoPE requires packed sparse attention")
-        if metadata.swa_pool.device != q.device:
-            raise ValueError("CSA2 Q and metadata must be on the same CUDA device")
         return inputs
+
+    def forward_fused_decode(self, q: torch.Tensor, forward_args: AttentionForwardArgs) -> None:
+        """Generation attention of a module tile, read straight from the packed pools.
+
+        The tile publishes its cache rows and runs its indexer as the staged path
+        does; one kernel then gathers each query's SWA and main rows, dequantizes
+        them exactly to BF16 and attends with the sink in FP32. ``q`` is the BF16
+        [count, heads, 512] tile, which the projection's unit-scale E4M3 Q replaces when
+        given; ``forward_args.output`` receives the result, or the state's ``output_mxfp8``
+        the grouped MXFP8 o_a projection's input made of it.
+        """
+        count = q.shape[0]
+        inputs = self._resolve_sparse_inputs(count, forward_args)
+        mxfp8 = inputs.state.output_mxfp8
+        main_indices, mapping = inputs.topk_indices, inputs.main_mapping
+        if main_indices is not None and mapping is None:
+            main_indices = main_indices.int()
+        table, page_size, max_positions, requests, visible = mapping or (None, 0, 0, None, None)
+        if forward_args.sparse_backend_args.query_ready is not None:
+            forward_args.sparse_backend_args.query_ready.wait()
+        quant_q = inputs.projected_quant_q
+        torch.ops.trtllm.csa2_sparse_decode(
+            q if quant_q is None else quant_q.view(q.shape),
+            inputs.swa_pool,
+            inputs.swa_indices,
+            inputs.main_pool,
+            main_indices,
+            table,
+            requests,
+            visible,
+            page_size,
+            max_positions,
+            forward_args.attention_sinks,
+            1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
+            forward_args.output.view(count, self.num_heads, _HEAD_DIM)
+            if mxfp8 is None
+            else mxfp8[0],
+            _fused_decode_workspace(q.device.index),
+            *(() if mxfp8 is None else mxfp8[1:]),
+        )
 
     def _native_slot_mapping(self, logical: torch.Tensor) -> bool:
         """Logical main selections may stay logical when native staging maps them."""
@@ -424,18 +788,42 @@ class CSA2TrtllmAttention(TrtllmAttention):
             and _fused_gather_supported(logical.device.index)
         )
 
-    def sparse_attn_predict(self, q, k, metadata, forward_args):
+    def sparse_attn_predict(self, q, k, metadata, forward_args, *, bank=False):
+        """``bank``: stage for the ``gen_fmha`` generation core (``_forward_gen_fmha``)."""
         if self.compute_backend != "trtllm" or self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 Flash and packed attention require their explicit module helper")
         if (
             metadata.is_cuda_graph
             and self.compute_backend == "trtllm"
             and not self.sparse_params.use_packed_sparse_attention
+            # The gen_fmha core (``bank``) reads no native workspace.
+            and not bank
             and metadata.workspace.numel() == 0
         ):
             raise RuntimeError("Warm up CSA2 metadata with forward before CUDA Graph capture")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
         if self.native_fp8:
+            generation = (
+                forward_args.attention_input_type == AttentionInputType.generation_only
+                and q.numel() > 0
+            )
+            # Generation Q may come with its amax word: alongside unit-scale FP8 Q from the
+            # Q-B GEMM, or alone from a small step's query RoPE.
+            q_word = inputs.projected_q_amax if generation else None
+            fp8_q = q_word is not None and inputs.projected_quant_q is not None
+            query_ready = forward_args.sparse_backend_args.query_ready
+            # FP8 staging reads Q's range before quantizing either Q or KV. Where the caller
+            # allows it, the selected rows are reduced before waiting for Q and only the scale
+            # finalize waits for the word: beside a small step's query path, which leaves most
+            # of the GPU idle, and ahead of a large step's Q-B GEMM, so the reduction is off the
+            # path from that GEMM to attention.
+            late_q = (
+                q_word is not None
+                and query_ready is not None
+                and forward_args.sparse_backend_args.late_query_ready
+            )
+            if query_ready is not None and not late_q:
+                query_ready.wait()
             # This hook runs before the parent's scale-default assignment, whose
             # scales serve Q: the staging KV scale is derived here instead, since
             # a unit one clamps every channel the packed pools decode above 448.
@@ -465,11 +853,31 @@ class CSA2TrtllmAttention(TrtllmAttention):
             # context does take range, bounded by Q's own amax and by the exponent the
             # main pool can actually need. Split-KV never runs here either way: every
             # MLA multi-CTA-KV cubin is a generation kernel.
+            #
+            # The fused context kernel reads BMM1's dequant product from its own buffer, so a
+            # context Q projected straight to unit-scale E4M3 keeps that scale: BMM1 takes the
+            # staged KV scale alone, Q pays nothing, and the KV range is not capped by Q.
+            if fp8_q:
+                projected = inputs.projected_quant_q
+                if (
+                    projected.numel() != q.numel()
+                    or projected.dtype != torch.float8_e4m3fn
+                    or projected.device != q.device
+                    or not projected.is_contiguous()
+                ):
+                    raise ValueError("CSA2 generation FP8 Q must match its BF16 query")
+            unit_q = context and inputs.projected_q_unit_scale
+            if unit_q and (
+                inputs.projected_quant_q is None or not self.runs_fused_context(metadata)
+            ):
+                raise ValueError("CSA2 unit-scale context Q requires the fused context kernel")
             stage_orig_quant, stage_quant_orig = metadata.derive_stage_kv_scales(
                 inputs,
-                q=q,
+                q=q if q_word is None and not unit_q else None,
                 q_shared=context,
-                maximum=_CONTEXT_STAGE_SCALE_MAX_EXPONENT if context else 126,
+                maximum=_CONTEXT_STAGE_SCALE_MAX_EXPONENT if context and not unit_q else 126,
+                q_word=q_word,
+                q_ready=query_ready if late_q else None,
             )
             if context:
                 forward_args.kv_scale_orig_quant = stage_orig_quant
@@ -478,31 +886,73 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 # Q's pair is the staging pair read backwards: dequant_q = 1 / dequant_kv.
                 forward_args.kv_scale_orig_quant = stage_quant_orig
                 forward_args.kv_scale_quant_orig = stage_orig_quant
+            # Under multi-stream CUDA graphs, BF16 Q is quantized on a side stream beside the row
+            # staging; an FP8 Q is rescaled by the staging itself.
+            side = (
+                private_stream(q.device.index, "csa2_query")
+                if generation and not fp8_q and do_multi_stream()
+                else None
+            )
+            q_fixup = None
+            if fp8_q:
+                # The staging moves the unit-scale Q to the live scale (rescale_fp8_query).
+                quant_q = inputs.projected_quant_q
+                q_fixup = (quant_q, forward_args.kv_scale_quant_orig)
+                forward_args.quant_q_buffer = quant_q.view(
+                    metadata.num_tokens, self.num_heads, _HEAD_DIM
+                )
+            elif generation:
+                from .kernel import quantize_stage_query
+
+                query = q.contiguous()
+                quant_q = torch.empty(query.shape, dtype=torch.float8_e4m3fn, device=q.device)
+                if side is not None:
+                    side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    quantize_stage_query(query, forward_args.kv_scale_quant_orig, quant_q)
+                forward_args.quant_q_buffer = quant_q.view(
+                    metadata.num_tokens, self.num_heads, _HEAD_DIM
+                )
             metadata.stage_selected(
                 inputs,
                 kv_scale_orig_quant=stage_orig_quant,
                 kv_scale_quant_orig=stage_quant_orig,
-                q_scale_quant_orig=forward_args.kv_scale_quant_orig,
+                q_scale_quant_orig=(
+                    metadata.native_unit_scale if unit_q else forward_args.kv_scale_quant_orig
+                ),
                 softmax_scale=1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
                 main_logical=inputs.main_logical_indices,
+                dedup=True,
+                bank=bank,
+                q_fixup=q_fixup,
             )
-            if (
-                forward_args.attention_input_type == AttentionInputType.generation_only
-                and q.numel()
-            ):
-                with torch.cuda.device(q.device):
-                    quant_q, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                        q.contiguous(), forward_args.kv_scale_quant_orig
-                    )
-                forward_args.quant_q_buffer = quant_q.view(
-                    metadata.num_tokens, self.num_heads, _HEAD_DIM
-                )
+            if side is not None:
+                torch.cuda.current_stream().wait_stream(side)
+            if generation:
                 forward_args.mla_bmm1_scale = metadata.mla_bmm1_scale
                 forward_args.mla_bmm2_scale = metadata.mla_bmm2_scale
             elif forward_args.attention_input_type == AttentionInputType.context_only:
                 forward_args.quant_scale_qkv = forward_args.kv_scale_orig_quant
+                if inputs.projected_quant_q is not None:
+                    quant_q = inputs.projected_quant_q
+                    if (
+                        quant_q.shape != q.shape
+                        or quant_q.dtype != torch.float8_e4m3fn
+                        or quant_q.device != q.device
+                        or not quant_q.is_contiguous()
+                    ):
+                        raise ValueError(
+                            "CSA2 projected FP8 Q must match its contiguous BF16 query"
+                        )
+                    if not unit_q:
+                        from .query_projection import fixup_fp8_query
+
+                        fixup_fp8_query(q, quant_q, forward_args.quant_scale_qkv)
+                    forward_args.quant_q_buffer = quant_q
         else:
-            metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+            metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices, dedup=True)
+        if not self.native_fp8 and forward_args.sparse_backend_args.query_ready is not None:
+            forward_args.sparse_backend_args.query_ready.wait()
         sparse = forward_args.sparse_runtime_params
         sparse.sparse_attn_kv_lens = metadata.prepared_lens
         sparse.aux_kv_cache_pool_ptr = (

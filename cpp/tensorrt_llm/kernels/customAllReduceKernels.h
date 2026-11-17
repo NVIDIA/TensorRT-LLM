@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -189,6 +189,13 @@ void customAllReduce(kernels::AllReduceParams& params, tensorrt_llm::DataType da
 
 void residualRmsNorm(
     kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
+
+//! Residual add + RMSNorm + per-tensor FP8 quantization in one pass (the NCCL-fallback path of
+//! RESIDUAL_RMS_NORM_[OUT_]QUANT_FP8); same outputs as residualRmsNorm followed by the static per-tensor
+//! quantize.
+bool residualRmsNormQuantFp8Supported(tensorrt_llm::DataType dataType, int hidden_size);
+void residualRmsNormQuantFp8(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, void* quant_out,
+    float const* scale, bool write_norm_out, cudaStream_t stream);
 
 void lamportInitialize(void* buffer, size_t size, tensorrt_llm::DataType dataType, cudaStream_t stream);
 

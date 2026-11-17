@@ -64,6 +64,7 @@ def _make_mock_kv_iter_stats(
     secondary_peak_free=None,
     secondary_peak_used=None,
     secondary_peak_evictable=None,
+    secondary_retained_copy=0,
     reused=5,
     full_reused=4,
     partial_reused=1,
@@ -101,6 +102,7 @@ def _make_mock_kv_iter_stats(
         secondary_peak_free_num_blocks=secondary_peak_free,
         secondary_peak_used_num_blocks=secondary_peak_used,
         secondary_peak_evictable_num_blocks=secondary_peak_evictable,
+        secondary_retained_copy_num_blocks=secondary_retained_copy,
         iter_alloc_total_blocks=reused + missed,
         iter_alloc_new_blocks=missed,
         iter_reused_blocks=reused,
@@ -122,6 +124,15 @@ def _make_mock_kv_iter_stats(
 
 
 class TestStatsSerializer:
+    @pytest.mark.parametrize("times", [[], [0.0, 2.5]])
+    def test_serializer_encoder_gpu_samples(self, times):
+        iter_stats = _make_mock_iteration_stats()
+        stats = (iter_stats, None, None, 0, None, None, "overlap", None, {"gpuTimesMS": times})
+        result = json.loads(BaseWorker._stats_serializer(stats))
+        assert result["multimodalEncoderStats"]["gpuTimesMS"] == times
+        legacy = json.loads(BaseWorker._stats_serializer(stats[:8]))
+        assert "multimodalEncoderStats" not in legacy
+
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
         iter_stats = _make_mock_iteration_stats()
@@ -169,6 +180,7 @@ class TestStatsSerializer:
         assert ws_stats["secondaryPeakFreeNumBlocks"] == 0
         assert ws_stats["secondaryPeakUsedNumBlocks"] == 0
         assert ws_stats["secondaryPeakEvictableNumBlocks"] == 0
+        assert ws_stats["secondaryRetainedCopyNumBlocks"] == 0
         assert ws_stats["iterReusedBlocks"] == 5
         assert ws_stats["iterFullReusedBlocks"] == 4
         assert ws_stats["iterPartialReusedBlocks"] == 1
@@ -427,6 +439,7 @@ class TestStatsSerializer:
         assert cold_group["secondaryPeakFreeNumBlocks"] == 6
         assert cold_group["secondaryPeakUsedNumBlocks"] == 4
         assert cold_group["secondaryPeakEvictableNumBlocks"] == 2
+        assert cold_group["secondaryRetainedCopyNumBlocks"] == 0
         assert not [key for key in cold_group if key.startswith("primary")]
         assert not [key for key in cold_group if key.startswith("iter")]
         assert "kvCacheIterationStatsByLifecycle" in d

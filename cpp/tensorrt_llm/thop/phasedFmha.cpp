@@ -611,6 +611,13 @@ TrtllmGenGenerationWorkspaceLayout trtllmGenGenerationLayout(FmhaParams const& p
         p.getMaxBlocksPerSequence(), useSparseAttention, /*skipFmhaWorkspace=*/true);
 }
 
+/// SM count the trtllm-gen generation kernels plan for: the call's `multi_processor_count`, which forces more KV
+/// splits per sequence than the device's count gives, else the device's.
+int trtllmGenGenerationSmCount(MHA const& op, FmhaParams const& p)
+{
+    return std::max(op.getMultiProcessorCount(), static_cast<int>(p.multi_processor_count));
+}
+
 std::size_t trtllmGenScratchOffset(TrtllmGenGenerationWorkspaceLayout const& layout)
 {
     return tc::alignSize(static_cast<std::size_t>(layout.totalSize),
@@ -888,7 +895,7 @@ std::size_t TrtllmGenFmha<AttentionVariant>::getWorkspaceSize(
             op.rotary_embedding_dim, op.useTllmGenSparseAttentionPaged(p));
         return trtllmGenScratchOffset(layout)
             + std::max(static_cast<std::size_t>(TrtllmAttentionWorkspaceManager::kTrtllmGenWorkspaceSize),
-                getMultiCtasKvScratchSize(op.getHeadSize(), op.mMultiProcessorCount));
+                getMultiCtasKvScratchSize(op.getHeadSize(), trtllmGenGenerationSmCount(op, p)));
     }
     else
     {
@@ -1047,6 +1054,15 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
         tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
     }
     tllmRunnerParams.mUsesSpcompress = mContextParams.useSpcompress;
+    if (runnerParams.headDimPerStageKv > 0)
+    {
+        // Only a precompiled staged kernel: compiling one would stall this step.
+        tllmRunnerParams.mHeadDimPerStageKv = runnerParams.headDimPerStageKv;
+        if (mContextRunner->usesNvrtc(tllmRunnerParams))
+        {
+            tllmRunnerParams.mHeadDimPerStageKv = 0;
+        }
+    }
 
     mContextRunner->run(tllmRunnerParams);
 }
@@ -1363,7 +1379,9 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     tllmRunnerParams.mScaleQ = q_scaling;
     // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
     tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-    tllmRunnerParams.mMultiProcessorCount = op.getMultiProcessorCount();
+    // The kernel selection splits each sequence's KV over this count, which getWorkspaceSize sized the
+    // multi-CTA scratch for.
+    tllmRunnerParams.mMultiProcessorCount = trtllmGenGenerationSmCount(op, p);
     tllmRunnerParams.stream = stream;
     tllmRunnerParams.mSfStartTokenIdx = static_cast<int32_t>(p.token_offset);
     tllmRunnerParams.mIsSpecDecTree = isSpecDecTree;
@@ -1547,6 +1565,12 @@ void TrtllmGenFmha<MLA>::runGenerationImpl(MLA const& op, FmhaParams const& p, c
     if (op.useSparseMLA())
     {
         auto const& sparseParams = op.template feature<torch_ext::SparseMlaFeature>().params();
+        if (auto const maxCtas = p.fwd.sparse_runtime_params.max_num_ctas_per_seq_kv; maxCtas.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(*maxCtas > 0 && *maxCtas <= std::numeric_limits<int32_t>::max(),
+                "Sparse MLA max_num_ctas_per_seq_kv must be a positive int32, got %ld", *maxCtas);
+            tllmRunnerParams.mMaxNumCtasPerSeqKv = static_cast<int32_t>(*maxCtas);
+        }
         bool const useDynamicSparseMLA = sparseParams.sparse_attn_kv_lens != nullptr;
         tllmRunnerParams.mSparseAttention
             = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;

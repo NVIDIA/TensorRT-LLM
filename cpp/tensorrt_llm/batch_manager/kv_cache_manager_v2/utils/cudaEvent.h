@@ -469,7 +469,14 @@ private:
 // Merge multiple CUDA events into one.
 // Returns makeNull() for 0 live events, the single live event for 1,
 // or a TemporaryCudaStream-merged event for many.
-// Mirrors Python's merge_events() utility.
-CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events);
+// Mirrors Python's merge_events() utility. Moves the single live event out of `events`.
+CachedCudaEvent mergeEvents(CachedCudaEvent* events, size_t count);
+
+//! mergeEvents over any contiguous container of events (std::vector, SmallVector).
+template <typename Events>
+CachedCudaEvent mergeEvents(Events& events)
+{
+    return mergeEvents(events.data(), events.size());
+}
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
