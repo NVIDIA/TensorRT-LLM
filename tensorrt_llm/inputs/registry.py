@@ -1646,8 +1646,10 @@ def create_input_processor_with_hash(
             mm_hashes_int32 = [
                 hexdigest_to_int32(mm_hashes[m][i]) for m, i in item_refs
             ]  # nested list w/ multiple int32 per hash
-        mm_uuid_list = (None if mm_uuids_by_key is None else
-                        [mm_uuids_by_key[m][i] for m, i in item_refs])
+        mm_uuid_list = (None if mm_uuids_by_key is None else [
+            mm_uuids_by_key[m][i] if m in mm_uuids_by_key else None
+            for m, i in item_refs
+        ])
         validate_mm_inputs(prompt_token_ids, mm_hashes_int32, start_positions,
                            num_mm_tokens)
 
@@ -1667,20 +1669,26 @@ def create_input_processor_with_hash(
         keys come from the placeholder tokens, which are the same for every
         image, so a request with another image and the same prompt layout
         would reuse the KV cache of this one. With random hashes, no other
-        request matches these blocks. The request still skips the encoder
-        cache, which needs content hashes. It stays as it is when its item
-        spans cannot be found.
+        request matches these blocks. The items keep the request's UUIDs. The
+        request still skips the encoder cache, which needs content hashes. It
+        stays as it is when its item spans cannot be found.
         """
         multimodal_data = (extra_processed_inputs or {}).get("multimodal_data")
         if (not isinstance(multimodal_data, dict)
                 or extra_processed_inputs.get("multimodal_input") is not None):
             return extra_processed_inputs
+        mm_uuids = inputs.get('multi_modal_uuids')
+        mm_uuids_by_key = (None if mm_uuids is None else validate_mm_uuids(
+            inputs['multi_modal_data'], mm_uuids))
         # Work on copies, so a failure leaves the request unchanged.
         result = {
             **extra_processed_inputs, "multimodal_data": dict(multimodal_data)
         }
         try:
-            add_multimodal_input(inputs, prompt_token_ids, result)
+            add_multimodal_input(inputs,
+                                 prompt_token_ids,
+                                 result,
+                                 mm_uuids_by_key=mm_uuids_by_key)
         except Exception as e:
             logger.debug(f"No random multimodal hashes: {e}")
             return extra_processed_inputs
@@ -1704,11 +1712,12 @@ def create_input_processor_with_hash(
                                          f"get_num_tokens_per_{m}"):
                 can_hash = False
         hashing_supported = input_processor.multimodal_hashing_supported
+        if can_hash:
+            # Bad UUIDs are an error in the request, with hashing on or off:
+            # raise it here, so the request is not served without them.
+            validate_mm_uuids(mm_data, inputs.get('multi_modal_uuids'))
 
         if can_hash and hashing_supported is not False:
-            # Bad UUIDs are an error in the request: raise it here, so the
-            # request is not served without them.
-            validate_mm_uuids(mm_data, inputs.get('multi_modal_uuids'))
             try:
                 result = multimodal_hashing_process(inputs, sampling_params)
                 # The probe worked: hashing is supported.

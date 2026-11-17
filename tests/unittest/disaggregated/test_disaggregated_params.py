@@ -180,6 +180,20 @@ def test_multimodal_spans_round_trip_through_openai_json():
     assert restored == original
 
 
+def test_embedding_handles_without_hashes_get_a_random_hash_each():
+    """KV block reuse keys an item by its hash, so no two items may share one."""
+    params = [
+        DisaggregatedParams(multimodal_embedding_handles=[{"tensor_size": [1, 16]}] * 2)
+        for _ in range(2)
+    ]
+
+    hashes = [tuple(mm_hash) for p in params for mm_hash in p.multimodal_hashes]
+    assert len(set(hashes)) == 4
+    for mm_hash in hashes:
+        assert len(mm_hash) == 8
+        assert all(isinstance(value, int) and -(2**31) <= value < 2**31 for value in mm_hash)
+
+
 @patch("tensorrt_llm.disaggregated_params.tllme")
 def test_get_context_phase_params_disagg_wins(mock_tllme):
     """disagg_request_id takes priority over ctx_request_id."""

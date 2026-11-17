@@ -456,5 +456,5 @@ def test_requests_without_content_hashes_do_not_share_block_keys():
         keys = sequence_to_blockchain_keys(4, ReuseScope(), augmented)
         block_keys.append([key for block, key in keys if block])  # Skip the root key.
 
-    assert len(block_keys[0]) == 2
+    assert [len(keys) for keys in block_keys] == [2, 2]
     assert not set(block_keys[0]) & set(block_keys[1])
