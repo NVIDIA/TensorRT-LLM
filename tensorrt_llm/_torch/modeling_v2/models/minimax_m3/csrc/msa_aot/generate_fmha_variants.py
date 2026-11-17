@@ -17,10 +17,10 @@
 The minimax_m3 family's vendored MSA package (kernels/msa_kernels/fmha_sm100, see
 3rdparty/vendor_sources.lock.yaml) compiles each FMHA variant at run time from two jinja
 templates. The opt-in ahead-of-time build compiles the variants the MiniMax-M3.1 targets call: this script
-renders those templates for the variants in VARIANTS into generated/, with the parameters the
-vendored jit.py would use, and the CMake file in this directory compiles them with jit.py's
-flags. Run it after changing VARIANTS or the vendored templates; --check fails when the
-checked-in sources are stale.
+renders those templates for the variants in VARIANTS into the output directory, with the parameters
+the vendored jit.py would use, and the CMake file in this directory runs it at configure time and
+compiles the rendered sources with jit.py's flags. Files are rewritten only when their content
+changes, so an unchanged render does not rebuild anything.
 """
 
 import argparse
@@ -33,7 +33,6 @@ import jinja2
 _HERE = Path(__file__).resolve().parent
 # This directory is <family>/csrc/msa_aot; the vendored package is <family>/kernels/msa_kernels/fmha_sm100.
 _PACKAGE = _HERE.parents[1] / "kernels/msa_kernels/fmha_sm100"
-_GENERATED = _HERE / "generated"
 
 # The variant keys (jit.py's dispatch indices: dtype, qo tile, single warp group, sparse mode,
 # page size, split-KV, pack factor) the MiniMax-M3.1 targets reach: the OnlyScore proxy of the
@@ -94,29 +93,20 @@ def render() -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="fail if generated/ is stale")
+    parser.add_argument(
+        "--out", type=Path, required=True, help="directory to render the sources into"
+    )
     args = parser.parse_args()
+    out = args.out
     files = render()
-    stale = sorted(
-        name
-        for name, text in files.items()
-        if not (_GENERATED / name).is_file() or (_GENERATED / name).read_text() != text
-    )
-    extra = (
-        sorted(p.name for p in _GENERATED.glob("*") if p.is_file() and p.name not in files)
-        if _GENERATED.is_dir()
-        else []
-    )
-    if args.check:
-        if stale or extra:
-            print(f"stale: {stale}; unexpected: {extra}", file=sys.stderr)
-            return 1
-        return 0
-    _GENERATED.mkdir(exist_ok=True)
-    for name in extra:
-        (_GENERATED / name).unlink()
+    out.mkdir(parents=True, exist_ok=True)
+    for path in out.iterdir():
+        if path.is_file() and path.name not in files:
+            path.unlink()
     for name, text in files.items():
-        (_GENERATED / name).write_text(text)
+        target = out / name
+        if not target.is_file() or target.read_text() != text:
+            target.write_text(text)
     return 0
 
 

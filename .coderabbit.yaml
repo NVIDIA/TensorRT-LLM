@@ -92,7 +92,6 @@ reviews:
     - "!tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/**"
     - "!tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100_q8kv8/**"
     - "!tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x/**"
-    - "!tensorrt_llm/_torch/modeling_v2/models/minimax_m3/csrc/msa_aot/generated/**"
 
   path_instructions:
     - path: "**"

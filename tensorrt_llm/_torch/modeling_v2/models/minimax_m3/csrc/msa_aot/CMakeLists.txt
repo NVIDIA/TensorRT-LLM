@@ -19,9 +19,8 @@
 # modules the MiniMax-M3.1 targets call, from the same sources with the same
 # nvcc command, into the layout jit.py looks in first
 # (msa_fmha_sm100/<variant>/<variant>.so, plan/, reduction/, sparse_topk/, k2q/,
-# prefill_bf16x/). build_wheel.py installs the tree under tensorrt_llm/libs. The
-# variant list and the rendered variant sources come from
-# generate_fmha_variants.py.
+# prefill_bf16x/). The variant list and the rendered variant sources come from
+# generate_fmha_variants.py, run at configure time into the build tree.
 
 set(MSA_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
 list(FILTER MSA_ARCHS INCLUDE REGEX "^10[0-9]")
@@ -33,9 +32,8 @@ endif()
 set(MSA_KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../kernels/msa_kernels)
 set(MSA_PACKAGE_DIR ${MSA_KERNELS_DIR}/fmha_sm100)
 set(MSA_CSRC ${MSA_PACKAGE_DIR}/csrc)
-set(MSA_GENERATED ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+set(MSA_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(MSA_OUT ${CMAKE_CURRENT_BINARY_DIR}/msa_fmha_sm100)
-include(${MSA_GENERATED}/variants.cmake)
 file(GLOB_RECURSE MSA_HEADERS ${MSA_CSRC}/*.h ${MSA_CSRC}/*.hpp
      ${MSA_CSRC}/*.cuh)
 
@@ -43,6 +41,24 @@ find_package(
   Python3
   COMPONENTS Interpreter
   REQUIRED)
+
+# Render the variant sources and their list; re-run configure when the
+# generator, the vendored templates or the vendored dispatch tables change.
+set(MSA_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/generate_fmha_variants.py)
+execute_process(COMMAND ${Python3_EXECUTABLE} ${MSA_GENERATOR} --out
+                        ${MSA_GENERATED} RESULT_VARIABLE MSA_GENERATE_RESULT)
+if(NOT MSA_GENERATE_RESULT EQUAL 0)
+  message(FATAL_ERROR "MSA fmha_sm100: generate_fmha_variants.py failed")
+endif()
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS
+           ${MSA_GENERATOR}
+           ${MSA_CSRC}/fmha_sm100_inst.jinja
+           ${MSA_CSRC}/fmha_sm100_variant_run.cu.jinja
+           ${MSA_PACKAGE_DIR}/jit.py)
+include(${MSA_GENERATED}/variants.cmake)
 execute_process(
   COMMAND
     ${Python3_EXECUTABLE} -c
