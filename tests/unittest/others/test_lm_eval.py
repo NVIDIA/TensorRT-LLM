@@ -1874,11 +1874,10 @@ def test_stop_strings_cli_rejects_non_list_of_strings(value):
 # ===========================================================================
 
 _P = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
-_IMAGE0, _IMAGE1 = ({"type": "image", "media_index": i} for i in range(2))
 
 
 @pytest.mark.parametrize(
-    "force_single,history,sizes,parts,counts",
+    "force_single,history,sizes,expected",
     [
         (
             False,
@@ -1888,68 +1887,79 @@ _IMAGE0, _IMAGE1 = ({"type": "image", "media_index": i} for i in range(2))
                 {"role": "user", "content": f"Compare to {_P} again."},
             ],
             [(84, 56), (56, 112), (84, 56)],
-            ["Before ", _IMAGE0, " between ", _IMAGE1, " after"],
-            [{"[IMG]": 2}, {}, {"[IMG]": 1}],
+            [
+                {"role": "user", "content": ["Before ", 0, " between ", 1, " after"]},
+                {"role": "assistant", "content": "Two pictures."},
+                {"role": "user", "content": ["Compare to ", 2, " again."]},
+            ],
         ),
         # is_force_single_image keeps the first placeholder for the one image it passes.
         (
             True,
             [{"role": "user", "content": f"{_P} and {_P}: which is red?"}],
             [(84, 56), (56, 112)],
-            [_IMAGE0, " and ", ": which is red?"],
-            [{"[IMG]": 1}],
+            [{"role": "user", "content": [0, " and ", ": which is red?"]}],
         ),
         # An image without a placeholder follows the text.
         (
             False,
             [{"role": "user", "content": "What is this?"}],
             [(84, 56)],
-            ["What is this?", _IMAGE0],
-            [{"[IMG]": 1}],
+            [{"role": "user", "content": ["What is this?", 0]}],
         ),
     ],
     ids=["in_place", "forced_single", "no_placeholder"],
 )
 def test_native_mistral_eval_renders_the_chat_with_its_images(
-    force_single, history, sizes, parts, counts
+    force_single, history, sizes, expected
 ):
-    """The chat is rendered once its images are loaded.
+    """The engine gets the ids mistral-common makes of the chat with its loaded images.
 
-    mistral-common sees their pixels and the original turn and image order.
+    The images keep the original turn and image order; ``expected`` gives each image's index.
     """
-    import json
+    import base64
+    import io
 
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
     from PIL import Image
+    from test_common.mistral_tekken import load_tekken
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    tokenizer = load_tekken("v15")  # the bundled Tekken file has no image encoder
+    images = [Image.new("RGB", size) for size in sizes]
+
+    def image_url(image):
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def chunk(part):
+        if isinstance(part, str):
+            return {"type": "text", "text": part}
+        return {"type": "image_url", "image_url": {"url": image_url(images[part])}}
+
+    messages = [
+        {**m, "content": [chunk(p) for p in m["content"]]} if isinstance(m["content"], list) else m
+        for m in expected
+    ]
+    expected_ids = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=messages, reasoning_effort="none")
+    ).tokens
 
     wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
     wrapper.is_force_single_image = force_single
     wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
-    deferred = wrapper.apply_chat_template(history)
-    assert json.loads(deferred)["conversation"] == history
     future = MagicMock()
     future.result.return_value.outputs = [MagicMock(text="A")]
     wrapper.llm.generate_async.return_value = future
     request = MagicMock()
-    request.args = (deferred, {}, {"visual": [Image.new("RGB", size) for size in sizes]})
-    with patch(
-        "tensorrt_llm.evaluate.lm_eval.trtllm_apply_chat_template", return_value=[1, 100, 200]
-    ) as render:
-        assert wrapper.generate_until([request], disable_tqdm=True) == ["A"]
+    request.args = (wrapper.apply_chat_template(history), {}, {"visual": images})
+    assert wrapper.generate_until([request], disable_tqdm=True) == ["A"]
 
-    rendered = render.call_args.kwargs
-    loaded = sizes[:1] if force_single else sizes
-    assert rendered["model_type"] == "mistral_common"
-    assert [m["role"] for m in rendered["conversation"]] == [m["role"] for m in history]
-    assert rendered["conversation"][0]["content_parts"] == parts
-    assert rendered["mm_placeholder_counts"] == counts
-    assert [image.size for image in rendered["mm_data"]["image"]] == loaded
-    assert rendered["chat_template_kwargs"] == {
-        "reasoning_effort": "none",
-        "continue_final_message": False,
-    }
     submitted = wrapper.llm.generate_async.call_args.args[0]
-    assert submitted["prompt_token_ids"] == [1, 100, 200] and "prompt" not in submitted
-    assert len(submitted["multi_modal_data"]["image"]) == len(loaded)
+    assert submitted["prompt_token_ids"] == expected_ids and "prompt" not in submitted
+    assert len(submitted["multi_modal_data"]["image"]) == (1 if force_single else len(images))
 
 
 def test_native_mistral_eval_continues_a_gen_prefix():

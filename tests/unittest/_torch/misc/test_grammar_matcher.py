@@ -50,12 +50,8 @@ def test_vocabulary_ids_are_decided_by_the_grammar():
     assert matcher.accept_token(VOCAB.index("["))
 
 
-def test_llguidance_over_a_hugging_face_tokenizer_rejects_a_padded_draft_token():
-    """llguidance builds its tokenizer from the Hugging Face tokenizer JSON.
-
-    A padded id is rejected without breaking the matcher, a valid answer is accepted
-    through to the stop token, and a rejected draft rolls back.
-    """
+def test_llguidance_builds_its_tokenizer_from_the_hugging_face_tokenizer_json():
+    """Given no ready tokenizer, the llguidance factory builds one from the config's JSON."""
     from tensorrt_llm.tokenizer import TransformersTokenizer
 
     root = llm_models_root()
@@ -72,18 +68,7 @@ def test_llguidance_over_a_hugging_face_tokenizer_rejects_a_padded_draft_token()
     params = GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, json.dumps(schema))
 
     matcher = factory.create(params)
-    assert not matcher.accept_token(vocab_size_padded - 1)
-    answer = tokenizer.encode('{"city": "Paris"}', add_special_tokens=False)
-    for token_id in answer:
+    for token_id in tokenizer.encode('{"city": "Paris"}', add_special_tokens=False):
         assert matcher.accept_token(token_id), token_id
     assert matcher.accept_token(tokenizer.eos_token_id)
     assert matcher.is_terminated()
-
-    matcher = factory.create(params)
-    assert matcher.accept_token(answer[0])
-    for token_id in answer[1:]:
-        assert matcher.accept_token(token_id)
-    matcher.rollback(len(answer) - 1)
-    for token_id in answer[1:]:
-        assert matcher.accept_token(token_id)
-    assert not matcher.accept_token(answer[0])

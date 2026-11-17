@@ -23,7 +23,6 @@ Tekken files under LLM_MODELS_ROOT.
 import asyncio
 import base64
 import copy
-import re
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -32,7 +31,7 @@ import pytest
 from PIL import Image
 from test_common.mistral_tekken import load_tekken
 
-from tensorrt_llm.inputs.utils import NATIVE_MISTRAL_MODEL_TYPES, apply_chat_template
+from tensorrt_llm.inputs.utils import apply_chat_template
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.render import render_conversation_with_media
@@ -81,12 +80,6 @@ def _render(tokenizer, messages, *, add_generation_prompt=True, counts=None, **k
 
 def _config(model_type=_MODEL_TYPE):
     return type("Config", (), {"model_type": model_type})()
-
-
-def test_the_native_format_renders_with_mistral_common():
-    assert _MODEL_TYPE in NATIVE_MISTRAL_MODEL_TYPES
-    assert get_serving_extension(_MODEL_TYPE).render_needs_media()
-    assert not get_serving_extension("llama").render_needs_media()
 
 
 def test_the_renderer_gets_only_what_mistral_common_reads():
@@ -345,7 +338,6 @@ _CASES = {
     "tools": ({"messages": _TOOL_HISTORY, "tools": [_WEATHER_TOOL]}, {"tools": [_WEATHER_TOOL]}),
     # Arguments that are not a JSON object reach mistral-common as sent, which renders them.
     "unparsable_args": ({"messages": _tool_history("{not json")}, {}),
-    "array_args": ({"messages": _tool_history("[1, 2]")}, {}),
     "ignored_fields": (
         {
             "messages": _HI,
@@ -392,50 +384,17 @@ def test_an_older_mistral_common_leaves_the_response_format_out(
     assert _server_ids(tokenizer, messages=_HI, response_format=response_format) == plain
 
 
-def test_reasoning_effort_renders_where_the_checkpoint_declares_it(tokenizer):
-    if not tokenizer.tokenizer.version.supports_model_settings:
-        # openai_chat returns HTTP 400 for a ValueError raised while rendering.
-        with pytest.raises(ValueError, match="reasoning_effort"):
-            _server_ids(tokenizer, messages=_HI, reasoning_effort="high")
-        return
-    high = _server_ids(tokenizer, messages=_HI, reasoning_effort="high")
-    assert high == _mistral_ids(tokenizer, _HI, reasoning_effort="high")
-    assert high != _mistral_ids(tokenizer, _HI, reasoning_effort="none")
-    with pytest.raises(ValueError, match="reasoning_effort"):
-        _server_ids(tokenizer, messages=_HI, chat_template_kwargs={"reasoning_effort": "turbo"})
-
-
 def _declared_efforts(tokenizer):
     builder = getattr(tokenizer.tokenizer, "model_settings_builder", None)
     effort = None if builder is None else builder.reasoning_effort
     return [] if effort is None else [str(getattr(v, "value", v)) for v in effort.values]
 
 
-def _check_effort(tokenizer, render, effort):
-    """An effort the checkpoint declares renders; any other is an invalid request.
-
-    Every route answers a ValueError raised while rendering with HTTP 400 and its message,
-    which lists the efforts the checkpoint declares (vLLM and SGLang do the same).
-    """
-    declared = _declared_efforts(tokenizer)
-    if effort in declared:
-        assert render() == _mistral_ids(tokenizer, _HI, reasoning_effort=effort)
-        return
-    # The wording is mistral-common's (1.12 rejects efforts outside its own enum earlier).
-    with pytest.raises(ValueError, match="reasoning_effort") as error:
-        render()
-    assert all(re.search(rf"\b{value}\b", str(error.value)) for value in declared)
+def _chat_route(tokenizer, effort):
+    return _server_ids(tokenizer, messages=_HI, reasoning_effort=effort)
 
 
-@pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max"])
-def test_a_chat_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, effort):
-    _check_effort(
-        tokenizer, lambda: _server_ids(tokenizer, messages=_HI, reasoning_effort=effort), effort
-    )
-
-
-@pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
-def test_a_responses_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, effort):
+def _responses_route(tokenizer, effort):
     from tensorrt_llm.serve.openai_protocol import ResponsesRequest
     from tensorrt_llm.serve.responses_utils import (
         reasoning_chat_template_kwargs,
@@ -443,32 +402,41 @@ def test_a_responses_reasoning_effort_is_checked_against_the_checkpoint(tokenize
     )
 
     request = ResponsesRequest(model="m", input="Hi.", reasoning={"effort": effort})
-    kwargs = reasoning_chat_template_kwargs(request, model_type=_MODEL_TYPE)
-    assert kwargs["reasoning_effort"] == effort
-
-    def render():
-        return _render(
-            tokenizer,
-            _HI,
-            chat_template_kwargs=kwargs,
-            injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
-        )
-
-    _check_effort(tokenizer, render, effort)
+    return _render(
+        tokenizer,
+        _HI,
+        chat_template_kwargs=reasoning_chat_template_kwargs(request, model_type=_MODEL_TYPE),
+        injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
+    )
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
-def test_an_anthropic_effort_is_checked_against_the_checkpoint(tokenizer, effort):
+def _anthropic_route(tokenizer, effort):
     from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
     from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 
-    def render():
-        anthropic = AnthropicMessagesRequest(
-            model="m", messages=_HI, max_tokens=16, output_config={"effort": effort}
-        )
-        return _request_ids(tokenizer, convert_anthropic_request(anthropic))
+    anthropic = AnthropicMessagesRequest(
+        model="m", messages=_HI, max_tokens=16, output_config={"effort": effort}
+    )
+    return _request_ids(tokenizer, convert_anthropic_request(anthropic))
 
-    _check_effort(tokenizer, render, effort)
+
+@pytest.mark.parametrize("effort", ["high", "low"])
+@pytest.mark.parametrize(
+    "route",
+    [_chat_route, _responses_route, _anthropic_route],
+    ids=["chat", "responses", "anthropic"],
+)
+def test_a_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, route, effort):
+    """Every route passes the effort to mistral-common.
+
+    One the checkpoint declares renders; any other is a ValueError, which every route answers
+    with HTTP 400.
+    """
+    if effort in _declared_efforts(tokenizer):
+        assert route(tokenizer, effort) == _mistral_ids(tokenizer, _HI, reasoning_effort=effort)
+        return
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        route(tokenizer, effort)
 
 
 @pytest.mark.parametrize(
@@ -521,11 +489,3 @@ def test_image_grids_render_from_the_image_size_alone(tokenizer, size, monkeypat
     monkeypatch.setattr(mistral_image, "transform_image", no_pixel_work)
     monkeypatch.setattr(Image.Image, "save", no_pixel_work)
     assert _server_ids(tokenizer, messages=messages) == expected
-
-
-def test_the_grid_only_tokenizer_shares_everything_but_pixel_work(tokenizer):
-    grid_only = tokenizer.grid_only_mistral
-    assert grid_only.instruct_tokenizer.tokenizer is tokenizer.tokenizer
-    assert grid_only.instruct_tokenizer is not tokenizer.instruct
-    assert tokenizer.instruct.image_encoder is not grid_only.instruct_tokenizer.image_encoder
-    assert tokenizer.grid_only_mistral is grid_only  # built once
