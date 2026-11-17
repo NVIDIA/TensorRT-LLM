@@ -63,7 +63,6 @@ full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[in
 full:B300/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto] SKIP (https://nvbugs/7023202)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/7088440)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8] SKIP (https://nvbugs/7099626)
-full:B300/test_unittests.py::test_unittests_v2[unittest/_torch/modeling/test_modeling_apertus.py::TestApertus8BInstruct] SKIP (https://nvbugs/7066385)
 full:CPU/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py::test_every_test_is_in_a_test_list SKIP (https://nvbugs/7082290)
 full:CPU/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py::test_unit_test_directories_mirror_source SKIP (https://nvbugs/7082289)
 full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run_call_in_test_code_must_set_timeout SKIP (https://nvbugs/6929769)
