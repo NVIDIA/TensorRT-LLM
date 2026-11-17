@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Worker for test_kv_pool_rebalance.py: context-side KV pool rebalance under disagg.
+"""Worker for test_disagg_kv_pool_rebalance.py: context-side KV pool rebalance under disagg.
 
 ctx and gen are separate single-rank MPI worlds, as in the cache_transceiver_test
 harness, whose transfer protocol (run_one_request) this reuses. Sequence:

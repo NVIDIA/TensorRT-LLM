@@ -452,8 +452,13 @@ KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 # Wall-clock budget for draining disagg KV sends ahead of a rebalance.  The
 # executor loop is stalled for the drain (no forward runs, so no new send can
 # start), so this bounds the stall; a drain that does not finish in time skips
-# the rebalance, and the auto-tuner asks again on a later check.
+# the rebalance, and the auto-tuner asks again on a later check.  Each pass
+# polls the sends without waiting and then sleeps at most
+# KV_POOL_REBALANCE_DISAGG_POLL_S, capped by the budget left, so the stall
+# overshoots the budget by at most one pass (an allgather and a non-blocking
+# sweep), not by a sender-future timeout.
 KV_POOL_REBALANCE_DISAGG_DRAIN_S = 0.5
+KV_POOL_REBALANCE_DISAGG_POLL_S = 0.005
 
 # A send whose generation peer has not asked for it after this long is waiting
 # on the peer's admission queue, which under load takes seconds; the drain
@@ -7947,12 +7952,18 @@ class PyExecutor:
                     f"flight after {KV_POOL_REBALANCE_DISAGG_DRAIN_S}s. "
                     f"Retrying in {backoff:g}s.")
                 return False
-            self.disagg.reap_context_sends(1)
+            # Non-blocking: reap_context_sends(1) would wait up to
+            # kv_transfer_sender_future_timeout_ms per pending send, far past
+            # the deadline, which is only checked between passes.
+            self.disagg.reap_context_sends(0)
             # Receives (generation side; copy-based rebalancing only, see
             # kv_pool_layout_shared_with_peers): rank-synchronized like the
-            # main loop's call, and every rank makes this pass.
+            # main loop's call, and every rank makes this pass. Non-blocking too.
             self.disagg.poll_gen_transfers()
             self._flush_pending_transfer_responses()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(KV_POOL_REBALANCE_DISAGG_POLL_S, remaining))
 
     def _note_disagg_drain_outcome(self, skipped: bool) -> float:
         """Track consecutive skipped drains; return the back-off now in force.
