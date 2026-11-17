@@ -845,6 +845,7 @@ def test_multirank_native_only_keeps_existing_progress_contract(enable_adp: bool
     executor.async_transfer_manager.has_any_inflight_requests.return_value = True
 
     assert not executor._has_pending_connector_transfers()
+    assert not executor._has_pending_native_sends()
     executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()
 
 

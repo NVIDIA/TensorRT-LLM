@@ -59,7 +59,7 @@ def request():
 def model():
     values = {"model_type": "qwen3_vl"}
     processor = SimpleNamespace(
-        config=SimpleNamespace(to_dict=lambda: values),
+        config=SimpleNamespace(model_type="qwen3_vl", to_dict=lambda: values),
         processor=SimpleNamespace(image_processor=None),
         get_preferred_media_io_kwargs=lambda: {},
         support_mm_disagg=True,
@@ -331,6 +331,18 @@ def test_failed_rebuild_and_discarded_result_reclaim_all_exports(tmp_path, monke
     oe.release_encoder_result(result)
     oe.release_encoder_result(result)
     assert len(released) == 6
+
+
+@pytest.mark.parametrize("role", ["encode", "consume"])
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "nemotron_h", "qwen2_vl", ""])
+def test_encoder_role_requires_a_validated_handoff_processor(role, model_type):
+    llm, _ = model()
+    llm.args = SimpleNamespace(
+        mm_encoder_only=role == "encode", disable_mm_encoder=role == "consume"
+    )
+    llm.input_processor.config.model_type = model_type
+
+    assert oe.encoder_role(llm, object()) == (role if model_type == "qwen3_vl" else "")
 
 
 def test_encoder_role_validation_fails_closed():

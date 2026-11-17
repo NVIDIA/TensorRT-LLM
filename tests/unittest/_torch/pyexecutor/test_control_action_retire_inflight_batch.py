@@ -218,6 +218,21 @@ class TestHandleControlRequest:
         assert ex._control_drain_ready(0) is False
         assert ex._control_drain_transfer_deadline is None
 
+    def test_native_send_does_not_disable_control_drain_deadline(self, cuda_sync):
+        ex = _ControlExecutor(drain=True, transfers=1)
+        ex.async_transfer_manager = SimpleNamespace(has_any_inflight_requests=lambda: True)
+
+        ex._handle_control_request()
+
+        assert ex._control_drain_transfer_deadline is not None
+        assert len(ex.control_requests) == 1
+        ex._control_drain_transfer_deadline = time.monotonic() - 1
+        ex._handle_control_request()
+
+        assert ex.control_requests == []
+        assert ex.order == ["retire", "barrier"]
+        assert cuda_sync == ["cuda_sync"]
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
