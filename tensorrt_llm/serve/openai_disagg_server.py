@@ -325,14 +325,13 @@ class OpenAIDisaggServer:
                                             400)
         self._val_err_n += 1
         if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-            # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
-            brief = [{"loc": e.get("loc"), "type": e.get("type"),
-                      "msg": e.get("msg")} for e in exc.errors()][:8]
+            message, _ = summarize_validation_errors(exc.errors())
+            message = message.translate(_LOG_CONTROL_CHARACTERS)
             method = request.method.translate(_LOG_CONTROL_CHARACTERS)
             path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
             logger.warning(
                 f"[validation] {method} {path} 400 "
-                f"(n={self._val_err_n}): {brief}")
+                f"(n={self._val_err_n}): {message}")
         return JSONResponse(status_code=400,
                             content=validation_error_body(exc.errors()))
 

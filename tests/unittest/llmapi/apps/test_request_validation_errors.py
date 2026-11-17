@@ -31,13 +31,17 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import TypeAdapter, ValidationError
 
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve.anthropic_protocol import AnthropicThinkingConfig
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     TOOL_PARAM_MAX_ENUM_VALUES,
+    ChatCompletionRequest,
     summarize_validation_errors,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -47,6 +51,13 @@ pytestmark = pytest.mark.cpu_only
 MODEL = "test-model"
 # Long enough that an echo of it could not pass unnoticed.
 PAYLOAD = "QUJD" * 50_000
+_VALUE_CANARIES = ("CLIENTSTART", "CLIENTMID", "CLIENTEND")
+
+
+def _rejected_value(size: int = 200_000) -> str:
+    start, middle, end = _VALUE_CANARIES
+    padding = size - len(start + middle + end)
+    return start + "Q" * (padding // 2) + middle + "Q" * (padding - padding // 2) + end
 
 
 def _chat_body(**extra):
@@ -232,6 +243,117 @@ def test_a_literal_no_union_member_accepts_is_named_once():
     )
 
 
+@pytest.mark.parametrize("field", ["thinking", "lora_request"])
+@pytest.mark.parametrize("size", [32, 200_000])
+def test_rejected_discriminator_and_lora_values_are_not_quoted(field: str, size: int) -> None:
+    value = _rejected_value(size)
+    if field == "thinking":
+        annotation = AnthropicThinkingConfig
+        invalid = {"type": value}
+    else:
+        annotation = LoRARequest
+        invalid = {"lora_name": "adapter", "lora_int_id": 1, "lora_ckpt_source": value}
+    with pytest.raises(ValidationError) as raised:
+        TypeAdapter(annotation).validate_python(invalid)
+    errors = [{**e, "loc": ("body", field, *e["loc"])} for e in raised.value.errors()]
+    message, param = summarize_validation_errors(errors)
+    message_size = len(message)
+    quotes_value = any(canary in message for canary in _VALUE_CANARIES)
+    assert message_size <= 256
+    assert not quotes_value
+    assert param == field
+    if field == "thinking":
+        assert "'enabled'" in message
+        assert "'adaptive'" in message
+        assert "'disabled'" in message
+
+
+def test_bare_literal_alternative_does_not_hide_tool_choice_type() -> None:
+    annotation = ChatCompletionRequest.model_fields["tool_choice"].annotation
+    with pytest.raises(ValidationError) as raised:
+        TypeAdapter(annotation).validate_python({"type": "invalid", "function": {"name": "f"}})
+    errors = [{**e, "loc": ("body", "tool_choice", *e["loc"])} for e in raised.value.errors()]
+    message, _ = summarize_validation_errors(errors)
+    assert "tool_choice.type" in message
+    assert "'function'" in message
+
+
+def test_non_discriminator_literal_does_not_discard_tool_choice_mode() -> None:
+    errors = [
+        {
+            "type": "literal_error",
+            "loc": ("body", "tool_choice", "literal['none','auto','required']"),
+            "msg": "literal",
+        },
+        {
+            "type": "literal_error",
+            "loc": ("body", "tool_choice", "ToolChoiceAllowed", "mode"),
+            "msg": "mode",
+        },
+        {
+            "type": "literal_error",
+            "loc": ("body", "tool_choice", "ToolChoiceFunction", "type"),
+            "msg": "type",
+        },
+    ]
+    assert summarize_validation_errors(errors) == (
+        "Invalid value for 'tool_choice.mode': mode.",
+        "tool_choice.mode",
+    )
+
+
+@pytest.mark.parametrize("kind", ["value_error", "json_invalid"])
+def test_validation_error_messages_have_per_error_and_joined_caps(kind: str) -> None:
+    errors = [
+        {"type": kind, "loc": ("body", f"field{i}"), "msg": PAYLOAD, "ctx": {"error": PAYLOAD}}
+        for i in range(20)
+    ]
+    single, _ = summarize_validation_errors(errors[:1])
+    joined, _ = summarize_validation_errors(errors)
+    single_size, joined_size = len(single), len(joined)
+    assert single_size <= 256
+    assert joined_size <= 4096
+
+
+@pytest.mark.parametrize("server_fixture", ["client", "disagg"])
+@pytest.mark.parametrize("field", ["thinking", "lora_request", "response_format"])
+def test_large_rejected_values_are_bounded_at_the_http_boundary(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    server_fixture: str,
+    field: str,
+) -> None:
+    server = request.getfixturevalue(server_fixture)
+    http: TestClient = server if server_fixture == "client" else server.client
+    warning = Mock()
+    monkeypatch.setattr(openai_disagg_server.logger, "warning", warning)
+    value = _rejected_value()
+    if field == "thinking":
+        path = "/v1/messages"
+        body = {**_chat_body(), "max_tokens": 16, "thinking": {"type": value}}
+    else:
+        path = "/v1/chat/completions"
+        invalid = (
+            {"lora_name": "adapter", "lora_int_id": 1, "lora_ckpt_source": value}
+            if field == "lora_request"
+            else {"type": "structural_tag", "format": {"type": value}}
+        )
+        body = _chat_body(**{field: invalid})
+    response = http.post(path, json=body)
+    assert response.status_code == 400
+    body_size = len(response.content)
+    quotes_value = any(canary in response.text for canary in _VALUE_CANARIES)
+    assert body_size < 1024
+    assert not quotes_value
+    if server_fixture == "disagg" and field != "thinking":
+        warning.assert_called_once()
+        logged = warning.call_args.args[0]
+        log_size = len(logged)
+        quotes_value_in_log = any(canary in logged for canary in _VALUE_CANARIES)
+        assert log_size < 4608
+        assert not quotes_value_in_log
+
+
 def test_many_errors_are_counted_not_listed(client):
     extra = {f"field{i:02d}": i for i in range(25)}
     error = _error(client.post("/v1/chat/completions", json=_chat_body(**extra)))
@@ -309,6 +431,18 @@ def test_disaggregated_server_answers_with_the_same_envelope(disagg):
     assert PAYLOAD[:64] not in response.text
     disagg.service.openai_chat_completion.assert_not_called()
     disagg.server._perf_metrics_collector.validation_exceptions.inc.assert_called_once()
+
+
+def test_disaggregated_validation_log_escapes_control_characters(
+    disagg: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warning = Mock()
+    monkeypatch.setattr(openai_disagg_server.logger, "warning", warning)
+    _error(disagg.client.post("/v1/chat/completions", json=_chat_body(**{"field\n\x1b": 1})))
+    warning.assert_called_once()
+    logged = warning.call_args.args[0]
+    has_controls = any(ord(char) < 32 or ord(char) == 127 for char in logged)
+    assert not has_controls
 
 
 def test_disaggregated_server_names_a_missing_body(disagg):

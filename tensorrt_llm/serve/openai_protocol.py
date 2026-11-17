@@ -387,6 +387,8 @@ class ErrorResponse(OpenAIBaseModel):
 # A longer location segment, such as an unknown field name, is cut short so
 # the error cannot echo an arbitrarily long name back.
 _MAX_LOCATION_SEGMENT_CHARS = 64
+_MAX_VALIDATION_ERROR_CHARS = 256
+_MAX_VALIDATION_MESSAGE_CHARS = 4096
 
 # Schema names pydantic tags a scalar union member with.
 _SCALAR_MEMBER_TAGS = frozenset(
@@ -429,10 +431,10 @@ def _matched_union_member_errors(
         errors: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
     """The errors left once each union keeps only the members its value chose.
 
-    A union reports every member's errors. A member whose literal field (a
-    message's "role", a content part's "type") rejected the value was not
-    the one the value was written for, so when other members accepted that
-    literal, the rejected members' errors are dropped.
+    A union reports every member's errors. Only a rejected role/type tag or
+    a wrong member type rules out a member, not other literal fields such as
+    tool-choice "mode". Bare literal alternatives can reject the value too;
+    keep every diagnostic when all members reject it.
     """
     members_by_union: Dict[tuple, Dict[str, List[int]]] = {}
     for index, error in enumerate(errors):
@@ -445,8 +447,13 @@ def _matched_union_member_errors(
         rejected = {
             tag
             for tag, indices in members.items()
-            if any(errors[i].get("type") == "literal_error"
-                   and len(errors[i].get("loc", ())) == len(prefix) + 2
+            if any((len(errors[i].get("loc", ())) == len(prefix) +
+                    1 and errors[i].get("type") in {
+                        "literal_error", "model_type", "model_attributes_type",
+                        "dict_type", "list_type", "string_type"
+                    }) or (errors[i].get("type") == "literal_error"
+                           and len(errors[i].get("loc", ())) == len(prefix) +
+                           2 and errors[i]["loc"][-1] in ("role", "type"))
                    for i in indices)
         }
         if rejected and len(rejected) < len(members):
@@ -473,13 +480,13 @@ def _error_location(error: Mapping[str, Any]) -> str:
 
 def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
                                 limit: int = 20) -> Tuple[str, Optional[str]]:
-    """Describe why a request body failed validation, without quoting it.
+    """Describe HTTP-boundary validation errors with bounded messages.
 
     Each error is named by its place in the body, worded the way OpenAI words
     the same rejection: "Unknown parameter: 'store'.", "Missing required
     parameter: 'messages'.", "Invalid value for 'messages.0.content': ...".
-    The offending value is never quoted. The client already has it, and a
-    rejected inline image would make the message megabytes long.
+    Input dumps and rejected discriminator tags are omitted. Custom validator
+    messages must not contain rejected values either.
 
     Args:
         errors: ``RequestValidationError.errors()`` of the rejected request.
@@ -510,6 +517,14 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
                 "msg", "")
             description = f"The request body is not valid JSON: {reason}."
             location = ""
+        elif error_type == "union_tag_invalid":
+            # Pydantic's msg includes the rejected tag; these are schema text.
+            context = error.get("ctx") or {}
+            expected = context.get("expected_tags", "a valid tag")
+            discriminator = context.get("discriminator", "the discriminator")
+            description = (
+                f"Invalid value for '{location}': expected {expected} "
+                f"for {discriminator}.")
         elif error_type == "extra_forbidden":
             description = f"Unknown parameter: '{location}'."
         elif error_type == "missing":
@@ -524,10 +539,11 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
         if index == 0:
             param = location or None
         if index < limit:
-            parts.append(description)
+            parts.append(description[:_MAX_VALIDATION_ERROR_CHARS])
     if len(described) > limit:
         parts.append(f"({len(described) - limit} more errors not shown.)")
-    return " ".join(parts) or "The request body is invalid.", param
+    message = " ".join(parts) or "The request body is invalid."
+    return message[:_MAX_VALIDATION_MESSAGE_CHARS], param
 
 
 def validation_error_body(
