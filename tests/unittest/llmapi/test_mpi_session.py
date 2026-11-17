@@ -301,7 +301,9 @@ def flashinfer_environment_probe():
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
-def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
+@pytest.mark.parametrize("pool_sizes", [(2, ), (1, 1)])
+def test_mpi_pool_session_flashinfer_workspace_isolation(
+        monkeypatch: pytest.MonkeyPatch, pool_sizes: tuple[int, ...]) -> None:
     # A singleton spawn reuses OpenMPI's already-running DVM once one exists in
     # this process, so a spawned worker's HOME can't be relied on to follow a
     # monkeypatched HOME set here; compare against the real home directory
@@ -309,9 +311,19 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", raising=False)
+    monkeypatch.delenv("TRTLLM_CACHE_DIR", raising=False)
 
-    with _pool_session(n_workers=2, wait_shutdown=True) as session:
-        worker_envs = _submit_sync(session, flashinfer_environment_probe)
+    with contextlib.ExitStack() as stack:
+        sessions = [
+            stack.enter_context(
+                _pool_session(n_workers=pool_size, wait_shutdown=True))
+            for pool_size in pool_sizes
+        ]
+        worker_envs = [
+            worker_env for session in sessions for worker_env in _submit_sync(
+                session, flashinfer_environment_probe)
+        ]
 
     workspaces = {workspace for workspace, _ in worker_envs}
     cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
@@ -637,8 +649,7 @@ def test_split_mpi_env():
 @pytest.mark.parametrize(
     "task_script", ["_run_mpi_comm_task.py", "_run_multi_mpi_comm_tasks.py"])
 def test_llmapi_launch_multiple_tasks(task_script: str):
-    """
-    Test that the trtllm-llmapi-launch can run multiple tasks.
+    """Test that the trtllm-llmapi-launch can run multiple tasks.
     """
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     test_file = os.path.join(cur_dir, task_script)
