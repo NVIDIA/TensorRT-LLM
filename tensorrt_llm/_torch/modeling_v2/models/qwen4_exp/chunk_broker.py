@@ -76,7 +76,9 @@ class OwnedSegment:
         except OSError:
             pass
         self._server.close()
-        for thread in [self._thread, *self._answers]:
+        # `_serve` alone starts answers: once it has returned, the list of answers is final.
+        self._thread.join(_POLL_SECONDS * 5)
+        for thread in self._answers:
             thread.join(_POLL_SECONDS * 5)
 
     def _serve(self) -> None:
