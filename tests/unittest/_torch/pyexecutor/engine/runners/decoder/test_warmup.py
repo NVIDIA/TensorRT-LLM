@@ -44,10 +44,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
-    DecoderWarmup,
-    WarmupAgreement,
-)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
@@ -738,7 +735,7 @@ def test_autotuner_warmup_hands_pp_cache_off_before_waiting_on_gpu(
     warmup = decoder_warmup(
         decoder_config(),
         mapping=mapping,
-        agreement=WarmupAgreement(peer_dist, mapping),
+        agreement=decoder_warmup_module.WarmupAgreement(peer_dist, mapping),
         dummy_requests=requests,
         forward_warmup=Mock(side_effect=lambda *args, **kwargs: events.append("forward")),
     )
