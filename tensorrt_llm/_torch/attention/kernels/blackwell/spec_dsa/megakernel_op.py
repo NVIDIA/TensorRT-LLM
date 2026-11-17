@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSeek-V4-Flash decode sparse attention for 1 to 48 rows on B200 (SM100, 148 SMs): the megakernel.
+"""specDSA megakernel, host side: fused DeepSeek-V4-Flash decode for 1 to 48 rows on B200 (SM100, 148 SMs).
 
 One cooperative launch streams each row's FP8 indexer K cache once, computes the indexer logits, selects the exact
 top-512 compressed positions (sampled threshold with a count certificate and exact fallbacks), maps them to
@@ -55,7 +55,7 @@ __all__ = [
     "MAX_CTX_LEN",
     "MIN_CTX_LEN",
     "SUPPORTED_BATCH_SIZES",
-    "Dsv4SparseDecodeState",
+    "SpecDsaMegakernelState",
     "error_bits",
     "is_supported",
     "precompile",
@@ -134,9 +134,9 @@ _engines: dict[tuple[int, int], dict] = {}
 
 
 def _kernel_modules() -> tuple:
-    from . import cache_policy, megakernel, row_desc
+    from . import megakernel, megakernel_lib
 
-    return cache_policy, megakernel, row_desc
+    return megakernel_lib, megakernel
 
 
 def is_supported(device: torch.device | None = None) -> tuple[bool, str]:
@@ -170,10 +170,10 @@ def _engine(device: torch.device, batch_size: int) -> dict:
     key = (_device_index(device), batch_size)
     with _lock:
         if key not in _engines:
-            cp, mk, _ = _kernel_modules()
-            kernel = mk.Dsv4SparseDecodeKernel(
+            lib, mk = _kernel_modules()
+            kernel = mk.SpecDsaMegakernel(
                 num_sms=NUM_SMS,
-                policy=cp.POL_EVICT_FIRST if batch_size > 1 else cp.POL_NONE,
+                policy=lib.POL_EVICT_FIRST if batch_size > 1 else lib.POL_NONE,
                 full_attention_tiles=True,
                 nrows=batch_size,
                 **_BASE,
@@ -202,22 +202,22 @@ def precompile(device: torch.device, batch_size: int) -> None:
     Must run outside CUDA-graph capture. ``run`` compiles on first use otherwise.
     """
     e = _engine(device, batch_size)
-    _, mk, rd = _kernel_modules()
+    _, mk = _kernel_modules()
     with _lock:
         if e["fn"] is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "dsv4_sparse_decode: compile the kernel (precompile) before CUDA-graph capture"
+                    "spec_dsa: compile the kernel (precompile) before CUDA-graph capture"
                 )
             e["fn"] = mk.compile_mk(e["kernel"])
         kernel = e["kernel"]
         for r in range(batch_size):
             rot, zlast, zc = _desc_params(kernel, batch_size, r)
-            rd.compile_desc(NUM_SMS, kernel.ns, rot, zlast, zc)
+            mk.compile_desc(NUM_SMS, kernel.ns, rot, zlast, zc)
 
 
 @dataclass
-class Dsv4SparseDecodeState:
+class SpecDsaMegakernelState:
     """Per-step metadata and workspace of one caller; see ``prepare``.
 
     ``ws64`` holds ``WS_WORDS`` int64 words per row (generation counter, error words, selection directives), ``hist``,
@@ -250,8 +250,8 @@ def prepare(
     ctx_lens: torch.Tensor,
     kv_lens: torch.Tensor,
     idx_block_table: torch.Tensor,
-    state: Dsv4SparseDecodeState | None = None,
-) -> Dsv4SparseDecodeState:
+    state: SpecDsaMegakernelState | None = None,
+) -> SpecDsaMegakernelState:
     """Build (or refresh in place) the per-step state for ``B = ctx_lens.numel()`` rows.
 
     Args:
@@ -286,11 +286,11 @@ def prepare(
         )
     if state is not None and state.batch_size != batch_size:
         raise ValueError(f"state is for {state.batch_size} rows, got {batch_size}")
-    _, mk, rd = _kernel_modules()
+    _, mk = _kernel_modules()
     kernel = _engine(device, batch_size)["kernel"]
     rsz = kernel.row_sizes()
     if state is None:
-        state = Dsv4SparseDecodeState(
+        state = SpecDsaMegakernelState(
             batch_size=batch_size,
             desc=torch.zeros(batch_size * rsz["desc"], dtype=torch.int32, device=device),
             swa_local=torch.empty((batch_size, WINDOW), dtype=torch.int32, device=device),
@@ -324,7 +324,7 @@ def prepare(
     with _lock:  # the descriptor kernels compile on first use
         for r in range(batch_size):
             rot, zlast, zc = _desc_params(kernel, batch_size, r)
-            rd.build_desc_device(
+            mk.build_desc_device(
                 ctx[r : r + 1],
                 bt[r : r + 1],
                 state.desc[r * rsz["desc"] : (r + 1) * rsz["desc"]],
@@ -337,12 +337,12 @@ def prepare(
     return state
 
 
-def error_bits(state: Dsv4SparseDecodeState) -> torch.Tensor:
+def error_bits(state: SpecDsaMegakernelState) -> torch.Tensor:
     """Per-row error bits (``ERR_*``) accumulated over the launches of ``state``: an int64 [B] device view, no sync.
 
     Zero means every launch so far completed normally. The bits are sticky; a fresh state starts at zero.
     """
-    _, mk, _ = _kernel_modules()
+    _, mk = _kernel_modules()
     return state.ws64.view(state.batch_size, mk.WS_WORDS)[:, mk.W_ERRB]
 
 
@@ -364,7 +364,7 @@ def _check_numel(name: str, t: torch.Tensor, numel: int, dtype: torch.dtype | No
 
 
 def run(
-    state: Dsv4SparseDecodeState,
+    state: SpecDsaMegakernelState,
     q_idx: torch.Tensor,
     w_idx: torch.Tensor,
     k_cache: torch.Tensor,

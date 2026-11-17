@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V4-Flash large-batch fused sparse decode kernels (CuTe DSL, SM100) against an fp64 reference of the chain.
+"""specDSA large-batch kernels (CuTe DSL, SM100) against an fp64 reference of the DeepSeek-V4-Flash decode chain.
 
 A batch is built from a few distinct base rows (own queries, indexer K pages, compressed KV rows, length); row ``b``
 uses base ``b % len(bases)`` and its own window pages and attention query, so a 1,024-row batch needs the memory of
@@ -61,7 +61,7 @@ LENGTHS = [
 
 
 def _op():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode.large_batch import op
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import large_batch_op as op
 
     return op
 

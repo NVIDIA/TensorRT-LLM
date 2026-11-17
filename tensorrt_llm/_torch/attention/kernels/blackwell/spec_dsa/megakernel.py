@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused DeepSeek-V4-Flash decode kernel (CuTe DSL, SM100): the cooperative launch, the indexer-K stream, the sampled
-threshold, candidate publication and the teams' exact top-512 selection, plus the host entry points
-``Dsv4SparseDecodeKernel`` and ``compile_mk`` used by ``op.py``.
+"""specDSA megakernel (CuTe DSL, SM100): the cooperative launch, the indexer-K stream, the sampled threshold,
+candidate publication and the teams' exact top-512 selection, with the row split descriptors, the selection entry points
+and the host entry points ``SpecDsaMegakernel`` and ``compile_mk`` used by ``megakernel_op.py``.
 """
 
 from __future__ import annotations
@@ -16,26 +16,597 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cudax
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from . import attention_roles as A
-from . import cache_policy as CP
-from . import ptx_helpers as B
-from . import row_desc as D
-from . import topk_select as S
-from . import topk_select_lib as L
+from . import megakernel_attention as A
+from . import megakernel_lib as L
 
-_RND_RN = "rn"
-NEG_INF = -math.inf
+# ====================================================================================================================
+# Per-row split descriptors (which stream CTA streams which 256-position splits and pages of a row), built on the
+# device by ``build_desc_device``.
+# ====================================================================================================================
+
 K_TOP = 512
 SPLIT_TOK = 256
 TILE = 128
-MAXS = D.MAXS
-N_MAX = D.N_MAX
+MAXS = 8
+N_MAX = 1 << 18
+PLAN = dict(aim_base=1024, sfac=16, amin=1792, sd_en=0, r_const=64, scap=8192)
+DESC_WORDS = 32
+MAGIC = 20912
+
+
+@cute.jit
+def _or_reduce(v):
+    return Int32(cute.arch.warp_redux_sync(v, "or"))
+
+
+@cute.kernel
+def _desc_kernel(
+    mCtx: cute.Tensor,
+    mBt: cute.Tensor,
+    mDesc: cute.Tensor,
+    ns_ctas: cutlass.Constexpr[int],
+    rot: cutlass.Constexpr[int] = 0,
+    zlast: cutlass.Constexpr[bool] = False,
+    zc: cutlass.Constexpr[int] = -1,
+):
+    c, _, _ = cute.arch.block_idx()
+    lane, _, _ = cute.arch.thread_idx()
+    out = Int32(0)
+    if c < Int32(ns_ctas):
+        n = mCtx[0]
+        bt_cols = cute.size(mBt, mode=[1])
+        n_ok = n
+        if n < Int32(0) or n > Int32(N_MAX):
+            n_ok = Int32(0)
+        nsplit = (n_ok + Int32(SPLIT_TOK - 1)) // Int32(SPLIT_TOK)
+        # this row's range is the one of virtual CTA (c + rot) mod ns_ctas
+        cv = (c + Int32(rot)) % Int32(ns_ctas)
+        s0 = cv * nsplit // Int32(ns_ctas)
+        s1 = (cv + Int32(1)) * nsplit // Int32(ns_ctas)
+        if cutlass.const_expr(zc >= 0):
+            # ranges over ns_ctas - 1 CTAs; CTA zc gets an empty range
+            cz_ = c
+            if c > Int32(zc):
+                cz_ = c - Int32(1)
+            s0 = cz_ * nsplit // Int32(ns_ctas - 1)
+            s1 = (cz_ + Int32(1)) * nsplit // Int32(ns_ctas - 1)
+            if c == Int32(zc):
+                s0 = nsplit
+                s1 = nsplit
+        if cutlass.const_expr(zlast):
+            # ranges over ns_ctas - 1 CTAs; CTA ns_ctas - 1 (the early T server) gets an empty range
+            s0 = c * nsplit // Int32(ns_ctas - 1)
+            s1 = (c + Int32(1)) * nsplit // Int32(ns_ctas - 1)
+            if c == Int32(ns_ctas - 1):
+                s0 = nsplit
+                s1 = nsplit
+        ns = s1 - s0
+        ntile = (n_ok + Int32(TILE - 1)) // Int32(TILE)
+        SMP, SS2, TGT, TGT2 = L.gvr_ladder(
+            n_ok,
+            Int32(K_TOP),
+            Int32(PLAN["aim_base"]),
+            Int32(PLAN["sfac"]),
+            Int32(PLAN["amin"]),
+            Int32(PLAN["sd_en"]),
+            PLAN["r_const"],
+            PLAN["scap"],
+        )
+        wst = Int32(8) * SS2
+        t = lane
+        gt = Int32(2) * s0 + t
+        inchunk = t < Int32(2) * ns
+        valid = inchunk and gt < ntile
+        j0 = (Int32(TILE) * gt + wst - Int32(1)) // wst
+        win = valid and j0 < SMP and (j0 * wst < Int32(TILE) * (gt + Int32(1)))
+        lm = Int32(cute.arch.lanemask_lt())
+        bw = Int32(cute.arch.vote_ballot_sync(win))
+        bv = Int32(cute.arch.vote_ballot_sync(valid and (not win)))
+        bi = Int32(cute.arch.vote_ballot_sync(inchunk and (not valid)))
+        nW = Int32(cute.arch.popc(bw))
+        m = Int32(cute.arch.popc(bv))
+        nv_ = Int32(cute.arch.popc(bw | bv))
+        pos = Int32(0)
+        if win:
+            pos = Int32(cute.arch.popc(bw & lm))
+        elif valid:
+            r = m - Int32(1) - Int32(cute.arch.popc(bv & lm))
+            k = r % Int32(4)
+            base = Int32(0)
+            for kk in cutlass.range_constexpr(3):
+                ck = (m - Int32(kk) + Int32(3)) // Int32(4)
+                if Int32(kk) < k:
+                    base = base + ck
+            pos = nW + base + r // Int32(4)
+        else:
+            pos = nW + m + Int32(cute.arch.popc(bi & lm))
+        g = pos % Int32(2)
+        ti = pos // Int32(2)
+        o0 = Int32(0)
+        o1 = Int32(0)
+        if inchunk:
+            if g == Int32(0):
+                o0 = t << Int32(4) * ti
+            else:
+                o1 = t << Int32(4) * ti
+        ord0 = _or_reduce(o0)
+        ord1 = _or_reduce(o1)
+        wl = lane - Int32(8)
+        task = wl // Int32(8)
+        grp = wl % Int32(8) // Int32(4)
+        kp = wl % Int32(4)
+        tsel = Int32(0)
+        if grp == Int32(0):
+            tsel = ord0 >> Int32(4) * task & Int32(15)
+        else:
+            tsel = ord1 >> Int32(4) * task & Int32(15)
+        gts = Int32(2) * s0 + tsel
+        pg = Int32(4) * gts + kp
+        page = Int32(0)
+        if lane >= Int32(8):
+            if task < ns:
+                if gts < ntile:
+                    if pg < bt_cols:
+                        page = mBt[0, pg]
+        if lane == Int32(0):
+            out = s0
+        elif lane == Int32(1):
+            out = ns
+        elif lane == Int32(2):
+            out = n
+        elif lane == Int32(3):
+            out = ord0
+        elif lane == Int32(4):
+            out = ord1
+        elif lane == Int32(5):
+            out = nW
+        elif lane == Int32(6):
+            out = nv_
+        elif lane == Int32(7):
+            out = Int32(MAGIC) | Int32(ns_ctas << 16)
+        else:
+            out = page
+    mDesc[c * Int32(DESC_WORDS) + lane] = out
+
+
+@cute.jit
+def _launch_desc(
+    ctx: cute.Tensor,
+    bt: cute.Tensor,
+    desc: cute.Tensor,
+    num_sms: cutlass.Constexpr[int],
+    ns_ctas: cutlass.Constexpr[int],
+    rot: cutlass.Constexpr[int],
+    zlast: cutlass.Constexpr[bool],
+    zc: cutlass.Constexpr[int],
+    stream: cuda_driver.CUstream,
+):
+    _desc_kernel(ctx, bt, desc, ns_ctas, rot, zlast, zc).launch(
+        grid=(num_sms, 1, 1), block=[32, 1, 1], stream=stream
+    )
+
+
+_COMPILED_DESC = {}
+
+
+def compile_desc(num_sms: int, ns_ctas: int, rot: int = 0, zlast: bool = False, zc: int = -1):
+    key = (num_sms, ns_ctas, rot, zlast, zc)
+    if key not in _COMPILED_DESC:
+        rt = cute.runtime
+        s = cute.sym_int
+        fk = [
+            rt.make_fake_compact_tensor(cutlass.Int32, (1,), stride_order=(0,)),
+            rt.make_fake_compact_tensor(cutlass.Int32, (1, s()), stride_order=(1, 0)),
+            rt.make_fake_compact_tensor(cutlass.Int32, (s(),), stride_order=(0,)),
+        ]
+        _COMPILED_DESC[key] = cute.compile(
+            _launch_desc,
+            *fk,
+            num_sms,
+            ns_ctas,
+            rot,
+            zlast,
+            zc,
+            rt.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    return _COMPILED_DESC[key]
+
+
+def build_desc_device(
+    ctx_lens: torch.Tensor,
+    bt_row: torch.Tensor,
+    desc: torch.Tensor,
+    num_sms: int,
+    ns_ctas: int,
+    rot: int = 0,
+    zlast: bool = False,
+    zc: int = -1,
+):
+    """Write one row's split descriptor into ``desc`` on the device from its compressed length and indexer
+    block-table row.
+    """
+    assert desc.numel() >= num_sms * DESC_WORDS and desc.dtype == torch.int32
+    compile_desc(num_sms, ns_ctas, rot % ns_ctas, bool(zlast), int(zc))(ctx_lens[0:1], bt_row, desc)
+
+
+def build_desc_host(
+    n: int, bt_row: torch.Tensor, ns_ctas: int, num_sms: int, smp: int, ss2: int
+) -> torch.Tensor:
+    n_ok = n if 0 <= n <= N_MAX else 0
+    nsplit = (n_ok + SPLIT_TOK - 1) // SPLIT_TOK
+    ntile = (n_ok + TILE - 1) // TILE
+    wst = 8 * ss2
+    bt = bt_row.reshape(-1).cpu().tolist()
+    d = torch.zeros((num_sms, DESC_WORDS), dtype=torch.int64)
+    for c in range(ns_ctas):
+        s0 = c * nsplit // ns_ctas
+        ns = (c + 1) * nsplit // ns_ctas - s0
+        tiles = list(range(2 * ns))
+        valid = [2 * s0 + t < ntile for t in tiles]
+        win = []
+        for t in tiles:
+            gt = 2 * s0 + t
+            j0 = (TILE * gt + wst - 1) // wst
+            win.append(valid[t] and j0 < smp and (j0 * wst < TILE * (gt + 1)))
+        W = [t for t in tiles if win[t]]
+        R = [t for t in tiles if valid[t] and (not win[t])][::-1]
+        R = [x for k in range(4) for x in R[k::4]]
+        Inv = [t for t in tiles if not valid[t]]
+        order = W + R + Inv
+        o = [0, 0]
+        for p, t in enumerate(order):
+            o[p % 2] |= t << 4 * (p // 2)
+        d[c, 0:8] = torch.tensor(
+            [s0, ns, n, o[0], o[1], len(W), len(W) + len(R), MAGIC | ns_ctas << 16]
+        )
+        for task in range(3):
+            for g in range(2):
+                p = 2 * task + g
+                if task < ns and p < len(order):
+                    t = order[p]
+                    gt = 2 * s0 + t
+                    for k in range(4):
+                        pg = 4 * gt + k
+                        d[c, 8 + 8 * task + 4 * g + k] = (
+                            bt[pg] if gt < ntile and pg < len(bt) else 0
+                        )
+    d = d.to(torch.int64)
+    d = torch.where(d >= 2**31, d - 2**32, d)
+    return d.to(torch.int32).view(-1)
+
+
+# ====================================================================================================================
+# Selection constants and the bin scale of the threshold band.
+# ====================================================================================================================
+
+NB_SEL = L.NB_SEL
+QUADC = L.QUADC
+NBS = L.NBS
+
+
+@cute.jit
+def bin_scale(lo: Float32, hi: Float32):
+    wv = (hi - lo) * Float32(1.0 / NB_SEL)
+    sc = Float32(0.0)
+    if wv > Float32(0.0):
+        if wv < Float32(3e38):
+            sc = cute.arch.rcp_approx(wv)
+    return sc
+
+
+@cute.jit
+def _pst(prof, slot, tid):
+    if cutlass.const_expr(prof is not None):
+        if tid == Int32(0):
+            cutlass.inttoptr(
+                prof + cutlass.Int64(slot) * cutlass.Int64(8), mem_space=1, dtype=cutlass.Int64
+            ).store(cutlass.Int64(L.gtimer()))
+
+
+@cute.jit
+def select_slots(
+    lst,
+    C,
+    K,
+    out_s,
+    s_hist,
+    s_ck,
+    s_cs,
+    s_res,
+    s_red,
+    s_wc,
+    tid,
+    nthr: cutlass.Constexpr,
+    bar_id: cutlass.Constexpr,
+    rng_lo,
+    rng_hi,
+    hist_ready,
+    prof=None,
+):
+    NW = nthr // 32
+    lane = tid & Int32(31)
+    wid = tid >> Int32(5)
+    lm = Int32(cute.arch.lanemask_lt())
+    nout = C
+    if nout > K:
+        nout = K
+    mret = Int32(0)
+    info = Int32(0)
+    Bret = Int32(-1)
+    if C <= K:
+        i = tid
+        while i < C:
+            out_s[i] = i
+            i = i + Int32(nthr)
+        if tid < Int32(NB_SEL):
+            for z_ in cutlass.range_constexpr(NB_SEL // nthr if NB_SEL >= nthr else 1):
+                s_hist[tid + Int32(z_ * nthr)] = Int32(0)
+        L.bar(bar_id, nthr)
+    else:
+        lo = rng_lo
+        hi = rng_hi
+        sc = bin_scale(lo, hi)
+        if hist_ready == Int32(0):
+            for z_ in cutlass.range_constexpr(NB_SEL // nthr if NB_SEL >= nthr else 1):
+                if tid + Int32(z_ * nthr) < Int32(NB_SEL):
+                    s_hist[tid + Int32(z_ * nthr)] = Int32(0)
+            L.bar(bar_id, nthr)
+            i4 = (tid >> Int32(5)) * Int32(128) + lane
+            while i4 < C:
+                bq_ = [Int32(0)] * 4
+                for q in cutlass.range_constexpr(4):
+                    icl = i4 + Int32(32 * q)
+                    if icl > C - Int32(1):
+                        icl = C - Int32(1)
+                    bq_[q] = L._vbin(Uint64(lst[icl]), lo, sc, NB_SEL)
+                for q in cutlass.range_constexpr(4):
+                    if i4 + Int32(32 * q) < C:
+                        cute.arch.red(
+                            s_hist.iterator + bq_[q],
+                            Int32(1),
+                            op="add",
+                            dtype=Int32,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                i4 = i4 + Int32(nthr * 4)
+        L.bar(bar_id, nthr)
+        _pst(prof, 58, tid)
+        L.find_cross(s_hist, K, tid, s_res, NB_SEL)
+        L.bar(bar_id, nthr)
+        _pst(prof, 59, tid)
+        Bb = s_res[L.RES_B]
+        above = s_res[L.RES_ABOVE]
+        m = s_res[L.RES_M]
+        Bret = Bb
+        need = K - above
+        mret = m
+        whole = Int32(0)
+        if need >= m:
+            whole = Int32(1)
+        keepc = Int32(0)
+        if whole == Int32(0):
+            if m <= Int32(QUADC):
+                keepc = Int32(1)
+        Bw = Bb
+        if whole != Int32(0):
+            Bw = Bb - Int32(1)
+        for z_ in cutlass.range_constexpr(NB_SEL // nthr if NB_SEL >= nthr else 1):
+            if tid + Int32(z_ * nthr) < Int32(NB_SEL):
+                s_hist[tid + Int32(z_ * nthr)] = Int32(0)
+        chunk = (C + Int32(nthr * 4) - Int32(1)) // Int32(nthr * 4) * Int32(128)
+        c0 = wid * chunk
+        c1 = c0 + chunk
+        if c1 > C:
+            c1 = C
+        cw = Int32(0)
+        cc = Int32(0)
+        i4 = c0 + lane
+        while i4 < c1:
+            for q in cutlass.range_constexpr(4):
+                icl = i4 + Int32(32 * q)
+                if icl > C - Int32(1):
+                    icl = C - Int32(1)
+                bb = L._vbin(Uint64(lst[icl]), lo, sc, NB_SEL)
+                if i4 + Int32(32 * q) < c1:
+                    if bb > Bw:
+                        cw = cw + Int32(1)
+                    elif bb == Bb:
+                        cc = cc + Int32(1)
+            i4 = i4 + Int32(128)
+        wcw = Int32(cute.arch.warp_redux_sync(cw, "add"))
+        wcc = Int32(cute.arch.warp_redux_sync(cc, "add"))
+        if lane == Int32(0):
+            s_wc[wid] = wcw
+            s_wc[Int32(NW) + wid] = wcc
+        L.bar(bar_id, nthr)
+        _pst(prof, 60, tid)
+        pw = Int32(0)
+        pc = Int32(0)
+        for w_ in cutlass.range_constexpr(NW):
+            if Int32(w_) < wid:
+                pw = pw + Int32(s_wc[w_])
+                pc = pc + Int32(s_wc[NW + w_])
+        base0 = c0
+        while base0 < c1:
+            ed = []
+            for q in cutlass.range_constexpr(4):
+                icl = base0 + Int32(32 * q) + lane
+                if icl > C - Int32(1):
+                    icl = C - Int32(1)
+                ed.append(Uint64(lst[icl]))
+            for q in cutlass.range_constexpr(4):
+                sl = base0 + Int32(32 * q) + lane
+                fw = Int32(0)
+                fc = Int32(0)
+                if sl < c1:
+                    bd_ = L._vbin(ed[q], lo, sc, NB_SEL)
+                    if bd_ > Bw:
+                        fw = Int32(1)
+                    elif bd_ == Bb:
+                        fc = Int32(1)
+                mw = Int32(cute.arch.vote_ballot_sync(fw != Int32(0)))
+                mc = Int32(cute.arch.vote_ballot_sync(fc != Int32(0)))
+                if fw != Int32(0):
+                    out_s[pw + Int32(cute.arch.popc(mw & lm))] = sl
+                if fc != Int32(0):
+                    if keepc != Int32(0):
+                        pcs = pc + Int32(cute.arch.popc(mc & lm))
+                        s_ck[pcs] = L.entry_key(ed[q])
+                        s_cs[pcs] = sl
+                pw = pw + Int32(cute.arch.popc(mw))
+                pc = pc + Int32(cute.arch.popc(mc))
+            base0 = base0 + Int32(128)
+        L.bar(bar_id, nthr)
+        _pst(prof, 61, tid)
+        if whole == Int32(0):
+            if m <= Int32(32):
+                info = Int32(1)
+                if wid == Int32(0):
+                    kq = Uint64(0)
+                    sq = Int32(0)
+                    if lane < m:
+                        kq = Uint64(s_ck[lane])
+                        sq = s_cs[lane]
+                    khi = Uint32(kq >> Uint64(32))
+                    klo = Uint32(kq & Uint64(4294967295))
+                    r_ = Int32(0)
+                    for j in cutlass.range_constexpr(32):
+                        ohi = cute.arch.shuffle_sync(khi, Int32(j))
+                        olo = cute.arch.shuffle_sync(klo, Int32(j))
+                        if Int32(j) < m:
+                            if ohi > khi:
+                                r_ = r_ + Int32(1)
+                            elif ohi == khi:
+                                if olo > klo:
+                                    r_ = r_ + Int32(1)
+                    if lane < m:
+                        if r_ < need:
+                            out_s[above + r_] = sq
+                L.bar(bar_id, nthr)
+            elif m <= Int32(QUADC):
+                info = Int32(1)
+                i = tid
+                while i < m:
+                    ki = Uint64(s_ck[i])
+                    r_ = Int32(0)
+                    jq = Int32(0)
+                    while jq < m:
+                        if Uint64(s_ck[jq]) > ki:
+                            r_ = r_ + Int32(1)
+                        jq = jq + Int32(1)
+                    if r_ < need:
+                        out_s[above + r_] = s_cs[i]
+                    i = i + Int32(nthr)
+                L.bar(bar_id, nthr)
+            else:
+                info = Int32(2)
+                pref = Uint64(0)
+                plen = Int32(0)
+                needr = need
+                done = Int32(0)
+                while done == Int32(0):
+                    shift = Int32(56) - plen
+                    if tid < Int32(NBS):
+                        s_hist[tid] = Int32(0)
+                    if cutlass.const_expr(nthr < NBS):
+                        for z_ in cutlass.range_constexpr(1, NBS // nthr):
+                            s_hist[tid + Int32(z_ * nthr)] = Int32(0)
+                    L.bar(bar_id, nthr)
+                    i = tid
+                    while i < C:
+                        e2_ = Uint64(lst[i])
+                        if L._vbin(e2_, lo, sc, NB_SEL) == Bb:
+                            k2 = L.entry_key(e2_)
+                            okp = Int32(1)
+                            if plen > Int32(0):
+                                if k2 >> Uint64(Int32(64) - plen) != pref:
+                                    okp = Int32(0)
+                            if okp != Int32(0):
+                                dg = Int32(Uint32(k2 >> Uint64(shift) & Uint64(255)))
+                                cute.arch.red(
+                                    s_hist.iterator + dg,
+                                    Int32(1),
+                                    op="add",
+                                    dtype=Int32,
+                                    sem="relaxed",
+                                    scope="cta",
+                                )
+                        i = i + Int32(nthr)
+                    L.bar(bar_id, nthr)
+                    L.scan_cross0(
+                        s_hist, needr, tid, s_res, needr, needr, s_hist, nb=NBS, zero=True
+                    )
+                    L.bar(bar_id, nthr)
+                    dB = s_res[L.RES_B]
+                    dab = s_res[L.RES_ABOVE]
+                    dm = s_res[L.RES_M]
+                    L.bar(bar_id, nthr)
+                    pref = pref << Uint64(8) | Uint64(dB)
+                    plen = plen + Int32(8)
+                    needr = needr - dab
+                    if needr >= dm:
+                        done = Int32(1)
+                    if plen >= Int32(64):
+                        done = Int32(1)
+                thr = pref << Uint64(Int32(64) - plen)
+                if plen >= Int32(64):
+                    thr = pref
+                nw2 = Int32(0)
+                r0 = c0
+                while r0 < c1:
+                    ii = r0 + lane
+                    f2_ = Int32(0)
+                    if ii < c1:
+                        e3_ = Uint64(lst[ii])
+                        if L._vbin(e3_, lo, sc, NB_SEL) == Bb:
+                            if L.entry_key(e3_) >= thr:
+                                f2_ = Int32(1)
+                    nw2 = nw2 + Int32(cute.arch.popc(cute.arch.vote_ballot_sync(f2_ != Int32(0))))
+                    r0 = r0 + Int32(32)
+                ex2, tot2 = L._warp_prefix(nw2, s_wc, tid, nthr, bar_id)
+                p2 = above + ex2
+                r0 = c0
+                while r0 < c1:
+                    ii = r0 + lane
+                    f2_ = Int32(0)
+                    if ii < c1:
+                        e4 = Uint64(lst[ii])
+                        if L._vbin(e4, lo, sc, NB_SEL) == Bb:
+                            if L.entry_key(e4) >= thr:
+                                f2_ = Int32(1)
+                    m2 = Int32(cute.arch.vote_ballot_sync(f2_ != Int32(0)))
+                    if f2_ != Int32(0):
+                        out_s[p2 + Int32(cute.arch.popc(m2 & lm))] = ii
+                    p2 = p2 + Int32(cute.arch.popc(m2))
+                    r0 = r0 + Int32(32)
+                L.bar(bar_id, nthr)
+                if tid < Int32(NBS):
+                    s_hist[tid] = Int32(0)
+                if cutlass.const_expr(nthr < NBS):
+                    for z_ in cutlass.range_constexpr(1, NBS // nthr):
+                        s_hist[tid + Int32(z_ * nthr)] = Int32(0)
+                L.bar(bar_id, nthr)
+    _pst(prof, 62, tid)
+    return (nout, mret, info, Bret)
+
+
+# ====================================================================================================================
+# Fused DeepSeek-V4-Flash decode kernel (CuTe DSL, SM100): the cooperative launch, the indexer-K stream, the
+# sampled threshold, candidate publication and the teams' exact top-512 selection, plus the host entry points
+# ``SpecDsaMegakernel`` and ``compile_mk`` used by ``megakernel_op.py``.
+# ====================================================================================================================
+
+_RND_RN = "rn"
+NEG_INF = -math.inf
 NTEAM = 8
 CAPR = 2048
 CAPL = 5632
@@ -43,7 +614,6 @@ BOARD_CAP = 4096
 RMAX = 10
 NSLOTS = 11
 NTILES = 5
-NB_SEL = S.NB_SEL
 NB_INITIAL = 512
 BUCKET_CAP = 512
 assert NB_INITIAL * 8 == NB_SEL * 4 and CAPL < 65536
@@ -51,7 +621,6 @@ NB_DRS = 1024
 DRS_DIG = 10
 K50_BITS = 50
 GPOS_MASK = (1 << 18) - 1
-PLAN = D.PLAN
 NGH = 8
 NCSLOT = 3
 SPIN_MS = 200
@@ -408,22 +977,22 @@ def cp_async8(saddr, gaddr, *, loc=None, ip=None):
 @dsl_user_op
 def lds_volatile_u32(saddr, *, loc=None, ip=None):
     return Int32(
-        B._asm(
-            B.T.i32(), [B._v(saddr, loc, ip)], "ld.volatile.shared.u32 $0, [$1];", "=r,r", loc, ip
+        L._asm(
+            L.T.i32(), [L._v(saddr, loc, ip)], "ld.volatile.shared.u32 $0, [$1];", "=r,r", loc, ip
         )
     )
 
 
 @dsl_user_op
 def fence_acq_rel_cta(*, loc=None, ip=None):
-    B._asm(None, [], "fence.acq_rel.cta;", "", loc, ip)
+    L._asm(None, [], "fence.acq_rel.cta;", "", loc, ip)
 
 
 @dsl_user_op
 def sts_volatile_u32(saddr, val, *, loc=None, ip=None):
-    B._asm(
+    L._asm(
         None,
-        [B._v(saddr, loc, ip), B._v(val, loc, ip)],
+        [L._v(saddr, loc, ip), L._v(val, loc, ip)],
         "st.volatile.shared.u32 [$0], $1;",
         "r,r",
         loc,
@@ -564,7 +1133,7 @@ def find_cross_warp_counts(s_hist, target, tidx, s_res, s_wc, nb: cutlass.Conste
             s_wc[7] = px2 + Int32(h1 & Uint32(65535))
 
 
-class Dsv4SparseDecodeKernel:
+class SpecDsaMegakernel:
     """Kernel configuration and device code: the constructor arguments are the compile-time knobs (``op.py`` holds
     the per-batch-size sets); ``row_sizes()`` gives the per-row workspace sizes.
     """
@@ -572,7 +1141,7 @@ class Dsv4SparseDecodeKernel:
     def __init__(
         self,
         num_sms: int = 148,
-        policy: int = CP.POL_EVICT_FIRST,
+        policy: int = L.POL_EVICT_FIRST,
         debug: bool = False,
         stamps: bool = False,
         math_regs: int = 232,
@@ -1401,7 +1970,7 @@ class Dsv4SparseDecodeKernel:
             board=BOARD_CAP,
             region=self.ns * CAPR * 2,
             ctl=16,
-            desc=self.num_sms * D.DESC_WORDS,
+            desc=self.num_sms * DESC_WORDS,
         )
 
     @staticmethod
@@ -1747,8 +2316,8 @@ class Dsv4SparseDecodeKernel:
                     cpasync.prefetch_descriptor(tma_atom_a)
                     cpasync.prefetch_descriptor(tma_atom_s)
                 pol = None
-                if cutlass.const_expr(self.policy != CP.POL_NONE):
-                    pol = CP.make_l2_policy(self.policy)
+                if cutlass.const_expr(self.policy != L.POL_NONE):
+                    pol = L.make_l2_policy(self.policy)
                 bt_cols = cute.size(mBlockTable, mode=[1])
                 bta = mBlockTable[0, cutlass.min(Int32(8) * s0 + lane, bt_cols - 1)]
                 btb = mBlockTable[0, cutlass.min(Int32(8) * s0 + Int32(32) + lane, bt_cols - 1)]
@@ -1985,7 +2554,7 @@ class Dsv4SparseDecodeKernel:
                             )
                             # The scale load from this K stage must complete before the
                             # release lets the TMA refill the stage.
-                            B.fence_proxy_async_smem()
+                            L.fence_proxy_async_smem()
                             kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                             kv_cons_state_math_0.advance()
                             cute.copy(tiled_copy_ref_0, tTR_0[None, None, None, 0, 0], tTR_rAcc)
@@ -2059,7 +2628,7 @@ class Dsv4SparseDecodeKernel:
                             )
                             # The scale load from this K stage must complete before the
                             # release lets the TMA refill the stage.
-                            B.fence_proxy_async_smem()
+                            L.fence_proxy_async_smem()
                             kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                             kv_cons_state_math_1.advance()
                             cute.copy(tiled_copy_ref_1, tTR_1[None, None, None, 0, 0], tTR_rAcc)
@@ -2173,8 +2742,8 @@ class Dsv4SparseDecodeKernel:
                     cpasync.prefetch_descriptor(tma_atom_a)
                     cpasync.prefetch_descriptor(tma_atom_s)
                 pol = None
-                if cutlass.const_expr(self.policy != CP.POL_NONE):
-                    pol = CP.make_l2_policy(self.policy)
+                if cutlass.const_expr(self.policy != L.POL_NONE):
+                    pol = L.make_l2_policy(self.policy)
                 bt_cols = cute.size(mBlockTable, mode=[1])
                 if cutlass.const_expr(not self.early):
                     cpasync.prefetch_descriptor(tma_atom_b)
@@ -2576,7 +3145,7 @@ class Dsv4SparseDecodeKernel:
                     q_cons_state.advance()
                     # All 256 threads fence: each warp's weight loads must complete before tid 0's
                     # q_free arrival lets the TMA refill this Q / W stage with the next row.
-                    B.fence_proxy_async_smem()
+                    L.fence_proxy_async_smem()
                     L.bar(3, 256)
                     if tidx == 0:
                         prims.mbarrier_arrive((q_free + q_stage_local) if self.qdb else q_free)
@@ -2641,7 +3210,7 @@ class Dsv4SparseDecodeKernel:
                                 )
                                 # The scale load from this K stage must complete before the
                                 # release lets the TMA refill the stage.
-                                B.fence_proxy_async_smem()
+                                L.fence_proxy_async_smem()
                                 kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                                 kv_cons_state_math_0.advance()
                                 cute.copy(tiled_copy_ref_0, tTR_0[None, None, None, 0, 0], tTR_rAcc)
@@ -2701,7 +3270,7 @@ class Dsv4SparseDecodeKernel:
                                 )
                                 # The scale load from this K stage must complete before the
                                 # release lets the TMA refill the stage.
-                                B.fence_proxy_async_smem()
+                                L.fence_proxy_async_smem()
                                 kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                                 kv_cons_state_math_1.advance()
                                 cute.copy(tiled_copy_ref_1, tTR_1[None, None, None, 0, 0], tTR_rAcc)
@@ -2742,7 +3311,7 @@ class Dsv4SparseDecodeKernel:
                                 )
                                 if tidx == Int32(0):
                                     w_ = Int32(0)
-                                    if B.mbar_test_wait(
+                                    if L.mbar_test_wait(
                                         Int32((tbbm_ + r_).toint()), Int32(0)
                                     ) == Int32(0):
                                         tk_ = gen + Uint64(5)
@@ -2797,7 +3366,7 @@ class Dsv4SparseDecodeKernel:
                                 )
                     if r_ == Int32(self.nrows - 1):
                         # the last row: wait its T (armed by the T poller), scan + publish with all 256 math threads
-                        B.spin(Int32((tbbm_ + r_).toint()), Int32(0))
+                        L.spin(Int32((tbbm_ + r_).toint()), Int32(0))
                         Tvl_ = L.f32_of_u32(Uint32(s_tvm_[r_ * Int32(2)]))
                         bsl_ = L.f32_of_u32(Uint32(s_tvm_[r_ * Int32(2) + Int32(1)]))
                         ntokl_ = cutlass.min(ns * Int32(SPLIT_TOK), n - t_lo)
@@ -3328,16 +3897,16 @@ class Dsv4SparseDecodeKernel:
             mx = L.f32_of_u32(Uint32(mv))
             lo, hi = self._band_range(tf, hi, mx)
             if tf > Float32(L.SENT_LO):
-                sv = L.u32_of_f32(S.bin_scale(lo, hi) * Float32(0.5))
+                sv = L.u32_of_f32(bin_scale(lo, hi) * Float32(0.5))
         return (tv, sv)
 
     @cute.jit
     def _t_known(self, tk, Tv, i, ns, tbar, s_tv, tpar=0):
         if tk == Int32(0):
-            t_ = B.mbar_test_wait(Int32(tbar.toint()), Int32(tpar))
+            t_ = L.mbar_test_wait(Int32(tbar.toint()), Int32(tpar))
             if i == ns:
                 while t_ == Int32(0):
-                    t_ = B.mbar_try_wait(Int32(tbar.toint()), Int32(tpar))
+                    t_ = L.mbar_try_wait(Int32(tbar.toint()), Int32(tpar))
             if cute.arch.vote_all_sync(t_ != Int32(0)):
                 tk = Int32(1)
                 Tv = L.f32_of_u32(Uint32(s_tv[0]))
@@ -3536,7 +4105,7 @@ class Dsv4SparseDecodeKernel:
                         rbase + Int64(tot) * Int64(8),
                         Uint64(DUMMY_GPOS) << Uint64(32) | Uint64(4286578688),
                     )
-            B.fence_proxy_async_global()
+            L.fence_proxy_async_global()
         L.bar(5, 256)
         if tidx == 0:
             self._stamp(mStamps, cta, 41)
@@ -3704,7 +4273,7 @@ class Dsv4SparseDecodeKernel:
                     rbase + Int64(tot) * Int64(8),
                     Uint64(DUMMY_GPOS) << Uint64(32) | Uint64(4286578688),
                 )
-        B.fence_proxy_async_global()
+        L.fence_proxy_async_global()
         L.bar(4, 128)
         if stid == Int32(0):
             if live != Int32(0):
@@ -3869,7 +4438,7 @@ class Dsv4SparseDecodeKernel:
                     rbase + Int64(tot) * Int64(8),
                     Uint64(DUMMY_GPOS) << Uint64(32) | Uint64(4286578688),
                 )
-        B.fence_proxy_async_global()
+        L.fence_proxy_async_global()
         L.bar(bid, nth)
         if tid == Int32(0):
             if live != Int32(0):
@@ -4533,8 +5102,8 @@ class Dsv4SparseDecodeKernel:
                 cute.arch.cluster_wait()
                 if tidx == Int32(160):
                     # (not ctid 0: on team CTA 0 it may still be in the late-done follower wait)
-                    B.mbar_arrive_remote(
-                        B.mapa_u32(Int32((bars + B_PR).toint()), B.cluster_ctarank() ^ Int32(1))
+                    L.mbar_arrive_remote(
+                        L.mapa_u32(Int32((bars + B_PR).toint()), L.cluster_ctarank() ^ Int32(1))
                     )
             elif cutlass.const_expr(self.gjoin):
                 self._control_s1d(
@@ -4704,8 +5273,8 @@ class Dsv4SparseDecodeKernel:
                     )
                     nbt = npg * Int32(4) // Int32(16) * Int32(16)
                     if nbt > Int32(0):
-                        B.mbar_arrive_expect_tx(Int32((bars + B_BTC).toint()), nbt)
-                        B.bulk_g2s(
+                        L.mbar_arrive_expect_tx(Int32((bars + B_BTC).toint()), nbt)
+                        L.bulk_g2s(
                             Int32(cute.recast_ptr(arena + T_OFF_BTC, dtype=Int32).toint()),
                             mBtC.iterator.toint(),
                             nbt,
@@ -5468,9 +6037,9 @@ class Dsv4SparseDecodeKernel:
                             cute.arch.cluster_wait()
                             if tidx == Int32(160):
                                 # (not ctid 0: on team CTA 0 it may still be in the late-done follower wait)
-                                B.mbar_arrive_remote(
-                                    B.mapa_u32(
-                                        Int32((bars + B_PR).toint()), B.cluster_ctarank() ^ Int32(1)
+                                L.mbar_arrive_remote(
+                                    L.mapa_u32(
+                                        Int32((bars + B_PR).toint()), L.cluster_ctarank() ^ Int32(1)
                                     )
                                 )
                 elif cutlass.const_expr(self.gjoin):
@@ -5800,8 +6369,8 @@ class Dsv4SparseDecodeKernel:
                         )
                         nbt = npg * Int32(4) // Int32(16) * Int32(16)
                         if nbt > Int32(0):
-                            B.mbar_arrive_expect_tx(Int32((bars + B_BTC).toint()), nbt)
-                            B.bulk_g2s(
+                            L.mbar_arrive_expect_tx(Int32((bars + B_BTC).toint()), nbt)
+                            L.bulk_g2s(
                                 Int32(cute.recast_ptr(arena + T_OFF_BTC, dtype=Int32).toint()),
                                 mBtC.iterator.toint(),
                                 nbt,
@@ -6541,7 +7110,7 @@ class Dsv4SparseDecodeKernel:
                 wa = L.ld_relaxed_u64(ca)
                 wb = L.ld_relaxed_u64(cb)
             else:
-                hv = B.ldg_cg_v4(hptr)
+                hv = L.ldg_cg_v4(hptr)
                 h0 = hv[0]
                 h1 = hv[1]
                 h2 = hv[2]
@@ -6583,7 +7152,7 @@ class Dsv4SparseDecodeKernel:
             # histogram read that includes every published contribution
             L.fence_acq_rel_gpu()
             L.bar(BAR_CTL, NT)
-            hx = B.ldg_cg_v4(hptr)
+            hx = L.ldg_cg_v4(hptr)
             h0 = hx[0]
             h1 = hx[1]
             h2 = hx[2]
@@ -6641,7 +7210,7 @@ class Dsv4SparseDecodeKernel:
         if real:
             na, nb, ab, sh0, sh1, sh2, sh3 = self._poll_counts_hist(ws, gen, ctid, hptr, s_wc)
         else:
-            hw_ = B.ldg_cg_v4(hptr)
+            hw_ = L.ldg_cg_v4(hptr)
             sh0 = hw_[0]
             sh1 = hw_[1]
             sh2 = hw_[2]
@@ -6659,7 +7228,7 @@ class Dsv4SparseDecodeKernel:
         HIC = L.f32_of_u32(Uint32(misc[Int32(9) + mo_]))
         SMAX = L.f32_of_u32(Uint32(misc[Int32(11) + mo_]))
         lo, hi = self._band_range(T, HIC, SMAX)
-        sc = S.bin_scale(lo, hi) * Float32(0.5)
+        sc = bin_scale(lo, hi) * Float32(0.5)
         eligible = (
             bad == Int32(0)
             and misc[Int32(13) + mo_] == Int32(0)
@@ -6705,7 +7274,7 @@ class Dsv4SparseDecodeKernel:
                 if total != C1:
                     # stale snapshot: one re-read, ordered after every count acquire by the barrier above
                     L.bar(BAR_CTL, NT)
-                    hw2 = B.ldg_cg_v4(hptr)
+                    hw2 = L.ldg_cg_v4(hptr)
                     sh0 = hw2[0]
                     sh1 = hw2[1]
                     sh2 = hw2[2]
@@ -6756,7 +7325,7 @@ class Dsv4SparseDecodeKernel:
             m = s_res[L.RES_M]
             # Every bin strictly above the crossing contains at most Kq rows,
             # so it fits in BUCKET_CAP. Only the crossing needs a capacity test.
-            if total == C1 and Bb >= Int32(0) and m <= Int32(S.QUADC):
+            if total == C1 and Bb >= Int32(0) and m <= Int32(QUADC):
                 if real:
                     fast = Int32(1)
         if fast != Int32(0):
@@ -6809,9 +7378,9 @@ class Dsv4SparseDecodeKernel:
             pre_ = Int32(0)
         s_wc = _sm_tensor(arena, T_OFF_WC, Int32, 64)
         s_outs = _sm_tensor(arena, T_OFF_OUTS, Int32, K_TOP)
-        s_ck = _sm_tensor(arena, T_OFF_CK, Uint64, S.QUADC)
-        s_cs = _sm_tensor(arena, T_OFF_CS, Int32, S.QUADC)
-        s_crow = _sm_tensor(arena, T_OFF_CROW, Int32, S.QUADC)
+        s_ck = _sm_tensor(arena, T_OFF_CK, Uint64, QUADC)
+        s_cs = _sm_tensor(arena, T_OFF_CS, Int32, QUADC)
+        s_crow = _sm_tensor(arena, T_OFF_CROW, Int32, QUADC)
         s_btc = _sm_tensor(arena, T_OFF_BTC, Int32, BTC_CAP)
         misc = _sm_tensor(arena, T_OFF_MISC, Int32, 64)
         rg = mRegion.iterator.toint()
@@ -6854,7 +7423,7 @@ class Dsv4SparseDecodeKernel:
                 # Issue independent bucket reads before consuming any result.
                 # Crossing entries are included to overlap their load latency too.
                 entries = [Uint64(0)] * (K_TOP // NT)
-                cross = [Uint64(0)] * ((S.QUADC + NT - 1) // NT)
+                cross = [Uint64(0)] * ((QUADC + NT - 1) // NT)
                 for q in cutlass.range_constexpr(K_TOP // NT):
                     po = ctid * Int32(4) + Int32(q)
                     if po < above:
@@ -6868,7 +7437,7 @@ class Dsv4SparseDecodeKernel:
                             else:
                                 e = L.ld_relaxed_u64(rg + Int64(off) * Int64(8))
                         entries[q] = e
-                for q in cutlass.range_constexpr((S.QUADC + NT - 1) // NT):
+                for q in cutlass.range_constexpr((QUADC + NT - 1) // NT):
                     i = ctid + Int32(q * NT)
                     if i < m:
                         e = Uint64(Uint32(above + i)) << Uint64(32) | Uint64(
@@ -6896,7 +7465,7 @@ class Dsv4SparseDecodeKernel:
                         if pre_ == Int32(0):
                             rv_ = self._k3row(gp, npg_s, s_btc, mBtC, mbc, real)
                         (s_idx + Int32(128) + po).store(rv_)
-                for q in cutlass.range_constexpr((S.QUADC + NT - 1) // NT):
+                for q in cutlass.range_constexpr((QUADC + NT - 1) // NT):
                     i = ctid + Int32(q * NT)
                     if i < m:
                         e = cross[q]
@@ -7440,7 +8009,7 @@ class Dsv4SparseDecodeKernel:
             s_acq[ctid] = Int32(0)
         # Retire every warm generic LIST access before any warp can overwrite
         # LIST through the async proxy. This barrier also initializes counters.
-        B.fence_proxy_async_smem()
+        L.fence_proxy_async_smem()
         L.bar(BAR_CTL, NT)
         self._skew(gen, cta * Int32(4) + Int32(3), ctid)
         t64f = gen + Uint64(1)
@@ -7487,18 +8056,18 @@ class Dsv4SparseDecodeKernel:
         if wbase + wcopy <= Int32(CAPL):
             if wcopy > Int32(0):
                 if lane == Int32(0):
-                    B.mbar_expect_tx(Int32((bars + B_LST).toint()), wcopy * Int32(8))
+                    L.mbar_expect_tx(Int32((bars + B_LST).toint()), wcopy * Int32(8))
                 cute.arch.sync_warp()
-                B.fence_proxy_async_global()
+                L.fence_proxy_async_global()
                 if ctid < Int32(NS) and pa > Int32(0):
-                    B.bulk_g2s(
+                    L.bulk_g2s(
                         lbase + own_base * Int32(8),
                         rg + Int64(ctid) * Int64(2 * CAPR * 8),
                         pa * Int32(8),
                         Int32((bars + B_LST).toint()),
                     )
                 if ctid + Int32(NT) < Int32(NS) and pb > Int32(0):
-                    B.bulk_g2s(
+                    L.bulk_g2s(
                         lbase + (own_base + pa) * Int32(8),
                         rg + Int64(ctid + Int32(NT)) * Int64(2 * CAPR * 8),
                         pb * Int32(8),
@@ -7926,10 +8495,10 @@ class Dsv4SparseDecodeKernel:
         s_hist = _sm_tensor(arena, T_OFF_HIST, Int32, NB_SEL)
         s_phist = _sm_tensor(arena, T_OFF_HIST, Uint64, NB_INITIAL)
         s_outs = _sm_tensor(arena, T_OFF_OUTS, Int32, K_TOP)
-        s_ck = _sm_tensor(arena, T_OFF_CK, Uint64, S.QUADC)
-        s_cs = _sm_tensor(arena, T_OFF_CS, Int32, S.QUADC)
+        s_ck = _sm_tensor(arena, T_OFF_CK, Uint64, QUADC)
+        s_cs = _sm_tensor(arena, T_OFF_CS, Int32, QUADC)
         s_btc = _sm_tensor(arena, T_OFF_BTC, Int32, BTC_CAP)
-        s_crow = _sm_tensor(arena, T_OFF_CROW, Int32, S.QUADC)
+        s_crow = _sm_tensor(arena, T_OFF_CROW, Int32, QUADC)
         s_lst = _sm_tensor(arena, T_OFF_LIST, Uint64, CAPL)
         mret = Int32(0)
         info = Int32(0)
@@ -7963,7 +8532,7 @@ class Dsv4SparseDecodeKernel:
                 gmn, gmx = L._block_min_max_u32(kmn, kmx, s_red, ctid, NT, BAR_CTL)
                 lo = L.invkey(gmn)
                 hi = L.invkey(gmx)
-            sc = S.bin_scale(lo, hi) * Float32(0.5)
+            sc = bin_scale(lo, hi) * Float32(0.5)
             for z_ in cutlass.range_constexpr(NB_INITIAL // NT):
                 s_phist[ctid + Int32(z_ * NT)] = Uint64(0)
             L.bar(BAR_CTL, NT)
@@ -8022,7 +8591,7 @@ class Dsv4SparseDecodeKernel:
             lm = Int32(cute.arch.lanemask_lt())
             nkey = Int32(0)
             if Sw < Kw:
-                if Sx > Int32(S.QUADC) or fnar != Int32(0):
+                if Sx > Int32(QUADC) or fnar != Int32(0):
                     nkey = Int32(1)
                     # s_nkey aliases KV ring slots 0-2: wait for their first release by this CTA's QK. With rs24, row
                     # group 1 (odd d: tiles 3 and 4) fills the ring only after this selection's B_EAR / B_SEL arrive,
@@ -8058,7 +8627,7 @@ class Dsv4SparseDecodeKernel:
                             (s_idx + Int32(128) + po).store(row)
                     else:
                         pc_ = px + Int32(cute.arch.popc(mc & lm))
-                        if pc_ < Int32(S.QUADC):
+                        if pc_ < Int32(QUADC):
                             s_ck[pc_] = L.entry_key(e)
                             s_cs[pc_] = gp
                             s_crow[pc_] = row
@@ -8101,7 +8670,7 @@ class Dsv4SparseDecodeKernel:
                             if r_ < Kw - Sw:
                                 s_outs[Sw + r_] = s_cs[ctid]
                                 (s_idx + Int32(128) + Sw + r_).store(s_crow[ctid])
-                elif Sx <= Int32(S.QUADC) and fnar == Int32(0):
+                elif Sx <= Int32(QUADC) and fnar == Int32(0):
                     i = ctid
                     while i < Sx:
                         ki = Uint64(s_ck[i])
@@ -8300,7 +8869,7 @@ class Dsv4SparseDecodeKernel:
 _COMPILED = {}
 
 
-def compile_mk(mk: Dsv4SparseDecodeKernel):
+def compile_mk(mk: SpecDsaMegakernel):
     """Compile ``mk`` with TVM-FFI over symbolic shapes; returns the callable that ``op.run`` launches."""
     key = tuple(
         sorted(((k, v) for k, v in vars(mk).items() if isinstance(v, (int, float, bool, str))))

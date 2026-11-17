@@ -12,19 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSeek-V4-Flash decode sparse attention on B200 (SM100, 148 SMs) for any batch size from 1 to 1,024.
+"""specDSA: fused DeepSeek-V4-Flash decode sparse attention on B200 (SM100) for any batch size from 1 to 1,024.
 
 One decode step of a CSA layer: FP8 paged-MQA indexer logits over the compressed indexer K cache, exact top-512
 selection, mapping of the selected positions to compressed-KV rows, and the sparse MLA attention over those rows, the
-128-row sliding window and the attention sink. One call replaces the four kernels of the unfused chain.
+128-row sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The top-512
+threshold is guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate (the selection
+stays exact: a row where the guess does not hold takes an exact fallback).
 
 Two implementations sit behind one interface; ``implementation_for`` names the one a batch size uses:
 
-- ``megakernel`` (``megakernel_op.py``, 1 to ``MEGAKERNEL_MAX_BATCH`` rows): one cooperative launch that streams the
-  indexer K cache once and does the selection and the attention on dedicated CTAs while the others keep streaming;
-  compiled per batch size.
-- ``large_batch`` (``large_batch/``, more rows): a persistent indexer kernel and an attention kernel launched behind it
-  with programmatic dependent launch; one compile serves every batch size.
+- ``megakernel`` (``megakernel.py`` / ``megakernel_op.py``, 1 to ``MEGAKERNEL_MAX_BATCH`` rows): one cooperative launch
+  that streams the indexer K cache once and does the selection and the attention on dedicated CTAs while the others
+  keep streaming; compiled per batch size.
+- ``large_batch`` (``large_batch.py`` / ``large_batch_op.py``, more rows): a persistent indexer kernel and an attention
+  kernel launched behind it with programmatic dependent launch; one compile serves every batch size.
 
 Per step, ``prepare`` does the host work (descriptors or CTA schedule from the lengths, the sinks) and ``run`` launches
 on the current stream; the launch can be captured in a CUDA graph and replayed while ``prepare`` refreshes the state in
@@ -51,8 +53,7 @@ from dataclasses import dataclass
 
 import torch
 
-from . import megakernel_op
-from .large_batch import op as large_batch_op
+from . import large_batch_op, megakernel_op
 
 __all__ = [
     "DEFAULT_SOFTMAX_SCALE",
@@ -62,7 +63,7 @@ __all__ = [
     "MEGAKERNEL_MAX_BATCH",
     "MIN_BATCH_SIZE",
     "MIN_CTX_LEN",
-    "Dsv4SparseDecodeState",
+    "SpecDsaState",
     "error_bits",
     "implementation_for",
     "is_supported",
@@ -90,7 +91,7 @@ _LARGE_BATCH = "large_batch"
 
 
 @dataclass
-class Dsv4SparseDecodeState:
+class SpecDsaState:
     """Per-step metadata and workspace of one caller; see ``prepare``.
 
     ``implementation`` names the kernels the batch size uses, ``state`` is their state and ``sinks`` the float32 [64]
@@ -136,8 +137,8 @@ def prepare(
     kv_lens: torch.Tensor,
     idx_block_table: torch.Tensor,
     sinks: torch.Tensor,
-    state: Dsv4SparseDecodeState | None = None,
-) -> Dsv4SparseDecodeState:
+    state: SpecDsaState | None = None,
+) -> SpecDsaState:
     """Build (or refresh in place) the per-step state for ``B = ctx_lens.numel()`` rows.
 
     Args:
@@ -176,12 +177,12 @@ def prepare(
         sinks_copy = None
     if state is not None:
         return state
-    return Dsv4SparseDecodeState(
+    return SpecDsaState(
         batch_size=batch_size, implementation=implementation, state=inner, sinks=sinks_copy
     )
 
 
-def error_bits(state: Dsv4SparseDecodeState) -> torch.Tensor:
+def error_bits(state: SpecDsaState) -> torch.Tensor:
     """Error bits of the launches of ``state``: a device view, no sync; zero means no error.
 
     The megakernel keeps one sticky int64 word per row (``megakernel_op.ERR_*``); the large-batch kernels keep one int32
@@ -193,7 +194,7 @@ def error_bits(state: Dsv4SparseDecodeState) -> torch.Tensor:
 
 
 def run(
-    state: Dsv4SparseDecodeState,
+    state: SpecDsaState,
     q_idx: torch.Tensor,
     w_idx: torch.Tensor,
     k_cache: torch.Tensor,

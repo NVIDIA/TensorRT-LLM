@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V4-Flash fused sparse decode kernel (CuTe DSL, SM100) against an fp64 reference of the unfused chain.
+"""specDSA megakernel (CuTe DSL, SM100) against an fp64 reference of the unfused DeepSeek-V4-Flash decode chain.
 
 Synthetic inputs: per-row indexer K pages and KV rows scattered over shared pools, an opened K-th gap so the top-512
 set is well defined (rows with planted exact ties or all-equal rows are checked as value multisets), and an attention
@@ -40,13 +40,13 @@ SM_SCALE = 1.0 / math.sqrt(512.0)
 
 
 def _op():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode import megakernel_op
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import megakernel_op
 
     return megakernel_op
 
 
 def _mk():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode import megakernel
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import megakernel
 
     return megakernel
 

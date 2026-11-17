@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One op for every batch size: ``dsv4_sparse_decode.op`` from 1 to 1,024 rows (SM100).
+"""One op for every batch size: ``spec_dsa.op`` from 1 to 1,024 rows (SM100).
 
 The op picks the megakernel up to ``MEGAKERNEL_MAX_BATCH`` rows and the large-batch kernels above it. The case builder
 and the fp64 references of the large-batch test check every row's top-512 and attention here too, so both
@@ -23,13 +23,13 @@ the CUDA-graph and in-place refresh path, and the argument checks of the op.
 import pytest
 import torch
 
-from . import test_cute_dsl_dsv4_sparse_decode_large_batch as H
+from . import test_cute_dsl_spec_dsa_large_batch as H
 
 pytestmark = H.pytestmark
 
 
 def _op():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode import op
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import op
 
     return op
 

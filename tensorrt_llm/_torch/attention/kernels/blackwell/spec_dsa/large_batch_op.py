@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSeek-V4-Flash decode sparse attention for large batches on B200 (SM100, 148 SMs).
+"""specDSA large-batch kernels, host side: DeepSeek-V4-Flash decode for many rows on B200 (SM100, 148 SMs).
 
 Two launches per call, back to back on the current stream. The first streams each row's FP8 indexer K cache once,
 computes the indexer logits and selects the exact top-512 compressed positions (sampled threshold with a count
@@ -55,7 +55,7 @@ __all__ = [
     "MAX_CTX_LEN",
     "MIN_BATCH_SIZE",
     "MIN_CTX_LEN",
-    "Dsv4LargeBatchState",
+    "SpecDsaLargeBatchState",
     "error_bits",
     "is_supported",
     "precompile",
@@ -113,10 +113,9 @@ _engines: dict[int, dict] = {}
 
 
 def _kernel_modules() -> tuple:
-    from .. import cache_policy
-    from . import attention_tail, indexer_kernel, selection_lib
+    from . import large_batch, large_batch_lib
 
-    return attention_tail, cache_policy, indexer_kernel, selection_lib
+    return large_batch, large_batch_lib
 
 
 def is_supported(device: torch.device | None = None) -> tuple[bool, str]:
@@ -149,11 +148,11 @@ def _engine(device: torch.device) -> dict:
     key = _device_index(device)
     with _lock:
         if key not in _engines:
-            attention_tail, _, indexer_kernel, _ = _kernel_modules()
+            lb, _ = _kernel_modules()
             _engines[key] = {
-                "indexer": indexer_kernel.IndexerKernel(num_sms=NUM_SMS, **_KERNEL_CONFIG),
+                "indexer": lb.IndexerKernel(num_sms=NUM_SMS, **_KERNEL_CONFIG),
                 "indexer_fn": None,
-                "tail": attention_tail.AttentionTail(),
+                "tail": lb.AttentionTail(),
                 "tail_fn": None,
             }
         return _engines[key]
@@ -165,23 +164,23 @@ def precompile(device: torch.device) -> None:
     The compiled kernels serve every batch size. Must run outside CUDA-graph capture; ``run`` compiles on first use
     otherwise.
     """
-    attention_tail, _, indexer_kernel, _ = _kernel_modules()
+    lb, _ = _kernel_modules()
     e = _engine(device)
     with _lock:
         if e["indexer_fn"] is None or e["tail_fn"] is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "dsv4_sparse_decode (large batch): compile the kernels (precompile) before "
+                    "spec_dsa (large batch): compile the kernels (precompile) before "
                     "CUDA-graph capture"
                 )
             if e["indexer_fn"] is None:
-                e["indexer_fn"] = indexer_kernel.compile_indexer(e["indexer"])
+                e["indexer_fn"] = lb.compile_indexer(e["indexer"])
             if e["tail_fn"] is None:
-                e["tail_fn"] = attention_tail.compile_tail(e["tail"])
+                e["tail_fn"] = lb.compile_tail(e["tail"])
 
 
 @dataclass
-class Dsv4LargeBatchState:
+class SpecDsaLargeBatchState:
     """Per-step metadata and workspace of one caller; see ``prepare``.
 
     ``sched`` is the CTA schedule (row and unit offset where each CTA starts, one extra entry for the end),
@@ -237,8 +236,8 @@ def _host_ints(t: torch.Tensor, count: int, name: str) -> list[int]:
 def prepare(
     ctx_lens: torch.Tensor,
     sinks: torch.Tensor,
-    state: Dsv4LargeBatchState | None = None,
-) -> Dsv4LargeBatchState:
+    state: SpecDsaLargeBatchState | None = None,
+) -> SpecDsaLargeBatchState:
     """Build (or refresh in place) the per-step state for ``B = ctx_lens.numel()`` rows.
 
     Args:
@@ -261,11 +260,11 @@ def prepare(
         raise ValueError(f"compressed lengths must lie in [{MIN_CTX_LEN}, {MAX_CTX_LEN}]")
     if state is not None and state.batch_size != batch_size:
         raise ValueError(f"state is for {state.batch_size} rows, got {batch_size}")
-    _, _, indexer_kernel, selection_lib = _kernel_modules()
+    _, lib = _kernel_modules()
     if state is None:
         ready_queue = torch.zeros((batch_size, READY_QUEUE_WORDS), dtype=torch.int32, device=device)
-        ready_queue.view(-1)[selection_lib.AQ_ENTRY : selection_lib.AQ_ENTRY + batch_size] = -1
-        state = Dsv4LargeBatchState(
+        ready_queue.view(-1)[lib.AQ_ENTRY : lib.AQ_ENTRY + batch_size] = -1
+        state = SpecDsaLargeBatchState(
             batch_size=batch_size,
             sched=torch.empty((NUM_SMS + 1, 2), dtype=torch.int32, device=device),
             sinks=torch.empty((batch_size, NUM_HEADS), dtype=torch.float32, device=device),
@@ -283,7 +282,7 @@ def prepare(
     return state
 
 
-def error_bits(state: Dsv4LargeBatchState) -> torch.Tensor:
+def error_bits(state: SpecDsaLargeBatchState) -> torch.Tensor:
     """Status word of the last launch of ``state`` (``ERR_*`` bits): an int32 [1] device view, no sync.
 
     Zero means the last launch ran normally; a fresh state reads -7 until its first launch.
@@ -317,7 +316,7 @@ def _check_block_table(name: str, t: torch.Tensor, batch_size: int) -> None:
 
 
 def run(
-    state: Dsv4LargeBatchState,
+    state: SpecDsaLargeBatchState,
     q_idx: torch.Tensor,
     w_idx: torch.Tensor,
     k_cache: torch.Tensor,
