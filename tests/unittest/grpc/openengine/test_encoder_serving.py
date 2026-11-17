@@ -339,7 +339,10 @@ async def test_uncertain_encoder_transport_withdraws_health():
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_publish_reclaims_the_completed_cache(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_path", ["rpc", "request_id", "all_requests", "reservation"])
+async def test_cancel_during_publish_reclaims_the_completed_cache(
+    tmp_path, monkeypatch, cancel_path
+):
     llm, _ = model()
     result, _ = native_result()
     llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
@@ -367,6 +370,10 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(tmp_path, monk
         lambda *args: SimpleNamespace(media=(), inputs="prompt"),
     )
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    if cancel_path == "reservation":
+        from test_multimodal import _Frontend
+
+        inference._frontend = _Frontend()
     publish = inference._encoder_cache.publish
     discard = inference._encoder_cache.discard
     entered, reclaimed = asyncio.Event(), asyncio.Event()
@@ -396,12 +403,31 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(tmp_path, monk
     try:
         await asyncio.wait_for(entered.wait(), 2)
         assert list(tmp_path.glob("*.safetensors"))
-        rpc.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await rpc
+        if cancel_path == "rpc":
+            rpc.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await rpc
+        else:
+            if cancel_path == "reservation":
+                assert inference._frontend.reservations[0].abort()
+            else:
+                abort = (
+                    lifecycle_pb2.AbortRequest(request_id=req.request_id)
+                    if cancel_path == "request_id"
+                    else lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests())
+                )
+                response = await _servicer(inference=inference).Abort(abort, FakeServicerContext())
+                assert response.status == lifecycle_pb2.ABORT_STATUS_ABORTED
+            assert not rpc.done()
+            release.set()
+            responses = await asyncio.wait_for(rpc, 2)
+            assert responses == []
     finally:
         release.set()
         await asyncio.gather(rpc, return_exceptions=True)
     await asyncio.wait_for(reclaimed.wait(), 2)
     assert not list(tmp_path.glob("*.safetensors"))
     assert not inference._encoder_cleanup_failed
+    assert inference.active_request_count() == 0
+    if cancel_path == "reservation":
+        assert inference._frontend.reservations[0].released

@@ -770,7 +770,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                                 publication.run,
                                 partial(self._encoder_cache.publish, result, request, self._llm),
                             )
-                            if context.cancelled():
+                            if (
+                                context.cancelled()
+                                or local_request.aborted
+                                or (reservation is not None and reservation.aborted)
+                            ):
                                 return
                             responses.append(
                                 generation_pb2.GenerateResponse(
