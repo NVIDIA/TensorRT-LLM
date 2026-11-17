@@ -243,11 +243,6 @@ _MTP_EMBED_BLOCK_FIRST = True
 # call.
 _MOE_MAX_T = 8192
 
-# Wide expert parallelism (`ALLTOALL_MIN_EP` ranks and more): the most rows a rank sends a
-# round of the alltoall. A rank receives up to `ep_size` times that, which the runner takes
-# `_MOE_MAX_T` rows a call.
-_ALLTOALL_MAX_T = 1024
-
 
 def _moe_alltoall(mapping) -> bool:
     """Whether the routed experts exchange tokens with an alltoall: attention DP with pure
@@ -630,9 +625,10 @@ class _Alltoall(NamedTuple):
 
 def _alltoall_communicators(core: "DeepseekV3DefaultModelingV2") -> _Alltoall:
     """Build the alltoall communicators, collective over the EP group. A round sends at most
-    `_ALLTOALL_MAX_T` rows a rank, fewer when the engine runs fewer tokens a step. Under
-    online EPLB the last dispatch of a forward carries every rank's histogram of the
-    router's 256 experts."""
+    the engine's `max_num_tokens` rows a rank, so a forward is one round, as the built-in
+    MoE's is; a rank receives up to `ep_size` times that, which the runner takes `_MOE_MAX_T`
+    rows a call. Under online EPLB the last dispatch of a forward carries every rank's
+    histogram of the router's 256 experts."""
     cfg = core.model_config.pretrained_config
     d = core.dims
 
@@ -641,7 +637,7 @@ def _alltoall_communicators(core: "DeepseekV3DefaultModelingV2") -> _Alltoall:
             core.model_config.mapping,
             num_slots=d.num_slots,
             top_k=cfg.num_experts_per_tok,
-            max_tokens_per_rank=min(core.model_config.max_num_tokens, _ALLTOALL_MAX_T),
+            max_tokens_per_rank=core.model_config.max_num_tokens,
             hidden_size=d.hidden,
             payload=payload,
             eplb_num_experts=d.num_experts if d.eplb == "online" else None,
