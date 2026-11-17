@@ -223,20 +223,29 @@ def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_pat
 
 
 def _wait_in_thread(builder, op, key, monkeypatch):
-    """Start ``builder.wait(op, key)`` on a thread, and return it once the wait for another
-    rank's build has begun."""
+    """Start ``builder.wait(op, key)`` on a thread, and return the thread once the wait for
+    another rank's build has begun, with what the thread saw: the build's state when the wait
+    returned, or the error it raised."""
     began = threading.Event()
     wait = _jit_share._wait
+    seen = {}
 
     def waiting(result, failed):
         began.set()
         return wait(result, failed)
 
+    def run():
+        try:
+            builder.wait(op, key)
+            seen["state"] = builder.state(op, key)
+        except BaseException as e:  # noqa: BLE001 - reported to the test's thread
+            seen["error"] = e
+
     monkeypatch.setattr(_jit_share, "_wait", waiting)
-    thread = threading.Thread(target=builder.wait, args=(op, key))
+    thread = threading.Thread(target=run)
     thread.start()
     assert began.wait(60)
-    return thread
+    return thread, seen
 
 
 def test_a_rank_waits_for_a_build_another_started_and_makes_one_it_has_not(
@@ -267,10 +276,11 @@ def test_a_rank_waits_for_a_build_another_started_and_makes_one_it_has_not(
             # Not started by the rank that claimed it: the op makes it now.
             assert other.wait("op", "queued") == 0.0
             # Started there: the op waits for it.
-            waiter = _wait_in_thread(other, "op", "busy", monkeypatch)
+            waiter, seen = _wait_in_thread(other, "op", "busy", monkeypatch)
             release.touch()
             waiter.join(60)
-            assert not waiter.is_alive() and other.state("op", "busy") == "done"
+            # The wait returned once the build had ended there.
+            assert not waiter.is_alive() and seen == {"state": "done"}
         finally:
             release.touch()
     assert not (tmp_path / "x").exists() and not (tmp_path / "y").exists()
@@ -296,10 +306,10 @@ def test_a_parallel_build_a_rank_takes_back_is_waited_for_until_it_is_made(
             )
             # This rank takes its queued build back to make it: the other rank waits for it.
             assert builder.wait("op", "k") == 0.0
-            waiter = _wait_in_thread(other, "op", "k", monkeypatch)
+            waiter, seen = _wait_in_thread(other, "op", "k", monkeypatch)
             builder.op_compiled("op", "k", 2.0)
             waiter.join(60)
-            assert not waiter.is_alive() and other.state("op", "k") == "done"
+            assert not waiter.is_alive() and seen == {"state": "done"}
             assert RankWorker.get().build_seconds("op") == 2.0
         finally:
             release.touch()
