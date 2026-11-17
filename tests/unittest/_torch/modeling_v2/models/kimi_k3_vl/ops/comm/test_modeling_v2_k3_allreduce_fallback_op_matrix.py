@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Collected entry point for ``K3AllReduce`` against the built-in ``AllReduce`` off MNNVL.
+"""Collected entry point for ``K3AllReduce`` off MNNVL: every call reaches the runtime ``AllReduce``'s own all-reduce.
 
 The checks are ``_k3_allreduce_fallback_op_matrix.py`` beside this file, its own W-rank launcher (both modules
 share the process's autotuner cache and NCCL window pool, so one job, not independent cases); see ``_rank_job``

@@ -104,13 +104,6 @@ def use_decode_one_shot(model: nn.Module) -> None:
             mnnvl.early_trigger = True
 
 
-def skip_all_reduce() -> AllReduceParams:
-    """All-reduce parameters under which a row-parallel module returns this rank's unreduced output (its projection
-    without its all-reduce): a ``Linear``'s ``all_reduce_params``, a ``GatedMLP``'s ``final_all_reduce_params``; a
-    ``K3AllReduce`` returns its input under them."""
-    return AllReduceParams(enable_allreduce=False)
-
-
 def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``all_reduce(x)`` of a wide decode step (a ``K3AllReduce``, no fusion): its MNNVL all-reduce with the
     `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""

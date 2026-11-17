@@ -1,29 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The tp16_moetp16ep1 target's MLA layer (``mla.py``) against itself on one GPU, at one TP16 rank's shape
+"""The Kimi K3 family's MLA layer (``mla.py``) against itself on one GPU, at one TP16 rank's shape
 (``_kimi_k3_mla_steps``): each step run two ways from the same cache contents.
 
 * Captured and replayed (breakable CUDA graph for prefill steps, CUDA graph for decode steps) against eager: the same
   kernels in the same order, so the output and the cache are bit for bit equal.
 * Ways that run other kernels or another order, within the bf16 band (``BAND``, relative to the largest
-  output): chunked prefill against the whole prefix in one piece (the partials merged on softmax statistics), a mixed
+  output): chunked prefill over a cached prefix against the same requests' whole prompts run fresh (the partials
+  merged on softmax statistics against one causal attention, and the projections over other row counts), a mixed
   step against its context and generation requests run apart (FlashInfer's MLA decode against the CuTe DSL decode,
   and the projections over other row counts), and the decode branch against the generic path (the K3 decode kernels
-  against the CuTe DSL decode). The cache rows are bit for bit equal where the same kernels produce and append them
-  (chunked prefill against the whole prefix), else within the same band.
+  against the CuTe DSL decode). The cache rows are within the same band.
 """
 
 import pytest
 import torch
 
-__extra_import_path__ = [".."]
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+
+__extra_import_path__ = ["."]
 import _kimi_k3_mla_steps as ms  # noqa: E402
 from _kimi_k3_parity import assert_bitwise, assert_within  # noqa: E402
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E402,E501
-    mla,
-    step,
-)
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mla, step
+except NoTarget as no_target:
+    pytest.skip(str(no_target), allow_module_level=True)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
@@ -59,7 +61,7 @@ def test_breakable_graph_matches_eager(layer):
     """Fresh prefill, chunked prefill over a cached prefix and a mixed step, each captured in a breakable CUDA graph
     and replayed: the output and the cache are the eager step's, bit for bit."""
     lens = [0] * ms.NUM_REQUESTS
-    for make in (ms.fresh_prefill, lambda _: ms.prefix_step(True), ms.mixed):
+    for make in (ms.fresh_prefill, lambda _: ms.prefix_step(), ms.mixed):
         s = make(lens) if make is not ms.fresh_prefill else make()
         hidden = layer.hidden(s)
         eager, pool_e, graph, pool_g = _both(
@@ -87,19 +89,50 @@ def test_cuda_graph_matches_eager(layer, ids, tokens, branch):
     assert_bitwise(pool_g, pool_e, f"{s.name}: CUDA graph cache")
 
 
-def test_chunked_prefill_matches_whole_prefix(layer):
+def test_chunked_prefill_matches_whole_prompt(layer):
     """A context step over a cached prefix with chunked prefill (the prefix in 5 chunks, the partials merged on
-    softmax statistics) against the same step reading the prefix in one piece: the output within BAND; the appended
-    rows, from the same kernel, bit for bit."""
+    softmax statistics) against the same requests' whole prompts (prefix and new tokens, the prefix's hidden states
+    as the prefill wrote them) run fresh, without a cached prefix: the new tokens' output and every cache row of the
+    requests within BAND."""
     prefill = ms.fresh_prefill()
-    layer.run(prefill, layer.hidden(prefill))
-    chunked, whole = ms.prefix_step(True), ms.prefix_step(False)
+    prefill_hidden = layer.hidden(prefill)
+    layer.run(prefill, prefill_hidden)
+    chunked, whole = ms.prefix_step(), ms.whole_prompt_step()
     hidden = layer.hidden(chunked)
-    out_c, pool_c, out_w, pool_w = _both(
-        layer, lambda: layer.run(chunked, hidden), lambda: layer.run(whole, hidden)
+    whole_hidden = torch.cat(
+        [
+            torch.cat(
+                [
+                    prefill_hidden[ms.request_rows(prefill, rid)],
+                    hidden[ms.request_rows(chunked, rid)],
+                ]
+            )
+            for rid in chunked.request_ids
+        ]
     )
-    assert_within(out_c, out_w, BAND, "chunked prefill vs whole prefix")
-    assert_bitwise(pool_c, pool_w, "chunked prefill vs whole prefix: cache")
+    lens = ms.advance(ms.advance([0] * ms.NUM_REQUESTS, prefill), chunked)
+    rows = {}
+
+    def run(step, step_hidden):
+        out = layer.run(step, step_hidden)
+        rows[step.name] = ms.rows_of(
+            layer, chunked.request_ids, [lens[r] for r in chunked.request_ids]
+        )
+        return out
+
+    out_c, _, out_w, _ = _both(
+        layer, lambda: run(chunked, hidden), lambda: run(whole, whole_hidden)
+    )
+    new_rows = torch.cat(
+        [
+            out_w[ms.request_rows(whole, rid)][-chunked.seq_lens[k] :]
+            for k, rid in enumerate(chunked.request_ids)
+        ]
+    )
+    assert_within(out_c, new_rows, BAND, "chunked prefill vs whole prompt")
+    assert_within(
+        rows[chunked.name], rows[whole.name], BAND, "chunked prefill vs whole prompt: cache"
+    )
 
 
 def test_mixed_step_matches_separate_steps(layer):

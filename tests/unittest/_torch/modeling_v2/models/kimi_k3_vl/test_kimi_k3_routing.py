@@ -3,9 +3,10 @@
 """Kimi K3 routing (``models/kimi_k3_vl/routing.py``), driven by synthetic configs on CPU.
 
 No checkpoint weights: ``route`` reads the config shape, the quantization, the mapping, the SM version, the LLM API
-arguments, the environment and, with a standalone DSpark drafter, the drafter checkpoint's ``config.json``. Each case
-checks that a configuration the targets do not serve resolves to Modeling V1 under ``auto`` and names the requirement
-under ``require``, and that ``route`` and the targets apply the same checks (``drafter_config``, ``environment``).
+arguments, the environment and, with a standalone DSpark drafter, the drafter checkpoint's ``config.json`` and
+quantization files. Each case checks that a configuration the targets do not serve resolves to Modeling V1 under
+``auto`` and names the requirement under ``require``, and that ``route`` and the targets apply the same checks
+(``drafter_config``, ``engine_settings``, ``environment``).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
     drafter_config,
+    engine_settings,
     environment,
     routing,
 )
@@ -60,14 +62,16 @@ def _qualified(target) -> str:
     return f"{target.__module__.split('.modeling_v2.')[1]}.{target.__name__}"
 
 
-@pytest.fixture(autouse=True, params=[(10, 0), (10, 3)], ids=["sm100", "sm103"])
-def _on_sm10x(request, monkeypatch):
-    """Route as if this were each Blackwell GPU, wherever the test actually runs, on GB200 / GB300 trays of one
-    NVLink domain. The cases that need a GB200 pin sm 10.0 (``_on_sm100``)."""
+_SM100 = (10, 0)
+
+
+@pytest.fixture(autouse=True)
+def _on_gb200(monkeypatch):
+    """Route as if this were a GB200 (sm 10.0, the targets' SM), wherever the test actually runs, on trays of one
+    NVLink domain. A case that routes on another SM pins it itself."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: request.param)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
     monkeypatch.setattr(MNNVLAllReduce, "is_mnnvl", staticmethod(lambda *a, **k: True))
-    return request.param
 
 
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
@@ -86,7 +90,6 @@ def _model_config(pretrained_config, spec_config=None, **mapping_kwargs):
     )
 
 
-_SM100 = (10, 0)
 _TP16_MOETP4EP4 = dict(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
 _TP16_MOETP16EP1 = dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1)
 _K3_TARGET = (
@@ -191,12 +194,6 @@ def _k3_llm_args(mode="auto", **kv_cache_overrides) -> TorchLlmArgs:
     return _llm_args(mode, kv_cache_config=KvCacheConfig(**kv_cache))
 
 
-@pytest.fixture
-def _on_sm100(monkeypatch):
-    """Route as if this were a GB200."""
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
-
-
 def test_kimi_k3_config_surfaces_the_text_config_quantization():
     config = KimiK3Config(
         text_config=dict(quantization_config=_K3_CHECKPOINT_QUANTIZATION),
@@ -210,7 +207,6 @@ def test_kimi_k3_config_surfaces_the_text_config_quantization():
     assert quant_config.group_size == 32
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize("text_as_dict", [False, True], ids=["text-config", "text-dict"])
 @pytest.mark.parametrize(
@@ -224,7 +220,6 @@ def test_kimi_k3_targets_match(mode, text_as_dict, mapping_kwargs, target):
     assert _qualified(modeling_v2_resolve(config, _k3_llm_args(mode))) == target
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "quantization",
     [_K3_NVFP4_QUANTIZATION, None],
@@ -239,7 +234,6 @@ def test_kimi_k3_other_quantizations_do_not_match(quantization):
         modeling_v2_resolve(config, _k3_llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "text_overrides, mapping_kwargs, missed",
     [
@@ -282,7 +276,6 @@ def _k3_with(mapping_kwargs=_TP16_MOETP4EP4, quant_algo=QuantAlgo.W4A16_MXFP4, *
     return replace(_k3_model_config(_k3_config(), quant_algo, **mapping_kwargs), **fields)
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "config, llm_args, missed",
     [
@@ -347,6 +340,65 @@ def test_kimi_k3_unmet_settings_do_not_match(config, llm_args, missed):
     assert modeling_v2_resolve(config, _k3_llm_args("auto", **llm_args)) is None
     with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _k3_llm_args("require", **llm_args))
+
+
+# Each check of engine_settings that route and both targets' _check_construction apply, with a model config that
+# fails only that check.
+_SHARED_SETTINGS_CHECKS = [
+    ("dtype_declines", dict(pretrained_config=_k3_config_in(torch.float16))),
+    (
+        "kv_cache_quant_declines",
+        dict(
+            quant_config=QuantConfig(
+                quant_algo=QuantAlgo.W4A16_MXFP4, kv_cache_quant_algo=QuantAlgo.FP8
+            )
+        ),
+    ),
+    ("quantization_declines", dict(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4))),
+    ("allreduce_strategy_declines", dict(allreduce_strategy=AllReduceStrategy.NCCL)),
+    ("attn_backend_declines", dict(attn_backend="FLASHINFER")),
+]
+
+
+@pytest.mark.parametrize(
+    "predicate, failing_fields",
+    _SHARED_SETTINGS_CHECKS,
+    ids=[check[0] for check in _SHARED_SETTINGS_CHECKS],
+)
+@pytest.mark.parametrize(
+    "mapping_kwargs, target", [(_TP16_MOETP4EP4, "a"), (_TP16_MOETP16EP1, "b")], ids=["a", "b"]
+)
+def test_kimi_k3_route_and_the_targets_apply_the_same_settings_predicates(
+    monkeypatch, predicate, failing_fields, mapping_kwargs, target
+):
+    """``route`` and the target's ``_check_construction`` check the model config's settings only through the same
+    function of the family's ``engine_settings``: patched to refuse, it declines a deployment both otherwise take;
+    patched to accept, it lets through a deployment that fails only its check, so neither caller has its own copy."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        modeling as modeling_a,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+        modeling as modeling_b,
+    )
+
+    modeling = modeling_a if target == "a" else modeling_b
+    expected = _K3_TARGET if target == "a" else _K3_TARGET_B
+
+    accepted = _k3_with(mapping_kwargs)
+    failing = _k3_with(mapping_kwargs, **failing_fields)
+    assert modeling_v2_resolve(failing, _k3_llm_args("auto")) is None
+    with pytest.raises(NoTarget):
+        modeling._check_construction(failing)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine_settings, predicate, lambda *args: "the probe declines")
+        _k3_declines(accepted, "needs other settings: the probe declines")
+        with pytest.raises(NoTarget, match="needs other settings: the probe declines"):
+            modeling._check_construction(accepted)
+
+    monkeypatch.setattr(engine_settings, predicate, lambda *args: None)
+    assert _qualified(modeling_v2_resolve(failing, _k3_llm_args("require"))) == expected
+    modeling._check_construction(failing)
 
 
 # RadixArk-Kimi-K3-DSpark's config.json, one layer: a Qwen3-shaped GQA drafter whose heads and MLP split over TP16
@@ -427,7 +479,6 @@ def _k3_declines(config, missed):
         modeling_v2_resolve(config, _k3_llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 def test_kimi_k3_dspark_embedded_draft_does_not_match(tmp_path):
     """DSpark's draft is embedded in the target when the drafter checkpoint's weight index holds ``mtp.<n>.`` keys;
     tp16_moetp4ep4 builds its own drafter from a standalone checkpoint only."""
@@ -435,7 +486,6 @@ def test_kimi_k3_dspark_embedded_draft_does_not_match(tmp_path):
     _k3_declines(_k3_dspark(path), "draft embedded in the target")
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "drafter", [_K3_GQA_DRAFTER, _K3_MLA_DRAFTER], ids=["gqa drafter", "mla drafter"]
 )
@@ -446,7 +496,6 @@ def test_kimi_k3_dspark_standalone_drafters_match(tmp_path, drafter):
     assert _qualified(modeling_v2_resolve(config, _k3_llm_args("require"))) == _K3_TARGET
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "overrides, missed",
     [
@@ -475,6 +524,10 @@ def test_kimi_k3_dspark_standalone_drafters_match(tmp_path, drafter):
             dict(dflash_config={**_K3_GQA_DRAFTER["dflash_config"], "output_multiplier": -1.0}),
             "output_multiplier must be positive and finite",
         ),
+        (
+            dict(dflash_config={**_K3_GQA_DRAFTER["dflash_config"], "output_multiplier": 2.0}),
+            r"declares a logit transform \(output_multiplier 2.0, final_logit_softcapping None\)",
+        ),
     ],
     ids=[
         "llama backbone",
@@ -487,6 +540,7 @@ def test_kimi_k3_dspark_standalone_drafters_match(tmp_path, drafter):
         "intermediate not over tp16",
         "kv heads not over tp16",
         "negative logit multiplier",
+        "logit multiplier",
     ],
 )
 def test_kimi_k3_dspark_drafters_the_target_does_not_build_do_not_match(
@@ -498,7 +552,79 @@ def test_kimi_k3_dspark_drafters_the_target_does_not_build_do_not_match(
     _k3_declines(_k3_dspark(path), "does not build this drafter: .*" + missed)
 
 
-@pytest.mark.usefixtures("_on_sm100")
+# The weight quantization a drafter checkpoint declares, where ``ModelConfig.from_pretrained`` reads it: the
+# ``quantization_config`` of its config.json, or ModelOpt's hf_quant_config.json.
+_FP8_BLOCK_QUANTIZATION = {
+    "quant_method": "fp8",
+    "weight_block_size": [128, 128],
+    "activation_scheme": "dynamic",
+}
+_MODELOPT_FP8 = {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "FP8"}}
+_MODELOPT_FP8_KV_ONLY = {
+    "producer": {"name": "modelopt"},
+    "quantization": {"quant_algo": None, "kv_cache_quant_algo": "FP8"},
+}
+
+
+@pytest.mark.parametrize(
+    "drafter", [_K3_GQA_DRAFTER, _K3_MLA_DRAFTER], ids=["gqa drafter", "mla drafter"]
+)
+@pytest.mark.parametrize(
+    "inline, modelopt, algo",
+    [(_FP8_BLOCK_QUANTIZATION, None, "FP8_BLOCK_SCALES"), (None, _MODELOPT_FP8, "FP8")],
+    ids=["config.json", "hf_quant_config.json"],
+)
+def test_kimi_k3_dspark_quantized_drafters_do_not_match(tmp_path, drafter, inline, modelopt, algo):
+    """A drafter checkpoint that declares weight quantization is declined: both drafters load unquantized weights."""
+    config = dict(drafter) if inline is None else {**drafter, "quantization_config": inline}
+    path = _k3_drafter_checkpoint(tmp_path, config)
+    if modelopt is not None:
+        (tmp_path / "hf_quant_config.json").write_text(json.dumps(modelopt))
+    _k3_declines(
+        _k3_dspark(path),
+        "does not build this drafter: the drafter checkpoint declares weight quantization "
+        f"{algo}; the target loads an unquantized drafter",
+    )
+
+
+@pytest.mark.parametrize(
+    "drafter", [_K3_GQA_DRAFTER, _K3_MLA_DRAFTER], ids=["gqa drafter", "mla drafter"]
+)
+def test_kimi_k3_dspark_drafter_with_only_kv_cache_quantization_matches(tmp_path, drafter):
+    """A ModelOpt file that declares only a KV-cache quantization quantizes no weight (the draft KV cache takes the
+    target's dtype)."""
+    path = _k3_drafter_checkpoint(tmp_path, drafter)
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(_MODELOPT_FP8_KV_ONLY))
+    assert _qualified(modeling_v2_resolve(_k3_dspark(path), _k3_llm_args("require"))) == _K3_TARGET
+
+
+@pytest.mark.parametrize(
+    "drafter", [_K3_GQA_DRAFTER, _K3_MLA_DRAFTER], ids=["gqa drafter", "mla drafter"]
+)
+def test_kimi_k3_dspark_drafters_refuse_a_quantized_draft_config(tmp_path, drafter):
+    """The drafter constructors refuse the draft config the engine builds for a quantized checkpoint, with the
+    message ``route`` declines it with."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        drafter as gqa,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        drafter_mla as mla,
+    )
+
+    path = _k3_drafter_checkpoint(tmp_path, drafter)
+    pretrained_config = drafter_config.load_pretrained_config(path, trust_remote_code=True)
+    drafter_cls = (
+        mla.K3MLADSparkDrafter if drafter_config.is_mla(pretrained_config) else gqa.K3DSparkDrafter
+    )
+    draft_config = ModelConfig(
+        pretrained_config=pretrained_config, quant_config=QuantConfig(quant_algo=QuantAlgo.FP8)
+    )
+    with pytest.raises(
+        NoTarget, match="declares weight quantization FP8; the target loads an unquantized"
+    ):
+        drafter_cls(draft_config)
+
+
 @pytest.mark.parametrize("missing", ["config", "directory"])
 def test_kimi_k3_dspark_unreadable_drafter_does_not_match(tmp_path, missing):
     """A drafter config that cannot be loaded is declined, so under ``auto`` Modeling V1 reports the load error."""
@@ -510,27 +636,32 @@ def test_kimi_k3_dspark_unreadable_drafter_does_not_match(tmp_path, missing):
 
 
 # Each check of drafter_config a drafter constructor raises for, the drafter config it is probed with, the attention
-# backend, and what the constructor raises. The MLA drafter's later checks run after its block-decode backend
-# resolves, so the CuTe DSL probe is patched to pass.
+# backend, and what the constructor raises. The drafters' later checks run after their attention backend resolves, so
+# the TRTLLM-Gen and CuTe DSL probes are patched to pass.
 _SHARED_CHECKS = [
     ("gqa_declines", _K3_GQA_DRAFTER, "AUTO", NoTarget),
     ("gqa_tp_declines", _K3_GQA_DRAFTER, "AUTO", NoTarget),
+    ("quantized_weights_declines", _K3_GQA_DRAFTER, "AUTO", NoTarget),
     ("gqa_unknown_attention_backend", _K3_GQA_DRAFTER, "AUTO", ValueError),
     ("gqa_attention_backend_declines", _K3_GQA_DRAFTER, "AUTO", NoTarget),
+    ("logit_transform_declines", _K3_GQA_DRAFTER, "AUTO", NoTarget),
     ("mla_declines", _K3_MLA_DRAFTER, "AUTO", NoTarget),
+    ("quantized_weights_declines", _K3_MLA_DRAFTER, "AUTO", NoTarget),
     ("mla_cp_declines", _K3_MLA_DRAFTER, "AUTO", NotImplementedError),
     ("mla_tp_declines", _K3_MLA_DRAFTER, "AUTO", ValueError),
     ("mla_unknown_attention_backend", _K3_MLA_DRAFTER, "AUTO", ValueError),
+    ("logit_transform_declines", _K3_MLA_DRAFTER, "AUTO", NoTarget),
     ("mla_markov_head_declines", _K3_MLA_DRAFTER, "AUTO", ValueError),
     ("mla_causal_declines", _K3_MLA_DRAFTER, "AUTO", ValueError),
 ]
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "predicate, drafter_fields, backend, raised",
     _SHARED_CHECKS,
-    ids=[check[0] for check in _SHARED_CHECKS],
+    ids=[
+        f"{check[0]}-{'mla' if check[1] is _K3_MLA_DRAFTER else 'gqa'}" for check in _SHARED_CHECKS
+    ],
 )
 def test_kimi_k3_route_and_the_drafters_apply_the_same_predicates(
     tmp_path, monkeypatch, predicate, drafter_fields, backend, raised
@@ -543,6 +674,7 @@ def test_kimi_k3_route_and_the_drafters_apply_the_same_predicates(
     )
 
     monkeypatch.setattr(drafter_config, predicate, lambda *args: "the probe declines")
+    monkeypatch.setattr(drafter._block_attn_op, "unavailability_reason", lambda: None)
     monkeypatch.setattr(drafter_mla._mla_ops, "mla_decode_unavailability_reason", lambda: None)
     path = _k3_drafter_checkpoint(tmp_path, drafter_fields)
     _k3_declines(_k3_dspark(path), "does not build this drafter: the probe declines")
@@ -559,7 +691,6 @@ def test_kimi_k3_route_and_the_drafters_apply_the_same_predicates(
         )
 
 
-@pytest.mark.usefixtures("_on_sm100")
 def test_kimi_k3_route_and_the_mla_drafter_read_the_same_rope(tmp_path, monkeypatch):
     """The MLA drafter's RoPE check: ``route`` and the drafter's ``rope_params`` read the RoPE settings through
     ``drafter_config``'s functions."""
@@ -575,7 +706,6 @@ def test_kimi_k3_route_and_the_mla_drafter_read_the_same_rope(tmp_path, monkeypa
         drafter_mla.rope_params(pretrained_config, None)
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "overrides, missed",
     [
@@ -595,6 +725,10 @@ def test_kimi_k3_route_and_the_mla_drafter_read_the_same_rope(tmp_path, monkeypa
             dict(dflash_config={"final_logit_softcapping": -2.0}),
             "final_logit_softcapping must be non-negative and finite",
         ),
+        (
+            dict(dflash_config={"final_logit_softcapping": 30.0}),
+            r"declares a logit transform \(output_multiplier 1.0, final_logit_softcapping 30.0\)",
+        ),
     ],
     ids=[
         "heads not over tp16",
@@ -604,6 +738,7 @@ def test_kimi_k3_route_and_the_mla_drafter_read_the_same_rope(tmp_path, monkeypa
         "linear rope",
         "yarn no factor",
         "negative softcap",
+        "softcap",
     ],
 )
 def test_kimi_k3_dspark_mla_drafters_the_target_does_not_build_do_not_match(
@@ -615,7 +750,6 @@ def test_kimi_k3_dspark_mla_drafters_the_target_does_not_build_do_not_match(
     _k3_declines(_k3_dspark(path), "does not build this drafter: .*" + missed)
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "drafter, probe, backend, missed",
     [
@@ -623,7 +757,7 @@ def test_kimi_k3_dspark_mla_drafters_the_target_does_not_build_do_not_match(
             _K3_GQA_DRAFTER,
             None,
             "CUTEDSL",
-            r"K3DSparkDrafter attention backend must be one of \['AUTO', 'TRTLLM', 'VANILLA', 'FA4'\], got 'CUTEDSL'",
+            r"K3DSparkDrafter attention backend must be one of \['AUTO', 'TRTLLM', 'VANILLA'\], got 'CUTEDSL'",
         ),
         (
             _K3_GQA_DRAFTER,
@@ -651,7 +785,6 @@ def test_kimi_k3_dspark_attention_backends_the_drafters_refuse_do_not_match(
     _k3_declines(_k3_dspark(path, attention_backend=backend), missed)
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "drafter, backend",
     [
@@ -679,7 +812,6 @@ def test_kimi_k3_dspark_backends_route_does_not_probe_match(
     assert _qualified(modeling_v2_resolve(config, _k3_llm_args("require"))) == _K3_TARGET
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "field",
     ["enable_return_routed_experts", "use_cute_dsl_bf16_gemm", "use_cute_dsl_bf16_bmm"],
@@ -698,7 +830,6 @@ def test_kimi_k3_unsupported_llm_args_do_not_match(field):
                 modeling_v2_resolve(config, llm_args)
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "name, value",
     [
@@ -722,7 +853,6 @@ def test_kimi_k3_unread_environment_switches_do_not_match(monkeypatch, name, val
         modeling_v2_resolve(config, _k3_llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "name, value",
     [
@@ -757,7 +887,6 @@ def test_kimi_k3_route_reads_the_low_m_gemm_switch_as_its_parser_does(monkeypatc
         assert routing._low_m_gemm_off(value) == (not low_m_gemm._parse_enabled()), value
 
 
-@pytest.mark.usefixtures("_on_sm100")
 def test_kimi_k3_torch_compile_does_not_match():
     """The targets are not traced by torch.compile: a deployment that asks for it is declined."""
     config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
@@ -770,7 +899,6 @@ def test_kimi_k3_torch_compile_does_not_match():
         modeling_v2_resolve(config, llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 def test_kimi_k3_default_kv_cache_settings_do_not_match():
     """Without the K3 settings the KV cache config defaults to 32-token blocks with reuse on: no target."""
     config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
@@ -779,7 +907,6 @@ def test_kimi_k3_default_kv_cache_settings_do_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "spec_config",
     [SADecodingConfig(max_draft_len=2), None],
@@ -799,7 +926,6 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
         modeling_v2_resolve(config, _k3_llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "name, value, missed",
     [
@@ -844,7 +970,6 @@ def test_kimi_k3_environment_values_the_targets_reject_do_not_match(
         modeling_v2_resolve(config, _k3_llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "values",
     [

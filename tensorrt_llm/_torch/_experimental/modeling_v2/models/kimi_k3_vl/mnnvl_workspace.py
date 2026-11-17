@@ -36,9 +36,16 @@ same point, in the same order.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
+    from torch.distributed import ProcessGroup
+
+    from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+    from tensorrt_llm.mapping import Mapping
 
 NUM_LAMPORT_BUFFERS = 3
 """The MNNVL all-reduce workspace's buffer count: each call takes the next one and clears the one before."""
@@ -47,7 +54,7 @@ FLAG_WORDS = 9
 access count]."""
 
 
-def mnnvl_tp_group_comm(mapping):
+def mnnvl_tp_group_comm(mapping: Mapping) -> MPI.Comm | ProcessGroup:
     """A new communicator of exactly mapping.tp_group (its rank i = TP rank i) for a caller-owned
     MNNVL state's create(); only the group's ranks take part (MPI_Comm_create_group). The caller
     frees it (``free_group_comm``). Under Ray the TP ProcessGroup (c10d's).
@@ -67,7 +74,7 @@ def mnnvl_tp_group_comm(mapping):
     return comm
 
 
-def group_comm(mapping) -> Any:
+def group_comm(mapping: Mapping) -> MPI.Comm | ProcessGroup:
     """The communicator of ``mapping``'s TP group as the built-in MNNVL all-reduce makes it, rank i = TP rank i.
 
     Under MPI a new split of the session communicator (collective over the whole session: every rank calls it),
@@ -78,7 +85,7 @@ def group_comm(mapping) -> Any:
     return _get_mnnvl_workspace_comm(mapping)
 
 
-def use_fabric_handle(mapping) -> bool:
+def use_fabric_handle(mapping: Mapping) -> bool:
     """The built-in MNNVL all-reduce's handle rule for ``mapping``: fabric handles when the TP group spans nodes, or
     with ``TRTLLM_FORCE_MNNVL_AR=1``; else POSIX file descriptors. ``MnnvlWorkspace.create`` defaults to
     ``mapping.is_multi_node()`` instead."""
@@ -87,7 +94,7 @@ def use_fabric_handle(mapping) -> bool:
     return use_mnnvl_fabric_handle(mapping)
 
 
-def free_group_comm(comm) -> None:
+def free_group_comm(comm: MPI.Comm | ProcessGroup) -> None:
     """Free a communicator from ``mnnvl_tp_group_comm`` or ``group_comm`` under MPI. A process group belongs to c10d:
     nothing to free."""
     from tensorrt_llm._utils import mpi_disabled
@@ -96,7 +103,7 @@ def free_group_comm(comm) -> None:
         comm.Free()
 
 
-def device_index(mapping) -> int:
+def device_index(mapping: Mapping) -> int:
     """The CUDA device of this rank's multicast buffers: the mapping's local rank under MPI, the current device
     without MPI (Ray workers select their device themselves)."""
     from tensorrt_llm._torch.distributed.ops import _mnnvl_device_index
@@ -104,7 +111,7 @@ def device_index(mapping) -> int:
     return _mnnvl_device_index(mapping)
 
 
-def all_ranks_succeeded(comm, local_success: bool) -> bool:
+def all_ranks_succeeded(comm: MPI.Comm | ProcessGroup, local_success: bool) -> bool:
     """Whether every rank of ``comm`` (from ``mnnvl_tp_group_comm``) passed ``local_success`` true.
 
     Collective over ``comm``. Under MPI an integer all-reduce; without MPI an all-reduce on the process group's CPU
@@ -115,7 +122,9 @@ def all_ranks_succeeded(comm, local_success: bool) -> bool:
     return _mnnvl_workspace_all_succeeded(comm, local_success)
 
 
-def make_mcast_buffer(comm, size_bytes: int, mapping, fabric_handle: bool) -> Any:
+def make_mcast_buffer(
+    comm: MPI.Comm | ProcessGroup, size_bytes: int, mapping: Mapping, fabric_handle: bool
+) -> McastGPUBuffer:
     """Allocate ``size_bytes`` per rank of multicast memory over ``mapping``'s TP group and exchange the handles
     over ``comm`` (from ``mnnvl_tp_group_comm``). Returns the ``McastGPUBuffer``: ``get_uc_buffer(tp_rank, shape,
     dtype, offset)`` is this rank's view, ``get_mc_buffer(shape, dtype, offset)`` the multicast view.
@@ -130,7 +139,10 @@ def make_mcast_buffer(comm, size_bytes: int, mapping, fabric_handle: bool) -> An
 
 
 def arm_lamport_buffers(
-    uc_buffer: torch.Tensor, buffer_flags: torch.Tensor, buffer_bytes: int, comm
+    uc_buffer: torch.Tensor,
+    buffer_flags: torch.Tensor,
+    buffer_bytes: int,
+    comm: MPI.Comm | ProcessGroup,
 ) -> None:
     """Reset a three-buffer Lamport workspace for the MNNVL all-reduce kernels: every word of ``uc_buffer`` (this
     rank's view of ``NUM_LAMPORT_BUFFERS`` buffers of ``buffer_bytes``) to -0.0, the ``FLAG_WORDS`` words of
@@ -164,9 +176,9 @@ class MnnvlWorkspace:
     buffer_bytes: int
     rank: int
     world_size: int
-    handle: Any
+    handle: McastGPUBuffer
     """The ``McastGPUBuffer`` that owns the memory; the workspace is valid while this object lives."""
-    comm: Any
+    comm: MPI.Comm | ProcessGroup
     """The TP-group communicator the handles were exchanged over."""
 
     def comm_buffer(self, dtype: torch.dtype) -> torch.Tensor:
@@ -180,8 +192,8 @@ class MnnvlWorkspace:
 
     @classmethod
     def create(
-        cls, mapping, buffer_bytes: int, fabric_handle: Optional[bool] = None
-    ) -> "MnnvlWorkspace":
+        cls, mapping: Mapping, buffer_bytes: int, fabric_handle: Optional[bool] = None
+    ) -> MnnvlWorkspace:
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective over that group only: every rank of
         the group calls it at the same point, eagerly (not under CUDA-graph capture); ranks outside it take no part.
 
@@ -261,7 +273,7 @@ class SharedLamportWorkspace:
 
 
 def shared_lamport_workspace(
-    mapping, dtype: torch.dtype, buffer_bytes: Optional[int] = None
+    mapping: Mapping, dtype: torch.dtype, buffer_bytes: Optional[int] = None
 ) -> SharedLamportWorkspace:
     """The mapping's shared MNNVL all-reduce workspace, created or grown so one buffer holds ``buffer_bytes``.
 
@@ -285,14 +297,16 @@ def shared_lamport_workspace(
     )
 
 
-def has_shared_lamport_workspace(mapping) -> bool:
+def has_shared_lamport_workspace(mapping: Mapping) -> bool:
     """Whether ``mapping``'s shared MNNVL all-reduce workspace exists (some MNNVL all-reduce of it was built)."""
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
     return MNNVLAllReduce.allreduce_mnnvl_workspaces.get(mapping) is not None
 
 
-def mnnvl_supported(mapping, dtype: torch.dtype, explicitly_requested: bool = False) -> bool:
+def mnnvl_supported(
+    mapping: Mapping, dtype: torch.dtype, explicitly_requested: bool = False
+) -> bool:
     """Whether the built-in all-reduce runs ``mapping``'s TP group over MNNVL: a supported dtype (fp16, bf16, fp32),
     no context parallelism, an aarch64 host whose driver supports multicast memory, and either a group that spans
     nodes or ``explicitly_requested`` (the MNNVL strategy named rather than AUTO). ``TLLM_TEST_MNNVL=1`` forces it

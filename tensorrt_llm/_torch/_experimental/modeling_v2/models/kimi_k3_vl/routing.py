@@ -12,8 +12,8 @@ shape lives in its ``text_config``, so that is what this tree reads. The
 targets are text-only: they load no vision tower and refuse image input.
 
 This module and the family modules it reads (``drafter_config``,
-``environment``) import no target package: declining a deployment loads no
-modeling code and no native library.
+``engine_settings``, ``environment``) import no target package: declining a
+deployment loads no modeling code and no native library.
 """
 
 from __future__ import annotations
@@ -25,16 +25,13 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 from . import drafter_config as _drafter_config
+from . import engine_settings as _engine_settings
 from . import environment as _environment
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-# The one GPU architecture these targets are written for. sm is part of a
-# target's identity, not a knob: a different SM is a different target. The K3
-# decode kernels (the tcgen05 GEMVs, the fused MoE) are built for sm_100 only.
-_SM = (10, 0)
+    from tensorrt_llm.mapping import Mapping
 
 # The MXFP4 checkpoint's config shape; see the note in the sibling gpt_oss
 # routing module for what shape-sniffing does and does not pin.
@@ -44,16 +41,6 @@ _SM = (10, 0)
 # shape too; the quantization in ``config.json`` tells the two apart, and
 # ``_unmet_settings`` also checks the quantization the engine resolved.
 _SHAPE = (93, 7168, 896, 3584)
-
-# The KV-cache block size the targets' MLA kernels are built for.
-_TOKENS_PER_BLOCK = 64
-
-# The attention backend whose metadata the targets' attention layers read.
-_ATTN_BACKEND = "TRTLLM"
-
-# The routed-expert backend the targets' MoE runs. The engine resolves AUTO to
-# TRTLLM for Kimi K3 before it routes.
-_MOE_BACKENDS = frozenset({"AUTO", "TRTLLM"})
 
 # Values of TRTLLM_LOW_M_GEMM_BACKEND that its parser reads as off, after it
 # strips the value, lowercases it and maps "_" to "-".
@@ -124,7 +111,7 @@ def _quant_algo(pretrained_config: Any) -> Optional[QuantAlgo]:
     return quant_config.quant_algo
 
 
-def _parallel(m) -> Optional[str]:
+def _parallel(m: Mapping) -> Optional[str]:
     """Name the parallel topology, or None if no target implements it.
 
     Attention and the dense layers are sharded 16 ways. The routed experts are
@@ -161,10 +148,6 @@ def _unmet_settings(
     step. Checking them here first lets ``auto`` fall back to the built-in
     implementation instead of failing after the target is chosen.
     """
-    import torch
-
-    from tensorrt_llm.functional import AllReduceStrategy
-
     unmet = []
 
     spec_config = model_config.spec_config
@@ -195,43 +178,20 @@ def _unmet_settings(
                     f"speculative decoding DSPARK: the tp16_moetp4ep4 target does not build this drafter: {reason}"
                 )
 
-    if model_config.torch_dtype != torch.bfloat16:
-        unmet.append(f"dtype {model_config.torch_dtype}: the targets compute in bf16")
+    # The settings each target's _check_construction checks too, through the same family function. The KV cache
+    # quantization is read as the engine will apply kv_cache_config.dtype, which it has not done yet.
+    unmet.extend(
+        _engine_settings.declines(model_config, engine_kv_cache_quant_algo(model_config, llm_args))
+    )
 
-    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-    if kv_cache_quant_algo is not None:
-        unmet.append(
-            f"kv_cache_config.dtype {getattr(kv_cache_quant_algo, 'name', kv_cache_quant_algo)}: "
-            "the targets' MLA kernels read a bf16 KV cache"
-        )
-
-    attn_backend = str(model_config.attn_backend).upper()
-    if attn_backend != _ATTN_BACKEND:
-        unmet.append(
-            f"attn_backend {attn_backend}: the targets' attention reads the {_ATTN_BACKEND} "
-            "backend's metadata"
-        )
     if getattr(llm_args, "torch_compile_config", None) is not None:
         unmet.append("torch_compile_config set: torch.compile does not trace the targets")
 
-    quant_algo = model_config.quant_config.quant_algo
-    layer_quant = model_config.quant_config_dict
-    if quant_algo != QuantAlgo.W4A16_MXFP4 or layer_quant:
-        unmet.append(
-            f"resolved quantization {quant_algo} with {len(layer_quant or {})} per-layer "
-            "declarations: the targets load the MXFP4 checkpoint, W4A16_MXFP4 with no "
-            "per-layer declarations"
-        )
-
-    strategy = model_config.allreduce_strategy
-    if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
-        unmet.append(f"allreduce_strategy {strategy.name}: the targets take AUTO or MNNVL")
-
     kv_cache_config = llm_args.kv_cache_config
-    if kv_cache_config.tokens_per_block != _TOKENS_PER_BLOCK:
+    if kv_cache_config.tokens_per_block != _engine_settings.TOKENS_PER_BLOCK:
         unmet.append(
             f"kv_cache_config.tokens_per_block {kv_cache_config.tokens_per_block}: the targets "
-            f"need {_TOKENS_PER_BLOCK}"
+            f"need {_engine_settings.TOKENS_PER_BLOCK}"
         )
     if kv_cache_config.enable_block_reuse:
         unmet.append("kv_cache_config.enable_block_reuse true: the targets need it false")
@@ -247,10 +207,10 @@ def _unmet_settings(
         )
 
     moe_backend = str(model_config.moe_backend).upper()
-    if moe_backend not in _MOE_BACKENDS:
+    if moe_backend not in _engine_settings.MOE_BACKENDS:
         unmet.append(
             f"moe_config.backend {moe_backend}: the targets' routed experts run on "
-            f"{', '.join(sorted(_MOE_BACKENDS))}"
+            f"{', '.join(sorted(_engine_settings.MOE_BACKENDS))}"
         )
     if model_config.moe_load_balancer is not None:
         unmet.append("moe_config.load_balancer set: the targets do not support EPLB")
@@ -304,7 +264,9 @@ def route(
     quant_algo = _quant_algo(pretrained_config)
     parallel = _parallel(mapping)
     mxfp4_on_sm100 = (
-        compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.W4A16_MXFP4
+        compute_capability == _engine_settings.SM
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.W4A16_MXFP4
     )
 
     if mxfp4_on_sm100 and parallel is not None:

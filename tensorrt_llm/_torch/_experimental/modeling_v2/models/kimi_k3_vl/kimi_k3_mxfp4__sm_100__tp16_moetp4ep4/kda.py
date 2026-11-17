@@ -66,14 +66,14 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
 
+from ..norm import run_in_parallel
+from ..step import DecodeStep
 from . import decode_gemv as _decode_gemv
-from .norm import run_in_parallel
 from .ops.ssm.fused_recurrent_kda import fused_recurrent_kda
 from .ops.ssm.k3_kda_attn import k3_kda_attn
 from .ops.ssm.k3_kda_verify import k3_kda_verify
 from .ops.ssm.kda_mtp_decode import kda_mtp_decode
 from .ops.ssm.short_conv_update import short_conv_update
-from .step import DecodeStep
 
 #: Steps of up to this many projection rows overlap the [f_a | b] -> f_b chain with the wide q / k / v / g GEMM on the
 #: auxiliary stream (while a CUDA graph is captured): the cutoff the built-in layer uses.

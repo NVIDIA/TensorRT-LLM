@@ -129,7 +129,7 @@ def test_empty_batch_writes_nothing(mgr) -> None:
 
 def test_graph_replay_matches_eager(mgr, slots) -> None:
     """One reset per layer captured in a CUDA graph, replayed with the slots and flags rewritten in place: the same
-    pools as the same resets run eagerly on a copy."""
+    pools as the same resets run eagerly on a copy, after every replay."""
     pools = _layers(mgr)
     idx = slots[:4].clone()
     flags = torch.zeros(4, dtype=torch.bool, device="cuda")
@@ -142,10 +142,12 @@ def test_graph_replay_matches_eager(mgr, slots) -> None:
         _fill(pools, 81)
         eager = [kc.clone_pools({n: p[n] for n in NAMES}) for p in pools]
         start = [kc.clone_pools({n: p[n] for n in NAMES}) for p in pools]
+        eager_steps = []
         for s, f in schedule:
             h = torch.tensor([not x for x in f], dtype=torch.bool, device="cuda")
             for e in eager:
                 kda_reset_state_rows(e["ssm"], s.contiguous(), h, e["conv"])
+            eager_steps.append([kc.clone_pools(e) for e in eager])
         for p in pools:
             kda_reset_state_rows(p["ssm"], idx, flags, p["conv"])  # compile outside the capture
         torch.cuda.synchronize()
@@ -159,10 +161,23 @@ def test_graph_replay_matches_eager(mgr, slots) -> None:
         for p, s0 in zip(pools, start):
             for n in NAMES:
                 p[n].copy_(s0[n])
-        for s, f in schedule:
+        for step, (s, f) in enumerate(schedule):
             idx.copy_(s)
             flags.copy_(torch.tensor([not x for x in f], dtype=torch.bool, device="cuda"))
             graph.replay()
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
+            assert all(
+                torch.equal(p[n], e[n]) for p, e in zip(pools, eager_steps[step]) for n in NAMES
+            ), f"replay {step}"
     for p, e in zip(pools, eager):
         assert all(torch.equal(p[n], e[n]) for n in NAMES)
+
+
+def test_guard_refuses_strided_index_vectors() -> None:
+    """The kernel reads ``state_indices`` and ``has_initial_states`` at request offsets, so each must be dense 1-D."""
+    pool = torch.zeros(4, 2, dtype=torch.float32, device="cuda")
+    idx = torch.tensor([0, 2, 1, 2], dtype=torch.int32, device="cuda")
+    flags = torch.tensor([False, True, False, True], device="cuda")
+    for bad_idx, bad_flags in ((idx[::2], flags[:2]), (idx[:2], flags[::2])):
+        with pytest.raises(AssertionError, match="contiguous 1-D"):
+            kda_reset_state_rows.is_valid(pool, bad_idx, bad_flags)

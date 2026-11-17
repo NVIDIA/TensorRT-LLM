@@ -24,11 +24,11 @@ classification decides which kernels each module runs:
 * **wide**: a decode step of more than one token tile (DSpark verify of several requests). It keeps the decode
   layout's MoE head and tail, on M-general ops.
 
-Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
-text model (`KimiLinearModel` below: decoder layers, attention residuals, and the MLA / KDA / MoE modules of `mla.py`,
-`kda.py` and `moe.py`), on catalog entries and this family's ops, with the operations and the order of the built-in
-Kimi K3 text model. One weight differs: where the MoE decode path takes a layer, its latent norm's weight is folded
-into the latent up projection (the same function, rounded differently).
+Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's text
+model (`KimiLinearModel` below: decoder layers, attention residuals, and the MLA / KDA / MoE modules of the family's
+`mla.py` and `moe.py` and this target's `kda.py`), on catalog entries and this family's ops, with the operations and the
+order of the built-in Kimi K3 text model. One weight differs: where the MoE decode path takes a layer, its latent norm's
+weight is folded into the latent up projection (the same function, rounded differently).
 
 The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
 decode kernels' ops:
@@ -68,7 +68,7 @@ MNNVL. The construction-time ones fail in `__init__`, the per-engine ones on the
 setting. A layer the decode kernels do not take fails the weight load.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower (its
-weights are a predicted non-load, `weights.py`), and a step carrying multimodal input raises.
+weights are a predicted non-load, the family's `weights.py`), and a step carrying multimodal input raises.
 
 **Speculative decoding** is built and run by `spec_shell.py`'s functions: SA, or DSpark with a
 standalone drafter checkpoint. The DSpark drafter is this target's: `K3DSparkDrafter` for a GQA drafter,
@@ -113,36 +113,31 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCache
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from . import decode_comm as _decode_comm
-from . import decode_gemv as _decode_gemv
-from . import decode_moe as _decode_moe
-from . import spec_shell as _spec_shell
-from . import spec_worker as _spec_worker
-from . import weights as _weights
-from .attn_res import (
+from .. import engine_settings as _engine_settings
+from .. import environment as _environment
+from .. import weights as _weights
+from ..attn_res import (
     _AUX_ATTN_RES_STREAM_ENABLED,
-    KIMI_K3_AUX_ATTN_RES_STREAM_ENV,
     KimiK3RMSNorm,
     _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
     _apply_attn_res_and_rmsnorm,
     _attn_res_max_tokens,
 )
+from ..mla import KimiMLARuntime, resolve_attention_quant_config
+from ..moe import KimiK3GatedMLP, KimiK3MoERuntime
+from ..norm import RMSNorm
+from ..step import DecodeStep, decode_step, latent_push
+from . import decode_comm as _decode_comm
+from . import decode_gemv as _decode_gemv
+from . import decode_moe as _decode_moe
+from . import spec_shell as _spec_shell
+from . import spec_worker as _spec_worker
 from .drafter import K3DSparkDrafter
 from .kda import K3DecodeKDA
-from .mla import KimiMLARuntime, resolve_attention_quant_config
-from .moe import KimiK3GatedMLP, KimiK3MoERuntime
-from .norm import RMSNorm
-from .step import DecodeStep, decode_step, latent_push
-
-# The GPU architecture this target IS. Routing will not send another one here, but a direct instantiation could,
-# and the certification is per arch.
-_SM = (10, 0)
 
 #: The engine surface the first forward checks, under TRTLLM_MODELING_V2_VALIDATE, before this target relies on it:
 #: per object, the attributes read. A renamed field upstream then fails here, naming it.
@@ -159,10 +154,6 @@ REQUIRED_ENGINE_FIELDS = {
     ),
     "kv_cache_manager": ("enable_block_reuse", "mamba_layer_cache"),
 }
-
-# The MLA generation kernels for K3's 96 query heads exist only at a 64-token page (the built-in model's own
-# get_model_defaults sets it for the same reason).
-_TOKENS_PER_BLOCK = 64
 
 _LANG_PREFIX = "language_model."
 
@@ -650,14 +641,12 @@ class KimiLinearModel(DecoderModel):
         dtype = torch.bfloat16
 
         # Attention and MoE phases are sequential, so their branch-overlap
-        # roles share one stream; MoE-internal overlap roles remain separate.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        # roles share one stream; the MoE chunking overlap has its own.
+        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
@@ -688,7 +677,7 @@ class KimiLinearModel(DecoderModel):
         logger.info_once(
             "Kimi K3 aux hidden capture: mode="
             f"{'attn_res_stream' if _AUX_ATTN_RES_STREAM_ENABLED else 'prefix_only'} "
-            f"({KIMI_K3_AUX_ATTN_RES_STREAM_ENV}={int(_AUX_ATTN_RES_STREAM_ENABLED)})",
+            f"({_environment.AUX_ATTN_RES_STREAM}={int(_AUX_ATTN_RES_STREAM_ENABLED)})",
             key="kimi_k3_aux_capture_mode",
         )
 
@@ -963,9 +952,10 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
 def _check_construction(model_config: ModelConfig) -> None:
     """The settings this target is built for that are fixed before the first step."""
     capability = torch.cuda.get_device_capability()
-    if capability != _SM:
+    sm = _engine_settings.SM
+    if capability != sm:
         raise NoTarget(
-            f"this target is certified on sm_{_SM[0]}{_SM[1]}, running on sm_{capability[0]}{capability[1]}"
+            f"this target is certified on sm_{sm[0]}{sm[1]}, running on sm_{capability[0]}{capability[1]}"
         )
     mapping = model_config.mapping
     topology = (
@@ -982,39 +972,18 @@ def _check_construction(model_config: ModelConfig) -> None:
             "moe_tensor_parallel_size 4, moe_expert_parallel_size 4 and enable_attention_dp false; the engine built "
             f"(world, tp, pp, moe_tp, moe_ep, attention_dp) = {topology}"
         )
-    if model_config.torch_dtype != torch.bfloat16:
-        raise NoTarget(
-            f"this target computes in bf16; the engine resolved dtype {model_config.torch_dtype}"
-        )
-    kv_algo = model_config.quant_config.kv_cache_quant_algo
-    if kv_algo is not None:
-        raise NoTarget(
-            f"this target's MLA kernels read a bf16 KV pool; kv_cache_config.dtype resolved to {kv_algo}"
-        )
-    quant_algo = model_config.quant_config.quant_algo
-    if quant_algo != QuantAlgo.W4A16_MXFP4 or model_config.quant_config_dict:
-        raise NoTarget(
-            "this target loads the MXFP4 checkpoint, whose compressed-tensors config the model config reads as "
-            "W4A16_MXFP4 with no per-layer declarations (its routed experts run the W4A8_MXFP4_MXFP8 default); the "
-            f"engine read {quant_algo} with {len(model_config.quant_config_dict or {})} per-layer declarations"
-        )
-    strategy = model_config.allreduce_strategy
-    if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
-        raise NoTarget(
-            f"this target takes allreduce_strategy AUTO or MNNVL; allreduce_strategy is {strategy.name}"
-        )
-    attn_backend = str(model_config.attn_backend).upper()
-    if attn_backend != "TRTLLM":
-        raise NoTarget(
-            f"this target's attention reads the TRTLLM backend's metadata; attn_backend is {attn_backend}"
-        )
+    # The settings route checks too, through the same family function; the engine has applied
+    # kv_cache_config.dtype to the model config by now.
+    unmet = _engine_settings.declines(model_config, model_config.quant_config.kv_cache_quant_algo)
+    if unmet:
+        raise NoTarget("the tp16_moetp4ep4 target needs other settings: " + "; ".join(unmet))
 
 
 class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(
     DecoderModelForCausalLM[KimiLinearModel, PretrainedConfig]
 ):
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks, with
-    one-engine speculative decoding (the functions of `spec_shell.py`). The checkpoint load is this target's manifest
+    one-engine speculative decoding (the functions of `spec_shell.py`). The checkpoint load is the family's manifest
     loader (`weights.py`)."""
 
     # The engine builds the KDA layers' per-step metadata from this class (the hybrid cache manager's replay slots).
@@ -1253,9 +1222,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(
             raise RuntimeError(
                 "the attention metadata has no seq_lens; this target's decode_step needs it"
             )
-        if attn_metadata.tokens_per_block != _TOKENS_PER_BLOCK:
+        tokens_per_block = _engine_settings.TOKENS_PER_BLOCK
+        if attn_metadata.tokens_per_block != tokens_per_block:
             raise ValueError(
-                f"this target needs kv_cache_config.tokens_per_block {_TOKENS_PER_BLOCK}; the engine built "
+                f"this target needs kv_cache_config.tokens_per_block {tokens_per_block}; the engine built "
                 f"{attn_metadata.tokens_per_block}"
             )
         manager = attn_metadata.kv_cache_manager

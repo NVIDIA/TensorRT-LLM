@@ -29,7 +29,7 @@ class DecodeStep:
     num_requests: Optional[int] = None
     tokens_per_request: Optional[int] = None
     #: Whether the MoE layers' latent all-reduce is the routed experts' push form plus ``comm/k3_latent_reduce``
-    #: (``decode_moe.py``): set by ``KimiLinearModel.forward`` from ``latent_push``.
+    #: (each target's ``decode_moe.py``): set by the target's ``KimiLinearModel.forward`` from ``latent_push``.
     latent_push: bool = False
 
     @property

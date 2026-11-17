@@ -617,48 +617,49 @@ def _run_and_check_bf16(
     pool = env.pool_tensor()
     pool_before = pool.clone()
 
-    op(
-        fused_q,
-        q_pe,
-        latent_cache,
-        env.rotary_cos_sin,
-        cu_q_seqlens,
-        cu_kv_seqlens,
-        fmha_scheduler_counter,
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
-        metadata.kv_lens_cuda_runtime,
-        metadata.kv_lens_runtime,
-        metadata.prompt_lens_cpu_runtime,
-        num_contexts,
-        metadata.kv_cache_block_offsets,
-        env.kv_cache_manager.kv_cache_pool_pointers,
-        env.kv_cache_manager.kv_cache_pool_mapping,
-        None,  # kv_scale_orig_quant
-        None,  # kv_scale_quant_orig
-        None,  # kv_cache_scale_orig_quant
-        None,  # out_scale
-        None,  # block_ids_per_seq
-        [None, None],  # helix_tensor_params
-        predicted_tokens_per_seq,
-        0,  # layer_idx
-        num_heads,
-        1,  # num_kv_heads
-        GEN_HEAD_SIZE,
-        0,  # residual_dim
-        env.tokens_per_block,
-        MAX_SEQ_LEN,  # attention_window_size
-        1,  # beam_width
-        0,  # quant_mode
-        1.0,  # q_scaling
-        q_lora_rank,
-        KV_LORA_RANK,
-        QK_NOPE_HEAD_DIM,
-        QK_ROPE_HEAD_DIM,
-        V_HEAD_DIM,
-        True,  # rope_append
-    )
+    with validating(op):
+        op(
+            fused_q,
+            q_pe,
+            latent_cache,
+            env.rotary_cos_sin,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            None,  # mla_bmm1_scale
+            None,  # mla_bmm2_scale
+            None,  # quant_q_buffer
+            metadata.kv_lens_cuda_runtime,
+            metadata.kv_lens_runtime,
+            metadata.prompt_lens_cpu_runtime,
+            num_contexts,
+            metadata.kv_cache_block_offsets,
+            env.kv_cache_manager.kv_cache_pool_pointers,
+            env.kv_cache_manager.kv_cache_pool_mapping,
+            None,  # kv_scale_orig_quant
+            None,  # kv_scale_quant_orig
+            None,  # kv_cache_scale_orig_quant
+            None,  # out_scale
+            None,  # block_ids_per_seq
+            [None, None],  # helix_tensor_params
+            predicted_tokens_per_seq,
+            0,  # layer_idx
+            num_heads,
+            1,  # num_kv_heads
+            GEN_HEAD_SIZE,
+            0,  # residual_dim
+            env.tokens_per_block,
+            MAX_SEQ_LEN,  # attention_window_size
+            1,  # beam_width
+            0,  # quant_mode
+            1.0,  # q_scaling
+            q_lora_rank,
+            KV_LORA_RANK,
+            QK_NOPE_HEAD_DIM,
+            QK_ROPE_HEAD_DIM,
+            V_HEAD_DIM,
+            True,  # rope_append
+        )
     torch.cuda.synchronize()
 
     # 1. The roped q in fused_q's tail; its absorbed-q head and both inputs untouched.
@@ -670,7 +671,10 @@ def _run_and_check_bf16(
     _assert_bytes_equal(q_pe, q_pe_orig, "q_pe")
     _assert_bytes_equal(latent_cache, latent_orig, "latent_cache")
 
-    # 2. The appended rows, and nothing else in the pool.
+    # 2. The appended rows, and nothing else in the pool. The entry's reference (bf16 store, no scale) and this
+    # file's agree first.
+    half = QK_ROPE_HEAD_DIM // 2
+    table = env.rotary_cos_sin.view(-1, QK_ROPE_HEAD_DIM, 2)
     for n in range(rows):
         rid = gen_ids[n // tokens_per_seq]
         row = env.cache_row(rid, positions[n])
@@ -680,6 +684,15 @@ def _run_and_check_bf16(
                 env.rope_ref(latent_orig[n, KV_LORA_RANK:], positions[n]),
             ]
         )
+        entry_ref = op.reference(
+            latent_orig[n],
+            table[positions[n], :half, 0],
+            table[positions[n], :half, 1],
+            QK_ROPE_HEAD_DIM,
+            None,
+            torch.bfloat16,
+        )
+        _assert_bytes_equal(entry_ref, want, f"references disagree, row {n}")
         _assert_bytes_equal(row, want, f"appended row (request {rid}, position {positions[n]})")
     changed = (pool.view(torch.int16) != pool_before.view(torch.int16)).nonzero().cpu()
     got_slots = set(zip(changed[:, 0].tolist(), changed[:, 2].tolist()))

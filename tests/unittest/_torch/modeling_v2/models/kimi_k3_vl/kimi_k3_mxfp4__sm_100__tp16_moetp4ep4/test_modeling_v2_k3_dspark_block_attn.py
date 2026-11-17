@@ -34,8 +34,11 @@ _attn = importlib.import_module(
 )
 k3_dspark_block_attn = _attn.k3_dspark_block_attn
 
-if _attn.unavailability_reason() is not None:
-    pytest.skip(f"k3_dspark_block_attn: {_attn.unavailability_reason()}", allow_module_level=True)
+# Only the tests that need the kernels skip on the probe; the probe's own parity test runs either way.
+_needs_kernel = pytest.mark.skipif(
+    _attn.unavailability_reason() is not None,
+    reason=f"k3_dspark_block_attn: {_attn.unavailability_reason()}",
+)
 
 __extra_import_path__ = ["../../.."]
 from _validating import validating  # noqa: E402
@@ -233,6 +236,7 @@ def _builtin_sequence(case: _Case, cache: torch.Tensor, out: torch.Tensor) -> No
     )
 
 
+@_needs_kernel
 @pytest.mark.parametrize(
     "cell", k3_dspark_block_attn.CELLS, ids=[c.why for c in k3_dspark_block_attn.CELLS]
 )
@@ -270,6 +274,7 @@ def test_k3_dspark_block_attn(cell) -> None:
 _MULTI_CHUNK = [(32, 1, 3, 7), (64, 4, 2, 9)]
 
 
+@_needs_kernel
 @pytest.mark.parametrize("heads, kv, batch, block", _MULTI_CHUNK)
 def test_k3_dspark_block_attn_multi_chunk(heads, kv, batch, block) -> None:
     """A block split over several folded launches: within the band of the reference, and bit for bit the built-in
@@ -291,6 +296,7 @@ def test_k3_dspark_block_attn_multi_chunk(heads, kv, batch, block) -> None:
         assert torch.equal(_bits(out), _bits(out_builtin))
 
 
+@_needs_kernel
 def test_k3_dspark_block_attn_graph_replay() -> None:
     """Captured after an eager call, replayed on the eager call's inputs and then on rewritten q / k / v, lengths and
     slots: every replay bit for bit an eager call on the same inputs, out and cache."""
@@ -342,6 +348,7 @@ _OUT_OF_CONTRACT = {
 }
 
 
+@_needs_kernel
 @pytest.mark.parametrize("case_name", list(_OUT_OF_CONTRACT))
 def test_rejects_out_of_contract(case_name) -> None:
     """The guard refuses the inputs it lists (it raises before the kernel runs)."""
@@ -358,6 +365,7 @@ def test_rejects_out_of_contract(case_name) -> None:
 _SIZES = [(4, 1, 1, 7), (6, 1, 8, 7), (6, 1, 16, 7), (4, 1, 64, 8), (96, 16, 3, 1), (8, 8, 1, 0)]
 
 
+@_needs_kernel
 @pytest.mark.parametrize("heads, kv, batch, block", _SIZES)
 def test_buffer_sizes_match_the_dflash_runtime(heads, kv, batch, block) -> None:
     """The op's workspace and counter sizes equal the DFlash speculative runtime's (``get_dflash_trtllm_gen_ops``,

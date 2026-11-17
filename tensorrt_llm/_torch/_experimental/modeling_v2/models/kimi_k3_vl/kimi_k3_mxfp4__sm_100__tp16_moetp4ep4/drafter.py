@@ -14,7 +14,7 @@ The worker that calls it is this target's ``KimiK3DSparkWorker`` (``spec_worker.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -39,9 +39,10 @@ from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
 from tensorrt_llm.logger import logger
 
+from ..norm import RMSNorm
+from ..step import MAX_REQUESTS, MAX_TOKENS_PER_REQUEST
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
-from .norm import RMSNorm
 from .ops.activation.k3_draft_silu_and_mul import k3_draft_silu_and_mul
 from .ops.attention import k3_draft_rope as _rope_op
 from .ops.attention import k3_dspark_block_attn as _block_attn_op
@@ -51,7 +52,6 @@ from .ops.attention.k3_drafter_attn_qknorm import k3_drafter_attn_qknorm
 from .ops.attention.k3_dspark_block_attn import k3_dspark_block_attn
 from .ops.attention.k3_dspark_dense_block_attn import k3_dspark_dense_block_attn
 from .ops.spec.k3_dspark_markov_chain import k3_dspark_markov_chain
-from .step import MAX_REQUESTS, MAX_TOKENS_PER_REQUEST
 
 #: The (requests, block tokens) splits attention/k3_drafter_attn_qknorm certifies; R x 7 is DSpark's block at
 #: max_draft_len 7.
@@ -511,7 +511,11 @@ class K3DSparkDrafter(nn.Module):
         super().__init__()
         cfg = draft_config.pretrained_config
         mapping = draft_config.mapping
-        reason = _drafter_config.gqa_declines(cfg) or _drafter_config.gqa_tp_declines(cfg, mapping)
+        reason = (
+            _drafter_config.gqa_declines(cfg)
+            or _drafter_config.gqa_tp_declines(cfg, mapping)
+            or _drafter_config.quantized_weights_declines(draft_config.quant_config.quant_algo)
+        )
         if reason is not None:
             raise NoTarget(f"the Kimi K3 DSpark drafter does not build this drafter: {reason}")
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -522,7 +526,7 @@ class K3DSparkDrafter(nn.Module):
 
         def make_all_reduce():
             # A row-parallel projection's TP all-reduce (the family's K3AllReduce: the MNNVL all-reduce, which
-            # use_decode_one_shot gives the decode ceiling; the catalog all-reduce off MNNVL), on the drafter's mapping.
+            # use_decode_one_shot gives the decode ceiling; the runtime AllReduce off MNNVL), on the drafter's mapping.
             if tp_size == 1:
                 return None
             return K3AllReduce(mapping, draft_config.allreduce_strategy, dtype)
@@ -539,6 +543,9 @@ class K3DSparkDrafter(nn.Module):
         self.mask_token_embedding: Optional[torch.Tensor] = None
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
         self.block_size = dflash_config.get("block_size", getattr(cfg, "block_size", None))
+        reason = _drafter_config.logit_transform_declines(cfg)
+        if reason is not None:
+            raise NoTarget(f"the Kimi K3 DSpark drafter does not build this drafter: {reason}")
         self.logit_multiplier, self.logit_softcap = _drafter_config.logit_transform(dflash_config)
 
         # The DSpark heads: shift_label slots on by default, the vanilla Markov head, the confidence head (loaded,
@@ -669,7 +676,12 @@ class K3DSparkDrafter(nn.Module):
         the DSpark heads, and optionally the embedding, of which only the mask token's trained row is kept): this
         rank's shard of every projection, cut as the built-in DSpark drafter's loader cuts them. ``weight_mapper`` is
         not used. On the TP group's
-        collective state ``fc`` is split again (`_k3_split_fc`)."""
+        collective state ``fc`` is split again (`_k3_split_fc`).
+
+        Raises:
+            ValueError: a missing tensor, a tensor of the wrong shape, or a float8 or packed (integer) tensor
+                (`float_weight`).
+        """
         del weight_mapper, kwargs
         weights = self._take_head_weights(weights, self.model.norm.weight.device)
         mask_row = self._trained_mask_row(weights)
@@ -687,12 +699,15 @@ class K3DSparkDrafter(nn.Module):
             )
         # The drafter's own parameters' device (CUDA in the engine).
         device = self.model.norm.weight.device
-        fc_weight = _tensor(remapped["fc.weight"])
+        mapping = self.model_config.mapping
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        shards = CheckpointShards(remapped, 0 if tp_size == 1 else mapping.tp_rank, tp_size)
+        fc_weight = shards.full("fc.weight")
         self.fc = nn.Linear(
             fc_weight.shape[1], fc_weight.shape[0], bias=False, device=device, dtype=fc_weight.dtype
         )
         self.fc.weight.data.copy_(fc_weight)
-        norm_weight = _tensor(remapped["hidden_norm.weight"])
+        norm_weight = shards.full("hidden_norm.weight")
         self.hidden_norm = nn.RMSNorm(
             norm_weight.shape[0],
             eps=getattr(self.config, "rms_norm_eps", 1e-6),
@@ -701,38 +716,16 @@ class K3DSparkDrafter(nn.Module):
             dtype=norm_weight.dtype,
         )
         self.hidden_norm.weight.data.copy_(norm_weight)
-        self._load_backbone(remapped)
+        self._load_backbone(shards)
         if mask_row is not None:
             self.mask_token_embedding = mask_row.to(
                 device=self.fc.weight.device, dtype=self.model_config.torch_dtype
             )
         self._k3_split_fc()
 
-    def _load_backbone(self, weights: Dict) -> None:
-        """This rank's shard of every layer tensor and the final norm; every one must be in ``weights``."""
-        mapping = self.model_config.mapping
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        rank = 0 if tp_size == 1 else mapping.tp_rank
-        missing = []
-
-        def take(name: str):
-            if name not in weights:
-                missing.append(name)
-                return None
-            return weights[name]
-
-        def rows(name: str):
-            t = take(name)
-            return None if t is None else _shard(t, 0, rank, tp_size)
-
-        def cols(name: str):
-            t = take(name)
-            return None if t is None else _shard(t, 1, rank, tp_size)
-
-        def full(name: str):
-            t = take(name)
-            return None if t is None else _tensor(t)
-
+    def _load_backbone(self, shards: CheckpointShards) -> None:
+        """This rank's shard of every layer tensor and the final norm; every one must be in the checkpoint."""
+        rows, cols, full = shards.rows, shards.cols, shards.full
         loads = []
         for i, layer in enumerate(self.model.layers):
             p = f"layers.{i}."
@@ -753,19 +746,7 @@ class K3DSparkDrafter(nn.Module):
                 (mlp.down_proj.weight, cols(p + "mlp.down_proj.weight")),
             ]
         loads.append((self.model.norm.weight, full("norm.weight")))
-        if missing:
-            raise ValueError(
-                f"{type(self).__name__}: checkpoint provides no weights for {missing[:8]}"
-                f"{' ...' if len(missing) > 8 else ''}; loading would leave them uninitialized."
-            )
-        with torch.no_grad():
-            for param, value in loads:
-                if tuple(param.shape) != tuple(value.shape):
-                    raise ValueError(
-                        f"{type(self).__name__}: a checkpoint tensor of shape {tuple(value.shape)} for a parameter "
-                        f"of shape {tuple(param.shape)}"
-                    )
-                param.data.copy_(value)
+        shards.copy_into(type(self).__name__, loads)
 
     def _split_fused_qkv(self, weights: Dict) -> Dict:
         """A checkpoint that ships a fused ``self_attn.qkv_proj`` split into q / k / v by the global head counts, as
@@ -816,12 +797,16 @@ class K3DSparkDrafter(nn.Module):
                         f"DSpark {k} has shape {_shape(heads[k])}, expected [vocab, markov_rank] = "
                         f"({vocab}, {rank})."
                     )
-            self.markov_w1 = _tensor(heads["markov_w1.weight"]).to(device)
-            self.markov_w2 = _tensor(heads["markov_w2.weight"]).to(device)
+            self.markov_w1 = _whole("markov_w1.weight", heads["markov_w1.weight"]).to(device)
+            self.markov_w2 = _whole("markov_w2.weight", heads["markov_w2.weight"]).to(device)
         if "confidence_proj.weight" in heads:
-            self.confidence_proj_weight = _tensor(heads["confidence_proj.weight"]).to(device)
+            self.confidence_proj_weight = _whole(
+                "confidence_proj.weight", heads["confidence_proj.weight"]
+            ).to(device)
         if "confidence_proj.bias" in heads:
-            self.confidence_proj_bias = _tensor(heads["confidence_proj.bias"]).to(device)
+            self.confidence_proj_bias = _whole(
+                "confidence_proj.bias", heads["confidence_proj.bias"]
+            ).to(device)
         return weights
 
     def _trained_mask_row(self, weights: Dict) -> Optional[torch.Tensor]:
@@ -843,7 +828,7 @@ class K3DSparkDrafter(nn.Module):
                 f"expected [rows, hidden_size={hidden_size}]."
             )
         if 0 <= self.mask_token_id < shape[0]:
-            return weight[self.mask_token_id]
+            return float_weight(name, weight[self.mask_token_id])
         if self.mask_token_id == self.config.vocab_size:
             logger.warning(
                 f"{type(self).__name__}: the checkpoint ships {name}, but mask_token_id is DFlash's default "
@@ -1607,6 +1592,27 @@ def _tensor(t) -> torch.Tensor:
     return t if isinstance(t, torch.Tensor) else t[:]
 
 
+def float_weight(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor``, read from the draft checkpoint's ``name``, where it is an unquantized floating-point weight (bf16,
+    fp16 or fp32, which the drafters load as is or cast to bf16).
+
+    Raises:
+        ValueError: a float8 tensor or a packed (integer) one; copied into a bf16 parameter it would load without its
+            quantization scales.
+    """
+    if not tensor.is_floating_point() or tensor.element_size() < 2:
+        raise ValueError(
+            f"the draft checkpoint's {name} is {tensor.dtype}: the drafter loads unquantized weights (bf16, fp16 or "
+            "fp32), and a float8 or packed quantized tensor would load without its scales."
+        )
+    return tensor
+
+
+def _whole(name: str, t) -> torch.Tensor:
+    """The draft checkpoint's ``name``, ``t``, read whole and checked by `float_weight`."""
+    return float_weight(name, _tensor(t))
+
+
 def _shard(t, dim: int, rank: int, tp_size: int) -> torch.Tensor:
     """Rank ``rank``'s contiguous block of ``t`` along ``dim`` split evenly over ``tp_size`` ranks (the built-in
     loader's cut for these divisible widths), reading only that block from a lazy slice."""
@@ -1619,3 +1625,84 @@ def _shard(t, dim: int, rank: int, tp_size: int) -> torch.Tensor:
     index = [slice(None)] * len(_shape(t))
     index[dim] = slice(rank * step, (rank + 1) * step)
     return t[tuple(index)].contiguous() if isinstance(t, torch.Tensor) else t[tuple(index)]
+
+
+class CheckpointShards:
+    """This rank's shards of a draft checkpoint's tensors, read by name: ``rows`` / ``cols`` cut the rank's contiguous
+    block along dim 0 / 1 (`_shard`, the built-in loader's cut), ``full`` reads the tensor whole, ``vocab_rows`` cuts
+    a vocabulary-sharded embedding's rows (zero-padded where TP does not divide the vocabulary). Each one read is
+    checked by `float_weight`. A name the checkpoint lacks reads as None and is recorded; `copy_into` reports them
+    all."""
+
+    def __init__(self, weights: Dict, rank: int, tp_size: int) -> None:
+        self.weights = weights
+        self.rank = rank
+        self.tp_size = tp_size
+        self.missing: List[str] = []
+
+    def _take(self, name: str):
+        """The checkpoint's ``name`` as handed over (a torch tensor or a lazy safetensors slice), or None."""
+        if name not in self.weights:
+            self.missing.append(name)
+            return None
+        return self.weights[name]
+
+    def rows(self, name: str) -> Optional[torch.Tensor]:
+        t = self._take(name)
+        return None if t is None else float_weight(name, _shard(t, 0, self.rank, self.tp_size))
+
+    def cols(self, name: str) -> Optional[torch.Tensor]:
+        t = self._take(name)
+        return None if t is None else float_weight(name, _shard(t, 1, self.rank, self.tp_size))
+
+    def full(self, name: str) -> Optional[torch.Tensor]:
+        t = self._take(name)
+        return None if t is None else _whole(name, t)
+
+    def vocab_rows(
+        self, name: str, vocab: int, start: int, stop: int, rows: int
+    ) -> Optional[torch.Tensor]:
+        """Rows ``[start, stop)`` of the checkpoint's ``name`` (``vocab`` rows) in a zero tensor of ``rows`` rows: this
+        rank's block of a vocabulary-sharded embedding whose ``rows`` is the vocabulary divided by TP rounded up, so
+        the last rank's rows past the vocabulary stay zero (the built-in ``Embedding``'s load).
+
+        Raises:
+            ValueError: the checkpoint tensor does not have ``vocab`` rows.
+        """
+        t = self._take(name)
+        if t is None:
+            return None
+        shape = _shape(t)
+        if shape[0] != vocab:
+            raise ValueError(
+                f"the draft checkpoint's {name} has {shape[0]} rows, not the vocabulary size {vocab}"
+            )
+        count = max(0, stop - start)
+        block = float_weight(name, _tensor(t[start : start + count]))
+        out = block.new_zeros((rows, *shape[1:]))
+        out[:count].copy_(block)
+        return out
+
+    def copy_into(
+        self, owner: str, loads: Sequence[Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    ) -> None:
+        """Copy each value of ``loads`` into its parameter, every name read having been found and every value having
+        its parameter's shape (``owner`` names the drafter in the errors).
+
+        Raises:
+            ValueError: a name the checkpoint lacks, or a value of another shape.
+        """
+        missing = self.missing
+        if missing:
+            raise ValueError(
+                f"{owner}: checkpoint provides no weights for {missing[:8]}"
+                f"{' ...' if len(missing) > 8 else ''}; loading would leave them uninitialized."
+            )
+        with torch.no_grad():
+            for param, value in loads:
+                if tuple(param.shape) != tuple(value.shape):
+                    raise ValueError(
+                        f"{owner}: a checkpoint tensor of shape {tuple(value.shape)} for a parameter "
+                        f"of shape {tuple(param.shape)}"
+                    )
+                param.data.copy_(value)

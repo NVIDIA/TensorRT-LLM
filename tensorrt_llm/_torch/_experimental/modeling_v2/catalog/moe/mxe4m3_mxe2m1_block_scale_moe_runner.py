@@ -353,6 +353,9 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
         assert act_type in (ACT_TYPE_SWIGLU, ACT_TYPE_SITU), act_type
         if act_type == ACT_TYPE_SITU:
             assert alpha is not None and beta is not None, "SiTU takes both soft caps"
+            assert bool((alpha > 0).all()) and bool((beta > 0).all()), (
+                "SiTU's soft caps must be positive"
+            )
             assert clamp_limit is None, "SiTU takes no clamp limit"
         num_tokens, hidden = hidden_states.shape
         up_c, up_s, up_b = up

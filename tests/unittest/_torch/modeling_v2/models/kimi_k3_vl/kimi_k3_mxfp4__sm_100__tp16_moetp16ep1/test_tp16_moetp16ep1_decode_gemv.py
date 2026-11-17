@@ -22,12 +22,10 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import norm as norm_module
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
     decode_gemv,
     modeling,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    norm as norm_module,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import (
     k3_situ_mul,

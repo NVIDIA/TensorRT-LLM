@@ -109,3 +109,10 @@ def test_sequential_verify_chain() -> None:
             assert _rel(o, o_ref) <= TOL_OUT, (step, _rel(o, o_ref))
             assert _rel(state, ref_state) <= TOL_STATE, (step, _rel(state, ref_state))
     assert torch.equal(t["state"], start)
+
+
+def test_guard_refuses_no_lower_bound() -> None:
+    t = _make(1, 6, torch.Generator(device="cuda").manual_seed(3))
+    args = _args(t, 0, 1, t["state"])[:-1] + (None,)
+    with pytest.raises(AssertionError, match="lower-bound gate"):
+        fused_recurrent_kda.is_valid(*args)

@@ -7,7 +7,7 @@
 * `moe/k3_moe_front`, one kernel: this rank's slice of the MoE head (its latent-down rows and its router rows) as one
   GEMV, the slices' all-gather over the TP group's `K3MoeHeadWorkspace`, the top-16 routing, the MXFP8 latent, and
   the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of
-  ``trtllm::kimi_k3_noaux_tc_mxfp8_quant``, as the generic path's (`moe.py`), on the router logits
+  ``trtllm::kimi_k3_noaux_tc_mxfp8_quant``, which the generic path (the family's `moe.py`) runs, on the router logits
   of the front's head GEMV;
 * the routed experts of all 896 experts over this rank's intermediate slice: `moe/k3_moe_m1` at one token,
   `moe/k3_moe_m2` at two, `moe/k3_moe` (on a `K3MoeState`) at three to eight;
@@ -81,8 +81,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_
     k3_route_quant,
 )
 
+from ..norm import run_in_parallel
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
-from .norm import run_in_parallel
 
 # The MoE engines of one and two tokens.
 from .ops.moe.k3_moe_m1 import K3MoeM1Layer, K3MoeM1State, k3_moe_m1, k3_moe_m1_push
@@ -326,13 +326,6 @@ class K3DecodeMoeLayer:
                 torch.cuda.synchronize(device)
                 self._routed(*args, offset, push=True)
                 k3_latent_reduce(rows, exchange)
-        # The generic path's route + quant build (moe.py routes up to 64 tokens on it, without the early trigger).
-        k3_route_quant(
-            torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device),
-            self.bias,
-            torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device),
-            float(moe.gate.routed_scaling_factor),
-        )
         torch.cuda.synchronize(device)
 
     def _front(self, moe: nn.Module, x: torch.Tensor):

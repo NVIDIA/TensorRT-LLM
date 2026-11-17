@@ -9,6 +9,7 @@ TP16 rank's shapes (``_kimi_k3_kda_steps``).
   with acceptance in between (the K3 kernels' one-request k3_kda_attn round included). Every step run twice from the
   same pools gives the same bits; after every prefill and plain decode the replay caches' committed conv window equals
   the live pool's.
+* In every manager state, steps of some requests leave the other requests' conv and state rows as they were.
 * The decode kernels and the generic decode on the same step and pools agree within the ops' bands.
 * The generic decode of more than 8 requests, after a prefill batch with a long sequence.
 * A mixed step inside a breakable CUDA graph (the core as one eager break), replayed, gives the eager step's bits.
@@ -43,7 +44,7 @@ def buffers():
 def _run(module, metadata, hidden, step_kind: str = "branch"):
     """How the model calls the layer on a step: ``forward`` with the step's ``decode_step`` classification on the
     decode branch, ``forward_generic`` where ``decode_step`` gives None or ``step_kind`` is "generic"."""
-    step = ks.decode_step_of(TARGET, metadata)
+    step = ks.decode_step_of(metadata)
     if step_kind == "generic" or step is None:
         return lambda: module.forward_generic(hidden, metadata)
     return lambda: module.forward(hidden, metadata, step)
@@ -74,7 +75,7 @@ def test_step_sequence(mode, buffers):
         )
         ks.committed_window_follows(mgr, slots, "continuation + decode")
         decode = ks.make_step(mgr, [], [], [], slots)
-        assert ks.decode_step_of(TARGET, decode).tokens_per_request == 1
+        assert ks.decode_step_of(decode).tokens_per_request == 1
         _step(mgr, module, decode, 4, "decode (k3_kda_decode_attn)")
         ks.committed_window_follows(mgr, slots, "decode (k3_kda_decode_attn)")
         _step(mgr, module, decode, 5, "decode (kda_decode)", step_kind="generic")
@@ -90,6 +91,37 @@ def test_step_sequence(mode, buffers):
             verify = ks.make_step(mgr, [], [], [], round_slots, tokens_per_gen=steps)
             _step(mgr, module, verify, 10 + r, f"verify round {r}")
             ks.accept(mgr, round_slots, accepted)
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("mode", list(ks.MODES))
+def test_inactive_request_rows_keep_state(mode, buffers):
+    """Steps of two of four requests (a fresh prefill, a decode on each decode path, and a verify round in the
+    speculative states) leave the other two requests' conv and recurrent-state rows as they were."""
+    mgr = ks.build_manager(mode)
+    try:
+        module = ks.build_module(TARGET, k3_buffers=buffers, aux_stream=torch.cuda.Stream())
+        slots = ks.request_slots(mgr, 4, first_id=200)
+        ks.fill_pools(mgr, seed=31)
+        active, idle = slots[:2], slots[2:]
+        prefill = ks.make_step(mgr, active, [37, 5], [False, False], [])
+        ks.idle_rows_keep_state(
+            mgr, _run(module, prefill, ks.hidden_for(prefill, 32)), idle, "prefill"
+        )
+        decode = ks.make_step(mgr, [], [], [], active)
+        ks.idle_rows_keep_state(
+            mgr, _run(module, decode, ks.hidden_for(decode, 33)), idle, "decode"
+        )
+        ks.idle_rows_keep_state(
+            mgr, _run(module, decode, ks.hidden_for(decode, 34), "generic"), idle, "generic decode"
+        )
+        num_spec = ks.MODES[mode]
+        if num_spec is not None:
+            verify = ks.make_step(mgr, [], [], [], active, tokens_per_gen=num_spec + 1)
+            ks.idle_rows_keep_state(
+                mgr, _run(module, verify, ks.hidden_for(verify, 35)), idle, "verify"
+            )
     finally:
         mgr.shutdown()
 
@@ -133,7 +165,7 @@ def test_generic_decode_of_more_than_eight_requests(buffers):
         prefill = ks.make_step(mgr, slots, lens, [i % 3 == 0 for i in range(12)], [])
         _step(mgr, module, prefill, 7, "prefill x12")
         decode = ks.make_step(mgr, [], [], [], slots)
-        assert ks.decode_step_of(TARGET, decode) is None  # more than 8 requests: the generic path
+        assert ks.decode_step_of(decode) is None  # more than 8 requests: the generic path
         for i in range(2):
             _step(mgr, module, decode, 8 + i, f"decode x12 #{i}")
     finally:

@@ -3,8 +3,6 @@
 """FLA's token-by-token KDA (``fla.ops.kda.fused_recurrent_kda``) from dense V-first states: one step of Kimi K3's
 sequential KDA verify."""
 
-from typing import Optional
-
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -56,7 +54,7 @@ class FusedRecurrentKda(OpWrapper):
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         initial_state: torch.Tensor,
-        lower_bound: Optional[float],
+        lower_bound: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Imported on the first call, so that importing the target does not need FLA.
         from fla.ops.kda import fused_recurrent_kda as fla_fused_recurrent_kda
@@ -88,7 +86,7 @@ class FusedRecurrentKda(OpWrapper):
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         initial_state: torch.Tensor,
-        lower_bound: Optional[float],
+        lower_bound: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         heads, dim = q.shape[-2:]
         qf = q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6) * dim**-0.5
@@ -106,6 +104,22 @@ class FusedRecurrentKda(OpWrapper):
             state = state + b[:, t, :, None, None] * err.unsqueeze(-1) * kf[:, t].unsqueeze(-2)
             out[:, t] = (state * qf[:, t].unsqueeze(-2)).sum(-1)
         return out.to(v.dtype), state
+
+    def is_valid(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        initial_state: torch.Tensor,
+        lower_bound: float,
+    ) -> None:
+        assert lower_bound is not None, (
+            "the entry covers the lower-bound gate; FLA's gate without a lower bound is another formula"
+        )
 
 
 fused_recurrent_kda = FusedRecurrentKda()

@@ -12,7 +12,7 @@ The collected entry point is ``test_modeling_v2_kimi_k3_decode_moe_tp16_moetp16e
 
 Every rank builds MoE layers the way the target's ``post_load_weights`` does (``K3DecodeMoe.create``,
 ``fold_latent_norm``, ``K3DecodeMoeLayer.create``, ``warm_up``) from stand-in layers holding what the path reads: the
-target's KimiK3MoEGate, nn.Linear latent projections, the stock RMSNorm and shared GatedMLP at this TP, and the routed
+family's KimiK3MoEGate, nn.Linear latent projections, the stock RMSNorm and shared GatedMLP at this TP, and the routed
 experts of a TP16 rank (all 896, the 192-wide intermediate slice zero-padded to 256 by TRT-LLM's loader, random
 MXFP4). The reference of a step is the same front with the returned-partial ``k3_moe`` of its ``K3MoeState`` and the
 routed experts' MNNVL all-reduce.
@@ -69,6 +69,8 @@ GRAPH_ROWS = (2, 8, 1)
 R = None
 T = None  # the target module
 DM = None  # its decode_moe module
+# The family's MoE block, which the target module imports.
+_FAMILY_MOE = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.moe"
 
 
 def _gen(seed):
@@ -138,9 +140,7 @@ def _moe_layer(seed: int, experts):
         hidden_size=H,
     )
     with torch.device("cuda"):
-        gate = sys.modules[T.__package__ + ".moe"].KimiK3MoEGate(
-            cfg, logits_gemm_dtype=torch.bfloat16
-        )
+        gate = sys.modules[_FAMILY_MOE].KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16)
         down = nn.Linear(H, LATENT, bias=False, dtype=torch.bfloat16)
         up = nn.Linear(LATENT, H, bias=False, dtype=torch.bfloat16)
         norm = RMSNorm(hidden_size=LATENT, eps=1e-5, dtype=torch.bfloat16)

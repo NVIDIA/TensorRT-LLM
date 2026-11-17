@@ -697,18 +697,6 @@ class KimiK3DSparkWorker(DSparkWorker):
                     draft_model, gen_logits, inputs, spec_metadata
                 )
 
-                # DFlash 2: replace the independent per-position picks with one
-                # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "has_candidate_selector", False):
-                    gen_logits = self._apply_dflash2_selector(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        spec_metadata,
-                    )
-                    vocab_size = gen_logits.shape[-1]
-
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
                     spec_metadata,

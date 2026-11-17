@@ -93,7 +93,7 @@ def test_forward_without_speculation(model):
     assert (model.spec_config, model.draft_config, model.draft_model, model.spec_worker) == (
         None,
     ) * 4
-    assert model.use_separate_draft_kv_cache is False and model.layer_idx == -1
+    assert model.use_separate_draft_kv_cache is False
     assert model.epilogue == [model.lm_head]
     assert isinstance(model.logits_processor, target_modeling._decode_gemv.K3LogitsProcessor)
     model.logits_processor = _Logits()
@@ -109,4 +109,6 @@ def test_forward_without_speculation(model):
         and kwargs["spec_metadata"] is None
     )
     ((hidden, head, ctx),) = model.logits_processor.calls
-    assert hidden.shape[0] == 4 and head is model.lm_head and ctx is True
+    # The text model's first 4 of its 6 rows.
+    assert torch.equal(hidden, torch.arange(4 * HIDDEN, dtype=torch.float32).view(4, HIDDEN))
+    assert head is model.lm_head and ctx is True

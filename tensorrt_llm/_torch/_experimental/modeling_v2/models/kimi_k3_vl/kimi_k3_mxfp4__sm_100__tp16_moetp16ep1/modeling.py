@@ -24,10 +24,10 @@ classification decides which kernels each module runs:
 * **decode**: a pure decode step of R <= 8 generation requests and no context request; without speculation each
   request has one token. The request-aware kernels take it: MLA attention and its KV store.
 
-Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
-text model (`KimiLinearModel` below: decoder layers, attention residuals, and the MLA / KDA / MoE modules of `mla.py`,
-`kda.py` and `moe.py`), on catalog entries and this family's ops, with the operations and the order of the built-in
-Kimi K3 text model.
+Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's text
+model (`KimiLinearModel` below: decoder layers, attention residuals, and the MLA / KDA / MoE modules of the family's
+`mla.py` and `moe.py` and this target's `kda.py`), on catalog entries and this family's ops, with the operations and the
+order of the built-in Kimi K3 text model.
 
 The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
 decode kernels' ops:
@@ -67,12 +67,11 @@ per-engine ones on the first forward, each naming the setting. A layer the decod
 weight load.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower (its
-weights are a predicted non-load, `weights.py`), and a step carrying multimodal input raises.
+weights are a predicted non-load, the family's `weights.py`), and a step carrying multimodal input raises.
 
 **No speculative decoding.** A speculative decoding config fails construction, naming `tp16_moetp4ep4`'s expert
-split. The target class builds no drafter and no worker. This target drops
-`tp16_moetp4ep4`'s KDA verify kernels and the per-token verify states they keep; the text model's speculative
-hidden-state taps stay as `tp16_moetp4ep4` has them and never fire.
+split. The target class builds no drafter and no worker. This target has none of `tp16_moetp4ep4`'s KDA verify
+kernels, per-token verify states or speculative hidden-state taps.
 """
 
 from __future__ import annotations
@@ -106,33 +105,25 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCache
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from . import decode_comm as _decode_comm
-from . import decode_gemv as _decode_gemv
-from . import decode_moe as _decode_moe
-from . import weights as _weights
-from .attn_res import (
-    _AUX_ATTN_RES_STREAM_ENABLED,
-    KIMI_K3_AUX_ATTN_RES_STREAM_ENV,
+from .. import engine_settings as _engine_settings
+from .. import weights as _weights
+from ..attn_res import (
     KimiK3RMSNorm,
-    _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
     _apply_attn_res_and_rmsnorm,
     _attn_res_max_tokens,
 )
+from ..mla import KimiMLARuntime, resolve_attention_quant_config
+from ..moe import KimiK3GatedMLP, KimiK3MoERuntime
+from ..norm import RMSNorm
+from ..step import DecodeStep, decode_step, latent_push
+from . import decode_comm as _decode_comm
+from . import decode_gemv as _decode_gemv
+from . import decode_moe as _decode_moe
 from .kda import K3DecodeKDA
-from .mla import KimiMLARuntime, resolve_attention_quant_config
-from .moe import KimiK3GatedMLP, KimiK3MoERuntime
-from .norm import RMSNorm
-from .step import DecodeStep, decode_step, latent_push
-
-# The GPU architecture this target IS. Routing will not send another one here, but a direct instantiation could,
-# and the certification is per arch.
-_SM = (10, 0)
 
 #: The engine surface the first forward checks, under TRTLLM_MODELING_V2_VALIDATE, before this target relies on it:
 #: per object, the attributes read. A renamed field upstream then fails here, naming it.
@@ -149,10 +140,6 @@ REQUIRED_ENGINE_FIELDS = {
     ),
     "kv_cache_manager": ("enable_block_reuse", "mamba_layer_cache"),
 }
-
-# The MLA generation kernels for K3's 96 query heads exist only at a 64-token page (the built-in model's own
-# get_model_defaults sets it for the same reason).
-_TOKENS_PER_BLOCK = 64
 
 _LANG_PREFIX = "language_model."
 
@@ -300,7 +287,6 @@ class KimiLinearDecoderLayer(nn.Module):
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         step: DecodeStep,
-        capture: Optional[Tuple[Any, int]] = None,
         prenormed: bool = False,
         pending_moe_partial: Optional[Union[torch.Tensor, _decode_comm.PendingTail]] = None,
         defer_moe_tail: bool = False,
@@ -310,13 +296,6 @@ class KimiLinearDecoderLayer(nn.Module):
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
-
-        ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
-        stream for the layer BEFORE this one: the aggregated stream for layer j
-        is by definition what its next consumer sees, so the mixture computed
-        below already is it. Reading it here beats recomputing it, and is only
-        possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
-        PP support would need a recompute at the rank boundary.
 
         ``step`` is the step's classification (``decode_step``), handed to the
         attention module.
@@ -337,10 +316,7 @@ class KimiLinearDecoderLayer(nn.Module):
         ``hidden_states`` is the prefix sum without it, and this layer's
         pre-attention step reduces and adds it: a ``PendingTail`` in one
         ``K3DecodeComm.sandwich_tail`` call, a wide decode step's tensor by its
-        all-reduce and the fused add + attn_res + RMSNorm. On a tapped layer
-        the ``sandwich_tail`` call also stores the tap into the capture slot
-        where the speculative metadata exposes it (``capture_view``); other
-        tapped layers take the tap after the step.
+        all-reduce and the fused add + attn_res + RMSNorm.
 
         ``defer_moe_tail``: return ``(prefix_sum, num_snapshots, partial)``
         instead, ``partial`` this layer's MoE output unreduced, for the next
@@ -359,8 +335,6 @@ class KimiLinearDecoderLayer(nn.Module):
         snapshot_row = None
         if tail is not None and self.layer_idx % self.attn_res_block_size == 0:
             snapshot_row = block_residual[num_snapshots]
-        # No layer is tapped: this target decodes without speculation, so ``capture`` is always None.
-        assert capture is None
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
@@ -374,8 +348,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 updated_out=snapshot_row,
-                tap=None,
-                tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
             )
         elif pending_moe_partial is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -479,22 +451,10 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
-        capture: Optional[Tuple[Any, int]] = None,
     ) -> Tuple[torch.Tensor, int]:
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
-        if capture is not None:
-            if num_snapshots > 0:
-                hidden_states = _apply_attn_res(
-                    prefix_sum,
-                    valid_block_residual,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                )
-            tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
-            capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
-            hidden_states = self.input_layernorm(hidden_states)
-        elif num_snapshots > 0:
+        if num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
                 valid_block_residual,
@@ -605,14 +565,12 @@ class KimiLinearModel(DecoderModel):
         dtype = torch.bfloat16
 
         # Attention and MoE phases are sequential, so their branch-overlap
-        # roles share one stream; MoE-internal overlap roles remain separate.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        # roles share one stream; the MoE chunking overlap has its own.
+        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
@@ -636,16 +594,6 @@ class KimiLinearModel(DecoderModel):
         # The decode path's GEMVs and embedding (decode_gemv.py), built by the target's cache_derived_state once the
         # weights are final. None: every step embeds on the generic path.
         self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
-
-        # Which convention the drafter tap is on is not recoverable from the
-        # served output -- a mismatch only lowers acceptance -- so state it once
-        # at construction rather than leaving it to be inferred from an AL.
-        logger.info_once(
-            "Kimi K3 aux hidden capture: mode="
-            f"{'attn_res_stream' if _AUX_ATTN_RES_STREAM_ENABLED else 'prefix_only'} "
-            f"({KIMI_K3_AUX_ATTN_RES_STREAM_ENV}={int(_AUX_ATTN_RES_STREAM_ENABLED)})",
-            key="kimi_k3_aux_capture_mode",
-        )
 
     @property
     def kda_draft_records(self) -> bool:
@@ -675,21 +623,13 @@ class KimiLinearModel(DecoderModel):
         i: int,
         hidden_states: torch.Tensor,
         num_snapshots: int,
-        spec_metadata,
-        capture_set,
         step: DecodeStep,
     ) -> bool:
         """Whether layer ``i`` hands its MoE output on unreduced (the row-parallel tail, ``decode_moe.py``): its MoE
         takes the step with that tail, and its consumer, the next layer's pre-attention step or the final norm after
-        the last layer, accepts it. A layer DSpark taps defers too: the next layer's step reduces the output, then taps
-        its pre-norm mixture. An unknown capture set (every layer tapped) and a tapped last layer keep the replicated
-        tail."""
+        the last layer, accepts it."""
         layer = self.layers[i]
         if not (layer.is_moe and layer.block_sparse_moe.tail_rp_eligible(hidden_states, step)):
-            return False
-        if spec_metadata is not None and (
-            capture_set is None or (layer.layer_idx in capture_set and i == len(self.layers) - 1)
-        ):
             return False
         return self.layers[min(i + 1, len(self.layers) - 1)].accepts_moe_partial(num_snapshots)
 
@@ -708,7 +648,7 @@ class KimiLinearModel(DecoderModel):
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
         step = decode_step(attn_metadata, num_tokens)
         if step is None:
-            return self._generic_forward(attn_metadata, input_ids, inputs_embeds, spec_metadata)
+            return self._generic_forward(attn_metadata, input_ids, inputs_embeds)
         if self._latent_push(attn_metadata, step):
             step = replace(step, latent_push=True)
         # A decode step embeds and norms for layer 0 in one launch, the embedding written as layer 0's first snapshot.
@@ -736,21 +676,17 @@ class KimiLinearModel(DecoderModel):
                 hidden_states.shape[1],
             )
         num_snapshots = 0
-        capture_set = getattr(spec_metadata, "_capture_layer_set", None)
         # A MoE layer's output handed on unreduced, which the next layer's pre-attention step (or the final norm)
         # reduces: a decode_comm.PendingTail, or a wide decode step's tensor.
         pending_moe_partial = None
         for i, layer in enumerate(self.layers):
-            defer_moe_tail = self._defer_moe_tail(
-                i, hidden_states, num_snapshots, spec_metadata, capture_set, step
-            )
+            defer_moe_tail = self._defer_moe_tail(i, hidden_states, num_snapshots, step)
             outputs = layer(
                 hidden_states,
                 block_residual,
                 num_snapshots,
                 attn_metadata,
                 step=step,
-                capture=self._capture(spec_metadata, capture_set, i),
                 prenormed=i == 0 and prenormed is not None,
                 pending_moe_partial=pending_moe_partial,
                 defer_moe_tail=defer_moe_tail,
@@ -782,12 +718,7 @@ class KimiLinearModel(DecoderModel):
             )
             return normed
         return self._final_norm(
-            hidden_states,
-            block_residual,
-            num_snapshots,
-            spec_metadata,
-            capture_set,
-            _attn_res_max_tokens(step),
+            hidden_states, block_residual, num_snapshots, _attn_res_max_tokens(step)
         )
 
     def _generic_forward(
@@ -795,7 +726,6 @@ class KimiLinearModel(DecoderModel):
         attn_metadata: AttentionMetadata,
         input_ids: Optional[torch.IntTensor],
         inputs_embeds: Optional[torch.FloatTensor],
-        spec_metadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         block_residual = hidden_states.new_empty(
@@ -804,67 +734,19 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
-        capture_set = getattr(spec_metadata, "_capture_layer_set", None)
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states, num_snapshots = layer.forward_generic(
-                hidden_states,
-                block_residual,
-                num_snapshots,
-                attn_metadata,
-                capture=self._capture(spec_metadata, capture_set, i),
+                hidden_states, block_residual, num_snapshots, attn_metadata
             )
-        return self._final_norm(
-            hidden_states, block_residual, num_snapshots, spec_metadata, capture_set
-        )
-
-    def _capture(self, spec_metadata, capture_set, i: int) -> Optional[Tuple[Any, int]]:
-        # DSpark hidden-state capture. The drafter is distilled on
-        # the aggregated stream value -- the pre-norm softmax mixture its
-        # next consumer sees -- not on the raw prefix sum a layer returns,
-        # which is SGLang's fallback for models without the
-        # attention-residual scheme. Capturing the prefix sum costs 4.5pt
-        # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
-        # The tap fires inside layer i+1, which computes that tensor
-        # anyway; see its forward docstring. Ground truth: SGLang
-        # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
-        # aggregate_stream_torch.
-        if (
-            spec_metadata is not None
-            and i > 0
-            and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
-        ):
-            return (spec_metadata, self.layers[i - 1].layer_idx)
-        return None
+        return self._final_norm(hidden_states, block_residual, num_snapshots)
 
     def _final_norm(
         self,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
         num_snapshots: int,
-        spec_metadata,
-        capture_set,
         max_fused_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        # The last layer has no successor, so this one recompute is
-        # unavoidable -- output-side score weights, matching SGLang's
-        # layer_idx + 1 >= end_layer branch. Unreachable for K3's capture set
-        # against 93 layers; kept so a set that does include the final layer
-        # gets the right tensor rather than the raw prefix sum.
-        if spec_metadata is not None and len(self.layers) > 0:
-            last = self.layers[-1]
-            if capture_set is None or last.layer_idx in capture_set:
-                tail = (
-                    _apply_attn_res(
-                        hidden_states,
-                        block_residual[:num_snapshots],
-                        self.output_attn_res_proj,
-                        self.output_attn_res_norm,
-                    )
-                    if num_snapshots > 0 and _AUX_ATTN_RES_STREAM_ENABLED
-                    else hidden_states
-                )
-                spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
-
         return _apply_attn_res_and_rmsnorm(
             hidden_states,
             block_residual[:num_snapshots],
@@ -909,9 +791,10 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
 def _check_construction(model_config: ModelConfig) -> None:
     """The settings this target is built for that are fixed before the first step."""
     capability = torch.cuda.get_device_capability()
-    if capability != _SM:
+    sm = _engine_settings.SM
+    if capability != sm:
         raise NoTarget(
-            f"this target is certified on sm_{_SM[0]}{_SM[1]}, running on sm_{capability[0]}{capability[1]}"
+            f"this target is certified on sm_{sm[0]}{sm[1]}, running on sm_{capability[0]}{capability[1]}"
         )
     mapping = model_config.mapping
     topology = (
@@ -939,39 +822,18 @@ def _check_construction(model_config: ModelConfig) -> None:
             "the tp16_moetp16ep1 target decodes without speculation; for DSpark or SA set "
             "moe_tensor_parallel_size 4 and moe_expert_parallel_size 4 (the tp16_moetp4ep4 target)"
         )
-    if model_config.torch_dtype != torch.bfloat16:
-        raise NoTarget(
-            f"this target computes in bf16; the engine resolved dtype {model_config.torch_dtype}"
-        )
-    kv_algo = model_config.quant_config.kv_cache_quant_algo
-    if kv_algo is not None:
-        raise NoTarget(
-            f"this target's MLA kernels read a bf16 KV pool; kv_cache_config.dtype resolved to {kv_algo}"
-        )
-    quant_algo = model_config.quant_config.quant_algo
-    if quant_algo != QuantAlgo.W4A16_MXFP4 or model_config.quant_config_dict:
-        raise NoTarget(
-            "this target loads the MXFP4 checkpoint, whose compressed-tensors config the model config reads as "
-            "W4A16_MXFP4 with no per-layer declarations (its routed experts run the W4A8_MXFP4_MXFP8 default); the "
-            f"engine read {quant_algo} with {len(model_config.quant_config_dict or {})} per-layer declarations"
-        )
-    strategy = model_config.allreduce_strategy
-    if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
-        raise NoTarget(
-            f"this target takes allreduce_strategy AUTO or MNNVL; allreduce_strategy is {strategy.name}"
-        )
-    attn_backend = str(model_config.attn_backend).upper()
-    if attn_backend != "TRTLLM":
-        raise NoTarget(
-            f"this target's attention reads the TRTLLM backend's metadata; attn_backend is {attn_backend}"
-        )
+    # The settings route checks too, through the same family function; the engine has applied
+    # kv_cache_config.dtype to the model config by now.
+    unmet = _engine_settings.declines(model_config, model_config.quant_config.kv_cache_quant_algo)
+    if unmet:
+        raise NoTarget("the tp16_moetp16ep1 target needs other settings: " + "; ".join(unmet))
 
 
 class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(
     DecoderModelForCausalLM[KimiLinearModel, PretrainedConfig]
 ):
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks (no
-    speculative decoding). The checkpoint load is this target's manifest loader (`weights.py`)."""
+    speculative decoding). The checkpoint load is the family's manifest loader (`weights.py`)."""
 
     # The engine builds the KDA layers' per-step metadata from this class (the hybrid cache manager's replay slots).
     mamba_metadata_cls = KimiK3MambaMetadata
@@ -1006,8 +868,6 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(
         self.draft_model = None
         self.spec_worker = None
         self.use_separate_draft_kv_cache = False
-        # The capture slot of the final hidden states (DSpark capture layer -1).
-        self.layer_idx = -1
         self._step_checked = False
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._validate_step_contract = step_contract_enabled()
@@ -1162,9 +1022,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(
             raise RuntimeError(
                 "the attention metadata has no seq_lens; this target's decode_step needs it"
             )
-        if attn_metadata.tokens_per_block != _TOKENS_PER_BLOCK:
+        tokens_per_block = _engine_settings.TOKENS_PER_BLOCK
+        if attn_metadata.tokens_per_block != tokens_per_block:
             raise ValueError(
-                f"this target needs kv_cache_config.tokens_per_block {_TOKENS_PER_BLOCK}; the engine built "
+                f"this target needs kv_cache_config.tokens_per_block {tokens_per_block}; the engine built "
                 f"{attn_metadata.tokens_per_block}"
             )
         manager = attn_metadata.kv_cache_manager

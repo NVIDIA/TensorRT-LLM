@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The Kimi K3 targets' construction-time checks, host-side, each run by the target's test directory on its own
-modules: the ModelConfig fields the construction checks read, the targets' architecture on any host, the routed
-experts' quantization check and the DSpark worker's markov bias against the shared worker."""
+modules: the ModelConfig fields the construction checks read, the targets' architecture on any host, and the DSpark
+worker's markov bias against the shared worker."""
 
 import inspect
 import types
@@ -46,15 +46,6 @@ def config(
 def sm_100(monkeypatch):
     """The targets' architecture, on any host."""
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
-
-
-def check_routed_quant_is_checked(moe):
-    """A target's ``moe`` module serves the MXFP4 checkpoint's routed-expert quantization (W4A8_MXFP4_MXFP8) and
-    rejects at construction any other, unquantized included."""
-    moe._check_routed_quant(QuantAlgo.W4A8_MXFP4_MXFP8)
-    for other in (None, QuantAlgo.NVFP4, QuantAlgo.W4A16_MXFP4):
-        with pytest.raises(NotImplementedError, match="no per-expert checkpoint layout"):
-            moe._check_routed_quant(other)
 
 
 def check_dspark_markov_bias_meets_the_shared_worker_contract(spec_worker, monkeypatch):

@@ -103,20 +103,22 @@ def test_rejects_out_of_contract() -> None:
     weights = (x["res_weight"], x["rms_weight"], x["output_rms_weight"], 1e-6, 1e-6)
     single = x["block_residual"][:0]
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    sm_reserve_rule = r"sm_reserve=-?\d+ must be in"
+    # Each call against the native check that refuses it.
     bad_calls = {
-        "N == 1": (x["layer_residual"], None, single, *weights, 0),
-        "sm_reserve == SM count": (
-            x["layer_residual"],
-            None,
-            x["block_residual"],
-            *weights,
-            sm_count,
+        "N == 1": (
+            (x["layer_residual"], None, single, *weights, 0),
+            r"supported N values are \[2, 9\]",
         ),
-        "negative sm_reserve": (x["layer_residual"], None, x["block_residual"], *weights, -1),
+        "sm_reserve == SM count": (
+            (x["layer_residual"], None, x["block_residual"], *weights, sm_count),
+            sm_reserve_rule,
+        ),
+        "negative sm_reserve": (
+            (x["layer_residual"], None, x["block_residual"], *weights, -1),
+            sm_reserve_rule,
+        ),
     }
-    for name, args in bad_calls.items():
-        try:
+    for args, pattern in bad_calls.values():
+        with pytest.raises(RuntimeError, match=pattern):
             OP(*args)
-        except RuntimeError:
-            continue
-        raise AssertionError(f"{name}: the op accepted an out-of-contract call")

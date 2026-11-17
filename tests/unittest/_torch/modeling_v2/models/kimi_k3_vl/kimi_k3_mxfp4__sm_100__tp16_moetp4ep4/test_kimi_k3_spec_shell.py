@@ -237,7 +237,9 @@ def test_base_without_speculation():
         and kwargs["spec_metadata"] is None
     )
     ((hidden, head, ctx),) = shell.logits_processor.calls
-    assert hidden.shape[0] == 4 and head is shell.lm_head and ctx is True
+    # The text model's first 4 of its 6 rows.
+    assert torch.equal(hidden, torch.arange(4 * HIDDEN, dtype=torch.float32).view(4, HIDDEN))
+    assert head is shell.lm_head and ctx is True
 
 
 def test_spec_shell_without_speculation_is_the_base():
@@ -481,12 +483,19 @@ def test_drafter_load_cuts_each_projection_like_the_builtin_loader(monkeypatch, 
             assert torch.equal(mlp.down_proj.weight, shard(p + "mlp.down_proj.weight", row))
             assert torch.equal(attn.q_norm.weight, weights[p + "self_attn.q_norm.weight"])
             assert torch.equal(layer.input_layernorm.weight, weights[p + "input_layernorm.weight"])
+            assert torch.equal(attn.k_norm.weight, weights[p + "self_attn.k_norm.weight"])
+            assert torch.equal(
+                layer.post_attention_layernorm.weight,
+                weights[p + "post_attention_layernorm.weight"],
+            )
             assert (attn.num_heads, attn.num_key_value_heads) == (16 // tp, 16 // tp)
             assert (attn.o_proj.all_reduce is None) == (tp == 1)
             assert (mlp.down_proj.all_reduce is None) == (tp == 1)
         assert torch.equal(drafter.fc.weight, weights["fc.weight"])
         assert torch.equal(drafter.model.norm.weight, weights["norm.weight"])
         assert torch.equal(drafter.markov_w1, weights["markov_head.markov_w1.weight"])
+        assert torch.equal(drafter.markov_w2, weights["markov_head.markov_w2.weight"])
+        assert torch.equal(drafter.hidden_norm.weight, weights["hidden_norm.weight"])
 
 
 def test_drafter_load_requires_every_layer_tensor(monkeypatch):

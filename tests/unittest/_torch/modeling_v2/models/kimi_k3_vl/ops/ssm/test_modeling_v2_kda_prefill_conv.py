@@ -126,6 +126,7 @@ def _call(fn, inp: dict, conv: torch.Tensor, max_seqlen=None):
 
 
 def _check_outputs(got, want, tokens: int, heads: int) -> None:
+    assert len(got) == len(want) == 3, (len(got), len(want))
     for a, b in zip(got, want):
         assert (
             a.shape == (1, tokens, heads, 128) and a.dtype == torch.bfloat16 and a.is_contiguous()

@@ -13,7 +13,7 @@ collected entry point is ``test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_o
 The decode_comm checks are ``_kimi_k3_decode_comm_checks.py`` of the family test directory, all of them at every step
 of its ``ALL_STEPS``, the speculative ones included. This file adds the checks of the target's MoE decode path:
   * decode MoE (first, outside inference mode with autograd on, as post_load_weights runs): the MoE decode path built
-    from a MoE layer's own modules (the target's gate, whose parameters require grad, the latent projections, the
+    from a MoE layer's own modules (the family's gate, whose parameters require grad, the latent projections, the
     stock RMSNorm and shared GatedMLP; zeroed routed experts) at this TP, every kernel warmed up, then a 3-token step
     and a wide 16-token step against the shared expert's forward.
   * decode MoE push: the MoE decode path with random MXFP4 routed experts (this target's layout: 224 local experts of
@@ -58,7 +58,7 @@ MOE_TOL = 3e-2  # the front's fused shared gate_up + SiTU against the shared exp
 
 
 def _decode_moe_layer():
-    """A MoE layer with the parts the decode path reads, from the modules KimiK3MoERuntime builds: the target's
+    """A MoE layer with the parts the decode path reads, from the modules KimiK3MoERuntime builds: the family's
     KimiK3MoEGate, nn.Linear latent projections, the stock RMSNorm and GatedMLP (at this check's TP), each with its
     own parameters (the gate's and the latent projections' require grad, as in the model), and zeroed routed-expert
     buffers in TRTLLM-Gen's W4A8_MXFP4_MXFP8 layout, so the routed experts add nothing."""
@@ -80,9 +80,9 @@ def _decode_moe_layer():
         hidden_size=H,
     )
     with torch.device("cuda"):
-        gate = importlib.import_module(dc.T.__package__ + ".moe").KimiK3MoEGate(
-            cfg, logits_gemm_dtype=torch.bfloat16
-        )
+        gate = importlib.import_module(
+            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.moe"
+        ).KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16)
         down = nn.Linear(H, LATENT, bias=False, dtype=torch.bfloat16)
         up = nn.Linear(LATENT, H, bias=False, dtype=torch.bfloat16)
         norm = RMSNorm(hidden_size=LATENT, eps=1e-5, dtype=torch.bfloat16)

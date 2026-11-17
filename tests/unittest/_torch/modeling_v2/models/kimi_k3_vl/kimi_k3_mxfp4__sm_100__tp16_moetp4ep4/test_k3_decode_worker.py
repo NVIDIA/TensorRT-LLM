@@ -549,7 +549,10 @@ def _markov_drafter():
         lm_head=_head(),
         has_markov_head=True,
         markov_w1=torch.zeros(VOCAB, MARKOV_RANK, dtype=torch.bfloat16),
-        markov_w2=torch.zeros(VOCAB, MARKOV_RANK, dtype=torch.bfloat16),
+        # Row v holds v (exact in bf16), so a slice of other rows compares unequal.
+        markov_w2=torch.arange(VOCAB, dtype=torch.bfloat16)
+        .repeat_interleave(MARKOV_RANK)
+        .view(VOCAB, MARKOV_RANK),
         chain_calls=[],
     )
     drafter.apply_markov_chain_logits = lambda logits, first, argmax_fn, vocab_slice: (

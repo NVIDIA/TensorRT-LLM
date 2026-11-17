@@ -44,8 +44,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams, RopeEmbeddingUtils
 from tensorrt_llm.logger import logger
 
-from .drafter import DraftLinear, K3DSparkDrafter, _shard, _tensor
-from .norm import RMSNorm
+from ..norm import RMSNorm
+from .drafter import CheckpointShards, DraftLinear, K3DSparkDrafter, K3FcSlice
 from .ops.activation.k3_draft_silu_and_mul import k3_draft_silu_and_mul
 from .ops.attention import k3_dspark_mla as _mla_ops
 from .ops.attention.k3_dspark_mla import (
@@ -202,7 +202,8 @@ def rmsnorm_rope(
 class DraftEmbedding(nn.Module):
     """The drafter's own embedding, vocabulary-sharded over the TP group (the layout of an ``Embedding`` in COLUMN
     mode):
-    ``weight`` is this rank's rows; a lookup masks the ids outside them and sums over the group."""
+    ``weight`` is this rank's rows (the vocabulary divided by TP rounded up; the last rank's rows past the vocabulary
+    are zero); a lookup masks the ids outside them and sums over the group."""
 
     def __init__(self, vocab: int, hidden: int, tp_size: int, tp_rank: int, dtype, all_reduce):
         super().__init__()
@@ -342,7 +343,9 @@ class K3MLADSparkDrafter(nn.Module):
         super().__init__()
         cfg = draft_config.pretrained_config
         # The refusals route checks first (drafter_config.declines), in the same order.
-        reason = _drafter_config.mla_declines(cfg)
+        reason = _drafter_config.mla_declines(cfg) or _drafter_config.quantized_weights_declines(
+            draft_config.quant_config.quant_algo
+        )
         if reason is not None:
             raise NoTarget(f"the Kimi K3 MLA DSpark drafter does not build this drafter: {reason}")
         mapping = draft_config.mapping
@@ -376,6 +379,9 @@ class K3MLADSparkDrafter(nn.Module):
         self.mask_token_embedding = None
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
         self.block_size = dflash_config.get("block_size", getattr(cfg, "block_size", None))
+        reason = _drafter_config.logit_transform_declines(cfg)
+        if reason is not None:
+            raise NoTarget(f"the Kimi K3 MLA DSpark drafter does not build this drafter: {reason}")
         self.logit_multiplier, self.logit_softcap = _drafter_config.logit_transform(dflash_config)
 
         shift_label = head_config(cfg, "shift_label")
@@ -404,11 +410,10 @@ class K3MLADSparkDrafter(nn.Module):
         self.lilicorr = None
         self._runtime_position_ceiling = None
 
-        # The TP fusions: fc split by input feature with hidden_norm in its all-reduce, and the residual adds and
-        # RMSNorms after o_proj / down_proj in their all-reduces.
+        # The TP fusions: fc split by input feature (`K3FcSlice`) with hidden_norm in its all-reduce, and the residual
+        # adds and RMSNorms after o_proj / down_proj in their all-reduces.
         self._tp_split = tp_size > 1
-        self._fc_input_slice: Optional[slice] = None
-        self.fc: Optional[nn.Linear] = None
+        self.fc: Optional[nn.Module] = None
         self.hidden_norm: Optional[nn.RMSNorm] = None
         self._fc_all_reduce = None
 
@@ -473,9 +478,9 @@ class K3MLADSparkDrafter(nn.Module):
         """``hidden_norm(fc(hidden_states))``; under the TP fusions this rank's input columns, summed over the group
         with ``hidden_norm`` in the all-reduce."""
         hidden_states = hidden_states.to(self.fc.weight.dtype)
-        if self._fc_input_slice is None:
+        if not isinstance(self.fc, K3FcSlice):
             return self.hidden_norm(self.fc(hidden_states))
-        partial = self.fc(hidden_states[:, self._fc_input_slice])
+        partial = self.fc(hidden_states)
         return self._fc_all_reduce(
             partial,
             all_reduce_params=AllReduceParams(
@@ -550,7 +555,13 @@ class K3MLADSparkDrafter(nn.Module):
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs) -> None:
         """Load the draft checkpoint (TorchSpec spellings ``context_proj`` / ``context_norm`` / ``final_norm`` or
         ``fc`` / ``hidden_norm`` / ``norm``; ``layers.{i}.*``; ``embed_tokens``; the DSpark heads): this rank's shard
-        of every tensor, cut as the built-in MLA drafter's loader cuts them. ``weight_mapper`` is not used."""
+        of every tensor, cut as the built-in MLA drafter's loader cuts them (the GQA drafter's `CheckpointShards`).
+        ``weight_mapper`` is not used.
+
+        Raises:
+            ValueError: a missing tensor, a tensor of the wrong shape, or a float8 or packed (integer) tensor
+                (``drafter.float_weight``).
+        """
         del weight_mapper, kwargs
         device = self.model.norm.weight.device
         weights = self._take_head_weights(weights, device)
@@ -571,25 +582,32 @@ class K3MLADSparkDrafter(nn.Module):
             )
         mapping = self.model_config.mapping
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        rank = 0 if tp_size == 1 else mapping.tp_rank
-        fc_weight = _tensor(weights["fc.weight"])
-        if self._tp_split and fc_weight.shape[1] % mapping.tp_size == 0:
-            width = fc_weight.shape[1] // mapping.tp_size
-            self._fc_input_slice = slice(mapping.tp_rank * width, (mapping.tp_rank + 1) * width)
+        shards = CheckpointShards(weights, 0 if tp_size == 1 else mapping.tp_rank, tp_size)
+        fc_weight = shards.full("fc.weight")
+        # Under TP, this rank's block of fc's input columns, summed over the group by project_target_hidden.
+        sliced = (
+            K3FcSlice.of(fc_weight, mapping.tp_size, mapping.tp_rank) if self._tp_split else None
+        )
+        if sliced is not None:
             self._fc_all_reduce = K3AllReduce(
                 mapping, self.model_config.allreduce_strategy, fc_weight.dtype
             )
-            fc_weight = fc_weight[:, self._fc_input_slice]
-        elif self._tp_split:
-            logger.info(
-                f"{type(self).__name__}: fc input width {fc_weight.shape[1]} does not split over "
-                f"tp_size={mapping.tp_size}; keeping the unsplit context projection."
+            self.fc = sliced.to(device)
+        else:
+            if self._tp_split:
+                logger.info(
+                    f"{type(self).__name__}: fc input width {fc_weight.shape[1]} does not split over "
+                    f"tp_size={mapping.tp_size}; keeping the unsplit context projection."
+                )
+            self.fc = nn.Linear(
+                fc_weight.shape[1],
+                fc_weight.shape[0],
+                bias=False,
+                device=device,
+                dtype=fc_weight.dtype,
             )
-        self.fc = nn.Linear(
-            fc_weight.shape[1], fc_weight.shape[0], bias=False, device=device, dtype=fc_weight.dtype
-        )
-        self.fc.weight.data.copy_(fc_weight)
-        norm_weight = _tensor(weights["hidden_norm.weight"])
+            self.fc.weight.data.copy_(fc_weight)
+        norm_weight = shards.full("hidden_norm.weight")
         self.hidden_norm = nn.RMSNorm(
             norm_weight.shape[0],
             eps=getattr(self.config, "rms_norm_eps", 1e-6),
@@ -599,27 +617,16 @@ class K3MLADSparkDrafter(nn.Module):
         )
         self.hidden_norm.weight.data.copy_(norm_weight)
 
-        missing = []
-
-        def take(name):
-            if name not in weights:
-                missing.append(name)
-                return None
-            return weights[name]
-
-        def rows(name):
-            t = take(name)
-            return None if t is None else _shard(t, 0, rank, tp_size)
-
-        def cols(name):
-            t = take(name)
-            return None if t is None else _shard(t, 1, rank, tp_size)
-
-        def full(name):
-            t = take(name)
-            return None if t is None else _tensor(t)
-
-        loads = [(self.model.embed_tokens.weight, rows("embed_tokens.weight"))]
+        rows, cols, full = shards.rows, shards.cols, shards.full
+        embed = self.model.embed_tokens
+        embed_rows = shards.vocab_rows(
+            "embed_tokens.weight",
+            self.config.vocab_size,
+            embed.vocab_start_index,
+            embed.vocab_end_index,
+            embed.weight.shape[0],
+        )
+        loads = [(embed.weight, embed_rows)]
         for i, layer in enumerate(self.model.layers):
             p = f"layers.{i}."
             attn, mlp = layer.self_attn, layer.mlp
@@ -641,19 +648,7 @@ class K3MLADSparkDrafter(nn.Module):
                 (mlp.down_proj.weight, cols(p + "mlp.down_proj.weight")),
             ]
         loads.append((self.model.norm.weight, full("norm.weight")))
-        if missing:
-            raise ValueError(
-                f"{type(self).__name__}: checkpoint provides no weights for {missing[:8]}"
-                f"{' ...' if len(missing) > 8 else ''}; loading would leave them uninitialized."
-            )
-        with torch.no_grad():
-            for param, value in loads:
-                if tuple(param.shape) != tuple(value.shape):
-                    raise ValueError(
-                        f"{type(self).__name__}: a checkpoint tensor of shape {tuple(value.shape)} for a parameter "
-                        f"of shape {tuple(param.shape)}"
-                    )
-                param.data.copy_(value)
+        shards.copy_into(type(self).__name__, loads)
 
     # ------------------------------------------------------------------------------------------------------------------
     # The block decode.

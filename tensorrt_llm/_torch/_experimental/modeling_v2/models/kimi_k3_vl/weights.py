@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight manifest and loader: Kimi K3 (MXFP4) / sm_100 / tp16_moetp16ep1.
+"""Weight manifest and loader of the Kimi K3 (MXFP4) targets, shared by both: each target's `load_weights` calls `load`.
 
 The checkpoint is the vision-language wrapper's. `language_model.*` holds the language model; `vision_tower.*` and
-`mm_projector.*` hold the vision tower and its projector, which this text-only target never reads. Any other key fails
+`mm_projector.*` hold the vision tower and its projector, which the text-only targets never read. Any other key fails
 the load, naming it.
 
 Every parameter of the text model is one manifest row (`manifest`): the checkpoint key or keys it is read from, this
@@ -22,20 +22,23 @@ engine's `Mapping`:
 * **The dense MLP** (layer 0) is split over the layer's own TP group (`mlp_tp_size`, which the layer narrows to fit a
   node), **the shared expert** over the TP group: rows of gate and up, concatenated gate first, and columns of down.
 * **The routed experts** are this rank's EP window of whole experts, each at its MoE-TP slice of the intermediate:
-  under moe_tp 16 x moe_ep 1 a rank holds a sixteenth of the width of every expert (192 of 3072, which the relayout
-  zero-pads to 256 for the MoE kernels' tiles).
+  under moe_tp 4 x moe_ep 4 a rank holds a quarter of the width of a quarter of the experts; under moe_tp 16 x
+  moe_ep 1 a sixteenth of the width of every expert (192 of 3072, which the relayout zero-pads to 256 for the MoE
+  kernels' tiles).
 * Everything else (embedding, norms, the attention-residual norms and projections, router and bias, the latent
   projections and norm) is replicated. lm_head is the shell's, vocab-parallel; the load reads the rows it built.
 
 **A rank reads only its share.** A split row carries a `cut` (or one cut per key, `cuts`), applied to the engine's
 lazy safetensors entry, so the bytes of other ranks' shares are never read. A row of several keys concatenates them
 on the host, where the lazy entries are read, and copies the result into its parameter once. The routed experts are
-the exception: each local expert is read whole and handed to the routed experts' relayout
-(`moe.pack_mxfp4_expert`), which cuts the MoE-TP slice itself.
+the exception: each local expert is read whole on the host and handed to the routed experts' buffers
+(`moe.K3MxfpExpertWeights.load_packed_mxfp4_expert`), which cut the MoE-TP slice on the host and copy only that slice
+to the GPU for the relayout.
 
 **The routed experts stream per shard file.** The engine's lazy weights keep every shard mapped for the whole load,
-and the page cache cannot drop pages of an open mapping. The experts are about 90 GB of distinct pages per rank,
-more than a node holds for 4 ranks. So the rank's expert tensors are grouped by shard file, and each
+and the page cache cannot drop pages of an open mapping. A rank reads every expert of its window whole (about 17.5 MB
+each per layer): 224 experts under moe_tp 4 x moe_ep 4, all 896 under moe_tp 16 x moe_ep 1, more than a node's page
+cache holds for its ranks. So the rank's expert tensors are grouped by shard file, and each
 file is opened, read, closed and dropped from the page cache (`posix_fadvise(DONTNEED)`). Without a
 `model.safetensors.index.json` the experts fall back to the shared lazy weights, with a warning.
 
@@ -46,8 +49,8 @@ views of `k3_ag_weight` are not the load's: the MLA module derives them in its `
 Coverage is checked both ways before anything is read: every parameter is one row (`_check_rows`); every key the
 rank reads is in the checkpoint; a `language_model.*` key outside `model.layers.` that nothing reads warns.
 
-This file imports no tensorrt_llm code, and every module it writes into is the target's own (`kda.py`, `mla.py`,
-`moe.py`, `norm.py`), except the shell's lm_head.
+This file imports no tensorrt_llm code and no target: it reads the model it is handed by parameter name, and writes
+into the target's modules (its `kda.py`) and the family's (`mla.py`, `moe.py`, `norm.py`), and the shell's lm_head.
 """
 
 from __future__ import annotations
@@ -517,9 +520,9 @@ def _fill(param: nn.Parameter, row: Row, weights, d) -> None:
 def _pack_routed_expert(
     moe: nn.Module, expert: int, slot: int, tensors: dict[str, torch.Tensor]
 ) -> None:
-    """One routed expert's packed MXFP4 tensors (whole, as the checkpoint stores them) into its slot of the routed
-    experts' buffers: `moe.pack_mxfp4_expert`'s trtllm-gen relayout (MoE-TP cut, padding, shuffle, scale
-    interleave), through the buffers' own `load_packed_mxfp4_expert`."""
+    """One routed expert's packed MXFP4 tensors (whole, on the host, as the checkpoint stores them) into its slot of
+    the routed experts' buffers, through the buffers' own `load_packed_mxfp4_expert`: the MoE-TP cut and padding on
+    the host, then the copy of that share to the GPU and its trtllm-gen relayout (shuffle, scale interleave) there."""
     moe.routed_experts.backend.load_packed_mxfp4_expert(
         global_expert_id=expert, local_slot_id=slot, **tensors
     )

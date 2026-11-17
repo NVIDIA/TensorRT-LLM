@@ -156,6 +156,48 @@ def _target_cells_tests() -> list[Path]:
     )
 
 
+def _target_code(target_dir: Path) -> list[Path]:
+    """A target's code: the files of its directory, and the modules of its family
+    (the parent directory) that those files import, directly or through another
+    family module."""
+    family_dir = target_dir.parent
+    family_package = ".".join(
+        (
+            "tensorrt_llm",
+            "_torch",
+            "_experimental",
+            "modeling_v2",
+            *family_dir.relative_to(_ROOT).parts,
+        )
+    )
+    code = [p for p in target_dir.rglob("*.py") if "__pycache__" not in p.parts]
+    seen = set(code)
+    for source in code:  # grows as family modules are found
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            module = node.module or ""
+            if node.level:
+                base = source.parents[node.level - 1]
+            elif module == family_package or module.startswith(family_package + "."):
+                base, module = family_dir, module[len(family_package) + 1 :]
+            else:
+                continue
+            path = base.joinpath(*module.split(".")) if module else base
+            for candidate in (
+                path.with_suffix(".py"),
+                *(path / f"{a.name}.py" for a in node.names),
+            ):
+                if (
+                    candidate.is_file()
+                    and family_dir in candidate.parents
+                    and candidate not in seen
+                ):
+                    seen.add(candidate)
+                    code.append(candidate)
+    return code
+
+
 @pytest.mark.parametrize(
     "test", _target_cells_tests(), ids=lambda p: str(p.relative_to(p.parents[1]))
 )
@@ -164,8 +206,9 @@ def test_target_cells_feed_entries_the_target_calls(test):
 
     The test sits at `<area>/test_modeling_v2_<entry>.py`, mirroring
     `catalog/<area>/<entry>.py`. Each key is a target directory under `models/`,
-    and that target's code imports the entry: a cell for an entry the target
-    never calls certifies nothing it runs.
+    and that target's code (its directory and the family modules it imports)
+    imports the entry: a cell for an entry the target never calls certifies
+    nothing it runs.
     """
     area, entry = test.parent.name, test.stem.removeprefix("test_modeling_v2_")
     assert (_ROOT / "catalog" / area / f"{entry}.py").is_file(), (
@@ -186,9 +229,7 @@ def test_target_cells_feed_entries_the_target_calls(test):
     for target in targets:
         target_dir = _ROOT / "models" / target
         assert target_dir.is_dir(), f"{test.name}: {target!r} is not a directory under models/"
-        used = "".join(
-            p.read_text() for p in target_dir.rglob("*.py") if "__pycache__" not in p.parts
-        )
+        used = "".join(p.read_text() for p in _target_code(target_dir))
         assert re.search(rf"catalog\.{area}\.{entry} import", used), (
             f"{test.name}: declares cells for {target}, which never imports {area}/{entry}"
         )

@@ -59,9 +59,9 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
 
+from ..norm import run_in_parallel
+from ..step import DecodeStep
 from . import decode_gemv as _decode_gemv
-from .norm import run_in_parallel
-from .step import DecodeStep
 
 #: Decode steps of up to this many requests overlap the [f_a | b] -> f_b chain with the wide q / k / v / g GEMM on the
 #: auxiliary stream (while a CUDA graph is captured): the cutoff the built-in layer uses.

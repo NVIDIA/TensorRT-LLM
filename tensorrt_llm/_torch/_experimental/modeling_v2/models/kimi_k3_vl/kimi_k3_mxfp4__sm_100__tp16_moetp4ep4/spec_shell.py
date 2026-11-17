@@ -14,10 +14,10 @@ not build raises ``NoTarget``: under ``modeling_v2="auto"`` the engine then runs
 from __future__ import annotations
 
 import inspect
-from typing import Dict, Optional
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
-from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
@@ -39,6 +39,13 @@ from . import spec_worker as _spec_worker
 from .drafter import K3DSparkDrafter
 from .drafter_mla import K3MLADSparkDrafter
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+    from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+
+    from .modeling import ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4 as KimiK3CausalLM
+
 
 def set_draft_kv_cache_quant_algo(draft_config: ModelConfig, target_config: ModelConfig) -> None:
     """The draft KV cache takes the target's KV dtype unless the target requests a draft override (the built-in
@@ -54,15 +61,17 @@ def set_draft_kv_cache_quant_algo(draft_config: ModelConfig, target_config: Mode
 
 
 def slice_spec_position_ids(
-    position_ids: Optional[torch.Tensor], num_tokens: int
-) -> Optional[torch.Tensor]:
+    position_ids: torch.Tensor | None, num_tokens: int
+) -> torch.Tensor | None:
     """Speculative position IDs sliced along the token dimension."""
     if position_ids is None:
         return None
     return position_ids[..., :num_tokens]
 
 
-def draft_model_class(draft_config: ModelConfig):
+def draft_model_class(
+    draft_config: ModelConfig,
+) -> type[K3DSparkDrafter] | type[K3MLADSparkDrafter]:
     """The drafter class of a standalone DSpark checkpoint: `K3MLADSparkDrafter` for an MLA-shaped drafter
     (Inferact-Kimi-K3-DSpark), else `K3DSparkDrafter` for the Qwen3-shaped GQA drafter (RadixArk-Kimi-K3-DSpark).
     The built-in DSpark drafter dispatches on the same test (``is_mla``).
@@ -79,7 +88,7 @@ def draft_model_class(draft_config: ModelConfig):
     return K3DSparkDrafter
 
 
-def build(model: nn.Module, model_config: ModelConfig) -> None:
+def build(model: KimiK3CausalLM, model_config: ModelConfig) -> None:
     """Build ``model``'s speculative decoding from the text model's ``spec_config``, after
     ``DecoderModelForCausalLM.__init__`` and with ``model``'s speculative fields at their off values:
 
@@ -144,15 +153,15 @@ def build(model: nn.Module, model_config: ModelConfig) -> None:
 
 
 def forward(
-    model: nn.Module,
+    model: KimiK3CausalLM,
     attn_metadata: AttentionMetadata,
-    input_ids: Optional[torch.IntTensor] = None,
-    position_ids: Optional[torch.IntTensor] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    spec_metadata: Optional[SpecMetadata] = None,
-    resource_manager=None,
-    **kwargs,
-) -> torch.Tensor:
+    input_ids: torch.IntTensor | None = None,
+    position_ids: torch.IntTensor | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    spec_metadata: SpecMetadata | None = None,
+    resource_manager: ResourceManager | None = None,
+    **kwargs: object,
+) -> dict[str, torch.Tensor | None]:
     """``model``'s step with its speculative worker: the text model (the capture layer -1's hidden states into
     ``spec_metadata``), the padded rows dropped, the target logits in the layout the worker's acceptance reads, then the
     worker (the accepted tokens and the next draft tokens)."""
@@ -195,7 +204,11 @@ def forward(
     )
 
 
-def load_draft_weights(model: nn.Module, weights: Dict, weight_mapper=None) -> None:
+def load_draft_weights(
+    model: KimiK3CausalLM,
+    weights: Mapping[str, object],
+    weight_mapper: BaseWeightMapper | None = None,
+) -> None:
     """The drafter's checkpoint into ``model``'s drafter, then ``model``'s embedding and LM head shared with it."""
     if model.draft_model is None:
         raise ValueError("this Kimi K3 model has no drafter to load draft weights into")
@@ -206,7 +219,7 @@ def load_draft_weights(model: nn.Module, weights: Dict, weight_mapper=None) -> N
     model.draft_model.load_weights_from_target_model(model)
 
 
-def set_guided_decoder(model: nn.Module, guided_decoder) -> bool:
+def set_guided_decoder(model: KimiK3CausalLM, guided_decoder: CapturableGuidedDecoder) -> bool:
     """Hand the guided decoder to ``model``'s speculative worker; False without one that takes it."""
     if hasattr(model.spec_worker, "set_guided_decoder"):
         return model.spec_worker.set_guided_decoder(guided_decoder)

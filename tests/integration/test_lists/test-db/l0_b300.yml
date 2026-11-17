@@ -202,6 +202,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_k3_moe_m2.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_native.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_route_quant.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_k3_situ_mul.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_kda_decode.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_kda_prefill.py
@@ -209,8 +210,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_construction.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_norm.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_norm.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_drafter.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_moe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_rms_norm_gated_token_major.py
@@ -236,8 +236,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_ctx_kv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_kda_steps.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_kda_steps.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_moe.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_moe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_weights.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_weights.py
   - accuracy/modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]

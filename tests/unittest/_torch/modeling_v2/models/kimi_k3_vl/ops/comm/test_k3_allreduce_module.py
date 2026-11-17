@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``K3AllReduce`` without a collective: the strategies it takes, a one-rank group, and the hooks a row-parallel
-caller reads. The multi-rank behavior is ``test_modeling_v2_k3_allreduce_op_matrix.py``."""
+"""``K3AllReduce`` without a collective: it is the runtime ``AllReduce`` (its ``forward`` and hooks), the strategies
+it takes, and a one-rank group. The multi-rank behavior is ``test_modeling_v2_k3_allreduce_op_matrix.py`` (over
+MNNVL) and ``test_modeling_v2_k3_allreduce_fallback_op_matrix.py`` (off MNNVL)."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -38,8 +40,13 @@ def test_other_strategies_are_refused(strategy):
         K3AllReduce(Mapping(), strategy, torch.bfloat16)
 
 
-def test_row_parallel_hooks():
-    module = K3AllReduce(Mapping())
-    assert module.uses_nccl_symmetric_memory_window() is False
-    assert module.supports_moe_fold(8, 7168) is False
-    assert module.gemm_allreduce_norm(None, None, None, None, None, None) is None
+def test_runs_the_runtime_module():
+    """Only the constructor is the family's: the dispatch and the hooks a caller reads are the runtime module's."""
+    assert issubclass(K3AllReduce, AllReduce)
+    assert K3AllReduce.forward is AllReduce.forward
+    overridden = {
+        name
+        for name in set(vars(K3AllReduce)) & set(vars(AllReduce))
+        if not (name.startswith("__") and name.endswith("__"))
+    }
+    assert not overridden, overridden

@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi K3 targets' checkpoint load (``weights.py``) against the built-in model and loader, each run
-by the target's test directory on its own modules.
+"""The Kimi K3 targets' checkpoint load (the family's ``weights.py``) against the built-in model and loader, each
+run by the target's test directory on its own model; the host-side checks, by the family's
+``test_kimi_k3_weights_checks.py``.
 
 On one GPU, a scaled-down text model (4 layers: KDA + dense MLP, then MLA, KDA and MLA over the latent MoE; K3's MLA
 and KDA geometry, 8 experts) is built twice at one rank's share of a TP group (``Mapping(tp_size=4, rank=r)``):
 
 * the target's own ``KimiLinearModel`` behind a shell of the target class, its all-reduces replaced by a local
-  stand-in (``K3AllReduce`` builds a collective workspace at construction), loaded by the target's ``weights.load``;
+  stand-in (``K3AllReduce`` builds a collective workspace at construction), loaded by ``weights.load``;
 * the built-in ``KimiLinearForCausalLM`` (``_torch/models/modeling_kimi_linear.py``) with NCCL all-reduces (which
   allocate nothing across ranks at construction), loaded by its own ``load_weights`` with the language-model prefix
   stripped.
@@ -22,13 +23,14 @@ the same holds again, together with the derived weights the two hold under diffe
 (``compare_derived``). Every name only one side holds must be one of the explained families (``ONLY_BUILTIN``,
 ``ONLY_TARGET``).
 
-The host-side checks run the target's rejections on stand-in models, and the fused rows' per-key cuts and row ranges on
-a small checkpoint (``check_fused_rows``).
+The host-side checks run the loader's rejections on stand-in models, and the fused rows' per-key cuts and row ranges
+on a small checkpoint (``check_fused_rows``).
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import re
@@ -323,15 +325,20 @@ def _sentinel(model: nn.Module) -> None:
 def build_target(target_pkg: str, target_cls, layout: str, monkeypatch):
     """The target's text model at one rank of ``layout`` behind a shell of the target class (built without its
     ``__init__``, whose checks need 16 ranks of SM 10.0) holding the stock lm_head the shell builds, with
-    ``K3AllReduce`` replaced by ``LocalAllReduce`` in every module of the target that builds one."""
+    ``K3AllReduce`` replaced by ``LocalAllReduce`` in every module of the target or the family that builds one."""
     from tensorrt_llm._torch.modules.embedding import LMHead
     from tensorrt_llm._torch.modules.linear import TensorParallelMode
     from tensorrt_llm.functional import AllReduceStrategy
 
-    for name in ("modeling", "mla", "kda", "moe"):
-        module = importlib.import_module(f"{target_pkg}.{name}")
-        if hasattr(module, "K3AllReduce"):
-            monkeypatch.setattr(module, "K3AllReduce", LocalAllReduce)
+    family_pkg = target_pkg.rpartition(".")[0]
+    for name in ("modeling", "kda", "mla", "moe"):
+        # Each module sits in the target or in the family.
+        for pkg in (target_pkg, family_pkg):
+            if importlib.util.find_spec(f"{pkg}.{name}") is None:
+                continue
+            module = importlib.import_module(f"{pkg}.{name}")
+            if hasattr(module, "K3AllReduce"):
+                monkeypatch.setattr(module, "K3AllReduce", LocalAllReduce)
     modeling = importlib.import_module(f"{target_pkg}.modeling")
     config = _model_config(layout, AllReduceStrategy.AUTO)
     cfg = config.pretrained_config
@@ -601,6 +608,14 @@ def check_load_matches_builtin(
     assert target.model.layers[0].mlp_tp_size == (2 if gpus_per_node == 2 else tp)
 
     assert compare_common(builtin, target, "after the load") > 0
+    # ONLY_BUILTIN explains the built-in fused MoE's other state, so require the four expert buffers on both sides:
+    # compare_common then compared them.
+    for model in (builtin, target):
+        names = _named(model)
+        for buf in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight", "w2_weight_scale"):
+            assert any(
+                n.endswith(".block_sparse_moe.routed_experts.backend." + buf) for n in names
+            ), buf
     assert compare_fused(builtin, target, "after the load") == len(target.model.layers)
     post_load(builtin, include_root=True)
     post_load(target, include_root=False)

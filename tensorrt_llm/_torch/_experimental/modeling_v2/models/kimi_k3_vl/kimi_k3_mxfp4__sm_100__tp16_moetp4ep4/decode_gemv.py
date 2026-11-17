@@ -77,7 +77,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.k3
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
-from .norm import RMSNorm
+from ..norm import RMSNorm
 from .ops.gemm.k3_ctm_gemv import k3_ctm_gemv
 from .ops.gemm.k3_ctm_gemv_swiglu import k3_ctm_gemv_swiglu
 

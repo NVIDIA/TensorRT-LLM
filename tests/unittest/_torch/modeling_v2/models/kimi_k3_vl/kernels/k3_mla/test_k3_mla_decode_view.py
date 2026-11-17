@@ -38,13 +38,18 @@ def _attn(num_heads=6):
 def _meta(num_generations, num_contexts=0, pool=None, **overrides):
     if pool is None:
         pool = torch.zeros(POOL_PAGES, 1, 64, 1, 576, dtype=torch.bfloat16)
+
+    def get_buffers(layer_idx):
+        assert layer_idx == 3, f"get_buffers takes the model layer index 3, got {layer_idx}"
+        return pool
+
     meta = SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         beam_width=1,
         tokens_per_block=64,
         helix_position_offsets=None,
-        kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx: pool, layer_offsets={3: 1}),
+        kv_cache_manager=SimpleNamespace(get_buffers=get_buffers, layer_offsets={3: 1}),
         kv_cache_block_offsets=torch.arange(2 * MAX_SEQS * 2 * MAX_PAGES, dtype=torch.int32).view(
             2, MAX_SEQS, 2, MAX_PAGES
         ),

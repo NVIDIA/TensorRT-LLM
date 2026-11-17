@@ -121,6 +121,16 @@ def test_guard_refuses_mixed_devices(index) -> None:
             attn_res_fwd(*inputs, RMS_EPS)
 
 
+@pytest.mark.parametrize("index", (0, 1))
+def test_guard_refuses_misaligned_residuals(index) -> None:
+    inputs = list(_make_inputs(2, 2))
+    shape = inputs[index].shape
+    shifted = torch.empty(inputs[index].numel() + 1, dtype=torch.bfloat16, device="cuda")[1:]
+    inputs[index] = shifted.view(shape).copy_(inputs[index])
+    with pytest.raises(AssertionError, match="16-byte aligned"):
+        attn_res_fwd.is_valid(*inputs, RMS_EPS)
+
+
 def test_cuda_graph_replay_matches_eager() -> None:
     """One cell per kernel: a call captured in a CUDA graph replays the eager call's bits."""
     for num_tokens, num_candidates in ((1, 4), (1, 8), (4, 9)):

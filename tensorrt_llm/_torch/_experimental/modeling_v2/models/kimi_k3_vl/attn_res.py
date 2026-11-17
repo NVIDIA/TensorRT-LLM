@@ -51,9 +51,6 @@ class KimiK3RMSNorm(nn.Module):
         return self.weight * hidden_states_float.to(input_dtype)
 
 
-KIMI_K3_AUX_ATTN_RES_STREAM_ENV = _environment.AUX_ATTN_RES_STREAM
-
-
 # The family's environment module reads and checks these switches; routing.py checks the same values first.
 _AUX_ATTN_RES_STREAM_ENABLED = _environment.aux_attn_res_stream()
 
@@ -112,7 +109,7 @@ def _apply_attn_res_fused(
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
-    if K + 1 > 12 or M > 16384 or H != 7168:
+    if K + 1 > 12 or M > _environment.ATTN_RES_MAX_TOKENS or H != 7168:
         return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()

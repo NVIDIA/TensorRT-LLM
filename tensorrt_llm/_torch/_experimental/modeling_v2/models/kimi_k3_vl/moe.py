@@ -1,14 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The latent MoE layer on operations: the router, the routed experts (MXFP4 weights, MXFP8 activations, SiTU, on
-the catalog's trtllm-gen runner), their checkpoint layout, and the shared experts.
+"""The latent MoE layer on operations, shared by the Kimi K3 targets: the router, the routed experts (MXFP4 weights,
+MXFP8 activations, SiTU, on the catalog's trtllm-gen runner), their checkpoint layout, and the shared experts.
 
-A MoE layer on the generic path (a step the decode path of ``decode_moe.py`` does not take) runs:
+The routed experts' split over the TP group comes from the engine's ``Mapping`` (``moe_tp_size`` x ``moe_ep_size``):
+each rank holds ``num_experts / moe_ep`` whole experts at ``1 / moe_tp`` of the intermediate width (moe_tp 4 x moe_ep 4:
+224 experts at 768 columns; moe_tp 16 x moe_ep 1: all 896 experts at 192 columns, zero-padded to 256).
+
+A MoE layer on the generic path (a step the target's decode path, its ``decode_moe.py``, does not take) runs:
 
 1. the router logits, ``gemm/dsv3_router_gemm`` (bf16 x bf16 -> fp32) on the replicated hidden state;
 2. the latent down projection, ``gemm/dsv3_fused_a_gemm`` (7168 -> 3584);
-3. the top-16 of 896 and the MXFP8 latent: ``moe/k3_route_quant`` up to 64 tokens, else the catalog's
-   ``moe/noaux_tc_op`` and ``quantization/mxfp8_quantize``;
+3. the top-16 of 896 and the MXFP8 latent, per chunk: ``moe/kimi_k3_noaux_tc_mxfp8_quant`` (one C++ kernel) for 1 to
+   64 tokens, else the catalog's ``moe/noaux_tc_op`` and ``quantization/mxfp8_quantize``;
 4. this rank's routed experts, the catalog's ``moe/mxe4m3_mxe2m1_block_scale_moe_runner`` on the given top-16
    (SiTU, act_type 3, with the two soft caps per local expert in ``gemm1_alpha`` / ``gemm1_beta``), a partial sum
    over this rank's experts and intermediate slice; above ``moe_max_num_tokens`` tokens in even chunks;
@@ -27,7 +31,7 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -35,11 +39,16 @@ from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
+    ACT_TYPE_SITU,
+    ROUTING_METHOD_DEEPSEEK_V3,
     mxe4m3_mxe2m1_block_scale_moe_runner,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
     mxfp8_quantize,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
+    engine_settings as _engine_settings,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
     environment as _environment,
@@ -56,8 +65,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.ds
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_router_gemm import (
     dsv3_router_gemm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import (
-    k3_route_quant,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (  # noqa: E501
+    kimi_k3_noaux_tc_mxfp8_quant,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import AuxStreamType
@@ -65,9 +74,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from . import decode_comm as _decode_comm
-from . import decode_gemv as _decode_gemv
-from . import decode_moe as _decode_moe
 from .norm import RMSNorm, run_in_parallel
 from .step import DecodeStep
 
@@ -76,18 +82,12 @@ from .step import DecodeStep
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = _environment.disable_min_latency_latent_proj()
 
 # A/B escape hatch: route up to 64 tokens with noaux_tc_op + mxfp8_quantize instead of the fused
-# moe/k3_route_quant (read once at import).
+# moe/kimi_k3_noaux_tc_mxfp8_quant (read once at import).
 _K3_DISABLE_FUSED_ROUTE_QUANT = _environment.disable_fused_route_quant()
 
-# The geometry moe/k3_route_quant serves: 896 experts, top-16, latent 3584, up to 64 tokens.
+# The geometry moe/kimi_k3_noaux_tc_mxfp8_quant serves: 896 experts, top-16, latent 3584, 1 to 64 tokens.
 _ROUTE_QUANT_SHAPE = (896, 16, 3584)
 _ROUTE_QUANT_MAX_TOKENS = 64
-
-# The runner's routing_method_type for DeepSeek-V3 routing (RoutingMethodType.DeepSeekV3); with the top-16 given,
-# the kernel only reads the routing arguments, it does not route.
-_ROUTING_METHOD_DEEPSEEK_V3 = 2
-# The runner's act_type for SiTU (ActType_TrtllmGen.SiTu).
-_ACT_TYPE_SITU = 3
 
 # MXFP4 (group-32 E8M0 scales, two E2M1 values per byte) on the trtllm-gen cubins.
 _SCALE_BLOCK = 32
@@ -333,7 +333,7 @@ def _fc1_half(t: torch.Tensor, layout: Mxfp4ExpertLayout, values_per_byte: int) 
     return shard
 
 
-def pack_mxfp4_expert(
+def shard_mxfp4_expert(
     layout: Mxfp4ExpertLayout,
     w1_weight: torch.Tensor,
     w1_weight_scale: torch.Tensor,
@@ -342,16 +342,17 @@ def pack_mxfp4_expert(
     w3_weight: torch.Tensor,
     w3_weight_scale: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
-    """One checkpoint expert's packed MXFP4 tensors as this rank's buffer slots, in the trtllm-gen layout.
+    """This rank's share of one checkpoint expert's packed MXFP4 tensors, cut and zero-padded on the inputs' device.
 
-    Inputs are the checkpoint's uint8 tensors at full width, on any device (the outputs land on the same device):
-    ``w1`` (gate) and ``w3`` (up) ``[intermediate, hidden / 2]`` with scales ``[intermediate, hidden / 32]``, and
-    ``w2`` (down) ``[hidden, intermediate / 2]`` with scales ``[hidden, intermediate / 32]``.
+    Inputs are the checkpoint's uint8 tensors at full width: ``w1`` (gate) and ``w3`` (up) ``[intermediate,
+    hidden / 2]`` with scales ``[intermediate, hidden / 32]``, and ``w2`` (down) ``[hidden, intermediate / 2]`` with
+    scales ``[hidden, intermediate / 32]``. The cut is on the intermediate axis (rows of w1 / w3 and their scales,
+    columns of w2 and its scale), at whole bytes and whole 32-value scale groups (``Mxfp4ExpertLayout``).
 
-    Returns new contiguous uint8 tensors, keyed by buffer name (``Mxfp4ExpertLayout.slot_shapes``): the rank's
-    intermediate share of each (``Mxfp4ExpertLayout``), zero-padded; ``w3_w1_weight`` as ``[up | gate]`` rows
-    interleaved then 32-row block-shuffled, ``w2_weight`` block-shuffled, and both scales row-permuted as their
-    weights and 128x4 swizzled. The same bytes as the built-in ``load_packed_mxfp4_expert``.
+    Returns the six tensors under the same names at the rank's padded width: w1 / w3 ``[inter_pad, fc1_k_pad / 2]``,
+    their scales ``[inter_pad, fc1_k_pad / 32]``, w2 ``[fc2_rows_pad, inter_pad / 2]`` and its scale ``[fc2_rows_pad,
+    inter_pad / 32]``. A share that needs no padding is a view of its input; a padded one is a new tensor of the
+    share's size. Nothing of the full width is copied.
     """
     for name, value in (
         ("w1_weight", w1_weight),
@@ -365,18 +366,7 @@ def pack_mxfp4_expert(
             raise TypeError(
                 f"{name} must be 2-D packed MXFP4 uint8 data, got {value.dtype} {tuple(value.shape)}."
             )
-    device = w1_weight.device
     tp, rank = layout.moe_tp_size, layout.moe_tp_rank
-
-    w3_w1 = torch.cat([_fc1_half(w3_weight, layout, 2), _fc1_half(w1_weight, layout, 2)])
-    w3_w1_scale = torch.cat(
-        [
-            _fc1_half(w3_weight_scale, layout, _SCALE_BLOCK),
-            _fc1_half(w1_weight_scale, layout, _SCALE_BLOCK),
-        ]
-    )
-    fc1_rows = _fc1_rows(w3_w1.shape[0], device)
-
     rows, inter_pad = layout.fc2_rows_pad, layout.inter_pad
     if layout.logical_slices:
         per = layout.per_rank
@@ -397,14 +387,59 @@ def pack_mxfp4_expert(
         )
         assert w2.shape == (rows, inter_pad // 2), (tuple(w2.shape), rows, inter_pad)
         assert w2_scale.shape == (rows, inter_pad // _SCALE_BLOCK), (tuple(w2_scale.shape), rows)
-    fc2_rows = _shuffle_rows(rows, device)
+    return {
+        "w1_weight": _fc1_half(w1_weight, layout, 2),
+        "w1_weight_scale": _fc1_half(w1_weight_scale, layout, _SCALE_BLOCK),
+        "w2_weight": w2,
+        "w2_weight_scale": w2_scale,
+        "w3_weight": _fc1_half(w3_weight, layout, 2),
+        "w3_weight_scale": _fc1_half(w3_weight_scale, layout, _SCALE_BLOCK),
+    }
 
+
+def relayout_mxfp4_shard(shard: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """``shard_mxfp4_expert``'s output as the rank's buffer slots, in the trtllm-gen layout, on the shard's device.
+
+    Returns new contiguous uint8 tensors, keyed by buffer name (``Mxfp4ExpertLayout.slot_shapes``): ``w3_w1_weight``
+    as ``[up | gate]`` rows interleaved then 32-row block-shuffled, ``w2_weight`` block-shuffled, and both scales
+    row-permuted as their weights and 128x4 swizzled."""
+    device = shard["w1_weight"].device
+    w3_w1 = torch.cat([shard["w3_weight"], shard["w1_weight"]])
+    w3_w1_scale = torch.cat([shard["w3_weight_scale"], shard["w1_weight_scale"]])
+    fc1_rows = _fc1_rows(w3_w1.shape[0], device)
+    w2, w2_scale = shard["w2_weight"], shard["w2_weight_scale"]
+    fc2_rows = _shuffle_rows(w2.shape[0], device)
     return {
         "w3_w1_weight": torch.index_select(w3_w1, 0, fc1_rows).contiguous(),
         "w3_w1_weight_scale": _swizzle_scales(torch.index_select(w3_w1_scale, 0, fc1_rows)),
         "w2_weight": torch.index_select(w2, 0, fc2_rows).contiguous(),
         "w2_weight_scale": _swizzle_scales(torch.index_select(w2_scale, 0, fc2_rows)),
     }
+
+
+def pack_mxfp4_expert(
+    layout: Mxfp4ExpertLayout,
+    w1_weight: torch.Tensor,
+    w1_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w3_weight: torch.Tensor,
+    w3_weight_scale: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """One checkpoint expert's packed MXFP4 tensors (``shard_mxfp4_expert``'s inputs, on any device) as this rank's
+    buffer slots in the trtllm-gen layout, on the same device: ``shard_mxfp4_expert`` then ``relayout_mxfp4_shard``.
+    The same bytes as the built-in ``load_packed_mxfp4_expert``."""
+    return relayout_mxfp4_shard(
+        shard_mxfp4_expert(
+            layout,
+            w1_weight,
+            w1_weight_scale,
+            w2_weight,
+            w2_weight_scale,
+            w3_weight,
+            w3_weight_scale,
+        )
+    )
 
 
 def _check_routed_quant(quant_algo: Optional[QuantAlgo]) -> None:
@@ -509,8 +544,9 @@ class K3MxfpExpertWeights(nn.Module):
         w3_weight_scale: torch.Tensor,
     ) -> None:
         """Write one checkpoint expert (``pack_mxfp4_expert``'s inputs, on any device) into local slot
-        ``local_slot_id``. Each slot is written once; ``loaded_slots`` records the filled slots. Thread safe across
-        slots."""
+        ``local_slot_id``. The rank's share is cut on the inputs' device (``shard_mxfp4_expert``), so only the share
+        is copied to the buffers' device, where it is relaid out (``relayout_mxfp4_shard``) and written into the
+        slot. Each slot is written once; ``loaded_slots`` records the filled slots. Thread safe across slots."""
         if not 0 <= local_slot_id < self.expert_size_per_partition:
             raise IndexError(
                 f"local_slot_id={local_slot_id} is outside [0, {self.expert_size_per_partition})."
@@ -527,15 +563,16 @@ class K3MxfpExpertWeights(nn.Module):
                 raise ValueError(f"Packed MXFP4 local slot {local_slot_id} was loaded twice.")
             self.loaded_slots.add(local_slot_id)
         device = self.w3_w1_weight.device
-        slots = pack_mxfp4_expert(
+        shard = shard_mxfp4_expert(
             self.layout,
-            w1_weight.to(device),
-            w1_weight_scale.to(device),
-            w2_weight.to(device),
-            w2_weight_scale.to(device),
-            w3_weight.to(device),
-            w3_weight_scale.to(device),
+            w1_weight,
+            w1_weight_scale,
+            w2_weight,
+            w2_weight_scale,
+            w3_weight,
+            w3_weight_scale,
         )
+        slots = relayout_mxfp4_shard({name: t.to(device) for name, t in shard.items()})
         with torch.no_grad():
             for name, value in slots.items():
                 getattr(self, name).data[local_slot_id].copy_(value)
@@ -547,6 +584,28 @@ class K3MxfpExpertWeights(nn.Module):
             raise RuntimeError(
                 f"Kimi K3 load did not fill every routed-expert slot; missing {missing[:10]}"
             )
+
+
+def _route_quant_takes(
+    x: torch.Tensor, router_logits: torch.Tensor, e_score_correction_bias: torch.Tensor
+) -> bool:
+    """Whether ``moe/kimi_k3_noaux_tc_mxfp8_quant`` takes a chunk: 1 to 64 rows, contiguous fp32 logits ``[M, 896]``
+    and correction bias, a contiguous bf16 latent ``[M, 3584]`` (the op's checks, so any other chunk takes the unfused
+    route instead of raising)."""
+    num_experts, _, hidden = _ROUTE_QUANT_SHAPE
+    return (
+        router_logits.dim() == 2
+        and router_logits.shape[1] == num_experts
+        and router_logits.dtype == torch.float32
+        and router_logits.is_contiguous()
+        and e_score_correction_bias.dtype == torch.float32
+        and e_score_correction_bias.is_contiguous()
+        and x.dim() == 2
+        and tuple(x.shape) == (router_logits.shape[0], hidden)
+        and 0 < x.shape[0] <= _ROUTE_QUANT_MAX_TOKENS
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+    )
 
 
 class K3RoutedExperts(nn.Module):
@@ -580,6 +639,7 @@ class K3RoutedExperts(nn.Module):
         self.chunk_events = (
             (torch.cuda.Event(), torch.cuda.Event()) if chunk_stream is not None else None
         )
+        # The fixed half of the fused route + quant's conditions (``_route_quant_takes`` checks each chunk).
         self.route_quant_fused = (
             not _K3_DISABLE_FUSED_ROUTE_QUANT
             and (backend.num_experts, top_k, backend.hidden_size) == _ROUTE_QUANT_SHAPE
@@ -633,9 +693,8 @@ class K3RoutedExperts(nn.Module):
         routed_scaling_factor: float,
     ) -> torch.Tensor:
         """One chunk: the top-k and the MXFP8 latent, then the experts on the runner."""
-        rows = x.shape[0]
-        if self.route_quant_fused and 0 < rows <= _ROUTE_QUANT_MAX_TOKENS:
-            topk_ids, topk_weights, x_fp8, x_sf = k3_route_quant(
+        if self.route_quant_fused and _route_quant_takes(x, router_logits, e_score_correction_bias):
+            topk_ids, topk_weights, x_fp8, x_sf = kimi_k3_noaux_tc_mxfp8_quant(
                 router_logits, e_score_correction_bias, x, routed_scaling_factor
             )
         else:
@@ -677,8 +736,8 @@ class K3RoutedExperts(nn.Module):
             b.slot_start,
             b.expert_size_per_partition,
             routed_scaling_factor,
-            _ROUTING_METHOD_DEEPSEEK_V3,
-            _ACT_TYPE_SITU,
+            ROUTING_METHOD_DEEPSEEK_V3,
+            ACT_TYPE_SITU,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=None,
@@ -751,6 +810,26 @@ class KimiK3GatedMLP(nn.Module):
         )
 
 
+class DecodeMoePath(Protocol):
+    """What ``KimiK3MoERuntime`` calls on a target's decode path of a MoE layer (the target's
+    ``decode_moe.K3DecodeMoeLayer``)."""
+
+    def takes(self, hidden_states: torch.Tensor, step: DecodeStep, partial_tail: bool) -> bool:
+        """Whether the decode path runs the layer on ``step``."""
+        ...
+
+    def forward(
+        self,
+        moe: KimiK3MoERuntime,
+        hidden_states: torch.Tensor,
+        gemvs: Any,
+        partial_tail: bool,
+        push: bool = False,
+    ) -> Any:
+        """The layer's output on a step ``takes`` accepts (``KimiK3MoERuntime.forward``'s return)."""
+        ...
+
+
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block on operations (see the module docstring)."""
 
@@ -796,10 +875,10 @@ class KimiK3MoERuntime(nn.Module):
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
         self.gate.check_routing()
 
-        if model_config.moe_backend != "TRTLLM":
+        if model_config.moe_backend != _engine_settings.MOE_BACKEND:
             raise NoTarget(
                 f"moe_config.backend {model_config.moe_backend}: the Kimi K3 targets run the routed experts on "
-                "trtllm-gen (TRTLLM, or AUTO, which resolves to it)"
+                f"trtllm-gen ({_engine_settings.MOE_BACKEND}, or AUTO, which resolves to it)"
             )
         if model_config.moe_load_balancer is not None:
             raise NotImplementedError(
@@ -853,10 +932,6 @@ class KimiK3MoERuntime(nn.Module):
                 aux_stream_dict[AuxStreamType.MoeChunkingOverlap] if chunked_below_budget else None
             ),
         )
-        self.local_expert_ids = tuple(backend.initial_local_expert_ids)
-        self.experts_per_rank = backend.expert_size_per_partition
-        self.expert_lo = backend.slot_start
-        self.expert_hi = self.expert_lo + self.experts_per_rank
 
         self.shared_experts = KimiK3GatedMLP(
             cfg.hidden_size,
@@ -880,9 +955,10 @@ class KimiK3MoERuntime(nn.Module):
             self.moe_hidden_size, cfg.hidden_size, bias=False, dtype=dtype
         )
         self.routed_expert_norm = RMSNorm(self.moe_hidden_size, cfg.rms_norm_eps, dtype=dtype)
-        # The decode path (decode_moe.py) and the decode GEMVs' state, set by the target's post_load_weights.
-        self.decode_moe: Optional[_decode_moe.K3DecodeMoeLayer] = None
-        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
+        # The target's decode path (its decode_moe.py) and decode GEMVs' state (its decode_gemv.py, handed to the
+        # decode path as is), set by the target's post_load_weights.
+        self.decode_moe: Optional[DecodeMoePath] = None
+        self.decode_gemvs: Optional[Any] = None
 
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Linear) -> torch.Tensor:
@@ -894,7 +970,8 @@ class KimiK3MoERuntime(nn.Module):
     @staticmethod
     def _routed_mapping(mapping: Mapping) -> Mapping:
         """The routed experts' mapping: the engine's, with the user config's explicit ``moe_tensor_parallel_size`` /
-        ``moe_expert_parallel_size`` (16 x 1, asserted at construction) and no MoE cluster."""
+        ``moe_expert_parallel_size`` (each target asserts its own split at construction: 4 x 4 or 16 x 1) and no MoE
+        cluster."""
         mapping_dict = mapping.to_dict()
         mapping_dict["moe_cluster_size"] = 1
         mapping_dict["moe_tp_size"] = mapping.moe_tp_size
@@ -932,11 +1009,12 @@ class KimiK3MoERuntime(nn.Module):
         partial_tail: bool = False,
         *,
         step: DecodeStep,
-    ) -> Union[torch.Tensor, _decode_comm.PendingTail]:
+    ) -> Any:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16. ``step``: the step's classification
-        (``decode_step``); the decode path (``decode_moe.py``) runs the steps it takes. ``partial_tail`` (only where
-        ``tail_rp_eligible`` holds): return this rank's unreduced share of the output instead, a ``PendingTail`` at
-        most 8 tokens, a tensor on a wide decode step."""
+        (``decode_step``); the decode path (``decode_moe``) runs the steps it takes. Returns the output, bf16
+        ``[num_tokens, hidden_size]``. ``partial_tail`` (only where ``tail_rp_eligible`` holds): return this rank's
+        unreduced share of the output instead, the target's ``decode_comm.PendingTail`` at most 8 tokens, a tensor on
+        a wide decode step."""
         decode = self.decode_moe
         if decode is not None and decode.takes(hidden_states, step, partial_tail):
             return decode.forward(

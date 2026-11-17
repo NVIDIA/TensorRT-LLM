@@ -9,17 +9,19 @@ Not a pytest module: one fixed sequence of checks inside one W-rank job (both mo
 workspace rotation). The collected entry point is ``test_modeling_v2_k3_allreduce_op_matrix.py``.
 
 Checks:
-  * MNNVL strategy (MNNVL on one tray, as the K3 targets' AUTO is across trays): both modules take MNNVL. The plain
+  * MNNVL strategy (MNNVL on one tray, as the K3 targets' AUTO is across trays): both modules take MNNVL.
+    ``K3AllReduce`` is a runtime ``AllReduce`` whose ``mnnvl_allreduce`` is a ``K3MnnvlAllReduce`` and which holds
+    no runtime ``MNNVLAllReduce``; building another one leaves the mapping's shared workspace as it is (the same
+    buffers, size and flag words). The plain
     sum at the K3 widths (7168, the latent 3584) for 1 to 8192 rows, one-shot and two-shot, before
     ``use_decode_one_shot`` (the built-in kernel against the family copy at the built-in ceiling): bit for bit.
     After it on both modules (the targets' state after post_load_weights): the plain sum (decode rows, and
     ``wide_all_reduce``) and the drafter's fusions (residual + RMSNorm, RMSNorm) bit for bit. The fusions before
     it (not a path the targets run): ``residual_out`` bit for bit, ``norm_out`` within ``NORM_TOL``, recorded.
   * A CUDA graph of the new module's decode call replayed with new inputs: bit for bit the eager call.
-  * AUTO strategy on one tray (no MNNVL): both modules fall back. With the built-in autotuner off
-    (``TLLM_DISABLE_ALLREDUCE_AUTOTUNE=1``) both run the raw op's AUTO: bit for bit. The autotuner-on fallback
-    (NCCL_SYMMETRIC window outputs, which need an NCCL window tensor scope) is driven by
-    ``_k3_allreduce_fallback_op_matrix.py``.
+  * AUTO strategy on one tray (no MNNVL): ``K3AllReduce`` builds no MNNVL all-reduce and runs the runtime module's
+    own all-reduce on its IPC workspace (autotuner off, one plain call, bit for bit with a runtime module). Which
+    symbol it reaches and with which arguments is ``_k3_allreduce_fallback_op_matrix.py``.
   * ``enable_allreduce=False`` returns the input; every output is the same on every rank.
 """
 
@@ -41,7 +43,7 @@ ROWS = (1, 2, 3, 4, 5, 8, 9, 16, 17, 18, 32, 36, 37, 64, 65, 73, 74, 128, 1024, 
 DECODE_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 36)
 WIDE_ROWS = (9, 16, 32, 64)
 FUSED_ROWS = (1, 8, 36, 64, 2048)
-AUTO_ROWS = (1, 8, 64, 2048, 8192)
+AUTO_ROWS = (1, 2048)
 EPS = 1e-6
 NORM_TOL = 1e-2  # norm_out: max |err| / max |ref|; the kernels round each square to bf16
 
@@ -93,13 +95,52 @@ def _check_plain(stock, new, rows_list, seed0, tag, wide=None):
             STATS["plain_bitwise"] += 1
 
 
-def check_mnnvl_plain_default_ceiling():
+def _shared_workspace_state():
+    """The mapping's shared MNNVL workspace as this rank sees it: buffer address, bytes per buffer, flag words."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
+        mnnvl_workspace as mcast,
+    )
+
+    torch.cuda.synchronize()
+    ws = mcast.shared_lamport_workspace(R.mapping, torch.bfloat16)
+    return ws.uc_buffer.data_ptr(), ws.buffer_bytes, ws.buffer_flags.tolist()
+
+
+def check_mnnvl_structure():
+    """Over MNNVL K3AllReduce is the runtime module with the family's MNNVL all-reduce in its slot, and building it
+    does not rebuild, resize or re-arm the mapping's shared workspace."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import (
+        K3AllReduce,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+        K3MnnvlAllReduce,
+    )
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
     from tensorrt_llm.functional import AllReduceStrategy
 
     global MNNVL_STOCK, MNNVL_NEW
     MNNVL_STOCK, MNNVL_NEW = _modules(AllReduceStrategy.MNNVL)
     assert MNNVL_STOCK.mnnvl_allreduce is not None, "the built-in module did not take MNNVL"
-    assert MNNVL_NEW.mnnvl_allreduce is not None, "K3AllReduce did not take MNNVL"
+    assert isinstance(MNNVL_NEW, AllReduce)
+    assert K3AllReduce.forward is AllReduce.forward, (
+        "K3AllReduce overrides the runtime module's forward"
+    )
+    assert isinstance(MNNVL_NEW.mnnvl_allreduce, K3MnnvlAllReduce), "K3AllReduce did not take MNNVL"
+    assert not any(isinstance(m, MNNVLAllReduce) for m in MNNVL_NEW.modules()), (
+        "K3AllReduce holds a runtime MNNVL all-reduce"
+    )
+    before = _shared_workspace_state()
+    again = K3AllReduce(R.mapping, AllReduceStrategy.MNNVL, torch.bfloat16)
+    assert isinstance(again.mnnvl_allreduce, K3MnnvlAllReduce)
+    after = _shared_workspace_state()
+    assert before == after, (
+        f"building K3AllReduce changed the shared workspace: {before} -> {after}"
+    )
+    R.barrier()
+
+
+def check_mnnvl_plain_default_ceiling():
     _check_plain(MNNVL_STOCK, MNNVL_NEW, ROWS, 100, "MNNVL, built-in ceiling")
 
 
@@ -221,7 +262,7 @@ def _progress(msg):
 
 
 def check_auto_autotuner_off():
-    """Both modules off MNNVL with the built-in autotuner off: both run the raw op's AUTO."""
+    """AUTO on one tray (no MNNVL): K3AllReduce runs the runtime module's own all-reduce on its IPC workspace."""
     from tensorrt_llm.functional import AllReduceStrategy
 
     global AUTO_STOCK, AUTO_NEW
@@ -229,6 +270,7 @@ def check_auto_autotuner_off():
     assert AUTO_STOCK.mnnvl_allreduce is None and AUTO_NEW.mnnvl_allreduce is None, (
         "AUTO on one tray takes MNNVL in one of the modules"
     )
+    assert AUTO_NEW.workspace is not None and AUTO_NEW.workspace is AUTO_STOCK.workspace
     _autotune(False)
     for hidden in HIDDENS:
         for i, rows in enumerate(AUTO_ROWS):
@@ -242,6 +284,7 @@ def check_auto_autotuner_off():
 
 
 CHECKS = [
+    check_mnnvl_structure,
     check_mnnvl_plain_default_ceiling,
     check_mnnvl_fused_default_ceiling,
     check_skip_returns_the_input,

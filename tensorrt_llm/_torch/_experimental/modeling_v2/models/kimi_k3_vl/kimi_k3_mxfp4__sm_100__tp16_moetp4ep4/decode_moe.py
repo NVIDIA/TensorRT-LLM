@@ -79,8 +79,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_
     k3_route_quant,
 )
 
+from ..norm import run_in_parallel
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
-from .norm import run_in_parallel
 
 # The most tokens of the front and the small k3_moe build (one token tile), and of the wide build.
 MAX_TOKENS = 8
@@ -291,8 +291,6 @@ class K3DecodeMoeLayer:
             logits, self.bias, latent, float(moe.gate.routed_scaling_factor), early_trigger=True
         )
         k3_moe(x_fp8, x_sf, ids, weights, offset, self.wide)
-        # The generic path's build (moe.py routes up to 64 tokens on it, without the early trigger).
-        k3_route_quant(logits, self.bias, latent, float(moe.gate.routed_scaling_factor))
         torch.cuda.synchronize(device)
 
     def _front(self, moe: nn.Module, x: torch.Tensor):

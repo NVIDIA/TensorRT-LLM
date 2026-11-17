@@ -10,6 +10,7 @@ Not a pytest module: one fixed sequence of collective steps inside one W-rank jo
 ``test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py``.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -120,8 +121,9 @@ def check_mnnvl_decision():
         assert mcast.mnnvl_supported(
             R.mapping, torch.bfloat16, requested
         ) == MNNVLAllReduce.is_mnnvl(R.mapping, torch.bfloat16, explicitly_requested=requested)
-    # One tray: AUTO does not take MNNVL.
-    assert not mcast.mnnvl_supported(R.mapping, torch.bfloat16, False)
+    # One tray: AUTO does not take MNNVL (TLLM_TEST_MNNVL=1 forces it on).
+    if os.environ.get("TLLM_TEST_MNNVL", "0") != "1":
+        assert not mcast.mnnvl_supported(R.mapping, torch.bfloat16, False)
 
 
 def check_free_group_comm():

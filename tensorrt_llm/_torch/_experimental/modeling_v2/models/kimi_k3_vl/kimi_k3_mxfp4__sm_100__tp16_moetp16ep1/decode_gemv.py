@@ -75,7 +75,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.k3
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
-from .norm import RMSNorm
+from ..norm import RMSNorm
 
 # The row limit of the decode GEMV and head kernels (one token tile), and of k3_ctm_gemv_wide (a decode step of 8
 # requests of 8 tokens).

@@ -31,8 +31,10 @@ if torch.cuda.get_device_capability() != (10, 0):
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE  # noqa: E402
 
-if not IS_CUTLASS_DSL_AVAILABLE:
-    pytest.skip("k3_dspark_mla needs the CuTe DSL build", allow_module_level=True)
+# The rope entries need the CuTe DSL build; the decode tests skip on their own probes, which include it.
+_needs_cute = pytest.mark.skipif(
+    not IS_CUTLASS_DSL_AVAILABLE, reason="k3_dspark_mla needs the CuTe DSL build"
+)
 
 _mla = importlib.import_module(
     "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
@@ -145,6 +147,7 @@ def _rmsnorm_rope_inputs(spec, seed: int):
     return t, weight, freqs_cis, freqs_real, eps
 
 
+@_needs_cute
 @pytest.mark.parametrize(
     "cell", k3_dspark_rmsnorm_rope.CELLS, ids=[c.why for c in k3_dspark_rmsnorm_rope.CELLS]
 )
@@ -226,6 +229,7 @@ def _sentinel_out(spec) -> torch.Tensor:
     return torch.full(shape, float("nan"), dtype=torch.bfloat16, device="cuda")
 
 
+@_needs_cute
 @pytest.mark.parametrize(
     "cell", k3_dspark_rope_into.CELLS, ids=[c.why for c in k3_dspark_rope_into.CELLS]
 )
@@ -278,6 +282,7 @@ _ROPE_OUT_OF_CONTRACT = {
 }
 
 
+@_needs_cute
 @pytest.mark.parametrize("case", list(_ROPE_OUT_OF_CONTRACT))
 def test_rope_rejects_out_of_contract(case) -> None:
     """Both rope guards refuse the inputs listed (they raise before the kernel runs)."""

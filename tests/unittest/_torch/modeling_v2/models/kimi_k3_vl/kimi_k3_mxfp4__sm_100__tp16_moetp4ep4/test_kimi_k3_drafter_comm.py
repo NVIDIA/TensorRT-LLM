@@ -30,7 +30,7 @@
   projections with their all-reduce, and for nothing else; ``use_decode_comm`` compiles each
   ``comm/k3_sandwich_plain`` form whose shape every layer shares (one zero-row call each, on the group's sandwich
   workspace), and none without the fused norms; ``K3DecodeComm.compile_plain`` / ``takes_plain`` /
-  ``sandwich_plain`` hand the op its arguments; ``skip_all_reduce`` turns a module's all-reduce off.
+  ``sandwich_plain`` hand the op its arguments.
 """
 
 from types import SimpleNamespace
@@ -525,9 +525,3 @@ def test_takes_plain_asks_the_kernel_with_the_norm_weight(monkeypatch):
     (args,) = asked
     assert all(a is b for a, b in zip(args, (x, weight, residual, norm.weight)))
     assert args[4] is True
-
-
-def test_skip_all_reduce_turns_the_modules_all_reduce_off():
-    params = decode_comm.skip_all_reduce()
-    assert params.enable_allreduce is False and params.residual is None
-    assert decode_comm.skip_all_reduce() is not params

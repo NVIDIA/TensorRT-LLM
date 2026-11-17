@@ -67,5 +67,20 @@ class KdaResetStateRows(OpWrapper):
             if conv_pool is not None:
                 conv_pool[slot] = 0
 
+    def is_valid(
+        self,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        conv_pool: Optional[torch.Tensor] = None,
+    ) -> None:
+        for name, tensor in (
+            ("state_indices", state_indices),
+            ("has_initial_states", has_initial_states),
+        ):
+            assert tensor.dim() == 1 and tensor.is_contiguous(), (
+                f"{name} must be a contiguous 1-D tensor; the kernel reads it at request offsets"
+            )
+
 
 kda_reset_state_rows = KdaResetStateRows()

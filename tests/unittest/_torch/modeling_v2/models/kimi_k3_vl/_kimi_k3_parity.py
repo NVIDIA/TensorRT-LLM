@@ -51,10 +51,13 @@ def assert_bitwise(new: torch.Tensor, old: torch.Tensor, what: str = "output") -
     assert new.shape == old.shape and new.dtype == old.dtype, (
         f"{what}: {tuple(new.shape)} {new.dtype} vs {tuple(old.shape)} {old.dtype}"
     )
-    if not torch.equal(new, old):
+    # Bytes, not values: torch.equal takes -0.0 for 0.0 and NaN for unequal to itself.
+    new_bytes, old_bytes = new.reshape(-1).view(torch.uint8), old.reshape(-1).view(torch.uint8)
+    if not torch.equal(new_bytes, old_bytes):
         diff = (new.float() - old.float()).abs()
         raise AssertionError(
-            f"{what}: {int((new != old).sum())} of {new.numel()} elements differ, max |diff| {float(diff.max())}"
+            f"{what}: {int((new_bytes != old_bytes).sum())} of {new_bytes.numel()} bytes differ, "
+            f"max |diff| {float(diff.max())}"
         )
 
 

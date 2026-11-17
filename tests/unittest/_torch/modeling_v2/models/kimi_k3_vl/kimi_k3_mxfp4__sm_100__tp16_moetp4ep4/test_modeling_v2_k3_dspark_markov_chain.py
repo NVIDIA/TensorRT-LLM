@@ -80,10 +80,14 @@ def test_k3_dspark_markov_chain_shard_matches_the_runtime(tp_size, tp_rank) -> N
 
 
 def test_k3_dspark_markov_chain_rejects_out_of_contract() -> None:
-    """The guard refuses bf16 logits and a vocabulary the head does not have."""
+    """The guard refuses bf16 logits, a vocabulary the head does not have and strided anchors."""
     spec = dict(batch=2, block=3, vocab=5000, rank=4, dtype=torch.float32)
     base, first, w1, w2 = _inputs(spec, seed=1)
-    for args in ((base.bfloat16(), first, w1, w2), (base[..., :-1].contiguous(), first, w1, w2)):
+    for args in (
+        (base.bfloat16(), first, w1, w2),
+        (base[..., :-1].contiguous(), first, w1, w2),
+        (base, torch.stack((first, first), 1)[:, 0], w1, w2),
+    ):
         with validating(k3_dspark_markov_chain), pytest.raises(AssertionError):
             k3_dspark_markov_chain(*args)
 

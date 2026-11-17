@@ -212,11 +212,15 @@ class Group:
         from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_markov import (  # noqa: E501
             op,
         )
+        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_markov import (  # noqa: E501
+            k3_markov,
+        )
         from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams, allgather
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
         from tensorrt_llm.mapping import Mapping
 
         self.op, self.kernel, self.allgather = op, op._kernel_module(), allgather
+        self.k3_markov = k3_markov
         # The C++ chain k3_markov replaces; not every build registers it.
         try:
             self.cpp = torch.ops.trtllm.dspark_markov_chain
@@ -428,10 +432,11 @@ class Group:
         return corrected, tokens, next_new_reference(acc, tokens)
 
     def k3(self, base, first, w2s, shard: int, acc, copies: int, rewind=None):
-        """k3_markov as the model calls it (op.markov_chain); ``rewind``: (kv_lens, rewind, rewind_first, ...)."""
+        """k3_markov as the model calls it (``ops/spec/k3_markov`` on ``op.markov_workspace``); ``rewind``:
+        (kv_lens, rewind, rewind_first, ...)."""
         kv_lens, amounts, rewind_first = (None, None, 0) if rewind is None else rewind[:3]
-        return self.op.markov_chain(
-            self.mapping, base, first, self.w1, w2s, self.rank * shard, *acc, push_copies=copies,
+        return self.k3_markov(
+            base, first, self.w1, w2s, self.rank * shard, *acc, self.op.markov_workspace(self.mapping, copies),
             kv_lens=kv_lens, rewind=amounts, rewind_first=rewind_first,
         )  # fmt: skip
 

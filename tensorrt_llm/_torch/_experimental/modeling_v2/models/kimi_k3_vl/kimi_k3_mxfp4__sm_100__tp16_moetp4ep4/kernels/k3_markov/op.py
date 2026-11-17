@@ -283,30 +283,3 @@ def _(base, first_prev, markov_w1, markov_w2_shard, shard_offset, ws_uc, ws_mc, 
         base.new_empty((batch, block), dtype=torch.int32),
         base.new_empty((batch, block + 1), dtype=torch.int32),
     )
-
-
-def markov_chain(
-    mapping,
-    base: torch.Tensor,
-    first_prev: torch.Tensor,
-    markov_w1: torch.Tensor,
-    markov_w2_shard: torch.Tensor,
-    shard_offset: int,
-    accepted: torch.Tensor,
-    num_accepted: torch.Tensor,
-    accepted_rows: torch.Tensor,
-    push_copies: int = 1,
-    kv_lens: Optional[torch.Tensor] = None,
-    rewind: Optional[torch.Tensor] = None,
-    rewind_first: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``trtllm::k3_markov`` on ``mapping``'s TP group workspace; with ``kv_lens`` and ``rewind`` it also applies the
-    KV-length rewind (see ``k3_markov``)."""
-    ws = markov_workspace(mapping, push_copies)
-    if kv_lens is None or rewind is None:
-        kv_lens, rewind = ws["no_rewind"], ws["flags"][:0]
-    return torch.ops.trtllm.k3_markov(
-        base, first_prev, markov_w1, markov_w2_shard, int(shard_offset), ws["uc"], ws["mc"], ws["flags"],
-        ws["rank"], ws["slots"], ws["push_copies"], ws["buf_words"], accepted, num_accepted, accepted_rows, kv_lens,
-        rewind, int(rewind_first),
-    )  # fmt: skip

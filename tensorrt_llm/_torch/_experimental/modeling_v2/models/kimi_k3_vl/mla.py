@@ -15,11 +15,11 @@ kernels:
 * projections: ``gemm/cublas_mm`` for the fused ``[q_a | kv_a | k_pe]`` rows, ``torch.nn.functional.linear`` for
   q_b, kv_b, the gate and ``o_proj`` (what the built-in bf16 ``Linear`` runs), the q_a / kv_a RMSNorms on ``norm.py``;
 * context: ``attention/thop_attention`` with ``attention_input_type`` 1 over K / V expanded from the latent (fresh
-  prefill: kv_b per head with ``gemm/bmm_out`` straight into the strided K buffer); with a cached prefix,
-  ``attention/mla_rope_append_paged_kv_assign_q`` and then either the whole prefix
-  (``attention/load_paged_kv_cache_for_mla``, chunked prefill off) or the prefix chunk by chunk with the partials
-  merged on their softmax statistics (``load_chunked_kv_cache_for_mla``, ``merge_chunked_attention_for_mla``, chunked
-  prefill on);
+  prefill: kv_b per head with ``gemm/bmm_out`` straight into the strided K buffer); with a cached prefix (a later
+  chunk of chunked prefill), ``attention/mla_rope_append_paged_kv_assign_q`` and then the prefix chunk by chunk with
+  the partials merged on their softmax statistics (``load_chunked_kv_cache_for_mla``,
+  ``merge_chunked_attention_for_mla``). The targets run with block reuse off, so chunked prefill is the only source
+  of a cached prefix;
 * generation: the k_b absorption (``gemm/bmm_out``) beside ``attention/mla_rope_generation``, the latent attention,
   and the v_b projection (``gemm/bmm_out``).
 
@@ -33,15 +33,12 @@ from __future__ import annotations
 import copy
 import math
 import weakref
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
-    load_paged_kv_cache_for_mla,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
     mla_rope_append_paged_kv_assign_q,
 )
@@ -94,7 +91,6 @@ from tensorrt_llm._torch.utils import AuxStreamType, get_model_extra_attrs, mayb
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-from . import decode_gemv as _decode_gemv
 from .norm import RMSNorm, run_in_parallel
 from .step import DecodeStep
 
@@ -137,6 +133,8 @@ class _IdentityRope:
     the attention op is handed). Grown, never shrunk: a larger table holds the smaller one's rows."""
 
     _tables: Dict[torch.device, "_IdentityRope"] = {}
+    # The tables a larger one replaced: a CUDA graph captured with one still reads its memory.
+    _superseded: List["_IdentityRope"] = []
 
     def __init__(self, device: torch.device, positions: int, rope_dim: int) -> None:
         self.positions = positions
@@ -156,6 +154,8 @@ class _IdentityRope:
                     f"Kimi K3 MLA: the identity rope table needs {positions} positions inside a CUDA graph capture; "
                     "an eager step sizes it first"
                 )
+            if table is not None:
+                cls._superseded.append(table)
             table = cls(device, positions, rope_dim)
             cls._tables[device] = table
         return table
@@ -393,8 +393,9 @@ class K3DecodeMLA(nn.Module):
         self.g_proj_weight: Optional[torch.Tensor] = None
         # The decode attention's workspace: one per device, shared by every MLA layer.
         self.k3_workspace: Optional[K3MlaAttnWorkspace] = None
-        # The decode GEMVs' state (decode_gemv.py), shared by the target's layers.
-        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
+        # The decode GEMVs' state, shared by the target's layers: the target's ``decode_gemv.K3DecodeGemvs``, set in
+        # its ``post_load_weights``. ``project(site, x, weight)`` returns the site's rows, or None where it declines.
+        self.decode_gemvs: Optional[Any] = None
         # The FlashInfer MLA decode's multi-CTA KV counter (mixed steps), made on first use.
         self._fi_counter: Optional[torch.Tensor] = None
         # The key a breakable CUDA graph's eager break finds this layer by (``_core_inplace``).
@@ -707,9 +708,13 @@ class K3DecodeMLA(nn.Module):
     # -- context ------------------------------------------------------------------------------------------------
 
     def _context(self, q, compressed_kv, latent_cache, md, output, rope: _IdentityRope) -> None:
-        """The context requests' attention: a fresh prompt over its own K / V; a cached prefix (block reuse or a
-        later chunk) over the whole prefix, read from the cache in one piece or, with chunked prefill, chunk by
-        chunk with the partials merged."""
+        """The context requests' attention: a fresh prompt over its own K / V; a cached prefix (a later chunk of
+        chunked prefill) over the whole prefix, read from the cache chunk by chunk with the partials merged.
+
+        Raises:
+            RuntimeError: a cached prefix with chunked prefill off, which only block reuse produces; the targets
+                run with block reuse off (``routing.py`` declines it and the targets check it on the first step).
+        """
         with_cached_kv = bool(md.enable_context_mla_with_cached_kv)
         cached = with_cached_kv and md.num_ctx_cached_tokens > 0
         if with_cached_kv:
@@ -717,7 +722,10 @@ class K3DecodeMLA(nn.Module):
         if cached and md.runtime_features.chunked_prefill:
             self._context_chunked(q, compressed_kv, latent_cache, md, output, rope)
         elif cached:
-            self._context_cached(q, latent_cache, md, output, rope)
+            raise RuntimeError(
+                "Kimi K3 MLA: a context step over a cached prefix needs chunked prefill; "
+                "kv_cache_config.enable_block_reuse must be false"
+            )
         else:
             self._context_fresh(q, compressed_kv, latent_cache, md, output, rope)
 
@@ -799,46 +807,6 @@ class K3DecodeMLA(nn.Module):
             dim=-1,
         )
         return k.view(-1, heads * self.qk_head_dim), v
-
-    def _context_cached(self, q, latent_cache, md, output, rope: _IdentityRope) -> None:
-        """Chunked prefill off, a cached prefix (block reuse): the whole prefix and the chunk read back from the
-        cache, expanded, and attended in one call."""
-        self._append_and_assign_q(q, latent_cache, md, rope)
-        manager = md.kv_cache_manager
-        full_kv, full_k_pe = load_paged_kv_cache_for_mla(
-            out_dtype=q.dtype,
-            num_contexts=md.num_contexts,
-            num_ctx_kv_tokens=md.num_ctx_cached_tokens + md.num_ctx_tokens,
-            max_ctx_kv_len=int(md.max_ctx_kv_len),
-            cu_ctx_kv_lens=md.ctx_kv_indptr,
-            kv_cache_block_offsets=md.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=manager.kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=manager.kv_cache_pool_mapping,
-            kv_scale_quant_orig=None,
-            layer_idx=self._local_layer(md),
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            tokens_per_block=manager.tokens_per_block,
-            attention_window_size=manager.max_seq_len,
-            beam_width=1,
-            quant_mode=_QUANT_MODE_BF16_KV,
-        )
-        k, v = self._expand_kv(full_kv, full_k_pe)
-        del full_kv, full_k_pe
-        self._thop(
-            md,
-            rope,
-            q=q,
-            k=k,
-            v=v,
-            output=output,
-            attention_input_type=_CONTEXT,
-            mask_type=_MASK_CAUSAL,
-            latent_cache=None,
-            sequence_length=md.kv_lens_cuda_runtime,
-            host_past_key_value_lengths=md.kv_lens_runtime,
-            host_total_kv_lens=md.host_total_kv_lens,
-        )
 
     def _context_chunked(
         self, q, compressed_kv, latent_cache, md, output, rope: _IdentityRope
@@ -1133,6 +1101,11 @@ class K3DecodeMLA(nn.Module):
         lat = kv + rope_dim
         num_tokens = fused_q.shape[0]
         num_contexts, num_requests = md.num_contexts, md.num_generations
+        max_kv_len = int(md.kv_lens_runtime[num_contexts : num_contexts + num_requests].max())
+        if 0 < self._window(md) < max_kv_len:
+            raise NotImplementedError(
+                "Kimi K3 MLA: sliding-window attention is not supported by the FlashInfer MLA decode."
+            )
         seq_len_q = num_tokens // num_requests
         max_num_sequences = md.max_num_sequences or md.max_num_requests
         workspace = md.effective_workspace
@@ -1179,7 +1152,7 @@ class K3DecodeMLA(nn.Module):
             workspace,
             block_tables,
             md.kv_lens_cuda_runtime[num_contexts:],
-            int(md.kv_lens_runtime[num_contexts : num_contexts + num_requests].max()),
+            max_kv_len,
             latent_out.view(num_requests, seq_len_q, heads, kv),
             self.qk_nope_head_dim,
             kv,

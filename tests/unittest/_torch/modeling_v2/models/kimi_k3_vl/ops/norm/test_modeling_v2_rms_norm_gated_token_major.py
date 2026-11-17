@@ -114,3 +114,11 @@ def test_guard_refuses_per_column_fp8_scale() -> None:
     with pytest.raises(AssertionError, match="exactly one element"):
         with validating(rms_norm_gated_token_major):
             rms_norm_gated_token_major(x, z, weight, EPS, fp8_scale, "sigmoid")
+
+
+def test_guard_refuses_a_short_weight() -> None:
+    weight = torch.randn(HEAD_DIM // 2, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(8 * 6, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    z = _gate_view(8, 6, HEAD_DIM, torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight shape"):
+        rms_norm_gated_token_major.is_valid(x, z, weight, EPS, None, "sigmoid")

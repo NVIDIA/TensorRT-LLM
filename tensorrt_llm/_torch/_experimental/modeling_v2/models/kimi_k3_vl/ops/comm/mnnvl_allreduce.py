@@ -101,11 +101,13 @@ class K3MnnvlAllReduce(nn.Module):
         )
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
-        """The MoE fold (``MoEAllReduceParams``) is never taken."""
+        """The MoE fold (``MoEAllReduceParams``) is never taken. The runtime ``AllReduce.supports_moe_fold`` asks the
+        module in its ``mnnvl_allreduce`` slot."""
         return False
 
     def gemm_allreduce_norm(
         self, input, weight, weight_scale, input_scale, params, gemm_tactic
     ) -> None:
-        """No fused GEMM + all-reduce + norm kernel: the caller runs them apart."""
+        """No fused GEMM + all-reduce + norm kernel: the caller runs them apart. The runtime
+        ``AllReduce.gemm_allreduce_norm`` asks the module in its ``mnnvl_allreduce`` slot."""
         return None

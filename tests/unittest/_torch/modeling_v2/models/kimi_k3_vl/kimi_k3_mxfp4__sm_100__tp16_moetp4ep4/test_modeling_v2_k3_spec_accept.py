@@ -177,6 +177,7 @@ def drafts_for(
 
 def differing(got, want, names) -> list:
     """The names whose tensors differ in dtype, shape or bits."""
+    assert len(got) == len(want) == len(names), (len(got), len(want), len(names))
     return [
         n
         for n, x, y in zip(names, got, want)

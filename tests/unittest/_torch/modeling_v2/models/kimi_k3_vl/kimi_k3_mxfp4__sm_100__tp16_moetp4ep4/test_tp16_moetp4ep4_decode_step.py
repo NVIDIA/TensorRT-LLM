@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""How the tp16_moetp4ep4 target classifies a step for its decode kernels (host-side, no GPU): ``decode_step``, the
-attention-residual epilogue ceiling it sets, which steps the MoE layers push on, the KDA verify's dense output, the one
-path the text model runs for a step, and the DSpark worker reading the current batch-to-slot buffer."""
+"""The tp16_moetp4ep4 target's step wiring (host-side, no GPU): the KDA verify's dense output, the one path the text
+model runs for a step, and the DSpark worker reading the current batch-to-slot buffer. The family's
+``test_kimi_k3_step.py`` and ``test_kimi_k3_attn_res.py`` check how a step is classified."""
 
 import pytest
 import torch
@@ -15,21 +15,11 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
 
 __extra_import_path__ = [".."]
 from _kimi_k3_decode_step import (  # noqa: E402
-    ATTN_RES_CEILINGS,
-    GENERIC_STEPS,
-    LATENT_PUSH_STEPS,
-    PURE_DECODE_STEPS,
-    SHORT_STEPS,
     SLOT_ORDERS,
     STEP_PATHS,
-    check_attn_res_epilogue_ceiling,
     check_drafter_inputs_use_current_slot_buffer,
     check_each_step_takes_one_path_through_every_layer,
-    check_latent_push,
-    check_pure_decode_step,
-    check_short_step_is_small_only,
     check_spec_accept_uses_current_slot_buffer,
-    check_step_takes_the_generic_path,
 )
 
 try:
@@ -46,32 +36,6 @@ except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize("requests,tokens", PURE_DECODE_STEPS)
-def test_pure_decode_steps(requests, tokens):
-    """R <= 8 generation requests of the same T <= 8 tokens: a decode step, small up to one token tile, wide above."""
-    check_pure_decode_step(target, requests, tokens)
-
-
-@pytest.mark.parametrize("seq_lens,num_contexts,rows", SHORT_STEPS)
-def test_short_steps_are_small_only(seq_lens, num_contexts, rows):
-    check_short_step_is_small_only(target, seq_lens, num_contexts, rows)
-
-
-@pytest.mark.parametrize("seq_lens,num_contexts,rows", GENERIC_STEPS)
-def test_other_steps_take_the_generic_path(seq_lens, num_contexts, rows):
-    check_step_takes_the_generic_path(target, seq_lens, num_contexts, rows)
-
-
-@pytest.mark.parametrize("step,ceiling", ATTN_RES_CEILINGS)
-def test_attn_res_epilogue_ceiling(step, ceiling):
-    check_attn_res_epilogue_ceiling(target, step, ceiling)
-
-
-@pytest.mark.parametrize("step,given,pushes", LATENT_PUSH_STEPS)
-def test_latent_push(step, given, pushes):
-    check_latent_push(target, step, given, pushes)
 
 
 def _kda_verify_module(monkeypatch, seen):

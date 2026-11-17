@@ -250,18 +250,16 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     assert collective_tests <= expected, collective_tests - expected
     # The tests whose kernels are certified on sm_100 only (B300 is sm_103): one B200.
     sm100_tests = {
-        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_mla_steps.py",
-        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_mla_steps.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py",
         "ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py",
         "ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py",
         "ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py",
         "ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py",
+        "test_kimi_k3_mla_steps.py",
     }
     # The all-reduce off MNNVL: four x86 B200 (GB300 has MNNVL).
     non_mnnvl_tests = {
-        "ops/comm/test_modeling_v2_autotuned_allreduce_op_matrix.py",
         "ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py",
     }
     assert sm100_tests | non_mnnvl_tests <= expected, (sm100_tests | non_mnnvl_tests) - expected

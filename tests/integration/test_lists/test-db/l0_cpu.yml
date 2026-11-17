@@ -139,16 +139,18 @@ l0_cpu:
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_attn_res.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_capture_view.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_ctx_rows_start.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_draft_block_rows.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_weights.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_worker_gate.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_shell.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_weights_checks.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_weights_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_weights_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_causal_lm.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_allreduce_module.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py

@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Steps of a Kimi K3 target's MLA layer (``mla.py``) on one GPU, for checks of the layer against itself.
+"""Steps of the Kimi K3 family's MLA layer (``mla.py``) on one GPU, for checks of the layer against itself.
 
-``MlaLayer`` builds a target's ``KimiMLARuntime`` at one TP16 rank's shape (6 of the 96 heads) with a single-rank
+``MlaLayer`` builds the family's ``KimiMLARuntime`` at one TP16 rank's shape (6 of the 96 heads) with a single-rank
 ``Mapping()`` and random weights, over one bf16 latent cache (page 64) of 16 requests. ``run`` runs a step eagerly on
 the generic path or on the decode branch; ``run_breakable_graph`` and ``run_cuda_graph`` run it captured and replayed.
 ``snapshot`` / ``restore`` put the cache back, so two ways of running a step start from the same contents.
@@ -78,7 +78,6 @@ class Step:
     cached: List[int]
     num_contexts: int
     prompt_lens: List[int]
-    chunked_prefill: bool = True
 
     @property
     def num_tokens(self) -> int:
@@ -101,18 +100,23 @@ def fresh_prefill() -> Step:
     )
 
 
-def prefix_step(chunked_prefill: bool) -> Step:
-    """Three context requests continuing over a cached prefix (100, 37 and 128 tokens): with chunked prefill the
-    prefix is read in 5 chunks of up to 64 tokens; without, in one piece."""
-    return Step(
-        "chunked prefill" if chunked_prefill else "cached prefix",
-        [0, 1, 5],
-        [50, 30, 9],
-        [100, 37, 128],
-        3,
-        [50, 30, 9],
-        chunked_prefill=chunked_prefill,
-    )
+def prefix_step() -> Step:
+    """Three context requests continuing over a cached prefix (100, 37 and 128 tokens) with chunked prefill: the
+    prefix is read in 5 chunks of up to 64 tokens."""
+    return Step("chunked prefill", [0, 1, 5], [50, 30, 9], [100, 37, 128], 3, [50, 30, 9])
+
+
+def whole_prompt_step() -> Step:
+    """`prefix_step`'s requests as fresh context requests over their whole prompt (prefix and new tokens: 150, 67 and
+    137 tokens), without a cached prefix."""
+    return Step("whole prompt", [0, 1, 5], [150, 67, 137], [0, 0, 0], 3, [150, 67, 137])
+
+
+def request_rows(step: Step, request_id: int) -> slice:
+    """The rows of ``request_id``'s tokens in ``step``'s flat token axis."""
+    k = step.request_ids.index(request_id)
+    start = sum(step.seq_lens[:k])
+    return slice(start, start + step.seq_lens[k])
 
 
 def mixed(lens: List[int]) -> Step:
@@ -129,7 +133,7 @@ def generation(ids: List[int], tokens: int, lens: List[int]) -> Step:
 
 
 class MlaLayer:
-    """A target's MLA layer, its weights and its KV cache (see the module docstring)."""
+    """The family's MLA layer, its weights and its KV cache (see the module docstring)."""
 
     def __init__(self, mla_module, seed: int = 0) -> None:
         self.mla = mla_module
@@ -210,9 +214,7 @@ class MlaLayer:
             ),
             mapping=Mapping(),
             enable_context_mla_with_cached_kv=True,
-            runtime_features=AttentionRuntimeFeatures(
-                chunked_prefill=step.chunked_prefill, chunk_size=16
-            ),
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16),
         )
         md.prepare()
         return md

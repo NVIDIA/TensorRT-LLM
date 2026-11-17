@@ -159,6 +159,10 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
     ) -> None:
+        assert weight.shape == (x.shape[-1],), (
+            f"weight shape {tuple(weight.shape)}, not ({x.shape[-1]},): the multi-row kernel reads N weight "
+            "elements unmasked"
+        )
         if fp8_scale is not None:
             assert fp8_scale.numel() == 1, "fp8_scale must contain exactly one element"
             assert fp8_scale.dtype == torch.float32, "fp8_scale must have dtype torch.float32"

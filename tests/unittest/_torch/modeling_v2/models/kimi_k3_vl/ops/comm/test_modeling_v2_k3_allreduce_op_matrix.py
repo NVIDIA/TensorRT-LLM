@@ -28,6 +28,26 @@ if torch.cuda.device_count() < _rank_job.WORLD_SIZE:
     )
 
 
+def _mnnvl_available() -> bool:
+    """The condition the modules take MNNVL on with the MNNVL strategy named, which the check's MNNVL half needs."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import (
+        mnnvl_supported,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    world = _rank_job.WORLD_SIZE
+    mapping = Mapping(world_size=world, rank=0, gpus_per_node=world, tp_size=world)
+    return mnnvl_supported(mapping, torch.bfloat16, explicitly_requested=True)
+
+
+if not _mnnvl_available():
+    pytest.skip(
+        "the check needs MNNVL (GB200 / GB300 NVL); this host has none (the off-MNNVL path is "
+        "_k3_allreduce_fallback_op_matrix.py)",
+        allow_module_level=True,
+    )
+
+
 # The case starts its own W-rank mpirun over the visible devices; under xdist several workers would fight for them.
 @pytest.mark.no_xdist
 def test_k3_allreduce_op_matrix() -> None:

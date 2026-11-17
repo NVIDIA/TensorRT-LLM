@@ -123,6 +123,13 @@ class AttnResFwd(OpWrapper):
         rms_weight: torch.Tensor,
         rms_eps: float,
     ) -> None:
+        for name, tensor in (
+            ("layer_residual", layer_residual),
+            ("block_residual", block_residual),
+        ):
+            assert tensor.numel() == 0 or tensor.data_ptr() % 16 == 0, (
+                f"{name} must start 16-byte aligned; the kernel bulk-copies its rows"
+            )
         tensors = (block_residual, res_weight, rms_weight)
         if layer_residual.is_cuda and all(tensor.is_cuda for tensor in tensors):
             assert all(tensor.device == layer_residual.device for tensor in tensors), (

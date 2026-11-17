@@ -88,6 +88,9 @@ class K3DSparkMarkovChain(OpWrapper):
         tp_exchange=None,
     ) -> None:
         assert base_logits.dtype == torch.float32 and base_logits.stride(-1) == 1
+        assert first_prev_tokens.dim() == 1 and first_prev_tokens.is_contiguous(), (
+            "the kernel reads the anchors with unit stride"
+        )
         assert markov_w1.is_contiguous() and markov_w1.dtype == markov_w2.dtype
         assert markov_w1.shape == markov_w2.shape
         assert base_logits.shape[-1] < 2**24, "indices must be exact in float32"

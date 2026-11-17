@@ -325,8 +325,9 @@ def hidden_for(metadata, seed: int) -> torch.Tensor:
 
 def run_twice(mgr, run, what: str) -> torch.Tensor:
     """Run ``run()`` from the current pools, restore them, run it again: the outputs and every pool must be the same
-    bits (no step reads state it does not own, or a buffer a previous call left). Returns the output; the pools stay as
-    the second run left them."""
+    bits (repeated runs from the same pools give the same bits; no step reads a buffer a previous call left). Returns
+    the output; the pools stay as the second run left them. `idle_rows_keep_state` checks the rows a step does not
+    own."""
     before = snapshot(mgr)
     with torch.inference_mode():
         first = run().clone()
@@ -340,6 +341,21 @@ def run_twice(mgr, run, what: str) -> torch.Tensor:
     for name, t in pool_tensors(mgr).items():
         assert_bitwise(t, after_first[name], f"{what}: pool {name}")
     return second
+
+
+def idle_rows_keep_state(mgr, run, idle: list, what: str) -> None:
+    """Run ``run()`` once: the conv and recurrent-state rows at state slots ``idle`` (requests the manager holds that
+    are not in the step) keep their bits."""
+    cache = mgr.mamba_layer_cache(0)
+    rows = torch.tensor(idle, dtype=torch.long, device="cuda")
+    before = {name: getattr(cache, name)[rows].clone() for name in ("conv", "temporal")}
+    with torch.inference_mode():
+        run()
+    torch.cuda.synchronize()
+    for name, rows_before in before.items():
+        assert_bitwise(
+            getattr(cache, name)[rows], rows_before, f"{what}: {name} rows of idle requests"
+        )
 
 
 def committed_window_follows(mgr, slots: list, what: str) -> None:
@@ -358,6 +374,6 @@ def committed_window_follows(mgr, slots: list, what: str) -> None:
         assert_bitwise(window, live, f"{what}: {name} committed window")
 
 
-def decode_step_of(target: str, metadata):
-    """The target's own ``decode_step`` classification of ``metadata``'s step."""
-    return target_module(target, "step").decode_step(metadata, metadata.num_tokens)
+def decode_step_of(metadata):
+    """The family's ``decode_step`` classification of ``metadata``'s step (``step.py``, which both targets run)."""
+    return importlib.import_module(f"{PACKAGE}.step").decode_step(metadata, metadata.num_tokens)

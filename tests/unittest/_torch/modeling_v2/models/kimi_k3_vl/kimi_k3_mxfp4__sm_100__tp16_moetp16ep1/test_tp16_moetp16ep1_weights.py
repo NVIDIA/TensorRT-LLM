@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The tp16_moetp16ep1 target's checkpoint load (``weights.py``) on one GPU, against the built-in Kimi K3 model loaded
-by the built-in loader: on a scaled-down model at three ranks' shares, every parameter and buffer both hold, before and
-after the post-load, and every derived weight hold the same bits; the load reads the keys the built-in plan names, and
-fails on a missing, unknown or FP8 key (the checks are ``_kimi_k3_loader_parity``)."""
+"""The tp16_moetp16ep1 target's checkpoint load (the family's ``weights.py`` into this target's model) on one GPU,
+against the built-in Kimi K3 model loaded by the built-in loader: on a scaled-down model at three ranks' shares, every
+parameter and buffer both hold, before and after the post-load, and every derived weight hold the same bits; the load
+reads the keys the built-in plan names, and fails on a missing, unknown or FP8 key (the checks are
+``_kimi_k3_loader_parity``)."""
 
 import pytest
 
@@ -21,9 +22,9 @@ pytest.importorskip("fla")  # the built-in KDA module the comparison loads into
 
 TARGET = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1"
 try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import weights
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
         modeling,
-        weights,
     )
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)

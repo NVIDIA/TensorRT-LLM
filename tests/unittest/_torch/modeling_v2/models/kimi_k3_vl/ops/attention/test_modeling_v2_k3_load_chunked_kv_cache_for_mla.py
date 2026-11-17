@@ -39,7 +39,7 @@ def test_cells(cell):
         )
         assert md.chunked_loop_num >= 2
         manager = env.manager
-        seen = [0] * len(cached)
+        seen = [[] for _ in cached]
         for loop in range(md.chunked_loop_num):
             total = int(md.host_cu_chunked_seq_len[loop, len(cached)])
             with validating(op):
@@ -70,8 +70,20 @@ def test_cells(cell):
             )
             assert torch.equal(kv, want_kv) and torch.equal(k_pe, want_pe), f"chunk {loop}"
             cu = md.host_cu_chunked_seq_len[loop].tolist()
+            start = md.host_chunked_global_offset[loop].tolist()
             for r in range(len(cached)):
-                seen[r] += cu[r + 1] - cu[r]
-        assert seen == cached, "the chunks do not cover every cached row exactly once"
+                seen[r].extend(range(start[r], start[r] + cu[r + 1] - cu[r]))
+        assert [sorted(s) for s in seen] == [list(range(c)) for c in cached], (
+            "the chunks do not cover every cached row exactly once"
+        )
     finally:
         env.shutdown()
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_is_valid_rejects_a_wrong_chunk_total(delta):
+    """``num_ctx_cached_tokens`` must be the chunk plan's total; the op sizes its outputs from it."""
+    cu = torch.tensor([0, 10, 25], dtype=torch.int32)
+    args = (None,) * 5 + (0, LATENT, 64, 64, 64, 4096, 1, 0)
+    with pytest.raises(AssertionError, match="num_ctx_cached_tokens"):
+        op.is_valid(torch.bfloat16, 2, 25 + delta, cu, *args)

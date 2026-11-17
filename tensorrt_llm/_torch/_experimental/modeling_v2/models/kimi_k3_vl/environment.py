@@ -8,7 +8,7 @@ instead. This module imports nothing from the targets."""
 from __future__ import annotations
 
 import os
-from typing import List, Mapping
+from collections.abc import Mapping
 
 #: Which residual value the DSpark hidden-state tap hands the drafter: "1" (the default) the pre-norm
 #: attention-residual mixture, any other value the running prefix sum. It has to match what the drafter checkpoint was
@@ -19,11 +19,11 @@ AUX_ATTN_RES_STREAM = "KIMI_K3_AUX_ATTN_RES_STREAM"
 FUSED_ATTN_RES = "KIMI_K3_FUSED_ATTN_RES"
 #: Which attention-residual kernel serves a decode step: one of `ATTN_RES_TOPOLOGIES`, or `ATTN_RES_TOPOLOGY_ON`.
 ATTN_RES_TOPOLOGY = "KIMI_K3_ATTN_RES_TOPOLOGY"
-#: The most tokens the fused attention-residual epilogue takes: a positive integer.
+#: The most tokens the fused attention-residual epilogue takes, a positive integer.
 FUSED_ATTN_RES_MAX_TOKENS = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
 #: "1" runs the latent MoE projections as plain linear layers instead of the min-latency fused GEMM.
 DISABLE_MIN_LATENCY_LATENT_PROJ = "TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ"
-#: "1" routes up to 64 tokens with noaux_tc_op and mxfp8_quantize instead of the fused moe/k3_route_quant.
+#: "1" routes up to 64 tokens with noaux_tc_op and mxfp8_quantize instead of the fused moe/kimi_k3_noaux_tc_mxfp8_quant.
 DISABLE_FUSED_ROUTE_QUANT = "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT"
 #: Unset or "1": the router gate GEMM runs bf16 x bf16 with fp32 output; any other value upcasts to fp32 first.
 ROUTER_BF16 = "KIMI_K3_ROUTER_BF16"
@@ -31,24 +31,15 @@ ROUTER_BF16 = "KIMI_K3_ROUTER_BF16"
 #: ``max_position_embeddings``.
 MLA_MAX_POSITIONS = "KIMI_K3_MLA_MAX_POSITIONS"
 
-#: Every variable above, in the order `declines` checks them.
-VARIABLES = (
-    AUX_ATTN_RES_STREAM,
-    FUSED_ATTN_RES,
-    ATTN_RES_TOPOLOGY,
-    FUSED_ATTN_RES_MAX_TOKENS,
-    DISABLE_MIN_LATENCY_LATENT_PROJ,
-    DISABLE_FUSED_ROUTE_QUANT,
-    ROUTER_BF16,
-    MLA_MAX_POSITIONS,
-)
-
 #: The attention-residual topologies: ``per_token`` (the default) never uses the persistent kernel, ``persistent``
 #: uses it at every shape it implements, ``split`` uses it above `fused_attn_res_max_tokens` tokens.
 ATTN_RES_TOPOLOGIES = ("per_token", "persistent", "split")
 #: The one value that turns the persistent kernel on without naming a topology: it selects ``split``, the measured
 #: policy.
 ATTN_RES_TOPOLOGY_ON = "1"
+#: The most tokens (rows T) the native attention-residual ops take: ``check_attn_res_contract`` in
+#: ``csrc/k3AttnResOp.cpp`` raises above it.
+ATTN_RES_MAX_TOKENS = 16384
 
 
 def aux_attn_res_stream(environ: Mapping[str, str] = os.environ) -> bool:
@@ -106,7 +97,7 @@ def disable_min_latency_latent_proj(environ: Mapping[str, str] = os.environ) -> 
 
 
 def disable_fused_route_quant(environ: Mapping[str, str] = os.environ) -> bool:
-    """Whether routing skips the fused moe/k3_route_quant (`DISABLE_FUSED_ROUTE_QUANT`)."""
+    """Whether routing skips the fused moe/kimi_k3_noaux_tc_mxfp8_quant (`DISABLE_FUSED_ROUTE_QUANT`)."""
     return environ.get(DISABLE_FUSED_ROUTE_QUANT, "0") == "1"
 
 
@@ -134,10 +125,10 @@ def mla_max_positions(default: int, environ: Mapping[str, str] = os.environ) -> 
     return value
 
 
-def declines(environ: Mapping[str, str] = os.environ) -> List[str]:
+def declines(environ: Mapping[str, str] = os.environ) -> list[str]:
     """Each variable whose value a target would reject when it reads it, with the reason. The others accept every
     value."""
-    reasons = []
+    reasons: list[str] = []
     topology = "per_token"
     try:
         topology = attn_res_topology(environ)

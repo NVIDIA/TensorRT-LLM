@@ -326,7 +326,7 @@ std::tuple<at::Tensor, at::Tensor> k3_attn_res_add_rmsnorm_persistent_fwd(at::Te
     // which the unannotated Tensor return type does not advertise. That is
     // deliberate. Cloning to break the alias would copy [T, B, H] bf16 on a
     // path whose only caller discards the value (``_, output = persistent_op``
-    // in the targets' attn_res.py), and the persistent kernel has no token
+    // in the family's attn_res.py), and the persistent kernel has no token
     // ceiling by design -- at prefill lengths that is hundreds of MB of pure
     // waste. Do not consume the first result when layer_residual_add is None.
     // The aliasing is conditional and cannot be expressed in the schema; the
