@@ -143,26 +143,14 @@ def _prepare_fp4_mla_q_buffers(
     """
     if num_queries <= 0:
         raise ValueError(f"FP4 MLA Q buffer preparation needs queries, got {num_queries}.")
-    owner = getattr(metadata, "kv_cache_manager", None)
-    if owner is None:
-        raise RuntimeError("Fused FP4 MLA Q quantization requires a KV cache manager.")
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
+        raise RuntimeError(
+            "Fused FP4 MLA Q quantization requires a KV cache manager with the FP4 MLA cache layout."
+        )
     if num_heads <= 0 or num_heads > 128:
         raise ValueError(f"FP4 MLA Q buffers require 1-128 local heads, got {num_heads}.")
-    # The cache layout owns the Q buffers; a manager without one keeps them itself.
-    owner = fp4_mla_cache_layout(owner) or owner
-    get_or_create = getattr(owner, "get_or_create_fp4_mla_q_buffers", None)
-    if callable(get_or_create):
-        buffers = get_or_create()
-    else:
-        buffers = getattr(owner, "_fp4_mla_q_buffers", None)
-        if buffers is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Cannot create FP4 MLA Q buffers while capturing a CUDA graph. "
-                    "Run a warmup forward first."
-                )
-            buffers = {}
-            setattr(owner, "_fp4_mla_q_buffers", buffers)
+    buffers = cache_layout.get_or_create_fp4_mla_q_buffers()
 
     max_num_tokens = int(getattr(metadata, "max_num_tokens", num_queries) or num_queries)
     max_num_sequences = int(
@@ -368,7 +356,7 @@ def _build_fp4_mla_context_scatter_plan(
         head_dim=head_dim,
         backend=backend,
     )
-    if has_decode_views and getattr(state, "v_scale_pool", None) is None:
+    if has_decode_views and state.v_scale_pool is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -399,7 +387,7 @@ def _build_fp4_mla_context_scatter_plan(
             )
         _validate_fp4_mla_context_start_alignment(metadata, num_contexts, alignment=FP4_BLOCK_SIZE)
 
-    hp_pool = getattr(state, "hp_pool", None)
+    hp_pool = state.hp_pool
     if not isinstance(hp_pool, torch.Tensor):
         raise TypeError("FP4 MLA high-precision KV pool must be a tensor.")
     if hp_pool.device != latent_cache.device:
@@ -670,7 +658,7 @@ def _scatter_fp4_mla_context(
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
     has_decode_views = _fp4_mla_cache_has_decode_views(kv_cache_manager)
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
-    plan = getattr(state, "context_scatter_plan", None)
+    plan = state.context_scatter_plan
     if plan is None or not plan.matches(
         metadata,
         kv_cache,
@@ -707,13 +695,8 @@ def _scatter_fp4_mla_context(
         )
         v_packed_base = plan.v_packed_base
         if v_packed_base is not None:
-            get_v_page_offset = getattr(
-                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
-            )
-            v_page_offset = (
-                int(get_v_page_offset(local_layer))
-                if callable(get_v_page_offset)
-                else local_layer * kv_cache.shape[0]
+            v_page_offset = int(
+                fp4_mla_cache_layout(kv_cache_manager).get_mla_v_packed_page_offset(local_layer)
             )
             row_width = metadata.page_size // 2
             required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim
@@ -845,7 +828,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
 
-    pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
+    pool = metadata.fp4_mla_state.hp_pool
     if pool is None:
         raise RuntimeError("FP4 MLA 2D generation scatter requires the HP KV pool.")
     try:
@@ -1241,7 +1224,7 @@ def scatter_fp4_mla_kv_cache(
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
     if not _fp4_mla_cache_has_decode_views(kv_cache_manager):
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
-    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    if metadata.fp4_mla_state.v_scale_pool is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -1327,13 +1310,8 @@ def scatter_fp4_mla_kv_cache(
         )
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
-            get_v_page_offset = getattr(
-                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
-            )
-            v_page_offset = (
-                int(get_v_page_offset(local_layer))
-                if callable(get_v_page_offset)
-                else local_layer * kv_cache.shape[0]
+            v_page_offset = int(
+                fp4_mla_cache_layout(kv_cache_manager).get_mla_v_packed_page_offset(local_layer)
             )
             expected_row_width = metadata.page_size // 2
             required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim

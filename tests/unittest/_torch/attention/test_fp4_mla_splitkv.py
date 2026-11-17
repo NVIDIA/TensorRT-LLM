@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="requires an SM100-or-newer CUDA device",
@@ -122,15 +124,13 @@ def test_splitkv_workspace_is_shared_across_graph_buckets() -> None:
         FP4_MLA_P_GLOBAL_SCALE=1.0,
         run_trtllm_fp4_mla_decode_page_native_from_raw=partial_launch,
     )
-    base_metadata = SimpleNamespace(
-        is_cuda_graph=False, fp4_mla_state=SimpleNamespace(workspaces={})
-    )
+    base_metadata = SimpleNamespace(is_cuda_graph=False, fp4_mla_state=Fp4MlaState())
     buckets = []
     shared_pointers: dict[str, int] = {}
     for queries in [1, 4, 8]:
         metadata = copy.copy(base_metadata)
         metadata.is_cuda_graph = True
-        metadata.fp4_mla_state = SimpleNamespace(workspaces={})
+        metadata.fp4_mla_state = Fp4MlaState()
         q = torch.full((queries, heads, 320), queries, dtype=torch.uint8, device="cuda")
         sf = torch.zeros((queries, heads, 40), dtype=torch.uint8, device="cuda")
         output = torch.empty((queries, heads, columns), dtype=torch.bfloat16, device="cuda")

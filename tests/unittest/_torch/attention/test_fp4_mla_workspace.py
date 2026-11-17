@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
     FP4_MLA_PACKED_Q_ENV,
 )
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 
 CPU = torch.device("cpu")
 
@@ -52,7 +53,7 @@ class _FakePool:
 
 def _metadata(max_sequences: int = 128) -> SimpleNamespace:
     return SimpleNamespace(
-        fp4_mla_state=SimpleNamespace(workspaces={}),
+        fp4_mla_state=Fp4MlaState(),
         max_num_sequences=max_sequences,
         max_num_requests=max_sequences,
     )

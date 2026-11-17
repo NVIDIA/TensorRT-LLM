@@ -1006,7 +1006,7 @@ def _prepare_decode_call(
                     "same-device int32 tensor covering every query token."
                 )
             helix_kv_bounds = helix_kv_bounds[:num_queries]
-    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    if metadata.fp4_mla_state.v_scale_pool is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
@@ -1022,9 +1022,7 @@ def _prepare_decode_call(
     capacity = int(q_batch_capacity)
     # The fused generation update records the Q layout it produced; metadata
     # that never went through it (contract tests) carries the legacy layout.
-    recorded_rows_per_seq = getattr(
-        getattr(metadata, "fp4_mla_state", None), "prequantized_q_rows_per_seq", None
-    )
+    recorded_rows_per_seq = metadata.fp4_mla_state.prequantized_q_rows_per_seq
     packed_rows_per_seq = int(recorded_rows_per_seq or 0)
     if recorded_rows_per_seq is not None and packed_rows_per_seq != _fp4_mla_packed_rows_per_seq(
         num_heads, query_len_per_seq
@@ -1246,12 +1244,7 @@ def _cutedsl_v_operands(call: _DecodeCall, cutedsl_kernel: Any) -> _VOperands:
     if core_v_packed is None:
         raise RuntimeError("Persistent FP4 MLA V packing requires a stable full-pool base.")
     cache_layout = fp4_mla_cache_layout(metadata.kv_cache_manager)
-    get_v_page_offset = getattr(cache_layout, "get_mla_v_packed_page_offset", None)
-    v_page_offset = (
-        int(get_v_page_offset(local_layer))
-        if callable(get_v_page_offset)
-        else local_layer * kv_cache.shape[0]
-    )
+    v_page_offset = int(cache_layout.get_mla_v_packed_page_offset(local_layer))
     page_bytes = call.kv_lora_rank * (metadata.page_size // 2)
     expected_layer_ptr = core_v_packed.data_ptr() + v_page_offset * page_bytes
     if expected_layer_ptr != v_packed.data_ptr():
@@ -1278,12 +1271,7 @@ def _cutedsl_v_operands(call: _DecodeCall, cutedsl_kernel: Any) -> _VOperands:
             "two-dimensional uint8 tensor with the configured page stride."
         )
     core_v_sf = v_sf_pool_base.view(torch.float8_e4m3fn)
-    get_v_sf_page_offset = getattr(cache_layout, "get_mla_v_scale_page_offset", None)
-    v_sf_page_offset = (
-        int(get_v_sf_page_offset(local_layer))
-        if callable(get_v_sf_page_offset)
-        else local_layer * kv_cache.shape[0]
-    )
+    v_sf_page_offset = int(cache_layout.get_mla_v_scale_page_offset(local_layer))
     if v_sf_page_offset != v_page_offset:
         raise RuntimeError(
             "Persistent FP4 MLA V-packed and V-scale pools require matching encoded layer offsets."
@@ -1400,7 +1388,7 @@ def _run_packed_decode(call: _DecodeCall, v: _VOperands, cutedsl_kernel: Any) ->
             kv_capacity=call.max_kv_len,
             sm_count=_get_sm_count(call.device),
             envelope_reason=_host_4x.envelope_reason_static,
-            live_max_kv=getattr(call.metadata.fp4_mla_state, "kv_regime_max_kv", None),
+            live_max_kv=call.metadata.fp4_mla_state.kv_regime_max_kv,
             helix=call.helix_kv_bounds is not None,
             softmax_stats=call.softmax_stats_tensor is not None,
             v_packed=v.v_packed is not None,

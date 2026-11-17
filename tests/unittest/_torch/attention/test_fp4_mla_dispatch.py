@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
 from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import select_kv_regime_ceiling
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 
 SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
@@ -411,7 +412,7 @@ def _decode_call(**overrides):
     fields = dict(
         metadata=SimpleNamespace(
             page_size=128,
-            fp4_mla_state=SimpleNamespace(paged_kv_indptr_decode=torch.zeros(9, dtype=torch.int32)),
+            fp4_mla_state=Fp4MlaState(paged_kv_indptr_decode=torch.zeros(9, dtype=torch.int32)),
         ),
         layer_idx=0,
         local_layer=0,

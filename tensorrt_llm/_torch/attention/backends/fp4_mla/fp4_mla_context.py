@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
 
 _FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
-_FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
 
 
 def require_fp4_mla_fp8_context_support() -> None:
@@ -369,28 +368,22 @@ def get_or_create_fp8_mla_context_scratch(
     device: torch.device,
     head_dim: int,
 ) -> "_Fp8MlaContextScratch":
-    """Return the manager-owned FP8 MLA context scratch, creating or validating it."""
-    if kv_cache_manager is None:
-        raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
+    """Return the FP8 MLA context scratch of the manager's cache layout, creating or validating it."""
+    cache_layout = fp4_mla_cache_layout(kv_cache_manager)
+    if cache_layout is None:
+        raise RuntimeError(
+            "FP8 MLA context scratch requires a KV cache manager with the FP4 MLA cache layout."
+        )
+    created = False
 
     def create_scratch() -> _Fp8MlaContextScratch:
+        nonlocal created
+        created = True
         return _Fp8MlaContextScratch.create(meta, device=device, head_dim=head_dim)
 
-    # The cache layout owns the scratch; a manager without one keeps it itself.
-    owner = fp4_mla_cache_layout(kv_cache_manager) or kv_cache_manager
-    get_or_create = getattr(owner, "get_or_create_fp8_context_scratch", None)
-    if callable(get_or_create):
-        had_scratch = getattr(owner, "_fp8_context_scratch", None) is not None
-        scratch = get_or_create(create_scratch)
-    else:
-        scratch = getattr(owner, _FP8_CONTEXT_SCRATCH_ATTR, None)
-        had_scratch = scratch is not None
-        if scratch is None:
-            scratch = create_scratch()
-            setattr(owner, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
-
+    scratch = cache_layout.get_or_create_fp8_context_scratch(create_scratch)
     assert isinstance(scratch, _Fp8MlaContextScratch)
-    if had_scratch:
+    if not created:
         fp8_context_state = meta.fp4_mla_state.fp8_context_state
         if fp8_context_state is None or fp8_context_state[0] is not scratch:
             assert scratch.matches(meta, device=device, head_dim=head_dim), (

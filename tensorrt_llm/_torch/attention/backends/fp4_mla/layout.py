@@ -72,7 +72,7 @@ def get_fp4_mla_v_scale_pool_view(
     v_head_dim: int,
 ) -> torch.Tensor:
     """View the auxiliary MLA V-scale pool in Triton's block-scaled layout."""
-    pool = getattr(metadata.fp4_mla_state, "v_scale_pool", None)
+    pool = metadata.fp4_mla_state.v_scale_pool
     if pool is None:
         raise RuntimeError("FP4 MLA V scale pool is not allocated.")
 
@@ -103,7 +103,7 @@ def get_fp4_mla_v_scale_pool_view(
 
 
 def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "kv_global_scale", None)
+    global_scale = metadata.fp4_mla_state.kv_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -115,7 +115,7 @@ def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tens
 
 
 def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "q_global_scale", None)
+    global_scale = metadata.fp4_mla_state.q_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device

@@ -1377,6 +1377,7 @@ def test_fp4_mla_disagg_import_rebuilds_variant_sidecars(
         fp4_mla_layout=SimpleNamespace(
             mla_v_scale_head_dim=512,
             mla_v_head_dim=None if fused_v_transpose else 512,
+            _fp4_mla_compact_to_local=[0, 1],
             get_fp4_mla_cache_pool_bases=lambda: (kv_cache, sf_cache),
             get_mla_v_scale_pool_base=lambda: v_scale_pool,
             get_mla_v_scale_page_offset=lambda compact_layer: compact_layer,

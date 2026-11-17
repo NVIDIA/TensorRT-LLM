@@ -619,9 +619,7 @@ def rebuild_fp4_mla_disagg_imported_cache(
             "FP4 MLA disaggregated import cannot map local to global layers: "
             f"{len(pp_layers)} PP layers for {num_local_layers} local layers."
         )
-    fp4_local_layers = list(
-        getattr(cache_layout, "_fp4_mla_compact_to_local", range(num_local_layers))
-    )
+    fp4_local_layers = list(cache_layout._fp4_mla_compact_to_local)
     if not fp4_local_layers:
         raise RuntimeError("FP4 MLA disaggregated import found no local MLA layers.")
     if any(local_layer < 0 or local_layer >= num_local_layers for local_layer in fp4_local_layers):
@@ -679,7 +677,7 @@ def rebuild_fp4_mla_disagg_imported_cache(
         _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
         and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
     ):
-        v_head_dim = getattr(cache_layout, "mla_v_head_dim", None)
+        v_head_dim = cache_layout.mla_v_head_dim
         if v_head_dim is None:
             raise RuntimeError(
                 "CuTeDSL FP4 MLA disaggregated import requires a persistent V head dimension."

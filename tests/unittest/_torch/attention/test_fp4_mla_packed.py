@@ -13,6 +13,7 @@ import torch
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan as fp4_mla_packed_plan
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
@@ -101,7 +102,7 @@ def test_on_demand_split_count_launches_the_budget_only_for_a_split(monkeypatch)
 
     def metadata(kv_lens=None, *, packed_split=None, is_cuda_graph=False) -> SimpleNamespace:
         return SimpleNamespace(
-            fp4_mla_state=SimpleNamespace(packed_split=packed_split),
+            fp4_mla_state=Fp4MlaState(packed_split=packed_split),
             is_cuda_graph=is_cuda_graph,
             kv_lens_runtime=None if kv_lens is None else torch.tensor(kv_lens, dtype=torch.int32),
         )
@@ -426,7 +427,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
         kv_lens_cuda_runtime=torch.tensor([17, 25], dtype=torch.int32, device="cuda"),
         prompt_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
         is_cuda_graph=False,
-        fp4_mla_state=SimpleNamespace(
+        fp4_mla_state=Fp4MlaState(
             generation_kv_lens=corrected,
             generation_append_lens=generation_lens,
             generation_lengths_num_tokens=-1,
@@ -484,7 +485,7 @@ def test_packed_plan_wave_plan_env_rolls_back(monkeypatch) -> None:
         2, 4, 3, 17, 64, 6, 1024, None, None, ("key",)
     )
     kv_lens = torch.zeros(2, dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(fp4_mla_state=SimpleNamespace(packed_plan_key=None))
+    metadata = SimpleNamespace(fp4_mla_state=Fp4MlaState())
     monkeypatch.delenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, raising=False)
     fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
     monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, "0")
@@ -508,7 +509,7 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
         num_seqs=4,
         page_size=256,
         is_cuda_graph=True,
-        fp4_mla_state=SimpleNamespace(
+        fp4_mla_state=Fp4MlaState(
             device_page_table=True,
             page_table_stride=3904,
             generation_kv_lens=torch.zeros(4, dtype=torch.int32, device=device),

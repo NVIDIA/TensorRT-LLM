@@ -167,7 +167,7 @@ def _on_demand_split_count(
         or _fp4_mla_split_kv_override() != "auto"
     ):
         return splits
-    decided = getattr(metadata.fp4_mla_state, "packed_split", None)
+    decided = metadata.fp4_mla_state.packed_split
     if decided is not None:
         return splits if decided else 1
     if bool(getattr(metadata, "is_cuda_graph", False)):
