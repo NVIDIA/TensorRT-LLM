@@ -466,7 +466,6 @@ def test_reuse_limit_backs_off_to_a_block_boundary():
     boundary or comes with its window keeps its depth."""
     manager = SimpleNamespace(
         mixed_precision_reuse="default",
-        is_draft=False,
         tokens_per_block=128,
         _mixed_precision_high_groups=[1],
     )
@@ -507,6 +506,32 @@ def test_recompute_paired_draft_pool_claims_the_targets_depth(make_manager):
     # The target backed off from 512 to 384; the draft takes 384 too.
     reader = _request(2, tokens[:512] + [9999])
     assert draft.prepare_context_cache(reader, 384) == 384
+    draft.free_resources(reader)
+
+
+def test_paired_draft_pool_without_its_window_stops_at_a_block_boundary(make_manager):
+    """A paired draft pool offered a depth inside a block, where its own last-N window is missing,
+    stops at the block boundary before it, so the page of its first token keeps a high-precision
+    page for what it computes. The target claims the draft's depth, so it stops there too."""
+    draft = make_manager(config=mixed_config(), is_draft=True, joint_kv_cache_reuse=True)
+
+    tokens = list(range(640))
+    source = _request(1, tokens)
+    assert draft.prepare_context_cache(source) == 0
+    assert draft.try_allocate_draft_context(source, len(tokens))
+    source.move_to_next_context_chunk()
+    draft.try_commit_blocks(source)
+    draft.free_resources(source)
+
+    # The draft's window at 576 tokens misses page 3.
+    reader = _request(2, tokens[:576] + [9999])
+    assert draft.prepare_context_cache(reader, 576) == 512
+    assert draft._mixed_precision_low_prefix_len[2] == 512
+    assert draft.try_allocate_draft_context(reader, 577)
+    pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
+    draft.fill_mixed_precision_page_tables([2], 0, pages.numpy())
+    assert pages[1, 0, 0] >= 0 and pages[1, 0, 1:4].eq(kv.BAD_PAGE_INDEX).all()
+    assert pages[1, 0, 4] >= 0
     draft.free_resources(reader)
 
 

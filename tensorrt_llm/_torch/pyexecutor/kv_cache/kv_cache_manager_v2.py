@@ -6312,11 +6312,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self, req: LlmRequest, kv_cache: _KVCache, back_off: int = 0
     ) -> int | None:
         """For a prefix that came without its last-N window, the block boundary at least
-        `back_off` tokens before its end to reuse it up to; else None. A paired draft pool takes its
-        target's depth instead."""
+        `back_off` tokens before its end to reuse it up to; else None."""
         if (
             self.mixed_precision_reuse == "strict"
-            or self.is_draft
             or req.is_disagg_generation_init_state
             or kv_cache.num_committed_tokens == 0
         ):
@@ -6581,10 +6579,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Stop at a block boundary so the window pages after it hold only what this request
                 # computes; a rematch pruned inside a block backs off to the block's start.
                 # "recompute" stops N tokens earlier, and so does a disaggregated context request:
-                # the window it sends must hold computed tokens, not empty pages.
+                # the window it sends must hold computed tokens, not empty pages. A paired draft
+                # pool stops at the boundary only; the target backs off further, and the draft
+                # then claims the target's depth.
                 back_off = (
                     self.last_n
-                    if self.mixed_precision_reuse == "recompute" or req.is_context_only_request
+                    if (self.mixed_precision_reuse == "recompute" or req.is_context_only_request)
+                    and not self.is_draft
                     else 0
                 )
                 while (
