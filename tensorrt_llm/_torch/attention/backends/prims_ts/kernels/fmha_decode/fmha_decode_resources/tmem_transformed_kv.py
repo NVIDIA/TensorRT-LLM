@@ -264,8 +264,8 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
             addrspace=3,
         )
 
-        # Each lane owns four K rows. H256 stages the complete 16-byte SF row,
-        # so select the qword matching the active 128-column head slice.
+        # Each lane owns four K rows. Staged heads load the complete D/16-byte
+        # SF row, then select the qword matching the active 128-column slice.
         sf_rows = []
         sf_row_base = warp_idx * Int32(32) + lane_idx // Int32(4)
         sf_qwords_per_row = Int32(cfg.smem_kv_sf_bytes_per_token // 8)

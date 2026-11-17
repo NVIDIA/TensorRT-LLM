@@ -274,9 +274,11 @@ def populate_fp4_mla_generation_lengths(
     )
 
 
+# kv_lens is a view starting at the first generation row, so its alignment
+# follows the number of context requests.
 @triton.jit(
     do_not_specialize=["num_tokens", "tokens_per_seq"],
-    do_not_specialize_on_alignment=["num_tokens", "tokens_per_seq"],
+    do_not_specialize_on_alignment=["num_tokens", "tokens_per_seq", "kv_lens_ptr"],
 )
 def _helix_spec_buffers_kernel(
     positions_ptr,
@@ -818,6 +820,7 @@ def _fp4_mla_uniform_generation_lengths(
         metadata.fp4_mla_state.generation_lengths_num_tokens = num_gen_tokens
         metadata.fp4_mla_state.generation_lengths_num_seqs = num_gen
         metadata.fp4_mla_state.generation_lengths_num_contexts = num_contexts
+        metadata.fp4_mla_state.generation_lengths_serial += 1
         if record_for_capture:
             metadata.fp4_mla_state.generation_lengths_capture_recorded = True
     elif plan_pending:

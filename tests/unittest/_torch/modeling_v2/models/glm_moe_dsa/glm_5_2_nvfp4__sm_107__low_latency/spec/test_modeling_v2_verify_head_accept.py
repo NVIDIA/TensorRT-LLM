@@ -173,14 +173,60 @@ def test_cuda_graph_replays_advance_the_counter() -> None:
     target, draft, _, pool, counter = _build(spec, seed=5)
     force = spec["force"]
     # One eager call first, as the engine's warm-up does before capture.
-    op(target, draft, 0, None, pool, counter, *force, *STRIDES)
+    call_force_mode, call_force_base, call_force_max, call_force_frac = force
+    call_counter_stride, call_slot_stride, call_pool_size = STRIDES
+    op(
+        target,
+        draft,
+        0,
+        None,
+        pool,
+        counter,
+        call_force_mode,
+        call_force_base,
+        call_force_max,
+        call_force_frac,
+        call_counter_stride,
+        call_slot_stride,
+        call_pool_size,
+    )
     expected_counter = counter.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_counts = op(target, draft, 0, None, pool, counter, *force, *STRIDES)
+        call_force_mode, call_force_base, call_force_max, call_force_frac = force
+        call_counter_stride, call_slot_stride, call_pool_size = STRIDES
+        graph_counts = op(
+            target,
+            draft,
+            0,
+            None,
+            pool,
+            counter,
+            call_force_mode,
+            call_force_base,
+            call_force_max,
+            call_force_frac,
+            call_counter_stride,
+            call_slot_stride,
+            call_pool_size,
+        )
     for _ in range(8):
+        call_force_mode, call_force_base, call_force_max, call_force_frac = force
+        call_counter_stride, call_slot_stride, call_pool_size = STRIDES
         expected, _, expected_counter = op.reference(
-            target, draft, 0, None, pool, expected_counter, *force, *STRIDES
+            target,
+            draft,
+            0,
+            None,
+            pool,
+            expected_counter,
+            call_force_mode,
+            call_force_base,
+            call_force_max,
+            call_force_frac,
+            call_counter_stride,
+            call_slot_stride,
+            call_pool_size,
         )
         graph.replay()
         torch.testing.assert_close(graph_counts, expected, rtol=0, atol=0)

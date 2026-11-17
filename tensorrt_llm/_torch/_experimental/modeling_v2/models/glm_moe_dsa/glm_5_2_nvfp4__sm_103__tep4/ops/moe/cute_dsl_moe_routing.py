@@ -65,11 +65,12 @@ def pad_expert_id(local_expert_offset: int) -> int:
     return local_expert_offset - 1 if local_expert_offset > 0 else LOCAL_EXPERTS
 
 
-def allocate_maps(capacity_rows: int, device) -> dict[str, torch.Tensor]:
+def allocate_maps(capacity_rows: int, device, replicas: int = 0) -> dict[str, torch.Tensor]:
     """One set of the six maps for up to `capacity_rows` tokens. Sized by capacity, never
     by a call: the grouped GEMMs are told the tile bound once and read the live tile count
-    from `num_non_exiting_tiles`."""
-    n = max_tiles(capacity_rows)
+    from `num_non_exiting_tiles`. `replicas`: replica slots past the 64 home experts the
+    maps may also address (one more partial tile each)."""
+    n = max_tiles(capacity_rows) + int(replicas)
     i32 = {"dtype": torch.int32, "device": device}
     return {
         "tile_idx_to_expert_idx": torch.empty(n, **i32),

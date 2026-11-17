@@ -34,8 +34,10 @@ from _validating import validating  # noqa: E402 — needs the path declared abo
 _HANDLES: dict[object, CompiledMoeQuantize] = {}
 
 
-def _compiled(rows: int) -> CompiledMoeQuantize:
-    key = "prefill" if rows > DECODE_MAX_ROWS else rows
+def _compiled(rows: int, decode: bool = False) -> CompiledMoeQuantize:
+    """The exact-row handle up to 64 rows or when `decode` (a wide decode width), else the
+    prefill one."""
+    key = "prefill" if rows > DECODE_MAX_ROWS and not decode else rows
     if key not in _HANDLES:
         device = torch.cuda.current_device()
         _HANDLES[key] = build_prefill(device) if key == "prefill" else build_decode(rows, device)
@@ -129,7 +131,7 @@ def _near_scale_boundary(x: torch.Tensor, gs: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     rows = cell.spec["rows"]
-    compiled = _compiled(rows)
+    compiled = _compiled(rows, cell.spec.get("decode", False))
     x, gs = _inputs(cell)
     # 0xFF bytes: an e4m3 NaN scale and two -6 codes, so an unwritten byte fails.
     fp4_out = torch.full((rows, HIDDEN // 2), 0xFF, dtype=torch.uint8, device="cuda")
@@ -158,7 +160,7 @@ def test_the_stock_op_writes_the_same_layout(cell) -> None:
     exact elsewhere, outside the tie window where both kernels may pick either neighbour.
     """
     rows = cell.spec["rows"]
-    compiled = _compiled(rows)
+    compiled = _compiled(rows, cell.spec.get("decode", False))
     x, gs = _inputs(cell)
     fp4_out = torch.full((rows, HIDDEN // 2), 0xFF, dtype=torch.uint8, device="cuda")
     scale_out = torch.full((rows, HIDDEN // SF_VEC), 0xFF, dtype=torch.uint8, device="cuda")
@@ -180,6 +182,40 @@ def test_the_stock_op_writes_the_same_layout(cell) -> None:
         f"touches at most {MAX_DIFFERING_MANTISSAS}"
     )
     _assert_codes(fp4_out, stock_packed, quantize_reference(x, gs)[2], gs, skip_blocks=differ)
+
+
+@pytest.mark.parametrize("rows", (65, 127, 128, 129, 191, 192, 200))
+def test_wide_exact_row_kernel_is_the_64_row_kernel_per_row(rows: int) -> None:
+    """One CTA per row, the row count compiled in only as the grid: at a wide decode width
+    every row's codes and scales are bitwise what the 64-row handle writes for that row
+    (each 64-row chunk run on it), so the widening cannot change a byte the MTP1 path
+    certified. The input carries a zero block and a saturating block (448 e4m3 cap)."""
+    g = torch.Generator().manual_seed(rows)
+    x = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16).cuda()
+    x[0, :SF_VEC] = 0.0
+    x[-1, SF_VEC : 2 * SF_VEC] = 3.0e4
+    gs = (448.0 * 6.0 / x.float().abs().amax()).reshape(1) * 4.0
+    wide = _compiled(rows, decode=True)
+    fp4_out = torch.full((rows, HIDDEN // 2), 0xFF, dtype=torch.uint8, device="cuda")
+    scale_out = torch.full((rows, HIDDEN // SF_VEC), 0xFF, dtype=torch.uint8, device="cuda")
+    with validating(op):
+        op(x, gs, fp4_out, scale_out, wide)
+    narrow = _compiled(DECODE_MAX_ROWS)
+    for start in range(0, rows, DECODE_MAX_ROWS):
+        chunk = x[start : start + DECODE_MAX_ROWS]
+        n = int(chunk.shape[0])
+        pad = torch.zeros(DECODE_MAX_ROWS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        pad[:n] = chunk
+        q = torch.empty(DECODE_MAX_ROWS, HIDDEN // 2, dtype=torch.uint8, device="cuda")
+        s = torch.empty(DECODE_MAX_ROWS, HIDDEN // SF_VEC, dtype=torch.uint8, device="cuda")
+        op(pad, gs, q, s, narrow)
+        assert torch.equal(fp4_out[start : start + n], q[:n]), f"codes differ at rows {start}+"
+        assert torch.equal(scale_out[start : start + n], s[:n]), f"scales differ at rows {start}+"
+    _, ref_scales = op.reference(x, gs, fp4_out, scale_out, wide)
+    assert torch.equal(scale_out, ref_scales), "block scales are exact"
+    assert int((scale_out == 0).sum()) >= 1 and int((scale_out == 0x7E).sum()) >= 1, (
+        "the draw has no zero block or no saturated (448) scale"
+    )
 
 
 def _unreachable(*args) -> None:

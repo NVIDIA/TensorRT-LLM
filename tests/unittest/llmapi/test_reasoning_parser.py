@@ -23,7 +23,7 @@ import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
     MODEL_TYPE_TO_REASONING_PARSER, DeepSeekV41ReasoningParser,
-    NemotronV3ReasoningParser, ReasoningParserFactory,
+    MuseSparkReasoningParser, NemotronV3ReasoningParser, ReasoningParserFactory,
     resolve_auto_reasoning_parser)
 
 pytestmark = pytest.mark.cpu_only
@@ -429,6 +429,14 @@ def test_laguna_alias_of_poolside_v1() -> None:
     poolside = ReasoningParserFactory.create_reasoning_parser("poolside_v1")
     assert type(laguna) is type(poolside)
     assert MODEL_TYPE_TO_REASONING_PARSER["laguna"] == "poolside_v1"
+
+
+def test_muse_spark_auto_resolves_to_the_musespark_parser(tmp_path) -> None:
+    _write_config(str(tmp_path), "muse_spark")
+    name = resolve_auto_reasoning_parser(str(tmp_path))
+    assert name == MODEL_TYPE_TO_REASONING_PARSER["muse_spark"] == "musespark"
+    assert isinstance(ReasoningParserFactory.create_reasoning_parser(name),
+                      MuseSparkReasoningParser)
 
 
 @pytest.mark.parametrize("parser", ["poolside_v1", "laguna"])

@@ -912,16 +912,21 @@ class Qwen4ExpLogitsProcessor(nn.Module):
         lm_head: nn.Module,
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
+        *,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
         if not self.model_config.mapping.is_last_pp_rank():
-            return lm_head(hidden_states).float()
+            logits = lm_head(hidden_states)
+            return logits if keep_lm_head_dtype else logits.float()
         if not return_context_logits:
             if attn_metadata is not None:
                 last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
                 hidden_states = hidden_states[last_tokens]
             else:
                 hidden_states = hidden_states[-1]
-        return lm_head(self._collapse(hidden_states)).float()
+        logits = lm_head(self._collapse(hidden_states))
+        return logits if keep_lm_head_dtype else logits.float()
 
 
 class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):
@@ -1250,6 +1255,8 @@ _QWEN4_EXP_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     """Composite model using the production Qwen3-VL vision stack."""
+
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
 

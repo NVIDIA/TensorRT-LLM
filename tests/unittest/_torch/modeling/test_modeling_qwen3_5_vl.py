@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3_5 import (
     _lm_head_nvfp4_enabled,
+    _normalize_qwen35_exclude_modules,
     _normalize_qwen35_quant_config_dict,
     _normalize_qwen35_vl_config,
 )
@@ -66,7 +67,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 #     Qwen3NextAttention, which hardcodes output gating.
 
 
-def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
+def _write_qwen35_dense_vl_config(
+    tmp_path: Path, *, text_only: bool = False, **extra_config
+) -> Path:
     config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "image_token_id": 248056,
@@ -124,10 +127,79 @@ def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
         },
         "vision_end_token_id": 248054,
         "vision_start_token_id": 248053,
-        **extra_config,
     }
+    if text_only:
+        config = {
+            **config["text_config"],
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "tie_word_embeddings": config["tie_word_embeddings"],
+        }
+    config.update(extra_config)
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     return tmp_path
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_only", [False, True], ids=["composite", "text-only"])
+def test_qwen35_dense_fp8_mlp_exclusions(tmp_path: Path, text_only: bool) -> None:
+    """Normalize dense FP8 exclusions from composite and flat text-only checkpoints.
+
+    Config type and shape assertions distinguish the two checkpoint loader routes.
+    A split-only layer checks normalized patterns without a packed exclusion masking them.
+
+    Args:
+        tmp_path: Directory for the synthetic checkpoint configuration.
+        text_only: Whether the synthetic checkpoint has a flat text-only configuration.
+    """
+    config_path = _write_qwen35_dense_vl_config(
+        tmp_path,
+        text_only=text_only,
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "model.language_model.layers.0.mlp.gate_proj",
+                "model.language_model.layers.0.mlp.up_proj",
+                "model.language_model.layers.0.mlp.down_proj",
+                "model.layers.0.mlp.mlp.gate_up_proj",
+                "model.language_model.layers.1.mlp.gate_proj",
+                "model.language_model.layers.1.mlp.up_proj",
+                "mtp.layers.0.mlp.gate_proj",
+                "mtp.layers.0.mlp.up_proj",
+                "mtp.layers.0.mlp.down_proj",
+                "mtp.layers.0.mlp.gate_up_proj*",
+            ],
+        },
+    )
+    model_config = ModelConfig.from_pretrained(str(config_path))
+    pretrained_config = model_config.pretrained_config
+    if text_only:
+        assert isinstance(pretrained_config, transformers.Qwen3NextConfig)
+        assert pretrained_config.architectures == ["Qwen3_5ForCausalLM"]
+        assert pretrained_config.get_text_config() is pretrained_config
+    else:
+        assert isinstance(pretrained_config, transformers.Qwen3_5Config)
+        assert pretrained_config.architectures == ["Qwen3_5ForConditionalGeneration"]
+        assert pretrained_config.get_text_config() is pretrained_config.text_config
+    _normalize_qwen35_exclude_modules(model_config)
+    _normalize_qwen35_exclude_modules(model_config)
+
+    quant_config = model_config.quant_config
+    assert quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    for projection in ("gate_proj", "up_proj"):
+        assert f"model.layers.1.mlp.mlp.{projection}" in quant_config.exclude_modules
+    assert not quant_config.is_module_excluded_from_quantization(
+        "model.layers.1.mlp.mlp.gate_up_proj"
+    )
+    for layer_idx in (0, model_config.pretrained_config.num_hidden_layers):
+        for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+            assert quant_config.is_module_excluded_from_quantization(
+                f"model.layers.{layer_idx}.mlp.mlp.{projection}"
+            )
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.1.mlp.mlp.down_proj")
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.0.self_attn.q_proj")
 
 
 def test_qwen35_dense_vl_config_preserves_vlm_architecture(
@@ -385,6 +457,42 @@ def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> N
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("qkv_algo", "z_algo", "fused_algo"),
+    [
+        (QuantAlgo.FP8, QuantAlgo.FP8, QuantAlgo.FP8),
+        (
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        ),
+        # Mixed FP8 schemes cannot share one fused Linear: no fused entry.
+        (QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None),
+    ],
+)
+def test_qwen35_fuses_fp8_linear_attn_in_proj_entries(
+    qkv_algo: QuantAlgo, z_algo: QuantAlgo, fused_algo: QuantAlgo | None
+) -> None:
+    prefix = "model.language_model.layers.0.linear_attn"
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            f"{prefix}.in_proj_qkv": QuantConfig(quant_algo=qkv_algo),
+            f"{prefix}.in_proj_z": QuantConfig(quant_algo=z_algo),
+            f"{prefix}.out_proj": QuantConfig(quant_algo=z_algo),
+        },
+    )
+
+    _normalize_qwen35_quant_config_dict(model_config)
+
+    qcd = model_config.quant_config_dict
+    fused = qcd.get("model.layers.0.linear_attn.in_proj_qkvz")
+    assert (fused.quant_algo if fused is not None else None) == fused_algo
+    assert qcd["model.layers.0.linear_attn.out_proj"].quant_algo == z_algo
+    assert "model.layers.0.linear_attn.in_proj_qkv" not in qcd
+
+
 @pytest.mark.parametrize(
     ("sm_version", "expected_algo"),
     [
@@ -542,17 +650,22 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
         )
 
 
-def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
-    name = "model.language_model.layers.0.mlp.gate_proj"
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN])
+def test_qwen35_dense_vl_normalizes_fp8_mlp_paths(quant_algo: QuantAlgo) -> None:
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
-        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
     )
 
     _normalize_qwen35_quant_config_dict(model_config)
 
     assert model_config.quant_config_dict == {
-        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+        f"model.layers.0.mlp.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+        for proj in ("gate_proj", "up_proj", "down_proj")
     }
 
 

@@ -173,6 +173,17 @@ def shared_projection_kernel(
                         group=prims.CTAGroup.CTA_2,
                     )
                 ordinal += 1
+        # Producer tail, on both CTAs: the loop waits on a stage's empty barrier only to
+        # refill it, so the MMA's last `stages` multicast commit-arrives are awaited here.
+        # Nothing orders them against the `acc_full` commits the epilogue waits for, and an
+        # arrive still in flight at exit lands in the shared memory of the next CTA on the SM.
+        for t in cutlass.range_constexpr(stages):
+            last = ordinal - cutlass.Int32(stages - t)
+            if last >= 0:
+                while not prims.mbarrier_try_wait_parity(
+                    empty.subview(last % stages), (last // stages) % 2
+                ):
+                    pass
 
     if warp == 1 and rank == 0:
         ordinal = cutlass.Int32(0)
@@ -299,7 +310,11 @@ def shared_projection_kernel(
                     prims.cp_async_bulk_wait_group(0, read=True)
                     prims.mbarrier_arrive(c_empty.subview(c_slot))
                 c_ordinal += 1
-    prims.barrier_cluster_arrive_relaxed()
+    # The release form, not the relaxed one: rank 1's epilogue releases each accumulator
+    # slot with a remote arrive into rank 0 (`mapa(acc_empty, 0)` above), and rank 0's MMA
+    # warp waits only for the slots it reuses, so the last two tiles' arrives are ordered
+    # before rank 0's exit (and the pair's TMEM dealloc) by this barrier alone.
+    prims.barrier_cluster_arrive()
     prims.barrier_cluster_wait()
     if warp == 2:
         prims.tcgen05_dealloc(tmem, tmem_columns, group="cta_2")
