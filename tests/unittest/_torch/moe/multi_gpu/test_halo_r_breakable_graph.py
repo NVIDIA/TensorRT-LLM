@@ -69,7 +69,9 @@ _EAGER_TOKENS = 96
 _ABORT_TOKENS = 32
 # The hot rank of each replay step and of each eager forward.
 _REPLAY_HOT_RANKS = (1, 2, 3, 0)
-_EAGER_HOT_RANKS = (0, 1)
+# The hot rank of each eager forward; None is unskewed routing, which isolates the MoE output
+# check from HALO-R's helper slots.
+_EAGER_HOT_RANKS = (None, 0, 1)
 _WORKER_TIMEOUT_S = 900
 # A rank's log starts with its pid; a failed rank writes the marker before it aborts the ranks.
 _PID_LINE = "HALO_R_RANK_PID "
@@ -126,10 +128,12 @@ def _init_process_group(rank: int, world: int) -> None:
     dist.init_process_group(backend="nccl", store=store, rank=rank, world_size=world)
 
 
-def _skewed_logits(logits: torch.Tensor, hot_rank: int) -> torch.Tensor:
-    """Point three quarters of the tokens at the experts of ``hot_rank``."""
+def _skewed_logits(logits: torch.Tensor, hot_rank: int | None) -> torch.Tensor:
+    """Point three quarters of the tokens at the experts of ``hot_rank``; None leaves them as drawn."""
     home = _NUM_EXPERTS // _EP_SIZE
     skewed = logits.clone()
+    if hot_rank is None:
+        return skewed
     skewed[: logits.shape[0] * 3 // 4, hot_rank * home : (hot_rank + 1) * home] += 8
     return skewed
 
@@ -151,7 +155,34 @@ def _record_routes(layer: Any) -> list[tuple[torch.Tensor, torch.Tensor, bool]]:
     return records
 
 
-def _route_errors(layer: Any, logical: torch.Tensor, physical: torch.Tensor) -> list[str]:
+def _mismatch_by_route(
+    output: torch.Tensor,
+    ref_output: torch.Tensor,
+    physical: torch.Tensor,
+    home: int,
+    slots: int,
+    rtol: float = 0.1,
+    atol: float = 0.15,
+) -> dict[str, tuple[int, int]]:
+    """Split one layer's output mismatch by where each token was routed.
+
+    ``output`` and ``ref_output`` are (tokens, hidden); ``physical`` is the (tokens, top_k) slot of
+    every route. A token is "helper" if any of its routes reaches a helper slot, else "home"; a
+    token mismatches if any element is outside atol + rtol * |ref|, the check_accuracy band.
+    Returns {class: (tokens, mismatching tokens)}.
+    """
+    out, ref = output.float(), ref_output.float()
+    bad = ((out - ref).abs() > atol + rtol * ref.abs()).any(dim=-1)
+    on_helper = (physical.to(torch.int64) % slots >= home).any(dim=-1)
+    return {
+        "helper": (int(on_helper.sum()), int((bad & on_helper).sum())),
+        "home": (int((~on_helper).sum()), int((bad & ~on_helper).sum())),
+    }
+
+
+def _route_errors(
+    layer: Any, logical: torch.Tensor, physical: torch.Tensor, expect_helpers: bool = True
+) -> list[str]:
     """Check one eager forward's routes against the slot weights. Collective over the EP group."""
     world = dist.get_world_size()
     logical = logical.flatten().to(torch.int64)
@@ -176,7 +207,7 @@ def _route_errors(layer: Any, logical: torch.Tensor, physical: torch.Tensor) -> 
             errors.append(f"a helper slot read by a route holds another expert's {name}")
     helper_routes = is_helper.sum().reshape(1)
     dist.all_reduce(helper_routes)
-    if helper_routes.item() == 0:
+    if expect_helpers and helper_routes.item() == 0:
         errors.append("no route used a helper slot")
     return errors
 
@@ -366,7 +397,7 @@ def _run_steps(rank: int) -> list[str]:
                     return runner.capture_model_body(run_body)
                 return run_body()
 
-        def load(step: int, hot_rank: int, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def load(step: int, hot_rank: int | None, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
             x, logits = inputs[step]
             x, logits = x[:tokens], _skewed_logits(logits[:tokens], hot_rank)
             static_x[:tokens].copy_(x)
@@ -375,15 +406,31 @@ def _run_steps(rank: int) -> list[str]:
             return x, logits
 
         def check_output(
-            where: str, output: torch.Tensor, x: torch.Tensor, logits: torch.Tensor
+            where: str,
+            output: torch.Tensor,
+            x: torch.Tensor,
+            logits: torch.Tensor,
+            physical: list | None = None,
         ) -> None:
+            """Check each layer's output; with the eager routes, split a mismatch by route class."""
             for layer_idx, ref in enumerate(refs):
+                with torch.inference_mode():
+                    ref_output = ref.forward(x, logits)
                 try:
-                    with torch.inference_mode():
-                        ref_output = ref.forward(x, logits)
                     ref.check_accuracy(output[:, layer_idx], ref_output)
-                except AssertionError as error:
-                    errors.append(f"rank {rank} {where} layer {layer_idx}: output: {error}")
+                except Exception as error:  # noqa: BLE001 - check_accuracy raises a bare Exception
+                    detail = ""
+                    if physical is not None and physical[layer_idx] is not None:
+                        arena = layers[layer_idx].live_weight_arena
+                        split = _mismatch_by_route(
+                            output[:, layer_idx],
+                            ref_output,
+                            physical[layer_idx],
+                            arena.home_experts,
+                            arena.slot_count,
+                        )
+                        detail = f"; mismatching tokens by route (tokens, bad): {split}"
+                    errors.append(f"rank {rank} {where} layer {layer_idx}: output: {error}{detail}")
 
         def synchronize() -> None:
             torch.cuda.synchronize()
@@ -392,26 +439,34 @@ def _run_steps(rank: int) -> list[str]:
         step = 0
         eager_launches = [0] * _LAYERS
 
-        def eager_forward(where: str, hot_rank: int, tokens: int) -> None:
+        def eager_forward(where: str, hot_rank: int | None, tokens: int) -> None:
             nonlocal step
             x, logits = load(step, hot_rank, tokens)
             step += 1
             output = run_model().clone()
             synchronize()
-            check_output(where, output, x, logits)
-            for layer_idx, layer in enumerate(layers):
+            routes = []
+            for layer_idx in range(_LAYERS):
                 calls = records[layer_idx]
                 if len(calls) == 1 and not calls[0][2]:
-                    logical, physical, _ = calls.pop()
+                    routes.append(calls.pop()[:2])
                     eager_launches[layer_idx] += 1
                 else:
                     errors.append(f"rank {rank} {where} layer {layer_idx}: route calls {calls}")
                     calls.clear()
-                    # _route_errors is collective: every rank calls it, with no routes if need be.
-                    logical = physical = torch.empty(0, dtype=torch.int64, device="cuda")
+                    routes.append(None)
+            check_output(
+                where, output, x, logits, [r[1] if r is not None else None for r in routes]
+            )
+            for layer_idx, layer in enumerate(layers):
+                # _route_errors is collective: every rank calls it, with no routes if need be.
+                empty = torch.empty(0, dtype=torch.int64, device="cuda")
+                logical, physical = routes[layer_idx] or (empty, empty)
                 errors.extend(
                     f"rank {rank} {where} layer {layer_idx}: {error}"
-                    for error in _route_errors(layer, logical, physical)
+                    for error in _route_errors(
+                        layer, logical, physical, expect_helpers=hot_rank is not None
+                    )
                 )
 
         # Eager forwards outside the runner.
@@ -670,6 +725,52 @@ def test_halo_r_breakable_cuda_graph(tmp_path: Path) -> None:
         _skip("; ".join(sorted(skips)))
     failures = [error for _, errors in sorted(results) for error in errors]
     assert not failures, "\n".join(failures[:20])
+
+
+class _Scaled(torch.nn.Module):
+    """Stands for one MoE layer in the CPU test: returns its input times a factor."""
+
+    def __init__(self, factor: float) -> None:
+        super().__init__()
+        self.factor = factor
+
+    def forward(self, x: torch.Tensor, logits: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        del logits, kwargs
+        return x * self.factor
+
+
+@pytest.mark.cpu_only
+def test_layer_outputs_and_route_split() -> None:
+    """The body's outputs keep tokens first and one column per layer, and the mismatch split
+    attributes a bad token to the route class it took."""
+    tokens, hidden = 8, 4
+    x = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
+    output = _TwoLayerBody([_Scaled(1.0), _Scaled(2.0)])(x, torch.zeros(tokens, _NUM_EXPERTS))
+    assert output.shape == (tokens, _LAYERS, hidden)
+    for layer_idx, factor in enumerate((1.0, 2.0)):
+        torch.testing.assert_close(output[:, layer_idx], x * factor)
+
+    # 4 home + 2 helper slots per rank: slots 4-5 of every rank are helpers.
+    home, slots = 4, 6
+    physical = torch.tensor([[0, 1], [6, 7], [4, 0], [11, 12], [1, 2], [5, 9], [3, 6], [12, 17]])
+    on_helper = [False, False, True, True, False, True, False, True]
+    ref = torch.ones(tokens, hidden)
+    assert _mismatch_by_route(ref.clone(), ref, physical, home, slots) == {
+        "helper": (4, 0),
+        "home": (4, 0),
+    }
+    wrong = ref.clone()
+    wrong[torch.tensor(on_helper)] += 1.0
+    assert _mismatch_by_route(wrong, ref, physical, home, slots) == {
+        "helper": (4, 4),
+        "home": (4, 0),
+    }
+    wrong = ref.clone()
+    wrong[0, 0] = 5.0
+    assert _mismatch_by_route(wrong, ref, physical, home, slots) == {
+        "helper": (4, 0),
+        "home": (4, 1),
+    }
 
 
 def _skip(reason: str) -> None:
