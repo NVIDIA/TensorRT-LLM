@@ -32,7 +32,20 @@ sm107 = pytest.mark.skipif(
 
 #: The kv_b expansion: M x 512 -> 96 heads x (128 + 128).
 KV_B_N, KV_B_K = 24576, 512
-UNTUNED = ("base", (256, 256, 128), (256, 256, 64), (2, 1), False, False, "static", "m", 1, 128)
+# split_k=1, main's swizzle_size=1, then K3's epilogue subtile N=128.
+UNTUNED = (
+    "base",
+    (256, 256, 128),
+    (256, 256, 64),
+    (2, 1),
+    False,
+    False,
+    "static",
+    "m",
+    1,
+    1,
+    128,
+)
 
 
 def _modules():

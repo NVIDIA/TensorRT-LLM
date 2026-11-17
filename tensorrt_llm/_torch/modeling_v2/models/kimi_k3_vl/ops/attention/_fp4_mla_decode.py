@@ -48,6 +48,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
     _get_fp4_mla_kv_cache_tensors,
     _get_fp4_mla_q_global_scale,
     _get_fp4_mla_swizzled_scale_size,
+    _max_sequences,
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
@@ -318,12 +319,26 @@ def backend_plan_geometry(
     tasks = splits * num_requests
     # Graph buckets hold exactly their tasks; eager metadata grows on demand.
     task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    # The backend sizes its process-wide scratch for every graph bucket. Its
+    # fixed-count branch uses _SPLITS for all query widths, never an env-selected count.
+    max_requests = max(_max_sequences(metadata), num_requests)
+    slots_bound = max(32, _SPLITS * max_requests)
+    task_bound = max(task_capacity, slots_bound)
+    slot_rows_bound = 0
+    width = max(int(query_len), 1 + int(getattr(metadata, "max_total_draft_tokens", None) or 0))
+    for q in range(1, width + 1):
+        rows = _fp4_mla_packed_rows_per_seq(num_heads, q)
+        if rows > 0:
+            slot_rows_bound = max(slot_rows_bound, slots_bound * rows)
+    slot_rows_bound = max(slot_rows_bound, task_capacity * rows_per_seq)
+    packed_plan_length = _reduce_module().packed_plan_length
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_plan",
-        (_reduce_module().packed_plan_length(num_requests, task_capacity),),
+        (packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        capacity_numel=packed_plan_length(max_requests, task_bound),
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
     key = (
@@ -348,6 +363,8 @@ def backend_plan_geometry(
         helix_kv_bounds,
         plan,
         key,
+        task_bound,
+        slot_rows_bound,
     )
 
 

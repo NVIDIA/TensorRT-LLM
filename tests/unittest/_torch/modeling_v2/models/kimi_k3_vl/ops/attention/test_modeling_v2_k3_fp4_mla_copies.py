@@ -3,9 +3,10 @@
 """The Kimi K3 family copies of the FP4 MLA backend code are verbatim.
 
 ``ops/attention/_k3_fp4_mla_{cache,kernels}`` copy definitions of the FP4 MLA backend modules outside the
-KV-cache-manager contract; ``_k3_fp4_mla_{v_repack,cute_dsl_utils}`` copy whole modules. Every copied
-definition must be AST-identical to its source definition (imports aside), and every name the copies import
-from the contract modules must exist there. Parsing only: no GPU, no imports of the modules.
+KV-cache-manager contract; ``_k3_fp4_mla_{v_repack,cute_dsl_utils}`` copy whole modules. Copied
+definitions must be AST-identical to their source definitions (imports aside), apart from the explicitly
+listed target-specific divergences. Every name the copies import from the contract modules must exist
+there. Parsing only: no GPU, no imports of the modules.
 """
 
 import ast
@@ -36,6 +37,25 @@ ENV_FREE_DEFINITIONS = {
     "_triton_prepack_v_enabled": "TRTLLM_FP4_MLA_PREPACK_V / TRTLLM_FP4_MLA_TRITON_PREPACK_V",
     "_triton_v_packed_attr": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
     "_set_triton_v_packed_cache_valid": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+}
+
+# The backend gained a shared context plan in #21313. K3's caller also owns its
+# context/generation fusion, so replacing that caller is not an AST-only move.
+# Keep the legacy per-call signature and its numerical coverage. If this copy
+# ever adopts the backend's shared-plan signature, remove this exception.
+INTENTIONAL_DIVERGENCES = {
+    "_scatter_fp4_mla_kv_cache_2d_context": (
+        "K3 keeps its per-call context-scatter signature; the backend now takes "
+        "_Fp4MlaContextScatterPlan (#21313), while K3 still has its own caller."
+    ),
+    "scatter_fp4_mla_kv_cache": (
+        "K3 keeps its served context/generation fusion and owns the caller rather "
+        "than adopting the backend's new shared-plan workflow wholesale."
+    ),
+    "_update_triton_v_packed_cache": (
+        "K3 keeps its served V-cache update and metadata sidecars after the same "
+        "FP4 MLA backend refactor."
+    ),
 }
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
@@ -102,6 +122,11 @@ def test_copied_definitions_match_their_sources(copy):
             for src, src_node in sources[name]
             if _strip_imports(src_node) == _strip_imports(node)
         ]
+        if name in INTENTIONAL_DIVERGENCES:
+            assert not matches, (
+                f"{copy}.{name} now matches the backend's shared-plan signature; remove the explicit exception"
+            )
+            continue
         assert matches, f"{copy}.{name} differs from its source in {[s for s, _ in sources[name]]}"
 
 
