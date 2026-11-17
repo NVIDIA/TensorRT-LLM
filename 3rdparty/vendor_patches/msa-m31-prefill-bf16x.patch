@@ -235,7 +235,7 @@ index 0000000000000000000000000000000000000000..39212e2332b2c89dd175abaef1d9df40
 +README.md is for identification purposes only and does not imply
 +endorsement.
 diff --git a/README.md b/README.md
-index 63b1593519f0c32cbbc4dbd57b57441b1944de26..d7bc0fed20f78776e17b305e4ede683811c7bf31 100644
+index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978b7e0045b 100644
 --- a/README.md
 +++ b/README.md
 @@ -18,15 +18,15 @@ sparse prefill.
@@ -3134,7 +3134,7 @@ index bb5fa95636be775e0b86730335d37db5c58b0aea..f065fed6df8af0fb06692ea78372ea87
          batch = cu_seqlens_q.numel() - 1
          _check_page_table(page_table, kv_indptr, batch=batch)
 diff --git a/jit.py b/jit.py
-index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..82084f42034052ab7aa0462ca3d111d047e4d81c 100644
+index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..695b20223f1aac9eec6770a0e0cbceb25714d5a9 100644
 --- a/jit.py
 +++ b/jit.py
 @@ -1,7 +1,8 @@
@@ -3390,7 +3390,7 @@ index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..82084f42034052ab7aa0462ca3d111d0
 +
 +def _aot_dir() -> Path:
 +    # This file is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x/jit.py.
-+    default = Path(os.path.abspath(__file__)).parents[8] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
++    default = Path(os.path.abspath(__file__)).parents[7] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
 +    return Path(os.environ.get(E4M3X_AOT_DIR_ENV) or default)
 +
 +

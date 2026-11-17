@@ -354,7 +354,7 @@ DISABLE_E4M3X_AOT_ENV = "TRTLLM_M31_DISABLE_E4M3X_AOT"
 
 def _aot_dir() -> Path:
     # This file is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x/jit.py.
-    default = Path(os.path.abspath(__file__)).parents[8] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
+    default = Path(os.path.abspath(__file__)).parents[7] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
     return Path(os.environ.get(E4M3X_AOT_DIR_ENV) or default)
 
 

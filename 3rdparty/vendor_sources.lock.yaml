@@ -45,8 +45,8 @@ vendors:
     - cute/sparse_index_utils.py
     - cute/src/**/*
     patch: 3rdparty/vendor_patches/msa-m31-fmha-sm100.patch
-    patch_digest: sha256:598e69a9e42545538ac0b91f09e8c312fb1d0c8e402043ba59df0a29a3626a5d
-    digest: sha256-tree-v1:09a771d272ee6f40c8933750a669e9ae7f3c27698febd01f6b3986b61f9777c0
+    patch_digest: sha256:e3fff0eb3bc416ffdab5bdd41a1218c3c25a14bb42ba84fa02c0fe3a4ee491bd
+    digest: sha256-tree-v1:8ff7a3e1c209d4c2ec48cf80d6796ecf94c359c3ba93d1b2be6876f1b445b853
   msa-m31-prefill-bf16x:
     url: https://github.com/vllm-project/MSA.git
     branch: dev
@@ -56,8 +56,8 @@ vendors:
     include:
     - '**/*'
     patch: 3rdparty/vendor_patches/msa-m31-prefill-bf16x.patch
-    patch_digest: sha256:0d564a0f73849da6fc59a9d9cfdde57dedc223e131bb8f56bd9b34050d9c535f
-    digest: sha256-tree-v1:f81f6dc4410d2d459e07c9971c226277b41b15423c14ff44bfbcd5264596e637
+    patch_digest: sha256:a0ba7eba2198d3e5f4fb9f52b8d8b3be43ac990a10ec00a747196eb590469d8c
+    digest: sha256-tree-v1:88976bdd67858fce0bd5b1512f3780dfd9790f1e97be709fb981322c148a15b1
   msa-m31-q8kv8-indexer:
     url: https://github.com/vllm-project/MSA.git
     branch: dev

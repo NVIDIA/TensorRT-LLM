@@ -202,7 +202,7 @@ CACHE_BASE = _LazyCacheBase()
 # proxy modes without diagnostics. They load from there when present; no such module ships by default, so anything
 # else, and everything without that build, compiles at run time.
 # This file is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/jit.py.
-_PREBUILT_DIR = Path(os.path.abspath(__file__)).parents[8] / "libs" / "msa_fmha_sm100"
+_PREBUILT_DIR = Path(os.path.abspath(__file__)).parents[7] / "libs" / "msa_fmha_sm100"
 
 
 def _prebuilt(relative: str):
