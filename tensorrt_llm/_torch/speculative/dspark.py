@@ -506,6 +506,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._guided_draft_loop = bool(
+            getattr(spec_config, "_guided_draft_loop", self._guided_draft_loop)
+        )
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).

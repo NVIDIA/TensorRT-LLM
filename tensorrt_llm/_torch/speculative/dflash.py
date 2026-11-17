@@ -881,6 +881,9 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._guided_draft_loop = bool(
+            getattr(spec_config, "_guided_draft_loop", self._guided_draft_loop)
+        )
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
         self._compute_block_size = None

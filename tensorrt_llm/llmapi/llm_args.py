@@ -4393,6 +4393,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
+    # Internal, for benchmarking: with guided decoding and rejection sampling,
+    # draft the block one position at a time under the grammar mask instead of
+    # sampling it unmasked. Not part of the public config.
+    _guided_draft_loop: bool = PrivateAttr(False)
+
     mask_token_id: Optional[int] = Field(
         default=None,
         description=

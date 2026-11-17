@@ -111,6 +111,20 @@ def _make_worker(enable_confidence_scheduling=False, enable_fused_confidence_sch
     return DSv4DSparkWorker(cfg, Mapping())
 
 
+def test_guided_draft_loop_follows_the_config_attribute():
+    """The internal ``_guided_draft_loop`` config attribute reaches the worker, including after the
+    config is pickled to a worker process; it defaults to off."""
+    import pickle
+
+    from tensorrt_llm.llmapi import DSparkDecodingConfig
+    from tensorrt_llm.mapping import Mapping
+
+    cfg = DSparkDecodingConfig(max_draft_len=5)
+    assert DSv4DSparkWorker(cfg, Mapping())._guided_draft_loop is False
+    cfg._guided_draft_loop = True
+    assert DSv4DSparkWorker(pickle.loads(pickle.dumps(cfg)), Mapping())._guided_draft_loop is True
+
+
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
