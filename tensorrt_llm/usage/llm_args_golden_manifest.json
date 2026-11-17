@@ -889,6 +889,21 @@
       "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.copy_based_rebalancing"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.drop_unreferenced_on_rebalance"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.in_place_relocation"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"

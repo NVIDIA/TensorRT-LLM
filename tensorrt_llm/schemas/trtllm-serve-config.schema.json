@@ -3694,7 +3694,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). With dtype='fp8_ds_mla' it requires kv_pool_rebalance_config.copy_based_rebalancing. This option is incompatible with CSA2 sparse attention.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -4134,6 +4134,27 @@
           "status": "prototype",
           "title": "Cooldown Secs",
           "type": "number"
+        },
+        "copy_based_rebalancing": {
+          "default": false,
+          "description": "Copy-based rebalancing (CoReba). The GPU KV cache becomes one arena mapped once at startup; every pool group addresses it from the same base pointer with block indices relative to the arena. A rebalance moves the pool boundaries in proportion to the new ratios and copies blocks out of the parts that change owner, instead of remapping memory. With a host cache tier, the host quota is one arena as well, registered once. A pool group with several pools gives each pool its own window and block ids, which the model's cache manager must translate (DeepSeek-V4 does; other models with such pool groups are rejected). The GPU and host quotas are fixed after startup.",
+          "status": "prototype",
+          "title": "Copy Based Rebalancing",
+          "type": "boolean"
+        },
+        "drop_unreferenced_on_rebalance": {
+          "default": false,
+          "description": "With copy_based_rebalancing: drop, rather than copy, blocks that must move during a rebalance and that no request references (cached reusable blocks).",
+          "status": "prototype",
+          "title": "Drop Unreferenced On Rebalance",
+          "type": "boolean"
+        },
+        "in_place_relocation": {
+          "default": false,
+          "description": "With copy_based_rebalancing: rebalance without suspending running requests. Their blocks are copied on the GPU between iterations and their block indices rewritten in place, SWA scratch slots included.",
+          "status": "prototype",
+          "title": "In Place Relocation",
+          "type": "boolean"
         },
         "min_sampled_kv_caches": {
           "default": 2000,
