@@ -149,7 +149,8 @@ RUNTIME_SWITCHES: dict[str, bool] = {
     "cuda_graph": True,
     "chunked_prefill": False,
     "overlap_scheduler": True,
-    "kv_cache_reuse": True,
+    # Block reuse is a non-core feature: off unless asked for, proven by a variant.
+    "kv_cache_reuse": False,
 }
 
 # Scopes a target may be built at. ``text_only`` is the useful one: a

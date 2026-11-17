@@ -225,7 +225,8 @@ task:
 - a feature's width extensions (`mtp-tp`, `mtp-dp`) come after both the
   feature at the start member and the core's matching extension.
 
-Until a check of the core passes, the orchestrator holds back every `assemble`
+Until a check of the core shows its engine answering (it passes, or its
+benchmark comes back with a score), the orchestrator holds back every `assemble`
 or `feature` task whose `ref` is a feature unit or a variant and that builds on
 the core (it reaches the core's task through `depends_on` or
 `depends_on_soft`): a feature built on a target nobody has seen run is built

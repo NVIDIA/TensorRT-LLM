@@ -277,9 +277,9 @@ class GraphOrchestrator:
                 "[resume] the tasks running when the last process stopped start again: "
                 + ", ".join(t.id for t in restarted)
             )
-        #: The feature units and variants (their ``ref``), and the checks that show the
-        #: core runs (its boots, or its other checks where it owes no boot): a worker's
-        #: task on one of them starts once any of those checks has passed.
+        #: The feature units and variants (their ``ref``), and the core's checks: a
+        #: worker's task on one of them starts once any of those checks has shown the
+        #: engine answering (it passed, or it is a benchmark that came back with a score).
         refs, boots = after_core
         self._feature_refs, self._core_boots = frozenset(refs), tuple(boots)
         self.revision_cap = revision_cap
@@ -713,7 +713,7 @@ class GraphOrchestrator:
     def _waiting_for_core(self) -> set[str]:
         """The pending feature-unit and variant tasks that build on the core and wait for it to run.
 
-        Until one of the core's first checks passes, a feature's work that builds on the
+        Until a check of the core shows its engine answering, a feature's work that builds on the
         core's code (its task reaches a task claiming a core boot through hard
         or soft dependencies) builds on a target nobody has seen run, and takes
         the slots the core's repair needs. A feature's work with no such edge
@@ -724,7 +724,12 @@ class GraphOrchestrator:
             return set()
         with self._status_lock:
             latest = self.status.latest()
-        if any(latest[key].passed for key in self._core_boots if key in latest):
+        # The engine answered: a check passed, or a benchmark came back with a score.
+        if any(
+            latest[key].passed or (latest[key].measured is not None and not latest[key].void)
+            for key in self._core_boots
+            if key in latest
+        ):
             return set()
         boots = set(self._core_boots)
         core = {t.id for t in self.graph.tasks if boots & set(t.satisfies)}
@@ -1596,7 +1601,7 @@ class GraphOrchestrator:
                     # Ready work that cannot start with nothing running never will.
                     before_core = self._waiting_for_core()
                     reasons = ", ".join(
-                        f"{t.id} (waits for a core boot to pass)"
+                        f"{t.id} (waits for a check of the core to show it answering)"
                         if t.id in before_core
                         else f"{t.id} ({self._held(t)} GPUs)"
                         for t in blocked

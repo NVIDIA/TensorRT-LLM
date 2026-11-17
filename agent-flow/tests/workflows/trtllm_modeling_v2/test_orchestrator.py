@@ -632,6 +632,51 @@ def test_feature_work_on_the_core_waits_for_its_boot(tmp_path):
     assert started.index("mtp") > started.index("core")
 
 
+def test_feature_work_starts_once_the_cores_benchmark_has_scored_though_under_its_floor(tmp_path):
+    benchmark = _STANDING.checks[1]
+    contract = c.Contract(checks=_STANDING.checks[1:3], confirm=_MTP[0])
+    started, turns = [], []
+
+    def task(tid, kind, ref, satisfies=(), **kw):
+        return g.Task(id=tid, kind=kind, ref=ref, goal=f"do {tid}", touches=[f"models/{tid}.py"],
+                      gpus=1, est_minutes=10, satisfies=list(satisfies), **kw)  # fmt: skip
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            mtp = task("mtp", "feature", "mtp", _MTP[:1], depends_on_soft=["core"])
+            core = task("core", "assemble", "core", [benchmark.key])
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core, mtp]))
+        if "repair" not in started:
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(task("repair", "assemble", "core", [benchmark.key]))
+            return PlannerAnswer("GRAPH_UPDATED", "repair the core's numerics", graph)
+        return PlannerAnswer("DONE", "all green")
+
+    def work(t):
+        if t.id == "repair":  # the long part of a bring-up
+            deadline = time.monotonic() + 20
+            while "mtp" not in started and time.monotonic() < deadline:
+                time.sleep(0.01)
+        started.append(t.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        low = chk.key == benchmark.key and "repair" not in started
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not low, measured=41.0 if low else 93.0)  # fmt: skip
+
+    services = Services(plan=plan, work=work, check=check, free_gpus=lambda: 8)
+    orchestrator = GraphOrchestrator(
+        services, contract, c.ContractStatus.load(tmp_path), tmp_path, poll_s=0.01,
+        after_core=(["mtp"], [benchmark.key]),
+    )  # fmt: skip
+    assert orchestrator.run() == "delivered"
+    # The core's benchmark came back with 41: its engine answers. The feature's work on the
+    # core starts beside the repair, not after the repair's benchmark has passed.
+    assert started.index("mtp") < started.index("repair")
+
+
 def test_a_burst_of_operator_steers_reaches_the_planner_as_one(tmp_path):
     long = inbox.post(tmp_path, "x" * (inbox.MESSAGE_MAX_CHARS + 1))
     inbox.post(tmp_path, "drop the vision work")

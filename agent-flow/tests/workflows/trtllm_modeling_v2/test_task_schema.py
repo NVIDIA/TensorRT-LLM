@@ -13,6 +13,7 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.spec import derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -196,6 +197,14 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
     assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
     with pytest.raises(derive.DeriveError, match="kv= is named once"):
         derive.parse_goal("kv=fp8 kv=nvfp4")
+
+
+def test_a_spec_that_says_nothing_of_block_reuse_leaves_it_off(tmp_path):
+    spec = load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
+    assert spec["runtime"]["kv_cache_reuse"] is False
+    # So its core is gated as a derived spec's is: no boot beside its benchmark.
+    contract = contract_mod.compile_contract(spec, world_size=4)
+    assert [check.key for check in contract.checks] == ["core:accuracy[gsm8k]@tp1"]
 
 
 def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):
