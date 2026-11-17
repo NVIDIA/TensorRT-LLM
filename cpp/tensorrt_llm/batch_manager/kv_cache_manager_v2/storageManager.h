@@ -494,6 +494,13 @@ private:
     //! slot floors off it.
     [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
 
+    //! Raise the hot-level slot floors (the ones built from the construction constraints, which
+    //! slotCountsForLevel and constrainPoolGroupRatio clamp rebalancing targets to) to what `batch` needs,
+    //! scaled by 1/maxUtilForResume like the construction constraints. Each raised floor is capped at the
+    //! group's current slot count, so the current layout stays feasible and nothing has to move. Floors
+    //! never drop. Returns the resulting hot-level floors.
+    TypedVec<PoolGroupIndex, SlotCount> raiseHotMinSlots(BatchDesc const& batch, int tokensPerBlock);
+
     //! Slot counts `quota` buys at `ratio`, for a level that exists. Fixed hot-tier groups keep
     //! their fixed slot count.
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
@@ -653,6 +660,8 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
     //! Hot-level fixed slot counts, one entry per pool group.
     FixedSlotCounts mFixedSlots;
+    // KvCache::resume rejects a pool group above this utilization; floors are scaled by its inverse.
+    float mMaxUtilForResume{1.f};
 
     //! Host memory the hot level's host-backed pools may take: the configured quota, or the
     //! default construction fills in when it is unset. Kept because a rebalance moves the
