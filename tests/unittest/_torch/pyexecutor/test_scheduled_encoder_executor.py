@@ -105,7 +105,9 @@ class _Runner:
 
 
 class _Harness:
-    def __init__(self, *, max_batch_size=4, max_num_tokens=64, max_seq_len=32):
+    def __init__(
+        self, *, max_batch_size=4, max_num_tokens=64, max_seq_len=32, print_iter_log=False
+    ):
         self.runner = _Runner(max_batch_size)
         self.executor = ScheduledEncoderExecutor(
             self.runner,
@@ -115,6 +117,7 @@ class _Harness:
                 batch_wait_timeout_ms=0,
                 return_perf_metrics=False,
                 enable_iter_perf_stats=False,
+                print_iter_log=print_iter_log,
             ),
             mapping=Mapping(),
             dist=SimpleNamespace(rank=0, world_size=1, has_pp=False, barrier=lambda: None),
@@ -312,6 +315,20 @@ def test_a_fatal_error_with_peers_fails_everything_queued_and_kills_every_rank(m
         h.executor._worker_thread.join(timeout=30)
         assert kills == [2]
         assert h.runner.batches == [[running]]
+
+
+def test_print_iter_log_logs_each_batch_with_its_size_and_tokens(monkeypatch):
+    lines = []
+    monkeypatch.setattr(scheduled_encoder_executor.logger, "info", lines.append)
+    with _harness(max_batch_size=2, print_iter_log=True) as h:
+        first, second = h.submit(4), h.submit(4)
+        h.executor.start_worker()
+        h.result(first)
+        h.result(second)
+
+    (line,) = [line for line in lines if "num_scheduled_requests" in line]
+    assert "num_scheduled_requests = 2, num_tokens = 8, num_waiting = 0, " in line
+    assert "host_step_time = " in line and "device_step_time = " in line
 
 
 def test_shutdown_runs_queued_requests_first():

@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import os
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import CUASSERT, customized_gc_thresholds, release_gc
+from tensorrt_llm._utils import CUASSERT, customized_gc_thresholds, nvtx_range, release_gc
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.utils import check_prompt_capacity
 from tensorrt_llm.llmapi.utils import _reapply_current_thread_affinity_to_all_threads
@@ -95,8 +96,9 @@ class ScheduledEncoderExecutor:
     and publishes responses; every rank runs the same batches. Settings that only tune
     generation are ignored: the overlap scheduler, chunked prefill, guided decoding,
     ``scheduler_config``, the waiting-queue policy and the iteration-based batch waits.
-    Iteration statistics and KV cache events are always empty, and ``print_iter_log``
-    prints nothing.
+    Iteration statistics and KV cache events are always empty. With ``print_iter_log``
+    rank 0 logs one line per batch: its requests and prompt tokens, the requests still
+    waiting, the host time of the forward, sync and publish, and the GPU time of the forward.
     """
 
     is_generation_model = False
@@ -154,6 +156,12 @@ class ScheduledEncoderExecutor:
         self._waiting_queue = create_waiting_queue()
         self._error_budget = ErrorBudget()
         self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
+        self._iter_log = llm_args.print_iter_log and dist.rank == 0
+        self._forward_events = (
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            if self._iter_log
+            else None
+        )
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
         self._profiler = ProfileController(
@@ -424,20 +432,22 @@ class ScheduledEncoderExecutor:
                 self._hang_detector.checkpoint()
                 self._profiler.end_iteration()
                 self._profiler.begin_iteration()
-                self._receive()
-                if self.is_shutdown and not self._waiting_queue:
-                    self._loop_completed = True
-                    break
-                count = fit_batch(
-                    self._waiting_queue.peek_requests(self.max_batch_size),
-                    max_batch_size=self.max_batch_size,
-                    max_num_tokens=self.max_num_tokens,
-                )
-                if count:
-                    self._run([self._waiting_queue.pop_request() for _ in range(count)])
-                # Every pass counts, idle ones too, so a stop requested while idle fires.
-                self._iter_counter += 1
+                with nvtx_range("iteration"):
+                    self._receive()
+                    if self.is_shutdown and not self._waiting_queue:
+                        self._loop_completed = True
+                        break
+                    count = fit_batch(
+                        self._waiting_queue.peek_requests(self.max_batch_size),
+                        max_batch_size=self.max_batch_size,
+                        max_num_tokens=self.max_num_tokens,
+                    )
+                    if count:
+                        self._run([self._waiting_queue.pop_request() for _ in range(count)])
+                    # Every pass counts, idle ones too, so a stop requested while idle fires.
+                    self._iter_counter += 1
 
+    @nvtx_range("_receive")
     def _receive(self) -> None:
         """Fetch on rank 0, broadcast, then apply shutdown, cancellations and admission."""
         # Every rank computes the same value: it picks the broadcast transport.
@@ -477,6 +487,7 @@ class ScheduledEncoderExecutor:
         if canceled_ids:
             self._cancel_waiting(canceled_ids)
 
+    @nvtx_range("_check_admissible")
     def _check_admissible(self, item: RequestQueueItem) -> None:
         """Raise ValueError if one forward cannot run this request."""
         request = item.request
@@ -513,8 +524,10 @@ class ScheduledEncoderExecutor:
                     responses.append((item.id, response))
         self._publish(responses, (item.id for item in items))
 
+    @nvtx_range("_run")
     def _run(self, items: list[RequestQueueItem]) -> None:
         """Run one forward over ``items`` and publish one final response per request."""
+        host_start = time.monotonic()
         requests = merge_requests_to_llm_requests(items, exclude_last_generation_logits=False)
         for request in requests:
             if request.return_perf_metrics:
@@ -531,7 +544,11 @@ class ScheduledEncoderExecutor:
                 with self._perf_manager.record_perf_events(
                     gpu_forward_start, gpu_forward_end
                 ) as timing:
+                    if self._iter_log:
+                        self._forward_events[0].record()
                     outputs = self._runner.forward(inputs, resource_manager=None)
+                    if self._iter_log:
+                        self._forward_events[1].record()
                 if self._perf_manager.enabled:
                     # There is no sampling: report a zero-length sample phase.
                     self._perf_manager.save_timing_to_requests(
@@ -546,13 +563,32 @@ class ScheduledEncoderExecutor:
                     )
                 responses = self._complete(requests, outputs)
                 # Responses carry device tensors that other threads and processes read.
-                self._execution_stream.synchronize()
+                with nvtx_range("synchronize"):
+                    self._execution_stream.synchronize()
         except Exception as error:
             self._fail(requests, error)
             return
         if self.dist.rank == 0:
             self._publish(responses, (request.py_request_id for request in requests))
+        if self._iter_log:
+            self._log_iteration(items, len(requests), host_start)
 
+    def _log_iteration(
+        self, items: list[RequestQueueItem], num_requests: int, host_start: float
+    ) -> None:
+        """Log one batch: its size, the host time since it was taken and the GPU time of its forward."""
+        host_ms = (time.monotonic() - host_start) * 1000
+        device_ms = self._forward_events[0].elapsed_time(self._forward_events[1])
+        logger.info(
+            f"iter = {self._iter_counter}, "
+            f"num_scheduled_requests = {num_requests}, "
+            f"num_tokens = {sum(prompt_cost(item)[1] for item in items)}, "
+            f"num_waiting = {len(self._waiting_queue)}, "
+            f"host_step_time = {host_ms}ms, "
+            f"device_step_time = {device_ms}ms"
+        )
+
+    @nvtx_range("_complete")
     def _complete(
         self, requests: list[LlmRequest], outputs: dict[str, torch.Tensor]
     ) -> list[tuple[int, LlmResponse]]:
@@ -578,6 +614,7 @@ class ScheduledEncoderExecutor:
                 responses.append((request.py_request_id, response))
         return responses
 
+    @nvtx_range("_fail")
     def _fail(self, requests: list[LlmRequest], error: Exception) -> None:
         """Fail the batch; a fatal error also fails everything queued and shuts the loop down.
 
@@ -639,6 +676,7 @@ class ScheduledEncoderExecutor:
         ]
         self._publish(responses, (item.id for item, _ in rejected))
 
+    @nvtx_range("_publish")
     def _publish(
         self, responses: list[tuple[int, LlmResponse]], finished_ids: Iterable[int]
     ) -> None:
