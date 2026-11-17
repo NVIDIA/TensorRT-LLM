@@ -54,8 +54,12 @@ M_ALL = list(range(1, 9))
 
 def _ops():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op  # noqa: F401
-    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import op as _rq  # noqa: F401
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+        op,  # noqa: F401
+    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+        op as _rq,  # noqa: F401
+    )
 
     return torch.ops.trtllm
 
