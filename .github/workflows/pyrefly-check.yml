@@ -75,8 +75,13 @@ jobs:
             merge --no-commit --no-ff "$HEAD_SHA"
           git -C "$PYREFLY_MERGED_ROOT" diff --cached --name-status --find-renames -z "$base_sha" -- \
             > "$PYREFLY_REPORT_DIR/changes"
-          # Both scans use the target branch's Pyrefly configuration and wrapper scripts.
-          git -C "$PYREFLY_MERGED_ROOT" restore --source "$base_sha" --worktree -- pyproject.toml scripts
+          # Both scans use the PR's Pyrefly configuration and wrapper scripts, so a PR that
+          # changes the check rules is compared under its own rules. import_paths.py is
+          # included because the wrapper imports it.
+          merged_tree=$(git -C "$PYREFLY_MERGED_ROOT" write-tree)
+          git -C "$PYREFLY_BASE_ROOT" restore --source "$merged_tree" --worktree -- \
+            pyproject.toml scripts/run_pyrefly.sh scripts/pyrefly_workflow.py \
+            scripts/pyrefly_exclusion.py tests/test_common/import_paths.py
       - name: Install target branch dependencies
         id: base_install
         timeout-minutes: 15
