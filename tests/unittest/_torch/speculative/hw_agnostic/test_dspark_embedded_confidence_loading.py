@@ -48,6 +48,7 @@ def _wrapper(
         )
     )
     model.post_load_weights = Mock()
+    model.nvfp4_experts = False
     wrapper.dspark_model = model
     wrapper.config = model.config
     wrapper.num_stages = 1

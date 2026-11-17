@@ -10,7 +10,7 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel needs an sm_103 GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.norm import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.norm import (  # noqa: E402, E501
     cute_dsl_qkv_a_rmsnorm as entry,
 )
 
@@ -113,7 +113,7 @@ def test_below_the_threshold_the_cta_kernel_runs(compiled) -> None:
 def test_guard_refuses_a_compact_destination_handle(compiled) -> None:
     """Compiled for compact outputs, the kernel writes kv at row pitch 512 into
     a buffer whose pitch is 2624: the wrong elements, no error."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.norm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.norm import (  # noqa: E501
         self_attn_qkv_a_rmsnorm as kernel,
     )
 
