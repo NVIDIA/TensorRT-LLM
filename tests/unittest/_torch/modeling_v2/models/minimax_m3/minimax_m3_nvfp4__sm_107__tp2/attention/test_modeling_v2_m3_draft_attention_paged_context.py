@@ -15,11 +15,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_draft_attention import (  # noqa: E501
-    m3_draft_attention as op,
-)
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_draft_attention import (  # noqa: E501
+    m3_draft_attention as op,
+)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../..", "."]

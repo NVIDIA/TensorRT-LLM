@@ -30,7 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
-from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -84,6 +84,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
@@ -151,6 +153,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -158,6 +161,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    ReuseScope,
     SsmLayerConfig,
     _introspection,
 )
@@ -789,7 +793,7 @@ def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
     model_config.get_num_mamba_layers = lambda: num_mamba_layers
     if variable_geometry:
         model_config.kv_cache_layer_specs = tuple(
-            KVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
+            ModelKVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
             for head_dim in (256, 512)
         )
     model_config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
@@ -4676,7 +4680,9 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
             "snapshot_pruned_tokens=640 page_pruned_tokens=128 "
             "branch_snapshots_taken=3 branch_snapshots_skipped=3 "
             "branch_snapshots_skipped_by_reason="
-            "{'already_reused': 1, 'no_divergence': 2}"
+            "{'already_reused': 1, 'no_divergence': 2} "
+            "inflight_prefix_deferrals=0 inflight_prefix_points_requested=0 "
+            "inflight_prefix_points_taken=0"
         )
 
 
@@ -4878,6 +4884,124 @@ def test_v2_hybrid_waiter_points_after_history_advanced_commit():
             mgr.free_resources(probe)
     finally:
         for request in (owner, *probes):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _is_recurrent(life_cycle) -> bool:
+    return not isinstance(life_cycle, AttnLifeCycle)
+
+
+def _recurrent_state_lowest(_ordinal: int, life_cycle) -> int:
+    """Lowest eviction priority for recurrent-state pages, the default for attention pages."""
+    return PAGE_PRIORITY_MIN if _is_recurrent(life_cycle) else PAGE_PRIORITY_DEFAULT
+
+
+class _ShortPromptStateLowest(MambaHybridCacheManagerV2):
+    """Commits the recurrent-state pages of prompts shorter than 48 tokens at the lowest priority."""
+
+    def _context_priority_callback(self, req):
+        return _recurrent_state_lowest if req.prompt_len < 48 else None
+
+
+@skip_no_cuda
+def test_v2_hybrid_context_priority_callback_reaches_backend():
+    """A subclass's callback is asked for both the recurrent-state and the attention pages."""
+    calls = []
+
+    def recording_callback(ordinal, life_cycle):
+        priority = _recurrent_state_lowest(ordinal, life_cycle)
+        calls.append((_is_recurrent(life_cycle), priority))
+        return priority
+
+    class _Recording(MambaHybridCacheManagerV2):
+        def _context_priority_callback(self, req):
+            return recording_callback if req.prompt_len < 48 else None
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        additional_snapshot_offsets_from_end=[0],
+        model_manager_cls=_Recording,
+    )
+    long = _make_v2_conversation_request(1, [1] + list(range(100, 163)), "conv-1")
+    short = _make_v2_conversation_request(2, [2] + list(range(100, 131)), "conv-2")
+    try:
+        _run_v2_hybrid_context(mgr, long)
+        mgr.free_resources(long)
+        assert calls == []
+
+        _run_v2_hybrid_context(mgr, short)
+        mgr.free_resources(short)
+        assert (True, PAGE_PRIORITY_MIN) in calls
+        assert (False, PAGE_PRIORITY_DEFAULT) in calls
+        assert set(calls) <= {(True, PAGE_PRIORITY_MIN), (False, PAGE_PRIORITY_DEFAULT)}
+    finally:
+        for request in (long, short):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _has_prompt_end_snapshot(mgr: MambaHybridCacheManagerV2, tokens: list[int]) -> bool:
+    """Whether the radix tree holds the recurrent-state snapshot at the end of ``tokens``."""
+    ssm_life_cycle = _introspection.ssm_life_cycle_id(mgr.impl)
+    num_tokens, pages = _introspection.reuse_match_pages(
+        mgr.impl, ReuseScope(lora_id=None, salt=None), tokens, ssm_life_cycle
+    )
+    last_block = (len(tokens) - 1) // mgr.tokens_per_block
+    return num_tokens >= len(tokens) and len(pages) > last_block and pages[last_block] is not None
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("demote_short_prompts", [False, True])
+def test_v2_hybrid_short_prompt_snapshot_eviction_order(demote_short_prompts):
+    """Short-prompt snapshots go before older long-prompt ones once demoted; plain LRU otherwise."""
+    # Large recurrent states (4 layers of 256 heads) make the recurrent-state
+    # pool, not the attention pool, the one that evicts.
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=4,
+        mamba_num_heads=256,
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        max_num_turns=3,
+        additional_snapshot_offsets_from_end=[0],
+        model_manager_cls=_ShortPromptStateLowest if demote_short_prompts else None,
+    )
+    old_long_tokens = [1] + list(range(100, 163))
+    short_tokens = [2] + list(range(100, 131))
+    requests = [
+        _make_v2_conversation_request(1, old_long_tokens, "conv-1"),
+        _make_v2_conversation_request(2, short_tokens, "conv-2"),
+    ]
+    try:
+        for request in requests:
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+        assert _has_prompt_end_snapshot(mgr, old_long_tokens)
+        assert _has_prompt_end_snapshot(mgr, short_tokens)
+
+        for request_id in range(3, 256):
+            request = _make_v2_conversation_request(
+                request_id, [request_id] + list(range(100, 163)), f"conv-{request_id}"
+            )
+            requests.append(request)
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+            old_long_kept = _has_prompt_end_snapshot(mgr, old_long_tokens)
+            short_kept = _has_prompt_end_snapshot(mgr, short_tokens)
+            if not (old_long_kept and short_kept):
+                break
+        else:
+            pytest.fail("the recurrent-state pool never evicted a snapshot")
+
+        if demote_short_prompts:
+            assert old_long_kept and not short_kept
+        else:
+            assert short_kept and not old_long_kept
+    finally:
+        for request in requests:
             if request.py_request_id in mgr.kv_cache_map:
                 mgr.free_resources(request)
         mgr.shutdown()

@@ -26,7 +26,12 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
+    KeyType,
+    PackedSplitResolver,
+    sampling_variant,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -57,7 +62,12 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
-from .metadata import DecoderMetadata, resolve_mamba_metadata_cls, supports_advanced_draft_sampling
+from .metadata import (
+    DecoderMetadata,
+    resolve_mamba_metadata_cls,
+    supports_advanced_draft_sampling,
+    supports_temperature_only_graphs,
+)
 from .warmup import WarmupAgreement
 
 # Context requests per warmup batch whose breakable prefill graph breaks get
@@ -118,6 +128,28 @@ def _make_single_token_context_graph_batch(
     graph_batch.paused_requests = list(scheduled_requests.paused_requests)
     promoted_context_request_ids = frozenset(request.py_request_id for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+
+def _kv_regime_length_passes(
+    max_seq_len_list: list[int], kv_regime_ceilings: tuple[int, ...]
+) -> list[tuple[int, int]]:
+    """(warm-up length, KV regime) of every generation graph family a step can key, largest first.
+
+    For each warm-up length (the engine's maximum, plus the sparse short length when the
+    sparse attention keeps short and long graph families apart) a step can land in every
+    regime whose ceiling lies below that length and in the regime covering the length
+    itself. The warm-up request's longest row fills the regime, so the dispatcher decision
+    a graph captures is the one of its regime.
+    """
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+
+    passes: set[tuple[int, int]] = set()
+    for max_seq_len in max_seq_len_list:
+        passes.update((ceiling, ceiling) for ceiling in kv_regime_ceilings if ceiling < max_seq_len)
+        passes.add(
+            (max_seq_len, fp4_mla_dispatch.kv_regime_for_step(max_seq_len, kv_regime_ceilings))
+        )
+    return sorted(passes, reverse=True)
 
 
 def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, int] | None:
@@ -235,6 +267,8 @@ class DecoderCudaGraphs:
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
         self._inforward_split_warmed = False
+        # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
+        self._sampling_variants: frozenset[str] | None = None
 
     def forward_discarded_warmup(
         self,
@@ -835,6 +869,168 @@ class DecoderCudaGraphs:
         if not is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
 
+    @staticmethod
+    def _decode_sm_count() -> int:
+        """Streaming multiprocessors of the device the decode graphs replay on."""
+        return int(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        )
+
+    @staticmethod
+    def _fp4_mla_4x_unavailable() -> str | None:
+        """Why the device the decode graphs replay on cannot host the FP4 MLA 4x kernel; None when it can."""
+        from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
+            device_unsupported_reason,
+        )
+
+        return device_unsupported_reason(torch.device("cuda", torch.cuda.current_device()))
+
+    def _fp4_mla_decode_heads(self) -> int | None:
+        """Attention heads this rank's MLA layers decode with; None without MLA layers or with unequal ones."""
+        from tensorrt_llm._torch.attention.mla import MLA
+
+        heads = {
+            int(module.num_heads_tp) for module in self.model.modules() if isinstance(module, MLA)
+        }
+        return heads.pop() if len(heads) == 1 else None
+
+    def _kv_regime_resolver(
+        self, resource_manager: ResourceManager
+    ) -> Callable[[int, int], tuple[int, ...]] | None:
+        """KV regimes the decode graphs are keyed by, per graph shape; None for every backend but FP4 MLA 4x.
+
+        The FP4 MLA decode dispatcher (``fp4_mla_dispatch``) then decides on the
+        regime ceiling, the step's longest live KV rounded up, instead of the
+        page-table capacity. Resolved at capture, once the KV cache exists; the
+        regimes of a shape are those its 2x | 4x | two-stream decision can tell
+        apart (``kv_regimes_for_batch``), one for most shapes. None as well
+        where every step decodes on the 2x kernel whatever its KV: with Helix,
+        and on a device that cannot host the 4x kernel. The graph runner
+        resolves every decode step, so each shape is computed once: replay keeps
+        the ceilings its graphs were captured for.
+        """
+        # Only an FP4 MLA KV cache gets regimes (the predicate under which the
+        # attention metadata carries an fp4_mla_state); every other model returns
+        # here, before any FP4 MLA module is imported or probed.
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
+        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            FP4_MLA_TOKENS_PER_BLOCK,
+            _fp4_mla_cutedsl_4x_enabled,
+            _fp4_mla_packed_q_enabled,
+            _fp4_mla_packed_rows_per_seq,
+        )
+
+        # Environment gates next: the default (4x off) resolves nothing. The
+        # dispatcher runs only for the packed-Q cutedsl decode and keeps Helix on
+        # the 2x kernel, so regimes would only multiply those graphs.
+        if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
+            return None
+        if self.mapping.has_cp_helix():
+            return None
+        num_heads = self._fp4_mla_decode_heads()
+        if num_heads is None:
+            return None
+        # A device that cannot host the 4x kernel decodes every step on 2x, as
+        # Helix does: no regimes (the host logs the reason once per device).
+        if self._fp4_mla_4x_unavailable() is not None:
+            return None
+        from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
+            envelope_reason_static,
+        )
+
+        capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
+        sm_count = self._decode_sm_count()
+
+        @functools.cache
+        def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
+            query_len = int(draft_len) + 1
+            return fp4_mla_dispatch.kv_regimes_for_batch(
+                num_requests=int(batch_size),
+                query_len=query_len,
+                num_heads=num_heads,
+                rows_per_seq=_fp4_mla_packed_rows_per_seq(num_heads, query_len),
+                kv_capacity=capacity,
+                sm_count=sm_count,
+                envelope_reason=envelope_reason_static,
+            )
+
+        return resolver
+
+    def _packed_split_resolver(
+        self, resource_manager: ResourceManager
+    ) -> PackedSplitResolver | None:
+        """Packed split decisions the decode graphs are keyed by; None for every decode but the FP4 MLA packed one.
+
+        The FP4 MLA packed decode launches its KV split budget only for steps
+        whose balanced plan splits a request (``TRTLLM_FP4_MLA_SPLIT_ON_DEMAND``,
+        default on). A shape that fills two thirds of a 2-CTA wave captures an
+        unsplit and a split graph, a smaller one the split graph alone
+        (``packed_plan.packed_split_variants``); each step replays the graph of
+        its decision (``packed_plan.packed_split_needed``), agreed across
+        attention-DP ranks by the graph runner.
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
+        from tensorrt_llm._torch.attention.backends.fp4_mla import packed_plan
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _FP4_MLA_SPLIT_KV_ENV,
+            FP4_MLA_SCALE_ROW_GROUP,
+            _fp4_mla_packed_q_enabled,
+            _fp4_mla_packed_rows_per_seq,
+            _fp4_mla_split_on_demand_enabled,
+        )
+
+        # The decision only exists for the packed decode outside Helix (which
+        # keeps its split budget) and without a fixed split override. The
+        # environment and topology come first, then the model; the packed-Q
+        # check, which probes the device, last.
+        if not _fp4_mla_split_on_demand_enabled():
+            return None
+        if os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto") != "auto":
+            return None
+        if self.mapping.has_cp_helix():
+            return None
+        num_heads = self._fp4_mla_decode_heads()
+        if num_heads is None:
+            return None
+        if not _fp4_mla_packed_q_enabled():
+            return None
+        sm_count = self._decode_sm_count()
+
+        @functools.cache
+        def m_tiles(draft_len: int) -> int:
+            rows = _fp4_mla_packed_rows_per_seq(num_heads, int(draft_len) + 1)
+            return rows // FP4_MLA_SCALE_ROW_GROUP
+
+        @functools.cache
+        def variants(batch_size: int, draft_len: int) -> tuple[bool, ...]:
+            tiles = m_tiles(draft_len)
+            if tiles <= 0:
+                # No packed decode for this query width: one family.
+                return (True,)
+            return packed_plan.packed_split_variants(
+                int(batch_size), m_tiles=tiles, sm_count=sm_count
+            )
+
+        def decide(batch_size: int, draft_len: int, kv_lens: list[int]) -> bool:
+            del batch_size  # the step's rows are kv_lens
+            tiles = m_tiles(draft_len)
+            if tiles <= 0:
+                return True
+            return packed_plan.packed_split_needed(
+                kv_lens, query_len=int(draft_len) + 1, m_tiles=tiles, sm_count=sm_count
+            )
+
+        return PackedSplitResolver(variants=variants, decide=decide)
+
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
@@ -877,6 +1073,66 @@ class DecoderCudaGraphs:
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        # Without a resolver (every decode but the FP4 MLA 4x one) the capture
+        # leaves the graph runner's KV-regime state alone.
+        kv_regime_resolver = self._kv_regime_resolver(resource_manager)
+
+        def _length_passes(bs: int, draft_len: int) -> list[tuple[int, int | None]]:
+            """(warm-up length, KV regime) passes of one graph shape."""
+            if kv_regime_resolver is None:
+                return [(max_seq_len, None) for max_seq_len in max_seq_len_list]
+            return _kv_regime_length_passes(max_seq_len_list, kv_regime_resolver(bs, draft_len))
+
+        if kv_regime_resolver is not None:
+            self.cuda_graph_runner.set_kv_regime_resolver(kv_regime_resolver)
+            shapes = sorted(
+                {
+                    entry[:2]
+                    for entry in graphs_to_capture
+                    if entry[0] <= self._config.max_batch_size
+                }
+            )
+            families = sum(len(kv_regime_resolver(bs, draft_len)) for bs, draft_len in shapes)
+            logger.info(
+                f"FP4 MLA decode graphs keyed by KV regime: {families} (shape, regime) families over "
+                f"{len(shapes)} generation graph shapes, {len(max_seq_len_list)} warm-up length(s) each."
+            )
+
+        # Without a resolver (every decode but the FP4 MLA packed one with the
+        # on-demand split budget) the capture leaves the split state alone.
+        packed_split_resolver = self._packed_split_resolver(resource_manager)
+        if packed_split_resolver is not None:
+            self.cuda_graph_runner.set_packed_split_resolver(packed_split_resolver)
+            split_shapes = sorted(
+                {
+                    entry[:2]
+                    for entry in graphs_to_capture
+                    if entry[0] <= self._config.max_batch_size
+                }
+            )
+            unsplit_shapes = sum(
+                1
+                for bs, draft_len in split_shapes
+                if False in packed_split_resolver.variants(bs, draft_len)
+            )
+            logger.info(
+                f"FP4 MLA decode graphs keyed by the packed split decision: {unsplit_shapes} of "
+                f"{len(split_shapes)} generation graph shapes add an unsplit graph."
+            )
+
+        def _capture_passes(bs: int, draft_len: int) -> list[tuple[int, int | None, bool | None]]:
+            """(warm-up length, KV regime, packed split decision) passes of one graph shape."""
+            decisions = (
+                (None,)
+                if packed_split_resolver is None
+                else packed_split_resolver.variants(bs, draft_len)
+            )
+            return [
+                (max_seq_len, kv_regime, decision)
+                for max_seq_len, kv_regime in _length_passes(bs, draft_len)
+                for decision in decisions
+            ]
+
         def _run_capture_pass(
             force_non_greedy: bool,
             label: str,
@@ -900,7 +1156,11 @@ class DecoderCudaGraphs:
                     if bs > self._config.max_batch_size:
                         continue
 
-                    for max_seq_len in max_seq_len_list:
+                    for max_seq_len, kv_regime, packed_split in _capture_passes(bs, draft_len):
+                        if kv_regime_resolver is not None:
+                            self.cuda_graph_runner.set_capture_kv_regime(kv_regime)
+                        if packed_split_resolver is not None:
+                            self.cuda_graph_runner.set_capture_packed_split(packed_split)
                         warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
@@ -920,6 +1180,12 @@ class DecoderCudaGraphs:
                                 f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}"
+                                + (f", kv_regime={kv_regime}" if kv_regime is not None else "")
+                                + (
+                                    f", packed_split={packed_split}"
+                                    if packed_split is not None
+                                    else ""
+                                )
                             )
                             enable_spec_decode = draft_len > 0 or (
                                 self._config.spec_config is not None
@@ -946,6 +1212,10 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                if kv_regime_resolver is not None:
+                    self.cuda_graph_runner.set_capture_kv_regime(None)
+                if packed_split_resolver is not None:
+                    self.cuda_graph_runner.set_capture_packed_split(None)
                 if self._inputs is not None and self._inputs._dspark_confidence_enabled:
                     self.cuda_graph_runner.agreed_ragged_bucket = None
 
@@ -1007,10 +1277,12 @@ class DecoderCudaGraphs:
             #
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
-            _capture_variant("greedy")
-            if supports_advanced_draft_sampling(self._config.spec_config):
+            variants = self._sampling_variants_to_capture(temperature_only_graphs)
+            if "greedy" in variants:
+                _capture_variant("greedy")
+            if "advanced" in variants:
                 _capture_variant("advanced sampling", force_non_greedy=True)
-            if temperature_only_graphs:
+            if "temperature_only" in variants:
                 # Temperature-only batches replay the vocabulary-sharded Gumbel-max
                 # target sampling (the advanced pass records the stock sampler: its
                 # params enable top-k / top-p / min-p).
@@ -1041,6 +1313,45 @@ class DecoderCudaGraphs:
             self._metadata.spec_metadata.is_all_greedy_sample = True
             self._metadata.spec_metadata.is_all_temperature_only = False
             self._metadata.spec_metadata.temperature_only = False
+
+    def _sampling_variants_to_capture(self, temperature_only_graphs: bool) -> frozenset[str]:
+        """One-engine sampling variants to capture; cuda_graph_config.sampling_variants narrows them."""
+        listed = getattr(self._config.cuda_graph_config, "sampling_variants", None)
+        if listed is not None:
+            # Judged from the config: the speculative metadata may not exist before the first pass.
+            # Batches never select temperature_only with rejection sampling or penalties, which
+            # the vocabulary-shard sampler (DSpark) excludes too.
+            spec_config = self._config.spec_config
+            temperature_only_graphs = self._config.samples_from_vocab_shards or (
+                supports_temperature_only_graphs(self._config, self.mapping)
+                and not (spec_config.use_rejection_sampling or spec_config.enable_penalty)
+            )
+        supported = {"greedy"}
+        if supports_advanced_draft_sampling(self._config.spec_config):
+            supported.add("advanced")
+        if temperature_only_graphs:
+            supported.add("temperature_only")
+        if listed is None:
+            return frozenset(supported)
+        if not supported.issuperset(listed):
+            raise ValueError(
+                f"cuda_graph_config.sampling_variants lists {sorted(set(listed) - supported)}, "
+                f"but this engine can capture only {sorted(supported)}"
+            )
+        self._sampling_variants = frozenset(listed)
+        return self._sampling_variants
+
+    def warn_uncaptured_sampling_variant(self, spec_metadata: SpecMetadata) -> None:
+        """Log once per variant that a decode batch runs eagerly because its variant is not listed."""
+        if self._sampling_variants is None:
+            return
+        variant = sampling_variant(spec_metadata)
+        if variant not in self._sampling_variants:
+            logger.warning_once(
+                f"A decode batch with {variant} sampling runs eagerly: "
+                f"cuda_graph_config.sampling_variants captured {sorted(self._sampling_variants)}",
+                key=f"uncaptured_sampling_variant_{variant}",
+            )
 
     def _capture_break_graphs(
         self,

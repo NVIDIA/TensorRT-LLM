@@ -40,6 +40,8 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm._torch.modules.linear import Linear
 
+pytestmark = pytest.mark.cpu_only
+
 dspark_attention = modeling_dspark
 
 
@@ -952,7 +954,6 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
         DSv4DSparkDraftModel._bind_attn_projections(model)
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm,tp_size,enable_attention_dp,use_bf16",
     [
@@ -1002,7 +1003,6 @@ def test_post_load_weights_selects_dspark_linear_backend(
         bf16_bind.assert_not_called()
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("use_cute_backend", [False, True])
 def test_post_load_weights_preserves_linear_backend_before_transform(
     monkeypatch: pytest.MonkeyPatch, use_cute_backend: bool
@@ -1171,7 +1171,6 @@ def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
     assert len(quant_calls) == len(gemm_calls) == 1
 
 
-@pytest.mark.cpu_only
 def test_zero_argument_post_load_transforms_non_attention_linears(monkeypatch):
     from tensorrt_llm._torch.models import modeling_dspark
 

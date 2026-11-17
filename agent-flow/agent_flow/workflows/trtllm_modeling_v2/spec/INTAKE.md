@@ -16,7 +16,7 @@ role reads about the model. Intake writes files and reads the tree; it starts no
   quantization blocks), the safetensors index, the tokenizer and chat template.
 - The reference implementation the user names, enough to write the architecture brief below, and
   whether it can load this checkpoint's weights as stored (its quantization in particular).
-- `tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and this workflow's README.
+- `tensorrt_llm/_torch/modeling_v2/README.md` and this workflow's README.
 - For native code, `cpp/tensorrt_llm/modeling_v2/README.md`: family libraries, build declarations,
   namespaces, registration, fake implementations, loading errors and rebuild/install identity.
 

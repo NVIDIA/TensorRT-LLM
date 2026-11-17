@@ -22,9 +22,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterator,
-                    List, Mapping, Optional, Protocol, Tuple, Type, TypeVar,
-                    Union)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Mapping,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -1462,13 +1461,20 @@ def maybe_compute_mm_embed_cumsum(
     _cache_mm_embed_cumsum(mm_data, embed_mask)
 
 
+class _InputProcessorCallable(Protocol):
+
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> tuple[list[int], ExtraProcessedInputs | None]:
+        ...
+
+
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
     *,
     encoder_cache_enabled: bool = False,
-) -> Callable[[TextPrompt, SamplingParams], Tuple[
-        List[int], Optional[ExtraProcessedInputs]]]:
+) -> _InputProcessorCallable:
     """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
 
     Args:

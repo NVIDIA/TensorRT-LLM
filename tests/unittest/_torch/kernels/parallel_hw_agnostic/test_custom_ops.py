@@ -20,7 +20,7 @@ import torch._library.utils as library_utils
 import tensorrt_llm  # noqa: F401
 
 # The MiniMax-M3 ops' fake impls are registered by their modeling_v2 package.
-import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.fake_ops  # noqa: F401
+import tensorrt_llm._torch.modeling_v2.models.minimax_m3.fake_ops  # noqa: F401
 import tensorrt_llm._torch.pyexecutor.step_inputs  # noqa: F401
 
 pytestmark = pytest.mark.cpu_only
