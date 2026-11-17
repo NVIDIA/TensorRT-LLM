@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -41,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
+from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -58,7 +60,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -302,6 +304,35 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
             batch, new_tokens, None, None, True
         )
+
+    def test_prefill_cuda_graph_backend_leaves_unconstrained_eager_batch_inactive(self) -> None:
+        for backend in (PrefillCudaGraphBackend.BREAKABLE, PrefillCudaGraphBackend.PIECEWISE):
+            for maybe_graph in (False, True):
+                with self.subTest(backend=backend, maybe_graph=maybe_graph):
+                    inputs = input_preparer(
+                        decoder_config(is_spec_decode=False, prefill_cuda_graph_backend=backend),
+                        model=None,
+                    )
+                    decoder = object.__new__(CapturableGuidedDecoder)
+                    decoder.max_num_draft_tokens = 0
+                    decoder.queue = Queue()
+                    decoder._num_added_batches = 0
+                    inputs.guided_decoder = decoder
+                    inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+                    inputs._apply_steady_gen_fast_prepare = Mock(return_value=PreparedInputs({}))
+
+                    inputs.prepare_inputs(
+                        ScheduledRequests(),
+                        Mock(),
+                        Mock(),
+                        maybe_graph=maybe_graph,
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=True,
+                    )
+
+                    self.assertEqual(decoder.active, maybe_graph)
+                    self.assertEqual(decoder.queue.qsize(), int(maybe_graph))
 
     def test_prepare_inputs_single_cp_rank_ignores_cp_type(self) -> None:
         for cp_type in (CpType.ULYSSES, CpType.RING):
