@@ -298,7 +298,7 @@ class SamplingParams:
     include_stop_str_in_output: bool = False
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
-    embedding_bias: Optional[Union[torch.Tensor, list[float], EmbeddingBias]] = None
+    embedding_bias: Optional[Union[EmbeddingBias, torch.Tensor, List[float]]] = None
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
