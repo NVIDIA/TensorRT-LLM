@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .runtime_hooks import runtime_hooks_of
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -107,21 +108,18 @@ def _fp4_mla_block_reuse_blocker(pretrained_config, *,
                                  enable_chunked_prefill: bool) -> Optional[str]:
     """Why FP4 MLA cannot reuse KV cache blocks, or ``None`` if it can.
 
-    A reused prefix must end on a full 16-token FP4 quantization tile. On
-    hybrid linear-attention models (Kimi K3) it ends on a recurrent-state
-    snapshot, which the cache manager places on a cache block. A dense FP4
-    MLA prefix can end mid-tile: the reuse match backs off by the
-    one-model draft's prompt lookahead. The cached prefix is attended
-    through the MLA chunked-prefill partitions, which read it back from the
-    FP4 pages.
+    A reused prefix must end on a full 16-token FP4 quantization tile. A
+    dense FP4 MLA cache claims whole cache blocks only. On hybrid
+    linear-attention models (Kimi K3) the prefix ends on a recurrent-state
+    snapshot, which the cache manager places on a cache block. The cached
+    prefix is attended through MLA context partitions read back from the
+    FP4 pages, with or without chunked prefill. Hybrid models keep block
+    reuse tied to chunked prefill, the only combination validated with
+    their recurrent-state snapshots.
     """
-    if not is_hybrid_linear(pretrained_config):
-        return ("only hybrid linear-attention models, whose reused prefix "
-                "ends on a recurrent-state snapshot at a cache block, resume "
-                "on a full FP4 quantization tile")
-    if not enable_chunked_prefill:
-        return ("the cached prefix is attended through MLA chunked-prefill "
-                "partitions; set enable_chunked_prefill=True")
+    if is_hybrid_linear(pretrained_config) and not enable_chunked_prefill:
+        return ("hybrid linear-attention models reuse FP4 MLA cache blocks "
+                "only with chunked prefill; set enable_chunked_prefill=True")
     return None
 
 
@@ -1529,7 +1527,8 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        runtime_hooks_of(model_engine.model).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

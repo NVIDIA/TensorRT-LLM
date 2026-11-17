@@ -25,6 +25,8 @@ set is unchanged.
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 bindings = pytest.importorskip("tensorrt_llm.bindings")
 
 # Legacy nvinfer1::DataType integer values. These MUST remain stable.

@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
 
 import pytest
 import torch
@@ -30,6 +30,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -1101,7 +1102,11 @@ def build_test_activation(
     # cover the kinds this sweep supplies constants for, and a kind added to
     # ``ACTIVATION_PAYLOAD`` with a carrier of its own has to get that carrier.
     payload = ACTIVATION_PAYLOAD[kind]
-    return SimpleActivation(kind=kind) if payload is SimpleActivation else payload()
+    return (
+        SimpleActivation(kind=kind)
+        if payload is SimpleActivation
+        else cast(Callable[[], MoEActivation], payload)()
+    )
 
 
 def get_quick_skip_reason(

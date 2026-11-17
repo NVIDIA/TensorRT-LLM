@@ -12,10 +12,10 @@ claims about inputs no cell describes.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.ops.moe.fused_moe import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.ops.moe.fused_moe import (  # noqa: E501
     fused_moe,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 __extra_import_path__ = ["../../../.."]
 from _precision import true_fp32_matmul  # noqa: E402

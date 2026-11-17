@@ -86,7 +86,7 @@ _ATOL = 1.0
 
 def _build_base_inputs(
     num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device, seed=0
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
     w3_w1 = torch.randn(num_experts, 2 * inter_size, hidden_size, dtype=dtype, device=device) * 0.02

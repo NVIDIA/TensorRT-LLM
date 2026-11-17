@@ -7,9 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_post_conv import (
-    kda_post_conv,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_post_conv import kda_post_conv
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
