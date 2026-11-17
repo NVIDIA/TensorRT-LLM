@@ -247,6 +247,13 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         output1_scale_scalar = get_data_or_none(self, "fc31_scale_c")
         output1_scale_gate_scalar = get_data_or_none(self, "fc31_alpha")
         output2_scale_scalar = get_data_or_none(self, "fc2_alpha")
+        # Dynamic EP: the weights hold every expert; calls without tables run the static range.
+        local_offset, local_count = self.slot_start, self.expert_size_per_partition
+        dynamic_ep = getattr(self, "dynamic_ep", None)
+        dynamic_kwargs = {}
+        if dynamic_ep is not None:
+            local_offset, local_count = dynamic_ep[0], dynamic_ep[1]
+            dynamic_kwargs = {"dynamic_experts": self.expert_size_per_partition}
 
         outputs = self.op_backend.run_fp4_block_scale_moe(
             k.router_logits,
@@ -270,8 +277,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             k.n_group,
             k.topk_group,
             intermediate_size_per_partition_padded,
-            self.slot_start,
-            self.expert_size_per_partition,
+            local_offset,
+            local_count,
             k.routed_scaling_factor,
             self.routing_method.routing_method_type,
             do_finalize=k.do_finalize,
@@ -293,6 +300,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             decode_early_release_rows=self.decode_early_release_rows,
             decode_spare_sms=self._concurrent_sm_reserve,
             routing_tables=ctx.routing_tables,
+            cute_fc2_rows=self.cute_fc2_rows,
+            **dynamic_kwargs,
         )
 
         if not k.do_finalize:

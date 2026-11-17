@@ -2341,6 +2341,8 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_decode_front.py]": 89.08454096045197,
    "unittest/_torch/moe/test_moe_load_balancer.py": 22.810729521715228,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_load_balancer.py]": 22.810729521715228,
+   "unittest/_torch/moe/test_moe_ep_dynamic.py": 93.97603980099503,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_ep_dynamic.py]": 93.97603980099503,
    "unittest/_torch/moe/test_moe_lowm_fc2.py": 30.372560975609755,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_moe_lowm_fc2.py]": 30.372560975609755,
    "unittest/_torch/moe/test_moe_module.py::test_a_tactic_builds_the_implementation_it_names": 30.145165413533835,
