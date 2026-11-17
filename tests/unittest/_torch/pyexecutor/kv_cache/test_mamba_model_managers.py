@@ -22,7 +22,10 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     Qwen35HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
-from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshots
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
+    InforwardSnapshotHost,
+    InforwardSnapshots,
+)
 from tensorrt_llm._torch.modules.fla.replay_region import GDNReplayRegion
 from tensorrt_llm._torch.modules.fla.replay_region import replay_slot_count as gdn_replay_slot_count
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
@@ -83,7 +86,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ],
 )
 def test_model_managers_inherit_the_common_lifecycle(manager_cls):
-    assert manager_cls.__bases__ == (MambaHybridCacheManagerV2,)
+    # The GDN managers also mix in the in-forward snapshot API.
+    bases = tuple(base for base in manager_cls.__bases__ if base is not InforwardSnapshotHost)
+    assert bases == (MambaHybridCacheManagerV2,)
     for method in (
         "try_commit_blocks",
         "_setup_state_pool",
@@ -223,7 +228,7 @@ def _shutdown_manager(manager, monkeypatch):
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
-        if isinstance(manager, Qwen35HybridCacheManager):
+        if isinstance(manager, InforwardSnapshotHost):
             assert manager.inforward_snapshot_rows == 0
             assert manager.inforward_snapshot_plan == {}
 
@@ -500,7 +505,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     if manager_cls is Qwen4ExpHybridCacheManager:
         manager._ple_conv_states = {}
         manager._ple_ngram_contexts = {}
-    if manager_cls is Qwen35HybridCacheManager:
+    if issubclass(manager_cls, InforwardSnapshotHost):
         manager._inforward_snapshots = InforwardSnapshots()
     manager.mamba_layer_offsets = {42: 0}
     conv, ssm, payload = object(), object(), object()
@@ -1202,6 +1207,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
     )
 
     manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._inforward_snapshots = InforwardSnapshots()
     manager._mamba_layer_mask = [False, True]
     manager.pp_layers = manager.mamba_pp_layers = [1]
     manager.layer_offsets = manager.mamba_layer_offsets = {1: 0}
@@ -2595,3 +2601,42 @@ def test_fp4_mla_route_builds_the_kimi_k3_manager():
         )
         is KimiK3HybridCacheManager
     )
+
+
+def test_qwen4_inforward_snapshot_stages_and_restores_ple_state(monkeypatch):
+    """Qwen4-Exp stages each local PLE layer's state beside the GDN rows and restores it.
+
+    The floor on chunk tokens before P is the larger of the model's request and the PLE windows.
+    """
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+
+    def base_setup(self):
+        self._inforward_snapshots.rows = 2
+        self._inforward_snapshots.min_main = 3
+
+    monkeypatch.setattr(InforwardSnapshotHost, "_setup_inforward_snapshots", base_setup)
+    manager._inforward_snapshots = InforwardSnapshots()
+    manager.all_ssm_states = [torch.empty(1, 2, 1)]
+    manager._inforward_min_main_request = 65
+    manager._inforward_stage_ple = {}
+    manager._ple_layer_ids = [5, 9]
+    manager.layer_offsets = {5: 0}  # layer 9 lives on another PP rank
+    manager._ple_conv_state_shape = [8, 9]
+    manager._ple_ngram_context_shape = [2]
+    manager._ple_conv_state_dtype = torch.bfloat16
+    manager._setup_inforward_snapshots()
+
+    assert set(manager._inforward_stage_ple) == {5}
+    stage_conv, stage_ngram = manager.inforward_ple_stage_views(5)
+    assert stage_conv.shape == (2, 8, 9) and stage_conv.dtype == torch.bfloat16
+    assert stage_ngram.shape == (2, 2) and stage_ngram.dtype == torch.long
+    assert manager.inforward_ple_stage_views(9) is None
+    assert manager.inforward_snapshot_min_main == 65
+
+    manager._ple_conv_states = {5: torch.zeros(4, 8, 9, dtype=torch.bfloat16)}
+    manager._ple_ngram_contexts = {5: torch.zeros(4, 2, dtype=torch.long)}
+    buffers = manager._inforward_extra_restore_buffers()
+    assert [(pool.data_ptr(), stage.data_ptr()) for pool, stage in buffers] == [
+        (manager._ple_conv_states[5].data_ptr(), stage_conv.data_ptr()),
+        (manager._ple_ngram_contexts[5].data_ptr(), stage_ngram.data_ptr()),
+    ]

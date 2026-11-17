@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.causal_conv1d_fwd import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.causal_conv1d_fwd import (
     causal_conv1d_fwd,
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID

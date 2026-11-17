@@ -36,6 +36,10 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
 )
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
+    InforwardSnapshotHost,
+    InforwardSnapshots,
+)
 from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
@@ -55,6 +59,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 
 if TYPE_CHECKING:
     import transformers
+
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
 _IDENTITY_PAGE_INDEX_EXPANSION = 1
@@ -175,12 +181,13 @@ def _qwen4_exp_ple_state_bytes_per_rank(
     return local_ple_layers * ple_bytes_per_layer
 
 
-class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
+class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2):
     """Hybrid GDN/KV manager with lifecycle-coupled sparse side buffers.
 
     QSA adds a per-layer index-K cache and request-wide position coordinates.
     These buffers share the main K/V allocation, eviction, and prefix-reuse
-    lifecycle. This manager owns GDN replay and PLE state, while the parent
+    lifecycle. This manager owns GDN replay and PLE state, and the in-forward
+    snapshots of both when the model implements the split, while the parent
     manages common pool allocation and request lifecycles.
 
     Index geometry is resolved from the same serving/checkpoint configuration
@@ -193,6 +200,9 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     mamba_metadata_cls = GDNMambaMetadata
     _replay_region: GDNReplayRegion | None = None
     _context_only = False
+    # A model that implements the in-forward snapshot split opts in per instance
+    # (inforward_snapshot_min_main).
+    _supports_inforward_snapshot = False
     # Whether the model's GDN layers verify drafts with the fused kernels, which
     # commit in-layer at every batch size.
     gdn_fused_verify = False
@@ -224,6 +234,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         use_replay_state_update: bool | None = None,
         qwen4_exp_ple_cache_params: Qwen4ExpPLECacheParams | None = None,
         gdn_fused_verify: bool = False,
+        inforward_snapshot_min_main: int = 0,
         **kwargs,
     ) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
@@ -232,6 +243,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         # A disaggregated context server never decodes and keeps no replay history.
         self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._replay_region = None
+        # The model implements the in-forward snapshot split (GDN and PLE state at P) and opts in
+        # by naming its fewest chunk tokens before P; 0 leaves the path off.
+        self._supports_inforward_snapshot = inforward_snapshot_min_main > 0
+        self._inforward_min_main_request = inforward_snapshot_min_main
+        self._inforward_snapshots = InforwardSnapshots()
+        self._inforward_stage_ple: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._ple_params = qwen4_exp_ple_cache_params
         self._pretrained_config = pretrained_config
         self.qsa_index_dim = self.qsa_index_kv_heads = 0
@@ -692,6 +709,57 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             f"[{num_state_slots}, {self._ple_ngram_context_shape[0]}] (int64)"
         )
 
+    @override
+    def _setup_inforward_snapshots(self) -> None:
+        """Add staging rows for each local PLE layer's conv state and n-gram history.
+
+        They share the GDN slot, so the snapshot at P stages them too, and their windows at P must
+        lie inside the chunk, which raises the floor on chunk tokens before P.
+        """
+        super()._setup_inforward_snapshots()
+        snapshots = self._inforward_snapshots
+        rows = snapshots.rows
+        if rows == 0:
+            return
+        min_main = max(snapshots.min_main, self._inforward_min_main_request)
+        device = self.all_ssm_states[0].device
+        for layer_id in self._ple_layer_ids:
+            if layer_id not in self.layer_offsets:
+                continue
+            self._inforward_stage_ple[layer_id] = (
+                torch.empty(
+                    [rows] + self._ple_conv_state_shape,
+                    dtype=self._ple_conv_state_dtype,
+                    device=device,
+                ),
+                torch.empty(
+                    [rows] + self._ple_ngram_context_shape, dtype=torch.long, device=device
+                ),
+            )
+            min_main = max(
+                min_main, self._ple_conv_state_shape[-1], self._ple_ngram_context_shape[0]
+            )
+        snapshots.min_main = min_main
+        logger.info(
+            f"In-forward Mamba snapshots: PLE staging for layers {sorted(self._inforward_stage_ple)}, "
+            f"at least {min_main} chunk tokens before the snapshot point"
+        )
+
+    def inforward_ple_stage_views(
+        self, layer_idx: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """A PLE layer's staging rows: conv state ``[rows, channels, state_len]`` and n-gram
+        history ``[rows, ngram_size - 1]``; None without in-forward snapshots."""
+        return self._inforward_stage_ple.get(layer_idx)
+
+    @override
+    def _inforward_extra_restore_buffers(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        buffers = []
+        for layer_id, (stage_conv, stage_ngram) in self._inforward_stage_ple.items():
+            buffers.append((self._ple_conv_states[layer_id], stage_conv))
+            buffers.append((self._ple_ngram_contexts[layer_id], stage_ngram))
+        return buffers
+
     def ple_layer_cache(self, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Return persistent ``(conv_state, ngram_context)`` pools for a layer."""
         conv = self._ple_conv_states.get(layer_idx)
@@ -812,6 +880,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         super()._setup_model_state()
         if self.local_num_mamba_layers:
             self._setup_ple_states(self._state_layout.slot_capacity)
+        self._setup_inforward_snapshots()
+
+    @override
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        super().prepare_resources(scheduled_batch)
+        self._plan_inforward_snapshots(scheduled_batch)
 
     @property
     def replay_layer_group_id(self) -> int | None:
@@ -904,6 +978,8 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             self._replay_region.shutdown()
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
+        self._inforward_snapshots.shutdown()
+        self._inforward_stage_ple = {}
         super().shutdown()
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:

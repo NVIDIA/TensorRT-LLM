@@ -8,6 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
                     Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
                     Union)
@@ -58,6 +59,22 @@ def timing_metric(metric_name: str, metric_dict: dict[str,
     finally:
         metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
                                     time.perf_counter() - start)
+
+
+class ModelLoaderMetricNames(Enum):
+    """Names of the model loader's startup timing metrics."""
+
+    TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
+    CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
+    WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    CHECKPOINT_FINALIZATION_SECONDS = "checkpoint_finalization_seconds"
+    DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
+        "draft_checkpoint_preparation_seconds")
+    DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
+        "draft_checkpoint_finalization_seconds")
+    POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 @dataclass

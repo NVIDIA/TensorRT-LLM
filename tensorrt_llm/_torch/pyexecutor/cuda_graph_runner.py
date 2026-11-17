@@ -20,6 +20,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
+from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
@@ -186,6 +187,17 @@ class PackedSplitResolver(NamedTuple):
     decide: Callable[[int, int, List[int]], bool]
 
 
+def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
+    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it."""
+    if getattr(spec_metadata, "is_all_greedy_sample", True):
+        return "greedy"
+    # The one-engine fast paths' flag, or the vocabulary-shard sampler's.
+    if (getattr(spec_metadata, "temperature_only", False)
+            or spec_metadata.is_all_temperature_only):
+        return "temperature_only"
+    return "advanced"
+
+
 def _save_spec_decode_capture_state(
         attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
     if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
@@ -271,6 +283,8 @@ class CUDAGraphRunnerConfig:
     stage_decode_inputs: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    # One-engine sampling variants that have graphs (cuda_graph_config.sampling_variants); None for all.
+    sampling_variants: Optional[frozenset[str]] = None
     static_input_ids: Optional[torch.Tensor] = None
     """The decoder runner's own int32 input-id buffer. When given (with
     ``static_position_ids``), the graphs' static inputs are views of the
@@ -347,6 +361,8 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
+        # Keys of the graphs that captured host functions.
+        self._hostfunc_graph_keys: set[KeyType] = set()
         self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         # (batch, every rank's sampling mode) when the padding exchange carried one.
@@ -651,13 +667,11 @@ class CUDAGraphRunner:
         # both variants and dispatch at replay based on actual batch state.
         # Default to True (greedy fast-path) when the metadata doesn't carry
         # this field (non-one-engine paths or non-spec batches).
-        is_all_greedy_sample = bool(
-            getattr(spec_metadata, "is_all_greedy_sample", True))
-        # The temperature-only variant of the advanced-sampling graphs: the
-        # one-engine fast paths' flag, or the vocabulary-shard sampler's.
-        temperature_only = not is_all_greedy_sample and (
-            bool(getattr(spec_metadata, "temperature_only", False))
-            or spec_metadata.is_all_temperature_only)
+        # maybe_get_cuda_graph checks the same variant against the captured ones.
+        variant = sampling_variant(spec_metadata)
+        is_all_greedy_sample = variant == "greedy"
+        # The temperature-only variant of the advanced-sampling graphs.
+        temperature_only = variant == "temperature_only"
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -1040,7 +1054,12 @@ class CUDAGraphRunner:
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
-        can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
+        # A batch of an uncaptured sampling variant runs eagerly; under attention
+        # DP the agreement below then takes every rank's step eager with it.
+        can_run_cuda_graph = (
+            self._can_run_cuda_graph_batch(batch) and
+            (spec_metadata is None or self.config.sampling_variants is None or
+             sampling_variant(spec_metadata) in self.config.sampling_variants))
         batch_size = batch.batch_size
         (shapes_agree, forced_sample_type, forced_kv_regime,
          forced_packed_split) = self._agree_graph_shape(
@@ -1260,6 +1279,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            num_hostfuncs = len(HOSTFUNC_USER_DATA_HANDLES)
             with nccl_window_graph_capture(
                     graph, graph_pool, stream=self._priority_capture_stream()):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
@@ -1268,6 +1288,8 @@ class CUDAGraphRunner:
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
+            if len(HOSTFUNC_USER_DATA_HANDLES) > num_hostfuncs:
+                self._hostfunc_graph_keys.add(key)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
             _restore_spec_decode_capture_state(attn_metadata,
@@ -1445,6 +1467,8 @@ class CUDAGraphRunner:
         finally:
             if prologue_pack is not None:
                 prologue_pack.on_graph_replay()
+        if key in self._hostfunc_graph_keys:
+            record_hostfunc_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -2024,6 +2048,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()

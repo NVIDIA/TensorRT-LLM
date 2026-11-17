@@ -37,7 +37,10 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import (
     _RESOLVED_MODES,
     _ROUTES,
     ANY_MOE_IMPL,
@@ -48,15 +51,13 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     registered_routes,
     resolved_mode,
 )
-from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
     MTPDecodingConfig,
+    MultimodalConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -866,7 +867,7 @@ def test_routes_on_the_kv_cache_algorithm_the_engine_runs(
 )
 def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel):
     """MiniMax-M3 has one target per tensor-parallel width: tp2, tp4 and tp8 load different per-rank shapes."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     assert routing._parallel(Mapping(**mapping_kwargs)) == parallel
 
@@ -891,12 +892,12 @@ _OTHER_LAYOUT = dict(
 
 
 def _m3_text_config(**layout):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     return dict(zip(_M3_SHAPE_FIELDS, routing._SHAPE), **(layout or _M3_LAYOUT))
 
 
-_M3_TARGETS = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
+_M3_TARGETS = "tensorrt_llm._torch.modeling_v2.models.minimax_m3"
 _M3_TP2 = dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1)
 _M3_TP4 = dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1)
 _M3_TP8 = dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
@@ -922,8 +923,8 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
     import sys
     import types
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
     from tensorrt_llm.quantization.mode import QuantAlgo
 
     for directory, name in (
@@ -959,7 +960,7 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
 def test_minimax_m3_route_takes_the_released_checkpoint(monkeypatch, spec, tp):
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
@@ -1011,8 +1012,8 @@ def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatc
     even with their quantization."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     text_config = _m3_text_config(**layout)
@@ -1048,8 +1049,8 @@ def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwa
     checkpoints."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     with pytest.raises(NoTarget, match="sparse attention layers other than 3-59|rope_theta"):
@@ -1066,7 +1067,7 @@ def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwa
 
 def test_minimax_m3_layout_reads_rope_theta_from_rope_parameters():
     """A config that keeps the RoPE base under ``rope_parameters`` (newer transformers) reads the same."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     sparse = _M3_LAYOUT["sparse_attention_config"]
     assert routing._layout_mismatch(_m3_text_config()) is None
@@ -1122,7 +1123,7 @@ def _minimax_m3_sm(_on_sm10x):
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
     """The PR deployment (MSA, FP8 indexer, fused projection, kv_cache_config.dtype='nvfp4') takes the target."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(), None, tp)
@@ -1135,7 +1136,7 @@ def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
 def test_minimax_m3_bf16_kv_cache_falls_back_under_auto(monkeypatch, tp):
     """The targets run an FP8 or NVFP4 KV cache: ``auto`` with the BF16 cache resolves nothing, so the loader builds
     the registered built-in MiniMax-M3 model."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
@@ -1148,7 +1149,7 @@ def test_minimax_m3_bf16_kv_cache_falls_back_under_auto(monkeypatch, tp):
 
 @pytest.mark.usefixtures("_minimax_m3_sm")
 def test_minimax_m3_bf16_kv_cache_raises_under_require(monkeypatch):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
@@ -1164,7 +1165,7 @@ def test_minimax_m3_bf16_kv_cache_raises_under_require(monkeypatch):
 def test_minimax_m3_other_checkpoint_revision_is_declined(monkeypatch, tp):
     """Another checkpoint revision (same architecture class and shape, another RoPE base and sparse layout) with the
     PR runtime: ``auto`` builds the built-in model and ``require`` names the layout."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(), None, tp, layout=_OTHER_LAYOUT)
@@ -1176,7 +1177,7 @@ def test_minimax_m3_other_checkpoint_revision_is_declined(monkeypatch, tp):
 @pytest.mark.usefixtures("_minimax_m3_sm")
 def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     """An explicit kv_cache_config.dtype is the KV cache the engine runs with, whatever the checkpoint declares."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
@@ -1190,7 +1191,7 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
 @pytest.mark.parametrize("role", ["aggregated", "context", "generation"])
 def test_minimax_m3_is_claimed_in_every_serving_role(monkeypatch, tp: int, role: str) -> None:
     """Every serving role builds the target, under the default mode as under a set one."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
@@ -1215,7 +1216,7 @@ def test_minimax_m3_honors_a_draft_moe_tactic_only(monkeypatch, tp):
     its own, which no tactic names."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
@@ -1458,7 +1459,7 @@ def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_exper
     loader's ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, each
     target's own copy, which it builds the experts in, and the quant of the ids it honors."""
     module_path, class_name = target.rsplit(".", 1)
-    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
+    module = importlib.import_module(f"tensorrt_llm._torch.modeling_v2.{module_path}")
     assert module._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
     loaded = ModelConfig._declared_moe_quants(
         QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
@@ -1593,6 +1594,15 @@ def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
 def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
     config = _model_config(_qwen4_exp_config())
     _declined(config, dict(prefill_cuda_graph_backend="piecewise"), match="piecewise")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_encoder_attention_backend_falls_back():
+    """The target's own vision tower would ignore it; the built-in model applies it."""
+    config = _model_config(_qwen4_exp_config())
+    selected = MultimodalConfig(encoder_attention_backend={"vision": "TRTLLM"})
+    _declined(config, dict(multimodal_config=selected), match="encoder_attention_backend")
+    _claimed(config, dict(multimodal_config=MultimodalConfig(encoder_attention_backend={})))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")

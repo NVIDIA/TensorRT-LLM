@@ -92,10 +92,8 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        latent_op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import latent_op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
     from tensorrt_llm.mapping import Mapping
@@ -211,9 +209,7 @@ def test_latent_exchange_refuses_unsupported_tp_size():
     of one. Its refusal of capture at a supported size is a collective agreement: the 4-rank matrix
     (tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/_k3_latent_reduce_op_matrix.py) checks it."""
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        latent_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import latent_op
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=1, rank=0, tp_size=1)

@@ -268,6 +268,52 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
     mode: Literal["decode"] = Field(
         default="decode", description="CUDA graph configuration mode.")
 
+    sampling_variants: Optional[List[Literal[
+        "greedy", "advanced", "temperature_only"]]] = Field(
+            default=None,
+            min_length=1,
+            description=
+            "Sampling variants captured as CUDA graphs with one-engine speculative "
+            "decoding. 'greedy' serves decode batches whose requests all decode "
+            "greedily; 'advanced' serves batches with a sampled request, one whose "
+            "temperature, top-k, top-p or min-p does not resolve to greedy decoding "
+            "(a seed or a penalty alone does not); 'temperature_only' serves sampled "
+            "batches whose sampled requests set only a temperature, where the "
+            "target tokens are sampled from vocabulary-sharded logits: MTP-Eagle "
+            "one-model decode on models with the spec-decode fast paths (today "
+            "Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism, "
+            "without attention DP, relaxed acceptance or watermark_config; or a "
+            "DSpark draft embedded in the target checkpoint (the DeepSeek-V4 "
+            "family) with tensor parallelism, or with attention DP and "
+            "enable_lm_head_tp_in_adp. Both need no rejection sampling or "
+            "penalties; elsewhere the first capture rejects it. By default every "
+            "variant the engine supports is captured. "
+            "Without 'temperature_only', temperature-only batches use "
+            "'advanced'. Without 'greedy', greedy batches use the sampled graphs "
+            "('temperature_only' if listed, else 'advanced') and still decode "
+            "greedily, but add sampling-parameter and RNG-state uploads, take the "
+            "sampled path in eager steps too, can break exact ties differently on "
+            "'advanced', and lose the argmax fast paths: with rejection sampling, "
+            "argmax drafting and its LM-head-TP path, and the vocabulary-sharded "
+            "target argmax where the model has one (models with the spec-decode fast "
+            "paths and embedded DSpark drafts keep it by listing "
+            "'temperature_only', unless they use rejection sampling; DFlash with "
+            "tensor parallelism keeps its shard selection "
+            "without rejection sampling and with advanced_sampling_mode "
+            "'no_topk_no_topp'). Without 'advanced', a sampled batch that "
+            "'temperature_only' does not serve runs eagerly; under attention DP the "
+            "whole step then runs eagerly on every rank.",
+            status="prototype")
+
+    @field_validator("sampling_variants")
+    @classmethod
+    def validate_sampling_variants(
+            cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """Reject a repeated variant."""
+        if v is not None and len(set(v)) != len(v):
+            raise ValueError("sampling_variants must not repeat a variant")
+        return v
+
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
                              schedule: dict[int, int]) -> List[int]:
@@ -816,6 +862,10 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
     LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
 
 
+# Public attention backends a multimodal encoder can select.
+EncoderAttentionBackend = Literal["VANILLA", "TRTLLM", "FLASHINFER"]
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -828,6 +878,20 @@ class MultimodalConfig(StrictBaseModel):
          "inputs keep the existing CPU preprocessing path. False (default) "
          "disables GPU normalization."),
         status="prototype",
+    )
+
+    encoder_attention_backend: dict[str, EncoderAttentionBackend] | None = Field(
+        default=None,
+        description=
+        ("TensorRT-LLM attention backend for each logical multimodal encoder, "
+         "for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, "
+         "and FLASHINFER. Image and video share the vision encoder. Only encoders "
+         "using TensorRT-LLM Attention support this option; encoders using fixed "
+         "attention reject overrides at initialization. Omitted entries retain "
+         "their model-specific defaults and the language model's attn_backend "
+         "is unchanged. Unsupported encoders or backends raise an error."),
+        status="prototype",
+        telemetry=False,
     )
 
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
@@ -899,6 +963,16 @@ class MultimodalConfig(StrictBaseModel):
     def parse_encoder_cache_max_bytes(cls, value):
         return _parse_binary_byte_string(value)
 
+    @field_validator('encoder_attention_backend', mode='before')
+    @classmethod
+    def normalize_encoder_attention_backend(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                name: backend.upper() if isinstance(backend, str) else backend
+                for name, backend in value.items()
+            }
+        return value
+
     @model_validator(mode='after')
     def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':
         if (self.encoder_cuda_graph is not None
@@ -908,6 +982,22 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        # VANILLA derives segment boundaries on the host, so graph replay
+        # would reuse the captured ones. Image and video share `vision`.
+        graph_encoders = {
+            "vision" if name in ("image", "video") else name
+            for name in self.encoder_cuda_graph or ()
+        }
+        vanilla_graph_encoders = sorted(
+            encoder for encoder, backend in (
+                self.encoder_attention_backend or {}).items()
+            if backend == "VANILLA" and encoder in graph_encoders)
+        if vanilla_graph_encoders:
+            raise ValueError(
+                "multimodal_config.encoder_attention_backend selects VANILLA "
+                f"for {vanilla_graph_encoders}, which does not support "
+                "multimodal_config.encoder_cuda_graph. Select TRTLLM or "
+                "FLASHINFER, or disable CUDA graphs for that encoder.")
         return self
 
 
@@ -5585,6 +5675,20 @@ class MambaStateConfig(StrictBaseModel):
         "kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "
         "effect only when block reuse is enabled.")
 
+    cold_tier_states_per_request: Optional[_StrictPositiveInt] = Field(
+        default=None,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Recurrent states that one typical request (kv_cache_config.avg_seq_len "
+        "tokens) keeps in the host and disk tiers of KV cache manager V2, which "
+        "split their quota between recurrent-state and attention pages by it. "
+        "None keeps the GPU tier's split, whose typical request counts the live "
+        "state and every retained snapshot. A cold tier holds released "
+        "conversations, which mostly come back through their latest endpoint, "
+        "so a small value (1 or 2) gives more of the tier to attention pages. "
+        "Takes effect only with block reuse and a host or disk tier.")
+
 
 class KVEventsConfig(StrictBaseModel):
     """Configuration for streaming (push-based) KV cache event publishing."""
@@ -9228,6 +9332,7 @@ class TorchLlmArgs(BaseLlmArgs):
                                     and unsupported_headroom_reason(
                                         self.scheduler_config.gen_preemption,
                                         self) is None),
+            seq_slot_micro_batches=self.pipeline_parallel_size,
         )
 
     @model_validator(mode="after")
@@ -9569,6 +9674,53 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_cuda_graph_sampling_variants(self) -> 'TorchLlmArgs':
+        """Reject sampling variants that these arguments already rule out."""
+        variants = getattr(self.cuda_graph_config, "sampling_variants", None)
+        if variants is None:
+            return self
+        spec_config = self.speculative_config
+        # AUTO becomes suffix-automaton decoding, a one-engine mode, when the executor starts.
+        if spec_config is None or not (
+                isinstance(spec_config, AutoDecodingConfig)
+                or spec_config.spec_dec_mode.use_one_engine()):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants applies to one-engine "
+                "speculative decoding only")
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants does not apply with confidence "
+                "scheduling, which plans each step's CUDA graph before the step's "
+                "sampling variant is known")
+        if "temperature_only" not in variants:
+            return self
+        from tensorrt_llm._torch.speculative.interface import \
+            supports_sharded_target_sampling
+
+        # Only an embedded DSpark draft samples target tokens from vocabulary shards.
+        dspark_shards = (
+            spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target
+            and (self.enable_lm_head_tp_in_adp if self.enable_attention_dp else
+                 self.tensor_parallel_size > 1))
+        # Batches never select temperature_only with rejection sampling,
+        # penalties or a watermark.
+        if (spec_config.use_rejection_sampling or spec_config.enable_penalty
+                or self.watermark_config is not None
+                or not (dspark_shards or supports_sharded_target_sampling(
+                    spec_config,
+                    types.SimpleNamespace(
+                        tp_size=self.tensor_parallel_size,
+                        enable_attention_dp=self.enable_attention_dp)))):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants lists 'temperature_only', which "
+                "needs MTP-Eagle one-model decoding with tensor parallelism and without "
+                "attention DP or relaxed acceptance, or an embedded DSpark draft with "
+                "tensor parallelism or with attention DP and enable_lm_head_tp_in_adp, "
+                "and no rejection sampling, penalties or watermark_config")
         return self
 
     @model_validator(mode="after")

@@ -21,6 +21,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 AGENTX_CLIENT_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "perf" / "agentx_client.py"
 

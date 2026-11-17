@@ -15,10 +15,10 @@ from unittest.mock import patch, sentinel
 import pytest
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
     _mtp,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo

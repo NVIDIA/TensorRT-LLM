@@ -12,15 +12,22 @@ copies the staged state back (``InforwardSnapshots.finish``).
 The staging rows (the requests per batch that can take the path, at most
 ``max_batch_size`` and ``_INFORWARD_SNAPSHOT_MAX_ROWS``, within
 ``_INFORWARD_SNAPSHOT_STAGING_BYTES``) are allocated after the pools, outside
-the GPU cache quota.
+the GPU cache quota. ``TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS`` (rows) and
+``TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB`` (MiB) override the two caps. Requests
+beyond the rows run their tails a step later. Every rank schedules on its own
+and the scheduler budgets split rows from these caps, so both must be set
+identically on every rank of a server.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -31,6 +38,22 @@ if TYPE_CHECKING:
 
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+_INFORWARD_SNAPSHOT_MAX_ROWS_ENV = "TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS"
+_INFORWARD_SNAPSHOT_STAGING_MIB_ENV = "TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB"
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """A positive int from the environment, or `default` when unset."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from err
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -45,7 +68,7 @@ class InforwardSnapshotEntry(NamedTuple):
 class InforwardSnapshots:
     """The staging rows and this step's plan of one GDN hybrid cache manager.
 
-    The manager (``Qwen35HybridCacheManager``) owns one instance and hands
+    The manager (an ``InforwardSnapshotHost``) owns one instance and hands
     itself to the methods that read its recurrent-state pools and caches.
     """
 
@@ -91,14 +114,11 @@ class InforwardSnapshots:
             and row_bytes > 0
         ):
             return 0, row_bytes
-        rows = max(
-            1,
-            min(
-                manager.max_batch_size,
-                _INFORWARD_SNAPSHOT_MAX_ROWS,
-                _INFORWARD_SNAPSHOT_STAGING_BYTES // row_bytes,
-            ),
+        max_rows = _env_positive_int(_INFORWARD_SNAPSHOT_MAX_ROWS_ENV, _INFORWARD_SNAPSHOT_MAX_ROWS)
+        staging_mib = _env_positive_int(
+            _INFORWARD_SNAPSHOT_STAGING_MIB_ENV, _INFORWARD_SNAPSHOT_STAGING_BYTES >> 20
         )
+        rows = max(1, min(manager.max_batch_size, max_rows, (staging_mib << 20) // row_bytes))
         return rows, row_bytes
 
     def setup(self, manager: MambaHybridCacheManagerV2) -> None:
@@ -175,18 +195,29 @@ class InforwardSnapshots:
         self.plan = plan
 
     def finish(
-        self, manager: MambaHybridCacheManagerV2, scheduled_batch: ScheduledRequests
+        self,
+        manager: MambaHybridCacheManagerV2,
+        scheduled_batch: ScheduledRequests,
+        extra_buffers: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
     ) -> None:
         """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
 
         Called on the execution stream right after the forward, so the copies
-        precede the batch's sampler event.
+        precede the batch's sampler event. One index_copy_ per staged buffer
+        covers every planned request.
+
+        Args:
+            manager: The owning cache manager.
+            scheduled_batch: The batch the plan was made for.
+            extra_buffers: (live pool ``[slots, ...]``, staging ``[rows, ...]``)
+                of other model state that shares the GDN slot, restored with the
+                SSM and conv states.
         """
         plan = self.plan
         if not plan:
             return
         self.plan = {}
-        dst, src = [], []
+        slots, rows = [], []
         for request in scheduled_batch.context_requests:
             entry = plan.get(request.py_request_id)
             kv_cache = manager.kv_cache_map.get(request.py_request_id)
@@ -219,13 +250,23 @@ class InforwardSnapshots:
                 raise RuntimeError(
                     f"In-forward Mamba snapshot: request {request.py_request_id} lost its live SSM slot"
                 )
-            dst += [state[slot] for state in manager.all_ssm_states]
-            dst += [state[slot] for state in manager.all_conv_states]
-            src += list(self._stage_ssm[:, entry.row].unbind(0))
-            src += list(self._stage_conv[:, entry.row].unbind(0))
-        if dst:
-            with torch.cuda.stream(manager._stream):
-                torch._foreach_copy_(dst, src, non_blocking=True)
+            slots.append(slot)
+            rows.append(entry.row)
+        if not slots:
+            return
+        # (live pool [slots, ...], staging [rows, ...]) of every buffer the snapshot staged.
+        buffers = list(zip(manager.all_ssm_states, self._stage_ssm.unbind(0)))
+        buffers += list(zip(manager.all_conv_states, self._stage_conv.unbind(0)))
+        buffers += extra_buffers
+        device = self._stage_ssm.device
+        with torch.cuda.stream(manager._stream):
+            slot_index = _host_slots_to_device(slots, device)
+            # Rows follow batch order, so they are usually 0..n-1 and a slice replaces the gather.
+            leading = rows == list(range(len(rows)))
+            row_index = None if leading else _host_slots_to_device(rows, device)
+            for pool, stage in buffers:
+                src = stage[: len(rows)] if leading else stage.index_select(0, row_index)
+                pool.index_copy_(0, slot_index, src)
 
     def shutdown(self) -> None:
         self.rows = 0
@@ -234,7 +275,81 @@ class InforwardSnapshots:
         self._stage_conv = None
 
 
+class InforwardSnapshotHost:
+    """The in-forward snapshot API of a hybrid cache manager whose GDN layers implement the split.
+
+    Mixed into a ``MambaHybridCacheManagerV2`` subclass, which creates
+    ``_inforward_snapshots`` before the base constructor and calls the hooks:
+    ``_setup_inforward_snapshots`` once its recurrent-state pools are bound,
+    ``_plan_inforward_snapshots`` in ``prepare_resources``, and
+    ``_inforward_snapshots.shutdown`` in ``shutdown``. The executor calls
+    ``finish_inforward_snapshots`` after the forward.
+    """
+
+    _inforward_snapshots: InforwardSnapshots
+    # Whether the model's recurrent layers implement the split; a manager may
+    # decide per instance.
+    _supports_inforward_snapshot = True
+
+    @property
+    def inforward_snapshot_rows(self) -> int:
+        """Staging rows per batch of the in-forward snapshots; 0 when the path does not apply."""
+        return self._inforward_snapshots.rows
+
+    @property
+    def inforward_snapshot_max_tail(self) -> int:
+        """The longest prompt tail an in-forward snapshot covers."""
+        return self._inforward_snapshots.max_tail
+
+    @property
+    def inforward_snapshot_min_main(self) -> int:
+        """The fewest chunk tokens before an in-forward snapshot point."""
+        return self._inforward_snapshots.min_main
+
+    @property
+    def inforward_snapshot_plan(self) -> dict[int, InforwardSnapshotEntry]:
+        """This step's in-forward snapshots by request id."""
+        return self._inforward_snapshots.plan
+
+    def inforward_snapshot_stage_views(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """A layer's staging rows: SSM ``[rows, H, V, K]`` and conv ``[rows, conv_dim, d_conv - 1]``."""
+        return self._inforward_snapshots.stage_views(self.mamba_layer_offsets[layer_idx])
+
+    def state_index(self, request_id: int) -> int:
+        """The live state slot of a request scheduled in this step."""
+        return self._request_id_to_state_index[request_id]
+
+    def finish_inforward_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
+        """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
+
+        Called on the execution stream right after the forward, so the copies
+        precede the batch's sampler event.
+        """
+        if self._inforward_snapshots.plan:
+            self._inforward_snapshots.finish(
+                self, scheduled_batch, self._inforward_extra_restore_buffers()
+            )
+
+    def _setup_inforward_snapshots(self) -> None:
+        """Allocate the staging rows when the model implements the split and the path applies."""
+        if self._supports_inforward_snapshot and self.local_num_mamba_layers > 0:
+            self._inforward_snapshots.setup(self)
+
+    def _plan_inforward_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
+        """Plan this step's in-forward snapshots from the scheduler's marks."""
+        if self.inforward_snapshot_rows > 0:
+            self._inforward_snapshots.plan_batch(scheduled_batch)
+
+    def _inforward_extra_restore_buffers(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """(live pool ``[slots, ...]``, staging ``[rows, ...]``) of model state that shares the GDN slot.
+
+        ``finish_inforward_snapshots`` restores these with the SSM and conv states; none by default.
+        """
+        return []
+
+
 __all__ = [
     "InforwardSnapshotEntry",
+    "InforwardSnapshotHost",
     "InforwardSnapshots",
 ]

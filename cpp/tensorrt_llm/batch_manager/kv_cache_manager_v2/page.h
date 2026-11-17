@@ -63,6 +63,8 @@ public:
     CacheLevel cacheLevel;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    //! Dedupes the pages of one batched call: the StorageManager::nextVisitStamp() of the last call that took it.
+    uint64_t visitStamp = 0;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

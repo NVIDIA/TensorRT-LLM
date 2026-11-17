@@ -1236,8 +1236,19 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         # Appended draft layers grow with every token like the target's pages.
         draft_layer_specs = kwargs.pop("layer_specs", None) or ()
         kwargs.pop("shared_draft_block_width", None)
-        slope, intercept = super().get_cache_size_per_token(model_config, mapping, **kwargs)
-        return slope + sum(layer.bytes_per_token() for layer in draft_layer_specs), intercept
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
+        # Every request also reserves room for the drafter's next block in the
+        # target's attention layers and in the draft layers: max_draft_len + 1
+        # tokens, enough for either DSpark slot convention.
+        spec_config = kwargs.get("spec_config")
+        draft_scratch_tokens = (
+            spec_config.max_draft_len + 1 if draft_layer_specs and spec_config is not None else 0
+        )
+        slope, intercept = super().get_cache_size_per_token(
+            model_config, mapping, draft_scratch_tokens=draft_scratch_tokens, **kwargs
+        )
+        intercept += kwargs["max_batch_size"] * draft_scratch_tokens * draft_slope
+        return slope + draft_slope, intercept
 
     @classmethod
     @override
