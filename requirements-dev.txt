@@ -78,7 +78,8 @@ opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
 rapidfuzz==3.14.5
-aiperf==0.8.0
+aiperf==0.8.0; python_version < "3.11"
+aiperf==0.13.0; python_version >= "3.11"
 nanobind>=2.9.0
 nixl-cu13==1.5.2
 cupti-python>=13.0,<13.5
