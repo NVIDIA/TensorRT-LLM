@@ -140,6 +140,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -249,6 +250,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_dspark.draft_is_embedded_in_target",
     "tensorrt_llm._torch.models.modeling_dflash.DFlashForCausalLM",
     "tensorrt_llm._torch.pyexecutor.config_utils.is_mla",
+    # The admission check that refuses media (`validate_multimodal_request_data`).
+    "tensorrt_llm.inputs.multimodal.has_media_or_embeddings",
 )
 
 # The K3 decode kernels' bounds: the token-count kernels take one tile of DECODE_MAX_TOKENS rows; the request-aware
@@ -3481,6 +3484,15 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         )
         self._step_checked = True
 
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
+            )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -3492,7 +3504,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        if kwargs.pop("multimodal_params", None):
+        multimodal_params = kwargs.pop("multimodal_params", None) or []
+        if any(
+            p is not None and has_media_or_embeddings(p.multimodal_data) for p in multimodal_params
+        ):
             raise ValueError(
                 "this Kimi K3 target is text only: it loads no vision tower, and a request carried image input"
             )

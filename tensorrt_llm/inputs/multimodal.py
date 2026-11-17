@@ -603,6 +603,19 @@ def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
         mm_data.pop(modality, None)
 
 
+def has_media_or_embeddings(mm_data: Optional[Dict[str, Any]]) -> bool:
+    """Whether a request's `multimodal_data` carries more than M-RoPE positions.
+
+    Media, precomputed embeddings and placeholder bookkeeping count. A payload
+    with only `mrope_config` (a disaggregated generation request, or a
+    text-only warmup request) does not. Any other non-None entry counts, also
+    one this function does not know, so a text-only model that refuses on it
+    fails closed.
+    """
+    return any(value is not None for key, value in (mm_data or {}).items()
+               if key != "mrope_config")
+
+
 @dataclass
 class MultimodalInput:
     """Per-logical-unit multimodal metadata for KV-cache hashing (C++ layer).

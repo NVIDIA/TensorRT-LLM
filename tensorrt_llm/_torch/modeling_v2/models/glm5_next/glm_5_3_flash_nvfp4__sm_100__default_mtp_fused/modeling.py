@@ -73,6 +73,7 @@ from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_T
 from tensorrt_llm._torch.speculative.spec_tail_kernels import strict_accept
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import async_tensor_h2d
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -138,6 +139,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.distributed.ops.allgather",
     "tensorrt_llm._torch.speculative.interface.INVALID_PROMPT_LOOKAHEAD_TOKEN",
     "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer_set_repeated_for_next_layer",
+    # The admission check that refuses media (`validate_multimodal_request_data`).
+    "tensorrt_llm.inputs.multimodal.has_media_or_embeddings",
 )
 
 
@@ -2468,3 +2471,12 @@ class ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(Glm5NextForCausalLM):
 
     def load_weights(self, weights: Any, weight_mapper: BaseWeightMapper | None = None) -> None:
         _weights.load(self, weights, weight_mapper)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
+            )

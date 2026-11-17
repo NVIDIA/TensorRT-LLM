@@ -85,7 +85,8 @@ fp32; `mtp_experts_to_nvfp4` requantizes a rank's window to NVFP4 after load.
 `load(model, weights)` fills every declared parameter once and asserts coverage both
 ways: every parameter written, and every checkpoint key consumed (a key read through a
 cut is consumed) or predicted by `expected_unconsumed` -- the experts outside this
-rank's windows, and the MTP module when there is no speculation.
+rank's windows, the MTP module when there is no speculation, and the vision tower, whose
+weights are a second table (`VISION_WEIGHTS`) that the tower module declares and loads.
 """
 
 import mmap
@@ -1239,7 +1240,277 @@ class Qwen4ExpDefaultWeights:
             src=lambda d, i: [(f"{_ngram_prefix(d.ple_layer)}.weight_scale", None)],
             layers=None,
         ),
-        # --- the vision tower: all bf16, replicated, one-to-one, no transform ---
+        # --- the MTP draft module, at layer index num_hidden_layers, only when live ---
+        #
+        # Structurally one more decoder layer of this architecture with a two-branch
+        # front end; every shape equals a trunk full-attention layer's (cut the same way)
+        # except the front end and the expert quantization (FP8 128x128 block scales, not
+        # NVFP4). Its keys carry no `{p}`: the module's prefix is not the trunk's.
+        W(
+            "mtp_pre_e_norm",
+            shape=lambda d: (d.hidden,),
+            src=f"{_MTP}.pre_fc_norm_embedding.weight",
+            layers=_mtp_only,
+        ),
+        # `[hc_count * hidden]`: the module's input is the trunk's four-stream residual.
+        W(
+            "mtp_pre_h_norm",
+            shape=lambda d: (d.stream,),
+            src=f"{_MTP}.pre_fc_norm_hidden.weight",
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc_e",
+            shape=lambda d: (d.hidden, d.hidden),
+            src=f"{_MTP}.fc_embedding.weight",
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc_h",
+            shape=lambda d: (d.hidden, d.hidden),
+            src=f"{_MTP}.fc_hidden.weight",
+            layers=_mtp_only,
+        ),
+        *(
+            w
+            for tag, module in _HC_MODULES
+            for w in _hyper_connection(
+                f"mtp_{tag}",
+                lambda name, m=module: f"{_MTP_LAYER}.{m}.{name}.weight",
+                _mtp_only,
+            )
+        ),
+        *_attn_in_separate("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
+        *_attn_out_and_norms("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
+        *_index_branch("mtp_", f"{_MTP_LAYER}.self_attn.indexer", _mtp_only),
+        W(
+            "mtp_router",
+            shape=lambda d: (d.num_experts, d.hidden),
+            src=f"{_MTP_LAYER}.mlp.gate.weight",
+            layers=_mtp_only,
+        ),
+        # e4m3 codes stored row-major with one fp32 scale per 128x128 weight block, the
+        # FC1 halves concatenated `[up ; gate]` on the row axis; this rank's window.
+        W(
+            "mtp_fc1_w",
+            shape=lambda d: (d.mtp_local_experts, 2 * d.moe_inter, d.hidden),
+            dtype=f8,
+            src=_experts(_mtp_mlp, "up_proj.weight", "gate_proj.weight", window=_mtp_window),
+            transform=_mtp_fc1_w,
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc1_s",
+            shape=lambda d: (
+                d.mtp_local_experts,
+                (2 * d.moe_inter) // FP8_BLOCK,
+                d.hidden // FP8_BLOCK,
+            ),
+            dtype=f32,
+            src=_experts(
+                _mtp_mlp,
+                "up_proj.weight_scale_inv",
+                "gate_proj.weight_scale_inv",
+                window=_mtp_window,
+            ),
+            transform=_mtp_fc1_s,
+            layers=_mtp_only,
+        ),
+        # FC2 needs no relayout at all: the checkpoint's `[hidden, I]` e4m3 block is
+        # exactly the operand.
+        W(
+            "mtp_fc2_w",
+            shape=lambda d: (d.mtp_local_experts, d.hidden, d.moe_inter),
+            dtype=f8,
+            src=_experts(_mtp_mlp, "down_proj.weight", window=_mtp_window),
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc2_s",
+            shape=lambda d: (
+                d.mtp_local_experts,
+                d.hidden // FP8_BLOCK,
+                d.moe_inter // FP8_BLOCK,
+            ),
+            dtype=f32,
+            src=_experts(_mtp_mlp, "down_proj.weight_scale_inv", window=_mtp_window),
+            transform=_mtp_fc2_s,
+            layers=_mtp_only,
+        ),
+        *_shared_expert("mtp_", _mtp_mlp, _mtp_only),
+        # The module's own stack-final mixer, which is its `shared_head`.
+        *_mixer("mtp_fhc", f"{_MTP}.hyper_connection_mixer", _mtp_only),
+    )
+
+    def dims(self, core) -> SimpleNamespace:
+        """This rank's dimension bundle, from the core's normalized text config, the
+        engine's `Mapping` and the core's engine choices."""
+        return rank_dims(
+            core.model_config.pretrained_config,
+            core.model_config.mapping,
+            mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
+            trunk_moe_backend=core.trunk_moe_backend,
+            moe_prefill_copy=core.moe_prefill_copy,
+            dtype=core.model_config.torch_dtype,
+        )
+
+    def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
+        """The checkpoint keys this rank predicts it leaves unread: the tensors of every
+        routed expert outside its window (its per-tensor scalars are read on every rank;
+        under the intermediate split the window is every expert, each read at this rank's
+        slice), and, with MTP live, the draft experts outside its draft window; with MTP off, the
+        whole `mtp.` subtree. The `model.visual.` subtree is always left: the vision tower
+        loads it with its own table (`VISION_WEIGHTS`), or nothing does with
+        `disable_mm_encoder`. The windows are enumerated from `d`, not read off the
+        checkpoint, so a key that belongs to a real weight can never land here."""
+        out = {k for k in keys if k.startswith(f"{_VISUAL}.")}
+        start, count = _trunk_window(d)
+        for i in range(d.num_layers):
+            for e in range(d.num_experts):
+                if not start <= e < start + count:
+                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS)
+        if not d.mtp_enabled:
+            return out | {k for k in keys if k.startswith(f"{_MTP}.")}
+        start, count = _mtp_window(d)
+        for e in range(d.num_experts):
+            if not start <= e < start + count:
+                out.update(f"{_mtp_mlp(None)}.experts.{e}.{t}" for t in _MTP_EXPERT_TENSORS)
+        return out
+
+    def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
+        """Allocate every weight the table declares, at this rank's share.
+
+        Meta-init intercepts `torch.empty` here -- real CUDA storage arrives
+        when the engine materializes the registry.
+        """
+        w = nn.ParameterDict()
+        for entry in self.WEIGHTS:
+            dtype = entry.dtype or d.dtype
+            for key, _, _ in self._targets(entry, d):
+                w[key] = nn.Parameter(
+                    torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
+                )
+        return w
+
+    def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None, str]]:
+        """`[(param key, layer index | None, checkpoint layer prefix), ...]`.
+
+        One place decides which parameters an entry declares, so `declare` and
+        `manifest` cannot disagree about whether a weight exists.
+        """
+        layers = entry.layer_indices(d)
+        if layers is None:
+            return [(entry.name, None, "")]
+        return [(f"l{i}_{entry.name}", i, f"{_LM}.layers.{i}") for i in layers]
+
+    def manifest(self, d: SimpleNamespace) -> dict[str, list[tuple]]:
+        """param key -> [(checkpoint key, index into the param | None, cut | None,
+        transform | None)]."""
+        rows: dict[str, list[tuple]] = {}
+        for entry in self.WEIGHTS:
+            for key, i, prefix in self._targets(entry, d):
+                rows[key] = [
+                    (ckpt, index, cut, entry.transform)
+                    for ckpt, index, cut in entry.sources(d, i, prefix)
+                ]
+        return rows
+
+    def read(self, weights, ckpt_key, cut, transform, d, device=None) -> torch.Tensor:
+        """One manifest source -> the tensor its destination receives.
+
+        Each key of the source is read through its cut -- only this rank's rows or
+        columns leave the checkpoint -- moved to `device`, and handed to `transform`.
+        The one path `load` takes, so the shard test drives it directly.
+        """
+        multi = isinstance(ckpt_key, tuple)
+        keys = ckpt_key if multi else (ckpt_key,)
+        cuts = (cut if cut is not None else (None,) * len(keys)) if multi else (cut,)
+        assert len(cuts) == len(keys), (ckpt_key, cut)
+        for key in keys:
+            assert key in weights, f"checkpoint key missing: {key}"
+        src_all = tuple(_read(weights[key], c) for key, c in zip(keys, cuts))
+        if device is not None:
+            src_all = tuple(t.to(device, non_blocking=True) for t in src_all)
+        if transform is not None:
+            return transform(src_all if multi else src_all[0], d)
+        assert len(src_all) == 1, "a multi-key row needs a transform"
+        return src_all[0]
+
+    def fill(self, weights, d, consumed: set, param, ckpt_key, index, cut, transform) -> None:
+        """Copy one manifest source into `param` (or its row `index`) and record the
+        checkpoint keys it read in `consumed`."""
+        dst = param.data if index is None else param.data[index]
+        # Materialize where the destination lives: the expert relayouts are row
+        # gathers and the scale swizzle is a kernel, both on the device.
+        src = self.read(weights, ckpt_key, cut, transform, d, dst.device)
+        assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
+        assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
+        dst.copy_(src, non_blocking=True)
+        consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
+
+    def load(self, model, weights) -> None:
+        """Fill every declared parameter. The n-gram table is declared here first, each
+        source is read through its cut, multi-key rows feed their transform several
+        tensors at once, and coverage is asserted in both directions."""
+        core = model.model
+        d = self.dims(core)
+        # The one load-time declaration, before the manifest is built: the table's
+        # height comes from the shards, and the manifest addresses it by row range.
+        rows_per_shard = _declare_ngram_table(core, d, weights)
+        manifest = self.manifest(d)
+        manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
+        consumed: set = set()
+
+        def fill(param: nn.Parameter, ckpt_key, index, cut, transform) -> None:
+            self.fill(weights, d, consumed, param, ckpt_key, index, cut, transform)
+
+        assert set(manifest.keys()) == set(core.w.keys()), (
+            "manifest/parameter drift",
+            set(manifest.keys()) ^ set(core.w.keys()),
+        )
+        for param_key, sources in manifest.items():
+            for ckpt_key, index, cut, transform in sources:
+                fill(core.w[param_key], ckpt_key, index, cut, transform)
+            if param_key.endswith(_RELEASE_AFTER):
+                torch.cuda.empty_cache()
+
+        # The shell owns lm_head (untied, bf16 on this checkpoint); read the rows it built
+        # (`lm_head_share`) and nothing else.
+        cut, pad = lm_head_share(model.lm_head.weight.shape[0], d.vocab, d.tp_rank)
+        assert tuple(model.lm_head.weight.shape[1:]) == (d.hidden,), (
+            f"the shell built lm_head {tuple(model.lm_head.weight.shape)}; this checkpoint's "
+            f"is a dense [{d.vocab}, {d.hidden}] weight"
+        )
+        fill(model.lm_head.weight, "lm_head.weight", None, cut, pad)
+        # Parameter-side coverage, the other direction: name every registered parameter
+        # outside the target's own ParameterDict instead of assuming lm_head is the only
+        # one.
+        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
+        assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
+
+        torch.cuda.synchronize()
+        leftover = set(weights.keys()) - consumed
+        expected = self.expected_unconsumed(d, weights.keys())
+        assert leftover == expected, (
+            "checkpoint coverage: leftover keys are not exactly this rank's off-window "
+            f"experts{'' if d.mtp_enabled else ', the MTP module'} and the vision tower; unexpected "
+            f"{sorted(leftover - expected)[:8]}, missed {sorted(expected - leftover)[:8]}"
+        )
+
+
+MODEL_WEIGHTS = Qwen4ExpDefaultWeights()
+
+
+class Qwen4ExpVisionWeights(Qwen4ExpDefaultWeights):
+    """The vision tower's weights: all bf16, replicated, one-to-one, no transform.
+
+    The same `declare`, `manifest`, `read` and `fill` passes over a table of its own, which
+    the tower module (`vision.VisionTower`) declares and loads, so the language model's table
+    holds no vision weight and `disable_mm_encoder` allocates none. Its dimension bundle is
+    `vision_dims`.
+    """
+
+    WEIGHTS: tuple[W, ...] = (
         W(
             "vis_patch_w",
             shape=lambda d: (d.v_hidden, d.v_channels, d.v_tpatch, d.v_patch, d.v_patch),
@@ -1367,260 +1638,29 @@ class Qwen4ExpDefaultWeights:
             src=_visual("merger.linear_fc2.bias"),
             layers=None,
         ),
-        # --- the MTP draft module, at layer index num_hidden_layers, only when live ---
-        #
-        # Structurally one more decoder layer of this architecture with a two-branch
-        # front end; every shape equals a trunk full-attention layer's (cut the same way)
-        # except the front end and the expert quantization (FP8 128x128 block scales, not
-        # NVFP4). Its keys carry no `{p}`: the module's prefix is not the trunk's.
-        W(
-            "mtp_pre_e_norm",
-            shape=lambda d: (d.hidden,),
-            src=f"{_MTP}.pre_fc_norm_embedding.weight",
-            layers=_mtp_only,
-        ),
-        # `[hc_count * hidden]`: the module's input is the trunk's four-stream residual.
-        W(
-            "mtp_pre_h_norm",
-            shape=lambda d: (d.stream,),
-            src=f"{_MTP}.pre_fc_norm_hidden.weight",
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc_e",
-            shape=lambda d: (d.hidden, d.hidden),
-            src=f"{_MTP}.fc_embedding.weight",
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc_h",
-            shape=lambda d: (d.hidden, d.hidden),
-            src=f"{_MTP}.fc_hidden.weight",
-            layers=_mtp_only,
-        ),
-        *(
-            w
-            for tag, module in _HC_MODULES
-            for w in _hyper_connection(
-                f"mtp_{tag}",
-                lambda name, m=module: f"{_MTP_LAYER}.{m}.{name}.weight",
-                _mtp_only,
-            )
-        ),
-        *_attn_in_separate("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
-        *_attn_out_and_norms("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
-        *_index_branch("mtp_", f"{_MTP_LAYER}.self_attn.indexer", _mtp_only),
-        W(
-            "mtp_router",
-            shape=lambda d: (d.num_experts, d.hidden),
-            src=f"{_MTP_LAYER}.mlp.gate.weight",
-            layers=_mtp_only,
-        ),
-        # e4m3 codes stored row-major with one fp32 scale per 128x128 weight block, the
-        # FC1 halves concatenated `[up ; gate]` on the row axis; this rank's window.
-        W(
-            "mtp_fc1_w",
-            shape=lambda d: (d.mtp_local_experts, 2 * d.moe_inter, d.hidden),
-            dtype=f8,
-            src=_experts(_mtp_mlp, "up_proj.weight", "gate_proj.weight", window=_mtp_window),
-            transform=_mtp_fc1_w,
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc1_s",
-            shape=lambda d: (
-                d.mtp_local_experts,
-                (2 * d.moe_inter) // FP8_BLOCK,
-                d.hidden // FP8_BLOCK,
-            ),
-            dtype=f32,
-            src=_experts(
-                _mtp_mlp,
-                "up_proj.weight_scale_inv",
-                "gate_proj.weight_scale_inv",
-                window=_mtp_window,
-            ),
-            transform=_mtp_fc1_s,
-            layers=_mtp_only,
-        ),
-        # FC2 needs no relayout at all: the checkpoint's `[hidden, I]` e4m3 block is
-        # exactly the operand.
-        W(
-            "mtp_fc2_w",
-            shape=lambda d: (d.mtp_local_experts, d.hidden, d.moe_inter),
-            dtype=f8,
-            src=_experts(_mtp_mlp, "down_proj.weight", window=_mtp_window),
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc2_s",
-            shape=lambda d: (
-                d.mtp_local_experts,
-                d.hidden // FP8_BLOCK,
-                d.moe_inter // FP8_BLOCK,
-            ),
-            dtype=f32,
-            src=_experts(_mtp_mlp, "down_proj.weight_scale_inv", window=_mtp_window),
-            transform=_mtp_fc2_s,
-            layers=_mtp_only,
-        ),
-        *_shared_expert("mtp_", _mtp_mlp, _mtp_only),
-        # The module's own stack-final mixer, which is its `shared_head`.
-        *_mixer("mtp_fhc", f"{_MTP}.hyper_connection_mixer", _mtp_only),
     )
 
-    def dims(self, core) -> SimpleNamespace:
-        """This rank's dimension bundle, from the core's normalized text config, the
-        composite's vision config (the core holds it as `vision_config` before it
-        declares anything), the engine's `Mapping` and the core's engine choices."""
-        return rank_dims(
-            core.model_config.pretrained_config,
-            core.vision_config,
-            core.model_config.mapping,
-            mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
-            trunk_moe_backend=core.trunk_moe_backend,
-            moe_prefill_copy=core.moe_prefill_copy,
-            dtype=core.model_config.torch_dtype,
-        )
-
-    def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
-        """The checkpoint keys this rank predicts it leaves unread: the tensors of every
-        routed expert outside its window (its per-tensor scalars are read on every rank;
-        under the intermediate split the window is every expert, each read at this rank's
-        slice), and, with MTP live, the draft experts outside its draft window; with MTP off, the
-        whole `mtp.` subtree. The windows are enumerated from `d`, not read off the
-        checkpoint, so a key that belongs to a real weight can never land here."""
-        out = set()
-        start, count = _trunk_window(d)
-        for i in range(d.num_layers):
-            for e in range(d.num_experts):
-                if not start <= e < start + count:
-                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS)
-        if not d.mtp_enabled:
-            return out | {k for k in keys if k.startswith(f"{_MTP}.")}
-        start, count = _mtp_window(d)
-        for e in range(d.num_experts):
-            if not start <= e < start + count:
-                out.update(f"{_mtp_mlp(None)}.experts.{e}.{t}" for t in _MTP_EXPERT_TENSORS)
-        return out
-
-    def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
-        """Allocate every weight the table declares, at this rank's share.
-
-        Meta-init intercepts `torch.empty` here -- real CUDA storage arrives
-        when the engine materializes the registry.
-        """
-        w = nn.ParameterDict()
-        for entry in self.WEIGHTS:
-            dtype = entry.dtype or d.dtype
-            for key, _, _ in self._targets(entry, d):
-                w[key] = nn.Parameter(
-                    torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
-                )
-        return w
-
-    def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None, str]]:
-        """`[(param key, layer index | None, checkpoint layer prefix), ...]`.
-
-        One place decides which parameters an entry declares, so `declare` and
-        `manifest` cannot disagree about whether a weight exists.
-        """
-        layers = entry.layer_indices(d)
-        if layers is None:
-            return [(entry.name, None, "")]
-        return [(f"l{i}_{entry.name}", i, f"{_LM}.layers.{i}") for i in layers]
-
-    def manifest(self, d: SimpleNamespace) -> dict[str, list[tuple]]:
-        """param key -> [(checkpoint key, index into the param | None, cut | None,
-        transform | None)]."""
-        rows: dict[str, list[tuple]] = {}
-        for entry in self.WEIGHTS:
-            for key, i, prefix in self._targets(entry, d):
-                rows[key] = [
-                    (ckpt, index, cut, entry.transform)
-                    for ckpt, index, cut in entry.sources(d, i, prefix)
-                ]
-        return rows
-
-    def read(self, weights, ckpt_key, cut, transform, d, device=None) -> torch.Tensor:
-        """One manifest source -> the tensor its destination receives.
-
-        Each key of the source is read through its cut -- only this rank's rows or
-        columns leave the checkpoint -- moved to `device`, and handed to `transform`.
-        The one path `load` takes, so the shard test drives it directly.
-        """
-        multi = isinstance(ckpt_key, tuple)
-        keys = ckpt_key if multi else (ckpt_key,)
-        cuts = (cut if cut is not None else (None,) * len(keys)) if multi else (cut,)
-        assert len(cuts) == len(keys), (ckpt_key, cut)
-        for key in keys:
-            assert key in weights, f"checkpoint key missing: {key}"
-        src_all = tuple(_read(weights[key], c) for key, c in zip(keys, cuts))
-        if device is not None:
-            src_all = tuple(t.to(device, non_blocking=True) for t in src_all)
-        if transform is not None:
-            return transform(src_all if multi else src_all[0], d)
-        assert len(src_all) == 1, "a multi-key row needs a transform"
-        return src_all[0]
-
-    def load(self, model, weights) -> None:
-        """Fill every declared parameter. The n-gram table is declared here first, each
-        source is read through its cut, multi-key rows feed their transform several
-        tensors at once, and coverage is asserted in both directions."""
-        core = model.model
-        d = self.dims(core)
-        # The one load-time declaration, before the manifest is built: the table's
-        # height comes from the shards, and the manifest addresses it by row range.
-        rows_per_shard = _declare_ngram_table(core, d, weights)
+    def load(self, tower, weights) -> None:
+        """Fill every parameter of `tower.w` and assert coverage both ways: every
+        parameter written, and every `model.visual.` checkpoint key read."""
+        d = tower.dims
         manifest = self.manifest(d)
-        manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
-        consumed: set = set()
-
-        def fill(param: nn.Parameter, ckpt_key, index, cut, transform) -> None:
-            dst = param.data if index is None else param.data[index]
-            # Materialize where the destination lives: the expert relayouts are row
-            # gathers and the scale swizzle is a kernel, both on the device.
-            src = self.read(weights, ckpt_key, cut, transform, d, dst.device)
-            assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
-            assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
-            dst.copy_(src, non_blocking=True)
-            consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
-
-        assert set(manifest.keys()) == set(core.w.keys()), (
+        assert set(manifest.keys()) == set(tower.w.keys()), (
             "manifest/parameter drift",
-            set(manifest.keys()) ^ set(core.w.keys()),
+            set(manifest.keys()) ^ set(tower.w.keys()),
         )
+        consumed: set = set()
         for param_key, sources in manifest.items():
-            for ckpt_key, index, cut, transform in sources:
-                fill(core.w[param_key], ckpt_key, index, cut, transform)
-            if param_key.endswith(_RELEASE_AFTER):
-                torch.cuda.empty_cache()
-
-        # The shell owns lm_head (untied, bf16 on this checkpoint); read the rows it built
-        # (`lm_head_share`) and nothing else.
-        cut, pad = lm_head_share(model.lm_head.weight.shape[0], d.vocab, d.tp_rank)
-        assert tuple(model.lm_head.weight.shape[1:]) == (d.hidden,), (
-            f"the shell built lm_head {tuple(model.lm_head.weight.shape)}; this checkpoint's "
-            f"is a dense [{d.vocab}, {d.hidden}] weight"
-        )
-        fill(model.lm_head.weight, "lm_head.weight", None, cut, pad)
-        # Parameter-side coverage, the other direction: name every registered parameter
-        # outside the target's own ParameterDict instead of assuming lm_head is the only
-        # one.
-        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
-        assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
-
-        torch.cuda.synchronize()
-        leftover = set(weights.keys()) - consumed
-        expected = self.expected_unconsumed(d, weights.keys())
-        assert leftover == expected, (
-            "checkpoint coverage: leftover keys are not exactly this rank's off-window "
-            f"experts{'' if d.mtp_enabled else ' and the MTP module'}; unexpected "
-            f"{sorted(leftover - expected)[:8]}, missed {sorted(expected - leftover)[:8]}"
+            for source in sources:
+                self.fill(weights, d, consumed, tower.w[param_key], *source)
+        visual = {k for k in weights.keys() if k.startswith(f"{_VISUAL}.")}
+        assert consumed == visual, (
+            "vision checkpoint coverage: unexpected "
+            f"{sorted(visual - consumed)[:8]}, missed {sorted(consumed - visual)[:8]}"
         )
 
 
-MODEL_WEIGHTS = Qwen4ExpDefaultWeights()
+VISION_WEIGHTS = Qwen4ExpVisionWeights()
 
 
 def _heads(total: int, ranks: int, rank: int) -> tuple[int, int]:
@@ -1634,7 +1674,6 @@ def _heads(total: int, ranks: int, rank: int) -> tuple[int, int]:
 
 def rank_dims(
     cfg,
-    vcfg,
     mapping,
     *,
     mtp_enabled: bool,
@@ -1646,7 +1685,6 @@ def rank_dims(
 
     Args:
         cfg: the engine-normalized text config (`Qwen4ExpTextConfig`).
-        vcfg: the composite's vision config.
         mapping: this rank's `Mapping`.
         mtp_enabled: whether the engine has a `speculative_config` (the MTP module is live).
         trunk_moe_backend: the routed backend the trunk runs, which picks the expert layout.
@@ -1694,7 +1732,6 @@ def rank_dims(
     expert_inter = -(-expert_inter_share // EXPERT_INTER_ALIGN) * EXPERT_INTER_ALIGN
 
     ngram_heads = cfg.heads_per_ngram * (cfg.ngram_size - 1)
-    v_hidden = vcfg.hidden_size
     return SimpleNamespace(
         num_layers=cfg.num_hidden_layers,
         is_attn=[t == "full_attention" for t in cfg.layer_types],
@@ -1755,7 +1792,22 @@ def rank_dims(
         ple_head_dim=cfg.ple_embed_dim // ngram_heads,
         ple_shards=cfg.split_ngram_parts,
         ple_table_dtype=PLE_TABLE_DTYPE,
-        # --- the vision tower ---
+        # --- engine choices ---
+        mtp_enabled=mtp_enabled,
+        trunk_moe_backend=trunk_moe_backend,
+        moe_prefill_copy=moe_prefill_copy,
+        dtype=dtype,
+    )
+
+
+def vision_dims(vcfg, dtype: torch.dtype) -> SimpleNamespace:
+    """The vision table's dimension bundle, from the composite's vision config. The tower
+    is replicated, so every rank declares it whole. `hidden` is the merger's output width,
+    the text hidden size of the rows it replaces."""
+    v_hidden = vcfg.hidden_size
+    return SimpleNamespace(
+        hidden=vcfg.out_hidden_size,
+        dtype=dtype,
         v_depth=vcfg.depth,
         v_hidden=v_hidden,
         v_inter=vcfg.intermediate_size,
@@ -1764,11 +1816,6 @@ def rank_dims(
         v_patch=vcfg.patch_size,
         v_pos_rows=vcfg.num_position_embeddings,
         v_merge_dim=v_hidden * vcfg.spatial_merge_size * vcfg.spatial_merge_size,
-        # --- engine choices ---
-        mtp_enabled=mtp_enabled,
-        trunk_moe_backend=trunk_moe_backend,
-        moe_prefill_copy=moe_prefill_copy,
-        dtype=dtype,
     )
 
 

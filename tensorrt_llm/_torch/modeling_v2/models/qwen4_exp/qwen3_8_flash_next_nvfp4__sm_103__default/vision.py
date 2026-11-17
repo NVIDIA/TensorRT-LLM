@@ -10,9 +10,11 @@ media of the requests it serves -- under attention TP every rank the whole batch
 the same rows back, since every op is a deterministic function of its operands; under
 attention DP a rank its own requests'.
 
-The shell calls `multimodal_embeds` on every step, before the core's `begin_step`, and the
-executor calls `validate_request` on every new request. Neither runs inside a captured
-graph: the tower is eager and reads the request's grid on the host.
+The tower is the multimodal wrapper's `mm_encoder`. The wrapper's encoder hook calls
+`encode` per request, through the shared multimodal mixin, which caches the rows and keeps
+the chunk's; the language model splices them in its own prefill step. The wrapper's
+`validate_request` calls `validate_request` here on every new request. Neither runs inside a
+captured graph: the tower is eager and reads the request's grid on the host.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
@@ -36,7 +39,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
+
+from . import weights as _weights
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
 VISION_ROPE_THETA = 10000.0
@@ -292,12 +298,12 @@ def _rope_tables(
     return angles.cos().contiguous(), angles.sin().contiguous()
 
 
-class VisionTower:
+class VisionTower(nn.Module, MultimodalEncoderMixin):
     """One request's images or videos through the 27-block ViT and its patch merger.
 
-    Not a target: runs only for a context request carrying media, from the shell, before
-    the step. Attention is bidirectional per frame (a video's frame group is a frame),
-    expressed to `thop_attention` as one context "sequence" per frame; running the rows as
+    Not a target: the multimodal wrapper's encoder, run only for a context request carrying
+    media, before the step. Attention is bidirectional per frame (a video's frame group is a
+    frame), expressed to `thop_attention` as one context "sequence" per frame; running the rows as
     one sequence is far outside tolerance. The position-embedding interpolation and the 2-D
     rope both emit in spatial-merge order (what the merger's 4-to-1 reshape consumes); a
     raster-order emitter gives a correctly shaped, silently wrong tower.
@@ -306,11 +312,15 @@ class VisionTower:
     frames: attention is per frame, the position embedding and rope are per grid row and
     repeat per frame, the norms and MLPs are row-wise, and a frame's `h * w` is a multiple
     of `merge**2`, so a cut keeps every merger block whole. One frame past the bound cannot
-    be served; `validate_request` refuses it at admission."""
+    be served; `validate_request` refuses it at admission.
 
-    def __init__(self, w: dict, vision_config) -> None:
-        """`w` is the core's weight table after load; `vision_config` the composite
-        config's vision half, which `check_deployment` matched against this checkpoint's."""
+    The tower declares and loads its own weights (`weights.VISION_WEIGHTS`), so a model
+    built without it (`disable_mm_encoder`) allocates no vision weight."""
+
+    def __init__(self, vision_config, dtype: torch.dtype) -> None:
+        """`vision_config` is the composite config's vision half, which `check_deployment`
+        matched against this checkpoint's; `dtype` the activation dtype the tower runs at."""
+        super().__init__()
         vcfg = vision_config
         self.depth = vcfg.depth
         self.hidden = vcfg.hidden_size
@@ -324,11 +334,31 @@ class VisionTower:
         self.merge_dim = self.hidden * self.merge * self.merge
         # The position table is a square grid of this side.
         self.grid_side = math.isqrt(vcfg.num_position_embeddings)
-        self.dtype = w["embed"].dtype
-        self._w = _vision_views(w, self.depth)
+        self.dtype = dtype
+        # Every weight, declared here (meta-init intercepts `torch.empty`) and filled by
+        # `load_weights`; the views the ops read are built after load.
+        self.dims = _weights.vision_dims(vcfg, dtype)
+        self.w = _weights.VISION_WEIGHTS.declare(self.dims)
+        self._w: _VisionWeights | None = None
         # Persistent scratch: `thop_attention` grows `workspace` in place; never the
         # engine's own workspace.
         self._ws: torch.Tensor | None = None
+
+    def setup_attn_metadata(self, max_num_tokens: int, attention_metadata_capacity=None) -> None:
+        """No engine-built attention metadata: every tower call builds its own encoder-only
+        attention arguments from its frames (`_run`)."""
+
+    def load_weights(self, weights) -> None:
+        """Fill the tower's weights from the checkpoint's `model.visual.` keys."""
+        _weights.VISION_WEIGHTS.load(self, weights)
+
+    def post_load_weights(self) -> None:
+        """Build the views the ops read, then warm the kernels up; once, though the
+        engine's post-load walk may reach this module more than once."""
+        if self._w is not None:
+            return
+        self._w = _vision_views(self.w, self.depth)
+        self.warm_up()
 
     def warm_up(self) -> None:
         """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
@@ -340,7 +370,7 @@ class VisionTower:
             rows = sum(t * h * w for t, h, w in grid)
             self._run(torch.zeros(rows, self.pixel_width, dtype=self.dtype, device=device), grid)
 
-    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """`pixel_values` is `[sum(t*h*w), in_channels*kt*kh*kw]`, one flat patch per row,
         channel-slowest. `grid_thw` is one `(frames, height, width)` row per image or video
         and stays on the host (no synchronization). Returns
@@ -458,81 +488,25 @@ class VisionTower:
         return cublas_mm(gelu_erf(cublas_mm(merged, V.m_fc1, V.m_fc1_b)), V.m_fc2, V.m_fc2_b)
 
 
-# ------------------------------------------------------------ the shell's side ---
+# ------------------------------------------------------------ the encoder hook ---
 
 
-def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
-    """Run the vision tower for this batch; returns `(rows, mm_token_indices)` (the tower's
-    `[R, hidden]` rows in packed-batch order and the `[R]` placeholder rows they replace,
-    which the prefill target splices into its embedding), or None when the step carries no
-    media.
+def encode(tower: VisionTower, params) -> torch.Tensor:
+    """One request's tower rows, one per placeholder of the whole request, in prompt order.
 
-    Called by the shell, because the inherited `DecoderModelForCausalLM.forward` drops
-    `multimodal_params` from `**kwargs` on the no-speculation path. Host-side bookkeeping:
-    `multimodal_params` is a subset of the context requests, so never zip it positionally;
-    `multimodal_runtime` (chunked prefill / KV reuse only) gives the cached and in-chunk row
-    counts over the request's images and videos together, in prompt order; `mm_token_indices`
-    names every placeholder row.
-
-    The tower runs once per modality a request carries, and `in_prompt_order` merges the
-    two outputs. Positions are not derived here: every coordinate of a vision span, a
-    video's temporal one included, is in the payload's `mrope_config.mrope_position_ids`,
-    which the engine slices into `position_ids`."""
-    mm_params = kwargs.get("multimodal_params") or []
-    if not mm_params:
-        return None
-    rows = []
-    for params in mm_params:
-        data = getattr(params, "multimodal_data", None) or {}
-        image, video = data.get("image"), data.get("video")
-        if image is None and video is None:
-            continue
-        mrope_ids = (data.get("mrope_config") or {}).get("mrope_position_ids")
-        assert (
-            mrope_ids is not None and mrope_ids.dim() == 3 and mrope_ids.shape[0] == _POSITION_AXES
-        ), (
-            f"a media request needs mrope_config.mrope_position_ids of shape "
-            f"[{_POSITION_AXES}, 1, L]; got {None if mrope_ids is None else tuple(mrope_ids.shape)}"
-        )
-        runtime = getattr(params, "multimodal_runtime", None)
-        if runtime is not None and int(runtime.num_mm_tokens_in_chunk) == 0:
-            # Every placeholder row of this request lies in another chunk.
-            continue
-        assert tower is not None, "post_load_weights builds the vision tower before any step"
-        towers = {}
-        if image is not None:
-            towers["image"] = run_tower(tower, image, *MEDIA_KEYS["image"])
-        if video is not None:
-            towers["video"] = run_tower(tower, video, *MEDIA_KEYS["video"])
-        embeds = in_prompt_order(tower.merge, params, towers)
-        if runtime is not None:
-            # Chunked prefill or reused prefix: splice only this chunk's slice.
-            start = int(runtime.num_cached_mm_tokens)
-            count = int(runtime.num_mm_tokens_in_chunk)
-            total = embeds.shape[0]
-            assert int(runtime.total_embeds_in_request) == total, (
-                f"the executor counted {runtime.total_embeds_in_request} placeholder rows for "
-                f"this request and the tower produced {total} over its {sorted(towers)}; the "
-                "two are derived from the same grids and a disagreement means the merger's "
-                "row count is wrong"
-            )
-            assert 0 <= start <= start + count <= total, (start, count, total)
-            embeds = embeds[start : start + count]
-        rows.append(embeds)
-    if not rows:
-        return None
-    vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
-    mm_token_indices = kwargs.get("mm_token_indices")
-    assert mm_token_indices is not None, (
-        "the executor shipped multimodal params but no mm_token_indices; that pairing is what "
-        "the shell's `multimodal_token_ids` buys, and without it there is no sync-free way to "
-        "find the placeholder rows"
-    )
-    assert mm_token_indices.shape[0] == vision.shape[0], (
-        f"the batch has {mm_token_indices.shape[0]} placeholder rows and the tower produced "
-        f"{vision.shape[0]} embedding rows"
-    )
-    return vision, mm_token_indices
+    The tower runs once per modality the request carries, and `in_prompt_order` merges the
+    outputs. No chunk slice: the multimodal mixin keeps the rows of the current chunk. No
+    position check either: positions are not derived here (every coordinate of a vision span
+    is in `mrope_config.mrope_position_ids`, which admission checks), and the engine's memory
+    profiling hands the encoder a dummy request without them."""
+    data = params.multimodal_data
+    towers = {
+        modality: run_tower(tower, data[modality], *keys)
+        for modality, keys in MEDIA_KEYS.items()
+        if data.get(modality) is not None
+    }
+    assert towers, f"the multimodal payload carries {sorted(data)} and no image or video"
+    return in_prompt_order(tower.merge, params, towers)
 
 
 def run_tower(tower, media: dict, pixel_key: str, grid_key: str):

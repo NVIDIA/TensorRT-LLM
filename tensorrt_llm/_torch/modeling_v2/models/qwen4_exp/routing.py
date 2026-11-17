@@ -6,7 +6,8 @@ Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__de
 of the layouts in `_LAYOUTS`, with one-model MTP-Eagle (not at dep2) or no speculative
 decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
 does not run, so `auto` falls back to the built-in implementation instead of failing in the
-build.
+build. The routed class is the target's multimodal wrapper, which holds its language model
+and its vision tower.
 """
 
 from __future__ import annotations
@@ -92,7 +93,8 @@ def route(
         )
     from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
         ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+        ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration,
     )
 
     ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
-    return ModelingV2Qwen38FlashNextNvfp4Sm103Default
+    return ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration

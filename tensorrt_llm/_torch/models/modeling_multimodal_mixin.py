@@ -28,6 +28,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -58,6 +59,7 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .multimodal import EncoderParallelMode, SupportsMultimodal, get_multimodal_data_device_paths
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -407,8 +409,8 @@ class EncoderCachePartition:
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
-    Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
-    language-model delegation.
+    Implements ``SupportsMultimodal``. Concrete model forwards can call
+    `prepare_multimodal_inputs` while keeping their explicit language-model delegation.
 
     Current limitations:
 
@@ -423,6 +425,9 @@ class MultimodalModelMixin:
 
     supports_vision_gpu_normalize: ClassVar[bool] = False
     """Whether the model accepts processor-described raw vision pixels."""
+
+    supports_multimodal: ClassVar[Literal[True]] = True
+    """Opt in to the shared model contract without requiring mixin inheritance."""
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
@@ -439,9 +444,33 @@ class MultimodalModelMixin:
     supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]] = {}
     """Public backends by logical encoder; an empty set marks fixed attention."""
 
+    support_mm_disagg: ClassVar[bool] = False
+    """Set by ``supports_multimodal_disagg`` after validating the processor hook."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
-    _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
+    encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
+    """Set by the executor to time encoder calls; `_run_multimodal_encoder` enters it."""
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        """Return supported parallel modes for each enabled logical encoder.
+
+        An empty mapping leaves explicit encoder parallelism unsupported. Implementations
+        inspect the checkpoint config without constructing weights.
+        """
+        return {}
+
+    @property
+    def multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """Expose the existing model-owned encoder cache without transferring ownership."""
+        return self._multimodal_encoder_cache
+
+    def initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
+        """Initialize the encoder output cache through the existing implementation hook."""
+        return self._initialize_multimodal_encoder_cache(max_bytes)
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -496,9 +525,9 @@ class MultimodalModelMixin:
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
         """Run encoder work with optional runtime instrumentation after H2D."""
-        if self._encoder_forward_context is None:
+        if self.encoder_forward_context is None:
             return self.encode_multimodal_inputs(multimodal_params)
-        with self._encoder_forward_context():
+        with self.encoder_forward_context():
             return self.encode_multimodal_inputs(multimodal_params)
 
     def prepare_multimodal_encoder_inputs(
@@ -1051,8 +1080,7 @@ class MultimodalModelMixin:
                 sliced[key] = [value[i] for i in item_indices]
         return sliced
 
-    # A future optional mixin-owned forward can build on the same template method.
-    def prepare_multimodal_inputs(
+    def prepare_multimodal_rows(
         self,
         *,
         input_ids: torch.Tensor,
@@ -1060,12 +1088,15 @@ class MultimodalModelMixin:
         multimodal_params: Optional[Sequence[MultimodalParams]],
         num_context_requests: int,
         **forward_kwargs: Any,
-    ) -> PreparedLlmInputs:
-        """Prepare multimodal inputs for a concrete model forward.
+    ) -> Optional[tuple[torch.Tensor, list[torch.Tensor], Sequence[torch.Tensor]]]:
+        """Return this step's multimodal rows, before any fusion.
 
-        This method owns the common framework sequence around a model-specific
-        encoder hook: retrieve/cache embeddings, select active chunk rows if
-        needed, run optional model hooks, and fuse rows into text embeds.
+        Selects the params, retrieves or encodes their embeddings, runs the two
+        embedding hooks and keeps the rows of this chunk. Returns
+        ``(input_ids, active_embeddings, extra_embeds)``, or None when the step
+        has no multimodal params. A model whose language model places the rows
+        itself (for example at the step's ``mm_token_indices``) calls this
+        instead of `prepare_multimodal_inputs`.
         """
         context_params = list(
             self.select_multimodal_params(
@@ -1074,7 +1105,7 @@ class MultimodalModelMixin:
             )
         )
         if not context_params:
-            return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
+            return None
 
         embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
@@ -1091,6 +1122,35 @@ class MultimodalModelMixin:
             multimodal_params=context_params,
             **forward_kwargs,
         )
+        return input_ids, active_embeddings, extra_embeds
+
+    # A future optional mixin-owned forward can build on the same template method.
+    def prepare_multimodal_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: Optional[torch.Tensor],
+        multimodal_params: Optional[Sequence[MultimodalParams]],
+        num_context_requests: int,
+        **forward_kwargs: Any,
+    ) -> PreparedLlmInputs:
+        """Prepare multimodal inputs for a concrete model forward.
+
+        This method owns the common framework sequence around a model-specific
+        encoder hook: retrieve/cache embeddings, select active chunk rows if
+        needed, run optional model hooks (`prepare_multimodal_rows`), and fuse
+        rows into text embeds.
+        """
+        rows = self.prepare_multimodal_rows(
+            input_ids=input_ids,
+            positions=positions,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            **forward_kwargs,
+        )
+        if rows is None:
+            return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
+        input_ids, active_embeddings, extra_embeds = rows
 
         fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
             input_ids=input_ids,
@@ -1742,7 +1802,7 @@ def _dispatch_cross_iter_prefetch(
                     "multimodal_data",
                     "cuda",
                     pin_memory=prefer_pinned(),
-                    target_keywords=getattr(model, "multimodal_data_device_paths", None),
+                    target_keywords=get_multimodal_data_device_paths(model),
                 )
             # `to_device` may replace `multimodal_data` with a new dict; reattach
             # the (possibly new) dict to each request so the next iteration's
@@ -1850,3 +1910,8 @@ def maybe_prefetch_mm_encoder_for_next_iter(
         return 0
     _dispatch_cross_iter_prefetch(model, candidates, aux_stream)
     return len(candidates)
+
+
+if TYPE_CHECKING:
+    # Check the shared implementation without imposing Protocol inheritance at runtime.
+    _model_contract: SupportsMultimodal = MultimodalModelMixin()

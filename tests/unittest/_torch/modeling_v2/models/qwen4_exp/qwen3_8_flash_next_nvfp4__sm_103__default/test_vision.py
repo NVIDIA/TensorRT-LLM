@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The default target's vision path on the CPU: the tower's weights, its calls and angle table,
-the splice's bookkeeping and the admission check.
+the encoder hook's bookkeeping and the admission check.
 
-The tower is built over the weight table's own `vis_*` declarations on the meta device, so
-what it reads is what `weights.py` declares. Its per-call body is a stub where a test needs one
-(the vision ops need a GPU), and so is the whole tower where the shell's bookkeeping is under
-test: every row of a stub tower names the item it came from, so the modality dispatch, item
-metadata, chunk slice, frame grouping and the order of concatenated calls run with no engine.
+The tower is built over its own `vis_*` table on the meta device, so what it reads is what
+`weights.py` declares. Its per-call body is a stub where a test needs one (the vision ops need
+a GPU), and so is the whole tower where the encoder hook's bookkeeping is under test: every row
+of a stub tower names the item it came from, so the modality dispatch, item metadata, frame
+grouping and the order of concatenated calls run with no engine. The chunk slice is the
+multimodal mixin's (`test_multimodal_wrapper.py`).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.configs import Qwen4ExpVisionConfig
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
@@ -23,9 +25,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     vision as V,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
-    weights as W,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -35,7 +34,7 @@ from tensorrt_llm.inputs.multimodal import (
 
 pytestmark = pytest.mark.cpu_only
 
-Shell = M.ModelingV2Qwen38FlashNextNvfp4Sm103Default
+Wrapper = M.ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration
 
 # Qwen3.8-Flash-Next's vision config.
 _VISION = dict(
@@ -57,28 +56,12 @@ HIDDEN_OUT = 2560
 
 
 def _tower_over_the_weight_table() -> V.VisionTower:
-    """The tower over every `vis_*` weight the table declares, at the checkpoint's shapes,
-    on meta; `embed` stands in for the activation dtype the tower reads off it."""
-    vcfg = Qwen4ExpVisionConfig(**_VISION)
-    d = SimpleNamespace(
-        hidden=HIDDEN_OUT,
-        dtype=torch.bfloat16,
-        v_depth=vcfg.depth,
-        v_hidden=vcfg.hidden_size,
-        v_inter=vcfg.intermediate_size,
-        v_channels=vcfg.in_channels,
-        v_tpatch=vcfg.temporal_patch_size,
-        v_patch=vcfg.patch_size,
-        v_pos_rows=vcfg.num_position_embeddings,
-        v_merge_dim=vcfg.hidden_size * vcfg.spatial_merge_size**2,
-    )
-    w = {"embed": torch.empty(8, HIDDEN_OUT, dtype=torch.bfloat16, device="meta")}
-    for entry in W.MODEL_WEIGHTS.WEIGHTS:
-        if not entry.name.startswith("vis_"):
-            continue
-        for key, _, _ in W.MODEL_WEIGHTS._targets(entry, d):
-            w[key] = torch.empty(*entry.shape(d), dtype=entry.dtype or d.dtype, device="meta")
-    return V.VisionTower(w, vcfg)
+    """The tower at the checkpoint's shapes, on meta: it declares its own `vis_*` table
+    (`weights.VISION_WEIGHTS`), and the views are what `post_load_weights` builds."""
+    with torch.device("meta"):
+        tower = V.VisionTower(Qwen4ExpVisionConfig(**_VISION), torch.bfloat16)
+    tower._w = V._vision_views(tower.w, tower.depth)
+    return tower
 
 
 def test_the_tower_reads_the_weight_tables_vision_rows_at_the_ops_layouts():
@@ -212,6 +195,7 @@ def _stub_tower(monkeypatch, cap):
     the request."""
     monkeypatch.setattr(V, "VISION_CALL_MAX_PATCHES", cap)
     tower = object.__new__(V.VisionTower)
+    nn.Module.__init__(tower)
     tower.dtype = torch.float32
     tower.pixel_width = PIXEL_WIDTH
     tower.merge = MERGE
@@ -315,16 +299,10 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
 
 
 def _splice(tower, params, num_rows, padding=0):
-    """The tower's rows spliced, as the prefill target's break does, over a prompt whose
-    tokens 1..num_rows are the placeholders and which `padding` rows follow; returns the rows
-    that landed there, one value per row, or None when the step carries no media."""
-    kwargs = {
-        "multimodal_params": [params],
-        "mm_token_indices": torch.arange(1, 1 + num_rows, dtype=torch.int64),
-    }
-    vision = V.multimodal_embeds(tower, kwargs)
-    if vision is None:
-        return None
+    """The encoder hook's rows spliced, as the prefill target's break does, over a prompt
+    whose tokens 1..num_rows are the placeholders and which `padding` rows follow; returns the
+    rows that landed there, one value per row."""
+    vision = (V.encode(tower, params), torch.arange(1, 1 + num_rows, dtype=torch.int64))
     total = num_rows + 2
     h = torch.full((total + padding, HIDDEN), -1.0)
     target = SimpleNamespace(_step=SimpleNamespace(vision=vision, num_tokens=total))
@@ -343,13 +321,6 @@ VIDEOS = [(2, 2, 4), (2, 4, 4)]
 IMAGES = [(1, 4, 4), (1, 2, 2)]
 MIXED_ORDER = [_item("video", 0), _item("image", 0), _item("video", 1), _item("image", 1)]
 MIXED_ROWS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
-
-
-def test_a_text_step_runs_no_tower():
-    assert V.multimodal_embeds(None, {}) is None
-    assert V.multimodal_embeds(None, {"multimodal_params": []}) is None
-    # Position ids alone (a text prompt through a multimodal processor) are not media.
-    assert V.multimodal_embeds(None, {"multimodal_params": [_params()]}) is None
 
 
 def test_the_splice_fills_the_placeholders_and_zeroes_the_padding():
@@ -382,47 +353,20 @@ def test_a_mixed_request_needs_its_manifest():
         _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_ROWS))
 
 
-def test_a_chunk_takes_its_slice_of_the_prompt_order_rows():
-    runtime = SimpleNamespace(
-        num_cached_mm_tokens=3, num_mm_tokens_in_chunk=6, total_embeds_in_request=len(MIXED_ROWS)
-    )
-    params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER, runtime=runtime)
-    assert _splice(_Tower(), params, 6) == MIXED_ROWS[3:9]
-
-
-def test_a_chunk_without_placeholders_skips_the_tower():
-    runtime = SimpleNamespace(
-        num_cached_mm_tokens=len(MIXED_ROWS),
-        num_mm_tokens_in_chunk=0,
-        total_embeds_in_request=len(MIXED_ROWS),
-    )
-    tower = _Tower()
-    params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER, runtime=runtime)
-    assert _splice(tower, params, 0) is None
-    assert tower.calls == 0
-
-
-def test_a_media_request_needs_the_processors_position_ids():
-    with pytest.raises(AssertionError, match="mrope_position_ids"):
-        _splice(_Tower(), _params(video=VIDEOS, mrope=False), 12)
-
-
-def test_the_placeholder_rows_must_match_the_towers_rows():
-    kwargs = {
-        "multimodal_params": [_params(image=IMAGES)],
-        "mm_token_indices": torch.arange(4, dtype=torch.int64),
-    }
-    with pytest.raises(AssertionError, match="4 placeholder rows and the tower produced 5"):
-        V.multimodal_embeds(_Tower(), kwargs)
+def test_the_encoder_hook_needs_no_position_ids():
+    """The engine's memory profiling hands the encoder a dummy image with no position ids;
+    admission checks them for a real request."""
+    assert _splice(_Tower(), _params(image=IMAGES, mrope=False), 5) == [100.0] * 4 + [101.0]
 
 
 def test_the_grids_stay_on_the_host():
     """The executor moves only the pixels and the position ids; the grids the tower and the
     admission check read on the host stay there."""
-    paths = Shell.multimodal_data_device_paths.fget(None)
+    paths = Wrapper.multimodal_data_device_paths.fget(None)
     assert set(paths) == {
         "image.pixel_values",
         "video.pixel_values_videos",
+        "multimodal_embedding",
         "mrope_config.mrope_position_ids",
         "mrope_config.mrope_position_deltas",
     }
@@ -471,8 +415,8 @@ def _request(image=None, video=None, order=None, **overrides):
 
 
 def _admit(request):
-    """Through the shell's own hook, as the executor calls it."""
-    Shell.validate_request(SimpleNamespace(vision_tower=_GEOMETRY), request)
+    """The tower's admission check, which the wrapper's `validate_request` calls."""
+    V.validate_request(_GEOMETRY, request)
 
 
 def test_clean_requests_are_admitted():

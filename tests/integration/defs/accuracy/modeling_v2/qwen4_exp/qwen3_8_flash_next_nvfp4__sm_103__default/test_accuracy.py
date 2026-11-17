@@ -460,10 +460,12 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
     MTP3 = MTPDecodingConfig(max_draft_len=3)
     ENGINE_MTP = dict(ENGINE, max_seq_len=16384)
 
-    # The breakable prefill CUDA graph, up to max_num_tokens.
+    # The breakable prefill CUDA graph, up to max_num_tokens. A model with a vision tower
+    # refuses it at startup, so these text-only cases build none.
     BREAKABLE_PREFILL = dict(
         prefill_cuda_graph_backend="breakable",
         prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
+        disable_mm_encoder=True,
     )
 
     # The pass keys' acceptance-length floor in references/acceptance_length.yaml.
@@ -514,10 +516,12 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         moe_config=MOE,
     )
 
-    # These buckets cover the prompts of `test_tp1_breakable_prefill_matches_eager`.
+    # These buckets cover the prompts of `test_tp1_breakable_prefill_matches_eager`. As
+    # above, without a vision tower.
     TP1_BREAKABLE_PREFILL = dict(
         prefill_cuda_graph_backend="breakable",
         prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 3072],
+        disable_mm_encoder=True,
     )
 
     # One draft, and the longest the target runs.
@@ -1042,7 +1046,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
 
         replays.clear()
         eager_single, _, eager_answers, eager_long_tokens = run(
-            dict(self.TP1_ENGINE, max_num_tokens=3072)
+            dict(self.TP1_ENGINE, max_num_tokens=3072, disable_mm_encoder=True)
         )
         assert not replays, replays
 

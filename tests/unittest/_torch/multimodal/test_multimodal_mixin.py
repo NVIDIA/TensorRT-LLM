@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
+from tensorrt_llm._torch.models.multimodal import SupportsMultimodal, is_multimodal_model
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -34,6 +35,61 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+
+@pytest.mark.cpu_only
+def test_model_contract_detection_does_not_evaluate_encoder_properties() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    # The default embedding properties raise: capability detection must not read them.
+    assert is_multimodal_model(model)
+    text_model = torch.nn.Module()
+    text_model.supports_encoder_cache = True
+    assert not is_multimodal_model(text_model)
+
+
+@pytest.mark.cpu_only
+def test_model_contract_defaults_do_not_enable_optional_features() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    config = ModelConfig()
+    assert not model.supports_encoder_cache
+    assert not model.supports_mm_encoder_item_scheduling
+    assert model.supported_encoder_attention_backends == {}
+    assert not model.support_mm_disagg
+    assert not model.supports_vision_gpu_normalize
+    assert model.encoder_forward_context is None
+    assert model.get_multimodal_encoder_parallel_modes(config) == {}
+
+
+@pytest.mark.cpu_only
+def test_model_contract_cache_preserves_existing_implementation_hook() -> None:
+    model = MultimodalModelMixin()
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+    contract: SupportsMultimodal = model
+    with patch.object(
+        model,
+        "_initialize_multimodal_encoder_cache",
+        wraps=model._initialize_multimodal_encoder_cache,
+    ) as initialize:
+        cache = contract.initialize_multimodal_encoder_cache(1024)
+    initialize.assert_called_once_with(1024)
+    assert contract.multimodal_encoder_cache is cache
+    assert model._multimodal_encoder_cache is cache
+    assert contract.initialize_multimodal_encoder_cache(1024) is cache
+
+
+@pytest.mark.cpu_only
+def test_mixin_defines_every_model_contract_member() -> None:
+    # CI type checking does not compare the mixin with the Protocol, so compare the names.
+    members = set(SupportsMultimodal.__annotations__) | {
+        name for name in vars(SupportsMultimodal) if not name.startswith("_")
+    }
+    missing = [
+        name
+        for name in sorted(members)
+        if not hasattr(MultimodalModelMixin, name)
+        and name not in MultimodalModelMixin.__annotations__
+    ]
+    assert not missing
 
 
 def make_embedding(
@@ -274,6 +330,66 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
 
 
+@pytest.mark.cpu_only
+def test_prepare_multimodal_rows_returns_the_rows_that_inputs_fuses():
+    """`prepare_multimodal_inputs` is `prepare_multimodal_rows` plus the fuse: fusing the
+    rows gives the same inputs, and the rows keep `input_ids` for a model that places them
+    itself."""
+    hidden, mm_token_id = 8, 7
+    emb = make_embedding(num_embeddings=40, hidden_size=hidden)
+    input_ids = torch.tensor([0, mm_token_id, mm_token_id, 1], dtype=torch.long)
+    text_idx = torch.tensor([0, 3], dtype=torch.long)
+    mm_idx = torch.tensor([1, 2], dtype=torch.long)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden)
+    model = TensorEncoderMultimodalModel(emb, torch.tensor([mm_token_id]), mm_emb)
+    kwargs = dict(
+        input_ids=input_ids,
+        positions=None,
+        multimodal_params=[make_raw_multimodal_param()],
+        num_context_requests=1,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+
+    rows = model.prepare_multimodal_rows(**kwargs)
+    assert rows is not None
+    row_input_ids, active_embeddings, extra_embeds = rows
+    assert row_input_ids is input_ids
+    assert tuple(extra_embeds) == ()
+    torch.testing.assert_close(torch.cat(active_embeddings), mm_emb)
+
+    fused_ids, fused_embeds, fused_extra = model._fuse_multimodal_embeddings(
+        input_ids=row_input_ids,
+        multimodal_embeddings=active_embeddings,
+        mm_token_ids=model.multimodal_token_ids,
+        embedding_layer=model.text_embedding_layer,
+        extra_embeds=extra_embeds,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+    prepared = model.prepare_multimodal_inputs(**kwargs)
+    assert prepared.input_ids is None and fused_ids is None
+    torch.testing.assert_close(prepared.inputs_embeds, fused_embeds)
+    assert tuple(prepared.extra_embeds) == tuple(fused_extra) == ()
+
+
+@pytest.mark.cpu_only
+def test_a_text_step_has_no_multimodal_rows():
+    emb = make_embedding(num_embeddings=40, hidden_size=8)
+    model = DummyMultimodalModel(emb, torch.tensor([7]))
+    input_ids = torch.tensor([0, 1, 2], dtype=torch.long)
+    for params in ([], None, [MultimodalParams(multimodal_data={})]):
+        kwargs = dict(
+            input_ids=input_ids,
+            positions=None,
+            multimodal_params=params,
+            num_context_requests=1,
+        )
+        assert model.prepare_multimodal_rows(**kwargs) is None
+        prepared = model.prepare_multimodal_inputs(**kwargs)
+        assert prepared.input_ids is input_ids and prepared.inputs_embeds is None
+
+
 def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
 
@@ -424,15 +540,15 @@ def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     )
     first = make_keyed_multimodal_param()
     second = make_keyed_multimodal_param()
-    model._encoder_forward_context = MagicMock()
+    model.encoder_forward_context = MagicMock()
 
     first_embeddings = model._get_or_encode_multimodal_embeddings([first])
     second_embeddings = model._get_or_encode_multimodal_embeddings([second])
 
     assert model.encode_calls == 1
-    model._encoder_forward_context.assert_called_once_with()
-    model._encoder_forward_context.return_value.__enter__.assert_called_once_with()
-    model._encoder_forward_context.return_value.__exit__.assert_called_once()
+    model.encoder_forward_context.assert_called_once_with()
+    model.encoder_forward_context.return_value.__enter__.assert_called_once_with()
+    model.encoder_forward_context.return_value.__exit__.assert_called_once()
     torch.testing.assert_close(second_embeddings, first_embeddings)
 
 
