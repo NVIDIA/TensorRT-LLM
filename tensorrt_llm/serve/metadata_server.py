@@ -1,7 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import hashlib
-import hmac
 import json
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -9,10 +7,10 @@ from typing import Any, Optional
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import etcd3
+from tensorrt_llm.serve.record_signing import (RECORD_SIGNATURE_FIELD,
+                                               sign_record, signature_matches)
 
 METADATA_KEY_PREFIX = "trtllm/"
-RECORD_SIGNATURE_FIELD = "signature"
-_SIGNATURE_PREFIX = "sha256="
 
 
 class RemoteDictionary(ABC):
@@ -76,29 +74,9 @@ class EtcdDictionary(RemoteDictionary):
         return list(unique_keys)
 
 
-_SIGNATURE_HEX_LENGTH = 64  # SHA-256 hex digest
-
-
-def _is_well_formed_signature(value: Any) -> bool:
-    """Whether ``value`` has the form ``_sign_record`` produces."""
-    if not isinstance(value, str) or not value.startswith(_SIGNATURE_PREFIX):
-        return False
-    digest = value[len(_SIGNATURE_PREFIX):]
-    return len(digest) == _SIGNATURE_HEX_LENGTH and all(c in "0123456789abcdef"
-                                                        for c in digest)
-
-
-def _sign_record(record_auth_key: str, key: str, value: dict) -> str:
-    unsigned = {k: v for k, v in value.items() if k != RECORD_SIGNATURE_FIELD}
-    payload = json.dumps({
-        "key": key,
-        "value": unsigned
-    },
-                         sort_keys=True,
-                         separators=(",", ":")).encode("utf-8")
-    digest = hmac.new(record_auth_key.encode("utf-8"), payload,
-                      hashlib.sha256).hexdigest()
-    return f"{_SIGNATURE_PREFIX}{digest}"
+def _strip_signature(record: dict) -> dict:
+    """A copy of ``record`` without its signature field."""
+    return {k: v for k, v in record.items() if k != RECORD_SIGNATURE_FIELD}
 
 
 class JsonDictionary:
@@ -124,28 +102,28 @@ class JsonDictionary:
         except (ValueError, RecursionError):
             if self._record_auth_key is None:
                 raise
-            logger.warning(f"Ignoring unreadable metadata record {key}")
+            logger.warning(f"Ignoring unreadable metadata record {key!r}")
             return None
         if self._record_auth_key is None:
             return value
         if not isinstance(value, dict):
-            logger.warning(f"Ignoring unsigned metadata record {key}")
+            logger.warning(f"Ignoring unsigned metadata record {key!r}")
             return None
-        provided = value.get(RECORD_SIGNATURE_FIELD)
-        if not _is_well_formed_signature(provided) or not hmac.compare_digest(
-                provided, _sign_record(self._record_auth_key, key, value)):
+        unsigned = _strip_signature(value)
+        if not signature_matches(self._record_auth_key, key, unsigned,
+                                 value.get(RECORD_SIGNATURE_FIELD)):
             logger.warning(
-                f"Ignoring metadata record {key} with an invalid signature")
+                f"Ignoring metadata record {key!r} with an invalid signature")
             return None
-        return {k: v for k, v in value.items() if k != RECORD_SIGNATURE_FIELD}
+        return unsigned
 
     def put(self, key: str, value: Any):
         if self._record_auth_key is not None:
             if not isinstance(value, dict):
                 raise ValueError("Signed metadata records must be dicts")
-            value = dict(value)
-            value[RECORD_SIGNATURE_FIELD] = _sign_record(
-                self._record_auth_key, key, value)
+            value = _strip_signature(value)
+            value[RECORD_SIGNATURE_FIELD] = sign_record(self._record_auth_key,
+                                                        key, value)
         self._dict.put(key, json.dumps(value))
 
     def remove(self, key: str):

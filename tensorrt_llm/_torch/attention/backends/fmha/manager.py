@@ -36,7 +36,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .combined import CombinedFmha
-from .interface import Fmha, FmhaPhase
+from .interface import Fmha, FmhaPhase, FmhaPrewarmConfig
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
 from .xqa import XqaFmha
@@ -327,7 +327,12 @@ def generation_selection_cell(
     num_tokens = q.shape[0]
     if forward_args.attention_input_type == AttentionInputType.mixed:
         num_tokens -= metadata.num_ctx_tokens
-    q_len = num_tokens // num_generations
+    return generation_cell_bound(num_generations, num_tokens // num_generations)
+
+
+def generation_cell_bound(num_generations: int, q_len: int) -> tuple[int, int]:
+    """(generation requests, q_len) at the upper bound of their selection-cache cell (``generation_selection_cell``):
+    a decision made for the call's own sizes must evaluate a library's support here to agree with its selection."""
     return (
         max(
             num_generations,
@@ -357,6 +362,26 @@ class FmhaManager:
         self._xqa_index = next(
             (i for i, fmha in enumerate(self.fmha_libs) if isinstance(fmha, XqaFmha)), None
         )
+
+    def prewarm(self, config: FmhaPrewarmConfig, attempted: set[type[Fmha]]) -> None:
+        """Try each eligible library once across all local attention layers."""
+        for fmha in self.fmha_libs:
+            fmha_cls = type(fmha)
+            if fmha_cls in attempted:
+                continue
+            try:
+                if not fmha.can_prewarm(config):
+                    continue
+                attempted.add(fmha_cls)
+                fmha.prewarm()
+            except Exception as e:
+                # Optional JIT initialization must not fail startup. An actual
+                # forward retries the build if it selects this library.
+                attempted.add(fmha_cls)
+                logger.warning(
+                    f"{fmha_cls.__name__} prewarm failed; retrying lazily on first use. "
+                    f"{type(e).__name__}: {e}"
+                )
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel

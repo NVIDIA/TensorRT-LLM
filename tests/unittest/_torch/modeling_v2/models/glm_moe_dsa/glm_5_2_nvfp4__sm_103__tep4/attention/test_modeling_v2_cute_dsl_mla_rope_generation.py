@@ -21,12 +21,12 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel needs an sm_103 GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
-    cute_dsl_mla_rope_generation as entry,
-)
 from tensorrt_llm._torch.attention.backends.interface import RopeParams  # noqa: E402
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata  # noqa: E402
 from tensorrt_llm._torch.metadata import KVCacheParams  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+    cute_dsl_mla_rope_generation as entry,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager  # noqa: E402
 from tensorrt_llm.bindings import DataType  # noqa: E402
 from tensorrt_llm.bindings.internal.batch_manager import CacheType  # noqa: E402

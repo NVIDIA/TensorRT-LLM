@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.causal_conv1d_fwd import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.causal_conv1d_fwd import (
     causal_conv1d_fwd,
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
@@ -65,9 +65,10 @@ def _run(dim, seq_lens, slots, has_init, silu=True, use_bias=False, seed=0, chan
         before = x.clone()
     else:
         out = None
+        before = None
     with validating(causal_conv1d_fwd):
         causal_conv1d_fwd(x, weight, bias, pool.states, qsl, idx, init, silu, PAD_SLOT_ID, out)
-    if channel_last:
+    if before is not None:
         assert torch.equal(x, before)
     return x if out is None else out, ref_out, pool, storage_before, ref_states
 

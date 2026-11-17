@@ -210,6 +210,8 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     def read_scales():
         return torch.cat((k_scale, v_scale, projection.inv_kv_scales[1:]))
 
+    graph = None
+    captured = None
     if device == "cuda":
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -224,7 +226,7 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     ] == pointers
     expected = torch.tensor([0.5, 0.25, 2.0, 4.0], device=device)
     torch.testing.assert_close(read_scales(), expected)
-    if device == "cuda":
+    if graph is not None:
         graph.replay()
         torch.testing.assert_close(captured, expected)
 
@@ -2425,6 +2427,7 @@ def test_horizontal_producer_plan_cache_is_bounded() -> None:
     layer, main, index, _ = _make_horizontal_producer_layer("fp8")
     bound = modeling_minimaxm3._MAX_FUSED_PRODUCER_PLANS
     slot_tables = [torch.zeros(4, dtype=torch.int32, device="cuda") for _ in range(2 * bound + 4)]
+    plan = None
     for slots in slot_tables:
         plan = layer._fused_producer_plan(main, index, None, slots)
         assert plan is not None

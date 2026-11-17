@@ -36,14 +36,13 @@ if any(capability != (10, 7) for capability in _CAPABILITIES):
 
 # The hardware-specific module must be imported after collective eligibility.
 _SA = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
+    "tensorrt_llm._torch.modeling_v2.models.minimax_m3."
     f"minimax_m3_nvfp4__sm_107__tp{_WORLD}.ops.m3_sampled_accept"
 )
 _CALL_POLICY = {}
 if _WORLD == 4:
     _POLICY = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-        "minimax_m3_nvfp4__sm_107__tp4.modeling"
+        "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.modeling"
     )
     assert _POLICY.SAMPLED_ACCEPT_SM107TP4
     _CALL_POLICY = dict(
@@ -163,6 +162,7 @@ def test_distributed_sampled_reference(nreq: int, top_p: float, graph_mode: bool
         peers = _COMM.allgather(_digest(warm_cpu))
         _collective_check(len(set(peers)) == 1, "warm outputs disagree")
         draft.copy_(warm[-1].reshape(nreq, _DRAFT + 1)[:, :_DRAFT])
+        outputs = None
         if graph_mode:
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

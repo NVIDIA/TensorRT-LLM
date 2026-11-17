@@ -317,6 +317,7 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     _supports_reuse_match_backoff = False
+    _supports_draft_reuse_match_backoff = False
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local
@@ -1130,6 +1131,13 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
         # A compressed page holds tokens_per_block // ratio rows.
         return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
+
+    def _mixed_precision_layer_page(self, local_layer_idx: int) -> tuple[int, DataRole]:
+        # The high layer holds compressed rows, so it copies the COMPRESS page.
+        layer_id = self._layer_attn_to_layer_id[
+            self.pp_layers[local_layer_idx], DeepseekV4AttentionType.COMPRESS
+        ]
+        return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """

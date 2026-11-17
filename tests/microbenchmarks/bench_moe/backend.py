@@ -175,9 +175,8 @@ def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
         return cutlass_leaf(quant_algo)
     if backend_type == MoeBackendType.TRTLLM:
-        # Leaves are keyed by quant, so the format has to be named.
-        # ``trtllm_gen_leaf`` returns the native leaf for a quantized format
-        # and the FlashInfer one for the unquantized format.
+        # Leaves are keyed by quant, so the format has to be named; quant
+        # None names the unquantized leaf.
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import trtllm_gen_leaf
 
         return trtllm_gen_leaf(quant_algo)
