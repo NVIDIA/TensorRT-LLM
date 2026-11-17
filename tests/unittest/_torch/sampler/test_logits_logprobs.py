@@ -1127,24 +1127,29 @@ class TestLogsprobsInBatchedSampling:
             assert raw_configs
             test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
 
-        # Raw logprobs of rows the sampler rewrites before sampling (here: embedding bias),
-        # alone and mixed with requests it leaves alone.
-        embedding_bias = torch.linspace(-5.0, 5.0, vocab_size)
-        biased_configs = [
-            SamplingParams(
-                temperature=0.7, top_k=2, logprobs=params.logprobs, embedding_bias=embedding_bias
-            )
-            for label, params in BASE_CASES.items()
-            if label.startswith("single-raw")
-        ]
-        assert biased_configs
-        test_cases.append((biased_configs, "single_raw_biased"))
+        # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
+        # min_length), alone and mixed with requests it leaves alone.
+        logit_rewrites = {
+            "embedding_bias": {"embedding_bias": torch.linspace(-5.0, 5.0, vocab_size)},
+            "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
+            "min_length": {"end_id": 5, "min_tokens": 10},
+        }
+        rewritten_configs = []
+        for rewrite_label, rewrite in logit_rewrites.items():
+            configs = [
+                SamplingParams(temperature=0.7, top_k=2, logprobs=params.logprobs, **rewrite)
+                for label, params in BASE_CASES.items()
+                if label.startswith("single-raw")
+            ]
+            assert configs
+            test_cases.append((configs, f"single_raw_rewritten_{rewrite_label}"))
+            rewritten_configs += configs
         test_cases += _shuffle_mixed_batches(
             (
-                biased_configs,
+                rewritten_configs,
                 [params for label, params in BASE_CASES.items() if label.startswith("single")],
             ),
-            ("raw_biased", "single"),
+            ("raw_rewritten", "single"),
         )
 
         return test_cases
@@ -1250,14 +1255,18 @@ class TestLogsprobsInBatchedSampling:
                     num_logprobs=sampling_params.logprobs or 0,
                     return_log_probs=sampling_params.logprobs is not None,
                     embedding_bias=sampling_params.embedding_bias,
+                    end_id=sampling_params.end_id,
                 )
                 for sampling_params, seq_slot, draft_len in zip(
                     sampling_params_list, seq_slots, draft_lens, strict=True
                 )
             ]
             # Patch up request state to correctly infer input beam width (inspects req.is_context_init_state)
-            for req in scheduled_requests.generation_requests:
+            for req, sampling_params in zip(
+                scheduled_requests.generation_requests, sampling_params_list
+            ):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.py_bad_words = sampling_params._get_bad_words() or None
             return scheduled_requests
 
     @pytest.fixture(scope="function")
