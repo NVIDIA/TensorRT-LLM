@@ -35,6 +35,7 @@ import os
 import pickle
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 import cloudpickle
@@ -92,14 +93,6 @@ def _skip_reason() -> str | None:
         dtype=torch.bfloat16,
         model_config=MoeModelConfig(_NUM_EXPERTS, _TOP_K, _HIDDEN, _INTERMEDIATE),
     )
-
-
-def _init_worker(paths: list[str]) -> None:
-    # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
-    os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
-    for path in paths:
-        if path.endswith("tests/unittest") and path not in sys.path:
-            sys.path.append(path)
 
 
 def _init_process_group(rank: int, world: int) -> None:
@@ -183,11 +176,17 @@ def _relay_counts(layer: Any) -> tuple[int, int]:
     return launches, copies + skips
 
 
-def _run_rank() -> tuple[int, list[str]]:
-    """Run every step on this EP rank; return (rank, errors)."""
+def _run_rank(unittest_root: str) -> tuple[int, list[str]]:
+    """Run every step on this EP rank; return (rank, errors).
+
+    ``unittest_root`` (tests/unittest) goes on sys.path for the shared MoE test utilities.
+    """
+    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
     from tensorrt_llm._utils import mpi_rank
 
-    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
+    if unittest_root not in sys.path:
+        sys.path.append(unittest_root)
+
     rank = mpi_rank()
     try:
         torch.cuda.set_device(rank)
@@ -470,8 +469,8 @@ def _run_steps(rank: int) -> list[str]:
                     all_rank_num_tokens=[_ABORT_TOKENS] * _EP_SIZE,
                 )
             errors.append(f"rank {rank}: layer 1 launched again after its capture failed")
-        except RuntimeError as error:
-            if "restart the process" not in str(error):
+        except Exception as error:  # noqa: BLE001
+            if not isinstance(error, RuntimeError) or "restart the process" not in str(error):
                 errors.append(f"rank {rank}: layer 1 relaunch raised {error!r}")
         synchronize()
         runner.clear()
@@ -506,14 +505,25 @@ class _TwoLayerBody(torch.nn.Module):
 
 @pytest.mark.threadleak(enabled=False)  # the MPIPoolExecutor manager thread outlives the test
 def test_halo_r_breakable_cuda_graph() -> None:
+    """Single-node CI runs it as one plain pytest process, which starts the four ranks itself.
+
+    The ranks start as test_halo_r_relay.py starts them: an MPIPoolExecutor given the launch-queue
+    environment. The SM and fabric checks run in the ranks; this process only counts devices.
+    """
+    if os.environ.get("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR") or MPI.COMM_WORLD.Get_size() > 1:
+        _skip("starts its own four ranks; run it without trtllm-llmapi-launch or mpirun")
     if torch.cuda.device_count() < _EP_SIZE:
         _skip(f"needs {_EP_SIZE} GPUs")
-    if torch.cuda.get_device_capability(0)[0] != 10:
-        _skip("HALO-R requires an SM100-family GPU")
-    with MPIPoolExecutor(
-        initializer=_init_worker, initargs=(sys.path,), max_workers=_EP_SIZE
-    ) as executor:
-        results = list(executor.starmap(_run_rank, [()] * _EP_SIZE))
+    unittest_root = str(Path(__file__).resolve().parents[3])
+    # Outlasts the ranks' own timers, which start after the spawn and the tensorrt_llm import,
+    # so a hung rank dumps its stacks before this process exits.
+    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S + 240, exit=True)
+    try:
+        # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
+        with MPIPoolExecutor(_EP_SIZE, env={"CUDA_SCALE_LAUNCH_QUEUES": "4x"}) as executor:
+            results = list(executor.map(_run_rank, [unittest_root] * _EP_SIZE))
+    finally:
+        faulthandler.cancel_dump_traceback_later()
     skips = {error for _, errors in results for error in errors if error.startswith("skip: ")}
     if skips:
         _skip("; ".join(sorted(skips)))
