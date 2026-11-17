@@ -317,7 +317,7 @@ Per-layer dynamic EPLB has the following constraints:
 
 ## Modeling V2 targets
 
-A [Modeling V2](../../../tensorrt_llm/_torch/_experimental/modeling_v2/README.md) target runs only the EPLB modes it implements. When a deployment sets `modeling_v2` (`auto` or `require`) together with `moe_config.load_balancer`, the engine builds a target only if the target implements the deployment's EPLB mode. Otherwise `auto` builds the built-in model, which implements every mode above, and `require` fails with the reason.
+A [Modeling V2](../../../tensorrt_llm/_torch/modeling_v2/README.md) target runs only the EPLB modes it implements. When a deployment sets `modeling_v2` (`auto` or `require`) together with `moe_config.load_balancer`, the engine builds a target only if the target implements the deployment's EPLB mode. Otherwise `auto` builds the built-in model, which implements every mode above, and `require` fails with the reason.
 
 | Target | EPLB modes | Layouts |
 |---|---|---|

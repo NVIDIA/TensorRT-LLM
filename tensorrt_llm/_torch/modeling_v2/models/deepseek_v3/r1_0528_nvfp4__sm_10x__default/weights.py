@@ -82,7 +82,7 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import eplb_mode, eplb_slots
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import eplb_mode, eplb_slots
 
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the

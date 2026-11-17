@@ -31,8 +31,8 @@ from typing import Optional, Sequence
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import moe_eplb_mode
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2._router_index import moe_eplb_mode
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     SingleLayerMoeLoadBalancer,
     get_moe_load_balancer,
