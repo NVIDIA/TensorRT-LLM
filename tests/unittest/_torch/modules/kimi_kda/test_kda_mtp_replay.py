@@ -268,6 +268,70 @@ def test_kda_mtp_replay_matches_reference(heads, state_dtype, width, strong_deca
     torch.testing.assert_close(history_len, history_len_before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("width", [2, 6])
+@pytest.mark.parametrize("batch", [1, 3])
+@torch.no_grad()
+def test_kda_mtp_replay_paired_slots_match_separate_slots(state_dtype, width, batch):
+    """Interleaved (state slot, replay slot) pairs give the separate-index result bit for bit.
+
+    FP32 with six tokens and several rows takes the 32-bit history offsets.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
+
+    torch.manual_seed(11)
+    heads, slots, replay_slot_count, token_capacity = 4, 6, 7, 8
+    channels = 3 * heads * DIM
+    raw_x = _randn((batch, width, channels), 0.09).to(torch.bfloat16)
+    conv_weight = _randn((channels, 4), 0.18).to(torch.bfloat16)
+    conv_state = _randn((slots, channels, 3), 0.09).to(torch.bfloat16)
+    raw_g = _randn((batch, width, heads, DIM), 0.85, -0.36).to(torch.bfloat16)
+    raw_beta = _randn((batch, width, heads), 1.0, 2.7).to(torch.bfloat16)
+    checkpoint = _randn((slots, heads, DIM, DIM), 0.012).to(state_dtype)
+    capacity = WINDOW + token_capacity
+    (history_k,), (history_u,), (history_G,), history_len = _make_pool_history(
+        1, replay_slot_count, heads, capacity
+    )
+    history_len.copy_(torch.tensor([7, 2, 15, 11, 1, 3, 4], device="cuda", dtype=torch.int32))
+    state_indices = torch.tensor([4, 1, 5][:batch], device="cuda", dtype=torch.int32)
+    replay_indices = torch.tensor([6, 0, 2][:batch], device="cuda", dtype=torch.int32)
+    pairs = torch.stack((state_indices, replay_indices), 1).contiguous()
+    is_dummy = torch.zeros(batch, device="cuda", dtype=torch.bool)
+    A_log = _randn((heads,), 0.42, -0.21).clamp_(-0.75, 0.9)
+    dt_bias = _randn((heads * DIM,), 1.4, -4.6).clamp_(-8.0, -1.25)
+
+    results = []
+    for slot_views in ((state_indices, replay_indices), (pairs[:, 0], pairs[:, 1])):
+        k, u, g = history_k.clone(), history_u.clone(), history_G.clone()
+        output = torch.empty(batch, width, heads, DIM, device="cuda", dtype=torch.bfloat16)
+        candidate_x = torch.zeros(
+            (batch, token_capacity, channels), device="cuda", dtype=torch.bfloat16
+        )
+        kda_mtp_replay(
+            raw_x,
+            conv_weight,
+            conv_state,
+            raw_g,
+            raw_beta,
+            checkpoint,
+            slot_views[0],
+            is_dummy,
+            k,
+            u,
+            g,
+            history_len,
+            A_log,
+            dt_bias,
+            output,
+            candidate_x,
+            history_window=WINDOW,
+            replay_indices=slot_views[1],
+        )
+        results.append((output, candidate_x, k, u, g))
+    for separate, paired in zip(*results):
+        assert torch.equal(separate, paired)
+
+
 @torch.no_grad()
 def _commit_reference(
     state_views,

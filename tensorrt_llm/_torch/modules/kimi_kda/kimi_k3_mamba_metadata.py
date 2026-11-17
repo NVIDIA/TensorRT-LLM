@@ -39,6 +39,12 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_replay_state_indices: torch.Tensor | None = None
+        # The generation requests' (state slot, replay slot) pairs, interleaved
+        # so the KDA MTP replay reads both with one 8-byte load per row.
+        self._generation_slot_pairs = torch.empty(
+            (max_batch_size, 2), dtype=torch.int32, device="cuda"
+        )
+        self.generation_slot_pairs: torch.Tensor | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
@@ -51,6 +57,7 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
         self.generation_state_indices = None
         self.generation_replay_state_indices = None
+        self.generation_slot_pairs = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         if (
@@ -69,6 +76,11 @@ class KimiK3MambaMetadata(Mamba2Metadata):
                     num_contexts,
                     batch_size,
                 )
+            if getattr(attn_metadata.kv_cache_manager, "use_kda_mtp_replay", False):
+                pairs = self._generation_slot_pairs[: batch_size - num_contexts]
+                pairs[:, 0].copy_(self.state_indices[num_contexts:batch_size])
+                pairs[:, 1].copy_(self.replay_state_indices[num_contexts:batch_size])
+                self.generation_slot_pairs = pairs
 
         self.kda_max_seqlen = max(context_lengths, default=0)
         n = len(context_lengths)

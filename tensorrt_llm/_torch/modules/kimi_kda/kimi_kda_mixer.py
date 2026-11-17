@@ -631,7 +631,13 @@ class KimiKDALinearAttention(nn.Module):
                     f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
                 replay_kwargs = {}
+                verify_state_indices = generation_state_indices
+                verify_replay_indices = generation_replay_state_indices
                 if use_mtp_replay:
+                    # Interleaved pairs let the replay load both slots of a row at once.
+                    pairs = getattr(mamba_metadata, "generation_slot_pairs", None)
+                    if pairs is not None:
+                        verify_state_indices, verify_replay_indices = pairs[:, 0], pairs[:, 1]
                     dummy_mask = attn_metadata.kv_cache_manager.get_replay_dummy_request_mask()
                     if dummy_mask is None:
                         raise RuntimeError("KDA MTP replay requires the dummy-request mask")
@@ -642,12 +648,12 @@ class KimiKDALinearAttention(nn.Module):
                     layer_cache,
                     conv_pool,
                     ssm_pool,
-                    generation_state_indices,
+                    verify_state_indices,
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
                     # The MXFP8 core cannot be concatenated with a prefill
                     # core or stored into the BCG buffer.
                     allow_prequantized_output=output is None and num_prefills == 0,
-                    replay_slot_indices=generation_replay_state_indices,
+                    replay_slot_indices=verify_replay_indices,
                     # The MXFP8 input covers every row of a verify-only batch.
                     prequantized_input=(
                         prequantized_input
