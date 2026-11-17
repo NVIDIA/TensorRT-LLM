@@ -170,8 +170,14 @@ class CustomCheckpointLoader(BaseCheckpointLoader):
                  weight_loader: Optional[BaseWeightLoader] = None,
                  weight_mapper: Optional[BaseWeightMapper] = None,
                  config_loader: Optional[BaseConfigLoader] = None):
-        self._weight_loader = weight_loader or self.get_default_weight_loader()
-        self._config_loader = config_loader or self.get_default_config_loader()
+        if weight_loader is None:
+            self._weight_loader = self.get_default_weight_loader()
+        else:
+            self._weight_loader = weight_loader
+        if config_loader is None:
+            self._config_loader = self.get_default_config_loader()
+        else:
+            self._config_loader = config_loader
         self._weight_mapper = weight_mapper
         self._checkpoint_format = "CUSTOM_FORMAT"
 
