@@ -59,6 +59,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
+    RenormalizeNaiveMoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
@@ -109,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
+    MoEEligibility,
     MoEEnvironment,
     MoEInputRequirement,
     MoEProblem,
@@ -614,6 +616,7 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("decode_tuning", [False, True])
 def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
@@ -635,6 +638,175 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
     else:
         assert set(spec.gen_tuning_buckets) & set(range(1, 129)) == set(pow2)
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
+
+    # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
+    # un-finalized calls run different kernels).
+    for do_finalize in (False, True):
+        runner = FP4BlockScaleMoERunner(
+            512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
+        )
+        assert runner.unique_id() == (10, 512, 64, 0) + (
+            (True, do_finalize) if decode_tuning else ()
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("do_finalize", [False, True])
+def test_fp4_block_scale_decode_tactic_key_matches_tuning(
+    monkeypatch: pytest.MonkeyPatch, do_finalize: bool
+) -> None:
+    """``decode_tactic`` finds the entry the MoE op's own lookup finds for a call of that ``do_finalize``: the
+    entry is stored under the runner, tuning config and shapes that ``_run_fp4_block_scale_moe`` builds. A
+    mismatch leaves every decode front without a tactic, so it falls back to the stock MoE."""
+    from tensorrt_llm._torch.autotuner import AutoTunerProfilingCache
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _run_fp4_block_scale_moe
+    from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
+        TRTLLMGenFp4BlockScaleBase,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import to_trtllm_gen_act_type
+    from tensorrt_llm._torch.utils import ActivationType
+
+    tuned_tactic = [8, 3]
+    # Bypasses __init__, which queries the device.
+    cache = AutoTunerProfilingCache.__new__(AutoTunerProfilingCache)
+    cache.cache = {}
+
+    class _OpLookedUp(Exception):
+        pass
+
+    class _Tuner:
+        """Stores the op's tactic where the op's runtime lookup searches, then stops the op before its kernel."""
+
+        is_tuning_mode = False
+        profiling_cache = cache
+        _find_nearest_profile = AutoTuner._find_nearest_profile
+
+        def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+            shapes = tuple(AutoTuner._get_input_sizes(self, inputs))
+            key = cache.get_cache_key(custom_op, runners[0], shapes, tuning_config)
+            cache[key] = (0, tuned_tactic, 1.0)
+            raise _OpLookedUp
+
+    tuner = _Tuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    num_slots, top_k, num_local, inter, hidden, m = 512, 10, 64, 512, 4096, 14
+
+    def meta(*shape):
+        return torch.empty(shape, dtype=torch.uint8, device="meta")
+
+    backend = SimpleNamespace(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
+        num_slots=num_slots,
+        slot_start=0,
+        expert_size_per_partition=num_local,
+        _intermediate_size_padded=lambda: inter,
+        activation_type=ActivationType.Swiglu,
+        max_num_tokens=8192,
+        use_dp=False,
+        decode_tuning=True,
+        bias=False,
+        act_alpha=None,
+        act_beta=None,
+        act_clamp=None,
+        w3_w1_weight=meta(num_local, 2 * inter, hidden // 2),
+        w3_w1_weight_scale=meta(num_local, 2 * inter, hidden // 16),
+        w2_weight=meta(num_local, hidden, inter // 2),
+        w2_weight_scale=meta(num_local, hidden, inter // 16),
+    )
+    # Not tuned yet.
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) is None
+    # The op call TRTLLMGenFp4BlockScaleBase.run_moe makes for m router-logit rows.
+    with pytest.raises(_OpLookedUp):
+        _run_fp4_block_scale_moe(
+            meta(m, num_slots),
+            None,
+            meta(m, hidden // 2),
+            meta(m * hidden // 16),
+            backend.w3_w1_weight,
+            backend.w3_w1_weight_scale,
+            None,
+            None,
+            None,
+            None,
+            backend.w2_weight,
+            backend.w2_weight_scale,
+            None,
+            None,
+            None,
+            None,
+            num_slots,
+            top_k,
+            None,
+            None,
+            inter,
+            backend.slot_start,
+            num_local,
+            None,
+            int(backend.routing_method.routing_method_type),
+            do_finalize,
+            to_trtllm_gen_act_type(backend.activation_type),
+            tune_max_num_tokens=backend.max_num_tokens,
+            use_dp=backend.use_dp,
+            decode_tuning=backend.decode_tuning,
+        )
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) == tuned_tactic
+    # The other do_finalize runs other kernels and is tuned apart.
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, not do_finalize) is None
+
+
+@pytest.mark.cpu_only
+def test_decode_front_tactics_per_do_finalize() -> None:
+    """The decode front looks the MoE tactic and its front race up and caches them per (rows, do_finalize), the
+    key the MoE op tunes them under: an un-finalized call never takes a finalized call's tactic or its miss."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_front as df
+
+    num_experts, top_k = 512, 10
+    asked = []
+
+    def decode_tactic(m: int, do_finalize: bool):
+        asked.append((m, do_finalize))
+        return None if do_finalize else [8, 0]
+
+    backend = SimpleNamespace(decode_tactic=decode_tactic)
+    front = df.DecodeFront(frozenset())
+    assert front._moe_tactic(backend, 14, True) is None
+    assert front._moe_tactic(backend, 14, False) == [8, 0]
+    assert front._moe_tactic(backend, 14, False) == [8, 0]  # cached
+    assert asked == [(14, True), (14, False)]
+
+    moe = SimpleNamespace(
+        backend=SimpleNamespace(
+            decode_tactic=decode_tactic, expert_size_per_partition=num_experts, slot_start=0
+        ),
+        routing_method=SimpleNamespace(experts_per_token=top_k),
+    )
+    gate = SimpleNamespace(weight=torch.empty(num_experts, 16))
+    unfinalized = front._front_runner(gate, moe, False)
+    finalized = front._front_runner(gate, moe, True)
+    assert unfinalized.tile_of(7) == 8 and finalized.tile_of(7) is None
+    assert unfinalized.unique_id() != finalized.unique_id()
+
+
+@pytest.mark.cpu_only
+def test_fp4_block_scale_moe_op_mutability() -> None:
+    """The NVFP4 MoE op every model reaches is functional (torch.compile can trace it); the decode kernels' op
+    declares the buffers its engine writes."""
+    import tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops  # noqa: F401
+
+    def written(op):
+        return {
+            a.name for a in op.default._schema.arguments if a.alias_info and a.alias_info.is_write
+        }
+
+    assert written(torch.ops.trtllm.fp4_block_scale_moe_runner) == set()
+    assert written(torch.ops.trtllm.fp4_block_scale_moe_decode_runner) == {
+        "decode_engine_state",
+        "lamport_fc2_out",
+        "prerouted_tables",
+        "prerouted_ids",
+        "prerouted_weights",
+    }
 
 
 @pytest.mark.cpu_only
@@ -1263,6 +1435,81 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,expected_skip",
+    [
+        ({}, False),
+        ({"dtypes": [torch.float16]}, True),
+        ({"activation_type": ActivationType.Swiglu}, True),
+        ({"activation_type": ActivationType.Silu}, True),
+        ({"model_configs": [MoeModelConfig(64, 4, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 8, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 4, 4096, 1408)]}, True),
+        ({"swiglu_combos": [(1.702, 1.0, 7.0)]}, True),
+        ({"routing_methods": [RenormalizeNaiveMoeRoutingMethod]}, True),
+    ],
+    ids=[
+        "restored",
+        "float16",
+        "swiglu",
+        "silu",
+        "more-experts",
+        "larger-top-k",
+        "larger-hidden-size",
+        "custom-swiglu",
+        "renormalize-naive-routing",
+    ],
+)
+def test_trtllm_nvfp4_seq8_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    expected_skip: bool,
+) -> None:
+    backend = Mock(spec_set=["can_implement"])
+    backend.can_implement.return_value = MoEEligibility.ok()
+    monkeypatch.setattr("_torch.moe.moe_test_utils.find_backend_classes", lambda *_: [backend])
+    params = dict(
+        swiglu_combos=[(1, 0, float("inf"))],
+        model_configs=[MoeModelConfig(60, 4, 2048, 1408)],
+        seq_lens=[8],
+        dtypes=[torch.bfloat16],
+        backend_types=[MoeBackendType.TRTLLM],
+        quant_algos=[QuantAlgo.NVFP4],
+        routing_methods=[RenormalizeMoeRoutingMethod],
+        activation_type=ActivationType.Relu2,
+    )
+    params.update(overrides)
+    configs = list(iter_base_test_configs(**params))
+    assert len(configs) == 1
+    (
+        _swiglu_alpha,
+        _swiglu_beta,
+        _swiglu_limit,
+        _model_config,
+        _seq_len,
+        _dtype,
+        _backend_type,
+        _quant_algo,
+        _routing_method_cls,
+        skip_reason,
+        base_test_id,
+    ) = configs[0]
+    if expected_skip:
+        assert skip_reason is not None and "seq_len=8" in skip_reason
+    else:
+        assert skip_reason is None
+        assert params["model_configs"][0] in MOE_MODEL_CONFIGS
+        assert params["seq_lens"][0] in SEQ_LENS_TO_TEST
+        assert params["dtypes"][0] in DTYPES_TO_TEST
+        monkeypatch.setattr(sys.modules[__name__], "MOE_MODEL_CONFIGS", params["model_configs"])
+        monkeypatch.setattr(sys.modules[__name__], "SEQ_LENS_TO_TEST", params["seq_lens"])
+        monkeypatch.setattr(sys.modules[__name__], "DTYPES_TO_TEST", params["dtypes"])
+        generated_ids = {param.id for param in generate_element_wise_test_params()}
+        assert f"act=Relu2-{base_test_id}" in generated_ids
+        assert f"act=Silu-{base_test_id}" not in generated_ids
+
+
 def should_skip_gptoss(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -1550,12 +1797,12 @@ def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
     """A staged receiver can mark a never-loaded expert-weight owner transformed.
 
     Post-transform receivers install already transformed expert bytes without
-    calling `load_weights()`. `ModelLoader._mark_weights_transformed` only marks
+    calling `load_weights()`. `model_hooks.mark_weights_transformed` only marks
     modules that carry the guard, so it must exist from construction on the
     backend that sits behind the `_weights_removed` `ConfigurableMoE` wrapper.
     """
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
     from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 
     assert MoEWeightOwnerMixin._weights_transformed is False
     # `__new__` rather than the constructor: the guard is a class-level
@@ -1572,15 +1819,13 @@ def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
     model = torch.nn.Module()
     model.experts = wrapper
 
-    ModelLoader._mark_weights_transformed(model)
+    model_hooks.mark_weights_transformed(model)
 
     assert backend._weights_transformed is True
     assert wrapper._weights_transformed is False
-    # The walk itself must skip the marked backend; the backend's own guard
-    # would also stop the quantization transform, so spy on the hook it calls.
-    backend.transform_weights = MagicMock(wraps=backend.transform_weights)
-    ModelLoader._walk_transform(model)
-    backend.transform_weights.assert_not_called()
+    # The guard makes a later transform of the marked backend skip the
+    # quantization transform, so spy on the hook it would call.
+    backend.transform_weights()
     backend.quant_method.transform_weights.assert_not_called()
 
 
@@ -3288,7 +3533,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
     not just the override in isolation.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
@@ -3305,7 +3550,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend._alloc_symm_buffer.assert_called_once_with()
     backend.quant_method.cache_derived_state.assert_called_once_with(backend)
@@ -3321,7 +3566,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     ``post_load_weights``, so losing the override here leaves the derived
     MegaMoE-format state silently never recomputed.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # a process group and the cuMem symmetric-memory rendezvous.
@@ -3341,7 +3586,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend.create_weights.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(backend)
@@ -5310,6 +5555,7 @@ def generate_element_wise_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
             [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             if skip_reason:
                 continue
@@ -5377,6 +5623,7 @@ def generate_int8_woq_non_aligned_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS],
             [QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             # get_quick_skip_reason() rejects every quantized config whose sizes are
             # not 128-aligned. That gate is exactly what this case exists to cover:
@@ -7159,6 +7406,26 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         _load_balancer_done_set_cpu_stage=no_op,
         _maybe_get_perfect_router_expert_ids=lambda token_selected_experts: token_selected_experts,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "comm,dp_padding", [(object(), False), (None, True)], ids=["comm", "dp_padding"]
+)
+def test_lamport_fc2_out_rejects_communication_and_padding(comm, dp_padding):
+    """The MoE-output all-reduce polls the Lamport FC2 rows of this rank's tokens only, as prerouted routing."""
+    moe = _chunking_moe(SimpleNamespace(takes_lamport_fc2_out=True), num_chunks=1)
+    moe.comm = comm
+    with pytest.raises(ValueError, match="without communication or padding"):
+        ExternalCommMoEScheduler(moe).forward(
+            torch.zeros((4, 8), dtype=torch.bfloat16),
+            torch.zeros((4, 4)),
+            do_finalize=False,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=None,
+            use_dp_padding=dp_padding,
+            lamport_fc2_out=torch.empty((8, 8), dtype=torch.bfloat16),
+        )
 
 
 def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:

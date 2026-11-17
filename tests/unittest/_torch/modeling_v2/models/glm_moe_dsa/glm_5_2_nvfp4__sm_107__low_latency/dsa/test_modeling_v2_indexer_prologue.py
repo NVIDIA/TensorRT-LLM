@@ -13,13 +13,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
         _indexer_reference,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_prologue import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_prologue import (  # noqa: E501
         indexer_prologue as op,
     )
 except NoTarget as exc:
@@ -122,7 +122,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
 def test_q_part_matches_the_k_tail_launch_of_the_same_kernel():
     """The K part does not depend on whether the Q part is compiled in: the whole prologue and the
     K tail write the same K bytes for the same inputs."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_k_tail import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.indexer_k_tail import (  # noqa: E501
         indexer_k_tail,
     )
 

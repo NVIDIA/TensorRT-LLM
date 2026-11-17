@@ -14,10 +14,13 @@
 # limitations under the License.
 """Unit tests for the DSpark draft I/O proposal stage."""
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_dspark import build_draft_input_ids, dspark_propose
 from tensorrt_llm._torch.models.modeling_speculative import DSparkConfidenceHead, build_markov_head
+
+pytestmark = pytest.mark.cpu_only
 
 VOCAB, HID, RANK, B, BLK = 257, 32, 16, 2, 5
 NOISE_ID = 199

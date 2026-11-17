@@ -2299,6 +2299,7 @@ def _make_disagg_transfer_request(
     req.py_prompt_len = prompt_len
     req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
     req.is_disagg_generation_transmission_in_progress = in_progress
+    req.is_disagg_generation_transmission_complete = False
     return req
 
 
@@ -4600,6 +4601,7 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor.previous_batch = None
+        executor.enable_kv_cache_events = False
         executor._flush_pending_transfer_responses = Mock()
         executor._packed_sync_enabled = False
         executor._stage_timing = False
@@ -5196,3 +5198,31 @@ def test_disagg_gen_first_step_is_streamed_once():
     executor.active_requests = [request]
     PyExecutor._handle_responses(executor)
     assert request.create_response.call_count == 1
+
+
+def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
+    """torch keeps each Dynamo config value per thread: the limit the engine sets while it is built does
+    not reach PyExecutor's worker thread, which applies it again."""
+    from tensorrt_llm._torch.pyexecutor.engine.model_setup import DYNAMO_RECOMPILE_LIMIT
+
+    config = torch._dynamo.config
+    original = config.cache_size_limit
+    seen = {}
+    executor = types.SimpleNamespace(_uses_torch_compile=True)
+
+    def worker():
+        seen["inherited"] = config.cache_size_limit
+        PyExecutor._apply_dynamo_recompile_limit(executor)
+        seen["applied"] = config.cache_size_limit
+
+    config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
+    try:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+    finally:
+        config.cache_size_limit = original
+    assert seen["inherited"] != DYNAMO_RECOMPILE_LIMIT, (
+        "Dynamo config is process-wide; drop the hook"
+    )
+    assert seen["applied"] == DYNAMO_RECOMPILE_LIMIT

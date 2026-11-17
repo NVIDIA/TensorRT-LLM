@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .runtime_hooks import runtime_hooks_of
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -107,21 +108,18 @@ def _fp4_mla_block_reuse_blocker(pretrained_config, *,
                                  enable_chunked_prefill: bool) -> Optional[str]:
     """Why FP4 MLA cannot reuse KV cache blocks, or ``None`` if it can.
 
-    A reused prefix must end on a full 16-token FP4 quantization tile. On
-    hybrid linear-attention models (Kimi K3) it ends on a recurrent-state
-    snapshot, which the cache manager places on a cache block. A dense FP4
-    MLA prefix can end mid-tile: the reuse match backs off by the
-    one-model draft's prompt lookahead. The cached prefix is attended
-    through the MLA chunked-prefill partitions, which read it back from the
-    FP4 pages.
+    A reused prefix must end on a full 16-token FP4 quantization tile. A
+    dense FP4 MLA cache claims whole cache blocks only. On hybrid
+    linear-attention models (Kimi K3) the prefix ends on a recurrent-state
+    snapshot, which the cache manager places on a cache block. The cached
+    prefix is attended through MLA context partitions read back from the
+    FP4 pages, with or without chunked prefill. Hybrid models keep block
+    reuse tied to chunked prefill, the only combination validated with
+    their recurrent-state snapshots.
     """
-    if not is_hybrid_linear(pretrained_config):
-        return ("only hybrid linear-attention models, whose reused prefix "
-                "ends on a recurrent-state snapshot at a cache block, resume "
-                "on a full FP4 quantization tile")
-    if not enable_chunked_prefill:
-        return ("the cached prefix is attended through MLA chunked-prefill "
-                "partitions; set enable_chunked_prefill=True")
+    if is_hybrid_linear(pretrained_config) and not enable_chunked_prefill:
+        return ("hybrid linear-attention models reuse FP4 MLA cache blocks "
+                "only with chunked prefill; set enable_chunked_prefill=True")
     return None
 
 
@@ -1408,56 +1406,65 @@ def _create_py_executor(
     model_engine.set_warmup_purpose(
         "memory_profiling" if estimating_kv_cache else "final_executor")
 
-    with allocation_scope(
-            ExecutorMemoryType.INIT_EXTRA_RESOURCES
-            if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
-        # Reclaim unreachable allocations before warmup.
-        gc.collect()
-        py_executor = create_py_executor_instance(
-            dist=dist,
-            resources=resources,
-            mapping=mapping,
-            llm_args=llm_args,
-            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
-                ctx_chunk_config,
-                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                tokens_per_block, scheduler_config.context_chunking_policy),
-            model_engine=model_engine,
-            start_worker=False,
-            sampler=sampler,
-            drafter=drafter,
-            guided_decoder=guided_decoder,
-            capturable_guided_decoder=capturable_guided_decoder,
-            lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_manager=kv_connector_manager
-            if not estimating_kv_cache else None,
-            resource_governor_queue=resource_governor_queue,
-            max_seq_len=net_max_seq_len,
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            peft_cache_config=peft_cache_config,
-            scheduler_config=scheduler_config,
-            cache_transceiver_config=cache_transceiver_config,
-            transfer_budget_is_explicit=transfer_budget_is_explicit,
-            virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
-            execution_stream=execution_stream,
-            # Without the KV-cache estimation the executor serves from its
-            # construction: it gets the DWDP manager or the standalone dense
-            # DWDP manager now, primes it and exits it at shutdown. With the
-            # estimation only the serving phase gets it (rebind_resources
-            # below), since release_resources() exits the managers the
-            # executor holds.
-            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
-            dense_dwdp_manager=dense_dwdp_manager
-            if not estimating_kv_cache else None,
-            max_num_sequences=max_num_seq_slots,
-        )
+    try:
+        with allocation_scope(
+                ExecutorMemoryType.INIT_EXTRA_RESOURCES
+                if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
+            # Reclaim unreachable allocations before warmup.
+            gc.collect()
+            py_executor = create_py_executor_instance(
+                dist=dist,
+                resources=resources,
+                mapping=mapping,
+                llm_args=llm_args,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=sampler,
+                drafter=drafter,
+                guided_decoder=guided_decoder,
+                capturable_guided_decoder=capturable_guided_decoder,
+                lora_config=lora_config,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
+                kv_connector_manager=kv_connector_manager
+                if not estimating_kv_cache else None,
+                resource_governor_queue=resource_governor_queue,
+                max_seq_len=net_max_seq_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                peft_cache_config=peft_cache_config,
+                scheduler_config=scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
+                transfer_budget_is_explicit=transfer_budget_is_explicit,
+                virtual_memory_pools=vm_pools
+                if not estimating_kv_cache else None,
+                execution_stream=execution_stream,
+                # Without the KV-cache estimation the executor serves from its
+                # construction: it gets the DWDP manager or the standalone dense
+                # DWDP manager now, primes it and exits it at shutdown. With the
+                # estimation only the serving phase gets it (rebind_resources
+                # below), since release_resources() exits the managers the
+                # executor holds.
+                dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
+                dense_dwdp_manager=dense_dwdp_manager
+                if not estimating_kv_cache else None,
+                max_num_sequences=max_num_seq_slots,
+            )
 
-        # Originally, peft_cache_config might be mutated inside
-        # create_py_executor_instance. Restore it here.
-        peft_cache_config = py_executor.peft_cache_config
+            # Originally, peft_cache_config might be mutated inside
+            # create_py_executor_instance. Restore it here.
+            peft_cache_config = py_executor.peft_cache_config
+    except BaseException as error:
+        # A failed warmup or capture leaves the donation with no owner that
+        # would withdraw it before exit.
+        if kv_cache_creator is not None:
+            kv_cache_creator.close_remote_donor(error)
+        raise
 
     if estimating_kv_cache:
         try:
@@ -1514,11 +1521,14 @@ def _create_py_executor(
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
-        except BaseException:
+        except BaseException as error:
+            # Also past the final build, whose target manager's shutdown would withdraw the donation unmarked.
+            kv_cache_creator.close_remote_donor(error)
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        runtime_hooks_of(model_engine.model).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

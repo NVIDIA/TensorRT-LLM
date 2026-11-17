@@ -56,6 +56,9 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     #: The native op's pre-routed entry point (``run_moe_prerouted``).
     supports_prerouted_routing = True
 
+    #: The native op's ``lamport_fc2_out``.
+    takes_lamport_fc2_out = True
+
     #: Whether routing runs as one launch, fused with quantization, and with routing tables; set
     #: after loading.
     _fuses_route = False

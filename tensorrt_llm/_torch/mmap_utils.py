@@ -37,8 +37,13 @@ __all__ = [
 
 _MADV_DONTNEED = 4
 _MADV_PAGEOUT = 21
-_MADV_ADVICE_BY_MODE = {"dontneed": _MADV_DONTNEED, "pageout": _MADV_PAGEOUT}
 _MADV_POPULATE_READ = 22  # Requires Linux >= 5.14.
+_MADV_POPULATE_WRITE = 23  # Requires Linux >= 5.14.
+_MADV_ADVICE_BY_MODE = {
+    "dontneed": _MADV_DONTNEED,
+    "pageout": _MADV_PAGEOUT,
+    "populate_write": _MADV_POPULATE_WRITE,
+}
 _MMAP_FAILED = ctypes.c_void_p(-1).value
 
 
@@ -59,6 +64,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     mode : str, optional
         "dontneed" -> MADV_DONTNEED (immediate discard, default)
         "pageout"  -> MADV_PAGEOUT  (asynchronous pageout, Linux 4.5+)
+        "populate_write" -> MADV_POPULATE_WRITE (fault every page in writable, Linux 5.14+)
 
     Raises
     ------
@@ -72,7 +78,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     try:
         advice = _MADV_ADVICE_BY_MODE[mode]
     except KeyError:
-        raise ValueError("mode must be 'pageout' or 'dontneed'.")
+        raise ValueError("mode must be 'pageout', 'dontneed' or 'populate_write'.")
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:

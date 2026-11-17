@@ -54,10 +54,12 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -932,6 +934,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
     static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
+    static nb::object sRemoteMemError = nb::exception<kv::RemoteMemError>(m, "RemoteMemError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -999,7 +1002,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
         .value("DISK", kv::CacheTier::DISK)
+        .value("REMOTE", kv::CacheTier::REMOTE)
         .export_values();
+
+    nb::enum_<kv::RemoteTransport>(m, "RemoteTransport")
+        .value("NIXL", kv::RemoteTransport::kNixl)
+        .value("FABRIC", kv::RemoteTransport::kFabric);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
@@ -1777,6 +1785,29 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
+    nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
+        .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
+            nb::arg("transport") = kv::RemoteTransport::kNixl,
+            nb::arg("timeout_ms") = kv::RemoteTransferConfig{}.timeoutMs,
+            nb::arg("backend_params") = std::map<std::string, std::string>{})
+        .def_rw("transport", &kv::RemoteTransferConfig::transport)
+        .def_rw("timeout_ms", &kv::RemoteTransferConfig::timeoutMs)
+        .def_rw("backend_params", &kv::RemoteTransferConfig::backendParams) DEF_COPY(kv::RemoteTransferConfig);
+
+    nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
+        .def(nb::init<size_t, std::string, int64_t, uint32_t, std::vector<double>, kv::RemoteTransferConfig>(),
+            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = kv::RemoteCacheTierConfig{}.waitTimeoutMs,
+            nb::arg("expected_donors") = 0, nb::arg("pool_ratio") = std::vector<double>{},
+            nb::arg("transfer") = kv::RemoteTransferConfig{})
+        .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
+        .def_rw("path", &kv::RemoteCacheTierConfig::path)
+        .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)
+        .def_rw("expected_donors", &kv::RemoteCacheTierConfig::expectedDonors)
+        .def_rw("pool_ratio", &kv::RemoteCacheTierConfig::poolRatio)
+        .def_rw("transfer", &kv::RemoteCacheTierConfig::transfer)
+        .def_prop_ro("tier", &kv::RemoteCacheTierConfig::tier)
+        .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
+
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
         .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
             nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none())
@@ -1975,7 +2006,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking)
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
+                std::optional<kv::BatchDesc> coldTypicalStep)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2004,6 +2036,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
+                cfg->coldTypicalStep = std::move(coldTypicalStep);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2018,7 +2051,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
-            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{})
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
+            nb::arg("cold_typical_step").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2031,6 +2065,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
+        .def_rw("cold_typical_step", &kv::KVCacheManagerConfig::coldTypicalStep,
+            nb::for_setter(nb::arg("value").none()),
+            "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
+            "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
             "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
@@ -2123,7 +2161,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                bool ssmFromPending)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2142,12 +2181,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, ssmFromPending);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("ssm_from_pending") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
+        .def(
+            "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
@@ -2266,6 +2310,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "manager", [](kv::KvCache& self) -> kv::KvCacheManager& { return self.manager(); },
             nb::rv_policy::reference_internal)
         .def_prop_ro("committed_tokens", &committedTokensList)
+        .def("_get_committed_prefix_key",
+            [](kv::KvCache const& self, int numTokens) -> nb::object
+            {
+                std::optional<kv::BlockKey> key;
+                {
+                    nb::gil_scoped_release release;
+                    key = self.committedPrefixKey(numTokens);
+                }
+                if (!key)
+                    return nb::none();
+                return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
+            })
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
@@ -2805,6 +2861,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "remote_unquiesced_transfers",
+        // Remote transfers past their deadline whose staging is still out of use, after releasing the quiesced ones.
+        [](kv::KvCacheManager& manager) { return manager.storage().reapQuiescedRemoteTransfers(); }, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "level_pool_groups",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            // Per pool group of one cache level: slot count, bytes per slot, and the layer groups it holds.
+            auto const& storage = manager.storage();
+            kv::CacheLevel const level{cacheLevel};
+            TLLM_CHECK_WITH_INFO(
+                cacheLevel >= 0 && level < storage.numCacheLevels(), "cache_level %d is out of range", cacheLevel);
+            std::vector<std::tuple<int64_t, size_t, std::vector<int>>> groups(
+                static_cast<size_t>(storage.numPoolGroups(level).value()));
+            for (kv::PoolGroupIndex pg{0}; pg < storage.numPoolGroups(level); ++pg)
+            {
+                auto const& sizes = storage.slotSize(level, pg);
+                auto& group = groups[static_cast<size_t>(pg.value())];
+                std::get<0>(group) = static_cast<int64_t>(storage.numSlots(pg, level));
+                std::get<1>(group) = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+            }
+            for (kv::LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+            {
+                std::get<2>(groups[static_cast<size_t>(storage.getPoolGroupIndex(level, lc).value())])
+                    .push_back(lc.value());
+            }
+            return groups;
+        },
+        nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "disk_copy_counters",
         [](kv::KvCacheManager& manager)
@@ -3509,7 +3596,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig));
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
@@ -3737,6 +3824,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
+        .def_prop_ro("any_remote_level_failed",
+            // A lock-step scheduler stops once any remote level failed on this rank. Lock-free (atomic flags).
+            [](kv::KvCacheManager& self) { return self.storage().anyRemoteLevelFailed(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def_prop_ro("pool_group_descs",
             [](kv::KvCacheManager const& self)

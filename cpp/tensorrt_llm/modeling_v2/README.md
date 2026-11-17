@@ -5,10 +5,10 @@
 
 This guide covers C++/CUDA code owned by a Modeling V2 family or target. For
 model development in general, see the
-[Modeling V2 guide](../../../tensorrt_llm/_torch/_experimental/modeling_v2/README.md).
+[Modeling V2 guide](../../../tensorrt_llm/_torch/modeling_v2/README.md).
 
 Native code lives next to the Python code that uses it, under
-`tensorrt_llm/_torch/_experimental/modeling_v2/models/`:
+`tensorrt_llm/_torch/modeling_v2/models/`:
 
 * `<family>/csrc/` holds the family's `CMakeLists.txt` and code shared by its
   targets.
@@ -17,7 +17,7 @@ Native code lives next to the Python code that uses it, under
 The build finds every `models/<family>/csrc/CMakeLists.txt` and builds one
 library per family, `libth_modeling_v2_<family>.so`, installed next to
 `libth_common.so`. Nothing in it is linked into the other TensorRT-LLM
-libraries. [`_native.py`](../../../tensorrt_llm/_torch/_experimental/modeling_v2/_native.py)
+libraries. [`_native.py`](../../../tensorrt_llm/_torch/modeling_v2/_native.py)
 loads the library only when routing selects one of the family's targets.
 Adding a family with native code does not require changes under `cpp/`.
 
@@ -35,10 +35,10 @@ This directory holds only what every family shares:
 
 ## Adding native code to a target
 
-Paths below are relative to `tensorrt_llm/_torch/_experimental/modeling_v2/`.
+Paths below are relative to `tensorrt_llm/_torch/modeling_v2/`.
 The steps use a target `foo_nvfp4__sm_103__tp4` in family `foo`. GPT-OSS is a
 small working example: see its
-[build file](../../../tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/csrc/CMakeLists.txt)
+[build file](../../../tensorrt_llm/_torch/modeling_v2/models/gpt_oss/csrc/CMakeLists.txt)
 and its target's `csrc/` directory.
 
 1. Declare the family and the target in `models/foo/csrc/CMakeLists.txt`:
@@ -72,7 +72,7 @@ and its target's `csrc/` directory.
    returned namespace:
 
    ```python
-   from tensorrt_llm._torch._experimental.modeling_v2._native import load_target_ops
+   from tensorrt_llm._torch.modeling_v2._native import load_target_ops
 
    native_ops = load_target_ops(__name__)  # torch.ops.mv2_foo_foo_nvfp4_sm_103_tp4
    ```

@@ -116,6 +116,7 @@ def test_optimized_two_pool_prefill_and_decode(
         register_to_config=False,
         use_gqa_decode_fmha=False,
         cache_context_plan=False,
+        offers_gated_fp8_out=False,
         _output_quant_flags=None,
         _use_quantize_output=lambda: False,
     )
@@ -174,10 +175,13 @@ def test_optimized_two_pool_prefill_and_decode(
                     with patch.object(
                         layer_attention, "forward", wraps=layer_attention.forward
                     ) as backend_forward:
+                        call_q, call_k, call_v = layer_inputs
                         layer_outputs.append(
                             Attention.forward_impl(
                                 module,
-                                *layer_inputs,
+                                call_q,
+                                call_k,
+                                call_v,
                                 metadata,
                                 PredefinedAttentionMask.CAUSAL,
                                 None,
@@ -205,8 +209,17 @@ def test_optimized_two_pool_prefill_and_decode(
                 patch.object(attention, "forward", side_effect=RuntimeError("backend failure")),
                 pytest.raises(RuntimeError, match="backend failure"),
             ):
+                call_q, call_k, call_v = inputs
                 Attention.forward_impl(
-                    module, *inputs, metadata, PredefinedAttentionMask.CAUSAL, None, None, None
+                    module,
+                    call_q,
+                    call_k,
+                    call_v,
+                    metadata,
+                    PredefinedAttentionMask.CAUSAL,
+                    None,
+                    None,
+                    None,
                 )
             assert metadata.kv_cache_manager is manager
             assert metadata.kv_layout == kv_layout
@@ -347,7 +360,10 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
         ].transpose(0, 1)
     expected_high[1] = values[:128].transpose(0, 1)
     pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, high))
-    convert_mixed_precision_kv(True, 130, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4)
+    call_pool, call_low, call_high = pools
+    convert_mixed_precision_kv(
+        True, 130, call_pool, call_low, call_high, tables, lengths, layout, low_dtype=DataType.NVFP4
+    )
     # Compare complete records so padding and untouched pages must retain their sentinel.
     for actual, expected in ((low, expected_low), (high, expected_high)):
         torch.testing.assert_close(
@@ -361,15 +377,33 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     expected = values.clone()
     expected[128:130] = restored[128:130].to(dtype)
     lengths[0].fill_(130)
+    call_pool, call_low, call_high = pools
     convert_mixed_precision_kv(
-        False, 192, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+        False,
+        192,
+        call_pool,
+        call_low,
+        call_high,
+        tables,
+        lengths,
+        layout,
+        low_dtype=DataType.NVFP4,
     )
     actual = pool.transpose(1, 2).reshape_as(values)
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
     compiled = dict(kernels._compiled_kernels)
     for capacity in (129, 192):
+        call_pool, call_low, call_high = pools
         convert_mixed_precision_kv(
-            False, capacity, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+            False,
+            capacity,
+            call_pool,
+            call_low,
+            call_high,
+            tables,
+            lengths,
+            layout,
+            low_dtype=DataType.NVFP4,
         )
     assert kernels._compiled_kernels == compiled
     # A small pass makes every thread loop over several tokens; the result must not change.
@@ -377,8 +411,17 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     original_pass = kernels._PagedMixedPrecisionKV.tokens_per_pass
     kernels._PagedMixedPrecisionKV.tokens_per_pass = 8
     try:
+        call_pool, call_low, call_high = pools
         convert_mixed_precision_kv(
-            False, 192, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+            False,
+            192,
+            call_pool,
+            call_low,
+            call_high,
+            tables,
+            lengths,
+            layout,
+            low_dtype=DataType.NVFP4,
         )
     finally:
         kernels._PagedMixedPrecisionKV.tokens_per_pass = original_pass
