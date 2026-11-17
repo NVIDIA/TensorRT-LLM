@@ -250,6 +250,44 @@ _MX_CASES = (
         id="qwen3-moe-bf16-tp2-ep2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_DEEPSEEK_V3_MODEL",
+            default_model_subdir="DeepSeek-V3-Lite/bf16",
+            repository_cache_prefix="models--trtllm-mx-e2e--deepseek-v3-tp1",
+            tp_size=1,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="deepseek-v3-bf16-tp1",
+        # Each role holds roughly 51 GiB (54 GB) of BF16 weights on one GPU; memory
+        # profiling peaks at about 53 GiB.
+        marks=[pytest.mark.skip_less_device(2), pytest.mark.skip_less_device_memory(80000)],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_DEEPSEEK_V3_MODEL",
+            default_model_subdir="DeepSeek-V3-Lite/bf16",
+            repository_cache_prefix="models--trtllm-mx-e2e--deepseek-v3-tp2",
+            tp_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="deepseek-v3-bf16-tp2",
+        # Each role holds roughly 26 GiB of BF16 weights per GPU.
+        marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(40000)],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_DEEPSEEK_V3_MODEL",
+            default_model_subdir="DeepSeek-V3-Lite/bf16",
+            repository_cache_prefix="models--trtllm-mx-e2e--deepseek-v3-tp2-ep2",
+            tp_size=2,
+            moe_ep_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="deepseek-v3-bf16-tp2-ep2",
+        # Each role holds roughly 26 GiB of BF16 weights per GPU.
+        marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(40000)],
+    ),
 )
 
 

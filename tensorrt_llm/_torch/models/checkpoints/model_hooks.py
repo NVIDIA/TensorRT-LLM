@@ -83,6 +83,25 @@ def setup_aliases(model: nn.Module) -> None:
             module_setup_aliases()
 
 
+def prepare_post_transform_receiver(model: nn.Module) -> None:
+    """Prepare a staged post-transform receiver before its weights arrive.
+
+    Runs `setup_aliases()` on every module, then
+    `setup_post_transform_receiver_aliases()` on every module that defines it.
+    The second hook restores aliases that a model's weight loader creates,
+    because a staged receiver gets its weights without running that loader.
+    Only the MX receiver of a qualified root calls this; every other load path,
+    including GMS read-only peers, runs `setup_aliases()` alone.
+    """
+    setup_aliases(model)
+    for module in model.modules():
+        receiver_aliases: Optional[Callable[[], None]] = getattr(
+            module, "setup_post_transform_receiver_aliases", None
+        )
+        if receiver_aliases is not None and not getattr(module, "_weights_removed", False):
+            receiver_aliases()
+
+
 def mark_weights_transformed(model: nn.Module) -> None:
     """Mark modules with a transform guard as already transformed.
 
