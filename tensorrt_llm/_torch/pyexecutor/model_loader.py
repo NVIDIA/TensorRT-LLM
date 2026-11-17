@@ -3,9 +3,11 @@
 
 import copy
 import os
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
@@ -79,6 +81,7 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
+_WEIGHT_LOAD_THREADS_ENV = "TLLM_WEIGHT_LOAD_THREADS"
 
 # TorchLlmArgs fields that only the model classes listing them in
 # `model_specific_llm_args` implement.
@@ -629,6 +632,52 @@ def construct_checkpoint_loader(
         **extra_kwargs)
 
     return checkpoint_loader
+
+
+def _weight_load_num_threads() -> Optional[int]:
+    """Threads ``TLLM_WEIGHT_LOAD_THREADS`` asks for, capped at usable CPUs."""
+    value = os.environ.get(_WEIGHT_LOAD_THREADS_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        requested = int(value)
+    except ValueError as error:
+        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                         f"integer, got {value!r}") from error
+    if requested <= 0:
+        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                         f"integer, got {value!r}")
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    return min(requested, available)
+
+
+@contextmanager
+def _weight_load_threads() -> Iterator[None]:
+    """Run this thread's load on ``TLLM_WEIGHT_LOAD_THREADS`` torch threads.
+
+    Unset keeps the process's count. Only raises; restores on exit and on error.
+    """
+    requested = _weight_load_num_threads()
+    previous = torch.get_num_threads()
+    if requested is None or requested <= previous:
+        yield
+        return
+    logger.info(f"Weight loading uses {requested} torch threads (was "
+                f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
+    try:
+        torch.set_num_threads(requested)
+        # New threads start from torch's process-wide count; set it back from
+        # another thread so this one keeps the raise and loader pools do not.
+        setter = threading.Thread(target=torch.set_num_threads,
+                                  args=(previous, ))
+        setter.start()
+        setter.join()
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _inspect_shadow_weight_load_plan(
@@ -1454,18 +1503,19 @@ class ModelLoader:
                                          checkpoint_dir)
         if load_format == LoadFormat.AUTO:
             # read the checkpoint with the checkpoint loader, built-in or custom
-            self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
-                checkpoint_loader,
-                checkpoint_dir,
-                model_config=model_config,
-                model=model,
-                mapping=self.mapping,
-                llm_args=self.llm_args,
-                spec_config=self.spec_config,
-                source_identity=source_identity,
-                qualification=post_transform_qualification,
-                metrics=self._metrics,
-                startup_metadata=self._startup_metadata)
+            with _weight_load_threads():
+                self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+                    checkpoint_loader,
+                    checkpoint_dir,
+                    model_config=model_config,
+                    model=model,
+                    mapping=self.mapping,
+                    llm_args=self.llm_args,
+                    spec_config=self.spec_config,
+                    source_identity=source_identity,
+                    qualification=post_transform_qualification,
+                    metrics=self._metrics,
+                    startup_metadata=self._startup_metadata)
             if not weights_preloaded:
                 self._checkpoint_dirs_read.append(weights_checkpoint_dir)
             if loads_draft_weights:
