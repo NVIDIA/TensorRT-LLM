@@ -23,6 +23,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.attention import (
+    Attention,
     _helix_nccl_post_alltoall,
     _helix_nccl_pre_alltoall,
     _helix_post_process,
@@ -505,7 +506,8 @@ class TestHelixZeroKvMask(unittest.TestCase):
     speculative decoding), where num_tokens != num_seqs.
     """
 
-    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self):
+    @parameterized.expand([(False,), (True,)])
+    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self, is_cuda_graph):
         from tensorrt_llm._torch.attention.mla import MLA
 
         num_tokens = 3
@@ -517,7 +519,7 @@ class TestHelixZeroKvMask(unittest.TestCase):
             _helix_spec_tokens_valid=True,
             num_contexts=0,
             num_generations=1,
-            is_cuda_graph=False,
+            is_cuda_graph=is_cuda_graph,
         )
         attn_backend = Mock()
         attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
@@ -540,6 +542,25 @@ class TestHelixZeroKvMask(unittest.TestCase):
         generic_mask.assert_not_called()
         actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
         torch.testing.assert_close(actual_mask, helix_kv_bounds == 0)
+        assert post_process.call_args.kwargs["is_cuda_graph"] is is_cuda_graph
+
+    @parameterized.expand([(False,), (True,)])
+    def test_attention_forwards_zero_kv_mask_and_cuda_graph_flag(self, is_cuda_graph):
+        num_tokens = 3
+        attn = SimpleNamespace(mapping=Mock(), num_heads_tp_cp=2, head_dim=4)
+        attn_metadata = SimpleNamespace(is_cuda_graph=is_cuda_graph)
+        partial_o = torch.empty(num_tokens, 8)
+        softmax_stats = torch.empty(num_tokens, 2, 2)
+
+        with (
+            patch("tensorrt_llm._torch.attention.attention._helix_zero_kv_mask") as generic_mask,
+            patch("tensorrt_llm._torch.attention.attention._helix_post_process") as post_process,
+        ):
+            Attention._helix_post_process(attn, partial_o, softmax_stats, attn_metadata)
+
+        generic_mask.assert_called_once_with(attn_metadata, num_tokens)
+        assert post_process.call_args.kwargs["zero_kv_mask"] is generic_mask.return_value
+        assert post_process.call_args.kwargs["is_cuda_graph"] is is_cuda_graph
 
     def test_single_token_per_seq(self):
         # Plain decode: one token per sequence, so per-seq == per-token.
@@ -686,12 +707,16 @@ class TestHelixNcclReformatCompile(unittest.TestCase):
         assert self._num_compiled(_helix_nccl_post_alltoall) == 0
 
     def test_every_cuda_graph_shape_compiles(self):
-        num_shapes = torch._dynamo.config.recompile_limit + 1
-        for num_tokens in range(1, num_shapes + 1):
-            inputs = self._make_inputs(num_tokens)
-            graph_output = self._post_process(inputs, is_cuda_graph=True)
-            eager_output = self._post_process(inputs, is_cuda_graph=False)
-            torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+        # Pin the process-wide limit to dynamo's default: other test modules
+        # collected into the same process can raise it at import time.
+        recompile_limit = 8
+        num_shapes = recompile_limit + 1
+        with torch._dynamo.config.patch(recompile_limit=recompile_limit):
+            for num_tokens in range(1, num_shapes + 1):
+                inputs = self._make_inputs(num_tokens)
+                graph_output = self._post_process(inputs, is_cuda_graph=True)
+                eager_output = self._post_process(inputs, is_cuda_graph=False)
+                torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
         assert self._num_compiled(_helix_nccl_pre_alltoall) == num_shapes
         assert self._num_compiled(_helix_nccl_post_alltoall) == num_shapes
 
