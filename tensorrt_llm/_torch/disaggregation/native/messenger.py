@@ -193,12 +193,12 @@ class FrameSigner:
         """Verify ``[*payload, header, mac]`` and return the payload and header.
 
         Raises:
-            FrameAuthenticationError: The message is malformed, uses an unknown
-                key id, was sent on the other flow or to another recipient, or
-                its MAC does not match.
+            FrameAuthenticationError: The message is malformed, has no payload
+                frame, uses an unknown key id, was sent on the other flow or to
+                another recipient, or its MAC does not match.
         """
-        if len(frames) < 2:
-            raise FrameAuthenticationError("Message carries no authentication frames")
+        if len(frames) < 3:
+            raise FrameAuthenticationError("Message carries no payload or no authentication frames")
         payload, header, mac = frames[:-2], frames[-2], frames[-1]
         # Cheap structural checks first; the MAC is computed only for
         # well-formed headers that name a known key.

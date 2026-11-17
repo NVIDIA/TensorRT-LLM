@@ -245,6 +245,11 @@ def test_frame_signer_rejects_malformed_auth_frames():
             _verify(message)
 
 
+def test_frame_signer_rejects_message_without_payload():
+    with pytest.raises(FrameAuthenticationError, match="no payload"):
+        _verify(_signed([]))
+
+
 def test_frame_signer_rotation_accepts_every_configured_key():
     old = _signer({1: _KEY}, 1)
     rolling = _signer({1: _KEY, 2: _OTHER_KEY}, 2)

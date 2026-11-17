@@ -3,6 +3,7 @@
 """Control-plane frame authentication wired through the native transfer layer."""
 
 import threading
+import time
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
@@ -129,3 +130,21 @@ def test_signed_server_drops_forged_rank_info_request():
         auth_failures = server._messenger.auth_failures
     assert auth_failures == 1
     server._rank_info.to_bytes.assert_not_called()
+
+
+def test_signed_server_drops_message_without_payload_and_keeps_serving():
+    with _rank_info_server(_MASTER_KEY) as server:
+        auth_frames = _make_native_frame_signer(_MASTER_KEY).sign(
+            [],
+            sender_id=_RECEIVER_ENDPOINT.encode(),
+            recipient_id=server.endpoint.encode(),
+            flow=FrameSigner.FLOW_TO_ROUTER,
+        )
+        with ZMQMessenger("DEALER", server.endpoint, signer=None) as raw:
+            raw.send(auth_frames)
+            deadline = time.monotonic() + 5
+            while server._messenger.auth_failures < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+        _fetch(_make_receiver(_MASTER_KEY), server)
+        auth_failures = server._messenger.auth_failures
+    assert auth_failures == 1
