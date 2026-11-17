@@ -20,6 +20,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
+from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
@@ -186,6 +187,17 @@ class PackedSplitResolver(NamedTuple):
     decide: Callable[[int, int, List[int]], bool]
 
 
+def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
+    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it."""
+    if getattr(spec_metadata, "is_all_greedy_sample", True):
+        return "greedy"
+    # The one-engine fast paths' flag, or the vocabulary-shard sampler's.
+    if (getattr(spec_metadata, "temperature_only", False)
+            or spec_metadata.is_all_temperature_only):
+        return "temperature_only"
+    return "advanced"
+
+
 def _save_spec_decode_capture_state(
         attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
     if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
@@ -271,6 +283,8 @@ class CUDAGraphRunnerConfig:
     stage_decode_inputs: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    # One-engine sampling variants that have graphs (cuda_graph_config.sampling_variants); None for all.
+    sampling_variants: Optional[frozenset[str]] = None
     static_input_ids: Optional[torch.Tensor] = None
     """The decoder runner's own int32 input-id buffer. When given (with
     ``static_position_ids``), the graphs' static inputs are views of the
@@ -347,6 +361,8 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
+        # Keys of the graphs that captured host functions.
+        self._hostfunc_graph_keys: set[KeyType] = set()
         self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         # (batch, every rank's sampling mode) when the padding exchange carried one.
@@ -355,6 +371,7 @@ class CUDAGraphRunner:
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        self.forward_scratch_buffers = Buffers()
         if self.enabled:
             self._create_shared_static_tensors()
         self.cuda_graph_meta_buffers = (Buffers()
@@ -651,13 +668,11 @@ class CUDAGraphRunner:
         # both variants and dispatch at replay based on actual batch state.
         # Default to True (greedy fast-path) when the metadata doesn't carry
         # this field (non-one-engine paths or non-spec batches).
-        is_all_greedy_sample = bool(
-            getattr(spec_metadata, "is_all_greedy_sample", True))
-        # The temperature-only variant of the advanced-sampling graphs: the
-        # one-engine fast paths' flag, or the vocabulary-shard sampler's.
-        temperature_only = not is_all_greedy_sample and (
-            bool(getattr(spec_metadata, "temperature_only", False))
-            or spec_metadata.is_all_temperature_only)
+        # maybe_get_cuda_graph checks the same variant against the captured ones.
+        variant = sampling_variant(spec_metadata)
+        is_all_greedy_sample = variant == "greedy"
+        # The temperature-only variant of the advanced-sampling graphs.
+        temperature_only = variant == "temperature_only"
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -1040,7 +1055,19 @@ class CUDAGraphRunner:
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
-        can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
+        # A batch of an uncaptured sampling variant runs eagerly; under attention
+        # DP the agreement below then takes every rank's step eager with it.
+        can_run_cuda_graph = (
+            self._can_run_cuda_graph_batch(batch) and
+            (spec_metadata is None or self.config.sampling_variants is None or
+             sampling_variant(spec_metadata) in self.config.sampling_variants))
+        if can_run_cuda_graph and getattr(
+                attn_metadata, "beam_shared_prefix_enabled", False) is True:
+            # A beam longer than the library's captured tail runs this step eagerly.
+            from ..attention.backends.fmha.beam_shared_prefix import \
+                tail_exceeds_cuda_graph
+            can_run_cuda_graph = not tail_exceeds_cuda_graph(
+                batch.generation_requests)
         batch_size = batch.batch_size
         (shapes_agree, forced_sample_type, forced_kv_regime,
          forced_packed_split) = self._agree_graph_shape(
@@ -1092,8 +1119,11 @@ class CUDAGraphRunner:
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, key.draft_len,
-            self.cuda_graph_meta_buffers)
+            num_sequences_in_batch,
+            False,
+            key.draft_len,
+            self.cuda_graph_meta_buffers,
+            forward_scratch_buffers=self.forward_scratch_buffers)
         if key.kv_regime is not None:
             # The decode captured in this graph chooses its kernels on the
             # regime ceiling, an upper bound of the live KV, instead of the
@@ -1167,13 +1197,24 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
-    def capture(self,
-                key: KeyType,
-                forward_fn: Callable,
-                initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up and/or capture the forward pass for a graph key."""
+    def capture(
+        self,
+        key: KeyType,
+        forward_fn: Callable,
+        initial_inputs: Dict[str, Any],
+        enable_spec_decode: bool = False,
+        postprocess_fn: Optional[Callable] = None,
+        capture_scope: Callable[
+            [], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        record_tensor_ptrs: bool = False,
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key.
+
+        ``capture_scope`` encloses the graph capture but not the warmup
+        forwards before it. It is entered before the stream capture begins, so
+        it may switch the MoE communication timeouts. ``record_tensor_ptrs``
+        records the graph's metadata tensor addresses for moved_graph_tensors().
+        """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -1260,7 +1301,8 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            with nccl_window_graph_capture(
+            num_hostfuncs = len(HOSTFUNC_USER_DATA_HANDLES)
+            with capture_scope(), nccl_window_graph_capture(
                     graph, graph_pool, stream=self._priority_capture_stream()):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
@@ -1268,8 +1310,10 @@ class CUDAGraphRunner:
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
-            # The addresses the graph baked in, for the strict buffer check.
-            self._record_strict_buffer_snapshot(key)
+            if len(HOSTFUNC_USER_DATA_HANDLES) > num_hostfuncs:
+                self._hostfunc_graph_keys.add(key)
+            if record_tensor_ptrs or _STRICT_BUFFER_CHECK:
+                self._record_graph_tensor_ptrs(key)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -1445,6 +1489,8 @@ class CUDAGraphRunner:
         finally:
             if prologue_pack is not None:
                 prologue_pack.on_graph_replay()
+        if key in self._hostfunc_graph_keys:
+            record_hostfunc_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1465,20 +1511,23 @@ class CUDAGraphRunner:
 
         These are the addresses the captured graph's kernels may have baked
         in; any of them changing before a later replay means the graph would
-        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped,
+        and an object without a __dict__ records nothing.
         """
         graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
         return {
             name: value.data_ptr()
-            for name, value in vars(obj).items()
+            for name, value in getattr(obj, "__dict__", {}).items()
             if isinstance(value, torch.Tensor) and value.is_cuda
             and name not in graph_temporary_attrs
         }
 
     @staticmethod
-    def _assert_graph_tensor_ptrs_stable(obj: Any,
-                                         expected_ptrs: Dict[str, int]) -> None:
-        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
+    def _moved_graph_tensors(
+            obj: Any,
+            expected_ptrs: Dict[str, int]) -> Iterator[Tuple[str, Any, int]]:
+        """Yield (name, live value, captured data_ptr) for each tensor captured by
+        _snapshot_graph_tensor_ptrs that is no longer at its captured address.
 
         Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
         to draft KV cache buffers for the duration of a draft replay, so their
@@ -1489,25 +1538,47 @@ class CUDAGraphRunner:
         for name, expected_ptr in expected_ptrs.items():
             value = (swapped_attrs[name] if name in swapped_attrs else getattr(
                 obj, name, None))
+            if (not isinstance(value, torch.Tensor)
+                    or value.data_ptr() != expected_ptr):
+                yield name, value, expected_ptr
+
+    @staticmethod
+    def _assert_graph_tensor_ptrs_stable(obj: Any,
+                                         expected_ptrs: Dict[str, int]) -> None:
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        for name, value, expected_ptr in CUDAGraphRunner._moved_graph_tensors(
+                obj, expected_ptrs):
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."
                     f"{name}` was a tensor at capture time but is now "
                     f"{type(value).__name__}. Graph-visible buffers must be "
                     "updated in place, not rebound.")
-            if value.data_ptr() != expected_ptr:
-                raise RuntimeError(
-                    f"CUDA graph metadata tensor `{type(obj).__name__}."
-                    f"{name}` was reallocated between capture and replay "
-                    f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
-                    "Graph-visible buffers must be updated in place; "
-                    "rebinding invalidates addresses baked into the captured "
-                    "CUDA graph.")
+            raise RuntimeError(
+                f"CUDA graph metadata tensor `{type(obj).__name__}."
+                f"{name}` was reallocated between capture and replay "
+                f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
+                "Graph-visible buffers must be updated in place; "
+                "rebinding invalidates addresses baked into the captured "
+                "CUDA graph.")
 
-    def _record_strict_buffer_snapshot(self, key: KeyType) -> None:
-        """Snapshot graph-visible tensor addresses for key, if strict checking is enabled."""
-        if not _STRICT_BUFFER_CHECK:
-            return
+    def moved_graph_tensors(self) -> List[str]:
+        """Name each graph-visible metadata tensor that moved since its graph was captured."""
+        moved = []
+        for key, stored_meta in self.graph_metadata.items():
+            for owner in ("attn_metadata", "spec_metadata"):
+                expected_ptrs = stored_meta.get(f"{owner}_ptrs")
+                if expected_ptrs is None:
+                    continue
+                obj = stored_meta[owner]
+                moved.extend(f"{type(obj).__name__}.{name} (graph batch size "
+                             f"{key.batch_size}, draft length {key.draft_len})"
+                             for name, _, _ in self._moved_graph_tensors(
+                                 obj, expected_ptrs))
+        return moved
+
+    def _record_graph_tensor_ptrs(self, key: KeyType) -> None:
+        """Snapshot the graph-visible tensor addresses the graph for key baked in."""
         stored_meta = self.graph_metadata[key]
         stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
             stored_meta["attn_metadata"])
@@ -2024,6 +2095,8 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.forward_scratch_buffers.buffers.clear()
+        self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()

@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_k3_family_native_ops():
-    package = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+    package = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
     for target in (
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4",
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1",
