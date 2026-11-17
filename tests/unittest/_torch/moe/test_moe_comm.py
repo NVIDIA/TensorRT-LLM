@@ -1223,6 +1223,9 @@ def _worker_nccl_ep_cuda_graph_replay(
     config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool | None = None
 ) -> dict:
     """Verify routing replay; a non-None fallback flag also requires the selected window path."""
+    # Keep torch.ops out of the globals serialized by cloudpickle.
+    import torch
+
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
