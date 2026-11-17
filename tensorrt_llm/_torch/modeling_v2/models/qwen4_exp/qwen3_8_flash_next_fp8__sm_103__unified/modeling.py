@@ -97,29 +97,29 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import (
     NoTarget,
     engine_kv_cache_quant_algo,
     step_contract_enabled,
 )
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    fused_qk_norm_rope,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
     thop_attention,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
-from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import (
-    allreduce,
-    allreduce_group_args,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import (
-    eager_on_graph,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
     fused_sigmoid_mul_inplace,
 )
@@ -222,9 +222,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.rms_norm_gated_to
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (
     ple_gate_conv_inject_norm,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (
-    ple_ngram_embed,
-)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import ple_ngram_embed
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.bf16_to_fp32 import (
     bf16_to_fp32,
 )
@@ -244,13 +242,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_rows_ga
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (
     gdn_prefill_conv_post,
 )
-from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.linear import TensorParallelMode

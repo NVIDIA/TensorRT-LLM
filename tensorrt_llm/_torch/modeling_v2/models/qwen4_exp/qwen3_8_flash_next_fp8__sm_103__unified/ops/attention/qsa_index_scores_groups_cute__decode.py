@@ -25,11 +25,11 @@ from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
     qsa_paged_index_scores as _family_index_scores,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .qsa_sparse_gqa_splitk_cute__decode import (
     _asm,

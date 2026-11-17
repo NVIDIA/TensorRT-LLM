@@ -16,19 +16,11 @@ from typing import NamedTuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_erf import (
-    gelu_erf,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_tanh import (
-    gelu_tanh,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.layer_norm import (
-    layer_norm,
-)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_erf import gelu_erf
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_tanh import gelu_tanh
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.layer_norm import layer_norm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.vision.patch_embed_conv3d import (
     patch_embed_conv3d,
 )

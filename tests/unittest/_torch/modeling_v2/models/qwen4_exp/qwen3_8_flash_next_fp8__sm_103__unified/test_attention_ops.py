@@ -14,6 +14,9 @@ import cuda.bindings.driver as cuda_drv
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    triton_qsa_generation_token_mapping,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
     qsa_topk_expand_decode as family_op,
 )
@@ -86,9 +89,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.attention.qwen4_exp_attn_decode_prologue__decode import (  # noqa: E501
     qwen4_exp_attn_decode_prologue as _pro_op,
-)
-from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
-    triton_qsa_generation_token_mapping,
 )
 
 __extra_import_path__ = ["../../.."]

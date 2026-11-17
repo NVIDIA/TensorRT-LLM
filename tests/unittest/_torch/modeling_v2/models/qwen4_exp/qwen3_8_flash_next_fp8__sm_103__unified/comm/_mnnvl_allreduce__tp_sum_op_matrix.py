@@ -125,9 +125,7 @@ def _run_one_mpi_rank() -> int:
     from _validating import validating as _validating_cm
 
     MPI_RANK = _lockstep.Rank(_lockstep.parse_args(sys.argv[1:]))
-    from tensorrt_llm._torch.modeling_v2.catalog.comm import (
-        allreduce as allreduce_mod,
-    )
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allreduce as allreduce_mod
     from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified import (  # noqa: E501
         modeling as _modeling,
     )

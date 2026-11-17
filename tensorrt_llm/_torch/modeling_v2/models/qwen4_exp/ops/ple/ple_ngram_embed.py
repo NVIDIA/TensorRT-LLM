@@ -31,12 +31,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (
-    ngram_hash,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import (
-    warm_variants,
-)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import ngram_hash
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import warm_variants
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (
     DEP4_SLOTS,
     TEP4_SLOTS,

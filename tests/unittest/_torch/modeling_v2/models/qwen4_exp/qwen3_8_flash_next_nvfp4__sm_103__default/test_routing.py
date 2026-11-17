@@ -15,12 +15,12 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import ple_host_table, routing
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as M,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MoeConfig,

@@ -10,12 +10,11 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
 # surface; its row-count PDL policy is reached as Python. The split-K buckets are this
 # entry's own: an NVFP4 tile needs 16 tokens where the bf16 one takes 64.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.

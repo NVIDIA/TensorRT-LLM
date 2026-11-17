@@ -22,11 +22,11 @@ from typing import NamedTuple
 
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from ... import native_ops
 from .fp8_block_scale_moe_runner import dequantize_block_weight, requantize_1x128

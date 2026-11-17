@@ -18,12 +18,12 @@ import torch
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode as _family_topk,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: Consecutive scores a thread holds per slab (one 16-byte load).
 KPT = 4

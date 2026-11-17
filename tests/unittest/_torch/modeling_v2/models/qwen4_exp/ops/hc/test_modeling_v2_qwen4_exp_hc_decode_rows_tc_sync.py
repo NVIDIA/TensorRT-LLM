@@ -23,7 +23,7 @@ import pytest
 import tensorrt_llm
 
 _QWEN4_EXP = Path(tensorrt_llm.__file__).parent.joinpath(
-    "_torch", "_experimental", "modeling_v2", "models", "qwen4_exp"
+    "_torch", "modeling_v2", "models", "qwen4_exp"
 )
 _FAMILY = _QWEN4_EXP / "ops" / "hc" / "qwen4_exp_hc_decode_rows_tc.py"
 _FP8_TARGET = (

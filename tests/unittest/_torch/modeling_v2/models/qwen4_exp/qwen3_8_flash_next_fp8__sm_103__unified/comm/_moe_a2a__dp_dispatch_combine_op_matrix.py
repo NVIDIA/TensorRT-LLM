@@ -24,10 +24,7 @@ NUM_EXPERTS = 512
 TOPK = 10
 
 _MODELING_V2_TESTS = Path(__file__).resolve().parents[4]
-_TARGET = (
-    "tensorrt_llm._torch.modeling_v2.models.qwen4_exp."
-    "qwen3_8_flash_next_fp8__sm_103__unified"
-)
+_TARGET = "tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified"
 
 # Bound inside the rank body: importing the entry pulls in tensorrt_llm, which calls MPI_Init at
 # import, and the launcher must stay free of MPI and CUDA state.

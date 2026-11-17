@@ -27,12 +27,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as _fw
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 from ..gemm import low_m_bf16_mm__decode as _lowm
 

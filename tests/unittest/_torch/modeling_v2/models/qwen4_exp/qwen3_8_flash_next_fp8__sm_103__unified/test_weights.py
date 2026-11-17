@@ -16,10 +16,10 @@ import pytest
 import torch
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified import (  # noqa: E501
     weights as WT,
 )
-from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.models.modeling_utils import duplicate_kv_weight
 from tensorrt_llm.mapping import Mapping
 

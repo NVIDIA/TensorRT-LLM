@@ -31,13 +31,13 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
     _asm,
     _mapa,
     _sigmoid,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 #: This checkpoint's hyper-connection bottleneck width.
 RANK = 320

@@ -19,12 +19,7 @@ from flashinfer.gemm.kernels import dense_bf16_gemm_direct as _fi_direct
 from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as _fi_warp
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 
 class _Plan(NamedTuple):

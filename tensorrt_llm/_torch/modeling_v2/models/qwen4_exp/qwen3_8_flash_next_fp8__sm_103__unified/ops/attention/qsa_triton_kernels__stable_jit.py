@@ -19,15 +19,15 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    triton_qsa_paged_kv_store,
+    triton_qsa_paged_sparse_gqa,
+)
 from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import (
     compile_only,
     first_time,
     mark_warmed,
-)
-from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
-    triton_qsa_paged_kv_store,
-    triton_qsa_paged_sparse_gqa,
 )
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 from tensorrt_llm._utils import get_sm_version

@@ -39,8 +39,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .qsa_sparse_gqa_splitk_cute__decode import (
     MAX_SPLITS,
