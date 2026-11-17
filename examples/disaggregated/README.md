@@ -283,8 +283,10 @@ communicating peers must use the same key. The MPI launcher reads it from the
 disaggregated serving config; separately launched servers read their own configs.
 Without a key, workers warn and keep the unauthenticated control plane.
 No key is generated automatically, and configured peers never downgrade to
-unauthenticated messages. Use at least 16 bytes; 32 random bytes are recommended
-(for example `openssl rand -hex 32`).
+unauthenticated messages. The key must be at least 16 bytes; 32 random bytes are
+recommended (for example `openssl rand -hex 32`). A native transfer worker that is
+given a shorter key fails at startup with an error that names
+`internal_request_auth_key`.
 
 With a key, every native control message between context and generation workers
 (RankInfo exchange and reply, peer registration, KV/aux transfer results, cancels)
@@ -299,15 +301,17 @@ so a captured control message replayed later is dropped as well.
 Upgrade communicating context and generation workers together before enabling
 native authentication. Existing deployments that already set
 `internal_request_auth_key` for HTTP hand-off signing enable native authentication
-on upgrade as well. Set the same key on all communicating context/generation
-workers, or leave it unset on all of them; mixed configurations fail at the first
-RankInfo exchange with an error that names `internal_request_auth_key`, either
-because the reply fails verification or because the exchange times out. The
-exchange times out when the context worker has a key and the generation worker
-has a different key or none. Every request that needs that context worker then
-waits for the full RankInfo deadline described below before it fails, and the
-generation worker does not make progress on its other requests during that wait.
-Older workers without native authentication cannot talk to workers that have a key.
+on upgrade as well. Native transfer workers accepted a key shorter than 16 bytes
+before and now fail at startup with it, so replace such a key before upgrading.
+Set the same key on all communicating context/generation workers, or leave it
+unset on all of them; mixed configurations fail at the first RankInfo exchange with
+an error that names `internal_request_auth_key`, either because the reply fails
+verification or because the exchange times out. The exchange times out when the
+context worker has a key and the generation worker has a different key or none.
+Every request that needs that context worker then waits for the full RankInfo
+deadline described below before it fails, and the generation worker does not make
+progress on its other requests during that wait. Older workers without native
+authentication cannot talk to workers that have a key.
 
 For gRPC, `internal_request_auth_key` is now accepted and forwarded to native
 transfer workers; previously the serving command rejected this field in gRPC mode.
@@ -319,10 +323,11 @@ the key cannot exhaust it.
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
-server config and in each context/generation worker config. The proxy signs internal
-generation requests with this key, and generation workers reject request-supplied
-disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
-the internal handoff does not carry a valid signature.
+server config and in each context/generation worker config; native transfer workers
+require at least 16 bytes (see above). The proxy signs internal generation requests
+with this key, and generation workers reject request-supplied disaggregated metadata
+such as `ctx_info_endpoint` or `encoded_opaque_state` when the internal handoff does
+not carry a valid signature.
 
 
 #### Sending requests to the disaggregated server
