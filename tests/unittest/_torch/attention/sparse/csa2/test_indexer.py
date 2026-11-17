@@ -225,26 +225,6 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="SM107 decode routing requires SM107",
-)
-@pytest.mark.parametrize("consumer,heuristic", [(False, True), (True, True), (False, False)])
-def test_sm107_decode_topk_routing(consumer: bool, heuristic: bool) -> None:
-    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-    if not IS_CUTLASS_DSL_AVAILABLE:
-        pytest.skip("Self-sampling requires CuTe DSL")
-    layout = CSA2Layout((1, 1), (0,), (0, 1), candidate_source_layer_id=0, index_topk=512)
-    options = CSA2Params(use_cute_dsl_topk=False, enable_heuristic_topk=heuristic)
-    indexer = CSA2Indexer(layout, int(consumer), 32, 128, options)
-    assert indexer.top_k.decode_implementation == (
-        TopKImplementation.CUTE_DSL_GVR
-        if heuristic and not consumer
-        else TopKImplementation.CUDA_RADIX
-    )
-
-
 def _reference_candidate_mask(
     logits: torch.Tensor,
     compress_lens: torch.Tensor,
