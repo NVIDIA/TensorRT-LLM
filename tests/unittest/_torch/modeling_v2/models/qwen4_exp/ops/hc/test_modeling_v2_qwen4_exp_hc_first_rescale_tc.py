@@ -49,7 +49,9 @@ def _compare(out, ref) -> None:
             assert gate_ratio(got, want) <= 1.0, f"{gate_ratio(got, want):.4g}x the band"
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, bool]:
     rows, width, dtype = spec["rows"], HC_COUNT * HIDDEN, torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
     hc_out = (torch.randn(rows, width, generator=g, device=DEV) * 3.0).to(dtype)

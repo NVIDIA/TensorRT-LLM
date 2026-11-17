@@ -30,7 +30,9 @@ HIDDEN = 3584
 SF_COLS = HIDDEN // 32
 
 
-def _inputs(num_tokens: int, logit_scale: float = 2.5, seed: int = 0):
+def _inputs(
+    num_tokens: int, logit_scale: float = 2.5, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=gen, device="cuda") * logit_scale
     bias = torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.1

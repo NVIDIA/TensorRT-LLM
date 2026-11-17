@@ -190,7 +190,8 @@ def check_empty_slots_and_wide_rows() -> None:
         ranks.assert_bitwise(norm, two_step[0], f"{where}: norm_out vs finalize + hop")
         ranks.assert_bitwise(residual_out, two_step[1], f"{where}: residual_out")
         ref = entry.mnnvl_moe_finalize_hop.reference(per_rank, residual, gamma, EPS)
-        _compare(norm, residual_out, *ref, where)
+        call_ref_norm, call_ref_residual = ref
+        _compare(norm, residual_out, call_ref_norm, call_ref_residual, where)
         dist.barrier()
 
 
@@ -302,11 +303,21 @@ def check_cuda_graph_replays() -> None:
         torch.cuda.synchronize()
         norm, residual, draft_norm, draft_residual = state["outputs"]
         ref = entry.mnnvl_moe_finalize_hop.reference(per_rank, state["residual"], gamma, EPS)
-        _compare(norm, residual, *ref, f"replay {replay} verify rows={rows}")
+        call_ref_norm, call_ref_residual = ref
+        _compare(
+            norm, residual, call_ref_norm, call_ref_residual, f"replay {replay} verify rows={rows}"
+        )
         ref = entry.mnnvl_moe_finalize_hop.reference(
             per_rank_draft, residual[:draft_rows], gamma, EPS
         )
-        _compare(draft_norm, draft_residual, *ref, f"replay {replay} draft rows={draft_rows}")
+        call_ref_norm, call_ref_residual = ref
+        _compare(
+            draft_norm,
+            draft_residual,
+            call_ref_norm,
+            call_ref_residual,
+            f"replay {replay} draft rows={draft_rows}",
+        )
         ranks.assert_same_on_every_rank(draft_norm, f"replay {replay} draft step")
         assert ranks.workspace_addresses(MAPPING, HIDDEN) == addresses
         dist.barrier()
