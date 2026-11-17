@@ -30,11 +30,15 @@ build with the HALO-R kernels. HALO_R_TEST_NO_SKIP=1 turns a skip into a
 failure, as in ``test_halo_r_relay.py``.
 """
 
+import atexit
 import faulthandler
 import os
 import pickle
+import signal
 import sys
+import time
 import traceback
+from concurrent.futures import wait
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +70,13 @@ _ABORT_TOKENS = 32
 _REPLAY_HOT_RANKS = (1, 2, 3, 0)
 _EAGER_HOT_RANKS = (0, 1)
 _WORKER_TIMEOUT_S = 900
+# A rank's log starts with its pid; a failed rank writes the marker before it aborts the ranks.
+_PID_LINE = "HALO_R_RANK_PID "
+_FAILED_MARKER = "HALO_R_RANK_FAILED"
+# Log text that means the rank is failing or gone: the marker, a fatal signal, or the timeout dump.
+_FAILURE_TEXT = (_FAILED_MARKER, "Fatal Python error", "\nTimeout (")
+_POLL_S = 5
+_LOG_TAIL_LINES = 60
 
 
 class _CaptureFailure(Exception):
@@ -176,12 +187,35 @@ def _relay_counts(layer: Any) -> tuple[int, int]:
     return launches, copies + skips
 
 
-def _run_rank(unittest_root: str) -> tuple[int, list[str]]:
+_RANK_LOG = None
+
+
+def _redirect_output(log_dir: str) -> None:
+    """Send this rank's stdout and stderr, C++ and NCCL output included, to its own log file.
+
+    A rank's output otherwise reaches only the pytest process's file descriptors, which pytest
+    captures and drops if that process is killed. Fatal signals and the timeout dump go there too.
+    """
+    path = os.path.join(log_dir, f"rank{MPI.COMM_WORLD.Get_rank()}.log")
+    global _RANK_LOG
+    log = _RANK_LOG = open(path, "a", buffering=1)  # kept open for the life of the rank
+    log.write(f"{_PID_LINE}{os.getpid()}\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+    atexit.register(log.flush)
+    faulthandler.enable(file=log, all_threads=True)
+    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True, file=log)
+
+
+def _run_rank(unittest_root: str, log_dir: str) -> tuple[int, list[str]]:
     """Run every step on this EP rank; return (rank, errors).
 
-    ``unittest_root`` (tests/unittest) goes on sys.path for the shared MoE test utilities.
+    ``unittest_root`` (tests/unittest) goes on sys.path for the shared MoE test utilities; this
+    rank's output goes to ``log_dir``/rank<N>.log, which the pytest process reads on a failure.
     """
-    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
+    _redirect_output(log_dir)
     from tensorrt_llm._utils import mpi_rank
 
     if unittest_root not in sys.path:
@@ -199,7 +233,11 @@ def _run_rank(unittest_root: str) -> tuple[int, list[str]]:
         with torch.device(f"cuda:{rank}"):
             return rank, _run_steps(rank)
     except Exception:
+        # The pytest process is not in these ranks' MPI world, so the abort below ends the ranks
+        # but not the wait for their results: the marker tells it this rank failed.
+        print(_FAILED_MARKER, flush=True)
         traceback.print_exc()
+        sys.stderr.flush()
         MPI.COMM_WORLD.Abort(1)
         raise
     finally:
@@ -503,27 +541,103 @@ class _TwoLayerBody(torch.nn.Module):
         return torch.stack([moe(x, logits, all_rank_num_tokens=tokens) for moe in self.moes], dim=1)
 
 
+def _rank_logs(log_dir: Path) -> dict[int, str]:
+    logs = {}
+    for rank in range(_EP_SIZE):
+        path = log_dir / f"rank{rank}.log"
+        if path.exists():
+            logs[rank] = path.read_text(errors="replace")
+    return logs
+
+
+def _dead_ranks(logs: dict[int, str]) -> list[int]:
+    """Ranks whose log says they failed, or whose process is gone."""
+    dead = []
+    for rank, text in logs.items():
+        pids = [line[len(_PID_LINE) :] for line in text.splitlines() if line.startswith(_PID_LINE)]
+        gone = False
+        if pids:
+            try:
+                os.kill(int(pids[-1]), 0)
+            except ProcessLookupError:
+                gone = True
+        if gone or any(marker in text for marker in _FAILURE_TEXT):
+            dead.append(rank)
+    return dead
+
+
+def _end_ranks(logs: dict[int, str]) -> None:
+    """Kill the ranks that are still alive, so that a failure frees the GPUs at once."""
+    for text in logs.values():
+        for line in text.splitlines():
+            if line.startswith(_PID_LINE):
+                try:
+                    os.kill(int(line[len(_PID_LINE) :]), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def _wait_for_ranks(futures: list, log_dir: Path) -> list:
+    """Return every rank's result; fail fast, with the ranks' log tails, if a rank fails or hangs."""
+    deadline = time.monotonic() + _WORKER_TIMEOUT_S + 120
+    while True:
+        _, pending = wait(futures, timeout=_POLL_S)
+        if not pending:
+            return [future.result() for future in futures]
+        logs = _rank_logs(log_dir)
+        dead = _dead_ranks(logs)
+        if dead or time.monotonic() > deadline:
+            _end_ranks(logs)
+            tails = "\n".join(
+                f"--- rank {rank} ({log_dir / f'rank{rank}.log'}), last {_LOG_TAIL_LINES} lines:\n"
+                + "\n".join(text.splitlines()[-_LOG_TAIL_LINES:])
+                for rank, text in sorted(logs.items())
+            )
+            reason = (
+                f"ranks {dead} failed or exited" if dead else "the ranks did not finish in time"
+            )
+            pytest.fail(f"{reason}; {len(logs)} of {_EP_SIZE} rank logs:\n{tails}", pytrace=False)
+
+
 @pytest.mark.threadleak(enabled=False)  # the MPIPoolExecutor manager thread outlives the test
-def test_halo_r_breakable_cuda_graph() -> None:
+def test_halo_r_breakable_cuda_graph(tmp_path: Path) -> None:
     """Single-node CI runs it as one plain pytest process, which starts the four ranks itself.
 
     The ranks start as test_halo_r_relay.py starts them: an MPIPoolExecutor given the launch-queue
     environment. The SM and fabric checks run in the ranks; this process only counts devices.
+    Each rank writes its output to its own log under ``tmp_path``; this process polls the ranks and
+    fails with those logs as soon as one rank fails, exits or overruns.
     """
     if os.environ.get("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR") or MPI.COMM_WORLD.Get_size() > 1:
         _skip("starts its own four ranks; run it without trtllm-llmapi-launch or mpirun")
     if torch.cuda.device_count() < _EP_SIZE:
         _skip(f"needs {_EP_SIZE} GPUs")
     unittest_root = str(Path(__file__).resolve().parents[3])
-    # Outlasts the ranks' own timers, which start after the spawn and the tensorrt_llm import,
-    # so a hung rank dumps its stacks before this process exits.
-    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S + 240, exit=True)
+    # The last resort if this process itself hangs: it outlasts the rank timers and the poll's
+    # deadline, and writes its stacks to a file, since pytest drops captured output on an exit.
+    parent_log = open(tmp_path / "pytest_process.log", "a", buffering=1)
+    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S + 240, exit=True, file=parent_log)
+    # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
+    executor = MPIPoolExecutor(_EP_SIZE, env={"CUDA_SCALE_LAUNCH_QUEUES": "4x"})
+    finished = False
+    futures = []
     try:
-        # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
-        with MPIPoolExecutor(_EP_SIZE, env={"CUDA_SCALE_LAUNCH_QUEUES": "4x"}) as executor:
-            results = list(executor.map(_run_rank, [unittest_root] * _EP_SIZE))
+        futures = [
+            executor.submit(_run_rank, unittest_root, str(tmp_path)) for _ in range(_EP_SIZE)
+        ]
+        results = _wait_for_ranks(futures, tmp_path)
+        finished = True
     finally:
-        faulthandler.cancel_dump_traceback_later()
+        if finished:
+            executor.shutdown(wait=True)
+            faulthandler.cancel_dump_traceback_later()
+            parent_log.close()
+        else:
+            # The ranks are gone or killed: do not wait for them. The timer stays armed, so a
+            # hang while this process exits still ends with its stacks in pytest_process.log.
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False)
     skips = {error for _, errors in results for error in errors if error.startswith("skip: ")}
     if skips:
         _skip("; ".join(sorted(skips)))
