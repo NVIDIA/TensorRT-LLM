@@ -57,14 +57,16 @@ function bodyFor(report, run, serverUrl) {
     // One code block: each location on its own line, then the indented error kind and message.
     const shown = [];
     let size = 0;
-    for (const item of report.diagnostics.slice(0, 50)) {
+    for (const item of report.diagnostics) {
       const entry = escapeHtml(`${item.path}:${item.line}\n    [${item.name}] ${item.message}`);
       // GitHub limits a comment to 65536 characters.
       if (size + entry.length > 48000) break;
       shown.push(entry);
       size += entry.length + 1;
     }
-    lines.push(`<pre>${shown.join('\n')}</pre>`);
+    const list = `<pre>${shown.join('\n')}</pre>`;
+    // A long list is folded so that it does not fill the conversation page.
+    lines.push(count > 50 ? `<details><summary>Show the diagnostics</summary>\n\n${list}\n\n</details>` : list);
     if (shown.length < count) lines.push('', `Showing ${shown.length} of ${count} diagnostics.`);
   }
   lines.push('', `[Full reports and workflow logs](${serverUrl}/${run.repository.full_name}/actions/runs/${run.id})`);

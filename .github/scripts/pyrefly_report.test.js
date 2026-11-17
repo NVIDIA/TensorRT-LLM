@@ -200,6 +200,18 @@ test('diagnostics are listed in one code block, location first and message inden
     'tensorrt_llm/module.py:30\n    [parse-error] Parse error</pre>'));
 });
 
+test('more than 50 diagnostics are all listed, in a folded block', () => {
+  const state = harness();
+  const many = length => Array.from({length}, (_, index) => ({...finding, line: index + 1}));
+  state.report.diagnostics = many(50);
+  assert.ok(!bodyFor(state.report, state.run, 'https://github.com').includes('<details>'));
+  state.report.diagnostics = many(120);
+  const body = bodyFor(state.report, state.run, 'https://github.com');
+  assert.ok(body.includes('<details><summary>Show the diagnostics</summary>\n\n<pre>'));
+  assert.ok(body.includes('tensorrt_llm/module.py:120\n    [unknown-name] Unknown name `example`</pre>\n\n</details>'));
+  assert.ok(!body.includes('Showing'));
+});
+
 test('rendered diagnostics escape markup and keep long reports within the comment limit', () => {
   const state = harness();
   state.report.diagnostics = Array.from({length: 200}, () => ({...finding,
