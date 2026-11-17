@@ -107,7 +107,7 @@ class CommunicationFactory:
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
-           - NcclEP (if nccl-ep is available)
+           - NcclEP (if nccl-ep is available and NCCL supports the Device API)
            - DeepEP (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - DeepEPLowLatency (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - AllGather + ReduceScatter (fallback, always works)
@@ -295,7 +295,7 @@ class CommunicationFactory:
                 logger.info("Selected communication strategy: NcclEP")
                 return strategy
             except RuntimeError as e:
-                logger.debug(f"NcclEP not available: {e}")
+                logger.info(f"NcclEP not available: {e}")
         else:
             logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 

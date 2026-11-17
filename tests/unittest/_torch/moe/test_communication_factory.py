@@ -16,11 +16,15 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator, Sequence
+from enum import IntEnum
 from types import SimpleNamespace
+from typing import Any, NamedTuple
 from unittest.mock import Mock
 
 import pytest
 import torch
+from mpi4py import MPI
 from packaging.version import Version
 
 from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
@@ -31,6 +35,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -60,6 +65,20 @@ def _make_model_config(
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
     )
+
+
+_REAL_DEVICE_API_REASON = nccl_ep_utils.nccl_ep_device_api_unavailable_reason
+
+
+@pytest.fixture(autouse=True)
+def _stub_device_api_probe_supported(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Default to a platform with NCCL Device API; tests override for the unsupported case."""
+    _REAL_DEVICE_API_REASON.cache_clear()
+    monkeypatch.setattr(
+        nccl_ep_utils, "nccl_ep_device_api_unavailable_reason", lambda _mapping: None
+    )
+    yield
+    _REAL_DEVICE_API_REASON.cache_clear()
 
 
 def _strategy_unavailable(*args, **kwargs):
@@ -717,3 +736,299 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+# Fake NCCL / MPI so the real Device API probe runs without a GPU or an MPI launcher.
+_UNSET: Any = object()
+
+
+class _FakeNcclGinType(IntEnum):
+    NONE = 0
+    GDAKI = 1
+
+
+class _FakeNcclInvalid(Exception):
+    pass
+
+
+class _FakeMapping(NamedTuple):
+    pp_rank: int
+    moe_ep_rank: int
+    moe_ep_group_pg: object
+
+
+class _FakeMpiComm:
+    """Single-process MPI communicator whose peers contribute ``peer_values`` to reductions."""
+
+    def __init__(
+        self,
+        rank: int = 0,
+        size: int = 2,
+        peer_values: Sequence[int] = (),
+        bcast_result: Any = _UNSET,
+    ) -> None:
+        self.rank = rank
+        self.size = size
+        self.peer_values = tuple(peer_values)
+        self.bcast_result = bcast_result
+        self.children: list[_FakeMpiComm] = []
+        self.freed = False
+
+    def Split(self, _color: int, _key: int) -> _FakeMpiComm:
+        child = _FakeMpiComm(self.rank, self.size, self.peer_values, self.bcast_result)
+        self.children.append(child)
+        return child
+
+    def Get_rank(self) -> int:
+        return self.rank
+
+    def Get_size(self) -> int:
+        return self.size
+
+    def bcast(self, value: Any, root: int = 0) -> Any:
+        return value if self.bcast_result is _UNSET else self.bcast_result
+
+    def allreduce(self, value: int, op: Any = None) -> int:
+        values = [value, *self.peer_values]
+        if op == MPI.MIN:
+            return min(values)
+        if op == MPI.MAX:
+            return max(values)
+        if op == MPI.SUM:
+            return sum(values)
+        raise AssertionError(f"unexpected reduction op {op}")
+
+    def Free(self) -> None:
+        self.freed = True
+
+
+def _install_fake_nccl(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device_api_support: bool = True,
+    n_lsa_teams: int = 1,
+    gin_type: _FakeNcclGinType = _FakeNcclGinType.NONE,
+    init_error: BaseException | None = None,
+    unique_id_error: BaseException | None = None,
+) -> SimpleNamespace:
+    comm = SimpleNamespace(
+        device_api_support=device_api_support,
+        n_lsa_teams=n_lsa_teams,
+        gin_type=gin_type,
+        finalized=False,
+        destroyed=False,
+    )
+    comm.finalize = lambda: setattr(comm, "finalized", True)
+    comm.destroy = lambda: setattr(comm, "destroyed", True)
+    init = Mock(return_value=comm, side_effect=init_error)
+    get_unique_id = Mock(return_value=b"unique-id", side_effect=unique_id_error)
+    typing_module = SimpleNamespace(NcclGinType=_FakeNcclGinType, NcclInvalid=_FakeNcclInvalid)
+    core = SimpleNamespace(
+        get_unique_id=get_unique_id,
+        Communicator=SimpleNamespace(init=init),
+        typing=typing_module,
+    )
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(core=core))
+    monkeypatch.setitem(sys.modules, "nccl.core", core)
+    monkeypatch.setitem(sys.modules, "nccl.core.typing", typing_module)
+    return SimpleNamespace(comm=comm, init=init, get_unique_id=get_unique_id)
+
+
+def _install_fake_mpi(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> _FakeMpiComm:
+    import tensorrt_llm._utils as trtllm_utils
+
+    session = _FakeMpiComm(**kwargs)
+    monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(trtllm_utils, "mpi_comm", lambda: session)
+    return session
+
+
+def _ep_mapping() -> Mapping:
+    return Mapping(world_size=2, rank=0, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
+
+
+@pytest.mark.parametrize(
+    ("device_api_support", "n_lsa_teams", "gin_type", "reason_contains"),
+    [
+        (True, 1, _FakeNcclGinType.NONE, None),
+        (False, 1, _FakeNcclGinType.NONE, "Device API"),
+        (True, 2, _FakeNcclGinType.NONE, "GIN"),
+        (True, 2, _FakeNcclGinType.GDAKI, None),
+    ],
+)
+def test_nccl_ep_device_api_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    device_api_support: bool,
+    n_lsa_teams: int,
+    gin_type: _FakeNcclGinType,
+    reason_contains: str | None,
+) -> None:
+    fake = _install_fake_nccl(
+        monkeypatch,
+        device_api_support=device_api_support,
+        n_lsa_teams=n_lsa_teams,
+        gin_type=gin_type,
+    )
+    session = _install_fake_mpi(monkeypatch)
+
+    reason = _REAL_DEVICE_API_REASON(_ep_mapping())
+
+    if reason_contains is None:
+        assert reason is None
+    else:
+        assert reason is not None and reason_contains in reason
+    # Only the probe's own communicators are released, and the session communicator is not.
+    assert fake.comm.finalized and fake.comm.destroyed
+    assert [child.freed for child in session.children] == [True]
+    assert not session.freed
+
+
+def test_nccl_ep_device_api_reason_is_memoized(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install_fake_nccl(monkeypatch, device_api_support=False)
+    _install_fake_mpi(monkeypatch)
+    mapping = _ep_mapping()
+
+    first = _REAL_DEVICE_API_REASON(mapping)
+    fake.comm.device_api_support = True
+    second = _REAL_DEVICE_API_REASON(mapping)
+
+    assert first is not None and second == first
+    fake.init.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("peer_value", "expected"),
+    [(1, "supported"), (0, "unsupported"), (-1, "error")],
+)
+def test_nccl_ep_device_api_probe_reduces_with_min_across_ranks(
+    monkeypatch: pytest.MonkeyPatch, peer_value: int, expected: str
+) -> None:
+    # This rank supports the Device API; a peer reports ``peer_value``.
+    _install_fake_nccl(monkeypatch)
+    _install_fake_mpi(monkeypatch, peer_values=[peer_value])
+
+    if expected == "error":
+        with pytest.raises(RuntimeError, match="peer rank"):
+            _REAL_DEVICE_API_REASON(_ep_mapping())
+    elif expected == "unsupported":
+        assert _REAL_DEVICE_API_REASON(_ep_mapping()) is not None
+    else:
+        assert _REAL_DEVICE_API_REASON(_ep_mapping()) is None
+
+
+def test_nccl_ep_device_api_probe_error_raises_and_is_not_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _install_fake_nccl(monkeypatch, init_error=_FakeNcclInvalid("init failed"))
+    session = _install_fake_mpi(monkeypatch)
+    mapping = _ep_mapping()
+
+    with pytest.raises(RuntimeError, match="init failed"):
+        _REAL_DEVICE_API_REASON(mapping)
+    assert [child.freed for child in session.children] == [True]
+
+    # The failure was not cached: a later, healthy probe succeeds.
+    fake.init.side_effect = None
+    assert _REAL_DEVICE_API_REASON(mapping) is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_nccl_ep_device_api_probe_unique_id_failure_fails_every_rank(
+    monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    # Rank 0 cannot create the unique id and broadcasts ``None``: no rank may hang in
+    # ``bcast`` or skip the reduction, and nobody calls ``Communicator.init``.
+    fake = _install_fake_nccl(
+        monkeypatch, unique_id_error=RuntimeError("bad NCCL_SOCKET_IFNAME") if rank == 0 else None
+    )
+    session = _install_fake_mpi(monkeypatch, rank=rank, bcast_result=None)
+
+    with pytest.raises(RuntimeError, match="unique id"):
+        _REAL_DEVICE_API_REASON(_ep_mapping())
+    fake.init.assert_not_called()
+    assert [child.freed for child in session.children] == [True]
+
+
+def test_nccl_ep_device_api_probe_ray_releases_comm_and_reduces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tensorrt_llm._utils as trtllm_utils
+
+    fake = _install_fake_nccl(monkeypatch)
+    monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
+    get_comm = Mock(return_value=fake.comm)
+    interop = SimpleNamespace(get_nccl_comm_from_group=get_comm)
+    monkeypatch.setitem(sys.modules, "nccl.ep", SimpleNamespace(interop=SimpleNamespace(torch=interop)))
+    monkeypatch.setitem(sys.modules, "nccl.ep.interop", SimpleNamespace(torch=interop))
+    monkeypatch.setitem(sys.modules, "nccl.ep.interop.torch", interop)
+    # A peer worker reports "unsupported".
+    reduce_min = Mock(side_effect=lambda _mapping, value: min(value, 0))
+    monkeypatch.setattr(nccl_ep_utils, "_all_ranks_min", reduce_min)
+    mapping = _FakeMapping(pp_rank=0, moe_ep_rank=0, moe_ep_group_pg=object())
+
+    reason = _REAL_DEVICE_API_REASON(mapping)
+
+    assert reason is not None
+    get_comm.assert_called_once_with(mapping.moe_ep_group_pg)
+    reduce_min.assert_called_once()
+    # ``get_nccl_comm_from_group`` returns a fresh communicator, so the probe owns it.
+    assert fake.comm.finalized and fake.comm.destroyed
+
+
+def test_nccl_ep_rejected_without_device_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(
+        nccl_ep_utils, "nccl_ep_device_api_unavailable_reason", lambda _mapping: "no device api"
+    )
+
+    with pytest.raises(RuntimeError, match="no device api"):
+        NcclEP(_make_model_config().mapping, num_slots=128, hidden_size=4096)
+
+
+def _make_nccl_ep_selectable(
+    monkeypatch: pytest.MonkeyPatch, reason: str | None
+) -> Mock:
+    """Let the real ``NcclEP`` be selected, with the Device API probe answering ``reason``."""
+    _mock_nccl_ep_v02(monkeypatch)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    probe = Mock(return_value=reason)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_device_api_unavailable_reason", probe)
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    return probe
+
+
+def test_auto_selection_falls_back_when_device_api_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_config = _make_model_config()
+    probe = _make_nccl_ep_selectable(monkeypatch, "no device api")
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, AllGatherReduceScatter)
+    probe.assert_called_once_with(model_config.mapping)
+
+
+def test_forced_nccl_ep_surfaces_device_api_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    model_config = _make_model_config()
+    _make_nccl_ep_selectable(monkeypatch, "no device api")
+    monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "NCCL_EP")
+
+    with pytest.raises(RuntimeError, match="no device api"):
+        communication_factory.CommunicationFactory.create_strategy(
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            hidden_size=4096,
+        )

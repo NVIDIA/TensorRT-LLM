@@ -21,7 +21,10 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
-from typing import TYPE_CHECKING, Optional
+import functools
+import importlib
+import struct
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -61,6 +64,181 @@ def is_nccl_ep_installed() -> bool:
         logger.info(f"NCCL EP disabled: nccl.ep is not usable ({e!r})")
         _nccl_ep_installed = False
     return _nccl_ep_installed
+
+
+# Result codes of the Device API probe. They are reduced with MIN across ranks, so an error on
+# any rank wins over "unsupported", which wins over "supported".
+_PROBE_ERROR = -1
+_PROBE_UNSUPPORTED = 0
+_PROBE_SUPPORTED = 1
+
+
+def _nccl_probe_errors() -> tuple[type[BaseException], ...]:
+    """Errors NCCL/MPI bootstrap can legitimately raise.
+
+    nccl4py's errors (e.g. ``NcclInvalid``) do not derive from ``RuntimeError``.
+    """
+    errors: list[type[BaseException]] = [RuntimeError, OSError]
+    for module_name, attr in (
+        ("mpi4py.MPI", "Exception"),
+        ("nccl.core.typing", "NcclInvalid"),
+        ("nccl._extensions.bindings.nccl", "NCCLError"),
+        ("nccl._extensions.bindings.nccl_ep", "NCCLEpError"),
+    ):
+        try:
+            errors.append(getattr(importlib.import_module(module_name), attr))
+        except (ImportError, AttributeError):
+            pass
+    return tuple(errors)
+
+
+def _create_ep_nccl_comm(mapping: Mapping) -> tuple[Any, Any]:
+    """Create the EP-scoped NCCL communicator that ``NcclEpContext`` and the probe share.
+
+    Returns ``(comm, ep_mpi_comm)``; ``ep_mpi_comm`` is ``None`` under Ray, where the
+    communicator is bootstrapped from the torch EP group. The caller owns both and must
+    pass them to :func:`_release_ep_nccl_comm`.
+
+    Collective. If rank 0 cannot create the NCCL unique id, ``None`` is broadcast and every
+    rank raises ``RuntimeError``, instead of leaving its peers blocked in ``bcast``.
+    """
+    import nccl.core as nccl_core
+
+    from tensorrt_llm._utils import mpi_comm, mpi_disabled
+
+    # Ray actors have singleton MPI worlds; bootstrap from their torch EP
+    # group. MPI workers and microbenchmarks need no torch process group.
+    if mpi_disabled():
+        from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+        # Always a fresh communicator, owned by the caller.
+        return get_nccl_comm_from_group(mapping.moe_ep_group_pg), None
+
+    ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+    try:
+        ep_world_rank = ep_mpi_comm.Get_rank()
+        unique_id = None
+        unique_id_error = None
+        if ep_world_rank == 0:
+            try:
+                unique_id = nccl_core.get_unique_id()
+            except _nccl_probe_errors() as e:
+                unique_id_error = e
+        unique_id = ep_mpi_comm.bcast(unique_id, root=0)
+        if unique_id is None:
+            raise RuntimeError(
+                "NCCL EP: rank 0 of the EP group could not create an NCCL unique id"
+            ) from unique_id_error
+        comm = nccl_core.Communicator.init(
+            nranks=ep_mpi_comm.Get_size(),
+            rank=ep_world_rank,
+            unique_id=unique_id,
+        )
+    except BaseException:
+        _release_ep_nccl_comm(None, ep_mpi_comm)
+        raise
+    return comm, ep_mpi_comm
+
+
+def _release_ep_nccl_comm(comm: Any, ep_mpi_comm: Any) -> None:
+    """Release what :func:`_create_ep_nccl_comm` returned. Errors are logged, not raised."""
+    if comm is not None:
+        try:
+            comm.finalize()
+            comm.destroy()
+        except _NCCL_RUNTIME_ERRORS as e:
+            logger.warning(f"NCCL EP comm destroy error: {e}")
+    if ep_mpi_comm is not None:
+        from mpi4py import MPI
+
+        try:
+            ep_mpi_comm.Free()
+        except MPI.Exception as e:
+            logger.warning(f"EP MPI sub-comm free error: {e}")
+
+
+def _device_api_unavailable_reason(comm: Any) -> Optional[str]:
+    """Why ``Group.create`` would reject ``comm`` for a low-latency NCCL EP group, or ``None``."""
+    from nccl.core.typing import NcclGinType
+
+    if not comm.device_api_support:
+        return (
+            "NCCL reports no Device API support on the EP communicator (it needs cuMem, "
+            "NCCL_WIN_ENABLE and CUDA P2P between local GPUs, or GIN across nodes)"
+        )
+    if comm.n_lsa_teams > 1 and comm.gin_type == NcclGinType.NONE:
+        return (
+            "the EP group spans several NCCL LSA teams but GIN is not available "
+            "(e.g. NCCL_CROSS_NIC=0 or no GPUDirect RDMA), which low-latency NCCL EP requires"
+        )
+    return None
+
+
+def _all_ranks_min(mapping: Mapping, value: int) -> int:
+    """MIN-reduce ``value`` so every rank takes the same decision.
+
+    Under MPI this is over the whole session communicator; under Ray, over the EP group.
+    """
+    from tensorrt_llm._utils import mpi_comm, mpi_disabled
+
+    if mpi_disabled():
+        import torch.distributed as dist
+
+        # Built from a buffer: model construction runs under MetaInitMode, which would
+        # redirect torch.tensor/torch.empty to the meta device.
+        flag = torch.frombuffer(bytearray(struct.pack("i", value)), dtype=torch.int32)
+        flag = flag.to(torch.device("cuda", torch.cuda.current_device()))
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=mapping.moe_ep_group_pg)
+        return int(flag.item())
+
+    from mpi4py import MPI
+
+    return mpi_comm().allreduce(value, op=MPI.MIN)
+
+
+@functools.cache
+def nccl_ep_device_api_unavailable_reason(mapping: Mapping) -> Optional[str]:
+    """Return why NCCL EP cannot run on this platform, or ``None`` if it can.
+
+    NCCL EP needs the NCCL Device API; ``Group.create`` otherwise fails at the first MoE
+    dispatch ("Device API is not supported"), after the strategy was already selected and
+    with no fallback. This probes ``Communicator.device_api_support`` on the same EP
+    communicator ``NcclEpContext`` will use, plus the GIN requirement of multi-LSA-team
+    low-latency groups, so auto-selection can skip NcclEP instead.
+
+    Collective: on the MPI path it uses ``mpi_comm().Split`` and an all-reduce over the whole
+    session communicator, so every rank must reach its first NcclEP construction together
+    (true today: all ranks build every layer before ``__pp_init__``). The result is reduced
+    with MIN so all ranks agree.
+
+    Device API support is a property of the platform, so a definite answer is memoized for
+    the process. A probe *error* is not memoized: it raises ``RuntimeError`` on every rank.
+    """
+    errors = _nccl_probe_errors()
+    comm = ep_mpi_comm = None
+    code = _PROBE_ERROR
+    reason: Optional[str] = None
+    try:
+        comm, ep_mpi_comm = _create_ep_nccl_comm(mapping)
+        reason = _device_api_unavailable_reason(comm)
+        code = _PROBE_SUPPORTED if reason is None else _PROBE_UNSUPPORTED
+    except errors as e:
+        reason = f"{e!r}"
+        logger.warning(f"NCCL EP Device API probe failed on this rank: {e!r}")
+    try:
+        # Runs on every rank, whatever happened above, and before the teardown.
+        code = _all_ranks_min(mapping, code)
+    finally:
+        _release_ep_nccl_comm(comm, ep_mpi_comm)
+
+    if code == _PROBE_ERROR:
+        raise RuntimeError(f"NCCL EP Device API probe failed: {reason or 'on a peer rank'}")
+    if code == _PROBE_SUPPORTED:
+        logger.info("NCCL EP Device API is supported")
+        return None
+    reason = reason or "a peer rank reports that the NCCL Device API is unavailable"
+    logger.info(f"NCCL EP is unavailable: {reason}")
+    return reason
 
 
 def get_nccl_ep_version() -> Optional[Version]:
@@ -144,7 +322,6 @@ class NcclEpContext:
         external_fp8: bool = False,
         external_nvfp4: bool = False,
     ):
-        import nccl.core as nccl_core
         from nccl.ep import (
             Algorithm,
             DispatchConfig,
@@ -155,8 +332,6 @@ class NcclEpContext:
             LayoutInfo,
             Tensor,
         )
-
-        from tensorrt_llm._utils import mpi_comm, mpi_disabled
 
         self.mapping = mapping
         self.ep_size = mapping.moe_ep_size
@@ -216,24 +391,7 @@ class NcclEpContext:
             use_internal_fp8_dispatch or external_fp8 or external_nvfp4
         ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
 
-        # Ray actors have singleton MPI worlds; bootstrap from their torch EP
-        # group. MPI workers and microbenchmarks need no torch process group.
-        self._ep_mpi_comm = None
-        if mpi_disabled():
-            from nccl.ep.interop.torch import get_nccl_comm_from_group
-
-            self.comm = get_nccl_comm_from_group(mapping.moe_ep_group_pg)
-        else:
-            self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
-            ep_world_rank = self._ep_mpi_comm.Get_rank()
-            ep_world_size = self._ep_mpi_comm.Get_size()
-            unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
-            unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
-            self.comm = nccl_core.Communicator.init(
-                nranks=ep_world_size,
-                rank=ep_world_rank,
-                unique_id=unique_id,
-            )
+        self.comm, self._ep_mpi_comm = _create_ep_nccl_comm(mapping)
 
         dispatch_token_bytes = (
             hidden_size * 2
@@ -420,22 +578,9 @@ class NcclEpContext:
         self.output_tokens_nd = None
         self.output_tokens_buf = None
 
-        if self.comm is not None:
-            try:
-                self.comm.finalize()
-                self.comm.destroy()
-            except _NCCL_RUNTIME_ERRORS as e:
-                logger.warning(f"NCCL EP comm destroy error: {e}")
-            self.comm = None
-
-        if self._ep_mpi_comm is not None:
-            from mpi4py import MPI
-
-            try:
-                self._ep_mpi_comm.Free()
-            except MPI.Exception as e:
-                logger.warning(f"EP MPI sub-comm free error: {e}")
-            self._ep_mpi_comm = None
+        _release_ep_nccl_comm(self.comm, self._ep_mpi_comm)
+        self.comm = None
+        self._ep_mpi_comm = None
 
 
 def get_nccl_ep_context(

@@ -64,10 +64,19 @@ class NcclEP(Communication):
     ):
         super().__init__(mapping)
 
-        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import is_nccl_ep_installed
+        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
+            is_nccl_ep_installed,
+            nccl_ep_device_api_unavailable_reason,
+        )
 
         if not is_nccl_ep_installed():
             raise RuntimeError("nccl-ep is not installed.")
+
+        # Group.create fails at the first dispatch when NCCL cannot provide the Device API
+        # on the EP communicator. Raise here so that auto-selection falls back.
+        device_api_reason = nccl_ep_device_api_unavailable_reason(mapping)
+        if device_api_reason is not None:
+            raise RuntimeError(f"NCCL EP is not usable: {device_api_reason}")
 
         self.num_slots = num_slots
         self.num_experts = num_slots
