@@ -49,6 +49,6 @@ For unit-test implementation and parameter matrices:
   wall-time or flake-rate improvement.
 
 Before changing registrations or process boundaries, follow the
-[test-list instructions](../integration/test_lists/AGENTS.md). An existing parent
-entry may already select a new test; confirm actual selection before adding an
-entry.
+[test-list instructions](../integration/test_lists/AGENTS.md#test-registration-and-batching).
+An existing parent entry may already select a new test; confirm actual selection
+before adding an entry.

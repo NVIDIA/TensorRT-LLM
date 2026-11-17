@@ -188,19 +188,30 @@ When changing waive merging, matching, or prefix handling, update this section
 in the same change. Update the [CI overview](../../../docs/source/developer-guide/ci-overview.md#waiving-tests)
 when its summary or entry point changes.
 
-## CPU test registration and batching
+## Test registration and batching
 
-- Reuse a file or parent-directory entry when its actual marker/options already
-  select the intended case. Adding a function entry alongside that parent repeats
-  execution. Prefer one file entry for compatible functions from the same file
-  when all of its CPU cases are intended to run.
+These rules apply to CPU and GPU stages. File/directory batching below refers
+to `unittest/` bridge entries; ordinary integration tests and native C++ wrappers
+retain their own case selectors and launch requirements.
+
+- For a `unittest/` entry, reuse a file or parent-directory registration when its
+  actual marker/options already select the intended case. Adding a function entry
+  alongside that parent repeats execution. Prefer one file entry for compatible
+  functions when all cases selected for that stage are intended to run.
 - Keep intentional partial selectors and required `ISOLATION` boundaries. Before
   consolidating entries, compare real pytest collections under the stage's marker,
   exclusions and waivers: check node IDs, multiplicity and skip/xfail markers, not
   just total counts. Explain any deliberate case removal separately.
 - Run the proposed batch to check fixture and process-state interactions, including
-  event loops and environment variables. Retain separate processes where the tests
-  require them; a matching collection does not prove execution compatibility.
+  event loops and environment variables. Retain separate processes where needed;
+  matching collections do not prove execution compatibility. `ISOLATION` separates
+  the outer test-list entry, not each inner unit test, and does not disable inner
+  pytest workers.
+- Recheck effective parallelism after changing an entry. The
+  [unittest bridge](../defs/test_unittests.py) looks up GPU name and normalized
+  entry in `agg_unit_mem_df.csv`, defaults unmatched entries to serial execution,
+  and honors `LLM_TEST_PARALLEL_OVERRIDE`. Do not assume a regrouped entry inherits
+  the old worker count or can safely use a smaller entry's parallel factor.
 - Check CBTS through the generated filtered test-db, including file/function
   changes and any domain rules that depend on explicit registrations. Confirm the
   intended stages, retained tests and split counts. Document any coarser selection
@@ -209,6 +220,29 @@ when its summary or entry point changes.
   keys. Recheck references and safe coverage-history fallback. Use measured batch
   times when evaluating shard balance; summing old per-function startup costs does
   not estimate the new batch correctly. Preserve the existing waiver rules above.
+- For batching-only comparisons, keep selected cases, source/runtime inputs,
+  allocated resources and worker counts fixed; record cold/warm cache conditions.
+  If regrouping changes the worker policy, report that effect separately.
+  Include startup/setup and cleanup costs. Report first-attempt
+  failures separately from retry outcomes; a parallel failure followed by a serial
+  retry pass does not validate the proposed parallel batch. Report intentional
+  coverage pruning separately from batching gains.
+
+### Additional GPU validation
+
+- Run the proposed grouping on representative target GPU types/counts with the
+  intended worker and rank counts. Check peak device memory and state retained
+  between cases, including CUDA errors, allocations and process groups. Existing
+  cleanup fixtures do not prove isolation: the
+  [empty_cache API](https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.empty_cache.html)
+  releases unused allocator cache, not live tensors or arbitrary process state.
+- Preserve distributed launchers, rank-to-device mapping and collective/resource
+  cleanup. A plain `unittest/` file entry is not a replacement for a wrapper that
+  launches multiple ranks. Keep necessary process boundaries when GPU state or
+  resource use makes a shared batch unsafe.
+- Measure batch wall time and allocated GPU-seconds as well as the slowest shard;
+  fewer entries or less import overhead alone does not establish a GPU-time
+  reduction. Follow the [unit-test measurement guidance](../../unittest/AGENTS.md#coverage-and-execution-cost).
 
 ## Test coverage
 
