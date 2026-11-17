@@ -206,6 +206,7 @@ class ChecksRaised(Exception):
     def __init__(self, failed: list[str], raised: Mapping[str, str]) -> None:
         super().__init__("; ".join(f"{key}: {why}" for key, why in raised.items()))
         self.failed = failed
+        self.raised = tuple(raised)
 
 
 def _failed(submitted: Sequence[tuple[str, Future]]) -> list[str]:
@@ -338,6 +339,9 @@ class GraphOrchestrator:
         self._receipts_landed: dict[str, int] = {
             str(k): int(v) for k, v in (saved.get("receipts_landed") or {}).items()
         }
+        #: Checks a finished task asked for whose run recorded no verdict (its session
+        #: was lost): each runs again, though an earlier pass of it stands.
+        self._owed: set[str] = {str(k) for k in saved.get("owed") or ()}
         #: An event that needs the planner's judgement waits: it wakes the planner
         #: at once. What a dead process left unread is read first.
         self._urgent = bool(self.events) or self.unread_reports
@@ -433,6 +437,7 @@ class GraphOrchestrator:
             "not_started_attempts": self.not_started_attempts,
             "landings": {k: list(v) for k, v in self._landings.items()},
             "receipts_landed": self._receipts_landed,
+            "owed": sorted(self._owed),
         }
         write_text_atomic(self.events_path, json.dumps(state, indent=1))
 
@@ -520,6 +525,7 @@ class GraphOrchestrator:
         reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
         with self._status_lock:
             self.status.record(check.unit, result, marker=marker, inputs=check.inputs, reads=reads)
+            self._owed.discard(check.key)
         return bool(result.passed)
 
     def _submit_checks(
@@ -566,7 +572,9 @@ class GraphOrchestrator:
             return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
         except ChecksRaised as exc:
             # The work stands and has landed; only these checks' outcome is unknown.
-            # They are missing on the target, so they run again as re-checks.
+            # They are owed still, whatever an earlier pass of theirs says.
+            with self._status_lock:
+                self._owed.update(exc.raised)
             self._inconclusive[task.id] = str(exc)
             return decision, exc.failed
         finally:
@@ -738,7 +746,9 @@ class GraphOrchestrator:
         finishes runs the checks it claims, so what is left is:
 
         - a check a finished task claims that has no verdict to stand on: it
-          failed and the target has changed since, or its run recorded none.
+          failed and the target has changed since, or its run recorded none
+          (``_owed``: a run that recorded none is owed even where an earlier
+          pass stands).
           ``busy``, with foreground work running, these run once per landing;
           otherwise at once. A benchmark among them waits until no required
           task is open, unless the bring-up still needs it;
@@ -754,6 +764,9 @@ class GraphOrchestrator:
         delivery = self._delivery_keys()
         marker, evaluation = self._evaluated()
         due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
+        with self._status_lock:
+            owed = set(self._owed) - delivery - set(due)
+        due += [c.key for c in self.contract.checks if c.key in owed]
         open_work = self._required_open()
         if open_work:
             bringup = (

@@ -131,10 +131,14 @@ _CORE = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
 _MTP = ["mtp:accuracy[gsm8k]@tp1", "mtp:acceptance@tp1"]
 
 
-def _moving_target(plan, *, failing=lambda key, marker: False):
-    """Services whose target changes each time a task's work ends; ``ran`` is (check, state) pairs."""
+def _moving_target(plan, *, failing=lambda key, marker: False, lost=()):
+    """Services whose target changes each time a task's work ends; ``ran`` is (check, state) pairs.
+
+    ``lost``: the (check, state) runs whose session is lost, each once.
+    """
     landed = []
     ran = []
+    lost = list(lost)
 
     def work(task):
         landed.append(task.id)
@@ -143,6 +147,9 @@ def _moving_target(plan, *, failing=lambda key, marker: False):
     def check(chk):
         marker = f"m{len(landed)}"
         ran.append((chk.key, marker))
+        if (chk.key, marker) in lost:
+            lost.remove((chk.key, marker))
+            raise RuntimeError("the session was lost")
         return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
                                passed=not failing(chk.key, marker))  # fmt: skip
 
@@ -232,6 +239,21 @@ def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
     table = c.measured_where(later, status, "m2", since=lambda tree: "3")
     assert "| core:boot@tp1 | unknown | 3 |" in table
     assert "0, the final tree" in c.measured_where(here, status, "m1")
+
+
+def test_a_check_a_task_asked_for_runs_again_when_its_run_was_lost(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("again", "assemble", _CORE[:1], deps=["core"], touches=["models/core/"]),
+    )
+    services = _moving_target(plan, lost=[(_CORE[0], "m2")])
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # `again` changed the core and asked for its boot again. The run that was lost recorded
+    # nothing, and the boot's pass on m1 does not answer for it: it runs once more on m2.
+    assert [where for key, where in services.ran if key == _CORE[0]] == ["m1", "m2", "m2"]
+    assert status.latest()[_CORE[0]].marker == "m2"
 
 
 def _equivalent_units():
