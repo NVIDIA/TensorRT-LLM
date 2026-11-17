@@ -693,6 +693,28 @@ def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
         assert engine.llm_args.torch_compile_config is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("disable_mm_encoder", [False, True], ids=["tower", "text_only"])
+def test_breakable_gate_for_a_wrapper_with_its_own_tower(disable_mm_encoder: bool) -> None:
+    """A wrapper whose language model is a decoder: with a local tower the breakable prefill
+    graph is refused at startup; with `disable_mm_encoder` and no tower it is allowed, and
+    the graph runs the language model's body on text. The message is not matched."""
+    engine = object.__new__(ModelEngine)
+    engine.model = DummyLegacyMultimodalIndexModel()
+    engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+    engine.model.mm_encoder = None if disable_mm_encoder else torch.nn.Module()
+    engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+    if disable_mm_encoder:
+        engine._validate_breakable_cuda_graph_compatibility()
+    else:
+        with pytest.raises(ValueError):
+            engine._validate_breakable_cuda_graph_compatibility()
+
+
 class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)

@@ -1484,12 +1484,8 @@ class Qwen4ExpDefaultWeights:
         fill(model.lm_head.weight, "lm_head.weight", None, cut, pad)
         # Parameter-side coverage, the other direction: name every registered parameter
         # outside the target's own ParameterDict instead of assuming lm_head is the only
-        # one. The vision tower loads and checks its own table.
-        shell = {
-            n
-            for n, _ in model.named_parameters()
-            if not n.startswith(("model.w.", "vision_tower."))
-        }
+        # one.
+        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 
         torch.cuda.synchronize()

@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MoeConfig,
     MTPDecodingConfig,
+    MultimodalConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -38,7 +39,7 @@ _DUMMY_MODEL = "/tmp/dummy_model"
 _ARCH = "Qwen4ExpForConditionalGeneration"
 _TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
-    "ModelingV2Qwen38FlashNextNvfp4Sm103Default"
+    "ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration"
 )
 
 # The four-rank layouts, as the LLM API's parallel arguments build them. tp4 leaves the
@@ -535,3 +536,13 @@ def test_mtp_needs_the_cached_replay(monkeypatch, max_draft_len):
     _claimed(_model_config(**_LAYOUTS["tep4"]))
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
     _claimed(config)
+
+
+def test_the_encoder_side_stream_falls_back_while_the_tower_is_built():
+    """The vision tower reuses one attention workspace, so it does not run on the encoder
+    side stream: `encoder_side_stream_max_ahead > 0` falls back under `auto` while the tower
+    is built, and routes with `disable_mm_encoder`, which builds none."""
+    side_stream = MultimodalConfig(encoder_side_stream_max_ahead=1)
+    config = _model_config(**_LAYOUTS["tep4"])
+    _declined(config, match="encoder_side_stream_max_ahead", multimodal_config=side_stream)
+    _claimed(replace(config, disable_mm_encoder=True), multimodal_config=side_stream)
