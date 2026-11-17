@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""ModelingV2 target: Qwen3.8-Flash-Next-NVFP4 (hf-fc694b5_orig) / sm_103 / default.
+"""ModelingV2 target: Qwen3.8-Flash-Next-NVFP4 / sm_103 / default.
+
+The loader retains FP8 or BF16 PLE storage and supports FP8 block-scaled or native
+NVFP4 draft experts. Native NVFP4 experts use their checkpoint scalars and local window.
 
 One target for the layouts `routing.py` admits in one node: one rank (tp1, every head and
 expert); at four ranks tp4 (attention TP4, routed experts split by intermediate), tep4
@@ -652,7 +655,7 @@ _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 _QSA_MROPE_SECTION = None
 # The draft experts' activation scales are fp32, not the UE8M0 power-of-two form.
 _MTP_MOE_USE_UE8M0 = False
-# Rows per draft FP8 runner call: its 128-expert windows are certified up to one 8192-row
+# Rows per draft expert runner call: the FP8 runner's windows are certified up to one 8192-row
 # chunk (`fp8_block_scale_moe_runner`). The rows an attention-DP group gathers (up to
 # its size times a rank's) run in chunks of it.
 _MTP_MOE_MAX_ROWS = 8192
@@ -837,19 +840,20 @@ _MTP_DENSE_FP8_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold, at most f
 #: load the checkpoint's FP8 128x128 block-scaled experts are requantized (per-expert weight global
 #: scales, 16-element e4m3 block scales) into the trunk's layout and the FP8 copies are freed. The
 #: draft only proposes tokens, so this can change the acceptance length, not outputs. Certified at
-#: tp1; 0 (default): the FP8 block-scale runner.
+#: tp1; 0 (default) retains the checkpoint's FP8 or native NVFP4 format.
 _MTP_MOE_NVFP4_ENV = "TRTLLM_MODELING_V2_MTP_MOE_NVFP4"
 
 #: The NVFP4 draft MoE's two activation global scales are static, `448 * 6 / A` with `A` this factor
 #: times the largest calibrated amax of the trunk's routed experts (its `input_scale`s, FC1 input and
-#: FC2 input; the draft layer carries none). A global scale only has to keep the e4m3 block scales
+#: FC2 input; an FP8 draft carries none). Native NVFP4 uses its own checkpoint scales.
+#: A global scale only has to keep the e4m3 block scales
 #: inside their range, so the margin costs nothing until blocks are ~1e-3 of `A`.
 _MTP_MOE_NVFP4_FC1_MARGIN = 8.0
 _MTP_MOE_NVFP4_FC2_MARGIN = 4.0
 
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD"
 
-#: The opt-in switches certified at tp1; every other layout runs the checkpoint's bf16 paths.
+#: The opt-in conversions certified at tp1; other layouts retain checkpoint formats.
 _ONE_RANK_SWITCHES = (
     _DENSE_FP8_ENV,
     _GDN_INPROJ_NVFP4_ENV,
@@ -1180,8 +1184,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.moe_prefill_copy = _moe_prefill_copy(
             self.one_rank, self.trunk_moe_backend, model_config.max_num_tokens
         )
-        # The draft experts' NVFP4 copy at one rank (`_mtp_moe_nvfp4`), built once: it frees
-        # the FP8 experts, and the shell's post-load walk reaches `post_load_weights` again.
+        # Cached native NVFP4 operands or the one-rank FP8 conversion, built once because
+        # the shell's post-load walk reaches `post_load_weights` again.
         self._mtp_moe_nvfp4 = None
         # The FP8 draft head at tp1, set by the shell's `post_load_weights` after this core's;
         # the post-load walk calls this core's `post_load_weights` again, which leaves it.
@@ -1195,7 +1199,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.ngram_vocab_divisor = cfg.make_ngram_vocab_size_divisible_by
         eos = cfg.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
-        self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
         self.ple_host_offload = _ple_host_offload_enabled()
         _check_switches(self.one_rank)
         # CPU allocation behind the offloaded table; the `ple_table` parameter is a
@@ -2225,8 +2228,8 @@ class _MtpWeights(NamedTuple):
     # The shared expert's gate|up rows and gate-logit row, row views of `sh_gug`.
     sh_gu: torch.Tensor
     sh_gate: torch.Tensor
-    # With `_MTP_MOE_NVFP4_ENV` (one rank), `fc1_w` .. `fc2_s` are the NVFP4 copy in the trunk's
-    # layout and these its activation global scale and the runner's three scalars.
+    # Native NVFP4 or the one-rank FP8 conversion: `fc1_w` .. `fc2_s` use the trunk's
+    # layout, with an activation global scale and the runner's three scalars.
     moe_gscale: torch.Tensor | None = None
     out1_scale: torch.Tensor | None = None
     out1_gate_scale: torch.Tensor | None = None
@@ -2612,10 +2615,10 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
 
 def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
-    block-scale routed experts over this rank's window (1x128 activation scales, pre-routed),
+    block-scale or native NVFP4 routed experts over this rank's window,
     and the replicated bf16 shared expert in the trunk's form -- one GEMM forms gate|up and
     the per-token gate logit -- combined as `routed + sigmoid(gate logit) * shared`. The
-    activation scales come back transposed `[hidden / 128, tokens]` and go straight to the
+    FP8 activation scales come back transposed `[hidden / 128, tokens]` and go straight to the
     runner.
 
     The window's partial is completed as the trunk's is: under attention TP summed over the
@@ -2680,7 +2683,7 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
 def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
     """The draft layer's local routed experts on NVFP4 operands (`_mtp_moe_nvfp4`):
     the activation quantized at the static FC1 input global scale, then the trunk's
-    logits-routed trtllm-gen runner over every expert, finalized."""
+    logits-routed trtllm-gen runner over this rank's expert window, finalized."""
     xq, xsf = fp4_quantize(x.contiguous(), M.moe_gscale, _SF_VEC, False, False)
     return fp4_block_scale_moe_renorm_routed(
         cublas_mm(x, M.router),
@@ -2703,7 +2706,8 @@ def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
 
 def _mtp_moe_nvfp4(core) -> dict:
     """Native NVFP4 draft operands, or FP8 experts requantized to NVFP4, as the
-    `_MtpWeights` fields `_mtp_routed_nvfp4` reads; frees the FP8 copies. The runner's scalars
+    `_MtpWeights` fields `_mtp_routed_nvfp4` reads. Only conversion frees the FP8 copies.
+    The native path uses checkpoint scalars. For conversion, the runner's scalars
     follow `_moe_layer_scalars` with `1 / g_in` and `1 / g_mid` standing for the checkpoint's
     `input_scale`s and `1 / g_w` for its `weight_scale_2`: `out1_gate = 1 / (g_in * g_w1[e])`,
     `out1 = out1_gate * g_mid`, `out2 = 1 / (g_mid * g_w2[e])`. The activation scales are static
@@ -4169,7 +4173,7 @@ class PrefillTarget:
 
         Per-request stateful: ids become one `ngram_size`-wide window per token
         (predecessors from the paged id history); each window hashes to one row per head;
-        rows gather fp8 vectors from one table (`ple_ngram_embed`); the key/value projections,
+        rows gather FP8 or BF16 vectors from one table (`ple_ngram_embed`); the key/value projections,
         the gate, a dilated depthwise short conv over a paged state, the residual add and the
         next site's grouped norm are `ple_gate_conv_inject_norm`. A sequence carrying nothing
         is seeded with `eos_token_id`.
@@ -5585,8 +5589,8 @@ class DecodeTarget:
         return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
     def _mtp_moe(self, x) -> torch.Tensor:
-        """The draft layer's MoE at one rank: the FP8 block-scale routed experts (or with
-        `_MTP_MOE_NVFP4_ENV` the NVFP4 ones on the trunk's logits-routed runner) and the bf16
+        """The draft layer's MoE at one rank: FP8 block-scale or native NVFP4 routed experts
+        (FP8 can be converted with `_MTP_MOE_NVFP4_ENV`) and the bf16
         shared expert (its dense projections on `_draft_mm`), combined as `routed +
         sigmoid(gate logit) * shared`; the NVFP4 path runs the shared expert on the side
         stream."""

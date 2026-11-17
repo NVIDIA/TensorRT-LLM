@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight table and loader: Qwen3.8-Flash-Next-NVFP4 (hf-fc694b5_orig) / sm_103 / default.
+"""Weight table and loader: Qwen3.8-Flash-Next-NVFP4 / sm_103 / default.
+
+The n-gram table retains its stored FP8 or BF16 dtype. MTP experts retain native
+NVFP4 storage or the checkpoint's FP8 block-scale format.
 
 One `W` per weight role (shape, checkpoint source, the rank's cut, dtype, load-time
 transform); `Qwen4ExpDefaultWeights` unrolls the table into declaration, manifest and load.
@@ -32,7 +35,7 @@ scalars are derived in `modeling.py` after load.
   work in 128-row blocks), so each half is zero-extended to `expert_inter` = 256 rows (FC2
   to 256 columns) with zero codes and zero block scales before the relayout: SwiGLU of a
   zero row pair is zero and a zero FC2 column adds nothing, so the padding is exact.
-* **The MTP layer's FP8 block-scale experts** are split by expert over the whole TP
+* **The MTP layer's experts** are split by expert over the whole TP
   group at every member, `[128r, 128r + 128)`: the FP8 runner takes `H` and `I` in
   multiples of 128, which 640 / 4 is not.
 
@@ -100,7 +103,7 @@ import torch
 from cuda.bindings import runtime as cudart
 from torch import nn
 
-from tensorrt_llm._torch.models.modeling_utils import layerwise_moe_quant_config
+from tensorrt_llm._torch.models.modeling_utils import moe_experts_quant_config
 from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
@@ -225,7 +228,7 @@ class _RegisteredHostBuffer:
     device's random row gathers from 64 KiB pages run 2.5x (64 tokens) to 23x
     (1024 tokens) slower.
 
-    Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and on
+    Not torch's pinned allocator: it rounds a 47.7 GiB FP8 table up to 64 GiB, and on
     GB300 the device's random row gathers from its pages run an order of magnitude
     slower than from registered pageable memory."""
 
@@ -297,7 +300,7 @@ def _host_resident_empty(
     )
     table = torch.as_tensor(interface, device=device).view(dtype)
     # `torch.as_tensor` copies when it decides the buffer is not already on the
-    # requested device; a copy here would be a silent 48 GiB device allocation.
+    # requested device; a copy here would silently allocate the whole table on the device.
     assert table.data_ptr() == int(device_pointer), (
         "torch.as_tensor copied the host-mapped buffer instead of viewing it, "
         "so the table would be device-resident after all"
@@ -320,8 +323,8 @@ SF_VEC = 16
 # weight scales and along the activation row.
 FP8_BLOCK = 128
 
-#: The PLE n-gram table's storage: the checkpoint's FP8 per-tensor quantization, kept as
-#: stored (the gather dequantizes the rows it reads).
+#: The scaled PLE table's default storage. The loader also accepts unscaled BF16,
+#: retaining the stored dtype (the gather dequantizes the rows it reads).
 PLE_TABLE_DTYPE = torch.float8_e4m3fn
 
 #: The multiple a rank's stored routed-expert intermediate is padded up to. It is the
@@ -852,7 +855,7 @@ _EXPERT_SCALARS = (
 #: rank outside its window leaves unread. The draft layer's FP8 experts carry
 #: `weight_scale_inv` in place of the NVFP4 `weight_scale`.
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-_TRUNK_EXPERT_TENSORS = tuple(f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale"))
+_NVFP4_EXPERT_TENSORS = tuple(f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale"))
 _MTP_EXPERT_TENSORS = tuple(
     f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale_inv")
 )
@@ -1399,8 +1402,8 @@ class Qwen4ExpDefaultWeights:
         #
         # Structurally one more decoder layer of this architecture with a two-branch
         # front end; every shape equals a trunk full-attention layer's (cut the same way)
-        # except the front end and the expert quantization (FP8 128x128 block scales, not
-        # NVFP4). Its keys carry no `{p}`: the module's prefix is not the trunk's.
+        # except the front end and, for FP8 exports, the experts' 128x128 block scales.
+        # Native NVFP4 experts use the trunk's layout. The module's prefix is not the trunk's.
         W(
             "mtp_pre_e_norm",
             shape=lambda d: (d.hidden,),
@@ -1444,8 +1447,8 @@ class Qwen4ExpDefaultWeights:
             src=f"{_MTP_LAYER}.mlp.gate.weight",
             layers=_mtp_only,
         ),
-        # e4m3 codes stored row-major with one fp32 scale per 128x128 weight block, the
-        # FC1 halves concatenated `[up ; gate]` on the row axis; this rank's window.
+        # This rank's expert window: row-major FP8 with fp32 128x128 scales, or native
+        # packed NVFP4 with e4m3 block scales and the trtllm-gen relayout.
         W(
             "mtp_fc1_w",
             shape=lambda d: (
@@ -1470,8 +1473,7 @@ class Qwen4ExpDefaultWeights:
             transform=_mtp_fc1_s,
             layers=_mtp_only,
         ),
-        # FC2 needs no relayout at all: the checkpoint's `[hidden, I]` e4m3 block is
-        # exactly the operand.
+        # FP8 FC2 is already row-major; native NVFP4 FC2 uses the trtllm-gen shuffle.
         W(
             "mtp_fc2_w",
             shape=lambda d: (
@@ -1515,14 +1517,10 @@ class Qwen4ExpDefaultWeights:
         """This rank's dimension bundle, from the core's normalized text config, the
         composite's vision config (the core holds it as `vision_config` before it
         declares anything), the engine's `Mapping` and the core's engine choices."""
-        quant_config = core.model_config.quant_config
-        if core.model_config.quant_config_dict is not None:
-            quant_config = (
-                layerwise_moe_quant_config(
-                    core.model_config.quant_config_dict, f"{_MTP_LAYER}.mlp.experts"
-                )
-                or quant_config
-            )
+        quant_config = (
+            moe_experts_quant_config(core.model_config, f"{_MTP_LAYER}.mlp.experts")
+            or core.model_config.quant_config
+        )
         return rank_dims(
             core.model_config.pretrained_config,
             core.vision_config,
@@ -1531,7 +1529,7 @@ class Qwen4ExpDefaultWeights:
             trunk_moe_backend=core.trunk_moe_backend,
             moe_prefill_copy=core.moe_prefill_copy,
             dtype=core.model_config.torch_dtype,
-            mtp_nvfp4=quant_config is not None and quant_config.quant_algo == QuantAlgo.NVFP4,
+            mtp_nvfp4=quant_config.quant_algo == QuantAlgo.NVFP4,
         )
 
     def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
@@ -1546,13 +1544,13 @@ class Qwen4ExpDefaultWeights:
         for i in range(d.num_layers):
             for e in range(d.num_experts):
                 if not start <= e < start + count:
-                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS)
+                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _NVFP4_EXPERT_TENSORS)
         if not d.mtp_enabled:
             return out | {k for k in keys if k.startswith(f"{_MTP}.")}
         start, count = _mtp_window(d)
         for e in range(d.num_experts):
             if not start <= e < start + count:
-                tensors = _TRUNK_EXPERT_TENSORS if d.mtp_nvfp4 else _MTP_EXPERT_TENSORS
+                tensors = _NVFP4_EXPERT_TENSORS if d.mtp_nvfp4 else _MTP_EXPERT_TENSORS
                 out.update(f"{_mtp_mlp(None)}.experts.{e}.{t}" for t in tensors)
         return out
 

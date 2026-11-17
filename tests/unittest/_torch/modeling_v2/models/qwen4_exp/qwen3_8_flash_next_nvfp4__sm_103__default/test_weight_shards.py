@@ -28,6 +28,7 @@ import collections
 import json
 import re
 import struct
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -443,7 +444,7 @@ def _stub_model(configs, member: str, rank: int, mtp: bool):
             mapping=mapping,
             spec_config=object() if mtp else None,
             torch_dtype=torch.bfloat16,
-            quant_config=None,
+            quant_config=QuantConfig(),
             quant_config_dict=None,
         ),
         vision_config=vision,
@@ -508,6 +509,22 @@ def test_load_fills_every_parameter_and_covers_the_checkpoint(
     assert tuple(model.model.w["ple_table"].shape) == (320_001_536, 160)
 
 
+@pytest.mark.parametrize("expert_override", (None, QuantAlgo.NVFP4))
+def test_mtp_quantization_respects_exclusions(configs, expert_override: QuantAlgo | None) -> None:
+    """An expert exclusion wins over both the model and per-layer quantization."""
+    core = _stub_model(configs, "tp4", 3, True).model
+    expert_prefix = "mtp.layers.0.mlp.experts"
+    core.model_config.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4, exclude_modules=[expert_prefix]
+    )
+    core.model_config.quant_config_dict = (
+        {expert_prefix: QuantConfig(quant_algo=expert_override)}
+        if expert_override is not None
+        else None
+    )
+    assert not WT.MODEL_WEIGHTS.dims(core).mtp_nvfp4
+
+
 def test_load_unscaled_bf16_ngram_table(stored, checkpoint, monkeypatch) -> None:
     """Load unscaled BF16 shards through the real model and loader, with a unit scale."""
     monkeypatch.setenv(target_modeling._PLE_HOST_OFFLOAD_ENV, "0")
@@ -540,11 +557,13 @@ def test_load_unscaled_bf16_ngram_table(stored, checkpoint, monkeypatch) -> None
 
 
 @pytest.mark.parametrize(
-    "member,rank",
-    [("single", 0), ("tp4", 3), ("dep4", 3)],
-    ids=["single", "tp4-rank3", "dep4-rank3"],
+    "member,rank,global_bf16",
+    [("single", 0, False), ("tp4", 3, False), ("dep4", 3, False), ("single", 0, True)],
+    ids=["single", "tp4-rank3", "dep4-rank3", "global-bf16"],
 )
-def test_load_native_nvfp4_mtp_experts(stored, checkpoint, monkeypatch, member, rank) -> None:
+def test_load_native_nvfp4_mtp_experts(
+    stored, checkpoint, monkeypatch, member: str, rank: int, global_bf16: bool
+) -> None:
     """Load each rank's packed experts and replicated scalars, covering off-window keys."""
     monkeypatch.setenv(target_modeling._PLE_HOST_OFFLOAD_ENV, "0")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 3))
@@ -563,12 +582,17 @@ def test_load_native_nvfp4_mtp_experts(stored, checkpoint, monkeypatch, member, 
         spec_config=MTPDecodingConfig(max_draft_len=3),
     )
     expert_prefix = "mtp.layers.0.mlp.experts"
-    model_config = model_config.copy_with(
-        quant_config_dict={
-            **(model_config.quant_config_dict or {}),
-            expert_prefix: QuantConfig(quant_algo=QuantAlgo.NVFP4),
-        }
-    )
+    if global_bf16:
+        model_config = model_config.copy_with(
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4), quant_config_dict=None
+        )
+    else:
+        model_config = model_config.copy_with(
+            quant_config_dict={
+                **(model_config.quant_config_dict or {}),
+                expert_prefix: QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            }
+        )
     with torch.device("meta"):
         model = target_modeling.ModelingV2Qwen38FlashNextNvfp4Sm103Default(model_config)
     native = {
@@ -582,8 +606,26 @@ def test_load_native_nvfp4_mtp_experts(stored, checkpoint, monkeypatch, member, 
             if key.startswith(trunk_prefix)
         }
     )
+    if global_bf16:
+        dims = WT.MODEL_WEIGHTS.dims(model.model)
+        assert dims.mtp_nvfp4
+        shard_keys = set(WT.ngram_shard_keys(dims))
+        scale_key = WT.MODEL_WEIGHTS.manifest(dims)["ple_tscale"][0][0]
+        native = {
+            key: (shape, torch.bfloat16 if key in shard_keys else dtype)
+            for key, (shape, dtype) in native.items()
+            if key != scale_key
+        }
+        model.model.w["ple_tscale"] = torch.nn.Parameter(
+            torch.full((1,), float("nan"), dtype=torch.bfloat16), requires_grad=False
+        )
     tensors = _ReadTrackingCheckpoint(_meta_checkpoint(native))
     WT.MODEL_WEIGHTS.load(model, tensors)
+    if global_bf16:
+        assert model.model.w["ple_table"].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            model.model.w["ple_tscale"], torch.ones(1, dtype=torch.bfloat16), rtol=0, atol=0
+        )
     layer_prefix = f"l{model.model.mtp_layer_idx}_mtp_"
     count = model.model.num_experts // mapping.tp_size
     start = rank * count
@@ -644,11 +686,17 @@ def _native_mtp_core() -> SimpleNamespace:
 def test_native_nvfp4_mtp_preserves_codes_and_checkpoint_scalars() -> None:
     """Native draft operands keep their packed bytes and use checkpoint-derived alphas."""
     core = _native_mtp_core()
+    original = {key: tensor.clone() for key, tensor in core.w.items()}
     operands = target_modeling._mtp_moe_nvfp4(core)
-    torch.testing.assert_close(operands["fc1_w"], core.w["l0_mtp_fc1_w"], rtol=0, atol=0)
-    torch.testing.assert_close(
-        operands["fc1_s"].view(torch.uint8), core.w["l0_mtp_fc1_s"], rtol=0, atol=0
-    )
+    for suffix in ("fc1_w", "fc1_s", "fc2_w", "fc2_s"):
+        operand = operands[suffix]
+        assert operand.dtype == (torch.float8_e4m3fn if suffix.endswith("_s") else torch.uint8)
+        torch.testing.assert_close(
+            operand.view(torch.uint8), original[f"l0_mtp_{suffix}"], rtol=0, atol=0
+        )
+    for key, tensor in core.w.items():
+        assert tensor.numel() == original[key].numel()
+        torch.testing.assert_close(tensor, original[key], rtol=0, atol=0)
     torch.testing.assert_close(operands["moe_gscale"], torch.tensor([2.0]), rtol=0, atol=0)
     torch.testing.assert_close(operands["out1_scale"], torch.tensor([3.0, 2.0]), rtol=0, atol=0)
     torch.testing.assert_close(
@@ -658,17 +706,26 @@ def test_native_nvfp4_mtp_preserves_codes_and_checkpoint_scalars() -> None:
 
 
 @pytest.mark.parametrize("attention_dp", (False, True))
-def test_native_nvfp4_mtp_completes_the_expert_window(attention_dp, monkeypatch) -> None:
+def test_native_nvfp4_mtp_completes_the_expert_window(attention_dp: bool, monkeypatch) -> None:
     """Native draft MoE uses its rank's expert window and the TP/DP completion."""
     core = SimpleNamespace(
-        mtp_expert_offset=128, mtp_local_experts=128, num_experts=512, topk=2, moe_inter=128
+        mtp_expert_offset=384, mtp_local_experts=128, num_experts=512, topk=2, moe_inter=128
     )
-    features = torch.stack((torch.ones(128), torch.full((128,), 2.0)))
+    features = torch.stack((torch.ones(128), torch.full((128,), 2.0), torch.full((128,), 3.0)))
     remote_features = features + 1 if attention_dp else features
     core.dp_size = 2 if attention_dp else 1
-    core.tp_sum = lambda partial: partial + 2 * remote_features
 
-    def expert_sum(runner, local_rows, pad_rows):
+    def tp_sum(partial: torch.Tensor) -> torch.Tensor:
+        assert not attention_dp
+        return partial + 2 * remote_features
+
+    core.tp_sum = tp_sum
+
+    def expert_sum(
+        runner: Callable[[torch.Tensor], torch.Tensor], local_rows: torch.Tensor, pad_rows: int
+    ) -> torch.Tensor:
+        assert attention_dp
+        assert pad_rows == 1
         gathered = torch.cat((local_rows, remote_features, torch.zeros(pad_rows, 128)))
         return (runner(gathered) + 2 * gathered)[: local_rows.shape[0]]
 
@@ -685,31 +742,38 @@ def test_native_nvfp4_mtp_completes_the_expert_window(attention_dp, monkeypatch)
         router=torch.zeros(128, core.num_experts),
     )
 
-    def quantize(rows, global_scale, scale_vector, shuffle, use_ue8m0):
+    def quantize(
+        rows: torch.Tensor,
+        global_scale: torch.Tensor,
+        scale_vector: int,
+        shuffle: bool,
+        use_ue8m0: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return rows[:, :64].to(torch.uint8), torch.ones(rows.shape[0], 8, dtype=torch.uint8)
 
     def routed_kernel(
-        routing_logits,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=None,
-    ):
+        routing_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int = 0,
+        local_num_experts: int | None = None,
+    ) -> torch.Tensor:
         assert local_expert_offset == core.mtp_expert_offset
         assert local_num_experts == core.mtp_local_experts
         return hidden_states.float().repeat(1, 2)
 
     monkeypatch.setattr(target_modeling, "fp4_quantize", quantize)
+    monkeypatch.setattr(target_modeling, "_MTP_MOE_MAX_ROWS", 2)
     monkeypatch.setattr(target_modeling, "cublas_mm", lambda left, right: left @ right)
     monkeypatch.setattr(target_modeling, "fp4_block_scale_moe_renorm_routed", routed_kernel)
     result = target_modeling._mtp_moe_block(
