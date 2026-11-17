@@ -525,9 +525,12 @@ def test_mtp_quantization_respects_exclusions(configs, expert_override: QuantAlg
     assert not WT.MODEL_WEIGHTS.dims(core).mtp_nvfp4
 
 
-def test_load_unscaled_bf16_ngram_table(stored, checkpoint, monkeypatch) -> None:
+@pytest.mark.parametrize("host_offload", (False, True))
+def test_load_unscaled_bf16_ngram_table(
+    stored, checkpoint, monkeypatch, host_offload: bool
+) -> None:
     """Load unscaled BF16 shards through the real model and loader, with a unit scale."""
-    monkeypatch.setenv(target_modeling._PLE_HOST_OFFLOAD_ENV, "0")
+    monkeypatch.setenv(target_modeling._PLE_HOST_OFFLOAD_ENV, "1" if host_offload else "0")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 3))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *args, **kwargs: None)
