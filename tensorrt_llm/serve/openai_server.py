@@ -154,6 +154,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
     from tensorrt_llm.visual_gen.output import VisualGenOutput
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 
 def _is_visual_gen_instance(obj) -> bool:
@@ -918,31 +919,58 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
         self._image_edit_tasks: set[asyncio.Task["VisualGenOutput"]] = set()
+        self._image_edit_submissions: set[
+            asyncio.Task["VisualGenResult"]] = set()
 
-    def _on_image_edit_task_done(self,
-                                 task: "asyncio.Task[VisualGenOutput]") -> None:
+    def _on_image_edit_task_done(
+            self,
+            task: "asyncio.Task[VisualGenOutput]",
+            *,
+            submission: Optional["asyncio.Task[VisualGenResult]"] = None
+    ) -> None:
         """Retire an edit's generation task and observe any late failure."""
         self._image_edit_tasks.discard(task)
         if task.cancelled():
+            if submission is not None:
+                submission.add_done_callback(
+                    self._on_image_edit_submission_done)
             return
         error = task.exception()
         if error is not None:
             logger.error(f"Background image edit generation failed: {error!r}")
 
-    async def _shutdown_image_edit_tasks(self) -> None:
-        """Cancel and boundedly observe edit-owned waits before shutdown."""
-        tasks = tuple(self._image_edit_tasks)
-        if not tasks:
+    def _on_image_edit_submission_done(
+            self, submission: "asyncio.Task[VisualGenResult]") -> None:
+        """Observe a submission failure after its generation owner was cancelled."""
+        if submission.cancelled():
             return
-        for task in tasks:
-            task.cancel()
-        # Cancelling a submission's await cannot stop its worker thread. Bound
-        # this task-only wait; owned late tasks keep their completion callbacks.
-        _, pending = await asyncio.wait(tasks, timeout=1.0)
-        if pending:
-            logger.warning(
-                f"{len(pending)} image edit generation task(s) still pending at shutdown"
-            )
+        error = submission.exception()
+        if error is not None:
+            logger.error(f"Background image edit generation failed: {error!r}")
+
+    async def _shutdown_image_edit_tasks(self) -> None:
+        """Settle submissions, then boundedly observe cancelled result waits."""
+        observed = set()
+        while True:
+            # A cancelled await cannot stop a submitting worker. Keep its
+            # executor live until the callable returns or raises, including
+            # submissions registered by continuations while we were waiting.
+            while self._image_edit_submissions:
+                await asyncio.gather(
+                    *(asyncio.shield(task)
+                      for task in tuple(self._image_edit_submissions)),
+                    return_exceptions=True)
+            tasks = tuple(self._image_edit_tasks - observed)
+            if not tasks:
+                return
+            observed.update(tasks)
+            for task in tasks:
+                task.cancel()
+            _, pending = await asyncio.wait(tasks, timeout=1.0)
+            if pending:
+                logger.warning(
+                    f"{len(pending)} image edit generation task(s) still pending at shutdown"
+                )
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
@@ -4160,16 +4188,30 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 image_edit_start = time.perf_counter()
 
-                async def _submit_and_wait() -> "VisualGenOutput":
-                    handle = await asyncio.to_thread(
+                submission_ready = asyncio.Event()
+
+                async def _submit() -> "VisualGenResult":
+                    await submission_ready.wait()
+                    return await asyncio.to_thread(
                         self.generator.generate_async, request.prompt, params)
+
+                submission = asyncio.create_task(_submit())
+                self._image_edit_submissions.add(submission)
+                submission.add_done_callback(
+                    self._image_edit_submissions.discard)
+                submission_ready.set()
+
+                async def _submit_and_wait() -> "VisualGenOutput":
+                    handle = await asyncio.shield(submission)
                     return await handle.aresult()
 
                 # Keep ownership across both awaits even if the request goes
                 # away: generation cannot be cancelled, so consume its result.
                 task = asyncio.create_task(_submit_and_wait())
                 self._image_edit_tasks.add(task)
-                task.add_done_callback(self._on_image_edit_task_done)
+                task.add_done_callback(
+                    functools.partial(self._on_image_edit_task_done,
+                                      submission=submission))
                 output = await asyncio.shield(task)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)

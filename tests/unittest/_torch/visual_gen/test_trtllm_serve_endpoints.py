@@ -1874,12 +1874,17 @@ class TestImageEdit:
 
     @pytest.mark.threadleak(enabled=False)  # finite off-loop submit and fake executor
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("case", ["cancelled-aresult", "normal", "no-edits", "finite-submit"])
+    @pytest.mark.parametrize(
+        "case",
+        ["cancelled-aresult", "normal", "no-edits", "finite-submit", "finite-submit-failure"],
+    )
     async def test_image_edit_lifespan_settles_owned_tasks(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        case: Literal["cancelled-aresult", "normal", "no-edits", "finite-submit"],
+        case: Literal[
+            "cancelled-aresult", "normal", "no-edits", "finite-submit", "finite-submit-failure"
+        ],
     ) -> None:
         """Lifespan settles the edit owner before closing its result loop."""
         from tensorrt_llm._torch.visual_gen.executor import DiffusionResponse
@@ -1937,6 +1942,10 @@ class TestImageEdit:
         executor = _ResultExecutor()
         submit_entered = threading.Event()
         submit_finished = threading.Event()
+        release_submit = threading.Event()
+        finite_submit = case in {"finite-submit", "finite-submit-failure"}
+        errors: list[str] = []
+        monkeypatch.setattr("tensorrt_llm.serve.openai_server.logger.error", errors.append)
         original = gen.generate_async
 
         def _submit(
@@ -1944,8 +1953,10 @@ class TestImageEdit:
         ) -> VisualGenResult:
             submit_entered.set()
             try:
-                if case == "finite-submit":
-                    threading.Event().wait(0.25)  # finite callable; cancellation cannot stop it
+                if finite_submit:
+                    assert release_submit.wait(5), "submission gate was never released"
+                if case == "finite-submit-failure":
+                    raise ValueError("synthetic submission failure")
                 inner = original(inputs=inputs, params=params)
                 executor.response = DiffusionResponse(
                     request_id=inner.request_id,
@@ -1958,13 +1969,25 @@ class TestImageEdit:
         monkeypatch.setattr(gen, "generate_async", _submit)
         server, client = _create_async_server(gen, model_name="Qwen/Qwen-Image-Layered")
         edits_at_generator_shutdown: list[int] = []
+        cleanup_entered = asyncio.Event()
+        cleanup = server._shutdown_image_edit_tasks
+
+        async def _observe_cleanup() -> None:
+            cleanup_entered.set()
+            await cleanup()
+
+        monkeypatch.setattr(server, "_shutdown_image_edit_tasks", _observe_cleanup)
 
         def _shutdown() -> None:
+            if case != "no-edits":
+                assert submit_finished.is_set(), "executor released before submission settled"
+            assert not server._image_edit_submissions
             edits_at_generator_shutdown.append(len(server._image_edit_tasks))
             executor.shutdown()
 
         monkeypatch.setattr(gen, "shutdown", _shutdown)
         request_task: asyncio.Task[httpx.Response] | None = None
+        exit_task: asyncio.Task[bool | None] | None = None
         lifespan = server.app.router.lifespan_context(server.app)
         entered = False
         exited = False
@@ -1983,7 +2006,7 @@ class TestImageEdit:
                     )
                 )
                 assert await asyncio.to_thread(submit_entered.wait, 5)
-                if case != "finite-submit":
+                if not finite_submit:
                     assert await asyncio.to_thread(executor.waiting.wait, 5)
                 if case == "normal":
                     executor._event_loop.call_soon_threadsafe(executor.result_ready.set)
@@ -1992,22 +2015,42 @@ class TestImageEdit:
                     request_task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await asyncio.wait_for(request_task, 5)
-            await asyncio.wait_for(lifespan.__aexit__(None, None, None), 5)
+            exit_task = asyncio.create_task(lifespan.__aexit__(None, None, None))
+            if finite_submit:
+                await asyncio.wait_for(cleanup_entered.wait(), 5)
+                await asyncio.sleep(0)
+                assert not exit_task.done()
+                assert not edits_at_generator_shutdown
+                assert not submit_finished.is_set()
+                release_submit.set()
+            await asyncio.wait_for(exit_task, 5)
             exited = True
             assert edits_at_generator_shutdown == [0]
             assert not server._image_edit_tasks
+            assert not server._image_edit_submissions
             assert executor.pending_at_close == 0
-            if case != "no-edits":
-                assert await asyncio.to_thread(submit_finished.wait, 5)
+            if case == "finite-submit-failure":
+                assert any("synthetic submission failure" in message for message in errors), errors
         finally:
-            if entered and not exited:
-                await asyncio.wait_for(lifespan.__aexit__(None, None, None), 5)
-            if request_task is not None:
-                if not request_task.done():
-                    request_task.cancel()
-                await asyncio.gather(request_task, return_exceptions=True)
-            executor.shutdown()
-            await client.aclose()
+            release_submit.set()
+            try:
+                if entered and not exited:
+                    if exit_task is None:
+                        exit_task = asyncio.create_task(lifespan.__aexit__(None, None, None))
+                    await asyncio.wait_for(exit_task, 5)
+            finally:
+                try:
+                    if request_task is not None:
+                        if not request_task.done():
+                            request_task.cancel()
+                        await asyncio.gather(request_task, return_exceptions=True)
+                    if submit_entered.is_set():
+                        assert await asyncio.to_thread(submit_finished.wait, 5)
+                finally:
+                    try:
+                        executor.shutdown()
+                    finally:
+                        await client.aclose()
 
 
 # =========================================================================
