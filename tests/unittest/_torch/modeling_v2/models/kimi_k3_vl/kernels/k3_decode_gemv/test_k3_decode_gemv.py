@@ -42,7 +42,7 @@ EPS = 1e-6
 
 def _ops():
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
         op,  # noqa: F401
     )
 
@@ -137,9 +137,7 @@ def test_k3_decode_gemv_tail(rank, m):
 @pytest.mark.parametrize("m", [0, 9, 16])
 def test_token_limit(m):
     _ops()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import op
 
     lat = torch.zeros(m, LATENT, dtype=torch.bfloat16, device="cuda")
     act = torch.zeros(m, ACT, dtype=torch.bfloat16, device="cuda")
