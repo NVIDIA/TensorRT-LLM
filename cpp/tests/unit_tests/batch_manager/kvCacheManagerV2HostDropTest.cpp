@@ -27,12 +27,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -338,6 +340,99 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
     commitRound();
     EXPECT_EQ(drainAtLeast(2).size(), 2U);
     EXPECT_EQ(storage.hostDropStats().handed.load(), drained + 2);
+}
+
+TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
+{
+    bool const preferKernel = GetParam();
+    auto& storage = mManager->storage();
+    auto const info = storage.setUpHostDropRing(
+        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{/*enabled=*/true, /*maxWaitS=*/10.0, /*minChunk=*/2});
+    ASSERT_EQ(info.numSlots, 16);
+
+    // A consumer that gives slots back only after a while, like the pool's put threads in a burst. It records each
+    // slot's fill byte before releasing the slot (-1: not one pattern); the patterns are checked after it stops.
+    std::atomic<bool> stop{false};
+    std::mutex recordsMutex;
+    std::vector<std::pair<std::string, int>> seen;
+    std::thread consumer(
+        [&]
+        {
+            while (!stop.load())
+            {
+                auto batch = storage.drainHostDrops(4096);
+                if (batch.empty())
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::vector<int32_t> slots;
+                {
+                    std::lock_guard<std::mutex> lock(recordsMutex);
+                    for (auto& record : batch)
+                    {
+                        auto const* data = reinterpret_cast<uint8_t const*>(
+                            info.address + static_cast<uint64_t>(record.slot) * info.slotBytes);
+                        seen.emplace_back(record.key, allBytesEqual(data, mHotBytes, data[0]) ? int{data[0]} : -1);
+                        slots.push_back(record.slot);
+                    }
+                }
+                storage.releaseHostDropSlots(slots);
+            }
+        });
+    constexpr int kRounds = 14; // 2 drops per round after the first two: 24 drops through a 16-slot ring
+    for (int round = 0; round < kRounds; ++round)
+    {
+        commitRound();
+    }
+    int64_t const drops = 2 * (kRounds - 2);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard<std::mutex> lock(recordsMutex);
+            if (static_cast<int64_t>(seen.size()) >= drops)
+            {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    stop.store(true);
+    consumer.join();
+    for (auto const& [key, fill] : seen)
+    {
+        EXPECT_EQ(fill, int{mPatterns.at(key)}) << "the ring slot held the dropped page's bytes";
+    }
+    auto const& stats = storage.hostDropStats();
+    EXPECT_EQ(stats.ringFull.load(), 0) << "no page is dropped without a hand-off";
+    EXPECT_EQ(stats.handed.load(), drops);
+    EXPECT_EQ(static_cast<int64_t>(seen.size()), drops);
+    EXPECT_GT(stats.waits.load(), 0) << "the ring filled and eviction waited for released slots";
+    EXPECT_EQ(stats.timeouts.load(), 0);
+    EXPECT_EQ(stats.gilSkips.load(), 0);
+    EXPECT_EQ(stats.errors.load(), 0);
+}
+
+TEST_P(HostDropRingTest, LosslessWaitIsBoundedWhenSlotsNeverComeBack)
+{
+    bool const preferKernel = GetParam();
+    auto& storage = mManager->storage();
+    storage.setUpHostDropRing(
+        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{/*enabled=*/true, /*maxWaitS=*/0.2, /*minChunk=*/2});
+    auto const t0 = std::chrono::steady_clock::now();
+    for (int round = 0; round < 14; ++round)
+    {
+        commitRound(); // nobody releases a slot: the ring fills after 16 drops
+    }
+    auto const elapsed = std::chrono::steady_clock::now() - t0;
+    auto const& stats = storage.hostDropStats();
+    EXPECT_EQ(stats.handed.load(), 16);
+    EXPECT_EQ(stats.ringFull.load(), 2 * (14 - 2) - 16);
+    EXPECT_GE(stats.timeouts.load(), 1);
+    // One timed-out wait pauses waiting; with the pause there is at most one wait per 0.2 s, never a hang.
+    EXPECT_LT(elapsed, std::chrono::seconds(5));
 }
 
 INSTANTIATE_TEST_SUITE_P(CopyPath, HostDropRingTest, ::testing::Values(true, false),

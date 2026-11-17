@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/assert.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -90,12 +91,29 @@ struct HostDropRingInfo
     bool kernelCopy; // true: the batched page-copy kernel; false: a host-callback memcpy on the ring's stream
 };
 
+//! Lossless ring hand-off (see StorageManager::setUpHostDropRing): when the ring has no free slot, the evicting call
+//! waits for slots instead of dropping the page without a hand-off.
+struct HostDropLosslessConfig
+{
+    bool enabled = false;
+    //! Longest single wait. After a wait times out, waiting pauses for as long and pages are dropped without a
+    //! hand-off again (counted in ringFull), so a consumer that stops releasing slots costs one wait, not a hang.
+    double maxWaitS = 10.0;
+    //! A wait ends once this many slots (or every page still to stage) are free; capped at half the ring.
+    size_t minChunk = 64;
+};
+
 //! Cumulative host-drop hand-off counters, in pages.
 struct HostDropStats
 {
     std::atomic<int64_t> handed{0};   // pages passed to the hook or staged in the ring
     std::atomic<int64_t> ringFull{0}; // pages dropped without a hand-off because no ring slot was free
     std::atomic<int64_t> errors{0};   // failed hand-off calls
+    // Lossless ring hand-off only.
+    std::atomic<int64_t> waits{0};    // waits of the evicting thread for released ring slots
+    std::atomic<int64_t> waitNs{0};   // their total duration
+    std::atomic<int64_t> timeouts{0}; // waits that ended without enough slots
+    std::atomic<int64_t> gilSkips{0}; // pages dropped without a hand-off because the evicting thread held the GIL
 };
 
 // Immutable bidirectional mapping between lifecycles and pool groups.
@@ -425,8 +443,12 @@ public:
     //! Switches the last host level to the asynchronous hand-off: each dropped committed page is copied into a pinned
     //! ring on a dedicated stream and queued, and no hook runs on the evicting thread. The ring is allocated on the
     //! first call (at most `ringBytes`, at least 16 slots); later calls return the same ring. `preferKernel=false`
-    //! forces the host-callback copy.
-    HostDropRingInfo setUpHostDropRing(size_t ringBytes, bool preferKernel);
+    //! forces the host-callback copy. With `lossless.enabled`, a dropped page that finds the ring full is not dropped
+    //! without a hand-off: the evicting call stages the pages in chunks and waits for releaseHostDropSlots() between
+    //! them (back-pressure on eviction). The wait is bounded and is never taken while the calling thread holds the
+    //! Python GIL, which the consumer that releases the slots may need.
+    HostDropRingInfo setUpHostDropRing(
+        size_t ringBytes, bool preferKernel, HostDropLosslessConfig const& lossless = HostDropLosslessConfig{});
     //! Ring records whose copies have completed, oldest first; a batch is never split.
     std::vector<HostDropRingRecord> drainHostDrops(size_t maxRecords);
     //! Returns ring slots to the free list once their contents have been consumed.
@@ -713,6 +735,13 @@ private:
     CUdeviceptr mHostDropPairsDev = 0;
     size_t mHostDropPairsCap = 0; // in pairs
     std::atomic<bool> mHostDropAsync{false};
+    // Lossless hand-off: configuration, the wake-up for released slots, and the pause after a timed-out wait (guarded
+    // by mHostDropMutex).
+    bool mHostDropLossless = false;
+    int64_t mHostDropMaxWaitNs = 0;
+    size_t mHostDropMinChunk = 64;
+    int64_t mHostDropPausedUntilNs = 0;
+    std::condition_variable mHostDropSlotsFreed;
 
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.
     std::unique_ptr<StagingBufferManager> mPageStagingManager;

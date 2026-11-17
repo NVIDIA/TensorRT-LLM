@@ -3893,18 +3893,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("callback").none())
         .def(
             "host_drop_ring",
-            [](kv::KvCacheManager& self, size_t ringBytes, bool preferKernel)
+            [](kv::KvCacheManager& self, size_t ringBytes, bool preferKernel, bool lossless, double losslessMaxWaitS,
+                size_t losslessChunk)
             {
                 // (address, slot_bytes, num_slots, kernel_copy) of the pinned ring the last host level copies its
-                // drops into. Switches the hand-off to the ring; the hook is no longer called on eviction.
+                // drops into. Switches the hand-off to the ring; the hook is no longer called on eviction. With
+                // `lossless`, a full ring makes the evicting call wait for released slots instead of dropping pages
+                // without a hand-off (see StorageManager::setUpHostDropRing).
                 kv::HostDropRingInfo info{};
                 {
                     nb::gil_scoped_release release;
-                    info = self.storage().setUpHostDropRing(ringBytes, preferKernel);
+                    info = self.storage().setUpHostDropRing(
+                        ringBytes, preferKernel, kv::HostDropLosslessConfig{lossless, losslessMaxWaitS, losslessChunk});
                 }
                 return nb::make_tuple(info.address, info.slotBytes, info.numSlots, info.kernelCopy);
             },
-            nb::arg("ring_bytes"), nb::arg("prefer_kernel") = true)
+            nb::arg("ring_bytes"), nb::arg("prefer_kernel") = true, nb::arg("lossless") = false,
+            nb::arg("lossless_max_wait_s") = 10.0, nb::arg("lossless_chunk") = 64)
         .def(
             "drain_host_drops",
             [](kv::KvCacheManager& self, size_t maxRecords)
@@ -3941,6 +3946,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 out["handed"] = c.handed.load();
                 out["ring_full"] = c.ringFull.load();
                 out["errors"] = c.errors.load();
+                out["waits"] = c.waits.load();
+                out["wait_ns"] = c.waitNs.load();
+                out["timeouts"] = c.timeouts.load();
+                out["gil_skips"] = c.gilSkips.load();
                 return out;
             })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
