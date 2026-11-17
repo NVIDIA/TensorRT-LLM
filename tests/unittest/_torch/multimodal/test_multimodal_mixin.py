@@ -330,6 +330,66 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
 
 
+@pytest.mark.cpu_only
+def test_prepare_multimodal_rows_returns_the_rows_that_inputs_fuses():
+    """`prepare_multimodal_inputs` is `prepare_multimodal_rows` plus the fuse: fusing the
+    rows gives the same inputs, and the rows keep `input_ids` for a model that places them
+    itself."""
+    hidden, mm_token_id = 8, 7
+    emb = make_embedding(num_embeddings=40, hidden_size=hidden)
+    input_ids = torch.tensor([0, mm_token_id, mm_token_id, 1], dtype=torch.long)
+    text_idx = torch.tensor([0, 3], dtype=torch.long)
+    mm_idx = torch.tensor([1, 2], dtype=torch.long)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden)
+    model = TensorEncoderMultimodalModel(emb, torch.tensor([mm_token_id]), mm_emb)
+    kwargs = dict(
+        input_ids=input_ids,
+        positions=None,
+        multimodal_params=[make_raw_multimodal_param()],
+        num_context_requests=1,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+
+    rows = model.prepare_multimodal_rows(**kwargs)
+    assert rows is not None
+    row_input_ids, active_embeddings, extra_embeds = rows
+    assert row_input_ids is input_ids
+    assert tuple(extra_embeds) == ()
+    torch.testing.assert_close(torch.cat(active_embeddings), mm_emb)
+
+    fused_ids, fused_embeds, fused_extra = model._fuse_multimodal_embeddings(
+        input_ids=row_input_ids,
+        multimodal_embeddings=active_embeddings,
+        mm_token_ids=model.multimodal_token_ids,
+        embedding_layer=model.text_embedding_layer,
+        extra_embeds=extra_embeds,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+    prepared = model.prepare_multimodal_inputs(**kwargs)
+    assert prepared.input_ids is None and fused_ids is None
+    torch.testing.assert_close(prepared.inputs_embeds, fused_embeds)
+    assert tuple(prepared.extra_embeds) == tuple(fused_extra) == ()
+
+
+@pytest.mark.cpu_only
+def test_a_text_step_has_no_multimodal_rows():
+    emb = make_embedding(num_embeddings=40, hidden_size=8)
+    model = DummyMultimodalModel(emb, torch.tensor([7]))
+    input_ids = torch.tensor([0, 1, 2], dtype=torch.long)
+    for params in ([], None, [MultimodalParams(multimodal_data={})]):
+        kwargs = dict(
+            input_ids=input_ids,
+            positions=None,
+            multimodal_params=params,
+            num_context_requests=1,
+        )
+        assert model.prepare_multimodal_rows(**kwargs) is None
+        prepared = model.prepare_multimodal_inputs(**kwargs)
+        assert prepared.input_ids is input_ids and prepared.inputs_embeds is None
+
+
 def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
 

@@ -1080,8 +1080,7 @@ class MultimodalModelMixin:
                 sliced[key] = [value[i] for i in item_indices]
         return sliced
 
-    # A future optional mixin-owned forward can build on the same template method.
-    def prepare_multimodal_inputs(
+    def prepare_multimodal_rows(
         self,
         *,
         input_ids: torch.Tensor,
@@ -1089,12 +1088,15 @@ class MultimodalModelMixin:
         multimodal_params: Optional[Sequence[MultimodalParams]],
         num_context_requests: int,
         **forward_kwargs: Any,
-    ) -> PreparedLlmInputs:
-        """Prepare multimodal inputs for a concrete model forward.
+    ) -> Optional[tuple[torch.Tensor, list[torch.Tensor], Sequence[torch.Tensor]]]:
+        """Return this step's multimodal rows, before any fusion.
 
-        This method owns the common framework sequence around a model-specific
-        encoder hook: retrieve/cache embeddings, select active chunk rows if
-        needed, run optional model hooks, and fuse rows into text embeds.
+        Selects the params, retrieves or encodes their embeddings, runs the two
+        embedding hooks and keeps the rows of this chunk. Returns
+        ``(input_ids, active_embeddings, extra_embeds)``, or None when the step
+        has no multimodal params. A model whose language model places the rows
+        itself (for example at the step's ``mm_token_indices``) calls this
+        instead of `prepare_multimodal_inputs`.
         """
         context_params = list(
             self.select_multimodal_params(
@@ -1103,7 +1105,7 @@ class MultimodalModelMixin:
             )
         )
         if not context_params:
-            return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
+            return None
 
         embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
@@ -1120,6 +1122,35 @@ class MultimodalModelMixin:
             multimodal_params=context_params,
             **forward_kwargs,
         )
+        return input_ids, active_embeddings, extra_embeds
+
+    # A future optional mixin-owned forward can build on the same template method.
+    def prepare_multimodal_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: Optional[torch.Tensor],
+        multimodal_params: Optional[Sequence[MultimodalParams]],
+        num_context_requests: int,
+        **forward_kwargs: Any,
+    ) -> PreparedLlmInputs:
+        """Prepare multimodal inputs for a concrete model forward.
+
+        This method owns the common framework sequence around a model-specific
+        encoder hook: retrieve/cache embeddings, select active chunk rows if
+        needed, run optional model hooks (`prepare_multimodal_rows`), and fuse
+        rows into text embeds.
+        """
+        rows = self.prepare_multimodal_rows(
+            input_ids=input_ids,
+            positions=positions,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            **forward_kwargs,
+        )
+        if rows is None:
+            return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
+        input_ids, active_embeddings, extra_embeds = rows
 
         fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
             input_ids=input_ids,
