@@ -472,7 +472,7 @@ def test_group_args_fall_back_to_nccl(mapping, ipc_failed):
     # The raw-op entry builds its own workspace argument: it must not hand null
     # peer pointers to a custom kernel either.
     from tensorrt_llm import _utils
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as entry
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allreduce as entry
 
     with (
         _patched_workspace(ipc_failed) as workspace,
