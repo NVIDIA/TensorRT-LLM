@@ -87,6 +87,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PAGE_PRIORITY_DEFAULT,
     PAGE_PRIORITY_MIN,
@@ -2872,6 +2873,20 @@ def test_v2_hybrid_without_fp4_mla_has_no_layout() -> None:
     layout = SimpleNamespace()
     assert fp4_mla_cache_layout(SimpleNamespace(fp4_mla_layout=layout)) is layout
     assert not has_fp4_mla_cache_layout(SimpleNamespace())
+
+
+def test_fp4_mla_layout_hooks_forward_only_to_hooks_the_base_manager_defines() -> None:
+    # Without a layout a hook is the next class's, so every hook has to exist there:
+    # a missing one would fail on each manager that has no FP4 MLA cache.
+    forwarded = [
+        name
+        for name, member in vars(Fp4MlaLayoutHooks).items()
+        # A disaggregated import has nothing to rebuild without a layout: no forward.
+        if callable(member) and name != "rebuild_disagg_imported_cache"
+    ]
+
+    assert len(forwarded) == 7
+    assert [name for name in forwarded if not callable(getattr(KVCacheManagerV2, name, None))] == []
 
 
 def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
