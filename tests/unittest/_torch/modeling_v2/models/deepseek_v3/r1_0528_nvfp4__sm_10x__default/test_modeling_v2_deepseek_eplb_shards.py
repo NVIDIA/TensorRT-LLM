@@ -19,13 +19,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_modeling_v2_deepseek_default_shards import (
-    _TINY,
     _WS1,
     _assert_slot_scales_are_the_expert_products,
     _Checkpoint,
     _default_core,
     _layout_id,
     _mapping,
+    _tiny,
     _tiny_keys,
 )
 from torch import nn
@@ -87,7 +87,7 @@ def test_eplb_slots_hold_the_placed_experts(layout):
     """Rank r holds slots [r * S, (r + 1) * S) of every routed layer, S = num_slots / ep,
     and each slot the expert the placement puts there; together the ranks hold every
     expert of every layer, the MTP layer's included."""
-    cfg = SimpleNamespace(**_TINY)
+    cfg = _tiny(layout)
     ep = layout[3]
     held: dict = {}
     for rank in range(layout[0]):
@@ -116,7 +116,7 @@ def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
     expert."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
-    cfg = SimpleNamespace(**_TINY)
+    cfg = _tiny(layout)
     keys = _tiny_keys(cfg)
     oracle = _default_core(_WS1, 0, cfg, mtp)
     oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
@@ -190,7 +190,7 @@ def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch
     more, whether or not a slot already did, and coverage still holds both ways."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
-    cfg = SimpleNamespace(**_TINY)
+    cfg = _tiny(layout)
     keys = _tiny_keys(cfg)
     oracle = _default_core(_WS1, 0, cfg, mtp)
     oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)

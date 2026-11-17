@@ -321,7 +321,7 @@ A [Modeling V2](../../../tensorrt_llm/_torch/modeling_v2/README.md) target runs 
 
 | Target | EPLB modes | Layouts |
 |---|---|---|
-| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static, online | attention DP with pure expert parallelism over 4 or 8 GPUs (dep4, dep8) |
+| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static, online | attention DP with pure expert parallelism over 4, 8, 16, 32 or 36 GPUs (dep4, dep8, dep16, dep32, dep36). From dep16 on, the routed experts exchange tokens with an alltoall over multi-node NVLink (GB200 or GB300 NVL72), which those layouts need. dep36 runs as EPLB slots only, with a slot count 36 divides, such as 288. |
 
 Every other target declines EPLB, so those deployments run the built-in model.
 

@@ -56,8 +56,18 @@ _DEFAULT_LAYOUTS = frozenset(
         (8, True, 8, 1),  # dep8, experts split by intermediate
         (8, True, 2, 4),  # dep8, experts tp2 x ep4
         (16, True, 1, 16),  # dep16
+        (32, True, 1, 32),  # dep32: wide expert parallelism
     }
 )
+
+# The layouts the target runs only as EPLB slots: 256 experts do not split over 36 ranks,
+# and slots that 36 divides do (288: 8 a rank).
+_EPLB_ONLY_LAYOUTS = frozenset({(36, True, 1, 36)})  # dep36: wide expert parallelism
+
+# Wide expert parallelism: attention DP over 32 or 36 ranks. Its routed experts exchange
+# tokens with an alltoall over multi-node NVLink (modeling.py), the only exchange they were
+# measured with.
+_WIDE_EP_LAYOUTS = frozenset({(32, True, 1, 32), (36, True, 1, 36)})
 
 # The layouts at which the checkpoint's MTP layer (one-model MTP-Eagle) is
 # admitted. The MTP layer is cut like every other layer, so the forward
@@ -72,22 +82,39 @@ _MTP_LAYOUTS = frozenset(
         (4, True, 4, 1),  # dep4, experts split by intermediate
         (8, False, 2, 4),  # tp8, experts tp2 x ep4
         (8, True, 1, 8),  # dep8
+        (16, True, 1, 16),  # dep16: the MTP layer's experts over the alltoall
+        (32, True, 1, 32),  # dep32
+        (36, True, 1, 36),  # dep36, under EPLB
     }
 )
 
-# The layouts at which static EPLB was measured. EPLB balances attention DP over
+# The layouts at which EPLB was measured. EPLB balances attention DP over
 # expert-parallel ranks that each hold whole experts, which is the built-in
 # model's requirement too, so only attention-DP layouts with moe_tp 1 qualify.
+# From dep16 on the routed experts exchange tokens with an alltoall, and EPLB
+# was measured with it.
 _EPLB_LAYOUTS = frozenset(
     {
         (4, True, 1, 4),  # dep4
         (8, True, 1, 8),  # dep8
+        (16, True, 1, 16),  # dep16
+        (32, True, 1, 32),  # dep32
+        (36, True, 1, 36),  # dep36
     }
 )
 
 # From this EP size on, over multi-node NVLink, the default target's routed experts
 # exchange tokens with an alltoall rather than gather every rank's tokens.
 ALLTOALL_MIN_EP = 16
+
+
+def _multi_node_nvlink() -> bool:
+    """Whether this rank's GPU reaches the others over multi-node NVLink, which the routed
+    experts' alltoall needs."""
+    from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+
+    return MnnvlMemory.supports_mnnvl()
+
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -168,21 +195,45 @@ def route(
             "whole TP group"
         )
 
-    if layout not in _DEFAULT_LAYOUTS:
+    # Under EPLB the target loads its experts by slot and routes ids to slots. Which EPLB
+    # modes it implements is the resolver's check (`EPLB_MODES`); where it was measured
+    # is this one. Each EP rank holds an equal share of the experts, or of the slots.
+    eplb = moe_eplb_mode(model_config)
+    ep = mapping.moe_ep_size
+    experts = pretrained_config.n_routed_experts
+    if layout in _EPLB_ONLY_LAYOUTS and eplb is None:
+        raise NoTarget(
+            f"parallel layout {split} without EPLB; {experts} routed experts do not split "
+            f"over {ep} EP ranks, only EPLB slots that {ep} divides do"
+        )
+    if layout not in _DEFAULT_LAYOUTS | _EPLB_ONLY_LAYOUTS:
         raise NoTarget(
             f"parallel layout {split}; the default target is gated on tp2, tp2+ep2, "
             "dep2, tp4, tp4+ep4, tp4 with moe tp2 x ep2, dep4 with moe ep4, tp2 x ep2 "
             "or tp4, tp8, tp8+ep8, tp8 with moe tp4 x ep2 or tp2 x ep4, dep8 with moe "
-            "ep8, tp8 or tp2 x ep4, and dep16"
+            "ep8, tp8 or tp2 x ep4, dep16, dep32, and dep36 under EPLB"
         )
-
-    # Under EPLB the target loads its experts by slot and routes ids to slots. Which EPLB
-    # modes it implements is the resolver's check (`EPLB_MODES`); where it was measured
-    # is this one.
-    eplb = moe_eplb_mode(model_config)
     if eplb is not None and layout not in _EPLB_LAYOUTS:
         raise NoTarget(
-            f"{eplb} EPLB at parallel layout {split}; the default target runs EPLB at dep4 and dep8"
+            f"{eplb} EPLB at parallel layout {split}; the default target runs EPLB at dep4, "
+            "dep8, dep16, dep32 and dep36"
+        )
+    if eplb is not None:
+        num_slots = getattr(model_config.moe_load_balancer, "num_slots", None) or experts
+        if num_slots % ep:
+            raise NoTarget(
+                f"{eplb} EPLB with {num_slots} slots at parallel layout {split}; each EP "
+                "rank holds an equal share of the slots"
+            )
+
+    # Wide expert parallelism, and EPLB from dep16 on, were measured only with the routed
+    # experts' alltoall, which runs over multi-node NVLink.
+    wide = layout in _WIDE_EP_LAYOUTS or (eplb is not None and ep >= ALLTOALL_MIN_EP)
+    if wide and not _multi_node_nvlink():
+        raise NoTarget(
+            f"parallel layout {split}{f' with {eplb} EPLB' if eplb else ''} and no "
+            "multi-node NVLink; the default target runs it only over the routed experts' "
+            "alltoall, which needs it"
         )
 
     # Attention TP across nodes reduces only over multi-node NVLink.

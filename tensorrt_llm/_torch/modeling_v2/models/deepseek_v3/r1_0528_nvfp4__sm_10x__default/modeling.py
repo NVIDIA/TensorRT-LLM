@@ -32,7 +32,7 @@ forward:
   slot windows hold their experts and sums what those ranks computed back, in rounds every
   rank runs (`_experts_alltoall`). The trunk sends NVFP4 rows, the MTP layer bf16 rows.
 
-Under EPLB (`moe_config.load_balancer`, attention DP at dep4 and dep8) every routed MoE layer
+Under EPLB (`moe_config.load_balancer`, attention DP from dep4 to dep36) every routed MoE layer
 registers with the engine's load balancer, its experts are loaded by slot rather than by a
 contiguous expert window (weights.py), and `_experts` routes the router's expert ids to slot ids
 before the runner, which then works in slots. Under online EPLB the balancer also moves experts

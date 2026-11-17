@@ -38,6 +38,7 @@ from pydantic import ValidationError
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import (
@@ -102,8 +103,10 @@ def _on_sm10x(request, monkeypatch):
 
 
 def _set_mnnvl(monkeypatch, available: bool) -> None:
-    """Whether the nodes share multi-node NVLink, as `MNNVLAllReduce.is_mnnvl` reports."""
+    """Whether the nodes share multi-node NVLink, as `MNNVLAllReduce.is_mnnvl` and
+    `MnnvlMemory.supports_mnnvl` report."""
     monkeypatch.setattr(MNNVLAllReduce, "is_mnnvl", staticmethod(lambda *a, **k: available))
+    monkeypatch.setattr(MnnvlMemory, "supports_mnnvl", staticmethod(lambda: available))
 
 
 def _gpt_oss_config(**overrides):
@@ -620,11 +623,21 @@ _R1_DEFAULT_LAYOUTS = {
     "dep8-moetp8": _layout(8, True, 8, 1),
     "dep8-moetp2-ep4": _layout(8, True, 2, 4),
     "dep16": _layout(16, True, 1, 16),
+    "dep32": _layout(32, True, 1, 32),
 }
 
 # The layouts the MTP layer's acceptance was measured at: each residual-norm
 # path and each expert split.
-_R1_MTP_LAYOUTS = ("dep4", "tp4", "tp4-ep4", "dep4-moetp4", "tp8-moetp2-ep4", "dep8")
+_R1_MTP_LAYOUTS = (
+    "dep4",
+    "tp4",
+    "tp4-ep4",
+    "dep4-moetp4",
+    "tp8-moetp2-ep4",
+    "dep8",
+    "dep16",
+    "dep32",
+)
 
 
 @pytest.mark.parametrize(
@@ -1975,7 +1988,6 @@ def test_r1_per_layer_dynamic_eplb_keeps_the_builtin_model():
         pytest.param(_layout(4, False, 1, 4), id="tp4_ep4"),
         pytest.param(_layout(4, True, 2, 2), id="dep4_moetp2_ep2"),
         pytest.param(_layout(2, True, 1, 2), id="dep2"),
-        pytest.param(_layout(16, True, 1, 16), id="dep16"),
     ],
 )
 @pytest.mark.parametrize("eplb_mode", ["static", "online"])
@@ -1986,6 +1998,85 @@ def test_r1_eplb_is_refused_where_it_was_not_measured(mapping_kwargs, eplb_mode)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=f"{eplb_mode} EPLB at parallel layout"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+_R1_WIDE_EP_EPLB_LAYOUTS = {
+    "dep16": _layout(16, True, 1, 16),
+    "dep32": _layout(32, True, 1, 32),
+    "dep36": _layout(36, True, 1, 36),
+}
+
+
+@pytest.mark.parametrize("eplb_mode", ["static", "online"])
+@pytest.mark.parametrize("spec_config", [None, _MTP3], ids=["no_spec", "mtp3"])
+@pytest.mark.parametrize(
+    "mapping_kwargs", list(_R1_WIDE_EP_EPLB_LAYOUTS.values()), ids=list(_R1_WIDE_EP_EPLB_LAYOUTS)
+)
+def test_r1_eplb_matches_at_wide_ep(mapping_kwargs, spec_config, eplb_mode):
+    """From dep16 on the routed experts exchange tokens with an alltoall, and EPLB was measured
+    with it at dep16, dep32 and dep36, with and without the MTP layer: 288 slots, 18, 9 and 8
+    a rank."""
+    config = _balanced(
+        _model_config(_r1_config(), spec_config=spec_config, **mapping_kwargs), eplb_mode
+    )
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
+
+
+def test_r1_dep36_runs_only_as_eplb_slots():
+    """256 experts do not split over 36 ranks; 288 slots do, 8 a rank."""
+    config = _model_config(_r1_config(), **_layout(36, True, 1, 36))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="256 routed experts do not split over 36 EP ranks"):
+        modeling_v2_resolve(config, _llm_args("require"))
+    balanced = _balanced(config, "static", num_slots=288)
+    assert _qualified(modeling_v2_resolve(balanced, _llm_args("require"))) == _R1_DEFAULT_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, num_slots",
+    [
+        pytest.param(_layout(36, True, 1, 36), 256, id="dep36-256"),
+        pytest.param(_layout(32, True, 1, 32), 300, id="dep32-300"),
+        pytest.param(_layout(8, True, 1, 8), 260, id="dep8-260"),
+    ],
+)
+def test_r1_eplb_slots_that_do_not_split_over_the_ranks_are_refused(mapping_kwargs, num_slots):
+    """Each EP rank holds an equal share of the slots: a slot count the EP size does not divide
+    keeps the built-in model rather than failing when the target lays its slots out."""
+    config = _balanced(_model_config(_r1_config(), **mapping_kwargs), "static", num_slots)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=f"{num_slots} slots at parallel layout"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, eplb_mode",
+    [
+        pytest.param(_layout(32, True, 1, 32), None, id="dep32"),
+        pytest.param(_layout(36, True, 1, 36), "static", id="dep36-static"),
+        pytest.param(_layout(16, True, 1, 16), "online", id="dep16-online"),
+    ],
+)
+def test_r1_wide_ep_without_multi_node_nvlink_keeps_the_builtin_model(
+    monkeypatch, mapping_kwargs, eplb_mode
+):
+    """Wide expert parallelism, and EPLB from dep16 on, were measured only over the routed
+    experts' alltoall, which needs multi-node NVLink."""
+    _set_mnnvl(monkeypatch, False)
+    config = _model_config(_r1_config(), **mapping_kwargs)
+    if eplb_mode is not None:
+        config = _balanced(config, eplb_mode)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="no multi-node NVLink"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_r1_dep16_without_eplb_keeps_the_allgather_without_multi_node_nvlink(monkeypatch):
+    """dep16 without EPLB was measured over the allgather too, which needs no multi-node
+    NVLink, so it keeps the target."""
+    _set_mnnvl(monkeypatch, False)
+    config = _model_config(_r1_config(), **_layout(16, True, 1, 16))
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
 
 
 @pytest.mark.usefixtures("_glm52_sm")

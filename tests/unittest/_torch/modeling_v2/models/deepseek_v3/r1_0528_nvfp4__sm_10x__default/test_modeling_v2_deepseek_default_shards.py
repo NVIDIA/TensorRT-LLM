@@ -52,7 +52,8 @@ pytestmark = pytest.mark.cpu_only
 
 
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
-_MTP_LAYOUTS = sorted(routing._MTP_LAYOUTS)
+# The MTP layouts that run without EPLB; dep36 runs only as EPLB slots.
+_MTP_LAYOUTS = sorted(routing._MTP_LAYOUTS & routing._DEFAULT_LAYOUTS)
 
 # The oracle: one rank, attention TP, nothing split.
 _WS1 = (1, False, 1, 1)
@@ -589,12 +590,18 @@ _TINY = dict(
     q_lora_rank=64,
     vocab_size=1001,
     first_k_dense_replace=1,
-    n_routed_experts=16,  # divisible by every admitted EP size, up to dep16's
+    n_routed_experts=16,  # divisible by every EP size up to dep16's; see `_tiny`
     moe_intermediate_size=1024,
     n_shared_experts=1,
     intermediate_size=1024,
     num_nextn_predict_layers=1,
 )
+
+
+def _tiny(layout) -> SimpleNamespace:
+    """The tiny model at `layout`: 16 routed experts while its EP size divides 16, else 288,
+    which 32 and 36 EP ranks split -- 9 and 8 a rank."""
+    return SimpleNamespace(**dict(_TINY, n_routed_experts=16 if 16 % layout[3] == 0 else 288))
 
 
 def _tiny_keys(cfg) -> list[str]:
@@ -693,7 +700,7 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
     experts; without it, it is left whole."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
-    cfg = SimpleNamespace(**_TINY)
+    cfg = _tiny(layout)
     keys = _tiny_keys(cfg)
     mtp_prefix = f"model.layers.{cfg.num_hidden_layers}."
     for rank in range(layout[0]):

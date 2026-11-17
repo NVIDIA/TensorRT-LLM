@@ -101,16 +101,38 @@ _LAYOUTS = [
     _layout("dep8_moetp8", 8, 8, 1, True),
     _layout("dep8_moetp2_ep4", 8, 2, 4, True),
     _layout("dep16", 16, 1, 16, True),
+    _layout("dep32", 32, 1, 32, True),
 ]
 
 # The layouts routing admits MTP at: each residual-norm path (attention TP in
 # one tray and across trays, attention DP) and each expert split.
-_MTP_LAYOUT_IDS = ("dep4", "tp4", "tp4_ep4", "dep4_moetp4", "tp8_moetp2_ep4", "dep8")
+_MTP_LAYOUT_IDS = (
+    "dep4",
+    "tp4",
+    "tp4_ep4",
+    "dep4_moetp4",
+    "tp8_moetp2_ep4",
+    "dep8",
+    "dep16",
+    "dep32",
+    "dep36",
+)
 _MTP_LAYOUTS = [p for i in _MTP_LAYOUT_IDS for p in _LAYOUTS if p.id == i]
 
 
-# The layouts the target runs EPLB at: attention DP over ranks holding whole experts.
-_EPLB_LAYOUTS = [p for i in ("dep4", "dep8") for p in _LAYOUTS if p.id == i]
+# The layouts the target runs EPLB at: attention DP over ranks holding whole experts, from
+# dep16 on over the alltoall of wide expert parallelism. dep36 runs only as EPLB slots.
+_EPLB_LAYOUTS = [p for i in ("dep4", "dep8", "dep16", "dep32") for p in _LAYOUTS if p.id == i] + [
+    _layout("dep36", 36, 1, 36, True)
+]
+
+# Each EPLB layout without and with the MTP layer, where routing admits it.
+_EPLB_CASES = [
+    pytest.param(p.values[0], mtp, id=f"{p.id}-{'mtp3' if mtp else 'no_spec'}", marks=p.marks)
+    for p in _EPLB_LAYOUTS
+    for mtp in (False, True)
+    if not mtp or p.id in _MTP_LAYOUT_IDS
+]
 
 
 def _eplb_placement(layer: int, experts: int, slots: int, ep_size: int) -> list:
@@ -124,12 +146,16 @@ def _eplb_placement(layer: int, experts: int, slots: int, ep_size: int) -> list:
     """
     order = list(range(experts))
     random.Random(layer).shuffle(order)
-    per_rank, spare = experts // ep_size, (slots - experts) // ep_size
+    # A rank's share of the experts is uneven when the EP size does not divide them, as 256
+    # over 36 ranks; its slots then hold one more or one fewer spare.
+    bounds = [rank * experts // ep_size for rank in range(ep_size + 1)]
+    per_rank = slots // ep_size
     out = []
     for rank in range(ep_size):
-        own = order[rank * per_rank : (rank + 1) * per_rank]
-        extra = [order[(rank * per_rank + per_rank + k) % experts] for k in range(spare)]
-        extra[0] = own[0]
+        own = order[bounds[rank] : bounds[rank + 1]]
+        extra = [order[(bounds[rank + 1] + k) % experts] for k in range(per_rank - len(own))]
+        if extra:
+            extra[0] = own[0]
         out += own + extra
     return out
 
@@ -266,7 +292,8 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         # whose dispatch takes only NVFP4 uint8 hidden states, and the MTP layer
         # is bf16 because modelopt excludes model.layers.61* from quantization.
         # Disabling DeepEP moves stock off it; the modeling_v2 target builds its
-        # own allgather + reduce-scatter and never consults the factory. Set at
+        # own exchange (allgather + reduce-scatter, or from dep16 on its own
+        # one-sided alltoall) and never consults the factory. Set at
         # every layout, where it is inert under attention TP. It travels as
         # ``env_overrides`` because it is read on the ranks.
         rank_env = {MODELING_V2_VALIDATE_ENV: "1"}
@@ -327,8 +354,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_not_sm10x
-    @pytest.mark.parametrize("mtp", [False, True], ids=["no_spec", "mtp3"])
-    @pytest.mark.parametrize("parallel", _EPLB_LAYOUTS)
+    @pytest.mark.parametrize("parallel, mtp", _EPLB_CASES)
     def test_gsm8k_static_eplb(self, mocker, parallel, mtp):
         """Static EPLB at a placement drawn per layer, the MTP layer included.
 
@@ -364,8 +390,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_not_sm10x
-    @pytest.mark.parametrize("mtp", [False, True], ids=["no_spec", "mtp3"])
-    @pytest.mark.parametrize("parallel", _EPLB_LAYOUTS)
+    @pytest.mark.parametrize("parallel, mtp", _EPLB_CASES)
     def test_gsm8k_online_eplb(self, mocker, parallel, mtp):
         """Online EPLB from the built-in default placement, the MTP layer included.
 
