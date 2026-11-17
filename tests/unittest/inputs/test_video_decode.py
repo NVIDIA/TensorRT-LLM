@@ -9,6 +9,7 @@ import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -51,13 +52,27 @@ def test_np_format_returns_stacked_uint8_ndarray(sample_video_path: str) -> None
 
 def test_pt_format_returns_list_of_chw_tensors(sample_video_path: str) -> None:
     video = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="pt")
+    numpy_video = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+    expected = numpy_video.frames.astype(np.float32)
+    expected *= 1.0 / 255.0
     assert isinstance(video.frames, list)
     assert len(video.frames) == 10
     for frame in video.frames:
         assert isinstance(frame, torch.Tensor)
         assert frame.shape == (3, 64, 64)
         assert frame.dtype == torch.float32
+        assert frame.is_contiguous()
         assert 0.0 <= frame.min().item() and frame.max().item() <= 1.0
+    torch.testing.assert_close(
+        torch.stack(video.frames), torch.from_numpy(expected).permute(0, 3, 1, 2), rtol=0, atol=0
+    )
+    assert video.metadata == numpy_video.metadata
+    # The output stays on CPU even when an application changes the default device.
+    with torch.device("meta"):
+        default_device_video = _load_video_by_cv2(
+            sample_video_path, num_frames=10, fps=-1, format="pt"
+        )
+    torch.testing.assert_close(torch.stack(default_device_video.frames), torch.stack(video.frames))
 
 
 def test_pil_format_returns_list_of_pil_images(sample_video_path: str) -> None:
@@ -78,7 +93,7 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
     assert np.shares_memory(video.frames, batched[0])
 
 
-@pytest.mark.parametrize(("format", "peak_bytes_per_value"), [("np", 2), ("pil", 2), ("pt", 9)])
+@pytest.mark.parametrize(("format", "peak_bytes_per_value"), [("np", 2), ("pil", 2), ("pt", 5)])
 def test_decode_limit_is_checked_before_frame_stack_allocation(
     sample_video_path: str, format: str, peak_bytes_per_value: int
 ) -> None:
@@ -126,7 +141,7 @@ def test_pt_decode_reserves_peak_then_commits_retained_bytes(sample_video_path: 
         decoded_memory_reserver=reserve,
     )
 
-    assert reserved == [(10 * 64 * 64 * 3 * 9, 10 * 64 * 64 * 3 * 4)]
+    assert reserved == [(10 * 64 * 64 * 3 * 5, 10 * 64 * 64 * 3 * 4)]
     assert reservation.committed == 10 * 64 * 64 * 3 * 4
     assert reservation.released is False
 
@@ -157,6 +172,59 @@ def test_decode_releases_reservation_after_allocation_failure(sample_video_path:
             )
 
     assert reservation.released is True
+
+
+@pytest.mark.parametrize("end_frame, failed_frame", [(20, None), (15, 8)])
+def test_video_conversion_preserves_sequential_sampling(
+    monkeypatch: pytest.MonkeyPatch, end_frame: int, failed_frame: int | None
+) -> None:
+    """Keep decode-order sampling, RGB conversion and readable-frame truncation."""
+    bgr = np.arange(4 * 64 * 3, dtype=np.uint8).reshape(4, 64, 3)
+    captures = []
+
+    class SequentialCapture:
+        def __init__(self, *args: Any) -> None:
+            self.next_frame = 0
+            self.grabbed = []
+            self.released = False
+            captures.append(self)
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop: int) -> int:
+            return {cv2.CAP_PROP_FRAME_COUNT: 20, cv2.CAP_PROP_FPS: 30}[prop]
+
+        def grab(self) -> bool:
+            if self.next_frame >= end_frame:
+                return False
+            self.grabbed.append(self.next_frame)
+            self.next_frame += 1
+            return True
+
+        def retrieve(self, scratch: np.ndarray | None) -> tuple[bool, np.ndarray]:
+            frame_idx = self.next_frame - 1
+            return frame_idx != failed_frame, np.roll(bgr, frame_idx, axis=1)
+
+        def set(self, *args: Any) -> None:
+            pytest.fail("decode-order video sampling must not seek")
+
+        def release(self) -> None:
+            self.released = True
+
+    monkeypatch.setattr(cv2, "VideoCapture", SequentialCapture)
+    decoded = _load_video_by_cv2("unused.mp4", num_frames=10, fps=-1, format="pt")
+    indices = [i for i in np.linspace(0, 19, 10, dtype=int) if i < end_frame and i != failed_frame]
+    expected = np.stack([np.roll(bgr, int(i), axis=1)[..., ::-1] for i in indices]).astype(
+        np.float32
+    )
+    expected *= 1.0 / 255.0
+    torch.testing.assert_close(
+        torch.stack(decoded.frames), torch.from_numpy(expected).permute(0, 3, 1, 2), rtol=0, atol=0
+    )
+    assert decoded.metadata["frames_indices"] == indices
+    assert captures[0].grabbed == list(range(end_frame))
+    assert captures[0].released
 
 
 def test_truncated_numpy_video_owns_only_the_counted_frames(sample_video_path: str) -> None:
