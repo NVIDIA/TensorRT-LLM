@@ -1042,6 +1042,7 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_kernel(
 @cute.kernel
 def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
     input_tensor: cute.Tensor,
+    input2_tensor: cute.Tensor,
     residual_tensor: cute.Tensor,
     norm_weight_tensor: cute.Tensor,
     norm_output_tensor: cute.Tensor,
@@ -1078,6 +1079,7 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
     MULTICAST_PUBLISH: cutlass.Constexpr[bool],
     IKET_PHASES: cutlass.Constexpr[bool],
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
+    ADD_SECOND_INPUT: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -1086,6 +1088,7 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
     row = bidx // CTAS_PER_ROW
 
     input_array = cutlass.make_array_view(input_tensor)
+    input2_array = cutlass.make_array_view(input2_tensor)
     residual_array = cutlass.make_array_view(residual_tensor)
     norm_weight_array = cutlass.make_array_view(norm_weight_tensor)
     norm_output_array = cutlass.make_array_view(norm_output_tensor)
@@ -1341,6 +1344,21 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
                     _BF16_VEC_SIZE,
                     alignment=_ALIGNMENT_BYTES,
                 )
+            if ADD_SECOND_INPUT:
+                # This rank's partial is `input + input2`, added in fp32 and rounded once to
+                # bf16: the bits `torch.add` of the two bf16 operands gives. That sum is what
+                # this rank publishes and adds to its own accumulation.
+                second_values = input2_array[row, :].load(
+                    col,
+                    _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                )
+                input_values_array[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                    input_values_array[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)].to(
+                        cutlass.Float32
+                    )
+                    + second_values.to(cutlass.Float32)
+                ).to(cutlass.BFloat16)
             input_values = input_values_array[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
             sanitized_input_values = cutlass.Array(
                 cutlass.BFloat16,
@@ -2523,7 +2541,9 @@ def _tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_row_ke
             if peer_max > block_max:
                 block_max = peer_max
 
-            sf_unquantized = global_scale * block_max * cutlass.Float32(1.0 / 6.0)
+            # fp4_quantize's order and reciprocal (`SFScaleVal * (vecMax * rcp(6))`), so the
+            # scale bytes and codes are that op's on the same bf16 norm output.
+            sf_unquantized = global_scale * (block_max * cute.arch.rcp_approx(cutlass.Float32(6.0)))
             sf_packed = prims.cvt_f32x2_to_f8x2(
                 sf_unquantized,
                 sf_unquantized,
@@ -2741,7 +2761,9 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row(
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
 ) -> None:
     M = input_tensor.shape[0]
+    # The second input operand is unread with ADD_SECOND_INPUT off.
     _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
+        input_tensor,
         input_tensor,
         residual_tensor,
         norm_weight_tensor,
@@ -2779,6 +2801,100 @@ def _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row(
         MULTICAST_PUBLISH,
         IKET_PHASES,
         ROTATED_POLL_ORDER,
+        False,
+    ).launch(
+        grid=(M * CTAS_PER_ROW, 1, 1),
+        block=(THREADS_PER_BLOCK, 1, 1),
+        cluster=(CTAS_PER_ROW, 1, 1),
+        stream=stream,
+        use_pdl=USE_PDL,
+    )
+
+
+@cute.jit
+def _tp_allreduce_add2_residual_rms_norm_bf16_oneshot_lamport_split_row(
+    input_tensor: cute.Tensor,
+    input2_tensor: cute.Tensor,
+    residual_tensor: cute.Tensor,
+    norm_weight_tensor: cute.Tensor,
+    norm_output_tensor: cute.Tensor,
+    residual_output_tensor: cute.Tensor,
+    buffers: list[cute.Tensor],
+    ready_flags: list[cute.Tensor],
+    signal_state: cute.Tensor,
+    multicast_base: cutlass.Int64,
+    signal: cutlass.Int64,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    N: cutlass.Constexpr[int],
+    LOCAL_RANK: cutlass.Constexpr[int],
+    WORLD_SIZE: cutlass.Constexpr[int],
+    CTAS_PER_ROW: cutlass.Constexpr[int],
+    THREADS_PER_BLOCK: cutlass.Constexpr[int],
+    USE_READY_FLAGS: cutlass.Constexpr[bool],
+    USE_DEVICE_SIGNAL_STATE: cutlass.Constexpr[bool],
+    ELIDE_SELF_RANK: cutlass.Constexpr[bool],
+    PEER_ORDER: cutlass.Constexpr[tuple[int, ...]],
+    PREFETCH_FUSED_INPUTS: cutlass.Constexpr[bool],
+    DIRECT_CLUSTER_REDUCTION: cutlass.Constexpr[bool],
+    POST_NORM_CLUSTER_BARRIER: cutlass.Constexpr[bool],
+    FP32_ACCUMULATION: cutlass.Constexpr[bool],
+    BATCH_POLL_PEERS: cutlass.Constexpr[bool],
+    READY_MASK_POLL_PEERS: cutlass.Constexpr[bool],
+    AGGREGATE_SIGNAL_AT_CLUSTER_ROOT: cutlass.Constexpr[bool],
+    USE_PDL: cutlass.Constexpr[bool],
+    PDL_RELEASE_STRICT: cutlass.Constexpr[bool],
+    PDL_RELEASE_PRE_NORM: cutlass.Constexpr[bool],
+    PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
+    LAST_CTA_SIGNAL_ADVANCE: cutlass.Constexpr[bool],
+    ALL_TO_ALL_CLUSTER_REDUCTION: cutlass.Constexpr[bool],
+    EARLY_INPUT_LOAD: cutlass.Constexpr[bool],
+    MULTICAST_PUBLISH: cutlass.Constexpr[bool],
+    IKET_PHASES: cutlass.Constexpr[bool],
+    ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
+) -> None:
+    """The split-row fused launch whose partial is `input_tensor + input2_tensor`."""
+    M = input_tensor.shape[0]
+    _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
+        input_tensor,
+        input2_tensor,
+        residual_tensor,
+        norm_weight_tensor,
+        norm_output_tensor,
+        residual_output_tensor,
+        buffers,
+        ready_flags,
+        signal_state,
+        multicast_base,
+        signal,
+        eps,
+        N,
+        LOCAL_RANK,
+        WORLD_SIZE,
+        CTAS_PER_ROW,
+        THREADS_PER_BLOCK,
+        USE_READY_FLAGS,
+        USE_DEVICE_SIGNAL_STATE,
+        ELIDE_SELF_RANK,
+        PEER_ORDER,
+        PREFETCH_FUSED_INPUTS,
+        DIRECT_CLUSTER_REDUCTION,
+        POST_NORM_CLUSTER_BARRIER,
+        FP32_ACCUMULATION,
+        BATCH_POLL_PEERS,
+        READY_MASK_POLL_PEERS,
+        AGGREGATE_SIGNAL_AT_CLUSTER_ROOT,
+        USE_PDL,
+        PDL_RELEASE_STRICT,
+        PDL_RELEASE_PRE_NORM,
+        PDL_RELEASE_AT_ENTRY,
+        LAST_CTA_SIGNAL_ADVANCE,
+        ALL_TO_ALL_CLUSTER_REDUCTION,
+        EARLY_INPUT_LOAD,
+        MULTICAST_PUBLISH,
+        IKET_PHASES,
+        ROTATED_POLL_ORDER,
+        True,
     ).launch(
         grid=(M * CTAS_PER_ROW, 1, 1),
         block=(THREADS_PER_BLOCK, 1, 1),
@@ -4207,7 +4323,11 @@ def compile_fused_for_rank(
     multicast_publish: bool = False,
     iket_phases: bool = False,
     rotated_poll_order: bool = False,
+    add_second_input: bool = False,
 ):
+    """`add_second_input` compiles the split-row launch that takes a second bf16 `[M, n]`
+    operand after the first and all-reduces their sum, `torch.add`'s bits, as this rank's
+    partial."""
     cutlass.cuda.initialize_cuda_context(device_id)
     _validate_ctas_per_row(ctas_per_row)
     _validate_signal_advance_flags(
@@ -4250,10 +4370,18 @@ def compile_fused_for_rank(
         raise ValueError("device signal state is implemented only for split-row fused")
     if use_pdl and not split_rows:
         raise ValueError("PDL is implemented only for split-row fused")
+    if add_second_input and not split_rows:
+        raise ValueError("the second input is implemented only for split-row fused")
     _validate_multicast_publish(multicast_publish, use_ready_flags, split_rows)
 
     sym_m = cute.sym_int32()
     input_tensor = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (sym_m, n),
+        stride_order=(1, 0),
+        assumed_align=_ALIGNMENT_BYTES,
+    )
+    input2_tensor = make_fake_compact_tensor(
         cutlass.BFloat16,
         (sym_m, n),
         stride_order=(1, 0),
@@ -4309,13 +4437,15 @@ def compile_fused_for_rank(
         assumed_align=_READY_FLAG_ALIGNMENT_BYTES,
     )
 
-    fused_host = (
-        _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row
-        if split_rows
-        else _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport
-    )
+    if add_second_input:
+        fused_host = _tp_allreduce_add2_residual_rms_norm_bf16_oneshot_lamport_split_row
+    elif split_rows:
+        fused_host = _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row
+    else:
+        fused_host = _tp_allreduce_residual_rms_norm_bf16_oneshot_lamport
     compile_args = [
         input_tensor,
+        *((input2_tensor,) if add_second_input else ()),
         residual_tensor,
         norm_weight_tensor,
         norm_output_tensor,

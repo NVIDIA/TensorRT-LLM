@@ -207,6 +207,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.moe_tail_allreduce import (
+    ONE_SHOT_ROWS,
+    allreduce_add2_rmsnorm,
+    allreduce_add_rmsnorm_nvfp4,
+)
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
 
@@ -296,8 +301,9 @@ _FLASH_MLA_HEADS = 64
 # `gen_attn_flash_mla`, which every generation-row site reads; the native entry's cells cover
 # the 32K and the 1M configs (key lengths to 1048576, the 1M pools' slots past 2**31 bytes).
 _GEN_ATTN_FLASH_MLA = False
-# The pre-routed MoE call: the runner's routing method is inert once ids and weights are
-# given; 1 (renormalize) is the value its cells drive.
+# The runner's routing method, 1 (Renormalize): the top-k over the fp32 router logits, then an
+# fp32 softmax over those k. The decode target's runner routes the logits with it; the prefill
+# target passes ids and weights, where it is inert.
 _MOE_ROUTING_METHOD = 1
 # The routed experts' SwiGLU, the runner's `act_type` 0.
 _MOE_ACT_SWIGLU = 0
@@ -778,9 +784,15 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         dev = torch.cuda.current_device()
         self.build_kernels(dev)
         # Collective: every rank builds it with the same arguments. The peer buffers hold
-        # the whole token budget, so one workspace serves every closing collective.
+        # the whole token budget, so one workspace serves every closing collective; the
+        # two-input kernel only for the decode target's routed + shared add.
         self._lamport = build_lamport_workspace(
-            self.hidden, self.eps, self.max_num_tokens, self.tp_rank, self.tp_size
+            self.hidden,
+            self.eps,
+            self.max_num_tokens,
+            self.tp_rank,
+            self.tp_size,
+            add_second_input=True,
         )
         # The selection gather's communicator flavor, as the engine's own collectives pick it:
         # the MPI session's, or the TP process group's when MPI is disabled.
@@ -1649,11 +1661,15 @@ class DecodeTarget:
             step["radix_aux_indices"], step["radix_aux_logits"],
         )  # fmt: skip
 
-    def _mlp(self, o, L):
-        """This rank's share of the layer's MLP, a partial sum: the dense SwiGLU slice on the
-        dense layer; on a MoE layer every routed expert's width slice plus the shared expert's
-        slice. Under CUDA-graph capture the MoE layer's shared expert runs on the side stream
-        while the main stream runs the router, the quantization and the routed experts."""
+    def _mlp(self, o, L, quantized=None):
+        """This rank's share of the layer's MLP as partial sums `(routed, shared)`: `(None, the
+        dense SwiGLU slice)` on the dense layer; on a MoE layer every routed expert's width
+        slice and the shared expert's slice, which the caller adds. `quantized` is `o`'s NVFP4
+        codes and scales when the all-reduce wrote them, else they are quantized here. The
+        runner routes the router's fp32 logits itself: the top-k over the logits, an fp32
+        softmax over those k, bf16 weights. Under CUDA-graph capture the MoE layer's shared
+        expert runs on the side stream while the main stream runs the router, the quantization
+        and the routed experts."""
         core = self.core
 
         def shared():
@@ -1662,26 +1678,27 @@ class DecodeTarget:
 
         m = L.moe
         if m is None:
-            return shared()
+            return None, shared()
 
         def routed():
             logits = cublas_mm(o, m.router, None, torch.float32)
-            ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-            # One NVFP4 quantization under the layer's static scale serves every expert's slice
-            # on every rank: the width slices' partials sum.
-            xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+            if quantized is None:
+                # One NVFP4 quantization under the layer's static scale serves every expert's
+                # slice on every rank: the width slices' partials sum.
+                xq, xs = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+                xs = xs.view(torch.float8_e4m3fn)
+            else:
+                xq, xs = quantized
             return fp4_block_scale_moe_runner(
-                None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None, None,
-                None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2, core.num_experts,
-                core.topk, None, None, core.moe_inter, core.expert_offset, core.local_experts,
-                None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU, topk_weights=weights,
-                topk_ids=ids, tune_max_num_tokens=core.max_num_tokens,
+                logits, None, xq, xs, m.fc1_w, m.fc1_s, None, None, None, None, m.fc2_w, m.fc2_s,
+                None, m.out1, m.out1_gate, m.out2, core.num_experts, core.topk, None, None,
+                core.moe_inter, core.expert_offset, core.local_experts, None, _MOE_ROUTING_METHOD,
+                True, _MOE_ACT_SWIGLU, tune_max_num_tokens=core.max_num_tokens,
             )[0]  # fmt: skip
 
-        routed_out, shared_out = maybe_execute_in_parallel(
+        return maybe_execute_in_parallel(
             routed, shared, self._shared_fork, self._shared_join, self._shared_stream
         )
-        return torch.add(routed_out, shared_out)
 
     def forward(
         self,
@@ -1717,6 +1734,10 @@ class DecodeTarget:
         else:
             topk_buf = torch.empty([rows, core.idx_topk], dtype=torch.int32, device=dev)
         scratch = self._scratch(rows, h.dtype, dev)
+        # A MoE layer's NVFP4 quantization and its routed + shared add fold into the all-reduces
+        # around it (each the same bits as the separate op). Those are one-shot kernels, so a
+        # step of more rows than they take keeps the separate ops: per step, by its row count.
+        one_shot = rows <= ONE_SHOT_ROWS
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         residual = h
@@ -1724,13 +1745,25 @@ class DecodeTarget:
         for layer_idx, L in enumerate(self._layers):
             attn_out = self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen)
             partial = self._linear_fp8(attn_out, L.wo, L.wo_s)
-            o = cute_dsl_allreduce_add_rmsnorm(
-                partial, residual, L.ffn_norm, torch.empty_like(partial), core._lamport
-            )
-            mlp = self._mlp(o, L)
-            x = cute_dsl_allreduce_add_rmsnorm(
-                mlp, residual, L.next_norm, torch.empty_like(mlp), core._lamport
-            )
+            quantized = None
+            if one_shot and L.moe is not None:
+                o, *quantized = allreduce_add_rmsnorm_nvfp4(
+                    partial, residual, L.ffn_norm, L.moe.gscale, core._lamport
+                )
+            else:
+                o = cute_dsl_allreduce_add_rmsnorm(
+                    partial, residual, L.ffn_norm, torch.empty_like(partial), core._lamport
+                )
+            routed, shared = self._mlp(o, L, quantized)
+            if routed is not None and one_shot:
+                x = allreduce_add2_rmsnorm(
+                    routed, shared, residual, L.next_norm, torch.empty_like(shared), core._lamport
+                )
+            else:
+                mlp = shared if routed is None else torch.add(routed, shared)
+                x = cute_dsl_allreduce_add_rmsnorm(
+                    mlp, residual, L.next_norm, torch.empty_like(mlp), core._lamport
+                )
             if spec_metadata is not None:
                 spec_metadata.maybe_capture_hidden_states(layer_idx, residual)
         return x

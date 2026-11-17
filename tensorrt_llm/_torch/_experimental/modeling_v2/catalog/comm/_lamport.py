@@ -8,7 +8,8 @@ that launches from the workspace.
 
 `build_workspace` compiles four kernels: the pure all-reduce, the all-reduce
 fused with the residual add and RMSNorm (one-shot and two-shot), and the
-one-shot fused form that also emits an NVFP4-quantized norm output. They read
+one-shot fused form that also emits an NVFP4-quantized norm output; on request
+a fifth, the one-shot fused form whose partial is the sum of two inputs. They read
 and write the same symmetric-memory peer buffers and rotate the same device
 slot counter, so every collective of a forward goes through one
 `LamportWorkspace`, built once at load by `build_workspace`.
@@ -142,17 +143,25 @@ class LamportWorkspace:
     fused: object
     fused_quant: object
     fused_twoshot: object
+    #: The one-shot fused kernel over `input + input2`, or None when not built.
+    fused_add2: object = None
 
 
 def build_workspace(
-    hidden: int, eps: float, max_rows: int, rank: int, world: int
+    hidden: int,
+    eps: float,
+    max_rows: int,
+    rank: int,
+    world: int,
+    add_second_input: bool = False,
 ) -> LamportWorkspace:
     """Bring up the group, pin the peer buffers, agree multicast, compile the kernels.
 
     Collective: every rank of the group calls it, with the same `hidden`, `eps` and
     `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter of that
     in int32 flags of symmetric memory per rank, and compiles four CuTe DSL kernels
-    (pure, fused, fused+quant, fused two-shot) for this rank on the current device.
+    (pure, fused, fused+quant, fused two-shot) for this rank on the current device,
+    and with `add_second_input` a fifth, the one-shot fused kernel over two inputs.
     Launches nothing beyond the buffer fills and the one-element multicast agreement.
 
     The multicast decision is agreed across the group: a rank compiling the multicast
@@ -217,6 +226,23 @@ def build_workspace(
         **_FUSED_OPTIONS,
         **common,
     )
+    # The fused kernel's options and transport over `input + input2`; it interleaves with
+    # the others on the same slots and signal state.
+    fused_add2 = None
+    if add_second_input:
+        fused_add2 = _ar.compile_fused_for_rank(
+            rank,
+            world,
+            dev.index,
+            hidden,
+            eps=eps,
+            pdl_release_policy=_FUSED_PDL_POLICY,
+            prefetch_fused_inputs=True,
+            multicast_publish=use_mc,
+            add_second_input=True,
+            **_FUSED_OPTIONS,
+            **common,
+        )
     fused_twoshot = _ar.compile_fused_twoshot_for_rank(
         rank,
         world,
@@ -242,6 +268,7 @@ def build_workspace(
         fused=fused,
         fused_quant=fused_quant,
         fused_twoshot=fused_twoshot,
+        fused_add2=fused_add2,
     )
 
 
