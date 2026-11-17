@@ -84,6 +84,12 @@ def test_indexer_preserves_request_geometry(
         _max_ctx_len=max_seq_len,
         unfused_glue=unfused,
     )
+    for value in vars(modeling).values():
+        # A target that picks the decode selector in its model (the sm_107 tp target's split
+        # radix top-k for DSpark verification) gets that method, its split selector not built.
+        if isinstance(value, type) and "_select_indexer_decode" in vars(value):
+            core._ix_topk_verify = None
+            core._select_indexer_decode = MethodType(value._select_indexer_decode, core)
     ix = SimpleNamespace(
         rope=True,
         wk_wp=None,
