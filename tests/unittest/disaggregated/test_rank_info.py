@@ -403,3 +403,10 @@ def test_from_bytes_rejects_another_protocol_version_before_decoding_fields():
     newer["field_from_a_newer_release"] = 1
     with pytest.raises(ValueError, match="protocol version mismatch"):
         RankInfo.from_bytes(msgpack.packb(newer))
+
+    # On the same version, a field this build does not define (a peer built
+    # with a newer RankInfo) is an incompatible peer, not a TypeError.
+    same_version = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    same_version["field_from_a_newer_build"] = True
+    with pytest.raises(ValueError, match=r"does not define: \['field_from_a_newer_build'\]"):
+        RankInfo.from_bytes(msgpack.packb(same_version))
