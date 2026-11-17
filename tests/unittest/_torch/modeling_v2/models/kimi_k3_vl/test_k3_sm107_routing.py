@@ -239,6 +239,48 @@ def test_fp8_kv_no_spec_and_non_nvfp4_experts_get_no_target():
         _route_name(_model_config(mapping, expert_algo="FP8"), _llm_args(worker))
 
 
+@pytest.mark.parametrize(
+    "model_fields,llm_fields,message",
+    [
+        (
+            {"attn_backend": "FLASHINFER"},
+            {},
+            "attn_backend='TRTLLM'",
+        ),
+        (
+            {"sparse_attention_config": SimpleNamespace()},
+            {},
+            "sparse attention",
+        ),
+        (
+            {"moe_load_balancer": SimpleNamespace(mode="standard")},
+            {},
+            "EPLB",
+        ),
+        (
+            {"moe_disable_finalize_fusion": True},
+            {},
+            "FORCE_DETERMINISTIC",
+        ),
+        (
+            {},
+            {"enable_locality_domains": True},
+            "locality domains",
+        ),
+    ],
+    ids=("attention", "sparse", "eplb", "deterministic", "locality"),
+)
+def test_constructor_unsupported_configs_get_no_target(model_fields, llm_fields, message):
+    """The constructor's rejections happen at route time, so modeling_v2=auto can fall back to V1."""
+    worker = _worker("vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_dep16_bs16_dspark5", "gen")
+    model_config = _model_config(_mapping(worker))
+    for name, value in model_fields.items():
+        setattr(model_config, name, value)
+    llm_args = _llm_args(worker, **llm_fields)
+    with pytest.raises(NoTarget, match=message):
+        _route_name(model_config, llm_args)
+
+
 def test_route_returns_the_target_class_only_on_sm107():
     worker = _worker("vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_helix8_bs8_dspark7", "gen")
     model_config, llm_args = _model_config(_mapping(worker)), _llm_args(worker)

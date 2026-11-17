@@ -224,6 +224,25 @@ def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
         raise NoTarget(
             f"the sm107 Kimi K3 targets launch their kernels with PDL, got TRTLLM_ENABLE_PDL={pdl!r}"
         )
+    # These are also rejected by the target constructors. Check them here so
+    # ``modeling_v2=auto`` can choose V1 instead of failing during model load.
+    attn_backend = getattr(model_config, "attn_backend", "TRTLLM")
+    if attn_backend.upper() != "TRTLLM":
+        raise NoTarget(
+            f"the sm107 Kimi K3 targets support only attn_backend='TRTLLM', got {attn_backend!r}"
+        )
+    if getattr(model_config, "sparse_attention_config", None) is not None:
+        raise NoTarget("the sm107 Kimi K3 targets do not support sparse attention")
+    if getattr(model_config, "moe_load_balancer", None) is not None:
+        raise NoTarget("the sm107 Kimi K3 targets do not support EPLB or replicated expert slots")
+    if getattr(model_config, "moe_disable_finalize_fusion", False):
+        raise NoTarget(
+            "the sm107 Kimi K3 targets require the fused-finalize kernels "
+            "(moe_disable_finalize_fusion / FORCE_DETERMINISTIC is not supported)"
+        )
+    if getattr(llm_args, "enable_locality_domains", False):
+        raise NoTarget("the sm107 Kimi K3 targets do not support locality domains")
+
     mapping = model_config.mapping
     backend = llm_args.moe_config.backend
     target = _sm107_target(mapping, llm_args)
