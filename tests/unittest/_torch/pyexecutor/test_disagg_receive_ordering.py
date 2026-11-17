@@ -241,6 +241,7 @@ def test_cancelled_admission_releases_event() -> None:
     ready = Mock()
     manager._disagg_receive_ready[request.py_request_id] = ready
     manager.conversation_manager = None
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
