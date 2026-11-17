@@ -4064,6 +4064,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         get_sm_version() not in (100, 103, 107),
         reason="TRTLLM Gen MoE supports SM100, SM103 and SM107 only")
 
+    @staticmethod
+    def _create_gpqa_task(model_name: str) -> GPQADiamond:
+        task = GPQADiamond(model_name)
+        # Opt in so caller sampling parameters override GPQA's greedy default.
+        task.EVALUATE_KWARGS = dict(getattr(task, "EVALUATE_KWARGS", {}),
+                                    sampling_override=True)
+        return task
+
     def _fixed_date_evaluator_kwargs(self, llm: LLM) -> dict:
         chat_template = llm.tokenizer.get_chat_template()
         date_expression = 'strftime_now("%Y-%m-%d")'
@@ -4564,8 +4572,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
-            task.EVALUATE_KWARGS = dict(sampling_override=True)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(
                 **extra_evaluator_kwargs["chat_template_kwargs"],
@@ -4714,7 +4721,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
@@ -4794,7 +4801,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(
                 **extra_evaluator_kwargs["chat_template_kwargs"],
@@ -4874,7 +4881,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
@@ -4989,7 +4996,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
