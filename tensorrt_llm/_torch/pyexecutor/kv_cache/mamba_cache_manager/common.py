@@ -715,7 +715,12 @@ def _estimate_mamba_hybrid_cache_cost(
             if local_attention_layers > 0
             else 0
         )
-    state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
+    state_bytes = (
+        params.get_states_bytes_per_layer(mapping, kda_2fp4=True)
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay
+        else params.get_states_bytes_per_layer(mapping)
+    )
+    state_bytes_per_rank = local_mamba_layers * state_bytes
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size + int(
         kwargs.get("gen_preemption_headroom", 0)

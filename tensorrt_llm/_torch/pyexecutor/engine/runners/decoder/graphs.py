@@ -512,6 +512,7 @@ class DecoderCudaGraphs:
             # A physically pruned context cache cannot become a decode
             # batch, including single-token synthetic prefill warmup rows.
             and getattr(kv_cache_manager, "context_swa_layer_limit", None) is None
+            and not getattr(kv_cache_manager, "use_kda_2fp4_replay", False)
             and self.cuda_graph_runner.enabled
             and can_promote_spec_decode
             and not ced_enabled

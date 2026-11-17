@@ -81,6 +81,7 @@ Welcome to TensorRT LLM's Documentation!
    features/paged-attention-ifb-scheduler.md
    features/parallel-strategy.md
    features/quantization.md
+   features/kda-2fp4-replay.md
    features/sampling.md
    features/watermarking.md
    features/additional-outputs.md

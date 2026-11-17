@@ -251,6 +251,16 @@ def _cross_field_rules(definitions: dict) -> None:
                     }
                 },
             ),
+            # validate_mamba_snapshot_offsets(): KDA 2FP4 replay.
+            when(
+                _is_set_to("mamba_state_config", _is_set_to("kda_2fp4_replay", {"const": True})),
+                {
+                    "properties": {
+                        "use_kv_cache_manager_v2": {"not": {"const": False}},
+                        "enable_kv_pool_rebalance": {"not": {"const": True}},
+                    }
+                },
+            ),
         ]
     )
     # AttentionDpConfig.validate_attention_dp_config().

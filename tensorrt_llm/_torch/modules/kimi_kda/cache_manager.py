@@ -9,7 +9,8 @@ import math
 import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -39,6 +40,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
 from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
+
+if TYPE_CHECKING:
+    from .kda_2fp4 import ReplayHistory
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -594,6 +598,8 @@ class KDAReplayState:
         if _is_disagg_context_server(kwargs.get("is_disagg", False)):
             return None
         spec_config = kwargs.get("spec_config")
+        if kwargs.get("kda_2fp4_replay", False):
+            return cls._estimate_selected_2fp4_replay(model_config, mapping, **kwargs)
         num_spec = kwargs.get("kda_replay_num_spec")
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(spec_config, manager_supports_replay=True)
@@ -643,6 +649,28 @@ class KDAReplayState:
             draft_records=state.draft_records,
         )
         return layout, local_layers, stochastic_rounding
+
+    @staticmethod
+    def _estimate_selected_2fp4_replay(
+        model_config, mapping: Mapping, **kwargs
+    ) -> tuple[dict[str, tuple[torch.dtype, list[int]]], int, bool] | None:
+        """The 2FP4 replay layout and local layer count (``KDA2Fp4ReplayState``)."""
+        spec_config = kwargs.get("spec_config")
+        params, local_layers, _ = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec_config,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        if not local_layers:
+            return None
+        layout = _kda_2fp4_replay_layout(
+            None if spec_config is None else spec_config.tokens_per_gen_step,
+            params.num_heads // _mamba_effective_tp_size(mapping),
+            params.head_dim,
+        )
+        return layout, local_layers, False
 
     def bind(
         self,
@@ -1267,6 +1295,322 @@ class KDAMtpReplayState(KDAReplayState):
         self._conv_descriptors = None
 
 
+_KDA_2FP4_HISTORY_ROLES = ("kda_2fp4_k", "kda_2fp4_u", "kda_2fp4_g")
+_KDA_2FP4_LENGTH_ROLE = "kda_2fp4_len"
+
+
+def _kda_2fp4_replay_layout(
+    tokens_per_gen_step: int | None, num_heads: int, head_dim: int
+) -> dict[str, tuple[torch.dtype, list[int]]]:
+    """Per-slot planes of one KDA layer's 2FP4 replay history.
+
+    The history holds ``HISTORY_SIZE`` accepted rows, plus the verified
+    candidates with speculative decoding. Every layer keeps its own length:
+    ordinary decode advances it inside that layer's replay launch.
+    """
+    from .kda_2fp4 import HISTORY_SIZE
+
+    capacity = HISTORY_SIZE + (tokens_per_gen_step or 0)
+    shape = [num_heads, capacity, head_dim]
+    return {
+        "kda_2fp4_k": (torch.bfloat16, shape),
+        "kda_2fp4_u": (torch.bfloat16, shape),
+        "kda_2fp4_g": (torch.float32, shape),
+        _KDA_2FP4_LENGTH_ROLE: (torch.int32, [_KDA_REPLAY_COUNT_BYTES // torch.int32.itemsize]),
+    }
+
+
+def apply_kda_2fp4_state_layout(manager: MambaHybridCacheManagerV2) -> None:
+    """Store the manager's recurrent states as packed 2FP4 checkpoints.
+
+    Must run before the V2 pools are configured. Every SSM slot then holds one
+    ``STATE_BYTES_PER_HEAD`` payload per head instead of an FP32/BF16 state.
+    """
+    from .kda_2fp4 import STATE_BYTES_PER_HEAD
+
+    context = manager._state_layout
+    if not context.mamba_pp_layers:
+        return
+    heads, value_dim, key_dim = context.ssm_state_shape
+    if (value_dim, key_dim) != (128, 128):
+        raise ValueError("KDA 2FP4 replay requires K=V=128.")
+    if context.conv_state_dtype != torch.bfloat16 or context.conv_state_shape[-1] != 3:
+        raise ValueError("KDA 2FP4 replay requires BF16 activations and Conv4.")
+    if context.conv_state_layout != "q_k_v" or context.n_groups_per_rank != heads:
+        raise ValueError("KDA 2FP4 replay requires equal Q/K/V heads.")
+    manager.ssm_state_shape = [heads, 1, STATE_BYTES_PER_HEAD]
+    manager.ssm_state_dtype = torch.uint8
+    manager.ssm_bytes = heads * STATE_BYTES_PER_HEAD
+    manager._state_layout = replace(
+        context,
+        ssm_state_shape=tuple(manager.ssm_state_shape),
+        ssm_state_dtype=manager.ssm_state_dtype,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class Kda2Fp4LayerCache(MambaLayerCache):
+    """Packed 2FP4 checkpoint views and the layer's replay history, if any.
+
+    A disaggregated context worker keeps no history (``history is None``).
+    """
+
+    history: ReplayHistory | None = field(default=None, metadata={"slot_shared": True})
+
+
+class KDA2Fp4ReplayState(KDAReplayState):
+    """Replay of packed 2FP4 KDA checkpoints for ordinary decode and DSpark verification.
+
+    Each request owns one replay slot of the KDA replay region, holding every
+    layer's K/U/G history and its length (see ``_kda_2fp4_replay_layout``);
+    the region keeps it across suspension. Ordinary decode replays and, when
+    the window fills, commits inside each layer's launch. DSpark verification
+    leaves the checkpoints untouched; after sampling one ``commit_verified``
+    launch commits every layer's accepted prefix.
+    """
+
+    def __init__(self, tokens_per_gen_step: int | None) -> None:
+        super().__init__(0 if tokens_per_gen_step is None else tokens_per_gen_step - 1)
+        self.tokens_per_gen_step = tokens_per_gen_step
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
+        self._num_heads = 0
+        self._owns_history = False
+        self.histories: list[ReplayHistory] = []
+        self.candidate_x: torch.Tensor | None = None
+        self.old_lengths: torch.Tensor | None = None
+        self.arrivals: torch.Tensor | None = None
+        self._commit_descriptors: torch.Tensor | None = None
+
+    @property
+    def verifies_drafts(self) -> bool:
+        return self.tokens_per_gen_step is not None
+
+    @override
+    def validate(self, context: MambaStateLayout) -> None:
+        from .kda_2fp4 import validate_speculative_config
+
+        validate_speculative_config(context.spec_config)
+        spec_tokens = (
+            None if context.spec_config is None else context.spec_config.tokens_per_gen_step
+        )
+        if spec_tokens != self.tokens_per_gen_step:
+            raise ValueError(
+                f"KDA 2FP4 replay width ({self.tokens_per_gen_step}) must match the "
+                f"tokens per generation step ({spec_tokens})"
+            )
+
+    @override
+    def pool_layout(self, context: MambaStateLayout) -> dict[str, tuple[torch.dtype, list[int]]]:
+        if not context.mamba_pp_layers:
+            return {}
+        num_heads, _, _ = context.ssm_state_shape
+        return _kda_2fp4_replay_layout(self.tokens_per_gen_step, num_heads, 128)
+
+    @override
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        return {DataRole(name): spec for name, spec in self.pool_layout(context).items()}
+
+    @override
+    def bytes_per_slot(self, context: MambaStateLayout, layer_id: int) -> int:
+        return sum(
+            dtype.itemsize * math.prod(shape) for dtype, shape in self.pool_layout(context).values()
+        )
+
+    @override
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        from .kda_2fp4 import ReplayHistory, commit_descriptor
+
+        self._ssm_states = tuple(ssm_states)
+        self._conv_states = tuple(conv_states)
+        if not ssm_states:
+            return
+        device = ssm_states[0].device
+        self._num_heads = context.ssm_state_shape[0]
+        if self._pool_views is not None:
+            self.pool_layers = [
+                {str(role): view for role, view in views.items()} for views in self._pool_views
+            ]
+        elif self.pool_layers is None:
+            self._allocate_history(context, device)
+        layers = len(context.mamba_pp_layers)
+        if self.verifies_drafts:
+            self.candidate_x = torch.zeros(
+                [
+                    layers,
+                    context.max_batch_size,
+                    self.tokens_per_gen_step,
+                    context.conv_state_shape[0],
+                ],
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.old_lengths = torch.zeros(
+                [layers, context.max_batch_size], dtype=torch.int32, device=device
+            )
+        else:
+            # Shared by the layers: a row's last CTA resets its counter.
+            self.arrivals = torch.zeros(context.max_batch_size, dtype=torch.int32, device=device)
+        self.histories = [
+            ReplayHistory(
+                k=layer["kda_2fp4_k"],
+                u=layer["kda_2fp4_u"],
+                g=layer["kda_2fp4_g"],
+                length=layer[_KDA_2FP4_LENGTH_ROLE][:, 0],
+                candidate_x=None if self.candidate_x is None else self.candidate_x[offset],
+                old_lengths=None if self.old_lengths is None else self.old_lengths[offset],
+                arrivals=self.arrivals,
+            )
+            for offset, layer in enumerate(self.pool_layers)
+        ]
+        # The region pages and the persistent pools keep their addresses for
+        # the manager's lifetime (it refuses KV pool rebalancing).
+        if self.verifies_drafts:
+            self._commit_descriptors = torch.tensor(
+                [
+                    commit_descriptor(state, conv, history)
+                    for state, conv, history in zip(ssm_states, conv_states, self.histories)
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+        # The manager's replay bookkeeping (transfer seeding) keys on this
+        # vector; reset_replay_slots clears every layer's length.
+        self.prev_num_accepted_tokens = self.histories[0].length
+        self.intermediate_indices = torch.arange(
+            context.max_batch_size, dtype=torch.int32, device=device
+        )
+        logger.info(
+            "Configured KDA 2FP4 replay: "
+            + ("DSpark verification" if self.verifies_drafts else "ordinary decode")
+        )
+
+    def _allocate_history(self, context: MambaStateLayout, device: torch.device) -> None:
+        """Allocate standalone histories with one replay slot per recurrent-state slot."""
+        cache_size = context.slot_capacity
+        if cache_size is None:
+            raise RuntimeError("KDA 2FP4 replay requires the allocated V2 slot capacity")
+        layout = self.pool_layout(context)
+        self.pool_layers = [
+            {
+                role: torch.zeros([cache_size, *shape], dtype=dtype, device=device)
+                for role, (dtype, shape) in layout.items()
+            }
+            for _ in context.mamba_pp_layers
+        ]
+        self._owns_history = True
+
+    @override
+    def make_layer_cache(
+        self,
+        layer_offset: int,
+        conv: torch.Tensor,
+        temporal: torch.Tensor,
+    ) -> MambaLayerCache:
+        return Kda2Fp4LayerCache(
+            conv=conv,
+            temporal=temporal,
+            history=self.histories[layer_offset] if self.histories else None,
+        )
+
+    @override
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """Empty every layer's history at ``replay_slots``.
+
+        Only the lengths are reset: no kernel reads a history row at or past
+        the length, and candidate rows are written before they are committed.
+        """
+        if not self.histories or replay_slots.numel() == 0:
+            return
+        for history in self.histories:
+            history.length.index_fill_(0, replay_slots, 0)
+
+    @override
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        if not self.histories or slots.numel() == 0:
+            return
+        if replay_slots is None:
+            replay_slots = _host_slots_to_device(host_slots, slots.device)
+        self.reset_replay_slots(replay_slots)
+
+    @override
+    def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
+        """Move standalone histories after the requests' state slots changed.
+
+        Views of the manager's replay pool follow their requests on their own.
+        """
+        if not self._owns_history:
+            return
+        moves = [(old, new) for old, new in zip(old_slots, new_slots) if old >= 0 and old != new]
+        if not moves:
+            return
+        device = self._ssm_states[0].device
+        source = _host_slots_to_device([old for old, _ in moves], device)
+        destination = _host_slots_to_device([new for _, new in moves], device)
+        for layer in self.pool_layers:
+            for buffer in layer.values():
+                buffer.index_copy_(0, destination, buffer.index_select(0, source))
+
+    @override
+    @torch.inference_mode()
+    def seed_transferred_slots(
+        self, state_indices: torch.Tensor, replay_indices: torch.Tensor | None = None
+    ) -> None:
+        """Start transferred requests' replay from their transferred checkpoints."""
+        self.reset_replay_slots(state_indices if replay_indices is None else replay_indices)
+
+    @override
+    def record_acceptance(
+        self,
+        replay_indices: torch.Tensor,
+        num_accepted_draft_tokens: torch.Tensor,
+        is_dummy_request: torch.Tensor | None,
+    ) -> None:
+        raise NotImplementedError("KDA 2FP4 replay commits acceptance in update()")
+
+    @override
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Commit the accepted prefix of every layer's DSpark verification in one launch."""
+        from .kda_2fp4 import commit_verified
+
+        if batch.num_generations == 0 or not self._ssm_states:
+            return
+        if not self.verifies_drafts:
+            raise RuntimeError("KDA 2FP4 ordinary decode commits inside its replay")
+        if batch.is_dummy_request is None:
+            raise RuntimeError("KDA 2FP4 commit requires the dummy-request mask")
+        commit_verified(
+            self._commit_descriptors,
+            batch.destination_state_indices,
+            batch.destination_state_indices if replay_slots is None else replay_slots,
+            batch.num_accepted_tokens,
+            batch.is_dummy_request,
+            self._num_heads,
+            self.histories[0].k.shape[2],
+            self.tokens_per_gen_step,
+        )
+
+    @override
+    def shutdown(self) -> None:
+        super().shutdown()
+        self._ssm_states = ()
+        self._owns_history = False
+        self.histories = []
+        self.candidate_x = None
+        self.old_lengths = None
+        self.arrivals = None
+        self._commit_descriptors = None
+
+
 def _kda_mtp_state_descriptors(
     states: tuple[torch.Tensor, ...], inner_shape: tuple[int, ...], name: str
 ) -> torch.Tensor:
@@ -1406,6 +1750,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     kda_context_only = False
     _kda_replay_region: KDAReplayRegion | None = None
     _kda_mtp_replay = False
+    _kda_2fp4 = False
 
     @classmethod
     @override
@@ -1420,6 +1765,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         kda_replay_num_spec: int | None = None,
         kda_draft_records: bool = False,
         kda_mtp_replay: bool = False,
+        kda_2fp4_replay: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -1428,6 +1774,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         Args:
             kda_mtp_replay: Whether the model's KDA layers can verify drafts
                 with the KDA MTP replay kernels instead of the fused verify.
+            kda_2fp4_replay: Whether the recurrent states are packed 2FP4
+                checkpoints replayed by ``KDA2Fp4ReplayState``
+                (``kv_cache_config.mamba_state_config.kda_2fp4_replay``).
         """
         if use_replay_state_update:
             raise ValueError("KDA replay and Mamba2 replay are mutually exclusive")
@@ -1436,6 +1785,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_mtp_replay = kda_mtp_replay
+        self._kda_2fp4 = kda_2fp4_replay
         self._kda_replay: KDAReplayState | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -1446,6 +1796,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
+        if self._kda_2fp4:
+            return self._initialize_kda_2fp4_state()
         self.kda_context_only = self.kda_context_only and num_spec is not None
         if self.kda_context_only:
             return None
@@ -1470,12 +1822,46 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return isinstance(self._kda_replay, KDAMtpReplayState)
 
     @property
+    def use_kda_2fp4_replay(self) -> bool:
+        return self._kda_2fp4
+
+    @property
     def commits_every_generation_step(self) -> bool:
         """Whether every generation step, drafts or not, needs ``update_mamba_states``.
 
-        The KDA MTP replay verifies one-token steps too and commits them after sampling.
+        The KDA MTP replay and the 2FP4 DSpark verification verify one-token
+        steps too and commit them after sampling.
         """
-        return self.use_kda_mtp_replay
+        replay = self._kda_replay
+        return self.use_kda_mtp_replay or (
+            isinstance(replay, KDA2Fp4ReplayState) and replay.verifies_drafts
+        )
+
+    def _initialize_kda_2fp4_state(self) -> KDA2Fp4ReplayState | None:
+        """Pack the recurrent states as 2FP4 checkpoints and select their replay state.
+
+        A disaggregated context worker keeps no replay history.
+        """
+        apply_kda_2fp4_state_layout(self)
+        if self.kda_context_only:
+            return None
+        spec_config = self.spec_config
+        self._kda_replay = KDA2Fp4ReplayState(
+            None if spec_config is None else spec_config.tokens_per_gen_step
+        )
+        self._kda_replay.validate(self._state_layout)
+        return self._kda_replay
+
+    @override
+    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
+        if self._kda_2fp4:
+            state = self._kda_replay
+            return (state.make_layer_cache if state is not None else Kda2Fp4LayerCache)(
+                *(() if state is None else (self.mamba_layer_offsets[layer_idx],)),
+                conv=self.get_conv_states(layer_idx),
+                temporal=self.get_ssm_states(layer_idx),
+            )
+        return super().mamba_layer_cache(layer_idx)
 
     @property
     def keeps_kda_draft_records(self) -> bool:
@@ -1683,6 +2069,13 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def prepare_resources(self, scheduled_batch) -> None:
+        if self._kda_2fp4 and self.kda_context_only:
+            # The packed-checkpoint forward reads no replay history here; only
+            # attention-DP padding dummies may run as generation rows.
+            if any(not request.is_dummy for request in scheduled_batch.generation_requests):
+                raise ValueError(
+                    "A KDA 2FP4 disaggregated context worker cannot run generation requests."
+                )
         super().prepare_resources(scheduled_batch)
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
@@ -1733,7 +2126,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         **kwargs,
     ) -> int:
         return KDAReplayRegion.estimate_fixed_bytes(
-            model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+            model_config,
+            mapping,
+            max_batch_size,
+            kv_cache_config.max_util_for_resume,
+            kda_2fp4_replay=kv_cache_config.mamba_state_config.kda_2fp4_replay,
+            **kwargs,
         )
 
     @classmethod

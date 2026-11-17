@@ -5530,6 +5530,17 @@ _StrictNonNegativeInt = Annotated[StrictInt, PydanticField(ge=0)]
 class MambaStateConfig(StrictBaseModel):
     """Configuration for reusable Mamba recurrent-state snapshots."""
 
+    kda_2fp4_replay: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description="Enable native NVFP4 KDA replay for one-token decode "
+        "or DSpark verification with up to seven draft tokens. Checkpoints contain primary and residual FP4 "
+        "values with E4M3 block scales. Prefill uses a temporary dequantized "
+        "FP32 state; decode uses native NVFP4 checkpoint projections and "
+        "BF16 K/U plus FP32 cumulative-G history of length 16. Requires "
+        "Kimi KDA, SM100/SM103, and KV cache manager V2. Disabled by default.")
+
     periodic_snapshot_interval: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -6584,6 +6595,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @model_validator(mode='after')
     def validate_mamba_snapshot_offsets(self) -> 'KvCacheConfig':
         state_config = self.mamba_state_config
+        if state_config.kda_2fp4_replay:
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "KDA 2FP4 replay requires KV cache manager V2.")
+            if self.enable_kv_pool_rebalance:
+                raise ValueError(
+                    "KDA 2FP4 replay requires enable_kv_pool_rebalance=False.")
         has_additional_snapshots = bool(
             state_config.additional_snapshot_offsets_from_start
             or state_config.additional_snapshot_offsets_from_end)

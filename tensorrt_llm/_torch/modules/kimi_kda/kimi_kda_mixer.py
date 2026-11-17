@@ -11,7 +11,8 @@ Cache ownership
 ---------------
 The module reads and updates three short-convolution states in the combined
 ``[slots, 3D, W - 1]`` bf16 pool and one delta-rule recurrent state in the
-``[slots, H, V, K]`` fp32 pool. It owns the ``AttentionMetadata`` split,
+``[slots, H, V, K]`` FP32/BF16 pool, or a V2-owned packed 2FP4 checkpoint
+for non-speculative replay. It owns the ``AttentionMetadata`` split,
 cache-slot indexing, and speculative-verification state handling directly.
 """
 
@@ -572,7 +573,7 @@ class KimiKDALinearAttention(nn.Module):
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
-        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32 or bf16
+        ssm_pool = layer_cache.temporal  # Dense FP32/BF16 state or a packed 2FP4 payload.
         generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
@@ -604,7 +605,24 @@ class KimiKDALinearAttention(nn.Module):
             # history, so every generation row, including a draft-free step,
             # goes through the replay.
             use_mtp_replay = self._has_kda_mtp_replay(layer_cache)
-            if decode_rows == num_decodes and not use_mtp_replay:
+            if ssm_pool.dtype == torch.uint8:
+                if decode_rows % num_decodes:
+                    raise ValueError("2FP4 DSpark requires uniform verification widths")
+                decode_core = self.forward_decode_2fp4(
+                    hidden_states[num_ctx_tokens:num_tokens],
+                    conv_pool,
+                    ssm_pool,
+                    generation_state_indices,
+                    generation_replay_state_indices,
+                    attn_metadata.kv_cache_manager.get_replay_dummy_request_mask()[
+                        num_prefills:batch_size
+                    ],
+                    layer_cache,
+                    output=output[num_ctx_tokens:num_tokens] if output is not None else None,
+                )
+                if output is None:
+                    cores.append(decode_core)
+            elif decode_rows == num_decodes and not use_mtp_replay:
                 decode_core = self.forward_decode(
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
@@ -907,9 +925,24 @@ class KimiKDALinearAttention(nn.Module):
         has_init = mamba_metadata.has_initial_states[:num_prefills]
         staged_state = None
         kernel_pool, kernel_indices = ssm_pool, slot_indices
+        packed_state = ssm_pool.dtype == torch.uint8
+        if packed_state and self._dispatch.prefill_kernel_path == "optimized":
+            # The kernel dequantizes and requantizes the checkpoint itself;
+            # sequences without an initial state pass ~slot.
+            kernel_indices = getattr(mamba_metadata, "kda_packed_state_indices", None)
+            if kernel_indices is None:
+                kernel_indices = torch.where(
+                    has_init, slot_indices, torch.bitwise_not(slot_indices)
+                )
+        elif packed_state:
+            from .kda_2fp4 import materialize_checkpoint
+
+            staged_state = materialize_checkpoint(ssm_pool, slot_indices, has_init)
+            kernel_pool = staged_state
+            kernel_indices = mamba_metadata._arange_buffer[:num_prefills]
         use_indexed_state = self._dispatch.can_use_indexed_prefill(
-            state_pool=ssm_pool,
-            state_indices=slot_indices,
+            state_pool=kernel_pool,
+            state_indices=kernel_indices,
             has_initial_states=has_init,
             cu_seqlens=cu_seqlens,
             num_sequences=num_prefills,
@@ -919,8 +952,10 @@ class KimiKDALinearAttention(nn.Module):
             raise ValueError("Unsupported FlashInfer KDA state layout or prepared metadata")
         recurrent_in = None
         if use_indexed_state:
-            # The packed convolution clears fresh convolution rows itself.
-            reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
+            # The packed convolution clears fresh convolution rows itself, and
+            # packed 2FP4 prefill starts ~slot rows from zero.
+            if not packed_state:
+                reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
         elif mamba_metadata.use_initial_states:
             # The FLA core carries the state in fp32 (no-op for fp32 pools).
             recurrent_in = (
@@ -1001,8 +1036,16 @@ class KimiKDALinearAttention(nn.Module):
             sm_reserve=self._prefill_sm_reserve,
         )
 
-        # The packed convolution persisted the live convolution pool in place.
-        if final_state is not None:
+        # The packed convolution persisted the live convolution pool in place;
+        # the optimized kernel updated a packed 2FP4 checkpoint in place.
+        if ssm_pool.dtype == torch.uint8:
+            if staged_state is not None:
+                from .kda_2fp4 import store_checkpoint
+
+                store_checkpoint(
+                    ssm_pool, slot_indices, final_state if final_state is not None else kernel_pool
+                )
+        elif final_state is not None:
             _writeback_state_rows(ssm_pool, slot_indices, final_state)
         else:
             assert use_indexed_state
@@ -1178,6 +1221,86 @@ class KimiKDALinearAttention(nn.Module):
         # decode_kda applies output gate/RMSNorm and returns the supplied
         # BCG buffer when out=kda_out, so both modes share the core contract.
         return o.view(B, H, hd)
+
+    def forward_decode_2fp4(
+        self,
+        x2d: torch.Tensor,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        slot_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
+        dummy_mask: torch.Tensor,
+        layer_cache,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fused Conv4, native checkpoint replay, and gated output norm.
+
+        ``slot_indices`` address the packed checkpoints and Conv windows,
+        ``replay_indices`` the requests' replay histories.
+        """
+        from .kda_2fp4 import replay
+
+        if getattr(layer_cache, "history", None) is None:
+            # A disaggregated context worker keeps no replay history. The
+            # manager rejects its real generation requests in
+            # prepare_resources, so every row here is an attention-DP padding
+            # dummy that only keeps the ranks' collectives aligned; its Conv
+            # and recurrent states are not advanced.
+            return self._store_core(
+                torch.zeros(
+                    (x2d.shape[0], self.num_heads, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=x2d.device,
+                ),
+                output,
+            )
+        d, H, hd = self.proj_size, self.num_heads, self.head_dim
+
+        def project_qkvg() -> torch.Tensor:
+            if self._qkvg_proj_weight is not None:
+                return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
+            if self.qkvg_proj is not None:
+                return self.qkvg_proj(x2d)
+            inputs = (self.q_proj(x2d), self.k_proj(x2d), self.v_proj(x2d))
+            if self.use_full_rank_gate:
+                inputs += (self.g_proj(x2d),)
+            return torch.cat(inputs, dim=-1)
+
+        def project_gates() -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+            if self._bfa_proj_weight is not None:
+                return self._project_gate_inputs(x2d)
+            return self.b_proj(x2d), self.f_b_proj(self.f_a_proj(x2d)), None
+
+        qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
+            project_qkvg,
+            project_gates,
+            self._projection_fork_event,
+            self._projection_join_event,
+            self._projection_aux_stream if x2d.shape[0] <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None,
+            disable_on_compile=True,
+        )
+        onorm_g = qkvg[:, 3 * d : 4 * d] if self.use_full_rank_gate else onorm_lowrank
+        if onorm_g is None:
+            onorm_g = self.g_b_proj(self.g_a_proj(x2d))
+        return replay(
+            qkvg[:, : 3 * d],
+            conv_pool,
+            self._packed_conv_weight,
+            g,
+            beta,
+            onorm_g.unflatten(-1, (H, hd)),
+            self.o_norm.weight.detach(),
+            ssm_pool,
+            slot_indices,
+            replay_indices,
+            dummy_mask,
+            layer_cache.history,
+            self._A_log_f32,
+            self._dt_bias_f32,
+            self.gate_lower_bound,
+            self.o_norm.eps,
+            output=output,
+        )
 
     def forward_decode_fallback(
         self,

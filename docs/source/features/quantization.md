@@ -20,6 +20,8 @@ TensorRT LLM offers a variety of quantization recipes to optimize LLM inference.
 
 ## Usage
 
+For quantized Kimi KDA recurrent state, see [KDA 2FP4 checkpoint replay](kda-2fp4-replay.md).
+
 The default PyTorch backend supports FP4 and FP8 quantization on the latest Blackwell and Hopper GPUs.
 
 ### Running Pre-quantized Models
