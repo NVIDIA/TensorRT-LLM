@@ -454,9 +454,17 @@ class FallbackFmha(PhasedFmha):
             raise RuntimeError("FallbackFmha.attention requires workspace.")
         if output is None:
             raise RuntimeError("FallbackFmha.attention requires output.")
-        if not update_kv_cache and not is_cross:
+        # A Q-only self-attention input reads K/V that are already in the paged cache, through
+        # the paged-context FMHA, and leaves the cache as it is.
+        q_only_self_attention = not is_cross and q.size(-1) == num_heads * head_size
+        if (
+            not update_kv_cache
+            and not is_cross
+            and not (q_only_self_attention and use_paged_context_fmha)
+        ):
             raise RuntimeError(
-                "KV cache update cannot be disabled now (except for cross attention)."
+                "KV cache update can be disabled only for cross attention, or for a Q-only "
+                "self-attention input with paged-context FMHA."
             )
 
         num_tokens = q.size(0)

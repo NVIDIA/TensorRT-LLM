@@ -20,9 +20,12 @@ Defines shared types, enums, and the abstract base class for attention backends.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from ...cache import PagedKVTables
 
 
 @torch.compiler.disable
@@ -152,8 +155,26 @@ class AttentionBackend(ABC):
     def support_kv_cache_page_size(
         self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
     ) -> bool:
-        """Whether ``forward`` can attend over a ``BlockCausalKVCacheManager`` with
+        """Whether ``forward`` can attend over a ``PagedRolloutKVCache`` with
         ``tokens_per_page``-token pages holding ``dtype`` K/V (default: the backend's
         dtype) on the current GPU. A caller sizing a cache asks this before building it;
         ``forward`` refuses an unsupported cache either way."""
         return self.support_kv_cache()
+
+    def forward_paged_kv(
+        self, q: torch.Tensor, kv_pool: torch.Tensor, tables: "PagedKVTables"
+    ) -> torch.Tensor:
+        """Full attention of fixed-length query sequences over paged K/V, for backends whose
+        ``support_kv_cache()`` is true.
+
+        Args:
+            q: ``[B, S, H, D]``, sequence ``b`` of ``S`` queries.
+            kv_pool: one layer's pool ``[num_pages, 2, H_kv, page_size, D]``; plane 0 is K,
+                plane 1 is V.
+            tables: sequence ``b`` attends to the first ``tables.seq_lens_kv[b]`` tokens of
+                the pages ``tables.page_table[b]`` lists, in order.
+
+        Returns:
+            ``[B, S, H, D]``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not attend to paged K/V.")

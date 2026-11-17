@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One layer of causal-rollout attention, four ways.
+"""One layer of causal-rollout attention, five ways.
 
-    trtllm         TRTLLM backend over BlockCausalKVCacheManager: one fused paged trtllm-gen call
-    cudnn_paged    cuDNN backend over the same cache: run-copy of the new K/V + paged SDPA
+    cudnn_paged    cuDNN backend over PagedRolloutKVCache: staging the new K/V + paged SDPA
+    cutedsl_paged  CuTe DSL backend over the same cache: staging the new K/V + paged FMHA
+    flashinfer_paged  FlashInfer backend over the same cache: staging the new K/V + the
+                   TRTLLM-Gen paged context FMHA
+    trtllm_paged   TRTLLM backend over the same cache: staging the new K/V + the TRTLLM
+                   attention op, given the queries only
     sdpa_resident  one contiguous K/V buffer per layer: in-place write + torch SDPA
                    (PyTorch picks the kernel) over the resident history
     naive          materialised torch.cat of all K/V + SDPA (the VANILLA path)
@@ -62,8 +66,10 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
+from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unittest"))
@@ -268,15 +274,13 @@ def build_cache(g: Geometry, history_chunks: int, gen, num_layers: int = 1):
         causal_blocks={g.chunk: 1, g.tokens_per_frame: g.frames_per_chunk},
         max_pin_tokens=g.pinned,
     )
-    mgr = BlockCausalKVCacheManager(
+    mgr = PagedRolloutKVCache(
         num_layers=num_layers,
         num_kv_heads=g.num_kv_heads,
         head_dim=g.head_dim,
         dtype=g.torch_dtype,
         tokens_per_page=g.tokens_per_page,
-        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            spec, tokens_per_page=g.tokens_per_page
-        ),
+        pool_tokens=PagedRolloutKVCache.pool_tokens_for(spec, tokens_per_page=g.tokens_per_page),
     )
     mgr.open(spec, pin_tokens=g.pinned)
     kp = rand_kv(g, g.pinned, gen)
@@ -320,7 +324,7 @@ def new_tokens(g: Geometry, gen, fused: bool):
     return q, k, torch.randn_like(k)
 
 
-def pool_bytes(mgr: BlockCausalKVCacheManager, num_layers: int) -> int:
+def pool_bytes(mgr: PagedRolloutKVCache, num_layers: int) -> int:
     return sum(
         mgr.kv_buffer(i).numel() * mgr.kv_buffer(i).element_size() for i in range(num_layers)
     )
@@ -391,16 +395,33 @@ def sdpa(q, k, v):
     )[0].transpose(0, 1)
 
 
-def make_attn(backend: str, g: Geometry, layer_idx: int, mgr, state: dict):
-    if backend == "trtllm":
+PAGED_VARIANTS = ("cudnn_paged", "cutedsl_paged", "flashinfer_paged", "trtllm_paged")
+
+
+def make_attn(backend: str, g: Geometry, layer_idx: int):
+    if backend == "trtllm_paged":
         return TrtllmAttention(
             layer_idx=layer_idx,
             num_heads=g.num_heads,
             head_dim=g.head_dim,
             num_kv_heads=g.num_kv_heads,
             dtype=g.torch_dtype,
-            max_seq_len=mgr.capacity,
-            attention_metadata_state=state,
+            attention_metadata_state={},
+        )
+    if backend == "flashinfer_paged":
+        return FlashInferAttention(
+            layer_idx=layer_idx,
+            num_heads=g.num_heads,
+            head_dim=g.head_dim,
+            num_kv_heads=g.num_kv_heads,
+            dtype=g.torch_dtype,
+        )
+    if backend == "cutedsl_paged":
+        return CuTeDSLAttention(
+            layer_idx=layer_idx,
+            num_heads=g.num_heads,
+            head_dim=g.head_dim,
+            num_kv_heads=g.num_kv_heads,
         )
     return CuDNNAttention(
         layer_idx=layer_idx,
@@ -422,14 +443,12 @@ def chunk_cycle(args, g: Geometry, gen) -> None:
     mgr, kp, vp, hk, hv = build_cache(g, args.history_chunks, gen, layers)
     q, k, v = new_tokens(g, gen, args.fused_qkv)
     q4, k4, v4 = q[None], k[None], v[None]
-    state: dict = {}
-    attns = [make_attn(args.backend, g, i, mgr, state) for i in range(layers)]
+    attns = [make_attn(args.backend, g, i) for i in range(layers)]
 
     def forward_layer(attn, causal_block_size):
-        plan = mgr.plan(chunk, causal_block_size)
-        if args.backend == "trtllm":
-            return attn.forward(q4, k4, v4, batch_size=1, seq_len=chunk, kv=plan)
-        return attn.forward(q4, k4, v4, kv=plan)
+        return attn.forward(
+            q4, k4, v4, batch_size=1, seq_len=chunk, kv=mgr.plan(chunk, causal_block_size)
+        )
 
     def forward(causal_block_size):
         for attn in attns:
@@ -466,9 +485,9 @@ def chunk_cycle(args, g: Geometry, gen) -> None:
 
     # Commit: GPU span by CUPTI (eager, no graph): first kernel start to last kernel
     # end, so it includes launch gaps between the kernels; host time by the wall clock.
-    # Each commit at steady state drops pages, so the rotation and the private-page
-    # copies for both blockings are exercised every time. Nothing else runs between a
-    # commit and the next forward: the kernels read the cache's tensors directly.
+    # Each commit at steady state frees and backs pages and rewrites the page lists of
+    # both blockings. Nothing else runs between a commit and the next forward: the
+    # kernels read the cache's tensors directly.
     def commit():
         mgr.commit(mgr.max_staged_tokens)
 
@@ -520,7 +539,7 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--variant",
-        choices=["trtllm", "cudnn_paged", "sdpa_resident", "naive", "all"],
+        choices=[*PAGED_VARIANTS, "sdpa_resident", "naive", "all"],
         default="all",
     )
     ap.add_argument("--iters", type=int, default=50)
@@ -544,7 +563,7 @@ def parse_args():
         "--history-chunks",
         type=int,
         default=40,
-        help="chunks committed before timing; > window/chunk so the table has rotated",
+        help="chunks committed before timing; > window/chunk so pages have been recycled",
     )
     ap.add_argument(
         "--causal-block-size",
@@ -573,7 +592,7 @@ def parse_args():
     )
     ap.add_argument("--layers", type=int, default=36)
     ap.add_argument("--denoise-steps", type=int, default=4)
-    ap.add_argument("--backend", choices=["cudnn_paged", "trtllm"], default="cudnn_paged")
+    ap.add_argument("--backend", choices=PAGED_VARIANTS, default="cudnn_paged")
     return ap.parse_args()
 
 
@@ -608,7 +627,9 @@ def main() -> None:
 
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
     mgr, kp, vp, k_hist, v_hist = build_cache(g, args.history_chunks, gen)
-    start = mgr.staging_offset
+    # Positions in the resident sequence (the pinned prefix and the resident history), which
+    # the dense variants hold contiguously.
+    start = kp.shape[0] + mgr.history_tokens
     seq_len = start + chunk
 
     q, k, v = new_tokens(g, gen, args.fused_qkv)
@@ -627,16 +648,24 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    trtllm_attn = make_attn("trtllm", g, 0, mgr, {})
-    cudnn_attn = make_attn("cudnn_paged", g, 0, mgr, {})
+    cudnn_attn = make_attn("cudnn_paged", g, 0)
+    cutedsl_attn = make_attn("cutedsl_paged", g, 0)
+    flashinfer_attn = make_attn("flashinfer_paged", g, 0)
+    trtllm_attn = make_attn("trtllm_paged", g, 0)
     q4, k4, v4 = q[None], k[None], v[None]
     plan = mgr.plan(chunk, causal_block_size)
 
-    def run_trtllm():
-        return trtllm_attn.forward(q4, k4, v4, batch_size=1, seq_len=chunk, kv=plan)
-
     def run_cudnn_paged():
         return cudnn_attn.forward(q4, k4, v4, kv=plan)
+
+    def run_cutedsl_paged():
+        return cutedsl_attn.forward(q4, k4, v4, kv=plan)
+
+    def run_flashinfer_paged():
+        return flashinfer_attn.forward(q4, k4, v4, kv=plan)
+
+    def run_trtllm_paged():
+        return trtllm_attn.forward(q4, k4, v4, batch_size=1, seq_len=chunk, kv=plan)
 
     # Dense paths have no per-causal-block key count, so causal blocks cost them one launch each:
     # that is the per-frame clean pass as the reference runs it.
@@ -648,7 +677,7 @@ def main() -> None:
     # A contiguous per-layer buffer: the pinned prefix and the resident history (stale
     # tokens included: it has no per-causal-block start) are already in place; a call
     # writes the new tokens and attends over a slice.
-    slab_k = torch.empty(mgr.capacity, g.num_kv_heads, g.head_dim, device=DEV, dtype=dtype)
+    slab_k = torch.empty(seq_len, g.num_kv_heads, g.head_dim, device=DEV, dtype=dtype)
     slab_v = torch.empty_like(slab_k)
     n_res = mgr.history_tokens
     resident_k, resident_v = torch.cat((kp, k_hist[-n_res:])), torch.cat((vp, v_hist[-n_res:]))
@@ -668,8 +697,10 @@ def main() -> None:
         )
 
     variants = {
-        "trtllm": run_trtllm,
         "cudnn_paged": run_cudnn_paged,
+        "cutedsl_paged": run_cutedsl_paged,
+        "flashinfer_paged": run_flashinfer_paged,
+        "trtllm_paged": run_trtllm_paged,
         "sdpa_resident": run_sdpa_resident,
         "naive": run_naive,
     }
@@ -695,7 +726,7 @@ def main() -> None:
     for name in chosen:
         out = variants[name]().reshape(chunk, g.num_heads, g.head_dim).float()
         torch.cuda.synchronize()
-        if name in ("trtllm", "cudnn_paged"):
+        if name in PAGED_VARIANTS:
             checks[name] = check(name, out, ref_exact, ref_resident, chunk_only, "exact window")
         else:
             checks[name] = check(name, out, ref_resident, ref_exact, chunk_only, "resident")
@@ -728,7 +759,7 @@ def main() -> None:
             {
                 "variant": name,
                 "causal_block_size": causal_block_size,
-                "pool_bytes": pool if name in ("trtllm", "cudnn_paged") else None,
+                "pool_bytes": pool if name in PAGED_VARIANTS else None,
                 **checks[name],
                 **r,
             }
