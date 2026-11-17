@@ -87,7 +87,6 @@ def _spawn_attached_frontends(
     cancelled: threading.Event | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
     affinity_sockets: dict[int, socket.socket] | None = None,
-    before_terminate: Callable[[], None] | None = None,
 ) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -107,8 +106,6 @@ def _spawn_attached_frontends(
     bound for it (_frontend_affinity_sockets). Each child inherits its own
     socket; the launcher closes its copy and removes it from the dict.
 
-    before_terminate releases caller-owned resources before terminating children
-    if startup fails.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -163,16 +160,17 @@ def _spawn_attached_frontends(
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
     except BaseException:
-        try:
-            if before_terminate is not None:
-                before_terminate()
-        finally:
-            _terminate_attached_frontends(children)
+        _terminate_attached_frontends(children)
         raise
     finally:
         for fd in ready_fds:
             os.close(fd)
     return children
+
+
+def _frontend_ready_timeout_s() -> float:
+    """The launcher's budget for each attached-frontend startup phase."""
+    return float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
 
 
 def _wait_attached_frontends_ready(
@@ -182,7 +180,7 @@ def _wait_attached_frontends_ready(
     report_failure: Callable[[int, str, str], None] | None = None,
 ) -> None:
     """Block until every attached frontend writes its READY byte."""
-    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
+    timeout = _frontend_ready_timeout_s()
     deadline = time.monotonic() + timeout
     pending = dict(zip(ready_fds, children))
     with selectors.DefaultSelector() as selector:
@@ -227,9 +225,10 @@ def _wait_attached_frontends_ready(
 def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     """Report READY to the launcher over the inherited pipe.
 
-    Called after port bind, executor attach, server construction and middleware
-    registration, before HTTP startup waits for the launcher to serve. The
-    launcher must receive this byte before it can start answering that probe.
+    The launcher holds group startup until every attached frontend sends this
+    byte. An HTTP frontend sends it after constructing its server and then waits
+    for the launcher to serve (AttachedFrontendWatchdog.wait_until_ready). An
+    OpenEngine frontend sends it after its gRPC server has started.
     """
     ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
     if not (multi_frontend.is_attached_frontend and ready_fd):

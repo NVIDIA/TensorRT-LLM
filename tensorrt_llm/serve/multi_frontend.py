@@ -160,14 +160,14 @@ class LauncherForwarder:
             )
             if isinstance(error, asyncio.TimeoutError):
                 status_code = 504
-                headers = {"x-should-retry": "false"}
+                response_headers = {"x-should-retry": "false"}
                 message = (
                     f"The launcher frontend did not respond to {request.url.path} in time; "
                     "the request may still be processed. Check its result before retrying."
                 )
             else:
                 status_code = 503
-                headers = None
+                response_headers = None
                 message = (
                     f"The launcher frontend that serves {request.url.path} "
                     f"is unavailable: {error!r}"
@@ -175,7 +175,7 @@ class LauncherForwarder:
             return JSONResponse(
                 status_code=status_code,
                 content={"error": message},
-                headers=headers,
+                headers=response_headers,
             )
 
     async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
@@ -254,7 +254,7 @@ class AttachedFrontendWatchdog:
     def __init__(
         self,
         forwarder: LauncherForwarder,
-        launcher_pid: Optional[int],
+        launcher_pid: int,
         mark_dead: Callable[[BaseException], None],
         *,
         ppid_interval_s: float = 1.0,
@@ -262,33 +262,31 @@ class AttachedFrontendWatchdog:
         health_failures: int = 3,
     ):
         self._forwarder = forwarder
-        self._launcher_pid = launcher_pid if launcher_pid is not None else os.getppid()
+        self._launcher_pid = launcher_pid
         self._mark_dead = mark_dead
         self._ppid_interval = ppid_interval_s
         self._health_interval = health_interval_s
         self._health_failures = health_failures
-        self._launcher_answered = False
+        self._launcher_was_healthy = False
 
-    async def wait_until_ready(self, timeout_s: float) -> None:
-        """Wait for launcher HTTP serving, independently of health authorization."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_s
+    async def wait_until_ready(self) -> None:
+        """Wait for launcher HTTP serving, independently of health authorization.
+
+        Group-startup deadlines and cancellation belong to the launcher.
+
+        Raises:
+            RuntimeError: The launcher exits before answering an HTTP probe.
+        """
         while True:
             if os.getppid() != self._launcher_pid:
                 raise RuntimeError(
                     f"Launcher frontend (pid {self._launcher_pid}) exited during startup"
                 )
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"Launcher frontend not ready within {timeout_s:g}s "
-                    "(TLLM_FRONTEND_READY_TIMEOUT)"
-                )
-            status = await self._forwarder.get_status("/health", timeout_s=min(remaining, 5.0))
+            status = await self._forwarder.get_status("/health")
             if status is not None:
-                self._launcher_answered = status == 200
+                self._launcher_was_healthy = status == 200
                 return
-            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+            await asyncio.sleep(0.1)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -304,10 +302,11 @@ class AttachedFrontendWatchdog:
             next_health = loop.time() + self._health_interval
             status = await self._forwarder.get_status("/health")
             if status == 200:
-                self._launcher_answered = True
+                self._launcher_was_healthy = True
                 failures = 0
                 continue
-            if not self._launcher_answered:
+            # Auth-protected health can stay 401; count failures only after a 200.
+            if not self._launcher_was_healthy:
                 continue
             failures += 1
             if failures >= self._health_failures:

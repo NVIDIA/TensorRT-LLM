@@ -591,8 +591,8 @@ def _provision_kv_cache_pool(llm_args: dict,
 def _listen_on_launcher_uds(llm: PyTorchLLM) -> tuple[socket.socket, str]:
     """Bind and listen on the Unix socket for launcher-owned forwarded routes.
 
-    Listen before spawning attached frontends so their startup health probes
-    can queue until the launcher's uvicorn takes over the socket.
+    Queued startup probes are answered as soon as uvicorn accepts, instead of
+    waiting for the next connection-refusal retry in an attached frontend.
 
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed, socket file included, when the executor proxy shuts down.
@@ -925,8 +925,7 @@ def launch_server(
                         multi_frontend.num_frontends,
                         extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
                         report_failure=_report_observed_child_failure,
-                        affinity_sockets=attached_affinity_sockets,
-                        before_terminate=launcher_uds_sock.close)
+                        affinity_sockets=attached_affinity_sockets)
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
@@ -965,13 +964,11 @@ def launch_server(
             finally:
                 if stop_watching_frontends is not None:
                     stop_watching_frontends.set()
-                if launcher_uds_sock is not None:
-                    # Close before stopping frontends to reset queued forwards
-                    # and release their handlers. Its file goes with the ipc dir
-                    # (see _listen_on_launcher_uds).
-                    launcher_uds_sock.close()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
+                if launcher_uds_sock is not None:
+                    # Its file goes with the ipc dir (see _listen_on_launcher_uds).
+                    launcher_uds_sock.close()
 
 
 def launch_mm_encoder_server(

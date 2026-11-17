@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import traceback
+import typing
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -70,6 +71,8 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._frontend_processes import (_frontend_affinity_ports,
+                                                    _frontend_ready_timeout_s)
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -773,7 +776,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
             self._launcher_watchdog = AttachedFrontendWatchdog(
-                self._launcher_forwarder, multi_frontend_serving.launcher_pid,
+                self._launcher_forwarder,
+                typing.cast(int, multi_frontend_serving.launcher_pid),
                 self._on_launcher_lost)
         self._tokenization_owners: Optional[
             TokenizationOwners] = start_tokenization_owners(
@@ -807,6 +811,7 @@ class OpenAIServer(_VideoRoutesMixin):
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
+        self._registration_task: Optional[asyncio.Task] = None
         self.resource_governor = None
 
         # Skip loading AutoProcessor and model_config for VISUAL_GEN models
@@ -878,6 +883,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
+            if self._registration_task is not None:
+                self._registration_task.cancel()
+                await asyncio.gather(self._registration_task,
+                                     return_exceptions=True)
             await self._perf_metrics_writer.close()
             for task in (self._launcher_watchdog_task, self._clock_offset_task):
                 if task is not None:
@@ -4438,6 +4447,43 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
+    async def _wait_for_frontend_affinity_ports(self) -> None:
+        """Wait for attached affinity listeners before advertising this worker.
+
+        Raises:
+            RuntimeError: Attached listeners exceed the launcher startup budget.
+        """
+        mode = self._multi_frontend
+        if mode is None or not mode.is_launcher:
+            return
+        ports = _frontend_affinity_ports(
+            self.port, mode.num_frontends,
+            self.generator.args.serve_frontend_affinity_port_stride)[1:]
+        if not ports:
+            return
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(self.host, self.host)
+
+        async def wait_for_port(port: int) -> None:
+            while True:
+                try:
+                    _, writer = await asyncio.open_connection(host, port)
+                except OSError:
+                    await asyncio.sleep(0.1)
+                else:
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+        timeout = _frontend_ready_timeout_s()
+        try:
+            await asyncio.wait_for(asyncio.gather(*(wait_for_port(port)
+                                                    for port in ports)),
+                                   timeout=timeout)
+        except asyncio.TimeoutError as error:
+            raise RuntimeError(
+                "Attached frontend affinity ports not listening within "
+                f"{timeout:g}s (TLLM_FRONTEND_READY_TIMEOUT)") from error
+
     async def __call__(self,
                        host: str,
                        port: int,
@@ -4465,25 +4511,37 @@ class OpenAIServer(_VideoRoutesMixin):
 
         if self._launcher_watchdog is not None:
             try:
-                await self._launcher_watchdog.wait_until_ready(
-                    float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300")))
+                await self._launcher_watchdog.wait_until_ready()
             except BaseException:
                 await self._launcher_forwarder.close()
                 raise
 
-        async def _register_after_serving():
+        async def _register_after_serving() -> None:
             with _StartupTimer("http_server_start"):
                 while not server.started:
                     await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
+                    await self._wait_for_frontend_affinity_ports()
+                    if server.should_exit:
+                        return
                     with _StartupTimer(
                             f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
                     ):
-                        await self.disagg_cluster_worker.register_worker()
+                        await self.disagg_cluster_worker.register_worker(
+                            validator=lambda: not server.should_exit)
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True
+                    raise
 
-        asyncio.create_task(_register_after_serving())
-        await server.serve(sockets=sockets)
+        registration_task = asyncio.create_task(_register_after_serving())
+        self._registration_task = registration_task
+        try:
+            await server.serve(sockets=sockets)
+            if registration_task.done() and not registration_task.cancelled():
+                await registration_task
+        finally:
+            registration_task.cancel()
+            await asyncio.gather(registration_task, return_exceptions=True)
+            self._registration_task = None

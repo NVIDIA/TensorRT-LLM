@@ -25,10 +25,12 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager, nullcontext
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import httpx
@@ -39,6 +41,7 @@ from aiohttp import web
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 from starlette.routing import Match
+from test_common.serve import app_factory
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm._utils import AdjustedSteadyClock
@@ -49,11 +52,19 @@ from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
     LauncherForwarder,
+    MultiFrontendServing,
     SharedClockOffset,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture
+def frontend_tmp_path() -> Iterator[Path]:
+    """Short, so socket paths stay under the AF_UNIX path limit."""
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory:
+        yield Path(directory)
 
 
 class _FakeLauncher:
@@ -186,25 +197,11 @@ def test_forwarding_timeout_warns_that_a_delivered_post_can_still_execute(tmp_pa
             return {"id": "batch-1"}
 
         path = str(tmp_path / "launcher.sock")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            listener.bind(path)
-            listener.listen()
+        async with _serving_launcher(launcher, path):
             forwarder = LauncherForwarder(path, timeout_s=1.0)
             frontend = FastAPI()
             frontend.add_api_route("/v1/messages/batches", forwarder.forward, methods=["POST"])
-            server = uvicorn.Server(
-                uvicorn.Config(
-                    launcher,
-                    http="h11",
-                    loop="asyncio",
-                    lifespan="off",
-                    log_config=None,
-                    log_level=None,
-                )
-            )
-            serving = asyncio.create_task(server.serve(sockets=[listener]))
             try:
-                await _wait_for(lambda: server.started)
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=frontend), base_url="http://frontend"
                 ) as client:
@@ -218,8 +215,6 @@ def test_forwarding_timeout_warns_that_a_delivered_post_can_still_execute(tmp_pa
                 await asyncio.wait_for(completed.wait(), timeout=5)
             finally:
                 release.set()
-                server.should_exit = True
-                await asyncio.wait_for(serving, timeout=5)
                 await forwarder.close()
 
         assert seen == [payload]
@@ -243,6 +238,24 @@ def _capture_http_servers(monkeypatch: pytest.MonkeyPatch) -> list[uvicorn.Serve
     return servers
 
 
+@asynccontextmanager
+async def _serving_launcher(app: FastAPI, path: str) -> AsyncIterator[uvicorn.Server]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app, http="h11", loop="asyncio", lifespan="off", log_config=None, log_level=None
+            )
+        )
+        serving = asyncio.create_task(server.serve(sockets=[listener]))
+        try:
+            await _wait_for(lambda: server.started)
+            yield server
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(serving, timeout=10)
+
+
 @contextmanager
 def _isolated_uvicorn_logging(tmp_path: Path) -> Iterator[None]:
     def logger_state(logger: logging.Logger) -> tuple:
@@ -264,7 +277,7 @@ def _isolated_uvicorn_logging(tmp_path: Path) -> Iterator[None]:
     unrelated_log = tmp_path / "unrelated.log"
     unrelated_handler = logging.FileHandler(unrelated_log)
 
-    def config_without_logging(app: FastAPI, **kwargs) -> uvicorn.Config:
+    def config_without_logging(app: FastAPI, **kwargs: Any) -> uvicorn.Config:
         kwargs["log_config"] = None
         kwargs["log_level"] = None
         return uvicorn.Config(app, **kwargs)
@@ -288,6 +301,7 @@ def _isolated_uvicorn_logging(tmp_path: Path) -> Iterator[None]:
 
 def test_attached_frontend_waits_for_launcher_http_before_accepting_requests(
     monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
 ) -> None:
     servers = _capture_http_servers(monkeypatch)
 
@@ -311,25 +325,15 @@ def test_attached_frontend_waits_for_launcher_http_before_accepting_requests(
                 seen.append((request.url.path, await request.json()))
                 return {"id": "batch-1"}
 
-            with (
-                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
-                socket.socket() as frontend_socket,
-            ):
-                listener.bind(str(tmp_path / "multi_frontend_ipc" / "launcher.sock"))
-                listener.listen()
+            async with AsyncExitStack() as stack:
+                frontend_socket = stack.enter_context(socket.socket())
                 frontend_socket.bind(("127.0.0.1", 0))
                 address = f"http://127.0.0.1:{frontend_socket.getsockname()[1]}"
-                launcher_server = uvicorn.Server(
-                    uvicorn.Config(
-                        launcher,
-                        http="h11",
-                        loop="asyncio",
-                        lifespan="off",
-                        log_config=None,
-                        log_level=None,
+                await stack.enter_async_context(
+                    _serving_launcher(
+                        launcher, str(tmp_path / "multi_frontend_ipc" / "launcher.sock")
                     )
                 )
-                launcher_task = asyncio.create_task(launcher_server.serve(sockets=[listener]))
                 frontend_task = asyncio.create_task(
                     attached(
                         "127.0.0.1", frontend_socket.getsockname()[1], sockets=[frontend_socket]
@@ -362,19 +366,17 @@ def test_attached_frontend_waits_for_launcher_http_before_accepting_requests(
                     if servers:
                         servers[0].should_exit = True
                     await asyncio.wait_for(frontend_task, timeout=10)
-                    launcher_server.should_exit = True
-                    await asyncio.wait_for(launcher_task, timeout=10)
 
-    with (
-        tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory,
-        _isolated_uvicorn_logging(Path(directory)),
-    ):
-        asyncio.run(run(Path(directory)))
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run(frontend_tmp_path))
 
 
-def test_attached_frontend_startup_is_bounded_when_launcher_does_not_answer(
-    capfd: pytest.CaptureFixture[str],
+def test_attached_frontend_waits_beyond_the_launchers_ready_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
 ) -> None:
+    servers = _capture_http_servers(monkeypatch)
+
     async def run(tmp_path: Path) -> None:
         with isolated_serve_env(tmp_path) as env:
             attached = env.build_openai_server(
@@ -382,26 +384,378 @@ def test_attached_frontend_startup_is_bounded_when_launcher_does_not_answer(
                     multi_frontend_attached=True, env=(("TLLM_FRONTEND_READY_TIMEOUT", "0.1"),)
                 )
             )
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                listener.bind(str(tmp_path / "multi_frontend_ipc" / "launcher.sock"))
-                listener.listen()
-                with pytest.raises((RuntimeError, SystemExit)) as failure:
-                    await asyncio.wait_for(attached("127.0.0.1", 0), timeout=5)
-                if isinstance(failure.value, SystemExit):
-                    assert failure.value.code not in (None, 0)
-                captured = capfd.readouterr()
-                assert "TLLM_FRONTEND_READY_TIMEOUT" in (
-                    str(failure.value) + captured.out + captured.err
+            launcher = FastAPI()
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            @launcher.get("/health")
+            async def health() -> dict:
+                entered.set()
+                await release.wait()
+                return {}
+
+            path = str(tmp_path / "multi_frontend_ipc" / "launcher.sock")
+            async with _serving_launcher(launcher, path):
+                serving = asyncio.create_task(attached("127.0.0.1", 0))
+                control = LauncherForwarder(path)
+                try:
+                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    assert await control.get_status("/health", timeout_s=0.1) is None
+                    release.set()
+                    await _wait_for(lambda: servers[0].started or serving.done())
+                    assert servers[0].started, serving.exception()
+                finally:
+                    release.set()
+                    if servers:
+                        servers[0].should_exit = True
+                    await asyncio.wait_for(
+                        asyncio.gather(serving, return_exceptions=True), timeout=10
+                    )
+                    await control.close()
+
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run(frontend_tmp_path))
+
+
+@contextmanager
+def _frontend_listener_sockets(
+    count: int, stride: int
+) -> Iterator[tuple[int, list[socket.socket], list[socket.socket]]]:
+    for attempt in range(50):
+        stack = ExitStack()
+        shared = []
+        affinity = []
+        port = 0
+        try:
+            for frontend in range(count):
+                listener = stack.enter_context(socket.socket())
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                listener.bind(("127.0.0.1", port))
+                port = listener.getsockname()[1]
+                shared.append(listener)
+            if port + count * stride > 65535:
+                raise OSError("Affinity layout exceeds the TCP port range")
+            for frontend in range(count):
+                listener = stack.enter_context(socket.socket())
+                listener.bind(("127.0.0.1", port + stride * (frontend + 1)))
+                affinity.append(listener)
+        except OSError:
+            stack.close()
+            continue
+        with stack:
+            yield port, shared, affinity
+        return
+    raise RuntimeError("No available frontend socket layout")
+
+
+@pytest.mark.parametrize("start_attached", [True, False])
+def test_cluster_registration_waits_for_attached_affinity_listeners(
+    monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
+    start_attached: bool,
+) -> None:
+    captured = []
+    create_server = openai_server.create_uvicorn_server
+
+    def capture(config: uvicorn.Config) -> uvicorn.Server:
+        server = create_server(config)
+        server.capture_signals = nullcontext
+        captured.append(server)
+        return server
+
+    monkeypatch.setattr(openai_server, "create_uvicorn_server", capture)
+    monkeypatch.setenv("TLLM_FRONTEND_READY_TIMEOUT", "5" if start_attached else "0.1")
+
+    async def run() -> None:
+        registered = asyncio.Event()
+        affinity_probe_completed = asyncio.Event()
+        health_entered = asyncio.Event()
+        release_health = asyncio.Event()
+        listening_at_registration = []
+        storage = mock.AsyncMock()
+        storage.delete.return_value = True
+
+        with ExitStack() as stack:
+            port, shared, affinity = stack.enter_context(_frontend_listener_sockets(2, 7))
+            connect = asyncio.open_connection
+
+            async def observe_connection(host: str, target_port: int, **kwargs: Any) -> tuple:
+                try:
+                    return await connect(host, target_port, **kwargs)
+                finally:
+                    if target_port == port + 14:
+                        affinity_probe_completed.set()
+
+            stack.enter_context(mock.patch.object(asyncio, "open_connection", observe_connection))
+            path = str(frontend_tmp_path / "launcher.sock")
+            constructor = openai_server.OpenAIServer
+            servers = []
+            for frontend in range(2):
+                environment = stack.enter_context(
+                    isolated_serve_env(frontend_tmp_path / f"frontend-{frontend}")
                 )
 
-    with (
-        tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory,
-        _isolated_uvicorn_logging(Path(directory)),
-    ):
-        asyncio.run(run(Path(directory)))
+                def configure(frontend: int = frontend, **kwargs: Any) -> OpenAIServer:
+                    kwargs["multi_frontend_serving"] = MultiFrontendServing(
+                        launcher_uds=path,
+                        is_launcher=frontend == 0,
+                        launcher_pid=os.getppid() if frontend else None,
+                        frontend_id=frontend,
+                        num_frontends=2,
+                    )
+                    kwargs["generator"].args.serve_frontend_affinity_port_stride = 7
+                    if frontend == 0:
+                        kwargs["disagg_cluster_config"] = DisaggClusterConfig(
+                            cluster_uri="http://127.0.0.1:9", cluster_name="test"
+                        )
+                    return constructor(**kwargs)
+
+                with mock.patch.object(app_factory, "OpenAIServer", configure):
+                    servers.append(
+                        environment.build_openai_server(AggConfig(role=ServerRole.CONTEXT))
+                    )
+
+            async def register(*args: Any, **kwargs: Any) -> bool:
+                try:
+                    _, writer = await asyncio.open_connection("127.0.0.1", port + 14)
+                except OSError:
+                    listening_at_registration.append(False)
+                else:
+                    writer.close()
+                    await writer.wait_closed()
+                    listening_at_registration.append(True)
+                registered.set()
+                return True
+
+            async def hold_health(
+                request: Request, call_next: Callable[[Request], Awaitable[Response]]
+            ) -> Response:
+                if request.url.path == "/health":
+                    health_entered.set()
+                    await release_health.wait()
+                return await call_next(request)
+
+            storage.set.side_effect = register
+            stack.enter_context(
+                mock.patch.object(
+                    openai_server, "create_cluster_storage_client", return_value=storage
+                )
+            )
+            servers[0].app.middleware("http")(hold_health)
+            listener = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            listener.bind(path)
+            listener.listen()
+            tasks = []
+            try:
+                if start_attached:
+                    tasks.append(
+                        asyncio.create_task(
+                            servers[1]("127.0.0.1", port, sockets=[shared[1], affinity[1]])
+                        )
+                    )
+                    await _wait_for(lambda: len(captured) == 1)
+                launcher = asyncio.create_task(
+                    servers[0]("127.0.0.1", port, sockets=[shared[0], affinity[0], listener])
+                )
+                tasks.append(launcher)
+                if start_attached:
+                    await asyncio.wait_for(health_entered.wait(), timeout=5)
+                    await asyncio.wait_for(affinity_probe_completed.wait(), timeout=5)
+                    assert not registered.is_set()
+                    release_health.set()
+                    await asyncio.wait_for(registered.wait(), timeout=5)
+                    assert listening_at_registration == [True]
+                    async with httpx.AsyncClient(
+                        base_url=f"http://127.0.0.1:{port + 14}"
+                    ) as client:
+                        assert (await client.get("/health")).status_code == 200
+                else:
+                    with pytest.raises(
+                        RuntimeError, match="affinity ports.*TLLM_FRONTEND_READY_TIMEOUT"
+                    ):
+                        await asyncio.wait_for(launcher, timeout=5)
+                    storage.set.assert_not_awaited()
+            finally:
+                release_health.set()
+                for server in captured:
+                    server.should_exit = True
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run())
 
 
-def test_attached_frontend_waiting_for_launcher_exits_on_sigterm() -> None:
+@pytest.mark.parametrize(
+    "registration_stage", ["affinity_wait", "storage_start", "storage_start_during_drain"]
+)
+def test_cluster_shutdown_does_not_register_a_starting_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
+    registration_stage: str,
+) -> None:
+    captured = _capture_http_servers(monkeypatch)
+
+    async def run() -> None:
+        waiting = asyncio.Event()
+        release_registration = asyncio.Event()
+        registration_settled = asyncio.Event()
+        metrics_closing = asyncio.Event()
+        release_metrics = asyncio.Event()
+        request_entered = asyncio.Event()
+        release_request = asyncio.Event()
+        storage = mock.AsyncMock()
+        storage.delete.return_value = True
+
+        async def start_storage() -> None:
+            if registration_stage != "affinity_wait":
+                task = asyncio.current_task()
+                assert task is not None
+                task.add_done_callback(lambda finished: registration_settled.set())
+                waiting.set()
+                await release_registration.wait()
+
+        async def register(*args: Any, **kwargs: Any) -> bool:
+            registration_settled.set()
+            return True
+
+        storage.start.side_effect = start_storage
+        storage.set.side_effect = register
+        with ExitStack() as stack:
+            port, shared, affinity = stack.enter_context(_frontend_listener_sockets(2, 7))
+            connect = asyncio.open_connection
+
+            async def observe_connection(host: str, target_port: int, **kwargs: Any) -> tuple:
+                try:
+                    return await connect(host, target_port, **kwargs)
+                except OSError:
+                    if registration_stage == "affinity_wait" and target_port == port + 14:
+                        waiting.set()
+                        try:
+                            await release_registration.wait()
+                        except asyncio.CancelledError:
+                            registration_settled.set()
+                            raise
+                    raise
+
+            stack.enter_context(mock.patch.object(asyncio, "open_connection", observe_connection))
+            environment = stack.enter_context(isolated_serve_env(frontend_tmp_path))
+            constructor = openai_server.OpenAIServer
+
+            def configure(**kwargs: Any) -> OpenAIServer:
+                kwargs["multi_frontend_serving"] = MultiFrontendServing(
+                    launcher_uds=str(frontend_tmp_path / "launcher.sock"),
+                    is_launcher=True,
+                    frontend_id=0,
+                    num_frontends=2,
+                )
+                kwargs["generator"].args.serve_frontend_affinity_port_stride = 7
+                kwargs["disagg_cluster_config"] = DisaggClusterConfig(
+                    cluster_uri="http://127.0.0.1:9", cluster_name="test"
+                )
+                return constructor(**kwargs)
+
+            with mock.patch.object(app_factory, "OpenAIServer", configure):
+                launcher = environment.build_openai_server(AggConfig(role=ServerRole.CONTEXT))
+            stack.enter_context(
+                mock.patch.object(
+                    openai_server, "create_cluster_storage_client", return_value=storage
+                )
+            )
+            close_metrics = launcher._perf_metrics_writer.close
+
+            async def hold_metrics_close() -> None:
+                metrics_closing.set()
+                await release_metrics.wait()
+                await close_metrics()
+
+            stack.enter_context(
+                mock.patch.object(launcher._perf_metrics_writer, "close", hold_metrics_close)
+            )
+
+            async def hold_request(
+                request: Request, call_next: Callable[[Request], Awaitable[Response]]
+            ) -> Response:
+                request_entered.set()
+                await release_request.wait()
+                return await call_next(request)
+
+            launcher.app.middleware("http")(hold_request)
+
+            def close_connection(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                writer.close()
+
+            async def wait_for_launcher_listener_close() -> None:
+                while True:
+                    try:
+                        _, writer = await connect("127.0.0.1", port + 7)
+                    except OSError:
+                        return
+                    writer.close()
+                    await writer.wait_closed()
+                    await asyncio.sleep(0)
+
+            attached_listener = None
+            request_task = None
+            serving = None
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port + 7}") as client:
+                try:
+                    if registration_stage != "affinity_wait":
+                        attached_listener = await asyncio.start_server(
+                            close_connection, sock=affinity[1]
+                        )
+                    serving = asyncio.create_task(
+                        launcher("127.0.0.1", port, sockets=[shared[0], affinity[0]])
+                    )
+                    await asyncio.wait_for(waiting.wait(), timeout=5)
+                    if registration_stage == "storage_start_during_drain":
+                        request_task = asyncio.create_task(client.get("/health"))
+                        await asyncio.wait_for(request_entered.wait(), timeout=5)
+                    captured[0].should_exit = True
+                    if request_task is not None:
+                        await asyncio.wait_for(wait_for_launcher_listener_close(), timeout=5)
+                    else:
+                        await asyncio.wait_for(metrics_closing.wait(), timeout=5)
+                    if registration_stage == "affinity_wait":
+                        attached_listener = await asyncio.start_server(
+                            close_connection, sock=affinity[1]
+                        )
+                        _, writer = await connect("127.0.0.1", port + 14)
+                        writer.close()
+                        await writer.wait_closed()
+                    release_registration.set()
+                    await asyncio.wait_for(registration_settled.wait(), timeout=5)
+                    storage.set.assert_not_awaited()
+                    release_request.set()
+                    if request_task is not None:
+                        assert (await request_task).status_code == 200
+                    await asyncio.wait_for(metrics_closing.wait(), timeout=5)
+                    release_metrics.set()
+                    await asyncio.wait_for(serving, timeout=5)
+                    storage.delete.assert_awaited()
+                finally:
+                    release_registration.set()
+                    release_request.set()
+                    release_metrics.set()
+                    for server in captured:
+                        server.should_exit = True
+                    tasks = [task for task in (request_task, serving) if task is not None]
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True), timeout=10
+                    )
+                    if attached_listener is not None:
+                        attached_listener.close()
+                        await attached_listener.wait_closed()
+
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run())
+
+
+def test_attached_frontend_waiting_for_launcher_exits_on_sigterm(
+    frontend_tmp_path: Path,
+) -> None:
     child_code = """
 import asyncio
 import os
@@ -409,11 +763,10 @@ import sys
 from pathlib import Path
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
-async def run():
+async def run() -> None:
     with isolated_serve_env(Path(sys.argv[1])) as env:
         attached = env.build_openai_server(AggConfig(
             multi_frontend_attached=True,
-            env=(("TLLM_FRONTEND_READY_TIMEOUT", "300"),),
         ))
         serving = asyncio.create_task(attached("127.0.0.1", 0))
         await asyncio.sleep(0)
@@ -423,36 +776,37 @@ async def run():
 
 asyncio.run(run())
 """
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory:
-        ipc_dir = Path(directory) / "multi_frontend_ipc"
-        ipc_dir.mkdir()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            listener.bind(str(ipc_dir / "launcher.sock"))
-            listener.listen()
-            read_fd, write_fd = os.pipe()
-            try:
-                child = subprocess.Popen(
-                    [sys.executable, "-c", child_code, directory, str(write_fd)],
-                    pass_fds=(write_fd,),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-            finally:
-                os.close(write_fd)
-            try:
-                with os.fdopen(read_fd, "rb", buffering=0) as ready:
-                    assert select.select([ready], [], [], 120)[0], "child did not reach startup"
-                    assert ready.read(1) == b"R", child.communicate(timeout=5)[1]
-                assert child.poll() is None
-                listener.close()
-                _frontend_processes._terminate_attached_frontends([child])
-                stderr = child.communicate(timeout=5)[1]
-                assert child.returncode == -signal.SIGTERM, stderr
-            finally:
-                if child.poll() is None:
-                    child.kill()
-                child.communicate(timeout=5)
+    directory = frontend_tmp_path
+    ipc_dir = directory / "multi_frontend_ipc"
+    ipc_dir.mkdir()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(ipc_dir / "launcher.sock"))
+        listener.listen()
+        read_fd, write_fd = os.pipe()
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(directory), str(write_fd)],
+                cwd=Path(__file__).resolve().parents[2],
+                pass_fds=(write_fd,),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        finally:
+            os.close(write_fd)
+        try:
+            with os.fdopen(read_fd, "rb", buffering=0) as ready:
+                assert select.select([ready], [], [], 120)[0], "child did not reach startup"
+                assert ready.read(1) == b"R", child.communicate(timeout=5)[1]
+            assert child.poll() is None
+            listener.close()
+            _frontend_processes._terminate_attached_frontends([child])
+            stderr = child.communicate(timeout=5)[1]
+            assert child.returncode == -signal.SIGTERM, stderr
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
 
 
 async def _require_test_authorization(
@@ -467,18 +821,22 @@ async def _require_test_authorization(
 
 def test_attached_frontend_starts_with_authenticated_launcher_health(
     monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
 ) -> None:
     from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 
     servers = _capture_http_servers(monkeypatch)
+    monkeypatch.setattr(
+        openai_server,
+        "AttachedFrontendWatchdog",
+        partial(AttachedFrontendWatchdog, ppid_interval_s=0.01, health_interval_s=0.05),
+    )
     raised_signals = []
     monkeypatch.setattr(signal, "raise_signal", raised_signals.append)
 
     async def run(tmp_path: Path) -> None:
         with isolated_serve_env(tmp_path) as env:
-            attached = env.build_openai_server(
-                AggConfig(multi_frontend_attached=True, env=(("TLLM_FRONTEND_READY_TIMEOUT", "1"),))
-            )
+            attached = env.build_openai_server(AggConfig(multi_frontend_attached=True))
             launcher = FastAPI()
             seen = []
 
@@ -495,20 +853,15 @@ def test_attached_frontend_starts_with_authenticated_launcher_health(
                 app.state.denied_health = 0
                 _apply_fastapi_middlewares(app, [f"{__name__}._require_test_authorization"])
 
-            with (
-                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
-                socket.socket() as frontend_socket,
-            ):
-                listener.bind(str(tmp_path / "multi_frontend_ipc" / "launcher.sock"))
-                listener.listen()
+            async with AsyncExitStack() as stack:
+                frontend_socket = stack.enter_context(socket.socket())
                 frontend_socket.bind(("127.0.0.1", 0))
                 port = frontend_socket.getsockname()[1]
-                launcher_server = uvicorn.Server(
-                    uvicorn.Config(
-                        launcher, http="h11", loop="asyncio", log_config=None, log_level=None
+                await stack.enter_async_context(
+                    _serving_launcher(
+                        launcher, str(tmp_path / "multi_frontend_ipc" / "launcher.sock")
                     )
                 )
-                launcher_task = asyncio.create_task(launcher_server.serve(sockets=[listener]))
                 frontend_task = asyncio.create_task(
                     attached("127.0.0.1", port, sockets=[frontend_socket])
                 )
@@ -521,7 +874,7 @@ def test_attached_frontend_starts_with_authenticated_launcher_health(
                         assert (await client.get("/health")).status_code == 401
                         headers = {"x-test-auth": "allowed"}
                         assert (await client.get("/health", headers=headers)).status_code == 200
-                        await _wait_for(lambda: launcher.state.denied_health >= 4, timeout=30)
+                        await _wait_for(lambda: launcher.state.denied_health >= 1 + 3)
                         assert not raised_signals
                         assert attached._launcher_watchdog_task is not None
                         assert not attached._launcher_watchdog_task.done()
@@ -537,14 +890,9 @@ def test_attached_frontend_starts_with_authenticated_launcher_health(
                     await asyncio.wait_for(
                         asyncio.gather(frontend_task, return_exceptions=True), timeout=10
                     )
-                    launcher_server.should_exit = True
-                    await asyncio.wait_for(launcher_task, timeout=10)
 
-    with (
-        tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory,
-        _isolated_uvicorn_logging(Path(directory)),
-    ):
-        asyncio.run(run(Path(directory)))
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run(frontend_tmp_path))
 
 
 async def _delay_test_health(
@@ -557,6 +905,7 @@ async def _delay_test_health(
 
 def test_attached_frontend_starts_with_slow_launcher_health(
     monkeypatch: pytest.MonkeyPatch,
+    frontend_tmp_path: Path,
 ) -> None:
     from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 
@@ -564,9 +913,7 @@ def test_attached_frontend_starts_with_slow_launcher_health(
 
     async def run(tmp_path: Path) -> None:
         with isolated_serve_env(tmp_path) as env:
-            attached = env.build_openai_server(
-                AggConfig(multi_frontend_attached=True, env=(("TLLM_FRONTEND_READY_TIMEOUT", "5"),))
-            )
+            attached = env.build_openai_server(AggConfig(multi_frontend_attached=True))
             launcher = FastAPI()
             health_responses = []
 
@@ -576,21 +923,12 @@ def test_attached_frontend_starts_with_slow_launcher_health(
                 return {}
 
             _apply_fastapi_middlewares(launcher, [f"{__name__}._delay_test_health"])
-            with (
-                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
-                socket.socket() as frontend_socket,
-            ):
+            async with AsyncExitStack() as stack:
+                frontend_socket = stack.enter_context(socket.socket())
                 path = str(tmp_path / "multi_frontend_ipc" / "launcher.sock")
-                listener.bind(path)
-                listener.listen()
                 frontend_socket.bind(("127.0.0.1", 0))
                 port = frontend_socket.getsockname()[1]
-                launcher_server = uvicorn.Server(
-                    uvicorn.Config(
-                        launcher, http="h11", loop="asyncio", log_config=None, log_level=None
-                    )
-                )
-                launcher_task = asyncio.create_task(launcher_server.serve(sockets=[listener]))
+                launcher_server = await stack.enter_async_context(_serving_launcher(launcher, path))
                 frontend_task = None
                 forwarder = LauncherForwarder(path)
                 try:
@@ -613,15 +951,10 @@ def test_attached_frontend_starts_with_slow_launcher_health(
                         await asyncio.wait_for(
                             asyncio.gather(frontend_task, return_exceptions=True), timeout=10
                         )
-                    launcher_server.should_exit = True
-                    await asyncio.wait_for(launcher_task, timeout=10)
                     await forwarder.close()
 
-    with (
-        tempfile.TemporaryDirectory(dir="/tmp", prefix="tllm-mf-") as directory,
-        _isolated_uvicorn_logging(Path(directory)),
-    ):
-        asyncio.run(run(Path(directory)))
+    with _isolated_uvicorn_logging(frontend_tmp_path):
+        asyncio.run(run(frontend_tmp_path))
 
 
 def test_readiness_wait_notices_a_gone_launcher_process(tmp_path: Path) -> None:
@@ -630,7 +963,7 @@ def test_readiness_wait_notices_a_gone_launcher_process(tmp_path: Path) -> None:
         watchdog = AttachedFrontendWatchdog(forwarder, -1, lambda error: None)
         try:
             with pytest.raises(RuntimeError, match="exited during startup"):
-                await asyncio.wait_for(watchdog.wait_until_ready(300), timeout=5)
+                await asyncio.wait_for(watchdog.wait_until_ready(), timeout=5)
         finally:
             await forwarder.close()
 
@@ -652,7 +985,7 @@ def test_watchdog_remembers_the_successful_startup_health_probe(tmp_path: Path) 
             health_failures=2,
         )
         try:
-            await watchdog.wait_until_ready(5)
+            await watchdog.wait_until_ready()
             launcher.health_status = 503
             await asyncio.wait_for(watchdog.run(), timeout=5)
         finally:
@@ -689,8 +1022,7 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
         task = asyncio.create_task(watchdog.run())
         launcher = None
         try:
-            # Startup probes can fail before the launcher answers; failures
-            # only count after its first successful response.
+            # Neither refused probes nor 503s count until /health returned 200 once.
             await asyncio.sleep(0.5)
             launcher = await asyncio.to_thread(_FakeLauncher, path, 503)
             await _wait_for(lambda: launcher.health_hits >= 3)
