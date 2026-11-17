@@ -112,7 +112,6 @@ l0_gr100:
   # there is a multi-GPU GR100 stage. Its cpu_only cases are in l0_cpu.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_common
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_fp4_mla
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_helix
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_kda
