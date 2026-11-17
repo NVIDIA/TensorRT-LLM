@@ -199,6 +199,45 @@ classes are fine when they make the code clearer or faster. The
 its [weight loader](models/gpt_oss/gpt_oss_120b__sm_10x__default/weights.py)
 are a small example.
 
+## Multimodal targets
+
+A vision-language architecture routes to one of two kinds of target.
+
+**A multimodal wrapper** runs media through the shared multimodal runtime. It is
+`MultimodalModelMixin` plus `PreTrainedModel`, as Modeling V1 vision-language
+models are, and holds:
+
+* `llm`: a language model target, built on a copy of the `ModelConfig` with the
+  text config only. `language_model` returns it.
+* `mm_encoder`: the tower, an `nn.Module` and `MultimodalEncoderMixin` that
+  declares and loads its own weights. It is None with `disable_mm_encoder`.
+
+The wrapper sets `model_config` to the engine's `ModelConfig`, which ends with
+the text config, and defines what the runtime reads that the mixin cannot
+supply: `encode_multimodal_inputs` (rows in request order), `dtype`,
+`validate_request` and `validate_multimodal_request_data`. It forwards what the
+engine reads off the routed model (`lm_head`, `spec_worker`, `draft_model`,
+`draft_config`, `multimodal_token_ids`) to `llm`, and compiles only `llm.model`
+(`apply_llm_torch_compile`). In `forward`, the mixin's `prepare_multimodal_rows`
+selects the requests, runs or reuses the encoder and keeps the current chunk's
+rows. How the rows reach the language model is the target's choice: the
+[qwen4_exp target](models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/modeling.py)
+keeps `input_ids` and writes the rows at `mm_token_indices` in its prefill step;
+another target may take fused `inputs_embeds` from `prepare_multimodal_inputs`.
+
+**A text-only target** serves the text half of the checkpoint. It defines
+`validate_multimodal_request_data` and raises when
+`tensorrt_llm.inputs.multimodal.has_media_or_embeddings` is true, so a request
+with media fails alone at admission instead of failing its batch in `forward`.
+M-RoPE positions alone, as a disaggregated generation request carries, are not
+media.
+
+With `disable_mm_encoder` a wrapper builds no tower, declares and loads no
+vision weights, and refuses media like a text-only target. The breakable prefill
+CUDA graph is refused at startup for a model with a local tower; with
+`disable_mm_encoder` it runs the language model as for text.
+`test_modeling_v2_contracts.py` checks both kinds from the source.
+
 ## Routing
 
 Each family's `routing.py` defines one `route` function, registered with

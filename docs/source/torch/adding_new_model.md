@@ -165,6 +165,9 @@ and graph integration. Processor prompt expansion and disaggregated transport
 retain their existing interfaces; implementing this Protocol does not enable a
 new model, modality, encoder backend, or E/P path by itself.
 
+A Modeling V2 vision-language target follows the same contract; see "Multimodal
+targets" in `tensorrt_llm/_torch/modeling_v2/README.md`.
+
 ### Weight Loading
 
 The base class `DecoderModelForCausalLM` provides a `load_weights` method that loads the weights from the checkpoint file and assigns them to the corresponding layers in the model. However, if the default method does not work for `MyModelForCausalLM`, you need to implement your own `load_weights`:
