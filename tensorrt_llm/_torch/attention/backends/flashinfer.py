@@ -2830,6 +2830,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             window_left = (attention_window_size
                            if attention_window_size is not None else -1)
 
+            # Triton indexes cached K/V as HND. Transpose only its view;
+            # FlashInfer append/decode retain the metadata's original layout.
+            triton_kv_cache = (kv_cache.transpose(2, 3)
+                               if metadata.kv_layout == "NHD" else kv_cache)
+
             triton_prefill_with_custom_mask(
                 q=q[:num_ctx_tokens],
                 k=k[:num_ctx_tokens],
@@ -2837,7 +2842,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 output=output[:num_ctx_tokens].view(-1, self.num_heads,
                                                     self.head_dim),
                 qo_indptr=metadata.qo_indptr[:num_contexts + 1],
-                kv_cache=kv_cache,
+                kv_cache=triton_kv_cache,
                 prefix_lens=prefix_lens,
                 page_table_indptr=metadata.
                 paged_kv_indptr_prefill[:num_contexts + 1],

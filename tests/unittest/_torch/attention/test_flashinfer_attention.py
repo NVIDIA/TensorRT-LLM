@@ -28,6 +28,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 
@@ -967,6 +969,16 @@ class TestFlashInferAttention(unittest.TestCase):
                                      device=device,
                                      dtype=torch.int32)
             starts = (positions - window + 1).clamp_min(0)
+            nhd_metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=attn_metadata.seq_lens,
+                num_contexts=1,
+                kv_cache_params=attn_metadata.kv_cache_params,
+                max_num_requests=2,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=[1, 3],
+                kv_layout="NHD")
+            nhd_metadata.prepare()
             for attn_layer_idx, flashinfer_attn in enumerate(layers):
                 context_qs, context_ks, context_vs = contexts_per_layer[
                     attn_layer_idx]
@@ -991,6 +1003,61 @@ class TestFlashInferAttention(unittest.TestCase):
                                            atol=1e-2,
                                            rtol=1e-2)
                 torch.testing.assert_close(actual[length:], reference[length:])
+
+                # The same cached-prefix mixed batch must work in NHD as well.
+                # Preserve logical values while changing the physical layout.
+                hnd_cache = kv_cache_manager.get_buffers(
+                    flashinfer_attn.layer_idx, kv_layout="HND").clone()
+                kv_cache_manager.get_buffers(flashinfer_attn.layer_idx,
+                                             kv_layout="NHD").copy_(
+                                                 hnd_cache.transpose(2, 3))
+                nhd_reference = flashinfer_attn.forward(
+                    q, k, v, nhd_metadata, attention_window_size=window)
+                torch.testing.assert_close(nhd_reference, reference)
+                nhd_actual = flashinfer_attn.forward(
+                    q,
+                    k,
+                    v,
+                    nhd_metadata,
+                    attention_window_size=window,
+                    variable_window_token_starts=starts,
+                    variable_window_token_ends=positions)
+                torch.testing.assert_close(nhd_actual[:length],
+                                           reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(nhd_actual[length:],
+                                           reference[length:])
+
+                # Reuse the backend instance to exercise its request-time probe.
+                for owner, attribute, value in (
+                    (flashinfer_attn, "flashinfer_backend", "trtllm-gen"),
+                    (flashinfer_attn, "is_mla_enable", True),
+                    (attn_metadata, "kv_cache_manager", None),
+                ):
+                    with mock.patch.object(owner, attribute, value):
+                        self.assertFalse(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata))
+                with mock.patch.object(type(attn_metadata),
+                                       "num_contexts",
+                                       new_callable=mock.PropertyMock,
+                                       return_value=0):
+                    self.assertFalse(
+                        flashinfer_attn.supports_variable_window(attn_metadata))
+                self.assertFalse(
+                    flashinfer_attn.supports_variable_window(SimpleNamespace()))
+                quant_config = flashinfer_attn.quant_config
+                try:
+                    for config, expected in ((None, True), (QuantConfig(
+                            kv_cache_quant_algo=QuantAlgo.FP8), False), (None,
+                                                                         True)):
+                        flashinfer_attn.update_quant_config(config)
+                        self.assertEqual(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata), expected)
+                finally:
+                    flashinfer_attn.update_quant_config(quant_config)
 
         finally:
             kv_cache_manager.shutdown()

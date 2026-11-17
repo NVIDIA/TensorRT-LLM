@@ -21,7 +21,9 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
-from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
+from tensorrt_llm._torch.models.modeling_gemma3 import (
+    _MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS, Gemma3ForCausalLM,
+    _use_compact_image_mask_for_lengths)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -373,7 +375,8 @@ class TestGemma3(unittest.TestCase):
                 dense = gemma3.forward(input_ids=input_ids,
                                        position_ids=position_ids,
                                        attn_metadata=attn_metadata,
-                                       image_token_mask=image_token_mask)
+                                       image_token_mask=image_token_mask,
+                                       return_context_logits=True)
                 with patch(
                         "tensorrt_llm._torch.models.modeling_gemma3._MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS",
                         1), patch.object(
@@ -383,7 +386,8 @@ class TestGemma3(unittest.TestCase):
                     compact = gemma3.forward(input_ids=input_ids,
                                              position_ids=position_ids,
                                              attn_metadata=attn_metadata,
-                                             image_token_mask=image_token_mask)
+                                             image_token_mask=image_token_mask,
+                                             return_context_logits=True)
                 # Reuse this model test's multilayer BF16 comparison policy.
                 self._assert_most_elems_close(actual_value=compact,
                                               ref_value=dense,
@@ -440,6 +444,12 @@ class TestGemma3(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     def test_gemma3_attention_mask(self):
+        # Check the real routing boundary before constructing this test's model.
+        self.assertEqual(_MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS, 8192)
+        for lengths, expected in (([], False), ([0], False), ([8191], False),
+                                  ([8192], True), ([8192, 1], False)):
+            self.assertEqual(_use_compact_image_mask_for_lengths(lengths),
+                             expected)
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
         gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
