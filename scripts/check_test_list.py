@@ -941,7 +941,7 @@ def list_test_db_names(test_db_path: str) -> list[str]:
     Raises ValueError on input the test-db scheduler rejects: duplicate mapping
     keys, a missing or unsupported version, a context defined in more than one
     file, a context or block of the wrong type, or a block without a
-    'condition' or a 'tests' list.
+    'condition' mapping or a 'tests' list.
     """
     # Imported here so --validate runs without PyYAML (pre-commit uses system python).
     import yaml
@@ -991,6 +991,10 @@ def list_test_db_names(test_db_path: str) -> list[str]:
                 if "condition" not in block:
                     raise ValueError(
                         f"{path}: context {context!r} has a block without 'condition'"
+                    )
+                if not isinstance(block["condition"], dict):
+                    raise ValueError(
+                        f"{path}: context {context!r} has a block whose 'condition' is not a mapping"
                     )
                 if not isinstance(block.get("tests"), list):
                     raise ValueError(
