@@ -592,7 +592,8 @@ def _run_fused_gdn_conv_post_conv(
     ba = torch.randn(num_tokens, 2 * num_v_heads, **bf16)
     mixed_qkv = projected[:, :qkv_dim]
     weight = torch.randn(qkv_dim, width, **bf16) * 0.5
-    bias = torch.randn(qkv_dim, **bf16) * 0.1 if has_bias else None
+    # A strided bias view: the op must read it by its logical layout.
+    bias = (torch.randn(2 * qkv_dim, **bf16) * 0.1)[::2] if has_bias else None
     pool = torch.randn(num_slots, qkv_dim * (width - 1) + slot_padding, **bf16) * 0.5
     expected_pool = pool.clone()
     conv_states, expected_states = (

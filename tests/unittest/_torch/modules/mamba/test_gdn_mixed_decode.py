@@ -392,7 +392,7 @@ def _extend_fused_and_unfused(
     """forward_extend on one batch with fused_gdn_conv_post_conv enabled and disabled.
 
     Returns (output, conv states, SSM states, intermediate conv windows, calls of
-    fused_gdn_conv_post_conv) of each run.
+    fused_gdn_conv_post_conv, intermediate SSM states) of each run.
     """
     torch.manual_seed(42)
     layer = _make_layer()
@@ -447,7 +447,15 @@ def _extend_fused_and_unfused(
                 **kwargs,
             )
         intermediate_conv = run_kwargs.get("intermediate_conv_states")
-        return out, conv_states, ssm_states, intermediate_conv, fused_call.call_count
+        intermediate_ssm = run_kwargs.get("intermediate_ssm_states")
+        return (
+            out,
+            conv_states,
+            ssm_states,
+            intermediate_conv,
+            fused_call.call_count,
+            intermediate_ssm,
+        )
 
     return run(True), run(False)
 
@@ -513,3 +521,6 @@ def test_fused_conv_post_conv_matches_unfused_target_verify(
     assert torch.equal(fused[1], unfused[1])
     torch.testing.assert_close(fused[2], unfused[2], rtol=1e-2, atol=1e-2)
     assert torch.equal(fused[3], unfused[3])
+    # The verify steps of the decode rows write their SSM states here.
+    assert fused[5].abs().amax() > 0
+    assert torch.equal(fused[5], unfused[5])

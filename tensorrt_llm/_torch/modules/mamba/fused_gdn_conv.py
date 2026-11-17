@@ -413,7 +413,7 @@ def fused_gdn_conv_post_conv(
 
     # Triton requires a tensor for every pointer argument; HAS_BIAS compiles out the accesses
     # through this stand-in.
-    bias_input = weight if bias is None else bias
+    bias_input = weight if bias is None else bias.contiguous()
     num_heads = 2 * num_k_heads + num_v_heads
     block_d = triton.next_power_of_2(max(head_k_dim, head_v_dim))
     block_t = 16
