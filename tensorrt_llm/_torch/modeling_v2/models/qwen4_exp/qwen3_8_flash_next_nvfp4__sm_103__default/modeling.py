@@ -428,6 +428,7 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -1199,7 +1200,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # device-address view that owns none of those pages.
         self._ple_table_host = None
 
-        # ---- the vision half (the weight table declares the tower) ---------
+        # ---- the vision half (the tower declares its own weights) ----------
         vcfg = getattr(composite_config, "vision_config", None)
         assert vcfg is not None, "the composite config carries no vision_config"
         self.vision_config = vcfg
@@ -6994,8 +6995,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
         # init).
         self._mm_token_ids_value = (self.model.image_token_id, self.model.video_token_id)
         self._mm_token_ids_cache: torch.Tensor | None = None
-        # Replicated on every rank; built once the weights are real (`post_load_weights`).
-        self.vision_tower: _vision.VisionTower | None = None
+        # Replicated on every rank. None with `disable_mm_encoder`: then no vision weight is
+        # declared or loaded and a media request is refused at admission.
+        self.vision_tower: _vision.VisionTower | None = (
+            None
+            if model_config.disable_mm_encoder
+            else _vision.VisionTower(self.model.vision_config, model_config.torch_dtype)
+        )
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
@@ -7015,8 +7021,19 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
     def validate_request(self, request) -> None:
         """Admission check, run by the executor on every new request: a media request the
         vision tower would assert on fails here as its own error (`vision.validate_request`);
-        a text request returns at once."""
-        _vision.validate_request(self.vision_tower, request)
+        a text request returns at once. Without a tower `validate_multimodal_request_data`
+        refuses media instead."""
+        if self.vision_tower is not None:
+            _vision.validate_request(self.vision_tower, request)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: with `disable_mm_encoder` the target serves text only, so a
+        request with media or embeddings fails alone. M-RoPE positions alone pass."""
+        if self.vision_tower is None and has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} runs with disable_mm_encoder and serves text only; "
+                "send no images, videos or embeddings"
+            )
 
     def forward(
         self,
@@ -7113,12 +7130,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)
+        if self.vision_tower is not None:
+            self.vision_tower.load_weights(weights)
 
     def post_load_weights(self):
+        # The engine's post-load walk calls the vision tower's own hook.
         super().post_load_weights()
         self.model.post_load_weights()
-        self.vision_tower = _vision.VisionTower(self.model.w, self.model.vision_config)
-        self.vision_tower.warm_up()
         if self.one_rank:
             self._build_heads(self.lm_head.weight.data)
 

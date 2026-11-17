@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.configs import Qwen4ExpVisionConfig
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
@@ -23,9 +24,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     vision as V,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
-    weights as W,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -57,28 +55,12 @@ HIDDEN_OUT = 2560
 
 
 def _tower_over_the_weight_table() -> V.VisionTower:
-    """The tower over every `vis_*` weight the table declares, at the checkpoint's shapes,
-    on meta; `embed` stands in for the activation dtype the tower reads off it."""
-    vcfg = Qwen4ExpVisionConfig(**_VISION)
-    d = SimpleNamespace(
-        hidden=HIDDEN_OUT,
-        dtype=torch.bfloat16,
-        v_depth=vcfg.depth,
-        v_hidden=vcfg.hidden_size,
-        v_inter=vcfg.intermediate_size,
-        v_channels=vcfg.in_channels,
-        v_tpatch=vcfg.temporal_patch_size,
-        v_patch=vcfg.patch_size,
-        v_pos_rows=vcfg.num_position_embeddings,
-        v_merge_dim=vcfg.hidden_size * vcfg.spatial_merge_size**2,
-    )
-    w = {"embed": torch.empty(8, HIDDEN_OUT, dtype=torch.bfloat16, device="meta")}
-    for entry in W.MODEL_WEIGHTS.WEIGHTS:
-        if not entry.name.startswith("vis_"):
-            continue
-        for key, _, _ in W.MODEL_WEIGHTS._targets(entry, d):
-            w[key] = torch.empty(*entry.shape(d), dtype=entry.dtype or d.dtype, device="meta")
-    return V.VisionTower(w, vcfg)
+    """The tower at the checkpoint's shapes, on meta: it declares its own `vis_*` table
+    (`weights.VISION_WEIGHTS`), and the views are what `post_load_weights` builds."""
+    with torch.device("meta"):
+        tower = V.VisionTower(Qwen4ExpVisionConfig(**_VISION), torch.bfloat16)
+    tower._w = V._vision_views(tower.w, tower.depth)
+    return tower
 
 
 def test_the_tower_reads_the_weight_tables_vision_rows_at_the_ops_layouts():
@@ -212,6 +194,7 @@ def _stub_tower(monkeypatch, cap):
     the request."""
     monkeypatch.setattr(V, "VISION_CALL_MAX_PATCHES", cap)
     tower = object.__new__(V.VisionTower)
+    nn.Module.__init__(tower)
     tower.dtype = torch.float32
     tower.pixel_width = PIXEL_WIDTH
     tower.merge = MERGE
@@ -572,3 +555,25 @@ def test_the_placeholder_count_is_the_sum_over_both_modalities():
         _admit(request)
     del request.py_multimodal_data["multimodal_embed_mask_cumsum"]
     _admit(request)
+
+
+def test_without_a_tower_media_is_refused_and_mrope_positions_pass():
+    """With `disable_mm_encoder` the shell builds no tower: a media request fails at
+    admission as its own error, and an M-RoPE-only payload (a disaggregated generation
+    request) passes. With a tower the geometry check owns media requests."""
+    no_tower = SimpleNamespace(vision_tower=None)
+    request = _request(image=IMAGES)
+    # No geometry check without a tower: it would read the tower's geometry.
+    Shell.validate_request(no_tower, request)
+    with pytest.raises(ValueError, match="disable_mm_encoder and serves text only"):
+        Shell.validate_multimodal_request_data(no_tower, request.py_multimodal_data)
+    with pytest.raises(ValueError, match="serves text only"):
+        Shell.validate_multimodal_request_data(
+            no_tower, {"multimodal_embedding": torch.zeros(4, HIDDEN)}
+        )
+    mrope_only = {"mrope_config": {"mrope_position_deltas": torch.zeros(1, 1)}}
+    Shell.validate_request(no_tower, SimpleNamespace(py_multimodal_data=mrope_only))
+    Shell.validate_multimodal_request_data(no_tower, mrope_only)
+    Shell.validate_multimodal_request_data(
+        SimpleNamespace(vision_tower=_GEOMETRY), request.py_multimodal_data
+    )

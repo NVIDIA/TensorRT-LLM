@@ -4,21 +4,16 @@
 `post_load_weights` runs, a media request of any grid compiles no Triton kernel.
 
 The tower is one block deep (the block's kernels are every block's) over random weights at the
-checkpoint's shapes, built from the weight table's own `vis_*` declarations.
+checkpoint's shapes, declared by the tower itself (`weights.VISION_WEIGHTS`).
 """
 
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 import torch
 
 from tensorrt_llm._torch.configs import Qwen4ExpVisionConfig
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     vision as V,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
-    weights as W,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.vision_rope_2d_packed_qk import (  # noqa: E501
     _rotary_neox_inplace_kernel,
@@ -58,27 +53,13 @@ _KERNELS = {
 
 def _tower() -> V.VisionTower:
     vcfg = Qwen4ExpVisionConfig(**_VISION)
-    d = SimpleNamespace(
-        hidden=HIDDEN_OUT,
-        dtype=torch.bfloat16,
-        v_depth=vcfg.depth,
-        v_hidden=vcfg.hidden_size,
-        v_inter=vcfg.intermediate_size,
-        v_channels=vcfg.in_channels,
-        v_tpatch=vcfg.temporal_patch_size,
-        v_patch=vcfg.patch_size,
-        v_pos_rows=vcfg.num_position_embeddings,
-        v_merge_dim=vcfg.hidden_size * vcfg.spatial_merge_size**2,
-    )
+    with torch.device("cuda"):
+        tower = V.VisionTower(vcfg, torch.bfloat16)
     gen = torch.Generator(device="cuda").manual_seed(7)
-    w = {"embed": torch.empty(8, HIDDEN_OUT, dtype=torch.bfloat16, device="cuda")}
-    for entry in W.MODEL_WEIGHTS.WEIGHTS:
-        if not entry.name.startswith("vis_"):
-            continue
-        for key, _, _ in W.MODEL_WEIGHTS._targets(entry, d):
-            shape, dtype = entry.shape(d), entry.dtype or d.dtype
-            w[key] = (torch.randn(*shape, generator=gen, device="cuda") * 0.02).to(dtype)
-    return V.VisionTower(w, vcfg)
+    for param in tower.w.values():
+        param.data.copy_(torch.randn(param.shape, generator=gen, device="cuda") * 0.02)
+    tower._w = V._vision_views(tower.w, tower.depth)
+    return tower
 
 
 def _variants() -> dict:

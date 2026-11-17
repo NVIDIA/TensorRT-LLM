@@ -40,6 +40,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     pool as P,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+    vision as V,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     weights as WT,
 )
 from tensorrt_llm.mapping import Mapping
@@ -123,10 +126,9 @@ def _mapping(member: str, rank: int) -> Mapping:
 
 
 def _dims(configs, member: str, rank: int, mtp: bool = True, prefill_copy: bool = False):
-    text, vision = configs
+    text, _ = configs
     return WT.rank_dims(
         text,
-        vision,
         _mapping(member, rank),
         mtp_enabled=mtp,
         trunk_moe_backend="TRTLLM",
@@ -159,6 +161,10 @@ def _rank_manifest(stored, d, member: str) -> dict[str, list[tuple]]:
     cut, pad = WT.lm_head_share(_lm_head_rows(member, d.vocab), d.vocab, d.tp_rank)
     manifest["lm_head.weight"] = [("lm_head.weight", None, cut, pad)]
     return manifest
+
+
+def _vision_dims(configs):
+    return WT.vision_dims(configs[1], torch.bfloat16)
 
 
 def _keys_and_cuts(ckpt_key, cut):
@@ -245,6 +251,10 @@ def test_every_checkpoint_tensor_is_claimed(stored, configs, member, mtp):
             f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
         read_by.update(claimed)
+        # The tower's own table reads the `model.visual.` keys the language table leaves.
+        vision_claimed = _claimed(WT.VISION_WEIGHTS.manifest(_vision_dims(configs)))
+        assert vision_claimed == {k for k in everything if k.startswith("model.visual.")}
+        read_by.update(vision_claimed)
 
     mtp_keys = set() if mtp else {k for k in everything if k.startswith("mtp.")}
     assert set(read_by) == everything - mtp_keys, "tensors no rank reads: " + str(
@@ -270,8 +280,11 @@ def test_rank_operands_have_their_parameter_shapes(stored, configs, member, rank
     fills its parameter exactly; the rank reads each tensor at its share, and once per
     layout it is kept in (the routed experts twice with the CuteDSL prefill copy)."""
     d = _dims(configs, member, rank, mtp=True, prefill_copy=prefill_copy)
+    vd = _vision_dims(configs)
     with torch.device("meta"):
         params = dict(WT.MODEL_WEIGHTS.declare(d))
+        # The vision tower's table, which every rank declares whole.
+        params.update(WT.VISION_WEIGHTS.declare(vd))
         # What `load` adds beside the table: the n-gram table and the shell's lm_head.
         params["ple_table"] = torch.empty(
             d.ple_shards * _rows_per_shard(stored, d), d.ple_head_dim, dtype=d.ple_table_dtype
@@ -281,6 +294,7 @@ def test_rank_operands_have_their_parameter_shapes(stored, configs, member, rank
         )
     entries = {key: _HeaderEntry(*spec) for key, spec in stored.items()}
     manifest = _rank_manifest(stored, d, member)
+    manifest.update(WT.VISION_WEIGHTS.manifest(vd))
     assert manifest.keys() == params.keys()
 
     read = collections.Counter()
@@ -485,6 +499,9 @@ def test_load_fills_every_parameter_and_covers_the_checkpoint(
     model = _stub_model(configs, member, rank, mtp)
     WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
     assert tuple(model.model.w["ple_table"].shape) == (320_001_536, 160)
+    with torch.device("meta"):
+        tower = V.VisionTower(configs[1], torch.bfloat16)
+    tower.load_weights(_meta_checkpoint(stored))
 
 
 # --------------------------------------------------- the cuts pick the heads --
@@ -746,6 +763,7 @@ def test_dep2_ranks_read_the_checkpoint_in_two_256_expert_windows(stored, config
             f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
         read_by.update(claimed)
+        read_by.update(_claimed(WT.VISION_WEIGHTS.manifest(_vision_dims(configs))))
 
         dep4 = _dims(configs, "dep4", rank, mtp=False)
         non_expert = {k for k in claimed if not _TRUNK_EXPERT_TENSOR.match(k)}
@@ -797,3 +815,93 @@ def test_dep2_load_fills_every_parameter_and_covers_the_checkpoint(stored, confi
     model = _stub_model(configs, "dep2", 1, False)
     WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
     assert model.lm_head.weight.shape[0] == 248320
+
+
+# ------------------------------------------------------- the vision table --
+
+#: Every vision-tower weight, as the language table declared them before the tower took
+#: its own table: the split loses none.
+_VISION_ENTRIES = {
+    "vis_patch_w", "vis_patch_b", "vis_pos",
+    "vis_n1_w", "vis_n1_b", "vis_qkv_w", "vis_qkv_b", "vis_proj_w", "vis_proj_b",
+    "vis_n2_w", "vis_n2_b", "vis_fc1_w", "vis_fc1_b", "vis_fc2_w", "vis_fc2_b",
+    "vis_m_n_w", "vis_m_n_b", "vis_m_fc1_w", "vis_m_fc1_b", "vis_m_fc2_w", "vis_m_fc2_b",
+}  # fmt: skip
+
+#: A small vision config: two blocks, every width shrunk.
+_SMALL_VISION = SimpleNamespace(
+    depth=2,
+    hidden_size=8,
+    num_heads=2,
+    intermediate_size=12,
+    in_channels=3,
+    temporal_patch_size=2,
+    patch_size=2,
+    num_position_embeddings=16,
+    spatial_merge_size=2,
+    out_hidden_size=6,
+)
+
+
+def test_the_vision_weights_are_a_table_of_their_own():
+    """The language table declares no vision weight, so `disable_mm_encoder` allocates
+    none; the tower's table declares exactly the entries the language table had."""
+    assert not [e.name for e in WT.MODEL_WEIGHTS.WEIGHTS if e.name.startswith("vis_")]
+    assert {e.name for e in WT.VISION_WEIGHTS.WEIGHTS} == _VISION_ENTRIES
+
+
+@pytest.mark.parametrize("mtp", [False, True], ids=["no-mtp", "mtp"])
+def test_the_language_table_leaves_every_vision_key(mtp):
+    d = SimpleNamespace(
+        num_layers=1,
+        num_experts=2,
+        expert_offset=0,
+        local_experts=2,
+        mtp_enabled=mtp,
+        mtp_expert_offset=0,
+        mtp_local_experts=2,
+    )
+    keys = {
+        "model.visual.patch_embed.proj.weight",
+        "model.visual.blocks.0.norm1.weight",
+        "model.visual.merger.linear_fc2.bias",
+        "model.language_model.embed_tokens.weight",
+        "mtp.fc_hidden.weight",
+    }
+    unread = WT.MODEL_WEIGHTS.expected_unconsumed(d, keys)
+    assert {k for k in unread if not k.startswith("mtp.")} == {
+        k for k in keys if k.startswith("model.visual.")
+    }
+
+
+def _small_vision_checkpoint(tower) -> dict:
+    """One distinct tensor per key the tower's table reads, at its declared shape."""
+    checkpoint = {}
+    for value, (key, sources) in enumerate(WT.VISION_WEIGHTS.manifest(tower.dims).items(), 1):
+        ((ckpt_key, index, cut, transform),) = sources
+        assert index is None and cut is None and transform is None, ckpt_key
+        param = tower.w[key]
+        checkpoint[ckpt_key] = torch.full(param.shape, float(value), dtype=param.dtype)
+    return checkpoint
+
+
+def test_the_tower_loads_its_table_and_covers_the_vision_keys():
+    """The tower module declares its table at a small config, `load_weights` fills every
+    parameter from `model.visual.` keys and reads them all, and the language model's keys
+    are not its to read. An unknown or missing vision key fails the load."""
+    tower = V.VisionTower(_SMALL_VISION, torch.float32)
+    # Twelve entries per block, at two blocks.
+    assert sum(k.startswith(("l0_", "l1_")) for k in tower.w) == 24
+    checkpoint = _small_vision_checkpoint(tower)
+    assert tuple(tower.w["vis_m_fc2_w"].shape) == (6, 32)
+    tower.load_weights({**checkpoint, "model.language_model.embed_tokens.weight": None})
+    manifest = WT.VISION_WEIGHTS.manifest(tower.dims)
+    for key, param in tower.w.items():
+        assert torch.equal(param.data, checkpoint[manifest[key][0][0]]), key
+
+    with pytest.raises(AssertionError, match="vision checkpoint coverage"):
+        tower.load_weights({**checkpoint, "model.visual.extra.weight": torch.zeros(1)})
+    missing = dict(checkpoint)
+    del missing["model.visual.pos_embed.weight"]
+    with pytest.raises(AssertionError, match="checkpoint key missing"):
+        tower.load_weights(missing)
