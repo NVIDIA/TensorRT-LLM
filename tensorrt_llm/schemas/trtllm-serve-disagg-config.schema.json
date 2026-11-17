@@ -5769,7 +5769,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). With dtype='fp8_ds_mla' it requires kv_pool_rebalance_config.copy_based_rebalancing. This option is incompatible with CSA2 sparse attention. Disaggregated serving: a server rebalances after draining its in-flight KV transfers (a drain that does not finish in time skips the rebalance and backs off). Without kv_pool_rebalance_config.copy_based_rebalancing, a server is vetoed for good, on every rank, once it registers with a context peer (it receives KV, so a peer holds its pool layout), which turns rebalancing off on generation servers in practice, and once a peer on another node registers unless ``kv_pool_rebalance_config.allow_cross_node_disagg`` is set. With copy-based rebalancing the pool layout and its registration never change, so neither veto applies. Transceivers that cannot support it (e.g. pipelined transfer) refuse rebalancing.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -6206,6 +6206,13 @@
       "additionalProperties": false,
       "description": "Tuning for the KV cache manager v2 pool rebalance auto-tuner.\n\nOnly used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.",
       "properties": {
+        "allow_cross_node_disagg": {
+          "default": false,
+          "description": "Disaggregated context servers: keep rebalancing after a KV transfer peer is found on another node. Rebalancing there is validated for intra-node transfers only, so by default it is switched off on every rank once a peer on another host registers.",
+          "status": "prototype",
+          "title": "Allow Cross Node Disagg",
+          "type": "boolean"
+        },
         "check_interval": {
           "default": 10,
           "description": "Number of PyExecutor iterations between checks of whether a pool rebalance should be attempted.",
@@ -6221,6 +6228,27 @@
           "status": "prototype",
           "title": "Cooldown Secs",
           "type": "number"
+        },
+        "copy_based_rebalancing": {
+          "default": false,
+          "description": "Copy-based rebalancing (CoReba). The GPU KV cache becomes one arena mapped once at startup; every pool group addresses it from the same base pointer with block indices relative to the arena. A rebalance moves the pool boundaries in proportion to the new ratios and copies blocks out of the parts that change owner, instead of remapping memory. With a host cache tier, the host quota is one arena as well, registered once. A pool group with several pools gives each pool its own window and block ids, which the model's cache manager must translate (DeepSeek-V4 does; other models with such pool groups are rejected). The GPU and host quotas are fixed after startup. With sparse attention KV cache offload (sparse_attention_config.enable_kv_cache_offload), pool groups holding offloaded history keep their initial size beside the arena, and the other pool groups are rebalanced.",
+          "status": "prototype",
+          "title": "Copy Based Rebalancing",
+          "type": "boolean"
+        },
+        "drop_unreferenced_on_rebalance": {
+          "default": false,
+          "description": "With copy_based_rebalancing: drop, rather than copy, blocks that must move during a rebalance and that no request references (cached reusable blocks).",
+          "status": "prototype",
+          "title": "Drop Unreferenced On Rebalance",
+          "type": "boolean"
+        },
+        "in_place_relocation": {
+          "default": false,
+          "description": "With copy_based_rebalancing: rebalance without suspending running requests. Their blocks are copied on the GPU between iterations and their block indices rewritten in place, SWA scratch slots included.",
+          "status": "prototype",
+          "title": "In Place Relocation",
+          "type": "boolean"
         },
         "min_sampled_kv_caches": {
           "default": 2000,
