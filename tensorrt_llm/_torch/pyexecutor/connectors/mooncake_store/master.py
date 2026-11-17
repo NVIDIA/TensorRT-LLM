@@ -423,6 +423,14 @@ def _client_config(
         "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "staging_buffer_bytes": parse_size(pool.staging_buffer_bytes, strict_units=True),
+        "async_load": pool.async_load,
+        "async_load_workers": pool.async_load_workers,
+        "group_blocks": pool.group_blocks,
+        # Omitted when off, which is what a reader that does not know the key
+        # assumes too.
+        **({"soft_pin_ttl_ms": pool.soft_pin_ttl_ms} if pool.soft_pin_ttl_ms is not None else {}),
+        **({"stats_interval": pool.stats_interval} if pool.stats_interval is not None else {}),
     }
     return config
 
@@ -482,6 +490,8 @@ def _launch_master(
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
     ]
+    # Extra master flags (e.g. the eviction high watermark, the KV lease TTL), space separated.
+    command.extend(os.environ.get("TRTLLM_MOONCAKE_MASTER_EXTRA_ARGS", "").split())
 
     logger.warning(f"mooncake-store: starting {' '.join(command)} on {host}")
     with open(log_path, "wb") as log_file:

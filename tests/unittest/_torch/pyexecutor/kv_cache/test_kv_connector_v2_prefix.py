@@ -15,7 +15,7 @@
 """Connector prefix reservation, allocation and legacy final-batch query tests."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -102,6 +102,8 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_load_failed = False
+        self.py_connector_admission_offer = None
         self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
@@ -157,6 +159,7 @@ class FakeConnectorManager:
         # Read by the manager to decide whether the prefix path runs at all.
         self.capacity_only = False
         self.prefix_reservations_enabled = False
+        self.admission_query_capable = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1
@@ -272,6 +275,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.conversation_manager = None
     manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
@@ -504,6 +508,29 @@ class TestConnectorReuseStats:
         assert not serve(manager, FakeRequest(), kv_cache)
 
         assert kv_cache.connector_reuse_calls == []
+
+
+class TestRetainContextAllocation:
+    """A skipped step keeps the allocation a connector already holds pages of."""
+
+    @pytest.mark.parametrize("is_draft", [False, True])
+    def test_capacity_stays_and_the_revert_marker_is_cleared(self, is_draft):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        manager.is_draft = is_draft
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        manager.kv_cache_map = {1: kv_cache}
+        req = FakeRequest()
+        req.py_ctx_pre_resize_cap = 64
+        req.py_draft_ctx_pre_resize_cap = 64
+
+        manager.retain_context_allocation(req)
+
+        assert kv_cache.resize_calls == []
+        assert kv_cache.capacity == PROMPT_LEN
+        marker = "py_draft_ctx_pre_resize_cap" if is_draft else "py_ctx_pre_resize_cap"
+        other = "py_ctx_pre_resize_cap" if is_draft else "py_draft_ctx_pre_resize_cap"
+        assert getattr(req, marker) is None
+        assert getattr(req, other) == 64
 
 
 class TestUnchunkedIsPureShrink:
@@ -1097,6 +1124,224 @@ class TestPrefixReservations:
         assert other.context_current_position == 0
 
 
+class TestAdmissionQuery:
+    """kv_connector_config.admission_query: the scheduler asks at admission, and prepare reuses that answer."""
+
+    @staticmethod
+    def _admitted(num_matched=64, load_async=True, capable=True, committed=0):
+        connector = FakeConnectorManager(num_matched=num_matched, load_async=load_async)
+        connector.admission_query_capable = capable
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=committed, capacity=PROMPT_LEN)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        req.context_current_position = committed
+        req.set_prepopulated_prompt_len(committed, TOKENS_PER_BLOCK)
+        manager.begin_connector_admission_pass()
+        return connector, manager, req, kv_cache
+
+    def test_an_async_answer_parks_and_is_not_asked_again(self):
+        connector, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        assert connector.queries == [(0, 0)]
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0)]
+        assert connector.commits == [(0, 64, True)]
+        assert len(connector.allocs) == 1
+        assert req.py_connector_admission_offer is None
+
+    @pytest.mark.parametrize("num_matched, load_async", [(64, False), (0, False)])
+    def test_sync_and_miss_answers_do_not_park_and_are_used_once(self, num_matched, load_async):
+        connector, manager, req, _ = self._admitted(num_matched, load_async)
+        assert not manager.query_connector_at_admission(req)
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0)]
+        assert connector.commits == [(0, num_matched, False)]
+
+    def test_no_capability_means_no_admission_query(self):
+        connector, manager, req, _ = self._admitted(capable=False)
+        assert not manager.query_connector_at_admission(req)
+        assert connector.queries == []
+        assert req.py_connector_admission_offer is None
+
+    @pytest.mark.parametrize(
+        "guard", ["reservations", "draft", "reported", "no_add_sequence", "capacity_only"]
+    )
+    def test_every_guard_blocks_the_query(self, guard):
+        connector, manager, req, _ = self._admitted()
+        if guard == "reservations":
+            connector.prefix_reservations_enabled = True
+        elif guard == "draft":
+            manager.is_draft = True
+        elif guard == "reported":
+            req.py_connector_allocation_reported = True
+        elif guard == "no_add_sequence":
+            connector.add_sequence = False
+        else:
+            connector.capacity_only = True
+        assert not manager.query_connector_at_admission(req)
+        assert connector.queries == []
+
+    def test_a_blocked_query_drops_an_old_answer(self):
+        _, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        assert req.py_connector_admission_offer is not None
+        req.py_connector_allocation_reported = True
+        assert not manager.query_connector_at_admission(req)
+        assert req.py_connector_admission_offer is None
+
+    def test_an_answer_from_an_earlier_pass_is_asked_again(self):
+        """A request dropped before prepare (e.g. by the total-KV cap) is asked afresh next pass,
+        and its pages are still reported once."""
+        connector, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        manager.begin_connector_admission_pass()
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0), (0, 0)]
+        assert len(connector.allocs) == 1
+        assert req.py_connector_admission_offer is None
+
+    def test_a_moved_cache_is_refused(self):
+        _, manager, req, kv_cache = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        kv_cache.num_committed_tokens = TOKENS_PER_BLOCK
+        with pytest.raises(RuntimeError, match="admission-time connector answer"):
+            manager._run_kv_connector_hooks(scheduled(req))
+
+    def test_releasing_the_allocation_drops_the_answer(self):
+        _, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        manager.kv_cache_map.pop(req.py_request_id)
+        manager.free_resources(req)
+        assert req.py_connector_admission_offer is None
+
+    @pytest.mark.parametrize(
+        "change",
+        [None, "no_connector", "draft", "not_capable", "capacity_only", "reservations"],
+    )
+    def test_connector_admission_query_enabled_gates(self, change):
+        connector, manager, _, _ = self._admitted()
+        if change == "no_connector":
+            manager.kv_connector_manager = None
+        elif change == "draft":
+            manager.is_draft = True
+        elif change == "not_capable":
+            connector.admission_query_capable = False
+        elif change == "capacity_only":
+            connector.capacity_only = True
+        elif change == "reservations":
+            connector.prefix_reservations_enabled = True
+        assert manager.connector_admission_query_enabled() is (change is None)
+
+
+class TestAdmissionGrow:
+    """`cover_admission_offer`: an admission-time offer past the chunk gets its pages before later admissions."""
+
+    @staticmethod
+    def _asked(num_matched=128, grow_ok=True, capacity=64, chunk=64, scratch_reuse=False):
+        connector = FakeConnectorManager(num_matched=num_matched, load_async=True)
+        connector.admission_query_capable = True
+        manager = make_manager(connector)
+        manager.enable_swa_scratch_reuse = scratch_reuse
+        req = FakeRequest()
+        req.context_chunk_size = chunk
+        kv_cache = FakeKvCache(committed=0, capacity=capacity, grow_ok=grow_ok)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        manager.begin_connector_admission_pass()
+        assert manager.query_connector_at_admission(req) == (num_matched > 0)
+        return connector, manager, req, kv_cache
+
+    def test_a_shifting_offer_is_covered_at_admission_and_served_in_full(self):
+        connector, manager, req, kv_cache = self._asked()
+
+        assert manager.cover_admission_offer(req)
+        # The shifted window [128, 192): capacity only, the history stays at the local match.
+        assert kv_cache.resize_calls == [(192, None)]
+        assert kv_cache.history_length == 0
+        assert req.py_ctx_pre_resize_cap == 64
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert req.context_current_position == 128 and req.context_chunk_size == 64
+        assert kv_cache.capacity == 192
+        assert connector.commits == [(0, 128, True)]
+
+    def test_without_pages_the_cover_fails_and_leaves_the_allocation(self):
+        _, manager, req, kv_cache = self._asked(grow_ok=False)
+
+        assert not manager.cover_admission_offer(req)
+
+        assert kv_cache.capacity == 64 and kv_cache.history_length == 0
+        assert req.py_ctx_pre_resize_cap is None
+
+    @pytest.mark.parametrize("num_matched", [0, 32])
+    def test_a_miss_or_an_offer_inside_the_chunk_needs_no_pages(self, num_matched):
+        _, manager, req, kv_cache = self._asked(num_matched=num_matched, grow_ok=False)
+        assert manager.cover_admission_offer(req)
+        assert kv_cache.resize_calls == []
+
+    def test_an_answer_from_an_earlier_pass_is_not_covered(self):
+        _, manager, req, kv_cache = self._asked(grow_ok=False)
+        manager.begin_connector_admission_pass()
+        assert manager.cover_admission_offer(req)
+        assert kv_cache.resize_calls == []
+
+    def test_the_target_matches_the_prepare_time_grow(self):
+        """Extra KV tokens and, on a final chunk, draft tokens: the prepare-time resize must not grow again."""
+        connector = FakeConnectorManager(num_matched=192, load_async=True)
+        connector.admission_query_capable = True
+        manager = make_manager(connector, num_extra_kv_tokens=3)
+        req = FakeRequest()
+        req.py_draft_tokens = [0, 0]
+        req.context_chunk_size = 64
+        kv_cache = FakeKvCache(committed=0, capacity=67)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        manager.begin_connector_admission_pass()
+        assert manager.query_connector_at_admission(req)
+
+        assert manager.cover_admission_offer(req)
+        # Offer 192 shifts the 64-token chunk to the prompt end: 256 + 3 extra + 2 draft.
+        assert kv_cache.capacity == PROMPT_LEN + 5
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        assert [capacity for capacity, _ in kv_cache.resize_calls] == [PROMPT_LEN + 5] * 2
+        assert req.context_current_position == 192 and req.context_chunk_size == 64
+
+    def test_a_revert_undoes_the_admission_grow(self):
+        _, manager, req, kv_cache = self._asked()
+        assert manager.cover_admission_offer(req)
+        assert manager.revert_allocate_context(req)
+        assert kv_cache.capacity == 64
+
+    @pytest.mark.parametrize("grow_ok", [True, False])
+    def test_swa_scratch_reuse_leaves_the_shift_to_prepare(self, grow_ok):
+        """A grow past the cursor would be replayed exactly as a pre-grown chunk, so it is not made."""
+        connector, manager, req, kv_cache = self._asked(grow_ok=grow_ok, scratch_reuse=True)
+
+        assert manager.cover_admission_offer(req)
+        assert kv_cache.resize_calls == []
+        assert req.py_ctx_pre_resize_cap is None
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        if grow_ok:
+            # As in TestChunkedBeyondTheChunk: the window shifts at prepare time.
+            assert (req.context_current_position, req.context_chunk_size) == (128, 64)
+            assert kv_cache.capacity == 192
+            assert connector.commits == [(0, 128, True)]
+        else:
+            # The grow fails at prepare time and the capped fallback applies.
+            assert (req.context_current_position, req.context_chunk_size) == (32, 32)
+            assert kv_cache.capacity == 64
+            assert connector.commits == [(0, 32, True)]
+
+
 def test_disagg_metadata_build_keeps_pending_context_reservation() -> None:
     manager, connector, req, cache = TestPrefixReservations.prepare()
     assert manager.resize_context(req, 32)
@@ -1118,3 +1363,25 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
     assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]
+
+
+@pytest.mark.parametrize("load_async", [False, True])
+def test_restarted_request_ignores_stale_prefix_without_losing_transfer_ownership(
+    load_async: bool,
+) -> None:
+    connector = FakeConnectorManager(num_matched=64, load_async=load_async)
+    manager = make_manager(connector)
+    request = FakeRequest()
+    request.py_connector_load_failed = True
+    cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning_once"
+    ) as warning:
+        assert not serve(manager, request, cache)
+    assert warning.call_count == int(load_async)
+    if load_async:
+        assert warning.call_args.kwargs["key"] == "kv_connector_async_reload_after_failure"
+    assert request.context_current_position == 32
+    assert connector.queries == [(request.py_request_id, 32)]
+    assert connector.commits == [(request.py_request_id, 0, load_async)]

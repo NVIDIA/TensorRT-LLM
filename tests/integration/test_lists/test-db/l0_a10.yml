@@ -46,6 +46,9 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_estimation_no_host_tier.py
+  - unittest/_torch/pyexecutor/connectors/mooncake_store/test_mooncake_store_chain.py
+  - unittest/_torch/pyexecutor/connectors/mooncake_store/test_mooncake_store_chain_switches.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
   - unittest/_torch/pyexecutor/test_resource_manager.py
   - unittest/_torch/pyexecutor/test_profile_endpoints.py
@@ -237,6 +240,7 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[qwen3_forced_windows]
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_chunked_prefill_survives_a_small_cache
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_async_load_matches_sync_tokens
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules

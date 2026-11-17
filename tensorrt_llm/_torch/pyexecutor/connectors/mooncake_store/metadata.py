@@ -14,14 +14,16 @@
 # limitations under the License.
 """The per-iteration work list the scheduler hands the workers.
 
-Instances are broadcast from rank 0 to every worker, so these carry only plain
-data: a page's identity (its block hash) and where that page currently lives on
-this rank (a layer group and a page slot index). Deliberately no store keys:
-each worker prefixes its own rank namespace, so one broadcast serves all shards.
+Built by the scheduler adapter, then broadcast from rank 0 to every worker
+under tensor parallelism, or bound locally on its owner under attention data
+parallelism. These carry only plain data: a page's identity (its block hash) and
+where that page currently lives on this rank (a layer group and a page slot
+index). Deliberately no store keys: each worker prefixes its own attention-shard
+namespace, so one work list serves every shard.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 __all__ = ["MooncakeStoreMetadata", "PageTransfer", "RequestTransfers"]
 
@@ -52,11 +54,23 @@ class RequestTransfers:
 
 @dataclass
 class MooncakeStoreMetadata:
-    """Loads to perform before the next forward pass, saves to start after it."""
+    """Loads to perform before the next forward pass, saves to start after it.
+
+    With `async_load` the scheduler hands parked requests' loads to the
+    workers' background load threads instead, in a third list.
+    """
 
     loads: List[RequestTransfers] = field(default_factory=list)
     saves: List[RequestTransfers] = field(default_factory=list)
+    #: Asynchronous loads to queue when the metadata is bound, after the KV
+    #: cache manager's allocation fence. Under TP the scheduler exists on rank 0
+    #: only and every rank loads its own shard of the parked request's pages.
+    async_loads: List[RequestTransfers] = field(default_factory=list)
+    #: Chain mode: (radix block key, connector block hash) of the blocks computed
+    #: this iteration, so every rank (tensor-parallel followers included, which
+    #: have no scheduler) can name its evicted host pages in the pool.
+    chain_map: List[Tuple[bytes, bytes]] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         """Whether there is any work at all this iteration."""
-        return bool(self.loads or self.saves)
+        return bool(self.loads or self.saves or self.async_loads or self.chain_map)

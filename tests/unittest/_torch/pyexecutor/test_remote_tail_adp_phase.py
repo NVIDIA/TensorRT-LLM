@@ -23,7 +23,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import Decoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import ADPRouter, RankState
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase, ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -154,7 +154,7 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
 
     with pytest.raises(
         RuntimeError,
-        match=r"V2 scheduler deadlock: 1 generation and 0 context request\(s\)",
+        match=r"V2 scheduler deadlock: 1 generation and 0 context and 0 generation-init request\(s\)",
     ):
         scheduler.schedule_request(active, set())
 
@@ -248,12 +248,14 @@ def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> N
         make_ctx_request(2, context_remaining_length=128),
         make_ctx_request(3, context_remaining_length=128),
     ]
-    for phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED):
+    phases = (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED)
+    for phase in phases:
         scheduler.set_remote_tail_phase(phase, context_ids, generation_ids)
         result = scheduler.schedule_request(active, set())
         assert not result.context_requests
         assert not result.generation_requests
-    assert not manager.mock_calls
+    # Each scheduling pass releases the completion gate once and touches no cache.
+    assert manager.mock_calls == [call.begin_completion_admission(active)] * len(phases)
 
 
 def test_disabled_phase_preserves_existing_request_selection() -> None:
@@ -660,6 +662,16 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         events.append("start_worker")
 
     monkeypatch.setattr(PyExecutor, "start_worker", start_worker)
+    # The router factory must receive the executor's connector manager; a
+    # missing keyword is invisible to every router test.
+    real_create = ADPRouter.create
+    seen_create_kwargs = {}
+
+    def recording_create(**kwargs):
+        seen_create_kwargs.update(kwargs)
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(ADPRouter, "create", recording_create)
     executor = PyExecutor(
         resource_manager,
         scheduler,
@@ -669,6 +681,8 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         max_num_sequences=8,
         kv_cache_transceiver=transceiver,
     )
+    assert "kv_connector_manager" in seen_create_kwargs
+    assert seen_create_kwargs["kv_connector_manager"] is None
     assert executor.kv_cache_transceiver is transceiver
     assert events == (
         ["warmup", "reserve", "start_worker"] if should_enable else ["warmup", "start_worker"]

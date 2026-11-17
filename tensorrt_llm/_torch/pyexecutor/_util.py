@@ -4131,6 +4131,22 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
+        # Opt-in (TRTLLM_KV_ESTIMATION_NO_HOST_TIER=1): the estimation pass builds throwaway probe
+        # managers that only hold dummy requests; with no explicit budget they auto-size a host
+        # spill tier whose host memory stays resident after the probe. Give the probes no host
+        # tier, so that memory stays free for the rest of the node (e.g. a Mooncake pool).
+        if estimating_kv_cache and os.environ.get(
+                "TRTLLM_KV_ESTIMATION_NO_HOST_TIER", "0") == "1":
+            self_kv_cache_config = self_kv_cache_config.model_copy(
+                update={"host_cache_size": 0})
+            if has_separate_one_model_draft:
+                draft_kv_cache_config = (draft_kv_cache_config
+                                         if draft_kv_cache_config is not None
+                                         else self._kv_cache_config).model_copy(
+                                             update={"host_cache_size": 0})
+            logger.info("KV cache estimation managers: host tier disabled "
+                        "(TRTLLM_KV_ESTIMATION_NO_HOST_TIER=1)")
+
         # Estimation managers are throwaway probes; the real build that
         # follows runs the check against the same engine and scheduler
         # settings.
@@ -5418,6 +5434,12 @@ def create_py_executor_resources(
         enable_prefix_aware_scheduling = (
             scheduler_config.enable_prefix_aware_scheduling
             if scheduler_config is not None else True)
+        # Admission-time connector queries. The executor checks the connector,
+        # the overlap scheduler and attention DP once the connector is bound;
+        # the fallbacks match the config defaults and are inert while it is off.
+        kv_connector_config = getattr(llm_args, "kv_connector_config", None)
+        admission = (kv_connector_config.admission_query
+                     if kv_connector_config is not None else None)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -5447,6 +5469,11 @@ def create_py_executor_resources(
                 if scheduler_config is not None else None),
             exact_context_demotion=runtime_hooks_of(
                 model_engine.model).exact_context_demotion,
+            connector_admission_query=admission is not None,
+            max_uncharged_connector_parks=(admission.max_uncharged_parks
+                                           if admission is not None else 0),
+            max_connector_offer_deferrals=(admission.max_offer_deferrals
+                                           if admission is not None else 16),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

@@ -107,7 +107,20 @@ def disable_native_kv_offload(kv_cache_config: "KvCacheConfig") -> None:
     Both fields are pinned to 0 rather than left unset, since a host_cache_size
     of None asks KVCacheManagerV2 to size a host tier automatically. Call this
     before the KV cache manager is built, which reads both to decide its tiers.
+
+    In chain mode (`TRTLLM_MOONCAKE_CHAIN=1`) the native host tier stays: the
+    pool is the victim of that tier, so lookups run GPU + host (one local
+    match) and then the pool past it. Loads only touch pages a live request
+    holds, which a migration never moves.
     """
+    if os.environ.get("TRTLLM_MOONCAKE_CHAIN", "0") == "1":
+        _allow_non_gpu_cache_tiers()
+        logger.info(
+            "Keeping the native host tier under the mooncake-store connector in chain mode "
+            f"(host_cache_size={kv_cache_config.host_cache_size}, "
+            f"disk_cache_size={kv_cache_config.disk_cache_size})"
+        )
+        return
     if kv_cache_config.host_cache_size == 0 and kv_cache_config.disk_cache_size == 0:
         return
     explicit = {
@@ -133,6 +146,42 @@ def disable_native_kv_offload(kv_cache_config: "KvCacheConfig") -> None:
         )
     kv_cache_config.host_cache_size = 0
     kv_cache_config.disk_cache_size = 0
+
+
+#: The KV cache manager that kept a host tier under the connector (chain mode); read by the worker.
+HOST_TIER_MANAGER = None
+
+
+def _allow_non_gpu_cache_tiers() -> None:
+    """Let PyExecutor run the connector over cache tiers below GPU (chain mode), if the executor is loaded.
+
+    PyExecutor rejects such tiers while a connector runs, because a page that
+    migrates off GPU leaves a registered address stale. In chain mode the
+    connector transfers only GPU pages a live request holds (a migration never
+    moves those) and takes host pages only through the host-drop hand-off, so
+    the check is replaced by one that records the manager for the worker. The
+    creator imports `py_executor` before it calls into this module, so the
+    class is patched before `_maybe_init_kv_connector_manager` runs.
+    """
+    import sys
+
+    mod = sys.modules.get("tensorrt_llm._torch.pyexecutor.py_executor")
+    if mod is None or getattr(mod.PyExecutor, "_mooncake_chain_tiers_allowed", False):
+        return
+
+    def _keep_tiers(kv_cache_manager) -> None:
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+        global HOST_TIER_MANAGER
+        # The worker chains the pool behind this manager's host tier when it registers the layout, right after
+        # this check.
+        HOST_TIER_MANAGER = kv_cache_manager
+        tiers = kv_cache_manager.impl.init_config.cache_tiers
+        names = ", ".join(str(t.tier) for t in tiers if t.tier != CacheTier.GPU_MEM)
+        logger.info(f"mooncake-store connector runs with cache tiers below GPU: {names or 'none'}")
+
+    mod.PyExecutor._reject_non_gpu_cache_tiers = staticmethod(_keep_tiers)
+    mod.PyExecutor._mooncake_chain_tiers_allowed = True
 
 
 def disable_partial_reuse(kv_cache_config: "KvCacheConfig") -> None:
@@ -188,6 +237,20 @@ def _restate_pool_block(
         ("model_key", effective.model_key, pool.model_key),
         ("transfer_batch_size", effective.transfer_batch_size, pool.transfer_batch_size),
         ("stage_through_host", effective.stage_through_host, pool.stage_through_host),
+        (
+            "staging_buffer_bytes",
+            effective.staging_buffer_bytes,
+            parse_size(pool.staging_buffer_bytes, strict_units=True),
+        ),
+        ("async_load", effective.async_load, pool.async_load),
+        ("async_load_workers", effective.async_load_workers, pool.async_load_workers),
+        ("group_blocks", effective.group_blocks, pool.group_blocks),
+    )
+    # Settings where `None` means off rather than "not stated", so a config
+    # that leaves one out restates the block to off.
+    nullable = (
+        ("soft_pin_ttl_ms", effective.soft_pin_ttl_ms, pool.soft_pin_ttl_ms),
+        ("stats_interval", effective.stats_interval, pool.stats_interval),
     )
     # Assignment adds to `model_fields_set`, so what the deployment stated for
     # itself has to be read before any of it is replaced. Only a value it chose
@@ -196,6 +259,12 @@ def _restate_pool_block(
     overridden = {}
     for setting, value, asked in superseded:
         if value is None or value == asked:
+            continue
+        setattr(pool, setting, value)
+        if setting in stated:
+            overridden[setting] = value
+    for setting, value, asked in nullable:
+        if value == asked:
             continue
         setattr(pool, setting, value)
         if setting in stated:
