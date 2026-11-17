@@ -49,6 +49,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -57,12 +58,25 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from types import ModuleType
 
-# Appended rather than prepended: internal/ is a directory of helper scripts,
-# and putting it ahead of the stdlib would let any future file in there shadow
-# a module this script already depends on.
-sys.path.append(str(Path(__file__).resolve().parent / "internal"))
-from check_a53_veneers import find_veneers  # noqa: E402
+
+def _load_internal(name: str) -> ModuleType:
+    """Import internal/<name>.py by file path rather than through sys.path.
+
+    This module is also imported in-process, by tests/unittest/scripts/test_bolt.py,
+    so an entry it put on sys.path would stay there and change how unrelated
+    modules in that process resolve their imports.
+    """
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent / "internal" / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+find_veneers = _load_internal("check_a53_veneers").find_veneers
 
 # Keep in sync with bolt_lib.sh::optimize_libraries.
 DEFAULT_BOLT_FLAGS = [
