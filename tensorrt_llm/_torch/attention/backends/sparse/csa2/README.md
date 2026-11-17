@@ -315,8 +315,10 @@ decoder queries. The query pass preserves those cache entries and still
 executes its attention and FFN. Replay is enabled by default with a shared
 Encoder/Decoder range of 140 tokens (`DEFAULT_BOUNDED_REPLAY_TOKENS`), or one
 token more than the required SWA window (including the embedded DSpark capture
-window) when that window is wider, without a physical-ring or page-alignment
-constraint. `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
+window) when that window is wider. Encoder replay requires the range to be at
+least `tokens_per_block`; cache initialization and sizing reject smaller ranges
+so cold recovery stays within the configured replay budget.
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
 does not exceed the required window is an error. The released checkpoint's SWA
 window remains 128.
 This policy is approximate across stacked

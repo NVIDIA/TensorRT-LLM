@@ -88,6 +88,84 @@ def test_encoder_replay_passes_cold_storage_to_base(
         )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("entrypoint", ["initialize", "size"])
+@pytest.mark.parametrize(
+    "replay_window,tokens_per_block,encoder_replay,rejected",
+    [
+        (140, 128, None, False),
+        (140, 128, True, False),
+        (255, 256, True, True),
+        (256, 256, True, False),
+        (257, 256, True, False),
+        (140, 256, True, True),
+        (140, 256, None, True),
+        (140, 256, False, False),
+    ],
+)
+def test_encoder_replay_window_covers_block(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    replay_window: int,
+    tokens_per_block: int,
+    encoder_replay: bool | None,
+    rejected: bool,
+) -> None:
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(replay_window))
+    config = KvCacheConfig(enable_block_reuse=True)
+    layout = CSA2Layout((0, 1, 1), (1,), (1,))
+
+    class BackendReached(Exception):
+        pass
+
+    def initialize_backend(manager: CSA2CacheManager, *_args: object, **_kwargs: object) -> None:
+        assert manager._decoder_replay_window == replay_window
+        assert manager._encoder_replay_enabled == (encoder_replay is not False)
+        raise BackendReached
+
+    def estimate_cache(*args: object, **_kwargs: object) -> None:
+        assert args[2] == replay_window
+        assert args[3] == (encoder_replay is not False)
+        raise BackendReached
+
+    monkeypatch.setattr(CSA2CacheManager.__bases__[0], "__init__", initialize_backend)
+    monkeypatch.setattr(cache_module, "_cache_size_layer_components", estimate_cache)
+    monkeypatch.setattr(CSA2Layout, "from_hf_config", lambda _config: layout)
+    with pytest.raises(ValueError if rejected else BackendReached) as error:
+        if entrypoint == "initialize":
+            CSA2CacheManager(
+                config,
+                CacheType.SELFKONLY,
+                num_layers=3,
+                tokens_per_block=tokens_per_block,
+                mapping=Mapping(),
+                layout=layout,
+                encoder_replay=encoder_replay,
+            )
+        else:
+            model = SimpleNamespace(
+                pretrained_config=None,
+                get_num_attention_layers=lambda: 3,
+                extra_attrs={}
+                if encoder_replay is None
+                else {"csa2_encoder_replay": encoder_replay},
+            )
+            CSA2CacheManager.get_cache_size_per_token(
+                model,
+                Mapping(),
+                tokens_per_block=tokens_per_block,
+                max_num_tokens=448,
+                kv_cache_config=config,
+            )
+    if rejected:
+        assert "replay_window >= tokens_per_block" in str(error.value)
+        assert f"replay_window={replay_window}, tokens_per_block={tokens_per_block}" in str(
+            error.value
+        )
+
+
 def test_disabled_layer_mask_rejected_before_allocation():
     with pytest.raises(ValueError, match="disabled layers in layer_mask"):
         CSA2CacheManager(
@@ -695,8 +773,11 @@ def test_prune_only_physical_swa_groups(limit: int | None) -> None:
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
 @pytest.mark.parametrize("remote_tail", [False, True])
 def test_static_sizing_removes_only_swa_reservation(
-    tokens_per_block: int, remote_tail: bool
+    monkeypatch: pytest.MonkeyPatch, tokens_per_block: int, remote_tail: bool
 ) -> None:
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(max(140, tokens_per_block)))
     layout = _context_only_layout()
     text_config = SimpleNamespace(
         compress_ratios=layout.compress_ratios,
@@ -716,7 +797,7 @@ def test_static_sizing_removes_only_swa_reservation(
     full = CSA2CacheManager.get_cache_size_per_token(
         model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
     )
-    # Remote-tail retention adds a 128-row lookback to the 141-row replay window.
+    # Remote-tail retention adds a 128-row lookback to the replay window.
     extra_pages = int(remote_tail)
     assert full[0] == ordinary[0]
     assert full[1] - ordinary[1] == 20 * extra_pages * tokens_per_block * 528 * 32

@@ -175,6 +175,18 @@ def _get_replay_capture_window(
     return max(layout.window_size, pretrained_config.sliding_window)
 
 
+def _validate_encoder_replay_window(
+    enabled: bool, replay_window: int, tokens_per_block: int
+) -> None:
+    """Keep cold Encoder recovery within the configured replay window."""
+    if enabled and replay_window < tokens_per_block:
+        raise ValueError(
+            "DeepSeek-V4.1 Encoder replay requires replay_window >= tokens_per_block: "
+            f"replay_window={replay_window}, tokens_per_block={tokens_per_block}; "
+            "increase TRTLLM_V41_BOUNDED_REPLAY_TOKENS or reduce tokens_per_block"
+        )
+
+
 def _swa_cache_window(
     swa_window: int,
     replay_window: int,
@@ -387,6 +399,9 @@ class CSA2CacheManager(KVCacheManagerV2):
                 max_num_tokens=kwargs.get("max_num_tokens", 8192),
                 replay_window=max(self.layout.window_size, self._decoder_replay_window),
             )
+        )
+        _validate_encoder_replay_window(
+            self._encoder_replay_enabled, self._decoder_replay_window, tokens_per_block
         )
         self._encoder_reuse_policy = (
             ReusePolicy.OPTIONAL if self._encoder_replay_enabled else ReusePolicy.REQUIRED
@@ -1736,6 +1751,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 replay_window=max(layout.window_size, replay_window),
             )
         )
+        _validate_encoder_replay_window(encoder_replay, replay_window, tokens_per_block)
         sizes, windows, scratch_groups = _cache_size_layer_components(
             layout,
             range(num_layers),
