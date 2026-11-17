@@ -13,6 +13,7 @@ from tensorrt_llm._torch.modules.linear import (
     flashinfer_mxfp8_autotune_active,
     flashinfer_mxfp8_decode_graph_capture_active,
 )
+from tensorrt_llm._torch.utils import is_torch_compiling
 
 
 class _Mxfp8GemmState(nn.Module):
@@ -46,8 +47,8 @@ class MxMode:
 
 def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
     method = state.quant_method
-    decode_graph = flashinfer_mxfp8_decode_graph_capture_active()
-    autotune = flashinfer_mxfp8_autotune_active()
+    decode_graph = not is_torch_compiling() and flashinfer_mxfp8_decode_graph_capture_active()
+    autotune = not is_torch_compiling() and flashinfer_mxfp8_autotune_active()
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,
