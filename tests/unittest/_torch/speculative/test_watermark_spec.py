@@ -95,7 +95,7 @@ def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph, dual_key):
     # up to numerical differences between the verification and the decoding kernels.
     # With dual keys, exact-match speculation routes tokens between the two keys exactly as plain
     # decoding does for the same seed.
-    dual = dict(algorithm="gumbel_dual_key", alpha=0.25) if dual_key else {}
+    dual = dict(algorithm="gumbel_dual_key", alpha=0.5) if dual_key else {}
     config = WatermarkConfig(key=0x5EED5EED, deduplicate_contexts="none", **dual)
     sampling_params = SamplingParams(
         max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True, seed=11
@@ -116,8 +116,11 @@ def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph, dual_key):
         )
     # A wrong watermark context would break every prompt within a token or two; numerical
     # differences between the two paths flip an occasional near-tie, so at least half must agree.
+    # With dual keys a speculative path that ignored the routing would break at the first of the
+    # many tokens drawn under the second key, so a longer common prefix is required.
+    min_prefix = 32 if dual_key else 16
     agreeing = sum(
-        _common_prefix(expected, actual) >= 16
+        _common_prefix(expected, actual) >= min_prefix
         for (_, expected), (_, actual) in zip(plain, speculative)
     )
     assert agreeing * 2 >= len(plain), f"only {agreeing}/{len(plain)} outputs match plain decoding"
@@ -216,4 +219,6 @@ def test_dual_key_routing_diversifies_repeated_prompts():
     count = len(PROMPTS)
     differ = sum(unseeded[i][1] != unseeded[i + count][1] for i in range(count))
     assert differ == count, f"only {differ}/{count} repeated prompts diverged"
-    assert all(seeded[i][1] == seeded[i + count][1] for i in range(count))
+    # Tokens drawn under the second key are about every fourth one, so an ignored seed would break
+    # the match within a few tokens; tiny numerical differences may still flip a late near-tie.
+    assert all(_common_prefix(seeded[i][1], seeded[i + count][1]) >= 32 for i in range(count))

@@ -188,7 +188,14 @@ class TestConfig:
         assert "12345" not in repr(WatermarkConfig(key=12345))
 
     @pytest.mark.parametrize(
-        "kwargs", [{"key": -1}, {"key": 2**64}, {"key": 1, "context_width": 0}]
+        "kwargs",
+        [
+            {"key": -1},
+            {"key": 2**64},
+            {"key": 1, "context_width": 0},
+            {"key": 1, "algorithm": "gumbel_dual_key", "alpha": -0.1},
+            {"key": 1, "algorithm": "gumbel_dual_key", "alpha": 1.5},
+        ],
     )
     def test_rejects_invalid(self, kwargs):
         with pytest.raises(ValueError):
