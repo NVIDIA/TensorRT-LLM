@@ -81,6 +81,7 @@ from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.recurrent_state_spec import RecurrentStateSpec
     from tensorrt_llm.llmapi.llm_args import (
         MultimodalConfig,
         MultimodalEncoderCudaGraphConfig,
@@ -3074,6 +3075,16 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
     ) -> Literal["PYTHON"]:
         """Match the NemotronH backbone's Python disaggregated route."""
         return NemotronHForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls, pretrained_config, *, quant_config=None, spec_config=None
+    ) -> "RecurrentStateSpec":
+        """Return the NemotronH backbone's declaration, read from ``llm_config``."""
+        llm_config = getattr(pretrained_config, "llm_config", None) or pretrained_config
+        return NemotronHForCausalLM.get_recurrent_state_spec(
+            llm_config, quant_config=quant_config, spec_config=spec_config
+        )
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

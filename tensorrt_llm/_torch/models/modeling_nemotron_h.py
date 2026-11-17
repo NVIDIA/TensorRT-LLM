@@ -46,6 +46,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..recurrent_state_spec import (RecurrentStateSpec,
+                                    recurrent_state_spec_from_mamba_params)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -947,6 +949,21 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                                           | None = None) -> Literal["PYTHON"]:
         """Use the Python transceiver for hybrid-state transfers."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(cls,
+                                 pretrained_config,
+                                 *,
+                                 quant_config=None,
+                                 spec_config=None) -> RecurrentStateSpec:
+        """Declare the Mamba2 state of the ``M`` layers of the hybrid pattern."""
+        from ..modules.mamba.cache_manager import get_nemotron_cache_params
+
+        params = get_nemotron_cache_params(pretrained_config,
+                                           spec_config=spec_config,
+                                           quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params,
+                                                      conv_sections="x_b_c")
 
     @staticmethod
     def lora_config(model_dir: str):

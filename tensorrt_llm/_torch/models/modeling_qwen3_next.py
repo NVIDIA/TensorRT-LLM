@@ -84,6 +84,8 @@ from ..moe.fused_moe.trtllm_gen.decode_front import (FUSED_FRONT_MAX_TOKENS,
                                                      route_front_steps)
 from ..moe.fused_moe.trtllm_gen.decode_moe import (LamportFc2Buffer,
                                                    rows_in_lamport)
+from ..recurrent_state_spec import (RecurrentStateSpec,
+                                    recurrent_state_spec_from_mamba_params)
 from ..speculative import SpecMetadata
 from ..speculative.kept_rows import DraftKeptRows, gather_rows2
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -2428,6 +2430,21 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                                           | None = None) -> Literal["PYTHON"]:
         """Use the Python transceiver for hybrid-state transfers."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(cls,
+                                 pretrained_config,
+                                 *,
+                                 quant_config=None,
+                                 spec_config=None) -> RecurrentStateSpec:
+        """Declare the GDN state of the linear-attention layers."""
+        from ..modules.fla.cache_manager import get_gdn_cache_params
+
+        params = get_gdn_cache_params(pretrained_config,
+                                      spec_config=spec_config,
+                                      quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params,
+                                                      conv_sections="q_k_v")
 
     def load_weights(self,
                      weights: dict,
