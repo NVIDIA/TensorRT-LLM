@@ -664,7 +664,7 @@ class GraphOrchestrator:
         return result
 
     def _confirmed(self, marker: str) -> bool:
-        """Whether some required check passed on the target as it is (``contract.confirmed``)."""
+        """Whether the target as it is was measured before delivery (``contract.confirmed``)."""
         with self._status_lock:
             return contract_mod.confirmed(self.contract, self.status, marker, self.s.holds)
 
@@ -760,7 +760,7 @@ class GraphOrchestrator:
           task is open, unless the bring-up still needs it;
         - with no required task open and every other required check passed,
           the delivery tier, on the target as it is;
-        - then, when no check has passed on the target as it is, the one check
+        - then, when no benchmark has scored the target as it is, the one check
           that confirms the final tree (:attr:`~.contract.Contract.confirm`).
 
         They run on the check pool; :meth:`_settled` reads the verdicts once

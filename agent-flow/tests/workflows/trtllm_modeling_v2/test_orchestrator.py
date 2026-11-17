@@ -191,6 +191,21 @@ def test_the_final_tree_is_confirmed_by_one_check_when_none_ran_on_it(tmp_path):
     )
 
 
+def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final_tree(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(*_STANDING.checks[:2], serve), confirm=_CORE[1])
+    plan = _plan_once(
+        _task("core", "assemble", [*_CORE, serve.key]),
+        _task("tidy", "kernel", deps=["core"], touches=["catalog/k.py"]),
+    )
+    services = _moving_target(plan)
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The delivery tier ran on what `tidy` left and answered. That is not a score: the
+    # benchmark runs there too.
+    assert services.ran[-2:] == [(serve.key, "m2"), (_CORE[1], "m2")]
+
+
 def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):
     turns = []
 
@@ -231,8 +246,11 @@ def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
     later = c.evaluate(contract, status, marker="m2")
     assert [x.key for x in later.passed] == [boot.key]
     assert not later.failed and [x.key for x in later.missing] == [benchmark.key]
-    # Standing is not having run there: only m1 was measured.
-    assert c.confirmed(contract, status, "m1") and not c.confirmed(contract, status, "m2")
+    # Standing is not having run there, and a boot that passed here does not say the
+    # target scores here: the benchmark confirms it.
+    assert not c.confirmed(contract, status, "m1") and not c.confirmed(contract, status, "m2")
+    status.record("core", result(benchmark, True), marker="m2")
+    assert c.confirmed(contract, status, "m2") and not c.confirmed(contract, status, "m3")
     assert c.passed_here(contract, status, boot, "m1")
     assert not c.passed_here(contract, status, boot, "m2")
     # The delivery report says where the standing pass was measured.
@@ -419,8 +437,9 @@ def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_pat
     status = c.ContractStatus.load(tmp_path)
     assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
     # The repair claims the boot, which runs on what it left. The benchmark that passed
-    # beside the failure stands, and the boot's pass confirms the final tree.
-    assert sorted(services.ran) == [(_CORE[1], "m1"), (_CORE[0], "m1"), (_CORE[0], "m2")]
+    # beside the failure stands; it runs once more, to score the final tree.
+    assert services.ran[-2:] == [(_CORE[0], "m2"), (_CORE[1], "m2")]
+    assert sorted(services.ran[:-2]) == [(_CORE[1], "m1"), (_CORE[0], "m1")]
 
 
 @pytest.mark.parametrize(

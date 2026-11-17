@@ -678,21 +678,36 @@ def passed_here(
     return same_inputs and verdict.passed
 
 
+def _scores(gate: str) -> bool:
+    """Whether ``gate`` judges the engine's answers by a score: a benchmark, or the disaggregated-serving test."""
+    return gate.startswith("accuracy[") or gate == disagg.GATE_NAME
+
+
 def confirmed(
     contract: Contract,
     status: ContractStatus,
     marker: str,
     holds: Callable[[Verdict], bool] | None = None,
 ) -> bool:
-    """Whether the target at ``marker`` was measured: some required check passed on this very state.
+    """Whether the target at ``marker`` was measured: a check that can see what a late change breaks passed here.
 
     The checks that passed earlier stand (:func:`evaluate`); this is the one
-    measurement the final tree owes before delivery. A contract that names no
-    confirmation check (:attr:`Contract.confirm`) owes none.
+    measurement the final tree owes before delivery. Where the confirmation
+    check (:attr:`Contract.confirm`) is a benchmark, any check that scores the
+    engine's answers counts, the last landing's own included; one that only
+    shows the engine answering (a boot, a serve, the acceptance of drafts)
+    does not say it still scores. Where the run owes boots alone, any required
+    check counts. A contract that names no confirmation check owes none.
     """
     if not contract.confirm:
         return True
-    return any(passed_here(contract, status, check, marker, holds) for check in contract.required())
+    named = next((c for c in contract.checks if c.key == contract.confirm), None)
+    scored = named is not None and _scores(named.gate)
+    return any(
+        passed_here(contract, status, check, marker, holds)
+        for check in contract.required()
+        if not scored or _scores(check.gate)
+    )
 
 
 def measured_where(

@@ -45,8 +45,8 @@ class Completion:
     files: tuple[str, ...] = ()
     required_open: bool = False
     unread_reports: bool = False
-    #: The check that confirms the final tree, while no check has passed on the
-    #: target as it is (``contract.confirmed``); empty once one has.
+    #: The check that confirms the final tree, while none of its kind has passed
+    #: on the target as it is (``contract.confirmed``); empty once one has.
     unconfirmed: str = ""
 
     @property
@@ -58,8 +58,8 @@ class Completion:
             gaps.append("delivery files: " + "; ".join(self.files))
         if self.unconfirmed:
             gaps.append(
-                f"no check has run on the target as it is: {self.unconfirmed} confirms it once "
-                "no required task is open"
+                f"the target as it is has not been measured: {self.unconfirmed} confirms it "
+                "once no required task is open"
             )
         return gaps
 
