@@ -267,7 +267,9 @@ def test_a_failure_after_the_launch_ends_the_loop_and_wakes_waiters():
     with _harness() as h:
 
         def fail(responses, finished_ids):
-            raise RuntimeError("the device was lost")
+            # The loop also publishes an empty list each pass; only a batch's responses fail.
+            if responses:
+                raise RuntimeError("the device was lost")
 
         h.executor._publish = fail
         pending = h.submit()

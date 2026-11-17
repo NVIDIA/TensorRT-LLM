@@ -478,8 +478,10 @@ class ScheduledEncoderExecutor:
                         # Every pass counts, idle ones too, so a stop requested while idle fires.
                         self._iter_counter += 1
         finally:
-            # The thread is a daemon: after a crash it may sit in a wedged device's wait.
             self._in_flight.put(None)
+            # After a crash the thread may sit in a wedged device's wait, so it is not joined.
+            if self._loop_completed:
+                self._completion_thread.join()
 
     def _wait_in_flight(self) -> None:
         """Block until every launched batch has been published."""
