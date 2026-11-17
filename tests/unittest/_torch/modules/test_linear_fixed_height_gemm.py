@@ -59,6 +59,8 @@ def test_fixed_height_is_opt_in(monkeypatch):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("switch", SWITCHES)
 def test_each_switch_enables_fixed_height(monkeypatch, switch):
+    for name in SWITCHES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(switch, "1")
 
     assert Linear(8, 4, bias=False, dtype=torch.bfloat16).use_fixed_height_gemm
