@@ -1932,6 +1932,18 @@ class TestImageEdit:
                 assert self.response is not None
                 return self.response
 
+            async def wait_for_waiters_done(self) -> None:
+                async def _wait_for_done() -> None:
+                    waiters = [task for ref in self.waiters if (task := ref()) is not None]
+                    if not waiters:
+                        return
+                    await asyncio.wait(waiters)
+
+                future = asyncio.run_coroutine_threadsafe(_wait_for_done(), self._event_loop)
+                done, _ = await asyncio.wait((asyncio.wrap_future(future),), timeout=5)
+                assert done, "result waiters did not finish before executor shutdown"
+                future.result()
+
             def shutdown(self) -> None:
                 self._stop.set()
                 self.thread.join(5)
@@ -1975,6 +1987,7 @@ class TestImageEdit:
         async def _observe_cleanup() -> None:
             cleanup_entered.set()
             await cleanup()
+            await executor.wait_for_waiters_done()
 
         monkeypatch.setattr(server, "_shutdown_image_edit_tasks", _observe_cleanup)
 
