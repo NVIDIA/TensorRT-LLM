@@ -1828,9 +1828,9 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
             self._confidence_logits is None or self._neutral_conf_row != num_rows
         ):
             self._allocate_confidence_state(draft_model, num_rows, self.max_draft_len)
-            self._output_verify_lens = torch.empty(
-                spec_metadata.max_num_requests, dtype=torch.int32, device="cuda"
-            )
+            # One executed window per output row. Sized by the slots, which bound every
+            # batch; max_num_requests is the captured bucket on CUDA graph metadata.
+            self._output_verify_lens = torch.empty(num_rows, dtype=torch.int32, device="cuda")
 
     def _assign_slot(
         self,
