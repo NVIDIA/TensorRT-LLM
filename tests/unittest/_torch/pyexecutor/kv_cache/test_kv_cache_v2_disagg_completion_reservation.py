@@ -186,6 +186,7 @@ def _first_chunk(**overrides: object) -> SimpleNamespace:
         py_connector_allocation_reported=False,
     )
     fields.update(overrides)
+    fields.setdefault("request_id", fields["py_request_id"])
     return SimpleNamespace(**fields)
 
 
@@ -297,6 +298,27 @@ def test_admission_revalidates_capacity_that_shrank_after_arrival() -> None:
         manager.reserve_context_completion(request)
     assert manager._disagg_completion_limits == {}
     assert manager._completion_waiter is None
+
+
+@pytest.mark.cpu_only
+def test_gen_init_revalidates_capacity_that_shrank_after_arrival() -> None:
+    manager = _context_reservation_manager(available=100)
+    manager._disagg_completion_capacity = 4
+    manager._completion_dummy_ids = set()
+    manager.prepare_context_cache = Mock(return_value=None)
+    request = _first_chunk(is_context_only_request=False, prompt_len=8, max_new_tokens=4)
+
+    # 12 tokens need 3 of the 4 blocks, so preparation goes ahead.
+    assert manager._prepare_disagg_gen_init_cache(request) is False
+    manager.prepare_context_cache.assert_called_once_with(request)
+
+    # Padding allocations then take half the idle capacity: reject, do not retry.
+    manager.prepare_context_cache.reset_mock()
+    manager.kv_cache_map[99] = Mock(num_blocks=2)
+    manager._completion_dummy_ids = {99}
+    with pytest.raises(ValueError, match="after retained padding allocations"):
+        manager._prepare_disagg_gen_init_cache(request)
+    manager.prepare_context_cache.assert_not_called()
 
 
 @pytest.mark.cpu_only

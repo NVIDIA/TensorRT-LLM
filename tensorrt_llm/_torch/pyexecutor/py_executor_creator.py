@@ -439,6 +439,37 @@ def _refuse_speculation_next_to_connector(
         "disable speculative decoding to run a connector.")
 
 
+def _validate_speculative_connector(spec_config: Optional[SpeculativeConfig],
+                                    use_kv_cache_manager_v2: bool | str,
+                                    speculative_prefill_only: bool,
+                                    connector: KvCacheConnectorManager) -> None:
+    """Validate the connector against speculative decoding, or shut it down and re-raise.
+
+    The connector's worker and scheduler already exist when these checks run,
+    so a refusal must release them before the error leaves the creator.
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        speculative_prefill_only: Whether the connector runs in that mode.
+        connector: The constructed connector manager.
+
+    Raises:
+        NotImplementedError: From `_refuse_speculation_next_to_connector`.
+        ValueError: From `_validate_speculative_connector_role`.
+    """
+    try:
+        _validate_speculative_connector_role(connector)
+        _refuse_speculation_next_to_connector(spec_config,
+                                              use_kv_cache_manager_v2,
+                                              speculative_prefill_only,
+                                              connector)
+    except (NotImplementedError, ValueError):
+        connector.shutdown()
+        raise
+
+
 def _validate_speculative_connector_role(
         connector: KvCacheConnectorManager) -> None:
     """Reject a speculative KV-moving connector on a known generation server."""
@@ -1508,11 +1539,9 @@ def _create_py_executor(
             logger.error(f"Error instantiating connector: {e}")
             raise
 
-        _validate_speculative_connector_role(kv_connector_manager)
-
-        _refuse_speculation_next_to_connector(spec_config, v2_selection,
-                                              speculative_prefill_only,
-                                              kv_connector_manager)
+        _validate_speculative_connector(spec_config, v2_selection,
+                                        speculative_prefill_only,
+                                        kv_connector_manager)
 
         if not kv_connector_manager.capacity_only and (
                 mapping.enable_attention_dp or speculative_prefill_only):

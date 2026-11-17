@@ -560,6 +560,53 @@ class TestRetainContextAllocation:
         assert getattr(req, other) == 64
 
 
+class TestRetainedGenerationAllocation:
+    """A retried step reuses the allocation a skipped step kept, sized for its draft width."""
+
+    @staticmethod
+    def make(retained, draft_slots, resize_ok=True):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        kv_cache = Mock(is_active=True, capacity=100)
+        kv_cache.resize.return_value = resize_ok
+        manager.kv_cache_map = {5: kv_cache}
+        manager._retained_generation_allocations = {5: retained}
+        manager._allocated_draft_lens = {}
+        manager._inflight_draft_lens = {}
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=draft_slots)
+        manager._fill_fresh_kv_pages = Mock()
+        return manager, kv_cache
+
+    def test_a_wider_retry_grows_by_the_difference(self):
+        manager, kv_cache = self.make(retained=1, draft_slots=3)
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        kv_cache.resize.assert_called_once_with(102)
+        assert manager._allocated_draft_lens == {5: 3}
+        assert manager._inflight_draft_lens == {5: [3]}
+        assert manager._retained_generation_allocations == {}
+
+    @pytest.mark.parametrize("draft_slots", [1, 3])
+    def test_an_equal_or_narrower_retry_keeps_the_allocation(self, draft_slots):
+        manager, kv_cache = self.make(retained=3, draft_slots=draft_slots)
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        kv_cache.resize.assert_not_called()
+        assert manager._allocated_draft_lens == {5: 3}
+        assert manager._inflight_draft_lens == {5: [3]}
+
+    def test_a_failed_growth_keeps_the_retained_allocation_for_the_next_try(self):
+        manager, _ = self.make(retained=1, draft_slots=3, resize_ok=False)
+
+        assert not manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        assert manager._retained_generation_allocations == {5: 1}
+        assert manager._allocated_draft_lens == {}
+        assert manager._inflight_draft_lens == {}
+
+
 class TestUnchunkedIsPureShrink:
     """With chunking off, ``resize_context`` already covered the whole prompt.
 
