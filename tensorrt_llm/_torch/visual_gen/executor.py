@@ -769,6 +769,9 @@ def run_diffusion_worker(
     ``in_client_process``: True only when this worker runs inside the client
     process. Declared by the launch site — never derive it from the
     environment here, the env writes below make every worker look external.
+
+    ``use_client_store``: Connect to a coordinator-owned TCPStore at
+    ``master_addr:master_port`` that stays alive until this worker exits.
     """
     # This native watchdog starts before CUDA, distributed, or model
     # initialization and does not depend on the Python GIL. It follows the
@@ -826,7 +829,7 @@ def run_diffusion_worker(
         init_torch_distributed(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             store=store,
-            init_method=None if use_client_store else "env://",
+            init_method=None if store is not None else "env://",
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -973,12 +976,7 @@ class DiffusionRemoteClient:
         self._worker_failure: Optional[str] = None
         self._request_to_send: Optional[DiffusionRequest] = None
 
-        # Start background thread (it will create its own event loop)
         self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
-        self.background_thread.start()
-
-        # Wait for the background thread to initialize the event loop
-        self.event_loop_ready.wait()
 
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
@@ -993,6 +991,9 @@ class DiffusionRemoteClient:
         _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
 
         try:
+            self.background_thread.start()
+            self.event_loop_ready.wait()
+
             if ext is None:
                 logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
                 ctx = _get_mp_context("spawn")

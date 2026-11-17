@@ -153,7 +153,7 @@ def _lightweight_background(client: DiffusionRemoteClient) -> None:
     client.shutdown_event.wait()
 
 
-def _rendezvous_worker(*, fail_pipeline: bool = False, **worker_kwargs) -> None:
+def _rendezvous_worker(**worker_kwargs) -> None:
     pipeline = SimpleNamespace(
         default_generation_params={},
         extra_param_specs={},
@@ -166,8 +166,6 @@ def _rendezvous_worker(*, fail_pipeline: bool = False, **worker_kwargs) -> None:
         patch.object(executor_module, "PipelineLoader") as loader,
     ):
         loader.return_value.load.return_value = pipeline
-        if fail_pipeline:
-            loader.return_value.load.side_effect = RuntimeError("model load failed")
         run_diffusion_worker(**worker_kwargs)
 
 
@@ -195,7 +193,10 @@ def _run_temporary_constructor_coordinator(
                 patch.object(
                     executor_module,
                     "find_free_port",
-                    side_effect=[29500, 29501, 29502],
+                    side_effect=[29501, 29502],
+                ),
+                patch.object(
+                    executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)
                 ),
                 patch.object(
                     executor_module,
@@ -698,8 +699,7 @@ def test_temporary_constructor_thread_does_not_kill_worker() -> None:
 
 @pytest.mark.timeout(_COLD_SPAWN_TIMEOUT)
 @pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
-@pytest.mark.parametrize("fail_pipeline", [False, True], ids=["ready", "startup-fails"])
-def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path, fail_pipeline: bool) -> None:
+def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path) -> None:
     context = executor_module._get_mp_context("spawn")
     create_process = context.Process
     master_ports = []
@@ -722,23 +722,56 @@ def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path, fail_pipe
     with (
         patch.object(executor_module, "_detect_external_launch", return_value=None),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
-        patch.object(executor_module, "_get_mp_context", return_value=context),
-        patch.object(context, "Process", side_effect=create_worker),
+        patch.object(
+            executor_module, "_get_mp_context", return_value=SimpleNamespace(Process=create_worker)
+        ),
         patch.object(
             executor_module,
             "run_diffusion_worker",
-            partial(_rendezvous_worker, fail_pipeline=fail_pipeline),
+            _rendezvous_worker,
         ),
     ):
-        if fail_pipeline:
-            with pytest.raises(RuntimeError, match="local worker processes exited"):
-                DiffusionRemoteClient(args=args)
-        else:
-            client = DiffusionRemoteClient(args=args)
-            try:
-                assert all(worker.is_alive() for worker in client.worker_processes)
-            finally:
-                client.shutdown()
+        client = DiffusionRemoteClient(args=args)
+        try:
+            assert all(worker.is_alive() for worker in client.worker_processes)
+        finally:
+            client.shutdown()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        contender.bind(("127.0.0.1", master_ports[0]))
+
+
+@pytest.mark.parametrize("fail_at_event_loop", [True, False], ids=["event-loop", "workers"])
+def test_local_rendezvous_port_is_released_after_startup_failure(fail_at_event_loop: bool) -> None:
+    master_ports = []
+    args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
+    create_store = executor_module.dist.TCPStore
+    error_type = KeyboardInterrupt if fail_at_event_loop else RuntimeError
+    event_loop_ready = MagicMock() if fail_at_event_loop else _THREADING_EVENT()
+    if fail_at_event_loop:
+        event_loop_ready.wait.side_effect = error_type("startup failed")
+
+    def record_store(*store_args, **store_kwargs) -> executor_module.dist.TCPStore:
+        store = create_store(*store_args, **store_kwargs)
+        master_ports.append(store.port)
+        return store
+
+    with (
+        patch.object(executor_module, "_detect_external_launch", return_value=None),
+        patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(executor_module.dist, "TCPStore", side_effect=record_store),
+        patch.object(
+            executor_module,
+            "_Event",
+            side_effect=[_THREADING_EVENT(), event_loop_ready, _THREADING_EVENT()],
+        ),
+        patch.object(executor_module, "_get_mp_context"),
+        patch.object(executor_module, "_WorkerProcessSpawner"),
+        patch.object(DiffusionRemoteClient, "_wait_ready", side_effect=error_type("startup failed")),
+        pytest.raises(error_type, match="startup failed"),
+    ):
+        DiffusionRemoteClient(args=args)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
         contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -756,7 +789,8 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
 
     with (
         patch.object(executor_module, "_detect_external_launch", return_value=None),
-        patch.object(executor_module, "find_free_port", side_effect=[29500, 29501, 29502]),
+        patch.object(executor_module, "find_free_port", side_effect=[29501, 29502]),
+        patch.object(executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
         patch.object(executor_module, "_get_mp_context", return_value=context),
         patch.object(executor_module, "_Thread") as thread_class,
