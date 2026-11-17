@@ -256,20 +256,17 @@ def test_a_check_a_task_asked_for_runs_again_when_its_run_was_lost(tmp_path):
     assert status.latest()[_CORE[0]].marker == "m2"
 
 
-def _equivalent_units():
-    """Three units' benchmarks at tp1; the core's and the multimodal unit's are one command.
-
-    As `intake derive` writes a spec: a unit that drafts has a benchmark of its own.
-    """
+def _three_benchmarks():
+    """Three units' benchmarks at tp1, as a spec with one `accuracy` block for every unit owes."""
     checks = tuple(
-        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER, equivalence=key)
-        for unit, key in (("core", "text"), ("multimodal", "text"), ("mtp", ""))
+        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER)
+        for unit in ("core", "multimodal", "mtp")
     )
     return c.Contract(checks=checks, confirm=checks[-1].key)
 
 
-def test_an_earlier_pass_of_an_equivalent_check_does_not_pass_a_check_that_failed(tmp_path):
-    contract = _equivalent_units()
+def test_a_check_passes_by_its_own_verdict_only(tmp_path):
+    contract = _three_benchmarks()
     core, multimodal, _ = contract.checks
     status = c.ContractStatus.load(tmp_path)
 
@@ -280,15 +277,17 @@ def test_an_earlier_pass_of_an_equivalent_check_does_not_pass_a_check_that_faile
     status.record("multimodal", result(multimodal, False), marker="m2")
     # Another task lands. The failure is due again; the core's pass on m1 says nothing of it.
     later = c.evaluate(contract, status, marker="m3")
-    assert multimodal.key in [x.key for x in later.missing] and not later.shared
-    # On one tree, an equivalent pass does stand in for a check with no verdict there.
-    status.record("core", result(core, True), marker="m3")
+    assert multimodal.key in [x.key for x in later.missing]
+    # Nor does a pass of the same benchmark by another unit on this very tree: the two
+    # units serve with different features on.
+    status.record("mtp", result(contract.checks[2], True), marker="m3")
     same_tree = c.evaluate(contract, status, marker="m3")
-    assert (multimodal.key, core.key) in [(x.key, by.key) for x, by in same_tree.shared]
+    assert multimodal.key in [x.key for x in same_tree.missing]
+    assert not c.passed_here(contract, status, multimodal, "m3")
 
 
 def test_a_run_is_not_delivered_on_a_failure_it_measured(tmp_path):
-    contract = _equivalent_units()
+    contract = _three_benchmarks()
     core, multimodal, mtp = (x.key for x in contract.checks)
     landed, ran, turns = [], [], []
 
