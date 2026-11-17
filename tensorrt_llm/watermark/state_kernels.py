@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .sampling import _philox_uniform
+
 __all__ = ["plan_windows", "commit_windows"]
 
 
@@ -40,6 +42,19 @@ def _mix64(x):
     x = x ^ (x >> 27)
     x = x * 0x94D049BB133111EB
     return x ^ (x >> 31)
+
+
+@triton.jit
+def _uses_second_key(route_seed, position, alpha):
+    """Whether the token at generation ``position`` is drawn under the second key.
+
+    The routing stream is Philox under ``route_seed`` at counter ``position``: a function of the
+    request and the token's place in its output only, so plain and exact-match speculative
+    decoding make the same choices.
+    """
+    key0 = (route_seed & 0xFFFFFFFF).to(tl.uint32)
+    key1 = ((route_seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    return _philox_uniform(position.to(tl.uint32), key0, key1) < alpha
 
 
 @triton.jit
@@ -75,14 +90,18 @@ def _plan_kernel(
     seeds2_ptr,
     active_ptr,
     keys_ptr,
+    route_ptr,
+    draw_ptr,
     stride_tail,
     stride_drafts,
     stride_ring,
     ring_size,
+    alpha,
     WIDTH: tl.constexpr,
     K: tl.constexpr,
     DEDUPE: tl.constexpr,
     DUAL: tl.constexpr,
+    ROUTE: tl.constexpr,
     SKIP: tl.constexpr,
     BLOCK_RING: tl.constexpr,
 ):
@@ -100,7 +119,14 @@ def _plan_kernel(
     if DUAL:
         key2 = tl.load(keys_ptr + 1).to(tl.uint64)
         seed2 = _context_seed(tail_row, drafts_row, position, key2, WIDTH, K)
-        tl.store(seeds2_ptr + out, seed2.to(tl.int64, bitcast=True))
+        seed2_signed = seed2.to(tl.int64, bitcast=True)
+        tl.store(seeds2_ptr + out, seed2_signed)
+        if ROUTE:
+            # The seed this position is drawn with; `seeds` stays the context's identity, which
+            # the repeat check and the repeat ring compare.
+            index = tl.load(count_ptr + slot) + position
+            use_second = _uses_second_key(tl.load(route_ptr + slot), index, alpha)
+            tl.store(draw_ptr + out, tl.where(use_second, seed2_signed, seed_signed))
     active = tl.load(enabled_ptr + request) != 0
     if SKIP:
         # The first generated tokens of a request stay unwatermarked.
@@ -138,6 +164,8 @@ def plan_windows(
     dual: bool,
     drafts: torch.Tensor | None,
     skip: torch.Tensor | None = None,
+    route_seeds: torch.Tensor | None = None,
+    alpha: float = 0.0,
 ):
     """Seeds and activity of ``B`` windows of ``K + 1`` positions.
 
@@ -152,15 +180,24 @@ def plan_windows(
         dual: whether to also return the seeds of the second key.
         drafts: optional ``[B, K]`` draft tokens the window verifies.
         skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
+        route_seeds: optional ``[rows]`` int64 routing-stream seeds (requires ``dual``). With
+            them, each position is drawn under the first key or, with probability ``alpha``, the
+            second one, see :func:`_uses_second_key`.
+        alpha: the probability of the second key.
 
     Returns:
-        ``(seeds [B, K+1] int64, seeds2 [B, K+1] int64 or None, active [B, K+1] bool)``.
+        ``(seeds [B, K+1] int64, seeds2 [B, K+1] int64 or None, active [B, K+1] bool,
+        draw [B, K+1] int64 or None)``; ``draw`` holds the seed each position is drawn with when
+        routing, ``seeds`` always the first key's.
     """
     batch = slots.shape[0]
     num_drafts = 0 if drafts is None else drafts.shape[1]
     width = tail.shape[1]
     seeds = torch.empty((batch, num_drafts + 1), dtype=torch.int64, device=slots.device)
     seeds2 = torch.empty_like(seeds) if dual else seeds
+    route = route_seeds is not None
+    assert not route or dual, "routing needs the second key"
+    draw = torch.empty_like(seeds) if route else seeds
     active = torch.empty((batch, num_drafts + 1), dtype=torch.int8, device=slots.device)
     if drafts is not None:
         drafts = drafts.to(torch.int64).contiguous()
@@ -176,18 +213,22 @@ def plan_windows(
         seeds2,
         active,
         keys,
+        route_seeds if route else count,
+        draw,
         tail.stride(0),
         drafts.stride(0) if drafts is not None else 0,
         ring.stride(0) if ring is not None else 0,
         ring_size,
+        alpha,
         WIDTH=width,
         K=num_drafts,
         DEDUPE=ring is not None,
         DUAL=dual,
+        ROUTE=route,
         SKIP=skip is not None,
         BLOCK_RING=1024,
     )
-    return seeds, (seeds2 if dual else None), active.to(torch.bool)
+    return seeds, (seeds2 if dual else None), active.to(torch.bool), (draw if route else None)
 
 
 @triton.jit

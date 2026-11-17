@@ -15,7 +15,7 @@
 
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
@@ -42,6 +42,18 @@ class WatermarkConfig(StrictBaseModel):
         "rejection sampling: draft tokens are drawn under the key, and the tokens "
         "that replace rejected drafts (or follow the last accepted one) under a second "
         "key derived from it, which keeps the output distribution exact.",
+    )
+    alpha: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Only for 'gumbel_dual_key'. Probability that a token of ordinary "
+        "(including exact-match speculative) decoding is drawn under the second key instead "
+        "of the first. The choice is made per token from the request's own random stream, so "
+        "requests with the same prompt and key diverge instead of repeating each other; a "
+        "request with a seed reproduces its choices. 0 uses the first key for every such token. "
+        "Speculative decoding with rejection sampling ignores it: the speculative protocol "
+        "selects the key of each token.",
     )
     key: int = Field(
         description="Secret key, an integer in [0, 2**64). Detection needs the same value.",
@@ -92,6 +104,12 @@ class WatermarkConfig(StrictBaseModel):
         "SamplingParams.watermarking=False. Set to False to enforce the watermark "
         "on every request that can carry one.",
     )
+
+    @model_validator(mode="after")
+    def _alpha_needs_dual_key(self) -> "WatermarkConfig":
+        if "alpha" in self.model_fields_set and self.algorithm != "gumbel_dual_key":
+            raise ValueError("alpha only applies to algorithm='gumbel_dual_key'")
+        return self
 
     @field_validator("context_width")
     @classmethod

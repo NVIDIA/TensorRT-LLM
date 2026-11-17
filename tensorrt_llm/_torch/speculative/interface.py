@@ -4389,7 +4389,9 @@ class SpecWorkerBase(nn.Module, ABC):
             watermark_plans = self._plan_watermark(spec_metadata, num_contexts,
                                                    batch_size, draft_tokens)
             planned = [plan for plan in watermark_plans if plan is not None]
-            seeds = torch.cat([plan.seeds.reshape(-1) for plan in planned])
+            seeds = torch.cat([(plan.seeds if plan.draw_seeds is None else
+                                plan.draw_seeds).reshape(-1)
+                               for plan in planned])
             active = torch.cat([plan.active.reshape(-1) for plan in planned])
             assert seeds.shape[0] == num_tokens, (
                 "watermark windows do not match the sampled rows")
