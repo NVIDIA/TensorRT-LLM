@@ -197,6 +197,20 @@ def _n3p_log_once() -> None:
         )
 
 
+# The DSpark worker's drafter hooks that prebuild arms (engine side, DFlashWorker.enable_*). On a TensorRT-LLM
+# without them prebuild sets up nothing: every item it owns stays off and the in-tree DSpark worker paths run.
+_WORKER_HOOKS = (
+    "enable_lean_glue",
+    "enable_fused_ctx_store",
+    "enable_fused_drafter_inputs",
+    "enable_fused_ctx_advance",
+    "enable_fused_block_refresh",
+    "enable_fused_forward_indices",
+    "enable_fused_qk_norm_rope",
+    "enable_fused_kv_rewind",
+)
+
+
 class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
     """The in-tree ``DSparkWorker`` with the calls this target's shell makes on its worker. W1: the one-launch Markov
     chain (``S4WorkerMixin``, switch ``TRTLLM_M31_DISABLE_DRAFT_S4``). N3 A2: the strict acceptance and the next-step
@@ -226,6 +240,13 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         (rank-local) and the N3 A1 workspace and compiles (collective), outside capture, every rank, in this order;
         no fused verify, no coded target head, no fused draft loop."""
         rank = getattr(getattr(self, "mapping", None), "tp_rank", None)
+        missing = [name for name in _WORKER_HOOKS if not hasattr(self, name)]
+        if missing:
+            logger.info(
+                f"M3.1 DSpark: prebuild skipped on rank {rank}: the DSpark worker has no {missing[0]} hook "
+                f"({len(missing)} of {len(_WORKER_HOOKS)} missing); the in-tree DSpark worker paths run"
+            )
+            return None
         # S10: the drafter's strided-view glue (bitwise; kill switch TRTLLM_M31_DISABLE_DRAFTER_LEAN_GLUE, read at
         # import).
         lean = not m31_disabled("DRAFTER_LEAN_GLUE")
