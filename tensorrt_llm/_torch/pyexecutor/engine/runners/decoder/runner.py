@@ -458,6 +458,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
     def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        if self._host_uploader is not None:
+            self._host_uploader.synchronize()
         self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
 
     def wait_for_input_copy(self) -> None:

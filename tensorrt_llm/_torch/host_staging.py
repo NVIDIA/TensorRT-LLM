@@ -125,6 +125,12 @@ class HostUploader:
         self._rings: dict[str, tuple[_UploadSlot, _UploadSlot]] = {}
         self._next: dict[str, int] = {}
 
+    def synchronize(self) -> None:
+        """Finish uploads before the owner releases the pinned staging buffers."""
+        for ring in self._rings.values():
+            for slot in ring:
+                slot.uploaded.synchronize()
+
     def upload(
         self, key: str, value: torch.Tensor, destination: torch.Tensor | None = None
     ) -> torch.Tensor:
