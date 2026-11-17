@@ -210,6 +210,21 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
 
 
+def _max_admissible_sequences(
+    max_batch_size: int,
+    mapping: Mapping,
+    *,
+    is_disagg: bool,
+    disable_overlap_scheduler: bool,
+    gen_preemption_headroom: int = 0,
+) -> int:
+    """Return how many sequences can hold KV at once; see _compute_index_mapper_capacity."""
+    needs_extra_slots = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+    return max_batch_size * mapping.pp_size * (2 if needs_extra_slots else 1) + (
+        gen_preemption_headroom
+    )
+
+
 def _compute_index_mapper_capacity(
     max_batch_size: int,
     mapping: Mapping,
@@ -240,10 +255,13 @@ def _compute_index_mapper_capacity(
     attention Batch hold one.
     """
     assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-    max_num_sequences = max_batch_size * mapping.pp_size
-    needs_extra_index_slots = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
-    max_admissible_sequences = max_num_sequences * (2 if needs_extra_index_slots else 1)
-    max_admissible_sequences += gen_preemption_headroom
+    max_admissible_sequences = _max_admissible_sequences(
+        max_batch_size,
+        mapping,
+        is_disagg=is_disagg,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        gen_preemption_headroom=gen_preemption_headroom,
+    )
     capacity = max_admissible_sequences + num_reserved_index_slots + int(has_guard_page)
     return max_admissible_sequences, capacity
 
@@ -4632,15 +4650,13 @@ class KVCacheManagerV2(BaseResourceManager):
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
             layer_specs=draft_specs,
         )
-        # Sequences that can hold KV at once, as max_admissible_sequences counts them: transfers
-        # in flight (disagg) or the overlap scheduler's retiring request double them, and
-        # requests paused by GEN slot preemption stay resident.
-        needs_extra_leases = self.is_disagg or (
-            not self._disable_overlap_scheduler and not self.mapping.has_pp()
-        )
-        num_sequences = (
-            self.max_batch_size * self.mapping.pp_size * (2 if needs_extra_leases else 1)
-            + self.gen_preemption_headroom
+        # Sequences that can hold KV at once, as max_admissible_sequences counts them.
+        num_sequences = _max_admissible_sequences(
+            self.max_batch_size,
+            self.mapping,
+            is_disagg=self.is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
+            gen_preemption_headroom=self.gen_preemption_headroom,
         )
         draft_bytes = (
             window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
