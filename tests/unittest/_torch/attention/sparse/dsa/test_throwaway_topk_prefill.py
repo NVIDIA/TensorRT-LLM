@@ -41,6 +41,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     Indexer,
     IndexerPrefillChunkMetadata,
+    throwaway_unfused_logits_elem_bound,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_LOGITS_DTYPE_ENV,
@@ -48,6 +49,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_MIN_CONTEXT_ENV,
     ThrowawayPrefillTopK,
     get_throwaway_prefill_topk,
+    throwaway_topk_launch_rows,
     throwaway_topk_logits_dtype,
     throwaway_topk_max_chunk,
     throwaway_topk_min_context,
@@ -511,6 +513,72 @@ def test_query_tiling_matches_reference(monkeypatch, qkv):
 
 @skip_not_sm100
 @pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_full_launch_rows_bind_the_caller_tensors_without_staging(monkeypatch, qkv):
+    """Tiles that fill the launch read Q, weights and Q scales and write the selection in place;
+    only the shorter last tile goes through the staging buffers and the output copy."""
+    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
+    plan = runner._wrapper._capacity_plan
+    staged, direct = [], []
+    real_stage, real_direct = plan._state.stage_payload, plan._run_direct
+
+    def stage_spy(q, *args, **kwargs):
+        staged.append(q.shape[0])
+        return real_stage(q, *args, **kwargs)
+
+    def direct_spy(*args, **kwargs):
+        direct.append(True)
+        return real_direct(*args, **kwargs)
+
+    monkeypatch.setattr(plan._state, "stage_payload", stage_spy)
+    monkeypatch.setattr(plan, "_run_direct", direct_spy)
+    _check("ds_v32", 256, 3000, qkv=qkv, seed=41, runner=runner)
+    assert (staged, len(direct)) == ([], 1)
+    # Two full tiles, then a 188-row tile; the staged buffers hold stale rows from before.
+    _check("ds_v32", 700, 3000, qkv=qkv, seed=42, runner=runner)
+    assert (staged, len(direct)) == ([188], 3)
+    _check("ds_v32", 256, 5000, qkv=qkv, seed=43, runner=runner)
+    assert (staged, len(direct)) == ([188], 4)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_staging_buffers_passed_back_take_the_staged_path(monkeypatch, qkv):
+    """Inputs inside the plan's own storage (here the staging buffers themselves) are not
+    bound in place; the staged path runs them without a copy and gets the same selection."""
+    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
+    num_q, kv_prefix, top_k = 256, 3000, CONFIGS["ds_v32"][1]
+    inputs = _make_inputs("ds_v32", num_q, kv_prefix, 45, qkv)
+    expected = _run(runner, inputs, kv_prefix, top_k)
+    plan = runner._wrapper._capacity_plan
+    state = plan._state
+    q = inputs.q.view(torch.uint8) if qkv == "mxfp4" else inputs.q
+    state.q.copy_(q)
+    state.weights.copy_(inputs.weights)
+    q_scale = None
+    if qkv == "mxfp4":
+        q_scale = plan._q_scale
+        q_scale.copy_(inputs.q_scale.contiguous().view(torch.int32).reshape(q_scale.shape))
+    direct = []
+    real_direct = plan._run_direct
+    monkeypatch.setattr(
+        plan, "_run_direct", lambda *a, **k: direct.append(1) or real_direct(*a, **k)
+    )
+    out = torch.full_like(expected, -2)
+    runner._wrapper.run(
+        state.q,
+        state.weights,
+        runner._k_stage,
+        k_scale=runner._k_scale_stage,
+        out=out,
+        q_scale=q_scale,
+    )
+    assert direct == []
+    # Row order within a selection is not part of the contract.
+    assert torch.equal(out.sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
 def test_plan_is_issued_once_per_chunk_and_reissued_when_the_chunk_changes(monkeypatch, qkv):
     """Layers of one chunk share a plan; a different chunk (or returning to one) needs a new
     plan, and every layer's result stays correct either way."""
@@ -670,6 +738,7 @@ def test_workspace_oom_disables_the_runner(monkeypatch):
     assert len(calls) == 1  # disabled after the first failure
     assert bool((out == -2).all())  # nothing written
     assert runner._k_stage is None  # buffers released
+    assert not runner.ready
 
 
 @skip_not_sm100
@@ -837,13 +906,19 @@ def test_prewarm_builds_the_shared_runner_and_warms_it(
     indexer.compress_ratio = 4
     indexer.use_fp4 = True
     indexer._build_throwaway_topk = Indexer._build_throwaway_topk.__get__(indexer)
-    assert Indexer.prewarm_throwaway_topk(indexer, 1 << 20, torch.device("cuda", 0)) is expected
+    indexer._throwaway_query_rows = Indexer._throwaway_query_rows.__get__(indexer)
+    indexer._indexer_max_chunk_size, indexer._q_split_threshold = None, 8192
+    prewarmed = Indexer.prewarm_throwaway_topk(
+        indexer, 1 << 20, torch.device("cuda", 0), 8448, _mapping(8, 2)
+    )
+    assert prewarmed is expected
     assert runner.warmups == warmups
     if warmups:
         assert built[0]["compress_ratio"] == 4
         assert built[0]["max_context_length"] == 1 << 20
         assert built[0]["qkv_dtype"] == "mxfp4"
         assert built[0]["device"] == torch.device("cuda", 0)
+        assert built[0]["max_query_rows"] == 1056  # this rank's share of a full chunk
         assert indexer._throwaway_topk is runner  # the forward reuses the warmed runner
 
 
@@ -984,6 +1059,138 @@ def test_runner_build_failure_is_cached(monkeypatch):
     assert len(warnings) == 1
 
 
+def test_runner_build_oom_falls_back(monkeypatch):
+    """Running out of memory while allocating the runner's buffers keeps the unfused path."""
+    built, warnings = [], []
+
+    class _TooLarge:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _TooLarge)
+    _fresh_runner_cache(monkeypatch)
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None  # not retried by later chunks
+    assert len(built) == 1
+    assert len(warnings) == 1
+
+
+def test_runner_build_oom_releases_the_partial_build_before_emptying_the_cache(monkeypatch):
+    """The cache is emptied only once the partially built runner has been released."""
+    partial, alive_at_empty_cache = [], []
+
+    class _PartialBuild:
+        def __init__(self, **kwargs):
+            partial.append(weakref.ref(self))
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _PartialBuild)
+    _fresh_runner_cache(monkeypatch)
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", lambda message: None)
+    monkeypatch.setattr(
+        throwaway_topk_module.torch.cuda,
+        "empty_cache",
+        lambda: alive_at_empty_cache.append(partial[0]() is not None),
+    )
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert alive_at_empty_cache == [False]
+
+
+class _ReadyRunner:
+    def __init__(self, compress_ratio=4, num_keys=1 << 18, ready=True):
+        self.compress_ratio = compress_ratio
+        self.num_keys = num_keys
+        self.ready = ready
+
+    def can_run(self, num_k_rows):
+        return 0 < num_k_rows <= self.num_keys
+
+
+def _model_with_indexers(*specs):
+    """A module tree holding Indexers with only the fields the logits bound reads.
+
+    Each spec is ``(enabled, failed, runner, min_context[, local])``; ``local=False`` marks an
+    indexer of another pipeline stage.
+    """
+    model = torch.nn.Module()
+    for i, (enabled, failed, runner, min_context, *local) in enumerate(specs):
+        indexer = Indexer.__new__(Indexer)
+        torch.nn.Module.__init__(indexer)
+        # Layers of other pipeline stages keep their modules but not their parameters.
+        indexer.wq_b = SimpleNamespace(weight=torch.empty(0) if local != [False] else None)
+        indexer._use_throwaway_topk = enabled
+        indexer._throwaway_topk_failed = failed
+        indexer._throwaway_topk = runner
+        indexer._throwaway_topk_min_context = min_context
+        model.add_module(f"indexer{i}", indexer)
+    return model
+
+
+_MAX_SEQ_LEN = 1 << 20  # 1M tokens, 256K compressed keys at ratio 4
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,expected",
+    [
+        # 8192 rows x (64K + 8K) / 4 keys = 151M elements; below the 2^28 packed cap.
+        (8192, 1 << 28),
+        # 32768 rows x (64K + 32K) / 4 keys = 768M elements; above the packed cap.
+        (32768, 32768 * (((1 << 16) + 32768) // 4)),
+    ],
+)
+def test_unfused_logits_bound_covers_short_and_packed_chunks(max_num_tokens, expected):
+    model = _model_with_indexers(
+        (True, False, _ReadyRunner(), 1 << 16), (True, False, _ReadyRunner(), 1 << 16)
+    )
+    # One decode token: 256K keys, far below the prefill terms.
+    bound = throwaway_unfused_logits_elem_bound(model, max_num_tokens, _MAX_SEQ_LEN, 1)
+    assert bound == expected
+
+
+def test_unfused_logits_bound_caps_prefill_terms_at_the_full_tile():
+    model = _model_with_indexers((True, False, _ReadyRunner(compress_ratio=1), 1 << 16))
+    # 64 rows x 4096 tokens = 262144 elements, below the short-context term.
+    assert throwaway_unfused_logits_elem_bound(model, 64, 4096, 1) == 64 * 4096
+
+
+def test_unfused_logits_bound_covers_decode_logits():
+    """Decode logits are not tiled by the budget, so they bound the reserve from below."""
+    model = _model_with_indexers((True, False, _ReadyRunner(), 1 << 16))
+    # 2048 decode tokens x (256K compressed keys + column padding), above the 2^28 prefill term.
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 2048) == 2048 * (
+        (1 << 18) + indexer_module._PAGED_LOGITS_COLUMN_SLACK
+    )
+
+
+def test_unfused_logits_bound_ignores_indexers_of_other_pipeline_stages():
+    """Indexers of other stages have no runner on this rank and allocate no logits here."""
+    model = _model_with_indexers(
+        (True, False, _ReadyRunner(), 1 << 16), (True, False, None, 1 << 16, False)
+    )
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 1) == 1 << 28
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        [],  # no DSA indexer
+        [(False, False, None, 0)],  # fused path not requested
+        [(True, True, None, 0)],  # runner build failed
+        [(True, False, None, 0)],  # runner not built yet (e.g. no profiling run)
+        [(True, False, _ReadyRunner(ready=False), 0)],  # workspace not allocated / disabled
+        [(True, False, _ReadyRunner(num_keys=1024), 0)],  # keys of long chunks do not fit
+        [(True, False, _ReadyRunner(), 0), (True, True, None, 0)],  # one layer failed
+        [(True, False, _ReadyRunner(), 0), (False, False, None, 0)],  # one layer stays unfused
+        [(False, False, None, 0, False)],  # only indexers of other pipeline stages
+    ],
+)
+def test_unfused_logits_bound_needs_a_ready_runner_on_every_layer(specs):
+    model = _model_with_indexers(*specs)
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 32) is None
+
+
 def _chunk_metadata(cached, new_tokens, compress_ratio):
     """Host-side fields of the attention metadata that prepare_one_prefill_chunk reads."""
 
@@ -1055,3 +1262,36 @@ def test_dispatch_slices_fp4_query_scales_with_the_rows():
     )
     assert handled is True
     assert torch.equal(runner.calls[0][7], q_scale[5:10])
+
+
+def test_launch_rows_follow_the_full_chunk_rows(monkeypatch):
+    monkeypatch.delenv(THROWAWAY_MAX_CHUNK_ENV, raising=False)
+    assert throwaway_topk_launch_rows(64, None) == 8192  # unknown chunk rows: the cap
+    assert throwaway_topk_launch_rows(64, 4096) == 4096
+    assert throwaway_topk_launch_rows(64, 1056) == 1056
+    assert throwaway_topk_launch_rows(64, 16384) == 8192  # larger chunks run in tiles
+    assert throwaway_topk_launch_rows(64, 1057) == 1060  # whole row tiles of 4 rows
+    assert throwaway_topk_launch_rows(32, 1003) == 1008  # 8 rows
+    assert throwaway_topk_launch_rows(4, 100) == 128  # 64 rows
+    monkeypatch.setenv(THROWAWAY_MAX_CHUNK_ENV, "2048")
+    assert throwaway_topk_launch_rows(64, 4096) == 2048
+
+
+def _mapping(tp_size, tp_rank=0, attention_dp=False):
+    return SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, enable_attention_dp=attention_dp)
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,chunk_size,mapping,rows",
+    [
+        (4096, None, None, 4096),
+        (4096, None, _mapping(8), 4096),  # below the split threshold: every rank has all rows
+        (4096, 2048, _mapping(1), 2048),  # the indexer chunk size bounds a chunk
+        (8448, None, _mapping(8, 3), 1056),  # split over the attention-TP ranks
+        (8450, None, _mapping(8, 7), 1057),
+        (8448, None, _mapping(8, 3, attention_dp=True), 8448),
+    ],
+)
+def test_throwaway_query_rows(max_num_tokens, chunk_size, mapping, rows):
+    indexer = SimpleNamespace(_indexer_max_chunk_size=chunk_size, _q_split_threshold=8192)
+    assert Indexer._throwaway_query_rows(indexer, max_num_tokens, mapping) == rows

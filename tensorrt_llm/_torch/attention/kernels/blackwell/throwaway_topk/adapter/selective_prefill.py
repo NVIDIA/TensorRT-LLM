@@ -188,6 +188,8 @@ class _CapacitySelectiveTopKPlan:
         self._metadata_flags = torch.empty(256, device=device, dtype=torch.int32)
         self._metadata_compiled = None
         self._metadata_args = {}
+        # Per pool key: the stage arguments that view a staging buffer (see _direct_slots_for).
+        self._direct_slots = {}
         self._cache_protected_ranges()
 
     def _refresh_schedules(self):
@@ -381,6 +383,7 @@ class _CapacitySelectiveTopKPlan:
             self._k_scale = None
             self._engines.clear()
             self._metadata_args.clear()
+            self._direct_slots.clear()
             self._engine = None
             self._keys = self._scales = None
             self._template_engine = self._template_keys = self._template_scales = None
@@ -615,6 +618,10 @@ class _CapacitySelectiveTopKPlan:
                     raise RuntimeError("prepare each K/k_scale binding before capture")
                 self.prepare_pool(kv_fused)
             self._engine = self._engines[key]
+            targets = None if capturing else self._direct_targets(q, out, selected)
+            if targets is not None:
+                self._run_direct(kv_fused, key, targets, copies[1:])
+                return out
             self._state.stage_payload(q, weights, copies)
             self._check_caller_capture(capturing, "layer payload copies")
             self._prepare_layer_inputs(kv_fused, key)
@@ -624,3 +631,104 @@ class _CapacitySelectiveTopKPlan:
                 out.copy_(selected)
                 self._check_caller_capture(capturing, "layer output copy")
         return selected if out is None else out
+
+    def _direct_targets(self, q, out, selected):
+        """Pair the Q and selection staging buffers with the caller tensors, or return None.
+
+        Every stage reads Q from ``state.q`` and writes the selection to ``selected`` by
+        address. A caller tensor with the staging buffer's shape, dtype and contiguous layout
+        can stand in for it, which saves the two large copies of a layer (Q in, selection
+        out). Only steps that supply the full staged row extent qualify: the stages address
+        every staged row. Weights and Q scales stay staged; they are small and the metadata
+        kernel binds them at preparation.
+        """
+        state = self._state
+        if out is None or q.shape[0] != state.q.shape[0]:
+            return None
+        pairs = ((state.q, q), (selected, out))
+        for staging, target in pairs:
+            if (
+                target.shape != staging.shape
+                or target.dtype != staging.dtype
+                or not target.is_contiguous()
+                or target.data_ptr() % 16
+            ):
+                return None
+        from bisect import bisect_left
+        from ._topk_runtime import _byte_range, _overlap
+
+        # The stages write plan-owned scratch, so Q must not alias it. ``out`` was checked
+        # against the plan storage and the inputs by the caller.
+        bounds = _byte_range(q)
+        index = bisect_left(self._protected_ranges, (bounds[1],))
+        if index > 0 and _overlap(bounds, self._protected_ranges[index - 1]):
+            return None
+        return pairs
+
+    def _direct_slots_for(self, key, stagings):
+        """Locate the stage arguments that view a staging buffer.
+
+        Returns one tuple per stage of ``(argument index, staging index, dtype, shape,
+        stride, element offset)`` for each argument whose bytes lie inside a staging buffer.
+        The engine of a pool key never changes its arguments, so the result is cached per key.
+        """
+        slots = self._direct_slots.get(key)
+        if slots is not None:
+            return slots
+        from ._topk_runtime import _byte_range, _overlap
+
+        ranges = [_byte_range(staging) for staging in stagings]
+        slots = []
+        for _, stage in self._engine.stages:
+            stage_slots = []
+            for index, arg in enumerate(stage.arguments.args):
+                if not isinstance(arg, torch.Tensor) or not arg.numel():
+                    continue
+                bounds = _byte_range(arg)
+                for which, (begin, end) in enumerate(ranges):
+                    if begin <= bounds[0] and bounds[1] <= end:
+                        offset = bounds[0] - begin
+                        if offset % arg.element_size():
+                            raise RuntimeError("misaligned view of a staging buffer")
+                        stage_slots.append(
+                            (
+                                index,
+                                which,
+                                arg.dtype,
+                                tuple(arg.shape),
+                                arg.stride(),
+                                offset // arg.element_size(),
+                            )
+                        )
+                        break
+                    if _overlap(bounds, (begin, end)):
+                        raise RuntimeError("stage argument partially overlaps a staging buffer")
+            slots.append(tuple(stage_slots))
+        slots = tuple(slots)
+        self._direct_slots[key] = slots
+        return slots
+
+    def _run_direct(self, kv_fused, key, targets, small_copies):
+        """Run the stages with the caller's Q and selection bound in place of the staging."""
+        state = self._state
+        if self._q_scale is not None:
+            small_copies = (
+                *small_copies,
+                (self._q_scale[: state.q.shape[0]], state.q_scale_input),
+            )
+        state._copy_inputs(small_copies)
+        slots = self._direct_slots_for(key, tuple(staging for staging, _ in targets))
+        typed = {}
+        self._prepare_layer_inputs(kv_fused, key)
+        for (_, stage), stage_slots in zip(self._engine.stages, slots, strict=True):
+            args = stage.arguments.args
+            if stage_slots:
+                args = list(args)
+                for index, which, dtype, shape, stride, offset in stage_slots:
+                    view = typed.get((which, dtype))
+                    if view is None:
+                        target = targets[which][1]
+                        view = target if target.dtype == dtype else target.view(dtype)
+                        typed[(which, dtype)] = view
+                    args[index] = view.as_strided(shape, stride, view.storage_offset() + offset)
+            stage.compiled_fn(*args, **stage.arguments.kwargs)

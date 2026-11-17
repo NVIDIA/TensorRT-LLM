@@ -36,12 +36,20 @@ def get_indexer_mqa_logits_elem_budget() -> int:
 
 
 def get_indexer_mqa_logits_workspace_bytes(
-    max_num_tokens: Optional[int] = None, max_seq_len: Optional[int] = None
+    max_num_tokens: Optional[int] = None,
+    max_seq_len: Optional[int] = None,
+    max_tile_elems: Optional[int] = None,
 ) -> int:
-    """Return the reachable maximum bytes for one FP32 MQA-logits tile."""
+    """Return the reachable maximum bytes for one FP32 MQA-logits tile.
+
+    ``max_tile_elems`` caps the tile further when the caller knows a tighter bound on the chunks
+    that reach the MQA-logits kernel.
+    """
     elem_budget = get_indexer_mqa_logits_elem_budget()
     if max_num_tokens is not None and max_seq_len is not None:
         elem_budget = min(elem_budget, max_num_tokens * max_seq_len)
+    if max_tile_elems is not None:
+        elem_budget = min(elem_budget, max_tile_elems)
     return elem_budget * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
 
 
