@@ -1,6 +1,56 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # AGENTS.md — tests
 
 Scope: this directory and everything under it. Supplements the repo-root `AGENTS.md`.
+
+## Test value and execution placement
+
+Before adding tests, review each case (including parameterized variants) and
+record in the PR:
+
+- Which regression do its assertions catch?
+- What coverage does it add beyond existing tests?
+- Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
+  check, and why is that frequency worth its setup and execution cost?
+
+Keep focused, reliable regression coverage in pre-merge CI; justify expensive
+or broad coverage there instead of registering every new test automatically.
+Use post-merge or QA for coverage suited to those schedules. Keep one-time
+investigation checks out of recurring CI unless they protect a lasting
+regression. Prune redundant cases or extend existing tests while preserving
+meaningful boundaries and failure modes. Follow the
+[unit-test coverage guidance](unittest/AGENTS.md#coverage-and-execution-cost)
+when comparing cases and parameter matrices.
+
+## Build test helpers before the test stage
+
+For CI tests that need native test helpers or executables, build them in the
+build stage and consume matching artifacts in the test stage. Do not introduce
+ad hoc compiler, CMake, or extension builds in pytest collection, fixtures, or
+test bodies merely to prepare a helper. Reuse the existing build targets and
+artifact flow; for C++ tests, see the repository-root
+[C++ test build guidance](../AGENTS.md#ci--testing).
+
+Keep intentional runtime compilation when it is part of the behavior under
+test (for example, a JIT kernel), and account for its cost when choosing the CI
+layer. Preserve explicit local/source-build workflows; these are not a reason
+to rebuild ordinary test helpers on every CI test node.
 
 ## Whether a new test runs in CI
 
