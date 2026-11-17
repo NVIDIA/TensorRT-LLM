@@ -1260,6 +1260,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.max_num_active_requests = 2
         executor._release_transfer = MagicMock()
         executor._kv_connector_config.transfer_timeout_sec = 0.05
+        executor._num_embeddings = 1234
         executors.append(executor)
     if outcome != "empty":
         executors[1].kv_connector_manager.request_finished(_request(42), [3])
@@ -1408,6 +1409,7 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.max_num_active_requests = 2
         executor._release_transfer = MagicMock()
         executor._terminate_request = MagicMock()
+        executor._num_embeddings = 1234
         executors.append(executor)
 
     owner = executors[loading_rank]
