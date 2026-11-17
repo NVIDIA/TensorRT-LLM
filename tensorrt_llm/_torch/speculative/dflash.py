@@ -882,7 +882,7 @@ class DFlashWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.mapping = mapping
         self._guided_draft_loop = bool(
-            getattr(spec_config, "_guided_draft_loop", self._guided_draft_loop)
+            getattr(spec_config, "guided_draft_loop", self._guided_draft_loop)
         )
         self._resolved_mask_token_id = None
         self._resolved_block_size = None

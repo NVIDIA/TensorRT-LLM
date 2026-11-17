@@ -4393,10 +4393,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
-    # Internal, for benchmarking: with guided decoding and rejection sampling,
-    # draft the block one position at a time under the grammar mask instead of
-    # sampling it unmasked. Not part of the public config.
-    _guided_draft_loop: bool = PrivateAttr(False)
+    guided_draft_loop: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, with guided decoding and rejection sampling, draft the block "
+        "one position at a time under the grammar mask instead of sampling it "
+        "unmasked. This raises acceptance length but costs a host round trip "
+        "per draft position, which lowers throughput in the measured cases. "
+        "Output is grammar-valid either way, because the target step always "
+        "applies the grammar.")
 
     mask_token_id: Optional[int] = Field(
         default=None,

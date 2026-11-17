@@ -507,7 +507,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.mapping = mapping
         self._guided_draft_loop = bool(
-            getattr(spec_config, "_guided_draft_loop", self._guided_draft_loop)
+            getattr(spec_config, "guided_draft_loop", self._guided_draft_loop)
         )
 
         # Per-slot rolling captured-context KV windows, built lazily on the
