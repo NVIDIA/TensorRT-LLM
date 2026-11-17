@@ -147,6 +147,7 @@ def vc_token_permutation(
     iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     init_centroids: torch.Tensor | None = None,
+    grouped_tokens: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Group similar value rows by k-means per batch and head, then argsort the labels.
 
@@ -158,8 +159,34 @@ def vc_token_permutation(
     A cold start uses one set of seed rows for every batch element and head.
     The rows come from ``generator`` or without one from the fixed rows of
     ``VC_KMEANS_SEED``. No element's grouping depends on the others.
+    ``grouped_tokens=(start, stop)`` groups only that token range. In a joint
+    sequence the range holds the video tokens. The other tokens follow in input
+    order. A text or audio key grouped with the video keys would precede the
+    long video tail in the rows attending to it. That tail would round to zero
+    against the row maximum.
     """
     b, s, h, d = v.shape
+    if grouped_tokens is not None:
+        start, stop = grouped_tokens
+        if not 0 <= start < stop <= s:
+            raise ValueError(
+                "grouped_tokens must be a non-empty range within the sequence"
+            )
+        perm, centroids = vc_token_permutation(
+            v[:, start:stop],
+            num_clusters=num_clusters,
+            iters=iters,
+            generator=generator,
+            init_centroids=init_centroids,
+        )
+        rest = torch.cat(
+            [
+                torch.arange(start, device=v.device),
+                torch.arange(stop, s, device=v.device),
+            ]
+        )
+        perm = torch.cat([perm + start, rest.expand(b, h, -1)], dim=-1)
+        return perm, centroids
     if num_clusters is None:
         num_clusters = VC_KMEANS_CLUSTERS
     # Seeding draws distinct value rows, so a short sequence caps the clusters.
@@ -434,9 +461,11 @@ class VCAttentionPreprocessor:
         # A rewind of the denoise step starts a new generation for every grouping.
         self._generation = 0
         self._last_step: int | None = None
-        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, last refresh
-        # step, generation.
-        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
+        # Per (batch, seq_len_k, num_kv_heads, grouped token range): perm,
+        # centroids, last refresh step, generation.
+        self._groupings: dict[
+            tuple[int, int, int, tuple[int, int] | None], dict[str, Any]
+        ] = {}
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -447,6 +476,7 @@ class VCAttentionPreprocessor:
         *,
         q: torch.Tensor | None = None,
         denoise_step: tuple[int, int] | None = None,
+        grouped_tokens: tuple[int, int] | None = None,
         mode: str | None = None,
     ) -> VCAttentionOperands:
         """Return the operands of one run for ``[B, S, H, D]`` bf16 K/V, and Q
@@ -454,7 +484,11 @@ class VCAttentionPreprocessor:
 
         ``denoise_step`` is the sampler's ``(step_index, num_steps)``. Kept
         out of torch.compile so the step index and the k-means refresh do not
-        recompile the caller per step.
+        recompile the caller per step. ``grouped_tokens=(start, stop)`` groups
+        only that token range. In a joint sequence the range holds the video
+        tokens. The other tokens follow in input order. ``None`` groups the
+        whole sequence. Outside the smooth window no tile means are subtracted.
+        A shape with no grouping yet keeps the input order there.
         ``mode`` names the step kind outright for a CUDA graph runner that
         replays one graph per kind. ``cold`` regroups from the seed rows,
         ``warm`` refreshes from the current centroids, ``keep`` demeans on the
@@ -462,7 +496,14 @@ class VCAttentionPreprocessor:
         the step in the bookkeeping. A missing grouping starts cold in every
         mode.
         """
-        key = (k.shape[0], k.shape[1], k.shape[2])
+        if grouped_tokens is not None:
+            start, stop = grouped_tokens
+            if not 0 <= start < stop <= k.shape[1]:
+                raise ValueError(
+                    "grouped_tokens must be a non-empty range within the sequence"
+                )
+            grouped_tokens = (int(start), int(stop))
+        key = (k.shape[0], k.shape[1], k.shape[2], grouped_tokens)
         entry = self._groupings.get(key)
         smooth = True
         cold = refresh = entry is None
@@ -500,6 +541,7 @@ class VCAttentionPreprocessor:
                     num_clusters=self.kmeans_clusters,
                     iters=self.kmeans_iters,
                     init_centroids=None if cold else entry["centroids"],
+                    grouped_tokens=grouped_tokens,
                 )
                 step = (
                     None
