@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The pinned public GSM8K protocol: items, prompt, request fields and scorer.
+"""The pinned public Beam GSM8K protocol: items, prompt, request fields and scorer.
 
 The protocol evaluates the first N questions (1 <= N <= 1319, default 100) of the
 ``openai/gsm8k`` ``main`` test split, in original split order, at a pinned dataset revision.
@@ -42,7 +42,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-PROTOCOL_ID = "gsm8k-first100-public-v1"
+PROTOCOL_ID = "beam-gsm8k-first100-public-v1"
 
 DATASET_ID = "openai/gsm8k"
 DATASET_CONFIG = "main"

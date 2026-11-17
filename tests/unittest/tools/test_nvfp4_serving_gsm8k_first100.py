@@ -33,7 +33,7 @@ from gsm8k_eval import protocol, records  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 # Change only together with a new PROTOCOL_ID and a regenerated manifest.json.
-PROTOCOL_DEFINITION_SHA256 = "9a0730c17d2a7c265dea42e15160043251e8bb3fb74060f09b8d1f148622a0be"
+PROTOCOL_DEFINITION_SHA256 = "1b20973ebed2049625b91f48ef2b6ed7d2089a8787d32765737faa921b632e02"
 
 
 # ------------------------------------------------------------------------------------ scorer

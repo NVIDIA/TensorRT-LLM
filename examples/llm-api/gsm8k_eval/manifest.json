@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "protocol": {
-  "id": "gsm8k-first100-public-v1",
+  "id": "beam-gsm8k-first100-public-v1",
   "dataset": {
    "id": "openai/gsm8k",
    "config": "main",

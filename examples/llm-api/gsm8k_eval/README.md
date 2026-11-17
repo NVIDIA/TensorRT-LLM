@@ -80,7 +80,8 @@ from); 130 when interrupted.
 
 ## Protocol
 
-The protocol id is `gsm8k-first100-public-v1`; `gsm8k_eval/manifest.json` freezes it.
+The Beam-specific protocol id is `beam-gsm8k-first100-public-v1`;
+`gsm8k_eval/manifest.json` freezes its settings, including `reasoning_effort: 128`.
 
 - Selection: test rows `0..N-1` in the original split order; question ids are `test-0000` to
   `test-1318`. The first 100 rows, the ten exemplars and every prompt digest are pinned by the
@@ -128,7 +129,9 @@ The output directory receives:
 Running again with the same output directory and the same settings resumes the run: completed
 replies are kept and never asked again, failed attempts stay recorded and their questions are
 asked again, and an interrupted last line is moved aside. A different protocol, selection,
-endpoint or configuration is refused; use a fresh output directory.
+endpoint or configuration is refused; use a fresh output directory. Results recorded under
+the previous `gsm8k-first100-public-v1` identifier must also use a fresh output directory
+with this version; the renamed protocol preserves the same prompts, requests and scoring.
 
 The replies of one run all come from one served model. Before its first request, each attempt
 records the model it asks: the `--served-model-name`, or else the only model that `/v1/models`
