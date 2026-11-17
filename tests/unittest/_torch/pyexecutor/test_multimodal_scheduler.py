@@ -1414,6 +1414,20 @@ def test_wrapper_forwards_async_transfer_manager_to_v2(scheduler_cls) -> None:
     assert inner._stalled_schedules == 1
 
 
+def test_wrapper_forwards_ctx_demote_threshold() -> None:
+    assert _scheduler(max_batch_size=1, max_num_tokens=10).ctx_demote_uncached_tokens == 0
+
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=0,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+    )
+    scheduler.scheduler._ctx_demote_uncached_tokens = 7
+    # PyExecutor reads this to decide whether the router publishes uncached-prefill estimates.
+    assert scheduler.ctx_demote_uncached_tokens == 7
+
+
 @pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
 @pytest.mark.parametrize("prompt_len", [11, 15, 19, 20, 21, 25, 29])
 def test_prepared_v2_windows_finish_with_one_item_of_output_capacity(scheduler_cls, prompt_len):

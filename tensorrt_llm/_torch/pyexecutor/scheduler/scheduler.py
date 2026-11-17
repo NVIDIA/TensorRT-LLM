@@ -414,6 +414,11 @@ class RequestScheduler(ABC):
         default is a no-op.
         """
 
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
+
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
         decoder-tail hold passes, and requests whose final window was held."""
@@ -786,6 +791,10 @@ class MultimodalScheduler(RequestScheduler):
 
     def set_async_transfer_manager(self, mgr) -> None:
         self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()
