@@ -43,6 +43,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-groups]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded-mxfp4]
   - unittest/_torch/misc/test_autotuner.py::test_rank_disagreeing_cache_does_not_deadlock
   - test_unittests.py::test_csa2_tensor_parallel
   # MegaMoE serving path, online expert placement and combine tactics on four ranks.
