@@ -153,6 +153,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
+    from tensorrt_llm.visual_gen.output import VisualGenOutput
 
 
 def _is_visual_gen_instance(obj) -> bool:
@@ -914,6 +915,17 @@ class OpenAIServer(_VideoRoutesMixin):
         self.media_storage_path = _resolve_media_dir()
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
+        self._image_edit_tasks: set[asyncio.Task["VisualGenOutput"]] = set()
+
+    def _on_image_edit_task_done(self,
+                                 task: "asyncio.Task[VisualGenOutput]") -> None:
+        """Retire an edit's generation task and observe any late failure."""
+        self._image_edit_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(f"Background image edit generation failed: {error!r}")
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
@@ -4130,11 +4142,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                # Offload the blocking resolve/enqueue off the event loop but
-                # await it (bad params → 400 here); then await generation.
-                handle = await asyncio.to_thread(self.generator.generate_async,
-                                                 request.prompt, params)
-                output = await handle.aresult()
+
+                async def _submit_and_wait() -> "VisualGenOutput":
+                    handle = await asyncio.to_thread(
+                        self.generator.generate_async, request.prompt, params)
+                    return await handle.aresult()
+
+                # Keep ownership across both awaits even if the request goes
+                # away: generation cannot be cancelled, so consume its result.
+                task = asyncio.create_task(_submit_and_wait())
+                self._image_edit_tasks.add(task)
+                task.add_done_callback(self._on_image_edit_task_done)
+                output = await asyncio.shield(task)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:

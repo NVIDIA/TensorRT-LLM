@@ -18,15 +18,18 @@ in OpenAIServer.register_visual_gen_routes():
 
 import asyncio
 import base64
+import gc
 import json
 import os
 import tempfile
 import threading
 import time
+import weakref
+from collections.abc import Generator
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from unittest.mock import patch
 
 import httpx
@@ -42,7 +45,11 @@ from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
-from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import (
+    VisualGenParams,
+    prepare_reference_slots,
+    validate_visual_gen_params,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1141,15 +1148,15 @@ class TestImageEdit:
 
     def _client(
         self,
-        tmp_path,
-        monkeypatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         *,
         image_output: Optional[torch.Tensor] = None,
         extra_param_specs: Optional[dict] = None,
         model: str = "Qwen/Qwen-Image-Layered",
         should_fail: bool = False,
         supports_image_edit: bool = True,
-    ):
+    ) -> tuple[TestClient, MockVisualGen]:
         gen = self._generator(
             image_output=image_output,
             extra_param_specs=extra_param_specs,
@@ -1591,7 +1598,9 @@ class TestImageEdit:
 
     @pytest.mark.threadleak(enabled=False)  # generate_async runs on a worker thread
     @pytest.mark.asyncio
-    async def test_image_edit_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+    async def test_image_edit_does_not_block_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """While an edit generates, the loop still answers other requests.
 
         The handler must submit the edit off the event loop and await the
@@ -1607,7 +1616,9 @@ class TestImageEdit:
         returned = threading.Event()
         original = gen.generate_async
 
-        def _blocking_generate_async(inputs=None, params=None):
+        def _blocking_generate_async(
+            inputs: str | None = None, params: VisualGenParams | None = None
+        ) -> MockVisualGenResult:
             entered.set()
             try:
                 # Models a long generation; self-releases so a failure cannot
@@ -1656,8 +1667,8 @@ class TestImageEdit:
     @pytest.mark.threadleak(enabled=False)  # the gated result waits on a worker thread
     @pytest.mark.asyncio
     async def test_image_edit_waits_for_its_result_without_blocking_the_event_loop(
-        self, tmp_path, monkeypatch
-    ):
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """While an edit waits for its result, the loop still answers other requests.
 
         Submission returns at once here, and the handle resolves only after
@@ -1676,14 +1687,14 @@ class TestImageEdit:
         class _GatedResult:
             """Result handle whose generation finishes once ``/health`` has answered."""
 
-            def __init__(self, inner: MockVisualGenResult):
+            def __init__(self, inner: MockVisualGenResult) -> None:
                 self.request_id = inner.request_id
                 self._inner = inner
 
-            def __await__(self):
+            def __await__(self) -> Generator[object, None, VisualGenOutput]:
                 return self.aresult().__await__()
 
-            async def aresult(self, timeout=None) -> VisualGenOutput:
+            async def aresult(self, timeout: float | None = None) -> VisualGenOutput:
                 waiting.set()
                 try:
                     await asyncio.to_thread(health_answered.wait, 5)
@@ -1691,7 +1702,7 @@ class TestImageEdit:
                 finally:
                     resolved.set()
 
-            def result(self, timeout=None) -> VisualGenOutput:
+            def result(self, timeout: float | None = None) -> VisualGenOutput:
                 waiting.set()
                 try:
                     # Self-releases so a handler that blocks the loop here
@@ -1701,7 +1712,9 @@ class TestImageEdit:
                 finally:
                     resolved.set()
 
-        def _gated_generate_async(inputs=None, params=None) -> _GatedResult:
+        def _gated_generate_async(
+            inputs: str | None = None, params: VisualGenParams | None = None
+        ) -> _GatedResult:
             return _GatedResult(original(inputs=inputs, params=params))
 
         monkeypatch.setattr(gen, "generate_async", _gated_generate_async)
@@ -1737,6 +1750,124 @@ class TestImageEdit:
             "resolved: openai_image_edit waits for generation on the event "
             "loop. Await handle.aresult() instead of calling handle.result()."
         )
+
+    @pytest.mark.threadleak(enabled=False)  # edit submission uses a worker thread
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_at", ["submit", "aresult", "timeout", None])
+    @pytest.mark.parametrize("fails", [False, True], ids=["success", "result-error"])
+    async def test_image_edit_consumes_result_after_cancellation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        cancel_at: Literal["submit", "aresult", "timeout"] | None,
+        fails: bool,
+    ) -> None:
+        """A cancelled edit still owns its submission and eventual result.
+
+        Only weak references escape the pending result: forcing GC while it
+        waits also checks that the server retains the generation task. Both a
+        late output and a late failure must be consumed without an unobserved
+        task exception, and the completed task must not stay on the server.
+        """
+        gen = self._generator(should_fail=fails)
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        entered = threading.Event()
+        release_submit = threading.Event()
+        waiting = asyncio.Event()
+        consumed = asyncio.Event()
+        futures: list[weakref.ReferenceType[asyncio.Future[None]]] = []
+        tasks: list[weakref.ReferenceType[asyncio.Task[VisualGenOutput]]] = []
+        original = gen.generate_async
+
+        class _PendingResult:
+            def __init__(self, inner: MockVisualGenResult) -> None:
+                self._inner = inner
+
+            async def aresult(self, timeout: float | None = None) -> VisualGenOutput:
+                future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                task = asyncio.current_task()
+                assert task is not None
+                futures.append(weakref.ref(future))
+                tasks.append(weakref.ref(task))
+                waiting.set()
+                await future
+                consumed.set()
+                return await self._inner.aresult(timeout=timeout)
+
+        def _submit(
+            inputs: str | None = None, params: VisualGenParams | None = None
+        ) -> _PendingResult:
+            entered.set()
+            if cancel_at == "submit":
+                assert release_submit.wait(5), "submission gate was never released"
+            return _PendingResult(original(inputs=inputs, params=params))
+
+        monkeypatch.setattr(gen, "generate_async", _submit)
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        unobserved: list[dict[str, object]] = []
+
+        def _exception_handler(
+            _loop: asyncio.AbstractEventLoop, context: dict[str, object]
+        ) -> None:
+            unobserved.append(context)
+
+        loop.set_exception_handler(_exception_handler)
+        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/images/edits",
+                json={
+                    "prompt": "split layers",
+                    "image": _b64_white_png_1x1(),
+                    "response_format": "b64_json",
+                },
+            )
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            if cancel_at != "submit":
+                await asyncio.wait_for(waiting.wait(), 5)
+            if cancel_at == "timeout":
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(request_task, timeout=0.01)
+            elif cancel_at is not None:
+                request_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(request_task, 5)
+            release_submit.set()
+            await asyncio.wait_for(waiting.wait(), 5)
+            gc.collect()
+            future = futures[0]()
+            assert future is not None and not future.cancelled(), (
+                "cancelling the edit lost or cancelled its result waiter"
+            )
+            future.set_result(None)
+            del future
+            await asyncio.wait_for(consumed.wait(), 5)
+            if cancel_at is None:
+                response = await asyncio.wait_for(request_task, 5)
+                assert response.status_code == (500 if fails else 200)
+            # Flush the task's completion callbacks before checking lifetime.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            gc.collect()
+            generation_task = tasks[0]()
+            if cancel_at is not None:
+                assert generation_task is None, "server retained a completed edit task"
+            del generation_task
+            assert not unobserved, unobserved
+        finally:
+            release_submit.set()
+            for reference in futures:
+                future = reference()
+                if future is not None and not future.done():
+                    future.set_result(None)
+            if not request_task.done():
+                request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            await client.aclose()
+            loop.set_exception_handler(previous_handler)
 
 
 # =========================================================================
