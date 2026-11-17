@@ -8,7 +8,7 @@ import pytest
 import torch
 from _kimi_k3_mla_cache_env import LATENT, LatentCache
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.load_chunked_kv_cache_for_mla import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.load_chunked_kv_cache_for_mla import (  # noqa: E501
     load_chunked_kv_cache_for_mla as op,
 )
 

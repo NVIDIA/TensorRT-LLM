@@ -70,7 +70,7 @@ R = None
 T = None  # the target module
 DM = None  # its decode_moe module
 # The family's MoE block, which the target module imports.
-_FAMILY_MOE = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.moe"
+_FAMILY_MOE = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.moe"
 
 
 def _gen(seed):
@@ -384,7 +384,7 @@ def _run_one_rank(args) -> int:
     import importlib
 
     T = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
     )
     DM = T._decode_moe

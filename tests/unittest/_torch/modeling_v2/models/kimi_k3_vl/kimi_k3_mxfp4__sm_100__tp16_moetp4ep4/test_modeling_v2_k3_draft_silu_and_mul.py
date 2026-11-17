@@ -18,7 +18,7 @@ if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
     pytest.skip("k3_draft_silu_and_mul is certified on sm_100 and sm_103", allow_module_level=True)
 
 k3_draft_silu_and_mul = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.activation.k3_draft_silu_and_mul"
 ).k3_draft_silu_and_mul
 

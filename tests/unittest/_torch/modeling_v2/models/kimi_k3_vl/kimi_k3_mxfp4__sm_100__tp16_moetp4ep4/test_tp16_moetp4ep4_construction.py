@@ -6,7 +6,7 @@ family's MoE block's, ``test_kimi_k3_moe.py``.)"""
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 __extra_import_path__ = [".."]
 from _kimi_k3_construction import (  # noqa: E402, F401
@@ -16,10 +16,10 @@ from _kimi_k3_construction import (  # noqa: E402, F401
 )
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         modeling as target,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         spec_worker,
     )
 except NoTarget as no_target:

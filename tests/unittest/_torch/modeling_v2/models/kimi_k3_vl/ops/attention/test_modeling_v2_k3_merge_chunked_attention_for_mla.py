@@ -6,7 +6,7 @@ two partials, per request's merge op (copy, merge, skip); rows a skipped request
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.merge_chunked_attention_for_mla import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.merge_chunked_attention_for_mla import (  # noqa: E501
     merge_chunked_attention_for_mla as op,
 )
 

@@ -188,11 +188,9 @@ def _compare_all(tag, seed0, symbols, fusions):
 def check_structure():
     """K3AllReduce is the runtime module, without an MNNVL all-reduce here, on the mapping's IPC workspace."""
     global STOCK, NEW
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import (
-        K3AllReduce,
-    )
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
     from tensorrt_llm.functional import AllReduceStrategy
 
     _spy_on_symbols()

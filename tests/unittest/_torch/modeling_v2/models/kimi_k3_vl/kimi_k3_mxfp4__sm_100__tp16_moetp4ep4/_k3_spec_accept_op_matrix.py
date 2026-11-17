@@ -98,7 +98,7 @@ def _run_one_rank(args) -> int:
     R = ls.Rank(args)
     import test_modeling_v2_k3_spec_accept as one_gpu
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_spec_accept import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_spec_accept import (  # noqa: E501
         op,
     )
 

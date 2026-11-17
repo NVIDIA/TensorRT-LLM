@@ -81,7 +81,7 @@ def _decode_moe_layer():
     )
     with torch.device("cuda"):
         gate = importlib.import_module(
-            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.moe"
+            "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.moe"
         ).KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16)
         down = nn.Linear(H, LATENT, bias=False, dtype=torch.bfloat16)
         up = nn.Linear(LATENT, H, bias=False, dtype=torch.bfloat16)
@@ -381,7 +381,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     dc.start_rank(args)
     modeling = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling"
     )
     return dc.run_matrix(

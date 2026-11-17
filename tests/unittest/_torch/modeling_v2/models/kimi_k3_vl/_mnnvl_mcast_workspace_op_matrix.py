@@ -144,7 +144,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, mcast
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
 
     mcast = mnnvl_workspace
     return ls.run_checks(R, CHECKS)

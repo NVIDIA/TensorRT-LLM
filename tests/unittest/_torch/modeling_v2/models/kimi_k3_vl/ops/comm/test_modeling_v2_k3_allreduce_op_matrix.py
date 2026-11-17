@@ -30,9 +30,7 @@ if torch.cuda.device_count() < _rank_job.WORLD_SIZE:
 
 def _mnnvl_available() -> bool:
     """The condition the modules take MNNVL on with the MNNVL strategy named, which the check's MNNVL half needs."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import (
-        mnnvl_supported,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import mnnvl_supported
     from tensorrt_llm.mapping import Mapping
 
     world = _rank_job.WORLD_SIZE

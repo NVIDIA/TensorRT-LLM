@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_k3_family_native_ops():
-    package = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+    package = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
     for target in (
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4",
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1",
@@ -55,7 +55,7 @@ def test_k3_family_native_ops():
 
 def test_k3_attn_res_fakes_match_real_ops():
     """The fakes of the unfused, add + RMSNorm and persistent attn_res ops report the real ops' shapes and dtypes."""
-    ops = load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    ops = load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
     torch.manual_seed(0)
     residual = torch.randn((3, 1, 7168), device="cuda", dtype=torch.bfloat16)
     blocks = torch.randn((2, 3, 1, 7168), device="cuda", dtype=torch.bfloat16)
@@ -119,7 +119,7 @@ def test_k3_mnnvl_fusion_allreduce_fake_outputs():
     """The fake returns, per fusion op, the outputs ``k3MnnvlFusionAllReduce`` allocates, in its order."""
     from tensorrt_llm.functional import AllReduceFusionOp as F
 
-    ops = load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    ops = load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
     tokens, hidden = 3, 7168
     x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(x)
@@ -169,7 +169,7 @@ def test_k3_mnnvl_fusion_allreduce_fake_outputs():
 def test_mnnvl_allgather_split_fake_outputs():
     """The fake returns ``mnnvlAllGatherSplit``'s two outputs: bf16 [tokens, world * bf16_columns] and fp32
     [tokens, world * (columns - bf16_columns)]."""
-    ops = load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    ops = load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
     comm_buffer = torch.empty((3, 1024), device="cuda", dtype=torch.float32)
     flags = torch.zeros((9,), device="cuda", dtype=torch.uint32)
     for tokens, columns, bf16_columns, world in ((1, 24, 16, 4), (8, 72, 64, 16), (3, 8, 0, 4)):
@@ -185,7 +185,7 @@ def test_mnnvl_allgather_split_fake_outputs():
 def test_mnnvl_allreduce_attn_res_fake_outputs():
     """The fake returns ``mnnvlAllReduceAttnRes``'s two outputs, the normed output and the updated prefix sum, each
     of ``input``'s shape and dtype; with and without ``prefix_sum``."""
-    ops = load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    ops = load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
     tokens, hidden = 4, 7168
     x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     blocks = torch.randn((2, tokens, hidden), device="cuda", dtype=torch.bfloat16)

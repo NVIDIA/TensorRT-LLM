@@ -22,19 +22,16 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    NoTarget,
-    modeling_v2_resolve,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget, modeling_v2_resolve
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import (
     drafter_config,
     engine_settings,
     environment,
     routing,
 )
-from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (
@@ -57,7 +54,7 @@ pytestmark = pytest.mark.cpu_only
 _DUMMY_MODEL = "/tmp/dummy_model"
 # A speculative mode no target implements.
 _NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 def _qualified(target) -> str:
@@ -377,10 +374,10 @@ def test_kimi_k3_route_and_the_targets_apply_the_same_settings_predicates(
     """``route`` and the target's ``_check_construction`` check the model config's settings only through the same
     function of the family's ``engine_settings``: patched to refuse, it declines a deployment both otherwise take;
     patched to accept, it lets through a deployment that fails only its check, so neither caller has its own copy."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         modeling as modeling_a,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
         modeling as modeling_b,
     )
 
@@ -607,10 +604,10 @@ def test_kimi_k3_dspark_drafter_with_only_kv_cache_quantization_matches(tmp_path
 def test_kimi_k3_dspark_drafters_refuse_a_quantized_draft_config(tmp_path, drafter):
     """The drafter constructors refuse the draft config the engine builds for a quantized checkpoint, with the
     message ``route`` declines it with."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         drafter as gqa,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         drafter_mla as mla,
     )
 
@@ -671,7 +668,7 @@ def test_kimi_k3_route_and_the_drafters_apply_the_same_predicates(
 ):
     """``route`` and the drafter constructors read the drafter config through the same functions of the family's
     ``drafter_config``: one patched to refuse is seen by both, and the constructor raises what it raises for it."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         drafter,
         drafter_mla,
     )
@@ -697,7 +694,7 @@ def test_kimi_k3_route_and_the_drafters_apply_the_same_predicates(
 def test_kimi_k3_route_and_the_mla_drafter_read_the_same_rope(tmp_path, monkeypatch):
     """The MLA drafter's RoPE check: ``route`` and the drafter's ``rope_params`` read the RoPE settings through
     ``drafter_config``'s functions."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         drafter_mla,
     )
 
@@ -973,7 +970,7 @@ def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_exper
     ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, the family MoE block's own copy,
     which it builds the experts in, and the quant of the ids each target honors."""
     module_path, class_name = target.rsplit(".", 1)
-    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
+    module = importlib.import_module(f"tensorrt_llm._torch.modeling_v2.{module_path}")
     family_moe = importlib.import_module(f"{_FAMILY}.moe")
     assert family_moe._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
     loaded = ModelConfig._declared_moe_quants(
@@ -1092,8 +1089,8 @@ _ROUTE_IN_A_FRESH_PROCESS = textwrap.dedent(
 
     from transformers import PretrainedConfig
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import routing
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, TorchLlmArgs
     from tensorrt_llm.mapping import Mapping

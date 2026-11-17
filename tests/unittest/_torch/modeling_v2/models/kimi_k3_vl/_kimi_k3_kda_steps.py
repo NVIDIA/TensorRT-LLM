@@ -29,7 +29,7 @@ import torch
 __extra_import_path__ = ["."]  # this file's own import of its neighbour _kimi_k3_parity
 from _kimi_k3_parity import assert_bitwise  # noqa: E402
 
-PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+PACKAGE = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 HEADS = 6
 HIDDEN = 7168
 HEAD_DIM = 128

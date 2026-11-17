@@ -173,6 +173,7 @@ class MockBenchmarkExecutor:
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
         self._benchmark_transfer_progress_global = False
         self._benchmark_completed_gen_transfer_ids = set()
+        self._benchmark_first_token_finished_ids = set()
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.max_num_active_requests = max_num_active_requests

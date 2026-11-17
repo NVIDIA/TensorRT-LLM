@@ -138,7 +138,7 @@ def _make_inputs(
     decode_query_len=1,
     topk=MSA_REQUIRED_TOPK,
     seed=0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (q, k_paged, v_paged, topk_idx, block_table, seq_lens), in that order.
 
     The order matches both the kernel wrapper and the oracle, so a test can

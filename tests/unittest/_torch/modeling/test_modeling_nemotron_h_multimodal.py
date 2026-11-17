@@ -428,9 +428,7 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
     prompt_pattern = reference_results[modality][condition]["prompt_pattern"]
     assert prompt_pattern in final_prompt, f"{final_prompt=} is not expected."
 
-    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-        inputs[0], sampling_params=None
-    )
+    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(inputs[0], None)
 
     # Check the output of the input processor.
     prompt_token_ids_length = len(prompt_token_ids)

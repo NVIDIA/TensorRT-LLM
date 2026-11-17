@@ -37,7 +37,7 @@ _needs_cute = pytest.mark.skipif(
 )
 
 _mla = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention.k3_dspark_mla"
 )
 k3_dspark_rmsnorm_rope = _mla.k3_dspark_rmsnorm_rope

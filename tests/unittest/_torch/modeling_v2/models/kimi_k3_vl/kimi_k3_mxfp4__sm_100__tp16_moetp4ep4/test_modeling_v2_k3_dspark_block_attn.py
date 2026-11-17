@@ -29,7 +29,7 @@ if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
     pytest.skip("k3_dspark_block_attn is certified on sm_100 and sm_103", allow_module_level=True)
 
 _attn = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention.k3_dspark_block_attn"
 )
 k3_dspark_block_attn = _attn.k3_dspark_block_attn

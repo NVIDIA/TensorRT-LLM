@@ -11,7 +11,7 @@ test_modeling_v2_attn_res_rmsnorm_fwd.py.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_fwd import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_fwd import (
     attn_res_add_rmsnorm_fwd,
 )
 

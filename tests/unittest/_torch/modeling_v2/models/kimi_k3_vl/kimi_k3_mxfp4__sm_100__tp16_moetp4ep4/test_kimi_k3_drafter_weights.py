@@ -18,13 +18,13 @@ import pytest
 import torch
 from transformers import PretrainedConfig, Qwen3Config
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     drafter as target_drafter,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     drafter_mla as target_drafter_mla,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import TensorParallelMode, load_weight_shard
 from tensorrt_llm.mapping import Mapping
 

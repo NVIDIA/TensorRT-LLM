@@ -31,23 +31,23 @@ from typing import List
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     K3MlaGeometry,
     k3_mla_decode_view,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_vb_out import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_vb_out import (
     _attention_reference,
     k3_mla_attn,
     k3_mla_attn_out,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_vb_out import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_vb_out import (
     k3_mla_attn_vb_out as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_workspace import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_workspace import (
     K3MlaAttnWorkspace,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -88,7 +88,7 @@ def _no_cluster(num_requests: int, heads: int) -> bool:
     fit on the SMs at once."""
     import cuda.bindings.driver as cuda_driver
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
         k3_mla_attn_kernel as kernel,
     )
 
@@ -210,7 +210,7 @@ class _MlaCache:
         self.mgr.shutdown()
 
 
-def _inputs(seed: int, m: int, heads: int):
+def _inputs(seed: int, m: int, heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """q (fused_q rows), the v_b weight and the gate (sigmoid values at GATE_COL0 + 128 h)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     q = (torch.randn(m, heads * DQK, generator=gen, device="cuda") * 0.5).bfloat16()
@@ -270,7 +270,7 @@ def _max_rel(a, b, tokens: int) -> float:
 
 def _counters(workspace: K3MlaAttnWorkspace) -> torch.Tensor:
     """The no-cluster arrival counters, [8 requests, groups, 2] (the (m, l) exchange's and the drain's)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
         k3_mla_attn_kernel as kernel,
     )
 

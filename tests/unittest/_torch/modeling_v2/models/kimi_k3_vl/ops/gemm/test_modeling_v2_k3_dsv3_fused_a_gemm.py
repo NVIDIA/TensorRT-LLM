@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_fused_a_gemm import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm,
 )
 

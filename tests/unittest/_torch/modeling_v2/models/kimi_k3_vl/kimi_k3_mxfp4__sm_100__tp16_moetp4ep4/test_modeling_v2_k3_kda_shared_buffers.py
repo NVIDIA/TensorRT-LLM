@@ -18,10 +18,8 @@ import importlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
-    K3KdaBuffers,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import K3KdaBuffers
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
     k3_kda_decode_attn,
 )
 
@@ -29,7 +27,7 @@ __extra_import_path__ = ["../ops/ssm"]
 import _kda_cells as kc
 
 k3_kda_attn = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_attn"
 ).k3_kda_attn
 

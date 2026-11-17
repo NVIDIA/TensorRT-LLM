@@ -12,11 +12,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm as BuiltinRMSNorm
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import norm
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import norm
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

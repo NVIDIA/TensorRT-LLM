@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.mamba.layernorm_gated  # noqa: F401  (registers the comparison op)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.rms_norm_gated_token_major import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major,
 )
 

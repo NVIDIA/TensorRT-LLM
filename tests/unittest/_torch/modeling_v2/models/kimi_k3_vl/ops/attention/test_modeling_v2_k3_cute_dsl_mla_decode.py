@@ -12,7 +12,7 @@ import pytest
 import torch
 from _kimi_k3_mla_cache_env import LATENT, PAGE, ROPE, ROW, LatentCache
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (
     cute_dsl_mla_decode as cute,
 )
 

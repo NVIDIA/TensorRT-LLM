@@ -28,21 +28,21 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     drafter as target_drafter,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     drafter_mla as target,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention import (  # noqa: E501
     k3_dspark_mla,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
     pytest.skip("the MLA DSpark drafter's kernels are certified on sm_100", allow_module_level=True)
-if k3_dspark_mla.mla_decode_unavailability_reason() is not None:
-    pytest.skip(k3_dspark_mla.mla_decode_unavailability_reason(), allow_module_level=True)
+# The CUTEDSL drafter needs the CuTe DSL MLA decode; the VANILLA and TRTLLM drafters do not.
+_CUTEDSL_REASON = k3_dspark_mla.mla_decode_unavailability_reason()
 
 from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM  # noqa: E402
 
@@ -132,6 +132,8 @@ def _load(cls, backend="CUTEDSL"):
 
 @pytest.fixture(scope="module")
 def pair():
+    if _CUTEDSL_REASON is not None:
+        pytest.skip(f"CUTEDSL needs the CuTe DSL MLA decode: {_CUTEDSL_REASON}")
     return SimpleNamespace(new=_load(target.K3MLADSparkDrafter), old=_load(MLADSparkForCausalLM))
 
 
@@ -392,13 +394,12 @@ def _arena(batch, block, seed):
 
 @pytest.mark.parametrize("backend", ["CUTEDSL", "VANILLA", "TRTLLM"])
 @pytest.mark.parametrize("split", [(1, 7), (3, 8)], ids=str)
-def test_arena_block_matches_main(pair, vanilla_pair, request, backend, split):
+def test_arena_block_matches_main(request, backend, split):
     """Without a page table every backend decodes eagerly over the arena, as the built-in drafter does."""
     if backend == "TRTLLM" and _TRTLLM_REASON is not None:
         pytest.skip(f"TRTLLM needs flashinfer's MLA decode: {_TRTLLM_REASON}")
-    drafters = {"CUTEDSL": pair, "VANILLA": vanilla_pair}.get(backend) or request.getfixturevalue(
-        "trtllm_pair"
-    )
+    fixture = {"CUTEDSL": "pair", "VANILLA": "vanilla_pair", "TRTLLM": "trtllm_pair"}[backend]
+    drafters = request.getfixturevalue(fixture)
     assert drafters.new._block_decode_variant(False) == "eager"
     inputs = _arena(*split, seed=split[0] * 10 + split[1] + 11)
     old_inputs = dict(inputs, ctx_k_cache=inputs["ctx_k_cache"].clone())

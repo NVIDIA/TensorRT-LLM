@@ -16,14 +16,14 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 __extra_import_path__ = ["."]
 import _kimi_k3_mla_steps as ms  # noqa: E402
 from _kimi_k3_parity import assert_bitwise, assert_within  # noqa: E402
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mla, step
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mla, step
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

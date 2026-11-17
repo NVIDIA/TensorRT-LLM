@@ -7,10 +7,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import (  # noqa: E501
-    bmm_out as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out as op  # noqa: E501
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above

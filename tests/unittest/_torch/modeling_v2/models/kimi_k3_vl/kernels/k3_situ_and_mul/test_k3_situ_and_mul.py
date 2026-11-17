@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.situ  # noqa: F401  (registers trtllm::situ_and_mul, the comparison)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
     situ_and_mul,
 )
 

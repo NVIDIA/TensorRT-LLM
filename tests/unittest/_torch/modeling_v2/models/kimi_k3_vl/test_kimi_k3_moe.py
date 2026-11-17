@@ -25,15 +25,15 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import moe as family_moe
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import moe as family_moe
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

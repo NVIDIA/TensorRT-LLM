@@ -1651,7 +1651,7 @@ def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) 
         )
 
     engine._dummy_requests = SimpleNamespace(
-        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens),
+        create_warmup_request=lambda _resources, tokens, _gen: batch(tokens, guided=True),
         release_batch_context=lambda requests, _resources: _released_batch(requests),
     )
 

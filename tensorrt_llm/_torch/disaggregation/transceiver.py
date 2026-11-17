@@ -363,6 +363,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
     _gen_idle_poll_skip: bool = False
     _gen_idle_agreed: bool = False
+    # Helix GEN idle probe; _init_sync_policy sets the instance value.
+    _gen_idle_probe: bool = False
     _gen_deferred_receives: int = 0
     _pending_rank_info_admissions: Optional[dict[int, tuple[LlmRequest, Optional[str]]]] = None
     _rank_info_start_failures: Optional[dict[int, LlmRequest]] = None
@@ -634,16 +636,50 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The PP loop does not, so _check_compatible rejects attention-DP
             # with both helix CP and pp_size > 1.
             #
-            # Non-DP tp x cp gathers over the world behind the same predicate and
-            # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # Non-DP TP x CP gathers over the world. Its scheduling loop aligns
+            # admission over both TP and CP before entering receive_gen_init.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
             self._gen_need_sync = m.world_size > 1
             self._gen_allgather = self._dist.allgather
         self._init_gen_idle_poll(self._gen_idle_poll_skip_applies(m, self._gen_need_sync))
+        self._gen_idle_probe = self._gen_idle_probe_applies(m, self._gen_need_sync)
+
+    @staticmethod
+    def _gen_idle_probe_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle non-blocking status poll is decided by one int64 allgather.
+
+        For context parallelism (helix), where the idle-poll skip does not
+        apply: without attention DP and with one PP stage the status consensus
+        spans the world, which is the TP x CP group the int64 allgather spans,
+        so every rank takes the same branch. The probe is a collective every
+        round, so ranks one round apart never split on entering one.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and mapping.cp_size > 1
+            and mapping.world_size == mapping.tp_size * mapping.cp_size
+        )
+
+    def _any_rank_has_recv_sessions(self) -> bool:
+        """Whether any rank of the group has a receive in progress.
+
+        Counts what the full consensus would act on, as the idle-poll skip does
+        (_consensus_outcome's local_session_count): sessions, receives admitted
+        but not started yet, RankInfo admissions that start their session only
+        inside _poll_rank_info_admissions, and coordinated start failures.
+        """
+        local = (
+            len(self._recv_sessions)
+            + self._gen_deferred_receives
+            + len(self._pending_rank_info_admissions or {})
+            + len(self._rank_info_start_failures or {})
+        )
+        counts = self._dist.tp_cp_allgather_int64([local])
+        return bool(counts.any())
 
     def _dp_group_allgather(self, obj):
         """Allgather over the CP ranks, then the PP ranks, of this DP group.
@@ -1869,6 +1905,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # Zero sessions on every rank last round and no receive requested
             # since (that clears the flag on all ranks in the same iteration):
             # this round's consensus would be empty everywhere.
+            return GenTransferStatus([], [], [])
+        if (
+            self._gen_idle_probe
+            and at_least_request_num == 0
+            and not self._any_rank_has_recv_sessions()
+        ):
+            # No receive session on any rank: the consensus would gather empty
+            # lists and return three empty lists without side effects. Only the
+            # non-blocking poll is short-circuited; blocking and at-least-N
+            # calls keep their pacing.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0

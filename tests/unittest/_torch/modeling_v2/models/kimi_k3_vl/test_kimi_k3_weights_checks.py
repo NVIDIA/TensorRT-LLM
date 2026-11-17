@@ -11,10 +11,10 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import moe, weights
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import moe, weights
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

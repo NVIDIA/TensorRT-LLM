@@ -7,10 +7,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-    op as ctm_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import op as ctm_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
 

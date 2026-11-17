@@ -19,7 +19,7 @@ __extra_import_path__ = ["../../.."]
 from _validating import validating  # noqa: E402
 
 k3_spec_accept = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_spec_accept"
 ).k3_spec_accept
 

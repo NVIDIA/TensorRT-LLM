@@ -18,7 +18,7 @@ if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
     pytest.skip("k3_dspark_markov_chain is certified on sm_100 and sm_103", allow_module_level=True)
 
 _op = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_dspark_markov_chain"
 )
 k3_dspark_markov_chain = _op.k3_dspark_markov_chain
@@ -116,7 +116,7 @@ def test_new_row_counts_reuse_the_compiled_kernels(tp_size, tp_rank, expected) -
     which the pair offsets, the slot count and the pair-buffer row stride are and are not multiples of 16. After the
     first row count, the other row counts compile no new variant of the chain's kernels."""
     kern = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_dspark_markov_chain.k3_dspark_markov_chain_kernel"
     )
     n_cols, rank, block = 32 * 2048, 8, 2

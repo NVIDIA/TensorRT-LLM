@@ -18,16 +18,14 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401  (registers the shared torch.ops.trtllm.* comparison ops)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_fwd import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_fwd import (
     attn_res_add_rmsnorm_fwd,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_persistent_fwd import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_persistent_fwd import (  # noqa: E501
     attn_res_add_rmsnorm_persistent_fwd,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import (
-    attn_res_fwd,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
     attn_res_rmsnorm_fwd,
 )
 

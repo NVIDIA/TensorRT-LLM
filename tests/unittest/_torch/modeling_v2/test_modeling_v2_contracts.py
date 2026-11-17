@@ -18,7 +18,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-_ROOT = Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/_experimental/modeling_v2"
+_ROOT = Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/modeling_v2"
 
 
 def _entry_files() -> list[Path]:
@@ -165,7 +165,6 @@ def _target_code(target_dir: Path) -> list[Path]:
         (
             "tensorrt_llm",
             "_torch",
-            "_experimental",
             "modeling_v2",
             *family_dir.relative_to(_ROOT).parts,
         )

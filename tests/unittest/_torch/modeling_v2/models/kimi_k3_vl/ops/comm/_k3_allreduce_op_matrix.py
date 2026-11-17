@@ -72,10 +72,8 @@ def _same(a, b) -> bool:
 
 
 def _modules(strategy):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import (
-        K3AllReduce,
-    )
     from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
 
     stock = AllReduce(mapping=R.mapping, strategy=strategy, dtype=torch.bfloat16)
     new = K3AllReduce(R.mapping, strategy, torch.bfloat16)
@@ -97,9 +95,7 @@ def _check_plain(stock, new, rows_list, seed0, tag, wide=None):
 
 def _shared_workspace_state():
     """The mapping's shared MNNVL workspace as this rank sees it: buffer address, bytes per buffer, flag words."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
-        mnnvl_workspace as mcast,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace as mcast
 
     torch.cuda.synchronize()
     ws = mcast.shared_lamport_workspace(R.mapping, torch.bfloat16)
@@ -109,14 +105,12 @@ def _shared_workspace_state():
 def check_mnnvl_structure():
     """Over MNNVL K3AllReduce is the runtime module with the family's MNNVL all-reduce in its slot, and building it
     does not rebuild, resize or re-arm the mapping's shared workspace."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import (
-        K3AllReduce,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
-        K3MnnvlAllReduce,
-    )
     from tensorrt_llm._torch.distributed import AllReduce
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+        K3MnnvlAllReduce,
+    )
     from tensorrt_llm.functional import AllReduceStrategy
 
     global MNNVL_STOCK, MNNVL_NEW
@@ -211,7 +205,7 @@ def check_mnnvl_plain_decode_ceiling():
     from torch import nn
 
     dc = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.decode_comm"
     )
     holder = nn.ModuleList([MNNVL_STOCK, MNNVL_NEW])

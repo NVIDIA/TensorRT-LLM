@@ -5,10 +5,10 @@ kernels take (``_attn_res_max_tokens``)."""
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import attn_res, step
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import attn_res, step
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

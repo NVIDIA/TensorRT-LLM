@@ -42,10 +42,8 @@ def sm100() -> bool:
 def load_ops():
     """Register the C++ ops and the K3 KDA CuTe DSL ops; return the k3_kda_attn op module (its constants)."""
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-        op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_verify import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_verify import (
         op as _verify,  # noqa: F401
     )
 

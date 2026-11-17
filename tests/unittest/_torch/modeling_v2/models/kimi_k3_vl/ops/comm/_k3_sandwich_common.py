@@ -432,7 +432,7 @@ def _chain_heads(seq) -> set:
 def armed_and_sized(ws) -> None:
     """``create`` returned this rank's view of a buffer sized for the group (two halves of [8 tokens][W ranks][7168]
     bf16 as int32 words), every word empty, every counter zero."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
         k3_sandwich_kernel as kernel,
     )
 
@@ -475,7 +475,7 @@ def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
     capture, its peers saying another rank cannot. No rank reaches the allocation in either case (the counted
     multicast allocation, which the workspaces in use went through), each rank frees the communicator made for it, no
     stream is left capturing, and the workspace in use is untouched: the next call is correct."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
 
     assert ALLOCATIONS[0] > 0, "the counter did not see the workspaces in use being created"
     before = ALLOCATIONS[0]

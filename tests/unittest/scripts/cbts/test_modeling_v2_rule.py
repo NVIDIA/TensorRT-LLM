@@ -28,7 +28,7 @@ from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim, _kept_entries
 
 pytestmark = pytest.mark.cpu_only
 
-_PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PY = "tensorrt_llm/_torch/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)"
 _COMM = "unittest/_torch/modeling_v2/comm"
@@ -248,7 +248,8 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         "test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py",
     }
     assert collective_tests <= expected, collective_tests - expected
-    # The tests whose kernels are certified on sm_100 only (B300 is sm_103): one B200.
+    # The tests that run on the targets' SM (sm_100; B300 is sm_103): one B200. Their kernels are certified on
+    # sm_100 only, except the parity test of the family's attention-residual CUDA against the built-in ops.
     sm100_tests = {
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py",
@@ -256,6 +257,7 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         "ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py",
         "ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py",
         "ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py",
+        "ops/norm/test_attn_res_v1_parity.py",
         "test_kimi_k3_mla_steps.py",
     }
     # The all-reduce off MNNVL: four x86 B200 (GB300 has MNNVL).

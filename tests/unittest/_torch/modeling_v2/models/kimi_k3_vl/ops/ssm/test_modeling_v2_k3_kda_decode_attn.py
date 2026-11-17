@@ -24,17 +24,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
     CTAS,
     FUSED_CTAS,
     K3KdaBuffers,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
     k3_kda_decode_attn,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import (
-    kda_decode,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import kda_decode
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

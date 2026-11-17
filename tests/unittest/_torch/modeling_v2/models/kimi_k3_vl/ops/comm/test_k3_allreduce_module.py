@@ -7,15 +7,13 @@ MNNVL) and ``test_modeling_v2_k3_allreduce_fallback_op_matrix.py`` (off MNNVL)."
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.distributed import AllReduce
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import (
-        K3AllReduce,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 

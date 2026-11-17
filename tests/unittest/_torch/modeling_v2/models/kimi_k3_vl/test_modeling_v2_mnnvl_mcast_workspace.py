@@ -12,7 +12,7 @@ import torch
 
 import tensorrt_llm._torch.distributed.ops as ops
 import tensorrt_llm._utils as utils
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace as mcast
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace as mcast
 
 pytestmark = pytest.mark.cpu_only
 

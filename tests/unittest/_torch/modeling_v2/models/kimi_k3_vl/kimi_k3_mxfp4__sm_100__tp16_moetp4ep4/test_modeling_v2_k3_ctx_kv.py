@@ -18,7 +18,7 @@ import torch
 __extra_import_path__ = ["../../.."]
 from _validating import validating
 
-_TARGET = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4"
+_TARGET = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4"
 k3_ctx_kv = importlib.import_module(f"{_TARGET}.ops.attention.k3_ctx_kv").k3_ctx_kv
 _kernel_op = importlib.import_module(f"{_TARGET}.kernels.k3_ctx_kv.op")
 

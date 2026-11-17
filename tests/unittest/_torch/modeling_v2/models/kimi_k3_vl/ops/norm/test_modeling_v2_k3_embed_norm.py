@@ -16,9 +16,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.k3_embed_norm import (
-    k3_embed_norm,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_embed_norm import k3_embed_norm
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

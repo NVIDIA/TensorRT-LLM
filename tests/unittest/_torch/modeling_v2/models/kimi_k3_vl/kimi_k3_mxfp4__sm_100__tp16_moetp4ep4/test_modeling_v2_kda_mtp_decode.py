@@ -32,7 +32,7 @@ import _kda_cells as kc
 from _validating import validating
 
 kda_mtp_decode = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.kda_mtp_decode"
 ).kda_mtp_decode
 

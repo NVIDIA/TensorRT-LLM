@@ -14,7 +14,7 @@ import _kda_cells as kc
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_reset_state_rows import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_reset_state_rows import (
     kda_reset_state_rows,
 )
 

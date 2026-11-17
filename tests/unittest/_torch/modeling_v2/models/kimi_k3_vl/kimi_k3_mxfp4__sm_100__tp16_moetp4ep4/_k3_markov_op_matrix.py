@@ -227,10 +227,10 @@ CHECKS = [check_cells, check_is_valid_rejects]
 def _run_one_rank(args) -> int:
     global R, OP, WORKSPACE, W1, W2, validating
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_markov.op import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_markov.op import (  # noqa: E501
         markov_workspace,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_markov import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_markov import (  # noqa: E501
         k3_markov,
     )
 

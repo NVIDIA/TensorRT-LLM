@@ -34,7 +34,7 @@ TOL_OUT, TOL_STATE = 4e-2, 2e-3
 
 @pytest.fixture(scope="module")
 def buffers():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
         K3KdaBuffers,
     )
 

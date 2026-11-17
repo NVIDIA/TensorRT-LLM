@@ -29,7 +29,7 @@ if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
     )
 
 _attn = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention.k3_dspark_dense_block_attn"
 )
 k3_dspark_dense_block_attn = _attn.k3_dspark_dense_block_attn
