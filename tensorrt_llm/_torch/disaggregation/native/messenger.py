@@ -132,7 +132,7 @@ class FrameSigner:
     MIN_KEY_SIZE = 16
     # Flow is the socket direction, not a role: requests travel DEALER to
     # ROUTER and replies ROUTER to DEALER. Together with sender and recipient
-    # ids it stops a frame from being reflected back the way it came.
+    # ids it makes a message signed for one direction fail in the other.
     FLOW_TO_ROUTER = 0
     FLOW_TO_DEALER = 1
 
@@ -235,9 +235,8 @@ class ZMQMessenger(MessengerInterface):
     """ZMQ socket wrapper used by the native transfer control plane.
 
     Messages are unauthenticated unless a ``signer`` is supplied. Passing
-    ``signer=None`` is an explicit opt-out: never bind a signer-less ROUTER on a
-    non-loopback address, because any host that can reach the port can then
-    forge every control message.
+    ``signer=None`` is an explicit opt-out: messages are then sent and accepted
+    without authentication.
 
     With a signer, only ROUTER and DEALER modes are supported. Every outgoing
     message gets ``[header, mac]`` appended, and every incoming message is
@@ -254,10 +253,10 @@ class ZMQMessenger(MessengerInterface):
     """
 
     # Bounds on routing ids remembered for replies and on replay state.
-    # Entries are added only after a MAC verifies, so an unauthenticated sender
-    # cannot grow them. Evicting the replay state of a long-idle peer socket
-    # forgets its last seq, so its earlier messages would be accepted again;
-    # forged frames still fail the MAC.
+    # Entries are added only after a MAC verifies, so messages that fail
+    # verification do not add any. Evicting the replay state of a long-idle
+    # peer socket forgets its last seq, so its earlier messages would be
+    # accepted again; messages without a valid MAC are still rejected.
     _MAX_PEER_IDS = 4096
     _MAX_REPLAY_STATE = 4096
     _AUTH_WARNING_INTERVAL_S = 10.0
@@ -436,8 +435,8 @@ class ZMQMessenger(MessengerInterface):
         )
 
     def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
-        # Drop the frame and keep listening: stopping here would let one forged
-        # frame take the listener down. Never log frame contents or keys.
+        # Drop the message and keep listening: one rejected message must not
+        # stop the listener. Never log frame contents or keys.
         self.auth_failures += 1
         now = time.monotonic()
         if now - self._last_auth_warning >= self._AUTH_WARNING_INTERVAL_S:

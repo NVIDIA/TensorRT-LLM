@@ -187,7 +187,7 @@ def test_frame_signer_round_trip():
 
 
 @pytest.mark.parametrize("index", [0, 1, 2])
-def test_frame_signer_rejects_tampered_payload(index):
+def test_frame_signer_rejects_modified_payload(index):
     message = _signed([b"AUX_AGENT_RESULT", b"1", b"23"])
     message[index] += b"x"
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
@@ -219,7 +219,7 @@ def test_frame_signer_rejects_dropped_or_appended_frames():
         ({"recipient_id": b"someone-else"}, "MAC mismatch"),
         ({"flow": FrameSigner.FLOW_TO_DEALER}, "other flow"),
     ],
-    ids=["wrong_key", "wrong_context", "wrong_recipient", "reflected"],
+    ids=["wrong_key", "wrong_context", "wrong_recipient", "other_flow"],
 )
 def test_frame_signer_rejects_mismatched_verifier(verifier_kwargs, match):
     with pytest.raises(FrameAuthenticationError, match=match):
@@ -228,7 +228,7 @@ def test_frame_signer_rejects_mismatched_verifier(verifier_kwargs, match):
 
 def test_frame_signer_rejects_rewritten_header_fields():
     message = _signed([b"CANCEL_SESSION", b"1234"])
-    message[-2] = message[-2][: -len(b"sender")] + b"spoofd"
+    message[-2] = message[-2][: -len(b"sender")] + b"SENDER"
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         _verify(message)
 
@@ -358,7 +358,7 @@ def test_signed_router_bounds_reply_targets_and_adds_them_after_verification(
         assert third.receive(timeout_ms=1000) == [b"reply"]
 
 
-def test_signed_listener_drops_forged_messages_and_keeps_running(signed_pair):
+def test_signed_listener_drops_messages_failing_verification_and_keeps_running(signed_pair):
     router, dealer = signed_pair
     received = []
     router.start_listener(received.append)
@@ -370,9 +370,9 @@ def test_signed_listener_drops_forged_messages_and_keeps_running(signed_pair):
         identity="tcp://127.0.0.1:40002",
     )
     try:
-        unsigned.send([b"KV_AGENT_RESULT", b"forged"])
+        unsigned.send([b"KV_AGENT_RESULT", b"unsigned"])
         wrong_key.send([b"KV_AGENT_RESULT", b"wrong key"])
-        dealer.send([b"KV_AGENT_RESULT", b"genuine"])
+        dealer.send([b"KV_AGENT_RESULT", b"signed"])
         deadline = time.monotonic() + 5
         while (not received or router.auth_failures < 2) and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -383,7 +383,7 @@ def test_signed_listener_drops_forged_messages_and_keeps_running(signed_pair):
         # Stop the listener inside the test body; thread-leak checks run
         # before fixture teardown.
         router.stop()
-    assert [message[1:] for message in received] == [[b"KV_AGENT_RESULT", b"genuine"]]
+    assert [message[1:] for message in received] == [[b"KV_AGENT_RESULT", b"signed"]]
     assert router.auth_failures == 2
     assert listener_alive
 
@@ -488,14 +488,14 @@ def test_replay_state_is_bounded_and_keeps_recently_used_streams(replay_router, 
 
 
 def test_replay_state_survives_a_rewritten_sender_id(replay_router):
-    # Changing sender_id to look like a new peer breaks the MAC instead.
+    # A message whose sender_id was changed after signing fails the MAC check.
     router, raw = replay_router
     message = _raw_signed(router, seq=5, stream_id=os.urandom(16))
     raw.send(message)
     router.receive(timeout_ms=1000)
-    forged = list(message)
-    forged[-2] = forged[-2][:-1] + b"8"
-    raw.send(forged)
+    rewritten = list(message)
+    rewritten[-2] = rewritten[-2][:-1] + b"8"
+    raw.send(rewritten)
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         router.receive(timeout_ms=1000)
 

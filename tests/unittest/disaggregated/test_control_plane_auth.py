@@ -121,12 +121,12 @@ def test_rank_info_exchange_rejects_key_mismatch(receiver_key, server_key, match
     assert not receiver._incompatible_peers
 
 
-def test_signed_server_drops_forged_rank_info_request():
+def test_signed_server_drops_unsigned_rank_info_request():
     with _rank_info_server(_MASTER_KEY) as server:
-        with ZMQMessenger("DEALER", server.endpoint, signer=None) as forger:
-            forger.send([MessageType.REQUEST_INSTANCE_INFO])
+        with ZMQMessenger("DEALER", server.endpoint, signer=None) as unsigned:
+            unsigned.send([MessageType.REQUEST_INSTANCE_INFO])
             with pytest.raises(TimeoutError):
-                forger.receive(timeout_ms=300)
+                unsigned.receive(timeout_ms=300)
         auth_failures = server._messenger.auth_failures
     assert auth_failures == 1
     server._rank_info.to_bytes.assert_not_called()
