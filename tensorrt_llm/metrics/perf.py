@@ -161,6 +161,9 @@ class PerfMetricsRecord:
 class KvCacheSnapshot(Protocol):
     max_num_blocks: int
     free_num_blocks: int
+    reused_blocks: int
+    missed_blocks: int
+    cache_hit_rate: float
 
 
 class PerfMetricsCollector:
@@ -242,6 +245,9 @@ class PerfMetricsCollector:
                         "maxNumBlocks": stats.max_num_blocks,
                         "freeNumBlocks": stats.free_num_blocks,
                         "usedNumBlocks": stats.max_num_blocks - stats.free_num_blocks,
+                        "reusedBlocks": stats.reused_blocks,
+                        "missedBlocks": stats.missed_blocks,
+                        "cacheHitRate": stats.cache_hit_rate,
                     },
                 },
                 capture_iter=loop_id,

@@ -446,7 +446,15 @@ def test_profile_step_collects_with_source_and_logging_gates(
     executor.num_unscheduled_requests = 0
     executor._iter_adp_dummy_ctx_tokens = 0
     executor._iter_adp_dummy_gen_tokens = 0
-    reader = Mock(return_value=SimpleNamespace(max_num_blocks=10, free_num_blocks=4))
+    reader = Mock(
+        return_value=SimpleNamespace(
+            max_num_blocks=10,
+            free_num_blocks=4,
+            reused_blocks=3,
+            missed_blocks=1,
+            cache_hit_rate=0.75,
+        )
+    )
     executor.kv_cache_manager = SimpleNamespace(get_kv_cache_stats=reader)
     monkeypatch.setenv(profiling.PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
     monkeypatch.delenv(profiling.PROFILE_START_STOP_ENV_VAR_NAME, raising=False)

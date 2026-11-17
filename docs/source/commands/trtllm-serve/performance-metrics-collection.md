@@ -25,11 +25,10 @@ is stalled. Free-form model state and iteration identifiers remain diagnostic
 data, not Prometheus labels.
 
 `LoggerExposure` formats collected loop records in the executor thread using
-the existing iteration-line fields. It also writes structured `per_rank`
-records when a new rank snapshot is collected. With `enable_iter_req_stats`
-and `enable_iter_perf_stats`, request iteration diagnostics are available to
-the logger as categorized records. Detailed rank snapshots are exposed when
-collected, so the final snapshot need not wait for another executor loop.
+the existing single-line iteration format, including KV block reuse counters.
+`num_fetched` counts requests assigned since the previous emitted line, including
+loops skipped by iteration sampling. Rank snapshots and request diagnostics stay
+available through the statistics transport without additional JSON log lines.
 
 `PrometheusExposure` is the long-lived serving-side adapter. HTTP and OpenEngine
 normalize transported records through the same category model before exposing
@@ -49,7 +48,7 @@ all expensive request/tier diagnostics.
 | --- | --- |
 | Production Prometheus | `return_perf_metrics: true`, `enable_iter_perf_stats: true`, `print_iter_log: false` |
 | Offline iteration text with basic KV utilization | `print_iter_log: true`; no HTTP server or Prometheus client instance is required |
-| Offline text plus detailed rank observations | `print_iter_log: true`, `enable_iter_perf_stats: true`; optionally enable request iteration diagnostics |
+| Iteration text with detailed statistics transport | `print_iter_log: true`, `enable_iter_perf_stats: true`; optionally enable request iteration diagnostics |
 | Both outputs | Enable iteration text alongside production collection; source reads and instrumentation are shared |
 
 This separation adds record construction/serialization and optional logging

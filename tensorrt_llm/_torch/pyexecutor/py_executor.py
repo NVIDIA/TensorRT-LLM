@@ -3550,9 +3550,8 @@ class PyExecutor:
             }
             append_kv_cache_iteration_stats(rank_metrics,
                                             self._latest_kv_iter_stats)
-        rank_record = self._perf_metrics.collect_rank(
-            rank_metrics, capture_iter=self.iter_counter)
-        self._profile_manager.expose_metrics(rank_record)
+        self._perf_metrics.collect_rank(rank_metrics,
+                                        capture_iter=self.iter_counter)
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -4021,17 +4020,6 @@ class PyExecutor:
             batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
-
-        if req_stats and self.print_log:
-            request_record = self._perf_metrics.collect_iteration({
-                "iter":
-                batch_state.iter_stats.iter,
-                "rank":
-                self.dist.rank,
-                "requestStats":
-                [json.loads(stat.to_json_str()) for stat in req_stats],
-            })
-            self._profile_manager.expose_metrics(request_record)
 
         stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
                                         num_completed_requests,

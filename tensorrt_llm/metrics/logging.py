@@ -2,23 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Executor-loop logger exposure for already collected performance records."""
 
-import json
 from collections.abc import Callable
 from datetime import datetime
 
-from .enums import MetricNames
 from .perf import PerfMetricsRecord, kv_cache_utilization
-
-
-def _json_keys(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            (key.value if isinstance(key, MetricNames) else key): _json_keys(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_json_keys(item) for item in value]
-    return value
 
 
 class LoggerExposure:
@@ -26,22 +13,34 @@ class LoggerExposure:
 
     def __init__(self, write: Callable[[str], None]) -> None:
         self._write = write
-        self._last_rank_snapshot: object = None
+        self.reset()
+
+    def reset(self) -> None:
+        """Start counting fetched requests for a new profiling context."""
+        self._previous_fetched = 0
 
     def emit(self, record: PerfMetricsRecord) -> None:
-        """Expose a loop in the existing text format, with rank detail on change."""
-        if record.kind == "rank":
-            if record.per_rank is self._last_rank_snapshot:
-                return
-            self._last_rank_snapshot = record.per_rank
+        """Expose one collected loop in the existing single-line text format."""
         if record.kind != "loop":
-            self._write(json.dumps(_json_keys(record.categories()), separators=(",", ":")))
             return
         values = record.per_iter
+        if values["loopSequence"] == 0:
+            self._previous_fetched = 0
+        fetched = values["numFetchedRequestsTotal"]
+        num_fetched = max(0, fetched - self._previous_fetched)
+        self._previous_fetched = fetched
         device = values.get("prevDeviceStepTimeMS")
         device_text = "N/A" if device is None else f"{device}ms"
-        utilization = kv_cache_utilization(record.per_rank.get("kvCacheStats", {}))
+        kv_stats = record.per_rank.get("kvCacheStats", {})
+        utilization = kv_cache_utilization(kv_stats)
         kv_text = "N/A" if utilization is None else f"{utilization:.3f}"
+        kv_reuse_text = ""
+        if "reusedBlocks" in kv_stats:
+            kv_reuse_text = (
+                f"kv_reused_blocks = {kv_stats['reusedBlocks']}, "
+                f"kv_missed_blocks = {kv_stats['missedBlocks']}, "
+                f"kv_hit_rate = {kv_stats['cacheHitRate']:.3f}, "
+            )
         timestamp = datetime.fromtimestamp(values["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
         self._write(
             f"iter = {values['iter']}, "
@@ -51,16 +50,14 @@ class LoggerExposure:
             f"adp_dummy_ctx_tokens = {values['adpDummyCtxTokens']}, "
             f"adp_dummy_gen_tokens = {values['adpDummyGenTokens']}, "
             f"kv_cache_util = {kv_text}, "
+            f"{kv_reuse_text}"
             f"currank_total_requests = {values['numFetchedRequestsTotal']}/{values['numFetchedRequestsAllRanks']}, "
             f"host_step_time = {values['hostStepTimeMS']}ms, "
             f"prev_device_step_time = {device_text}, "
             f"timestamp = {timestamp}, "
             f"states = {values['states']}, "
             f"num_active = {values['numActiveRequests']}, "
-            f"num_fetched = {values['numFetchedRequests']}, "
+            f"num_fetched = {num_fetched}, "
             f"num_dummy = {values['numDummyRequests']}, "
             f"num_unscheduled = {values['numUnscheduledRequests']}"
         )
-        # Detailed snapshots refresh at their collection cadence, not on every log line.
-        if record.per_rank:
-            self.emit(PerfMetricsRecord("rank", per_rank=record.per_rank))

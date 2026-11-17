@@ -613,6 +613,7 @@ class PyExecutorProfileManager:
         """
         executor = self._executor
         it = -1
+        self.metrics_logger.reset()
         enabled = False
         start_time = None
 

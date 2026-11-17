@@ -83,7 +83,15 @@ def test_categories_own_the_source_and_preserve_legacy_wire_shape() -> None:
 
 def test_logger_and_prometheus_share_one_collection_without_extra_source_reads() -> None:
     collector = PerfMetricsCollector()
-    reader = Mock(return_value=SimpleNamespace(max_num_blocks=10, free_num_blocks=4))
+    reader = Mock(
+        return_value=SimpleNamespace(
+            max_num_blocks=10,
+            free_num_blocks=4,
+            reused_blocks=3,
+            missed_blocks=1,
+            cache_hit_rate=0.75,
+        )
+    )
     record = collector.collect_loop(_loop(), read_kv_cache=reader)
     reader.assert_called_once_with()
     messages = []
@@ -95,15 +103,18 @@ def test_logger_and_prometheus_share_one_collection_without_extra_source_reads()
     assert "kv_cache_util = 0.600" in messages[0]
     assert "num_fetched = 3" in messages[0]
     assert "prev_device_step_time = N/A" in messages[0]
-    assert json.loads(messages[1])["per_rank"]["captureIter"] == 0
+    assert len(messages) == 1
+    assert "kv_reused_blocks = 3, kv_missed_blocks = 1, kv_hit_rate = 0.750" in messages[0]
     assert kv_cache_utilization(record.per_rank["kvCacheStats"]) == pytest.approx(0.6)
     assert prom.kv_cache_utilization.labels(
         **prom.labels, dp_rank="0"
     )._value.get() == pytest.approx(0.6)
     logger.emit(record)
     prom.emit(record)
-    # Cached rank snapshots are not re-exposed by the logger.
-    assert len(messages) == 3
+    assert len(messages) == 2
+    collector.collect_loop(_loop(1, fetched=5))
+    logger.emit(collector.collect_loop(_loop(2, fetched=8)))
+    assert "num_fetched = 5," in messages[-1]
 
 
 def test_batch_snapshots_replace_logger_polling_and_retain_capture_identity() -> None:
@@ -121,13 +132,21 @@ def test_batch_snapshots_replace_logger_polling_and_retain_capture_identity() ->
     exposure = LoggerExposure(messages.append)
     exposure.emit(rank)
     exposure.emit(loop)
-    assert len(messages) == 2
-    assert "kv_cache_util = 0.750" in messages[1]
+    assert len(messages) == 1
+    assert "kv_cache_util = 0.750" in messages[0]
 
 
 def test_logger_only_kv_refresh_uses_loop_sequence_when_iteration_counter_stalls() -> None:
     collector = PerfMetricsCollector()
-    reader = Mock(return_value=SimpleNamespace(max_num_blocks=10, free_num_blocks=10))
+    reader = Mock(
+        return_value=SimpleNamespace(
+            max_num_blocks=10,
+            free_num_blocks=10,
+            reused_blocks=0,
+            missed_blocks=0,
+            cache_hit_rate=0.0,
+        )
+    )
     for _ in range(17):
         collector.collect_loop(_loop(0), read_kv_cache=reader, kv_refresh_interval=16)
     assert reader.call_count == 2
@@ -147,7 +166,7 @@ def test_request_candidates_keep_enum_keys_and_diagnostic_requests_are_not_compl
     assert request.per_req[MetricNames.SPEC_DEC_DRAFTED_PER_POS] == (2, 1)
     messages = []
     LoggerExposure(messages.append).emit(request)
-    assert json.loads(messages[0])["per_req"]["spec_dec_drafted_per_pos"] == [2, 1]
+    assert messages == []
     prom = _prometheus()
     diagnostic = PerfMetricsCollector.collect_iteration({"requestStats": [{"id": 9}]})
     prom.emit(diagnostic)
