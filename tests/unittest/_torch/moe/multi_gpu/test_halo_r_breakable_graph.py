@@ -69,8 +69,8 @@ _EAGER_TOKENS = 96
 _ABORT_TOKENS = 32
 # The hot rank of each replay step and of each eager forward.
 _REPLAY_HOT_RANKS = (1, 2, 3, 0)
-# The hot rank of each eager forward; None is unskewed routing, which isolates the MoE output
-# check from HALO-R's helper slots.
+# The hot rank of each eager forward; None leaves the routing as drawn (HALO-R may still move a
+# few routes to helper slots, but no helper route is required).
 _EAGER_HOT_RANKS = (None, 0, 1)
 _WORKER_TIMEOUT_S = 900
 # A rank's log starts with its pid; a failed rank writes the marker before it aborts the ranks.
@@ -163,21 +163,22 @@ def _mismatch_by_route(
     slots: int,
     rtol: float = 0.1,
     atol: float = 0.15,
-) -> dict[str, tuple[int, int]]:
+) -> dict[str, tuple[int, float]]:
     """Split one layer's output mismatch by where each token was routed.
 
     ``output`` and ``ref_output`` are (tokens, hidden); ``physical`` is the (tokens, top_k) slot of
-    every route. A token is "helper" if any of its routes reaches a helper slot, else "home"; a
-    token mismatches if any element is outside atol + rtol * |ref|, the check_accuracy band.
-    Returns {class: (tokens, mismatching tokens)}.
+    every route. A token is "helper" if any of its routes reaches a helper slot, else "home". For
+    each class: (tokens, fraction of its elements outside atol + rtol * |ref|), the element count
+    check_accuracy uses.
     """
     out, ref = output.float(), ref_output.float()
-    bad = ((out - ref).abs() > atol + rtol * ref.abs()).any(dim=-1)
+    bad = (out - ref).abs() > atol + rtol * ref.abs()
     on_helper = (physical.to(torch.int64) % slots >= home).any(dim=-1)
-    return {
-        "helper": (int(on_helper.sum()), int((bad & on_helper).sum())),
-        "home": (int((~on_helper).sum()), int((bad & ~on_helper).sum())),
-    }
+    split = {}
+    for name, rows in (("helper", on_helper), ("home", ~on_helper)):
+        count = int(rows.sum())
+        split[name] = (count, round(float(bad[rows].float().mean()), 4) if count else 0.0)
+    return split
 
 
 def _route_errors(
@@ -429,7 +430,7 @@ def _run_steps(rank: int) -> list[str]:
                             arena.home_experts,
                             arena.slot_count,
                         )
-                        detail = f"; mismatching tokens by route (tokens, bad): {split}"
+                        detail = f"; element mismatch by route (tokens, fraction): {split}"
                     errors.append(f"rank {rank} {where} layer {layer_idx}: output: {error}{detail}")
 
         def synchronize() -> None:
@@ -594,8 +595,11 @@ class _TwoLayerBody(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         tokens = [int(x.shape[0])] * _EP_SIZE
-        # Tokens stay the first dimension, which the runner's shared output is sized by.
-        return torch.stack([moe(x, logits, all_rank_num_tokens=tokens) for moe in self.moes], dim=1)
+        # MegaMoE returns a view of its combine buffer, which MoE layers of one shape share and the
+        # next layer overwrites: copy each layer's output before the next layer runs. Tokens stay
+        # the first dimension, which the runner's shared output is sized by.
+        outputs = [moe(x, logits, all_rank_num_tokens=tokens).clone() for moe in self.moes]
+        return torch.stack(outputs, dim=1)
 
 
 def _rank_logs(log_dir: Path) -> dict[int, str]:
@@ -727,25 +731,30 @@ def test_halo_r_breakable_cuda_graph(tmp_path: Path) -> None:
     assert not failures, "\n".join(failures[:20])
 
 
-class _Scaled(torch.nn.Module):
-    """Stands for one MoE layer in the CPU test: returns its input times a factor."""
+class _SharedBufferLayer(torch.nn.Module):
+    """Stands for one MegaMoE layer in the CPU test: writes its input times a factor into a buffer
+    it shares with the other layers and returns a view of it, as MegaMoE returns its combine buffer."""
 
-    def __init__(self, factor: float) -> None:
+    def __init__(self, buffer: torch.Tensor, factor: float) -> None:
         super().__init__()
+        self.buffer = buffer
         self.factor = factor
 
     def forward(self, x: torch.Tensor, logits: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         del logits, kwargs
-        return x * self.factor
+        self.buffer[: x.shape[0]] = x * self.factor
+        return self.buffer[: x.shape[0]]
 
 
 @pytest.mark.cpu_only
 def test_layer_outputs_and_route_split() -> None:
-    """The body's outputs keep tokens first and one column per layer, and the mismatch split
-    attributes a bad token to the route class it took."""
+    """Each layer's column holds that layer's output even when the layers share an output buffer,
+    and the mismatch split attributes bad elements to the route class of their token."""
     tokens, hidden = 8, 4
     x = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
-    output = _TwoLayerBody([_Scaled(1.0), _Scaled(2.0)])(x, torch.zeros(tokens, _NUM_EXPERTS))
+    shared = torch.empty(16, hidden)
+    body = _TwoLayerBody([_SharedBufferLayer(shared, 1.0), _SharedBufferLayer(shared, 2.0)])
+    output = body(x, torch.zeros(tokens, _NUM_EXPERTS))
     assert output.shape == (tokens, _LAYERS, hidden)
     for layer_idx, factor in enumerate((1.0, 2.0)):
         torch.testing.assert_close(output[:, layer_idx], x * factor)
@@ -753,23 +762,23 @@ def test_layer_outputs_and_route_split() -> None:
     # 4 home + 2 helper slots per rank: slots 4-5 of every rank are helpers.
     home, slots = 4, 6
     physical = torch.tensor([[0, 1], [6, 7], [4, 0], [11, 12], [1, 2], [5, 9], [3, 6], [12, 17]])
-    on_helper = [False, False, True, True, False, True, False, True]
+    on_helper = torch.tensor([False, False, True, True, False, True, False, True])
     ref = torch.ones(tokens, hidden)
     assert _mismatch_by_route(ref.clone(), ref, physical, home, slots) == {
-        "helper": (4, 0),
-        "home": (4, 0),
+        "helper": (4, 0.0),
+        "home": (4, 0.0),
     }
     wrong = ref.clone()
-    wrong[torch.tensor(on_helper)] += 1.0
+    wrong[on_helper] += 1.0
     assert _mismatch_by_route(wrong, ref, physical, home, slots) == {
-        "helper": (4, 4),
-        "home": (4, 0),
+        "helper": (4, 1.0),
+        "home": (4, 0.0),
     }
     wrong = ref.clone()
     wrong[0, 0] = 5.0
     assert _mismatch_by_route(wrong, ref, physical, home, slots) == {
-        "helper": (4, 0),
-        "home": (4, 1),
+        "helper": (4, 0.0),
+        "home": (4, 0.0625),
     }
 
 
