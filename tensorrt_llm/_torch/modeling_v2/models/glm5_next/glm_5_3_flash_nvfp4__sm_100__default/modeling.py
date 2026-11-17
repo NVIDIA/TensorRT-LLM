@@ -66,6 +66,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import async_tensor_h2d
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -123,6 +124,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.modules.embedding.Embedding",
     "tensorrt_llm._torch.distributed.AllReduce",
     "tensorrt_llm._torch.modules.multi_stream_utils.maybe_execute_in_parallel",
+    # The admission check that refuses media (`validate_multimodal_request_data`).
+    "tensorrt_llm.inputs.multimodal.has_media_or_embeddings",
 )
 
 
@@ -2080,3 +2083,12 @@ class ModelingV2Glm53FlashNvfp4Sm100Default(Glm5NextForCausalLM):
 
     def load_weights(self, weights: Any, weight_mapper: BaseWeightMapper | None = None) -> None:
         _weights.load(self, weights, weight_mapper)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
+            )

@@ -20,6 +20,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
+    has_media_or_embeddings,
     select_multimodal_fields,
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
@@ -1225,3 +1226,44 @@ def test_params_do_not_infer_item_layout_from_raw_buckets():
     params = MultimodalParams(multimodal_data={"audio": {}, "image": {}})
     assert params.item_metadata is None
     assert params.get_item_layout() == ((), ())
+
+
+_MROPE = {"mrope_config": {"mrope_position_deltas": torch.zeros(1, 1)}}
+
+
+@pytest.mark.parametrize(
+    "mm_data,expected",
+    [
+        (None, False),
+        ({}, False),
+        (_MROPE, False),
+        ({"mrope_config": None, "image": None}, False),
+        ({"image": {"pixel_values": torch.zeros(1)}}, True),
+        ({"video": {"pixel_values_videos": torch.zeros(1)}}, True),
+        ({"audio": {"input_features": torch.zeros(1)}}, True),
+        ({"multimodal_embedding": torch.zeros(1, 4)}, True),
+        ({"multimodal_embed_mask_cumsum": torch.arange(3)}, True),
+        ({**_MROPE, "image": {"pixel_values": torch.zeros(1)}}, True),
+        ({"some_future_key": 1}, True),
+    ],
+    ids=[
+        "none",
+        "empty",
+        "mrope_only",
+        "none_values",
+        "image",
+        "video",
+        "audio",
+        "embedding",
+        "cumsum_only",
+        "mrope_and_image",
+        "unknown_key",
+    ],
+)
+def test_has_media_or_embeddings_ignores_only_mrope_positions(mm_data, expected):
+    """Only M-RoPE positions are not media.
+
+    Text-only models refuse everything else, including keys they do not know, so an
+    M-RoPE-only disaggregated generation request still passes.
+    """
+    assert has_media_or_embeddings(mm_data) is expected
