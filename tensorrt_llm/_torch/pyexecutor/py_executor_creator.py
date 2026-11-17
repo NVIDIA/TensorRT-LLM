@@ -47,6 +47,8 @@ from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
 from ..models.modeling_utils import timing_metric
+from ..attention.backends.fp4_mla.config import (
+    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE, FP4_MLA_TOKENS_PER_BLOCK)
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
                            should_use_separate_draft_kv_cache)
@@ -78,9 +80,6 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
-FP4_MLA_TOKENS_PER_BLOCK = 128
-# NVFP4 MLA quantizes the latent cache in 16-token tiles.
-FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 def _validate_fp4_mla_chunk_unit(

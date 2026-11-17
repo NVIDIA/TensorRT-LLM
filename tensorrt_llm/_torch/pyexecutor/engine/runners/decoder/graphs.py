@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, Protocol
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
     PackedSplitResolver,
     sampling_variant,
+    select_kv_regime_ceiling,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
@@ -141,14 +143,10 @@ def _kv_regime_length_passes(
     itself. The warm-up request's longest row fills the regime, so the dispatcher decision
     a graph captures is the one of its regime.
     """
-    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
-
     passes: set[tuple[int, int]] = set()
     for max_seq_len in max_seq_len_list:
         passes.update((ceiling, ceiling) for ceiling in kv_regime_ceilings if ceiling < max_seq_len)
-        passes.add(
-            (max_seq_len, fp4_mla_dispatch.kv_regime_for_step(max_seq_len, kv_regime_ceilings))
-        )
+        passes.add((max_seq_len, select_kv_regime_ceiling(max_seq_len, kv_regime_ceilings)))
     return sorted(passes, reverse=True)
 
 
@@ -879,157 +877,41 @@ class DecoderCudaGraphs:
     @staticmethod
     def _fp4_mla_4x_unavailable() -> str | None:
         """Why the device the decode graphs replay on cannot host the FP4 MLA 4x kernel; None when it can."""
-        from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
-            device_unsupported_reason,
+        from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import (
+            fp4_mla_4x_unavailable,
         )
 
-        return device_unsupported_reason(torch.device("cuda", torch.cuda.current_device()))
-
-    def _fp4_mla_decode_heads(self) -> int | None:
-        """Attention heads this rank's MLA layers decode with; None without MLA layers or with unequal ones."""
-        from tensorrt_llm._torch.attention.mla import MLA
-
-        heads = {
-            int(module.num_heads_tp) for module in self.model.modules() if isinstance(module, MLA)
-        }
-        return heads.pop() if len(heads) == 1 else None
+        return fp4_mla_4x_unavailable()
 
     def _kv_regime_resolver(
         self, resource_manager: ResourceManager
     ) -> Callable[[int, int], tuple[int, ...]] | None:
-        """KV regimes the decode graphs are keyed by, per graph shape; None for every backend but FP4 MLA 4x.
-
-        The FP4 MLA decode dispatcher (``fp4_mla_dispatch``) then decides on the
-        regime ceiling, the step's longest live KV rounded up, instead of the
-        page-table capacity. Resolved at capture, once the KV cache exists; the
-        regimes of a shape are those its 2x | 4x | two-stream decision can tell
-        apart (``kv_regimes_for_batch``), one for most shapes. None as well
-        where every step decodes on the 2x kernel whatever its KV: with Helix,
-        and on a device that cannot host the 4x kernel. The graph runner
-        resolves every decode step, so each shape is computed once: replay keeps
-        the ceilings its graphs were captured for.
-        """
-        # Only an FP4 MLA KV cache gets regimes (the predicate under which the
-        # attention metadata carries an fp4_mla_state); every other model returns
-        # here, before any FP4 MLA module is imported or probed.
+        """Return per-shape decode KV-regime ceilings from the attention backend, or None."""
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
-            return None
-        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
-        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
-            FP4_MLA_TOKENS_PER_BLOCK,
-            _fp4_mla_cutedsl_4x_enabled,
-            _fp4_mla_packed_q_enabled,
-            _fp4_mla_packed_rows_per_seq,
+        return TrtllmAttention.resolve_decode_kv_regimes(
+            kv_cache_manager=kv_cache_manager,
+            model=self.model,
+            mapping=self.mapping,
+            sm_count_fn=self._decode_sm_count,
+            four_x_unavailable_fn=self._fp4_mla_4x_unavailable,
         )
-
-        # Environment gates next: the default (4x off) resolves nothing. The
-        # dispatcher runs only for the packed-Q cutedsl decode and keeps Helix on
-        # the 2x kernel, so regimes would only multiply those graphs.
-        if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
-            return None
-        if self.mapping.has_cp_helix():
-            return None
-        num_heads = self._fp4_mla_decode_heads()
-        if num_heads is None:
-            return None
-        # A device that cannot host the 4x kernel decodes every step on 2x, as
-        # Helix does: no regimes (the host logs the reason once per device).
-        if self._fp4_mla_4x_unavailable() is not None:
-            return None
-        from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
-            envelope_reason_static,
-        )
-
-        capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
-        sm_count = self._decode_sm_count()
-
-        @functools.cache
-        def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
-            query_len = int(draft_len) + 1
-            return fp4_mla_dispatch.kv_regimes_for_batch(
-                num_requests=int(batch_size),
-                query_len=query_len,
-                num_heads=num_heads,
-                rows_per_seq=_fp4_mla_packed_rows_per_seq(num_heads, query_len),
-                kv_capacity=capacity,
-                sm_count=sm_count,
-                envelope_reason=envelope_reason_static,
-            )
-
-        return resolver
 
     def _packed_split_resolver(
         self, resource_manager: ResourceManager
     ) -> PackedSplitResolver | None:
-        """Packed split decisions the decode graphs are keyed by; None for every decode but the FP4 MLA packed one.
-
-        The FP4 MLA packed decode launches its KV split budget only for steps
-        whose balanced plan splits a request (``TRTLLM_FP4_MLA_SPLIT_ON_DEMAND``,
-        default on). A shape that fills two thirds of a 2-CTA wave captures an
-        unsplit and a split graph, a smaller one the split graph alone
-        (``packed_plan.packed_split_variants``); each step replays the graph of
-        its decision (``packed_plan.packed_split_needed``), agreed across
-        attention-DP ranks by the graph runner.
-        """
+        """Return per-step decode split-budget decisions from the attention backend, or None."""
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
-            return None
-        from tensorrt_llm._torch.attention.backends.fp4_mla import packed_plan
-        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
-            _FP4_MLA_SPLIT_KV_ENV,
-            FP4_MLA_SCALE_ROW_GROUP,
-            _fp4_mla_packed_q_enabled,
-            _fp4_mla_packed_rows_per_seq,
-            _fp4_mla_split_on_demand_enabled,
+        return TrtllmAttention.resolve_decode_packed_split(
+            kv_cache_manager=kv_cache_manager,
+            model=self.model,
+            mapping=self.mapping,
+            sm_count_fn=self._decode_sm_count,
+            resolver_cls=PackedSplitResolver,
         )
-
-        # The decision only exists for the packed decode outside Helix (which
-        # keeps its split budget) and without a fixed split override. The
-        # environment and topology come first, then the model; the packed-Q
-        # check, which probes the device, last.
-        if not _fp4_mla_split_on_demand_enabled():
-            return None
-        if os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto") != "auto":
-            return None
-        if self.mapping.has_cp_helix():
-            return None
-        num_heads = self._fp4_mla_decode_heads()
-        if num_heads is None:
-            return None
-        if not _fp4_mla_packed_q_enabled():
-            return None
-        sm_count = self._decode_sm_count()
-
-        @functools.cache
-        def m_tiles(draft_len: int) -> int:
-            rows = _fp4_mla_packed_rows_per_seq(num_heads, int(draft_len) + 1)
-            return rows // FP4_MLA_SCALE_ROW_GROUP
-
-        @functools.cache
-        def variants(batch_size: int, draft_len: int) -> tuple[bool, ...]:
-            tiles = m_tiles(draft_len)
-            if tiles <= 0:
-                # No packed decode for this query width: one family.
-                return (True,)
-            return packed_plan.packed_split_variants(
-                int(batch_size), m_tiles=tiles, sm_count=sm_count
-            )
-
-        def decide(batch_size: int, draft_len: int, kv_lens: list[int]) -> bool:
-            del batch_size  # the step's rows are kv_lens
-            tiles = m_tiles(draft_len)
-            if tiles <= 0:
-                return True
-            return packed_plan.packed_split_needed(
-                kv_lens, query_len=int(draft_len) + 1, m_tiles=tiles, sm_count=sm_count
-            )
-
-        return PackedSplitResolver(variants=variants, decide=decide)
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""

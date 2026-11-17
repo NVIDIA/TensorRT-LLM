@@ -6,7 +6,7 @@ import contextlib
 import os
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Tuple, TypeAlias)
+                    Sequence, Tuple, TypeAlias)
 
 import torch
 
@@ -167,6 +167,14 @@ def _largest_kv_regime(regimes) -> Optional[int]:
     """The largest KV regime among the ranks' (None entries ignored); None when no rank keys by regime."""
     known = [regime for regime in regimes if regime is not None]
     return max(known) if known else None
+
+
+def select_kv_regime_ceiling(max_kv_len: int, ceilings: Sequence[int]) -> int:
+    """Return the smallest decode KV-regime ceiling covering ``max_kv_len``."""
+    for ceiling in ceilings:
+        if max_kv_len <= ceiling:
+            return int(ceiling)
+    return int(ceilings[-1])
 
 
 def _agreed_packed_split(decisions) -> Optional[bool]:
@@ -854,14 +862,12 @@ class CUDAGraphRunner:
             return int(ceilings[0])
         # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
         # row's sequence length (the sparse short/long split counts them too).
-        # Imported here: only an FP4 MLA decode registers a resolver.
-        from ..attention.backends.fp4_mla import fp4_mla_dispatch
         from ..speculative import get_num_extra_kv_tokens
         max_kv_len = self._max_total_seq_len(
             batch, new_tensors_device,
             promoted_context_request_ids) + get_num_extra_kv_tokens(
                 self.spec_config)
-        return fp4_mla_dispatch.kv_regime_for_step(max_kv_len, ceilings)
+        return select_kv_regime_ceiling(max_kv_len, ceilings)
 
     def _packed_split_for_batch(
         self,

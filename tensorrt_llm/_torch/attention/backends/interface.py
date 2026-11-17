@@ -7,8 +7,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, List, Literal,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -1312,6 +1312,33 @@ class AttentionBackend(Generic[TMetadata]):
     @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
+
+    @classmethod
+    def resolve_decode_kv_regimes(
+        cls,
+        *,
+        kv_cache_manager: Any,
+        model: torch.nn.Module,
+        mapping: Mapping,
+        sm_count_fn: Callable[[], int],
+    ) -> Optional[Callable[[int, int], Tuple[int, ...]]]:
+        """Return a per-shape KV-regime ceiling resolver for decode CUDA graphs, if supported."""
+        del kv_cache_manager, model, mapping, sm_count_fn
+        return None
+
+    @classmethod
+    def resolve_decode_packed_split(
+        cls,
+        *,
+        kv_cache_manager: Any,
+        model: torch.nn.Module,
+        mapping: Mapping,
+        sm_count_fn: Callable[[], int],
+        resolver_cls: Callable[..., Any],
+    ) -> Optional[Any]:
+        """Return a per-step split-budget resolver for decode CUDA graphs, if supported."""
+        del kv_cache_manager, model, mapping, sm_count_fn, resolver_cls
+        return None
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",

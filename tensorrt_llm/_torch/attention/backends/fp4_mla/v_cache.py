@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA packed-V views, repacking, and cache validity tracking."""
 
-import os
 from typing import Any, Optional, Sequence
 
 import torch
@@ -15,11 +14,16 @@ from tensorrt_llm.bindings import DataType
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     FP4_BLOCK_SIZE,
+    FP4_MLA_BLOCK_V_ENV,
+    FP4_MLA_PREPACK_V_ENV,
     FP4_MLA_SCALE_ROW_GROUP,
+    FP4_MLA_SHARE_V_PACK_STORAGE_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
+    FP4_MLA_TRITON_PREPACK_V_ENV,
     HP_BLOCK_SIZE,
     _ceil_div,
     _env_enabled_default,
+    _env_flag_not_disabled,
     _env_int,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
@@ -29,16 +33,11 @@ from .layout import _ensure_workspace_tensor, get_fp4_mla_v_scale_pool_size
 
 
 def _shared_v_pack_storage_enabled() -> bool:
-    return os.getenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
+    return _env_flag_not_disabled(FP4_MLA_SHARE_V_PACK_STORAGE_ENV, True)
 
 
 def _select_triton_block_v(num_queries: int, *, prefer_prepacked_v: bool = False) -> int:
-    env_block_v = _env_int("TRTLLM_FP4_MLA_BLOCK_V")
+    env_block_v = _env_int(FP4_MLA_BLOCK_V_ENV)
     if env_block_v is not None:
         return env_block_v
     if prefer_prepacked_v:
@@ -184,8 +183,8 @@ def _v_packed_cache_tag(
 def _triton_prepack_v_enabled() -> bool:
     if _fp4_mla_attention_backend() != "triton":
         return False
-    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", True)
-    return _env_enabled_default("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
+    default = _env_enabled_default(FP4_MLA_PREPACK_V_ENV, True)
+    return _env_enabled_default(FP4_MLA_TRITON_PREPACK_V_ENV, default)
 
 
 def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:

@@ -74,6 +74,15 @@ FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
 
 
+FP4_MLA_FOLD_Q_ENV = "TRTLLM_FP4_MLA_FOLD_Q"
+FP4_MLA_SHARE_V_PACK_STORAGE_ENV = "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE"
+FP4_MLA_BLOCK_V_ENV = "TRTLLM_FP4_MLA_BLOCK_V"
+FP4_MLA_PREPACK_V_ENV = "TRTLLM_FP4_MLA_PREPACK_V"
+FP4_MLA_TRITON_PREPACK_V_ENV = "TRTLLM_FP4_MLA_TRITON_PREPACK_V"
+FP4_MLA_PAGE_STATS_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS"
+FP4_MLA_PV_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PV_NUM_WARPS"
+
+
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
 
 
@@ -115,14 +124,31 @@ _FP4_MLA_MAX_GRID_Z = 65_535
 
 def _env_enabled_default(name: str, default: bool) -> bool:
     value = os.getenv(name)
-    if value is None or value == "":
+    if value is None or value.strip() == "":
         return default
-    return value.lower() in (
+    return value.strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def _env_flag_not_disabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def has_fp4_mla_cache_layout(kv_cache_manager: object) -> bool:
+    """Return whether ``kv_cache_manager`` exposes the FP4 MLA page-table contract."""
+    return callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
 
 
 def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
@@ -183,11 +209,26 @@ def _fp4_mla_packed_rows_per_seq(num_heads: int, query_len: int) -> int:
     return rows if rows <= _FP4_MLA_PACKED_MAX_M else 0
 
 
-def _env_int(name: str) -> Optional[int]:
+def _fp4_mla_fold_q_enabled() -> bool:
+    return os.environ.get(FP4_MLA_FOLD_Q_ENV, "1") != "0"
+
+
+def _fp4_mla_split_kv_override() -> str:
+    return os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+
+
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
     value = os.environ.get(name)
-    if value is None or value == "":
-        return None
+    if value is None or value.strip() == "":
+        return default
     return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
 
 
 def _fp4_mla_attention_backend() -> str:

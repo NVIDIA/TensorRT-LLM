@@ -3,7 +3,6 @@
 """Device-updated split-KV adapter for the CuTeDSL FP4 MLA backends."""
 
 import math
-import os
 from types import ModuleType
 from typing import Any
 
@@ -11,7 +10,9 @@ import torch
 import triton
 import triton.language as tl
 
-_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+from .config import _FP4_MLA_SPLIT_KV_ENV as _SPLIT_KV_ENV
+from .config import _fp4_mla_split_kv_override
+
 _MAX_PARTITION_TOKENS = 160 * 1024
 
 
@@ -21,7 +22,7 @@ def select_split_count(max_kv_len: int) -> int:
     The environment override is an internal testing/tuning control. The default
     long-context size is conservative and has not been performance tuned.
     """
-    value = os.getenv(_SPLIT_KV_ENV, "auto")
+    value = _fp4_mla_split_kv_override()
     if value == "auto":
         if max_kv_len <= _MAX_PARTITION_TOKENS:
             return 1

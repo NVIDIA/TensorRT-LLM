@@ -56,7 +56,8 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, has_fp4_mla_cache_layout,
+                      load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -686,9 +687,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
-        if callable(
-                getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
-                        None)):
+        if has_fp4_mla_cache_layout(self.kv_cache_manager):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
         # Allocate static buffers for helix parallelism support.
@@ -3452,6 +3451,53 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def support_fp4_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def resolve_decode_kv_regimes(
+        cls,
+        *,
+        kv_cache_manager: Any,
+        model: torch.nn.Module,
+        mapping: Mapping,
+        sm_count_fn: Callable[[], int],
+        four_x_unavailable_fn: Optional[Callable[[], Optional[str]]] = None,
+    ) -> Optional[Callable[[int, int], Tuple[int, ...]]]:
+        if not has_fp4_mla_cache_layout(kv_cache_manager):
+            return None
+        from .fp4_mla.graph_resolvers import (fp4_mla_4x_unavailable,
+                                              resolve_fp4_mla_kv_regimes)
+
+        return resolve_fp4_mla_kv_regimes(
+            kv_cache_manager=kv_cache_manager,
+            model=model,
+            mapping=mapping,
+            sm_count_fn=sm_count_fn,
+            four_x_unavailable_fn=(fp4_mla_4x_unavailable
+                                   if four_x_unavailable_fn is None else
+                                   four_x_unavailable_fn),
+        )
+
+    @classmethod
+    def resolve_decode_packed_split(
+        cls,
+        *,
+        kv_cache_manager: Any,
+        model: torch.nn.Module,
+        mapping: Mapping,
+        sm_count_fn: Callable[[], int],
+        resolver_cls: Callable[..., Any],
+    ) -> Optional[Any]:
+        if not has_fp4_mla_cache_layout(kv_cache_manager):
+            return None
+        from .fp4_mla.graph_resolvers import resolve_fp4_mla_packed_split
+
+        return resolve_fp4_mla_packed_split(
+            kv_cache_manager=kv_cache_manager,
+            model=model,
+            mapping=mapping,
+            sm_count_fn=sm_count_fn,
+            resolver_cls=resolver_cls,
+        )
 
     def has_cached_kv_for_mla_context(
         self,

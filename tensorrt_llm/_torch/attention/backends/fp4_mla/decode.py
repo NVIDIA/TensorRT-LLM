@@ -3,7 +3,6 @@
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
 import functools
-import os
 from typing import Any, Callable
 
 import torch
@@ -22,6 +21,8 @@ from .config import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_K_RESIDUAL_DIM,
     FP4_MLA_P_GLOBAL_SCALE,
+    FP4_MLA_PAGE_STATS_NUM_WARPS_ENV,
+    FP4_MLA_PV_NUM_WARPS_ENV,
     FP4_MLA_Q_LOGICAL_DIM,
     FP4_MLA_Q_PACKED_DIM,
     FP4_MLA_Q_RESIDUAL_DIM,
@@ -32,6 +33,7 @@ from .config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_cutedsl_kernel_module,
+    _fp4_mla_fold_q_enabled,
     _fp4_mla_packed_rows_per_seq,
 )
 from .layout import (
@@ -274,12 +276,12 @@ def _run_triton_attention_decode(
     # benefits from num_warps=8 (more warps hide the QK load latency); the
     # masked path (q_len>1 / ragged lengths) carries extra per-thread state and
     # measured markedly faster at num_warps=4 (e.g. bs256 q_len4: 131->95ms).
-    page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS")
+    page_stats_num_warps = _env_int(FP4_MLA_PAGE_STATS_NUM_WARPS_ENV)
     if page_stats_num_warps is None:
         page_stats_num_warps = 8 if assume_full_pages else 4
     page_stats_launch_meta = {"occupancy": 2, "num_warps": page_stats_num_warps}
     # PV benefits from num_warps=8 across shapes measured.
-    pv_num_warps = _env_int("TRTLLM_FP4_MLA_PV_NUM_WARPS") or 8
+    pv_num_warps = _env_int(FP4_MLA_PV_NUM_WARPS_ENV) or 8
     pv_launch_meta = {"occupancy": 2, "num_warps": pv_num_warps}
     # PV loop pipelining. With TMA loads, num_stages>=2 lets the next page's
     # loads overlap with the current MMA via mbarrier. The PV report shows
@@ -1081,7 +1083,7 @@ def run_fp4_mla_attention_decode(
             and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
             and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
             and getattr(metadata, "_fp4_mla_fold_q", True)
-            and os.environ.get("TRTLLM_FP4_MLA_FOLD_Q", "1") != "0"
+            and _fp4_mla_fold_q_enabled()
         )
         if fold_queries:
             from .fp4_mla_splitkv import select_split_count

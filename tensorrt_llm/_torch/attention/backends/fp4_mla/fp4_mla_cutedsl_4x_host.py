@@ -21,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import math
-import os
 import sys
 import threading
 from collections import OrderedDict
@@ -30,6 +29,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from .config import _env_flag_not_disabled as _env_flag
+from .config import _env_int as _config_env_int
 
 __all__ = [
     "EnvelopeGeometry",
@@ -120,18 +122,9 @@ MIN_PAIRS_DERIVED = -1  # default: the 2x two-piece-plan rule above
 Q2_MIN_PAIRS = 20
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip().lower() not in ("0", "false", "off", "no")
-
-
 def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return int(value)
+    value = _config_env_int(name, default)
+    return default if value is None else value
 
 
 def split_enabled() -> bool:

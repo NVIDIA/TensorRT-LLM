@@ -71,6 +71,7 @@ from .config import _fp4_mla_cutedsl_kernel_module as _fp4_mla_cutedsl_kernel_mo
 from .config import _fp4_mla_q1_kv_blocks_per_program as _fp4_mla_q1_kv_blocks_per_program
 from .config import _fp4_mla_q1_prefix_blocks_per_program as _fp4_mla_q1_prefix_blocks_per_program
 from .config import _HPUpdatePhase as _HPUpdatePhase
+from .config import has_fp4_mla_cache_layout
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode
@@ -178,6 +179,7 @@ __all__ = [
     "get_fp4_mla_v_scale_pool_shape",
     "get_fp4_mla_v_scale_pool_size",
     "get_fp4_mla_v_scale_pool_view",
+    "has_fp4_mla_cache_layout",
     "materialize_fp4_mla_device_page_table",
     "populate_fp4_mla_append_metadata",
     "populate_fp4_mla_generation_lengths",
