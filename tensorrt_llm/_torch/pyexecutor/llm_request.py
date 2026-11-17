@@ -418,6 +418,9 @@ class PyResult:
         histories, so it copies their lists instead of consuming them.
         """
         result = copy(self)
+        if self.context_prompt_logprob_rows is not None:
+            result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
+            )
         result.diff = PyResult.Diff()
         if self._log_probs is not None:
             if self._streaming and beam_width <= 1 and self.log_probs:

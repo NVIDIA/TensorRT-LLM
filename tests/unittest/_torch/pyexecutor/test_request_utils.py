@@ -2199,6 +2199,8 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     first_logits = torch.arange(beam_width * 4, dtype=torch.float32).reshape(1, beam_width, 4)
     request.py_result.append_generation_logits(first_logits)
     request.py_result.append_context_logits(torch.ones(3, 1, 4))
+    first_prompt_rows = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    request.py_result.append_prompt_logprobs(first_prompt_rows)
     request.py_result.append_additional_context_outputs("hidden", torch.ones(3, 2))
     request.py_result.append_additional_generation_outputs("hidden", torch.ones(1, 2))
     response = prepare_response(request, publish_metadata=True, include_latest_logits=overlap)
@@ -2215,6 +2217,7 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
         [[{5: Logprob(-1.0)}] for _ in range(beam_width)], [-1.0] * beam_width
     )
     request.py_result.append_generation_logits(first_logits + 10)
+    request.py_result.append_prompt_logprobs(torch.ones(1, 3, dtype=torch.float64))
     request.py_result.append_additional_context_outputs("hidden", torch.zeros(1, 2))
     request.py_result.append_additional_generation_outputs("hidden", torch.zeros(1, 2))
     request.py_per_pos_drafted[0] = 9
@@ -2225,6 +2228,9 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
 
     assert response.result.log_probs == first_probs
     assert response.result.cum_log_probs == [-0.5] * beam_width
+    assert len(request.py_result.context_prompt_logprob_rows) == 2
+    assert len(response.result.context_prompt_logprob_rows) == 1
+    assert response.result.context_prompt_logprob_rows[0] is first_prompt_rows
     torch.testing.assert_close(response.result.generation_logits, first_logits.transpose(0, 1))
     torch.testing.assert_close(response.result.context_logits, torch.ones(3, 4))
     torch.testing.assert_close(
