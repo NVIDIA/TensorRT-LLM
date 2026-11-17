@@ -93,13 +93,20 @@ def build_attention_metadata(
     )
     metadata_kwargs = {}
     if enable_ragged_verification:
-        # The metadata class declares the capability; a backend without it
-        # has no token-major rows to present a ragged step with.
-        if not getattr(attention_backend.Metadata, "supports_ragged_verification", False):
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+            DSAtrtllmAttentionMetadata,
+        )
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+        # Validated row layouts: the dense TRTLLM metadata itself and the DSA metadata.
+        # Other subclasses lay out their own rows and stay rejected.
+        metadata_type = attention_backend.Metadata
+        if metadata_type is not TrtllmAttentionMetadata and not issubclass(
+            metadata_type, DSAtrtllmAttentionMetadata
+        ):
             raise ValueError(
-                "Ragged verification requires attention metadata that declares "
-                "supports_ragged_verification (the TRTLLM dense or DSA target metadata); "
-                f"got {attention_backend.Metadata.__name__}"
+                "Ragged verification requires the dense TRTLLM or the DSA target metadata "
+                f"backend; got {metadata_type.__name__}"
             )
         metadata_kwargs["enable_ragged_verification"] = True
     return attention_backend.Metadata(

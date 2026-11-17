@@ -403,9 +403,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
 
-    # This class and its subclasses can present a ragged verification step
-    # token-major (see `token_major_gen_view`).
-    supports_ragged_verification: ClassVar[bool] = True
     # Whether ragged verification needs the engine to compile this class's
     # KV-compressor metadata helpers at warmup.
     needs_ragged_compressor_warmup: ClassVar[bool] = False

@@ -9,10 +9,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch import utils as torch_utils
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
     DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, DSparkCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
@@ -476,6 +478,28 @@ def test_metadata_helper_enables_only_supported_ragged_metadata():
 
     kwargs["attention_backend"] = SimpleNamespace(Metadata=object)
     with pytest.raises(ValueError, match="DSA target metadata"):
+        metadata_module.build_attention_metadata(model, enable_ragged_verification=True, **kwargs)
+
+
+def test_metadata_helper_enables_dense_ragged_metadata(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        TrtllmAttentionMetadata, "__init__", lambda _self, **kwargs: seen.append(kwargs)
+    )
+    model, kwargs = _metadata_inputs(TrtllmAttentionMetadata)
+    metadata_module.build_attention_metadata(model, enable_ragged_verification=True, **kwargs)
+    assert seen[0]["enable_ragged_verification"] is True
+
+
+class _OtherLayoutMetadata(TrtllmAttentionMetadata):
+    """A dense-metadata subclass that lays out its own rows."""
+
+
+@pytest.mark.parametrize("metadata_type", [CSA2TrtllmMetadata, _OtherLayoutMetadata])
+def test_metadata_helper_rejects_unvalidated_ragged_metadata(metadata_type):
+    """Subclasses of the dense metadata are not validated by inheritance."""
+    model, kwargs = _metadata_inputs(metadata_type)
+    with pytest.raises(ValueError, match=f"got {metadata_type.__name__}"):
         metadata_module.build_attention_metadata(model, enable_ragged_verification=True, **kwargs)
 
 

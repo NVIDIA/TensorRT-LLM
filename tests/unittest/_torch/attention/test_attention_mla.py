@@ -1696,12 +1696,6 @@ def test_cross_attention_copy_drops_the_ragged_state():
 
 
 @pytest.mark.cpu_only
-def test_dense_metadata_declares_ragged_verification():
-    """Callers enable ragged verification by capability, not by class."""
-    assert TrtllmAttentionMetadata.supports_ragged_verification
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_contexts", [0, 1])
 def test_device_selected_windows_replace_the_host_split(monkeypatch,
                                                         num_contexts):
