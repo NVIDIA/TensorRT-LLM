@@ -7650,6 +7650,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
         // Keep this functional stage on AWS-PDX for EFA coverage.
         "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
+        "DGX_B300-16_GPUs-2_Nodes-PyTorch-MPI-Serve-Post-Merge-1": ["b300-flex-aws-pdx", "l0_dgx_b300_mpi_serve_multi_nodes", 1, 1, 16, 2, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test.
