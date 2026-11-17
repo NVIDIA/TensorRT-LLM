@@ -23,17 +23,15 @@ name: Pyrefly type check
 
 on:
   pull_request:
-    # `edited` is needed for a change of target branch; the job condition drops other edits.
-    types: [opened, synchronize, reopened, edited]
+    # `edited` is left out on purpose: a title or description edit would add a skipped run
+    # that hides the real result on the PR page, so push again after changing the target branch.
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
 
 jobs:
   check:
-    if: github.event.action != 'edited' || github.event.changes.base.ref.from != ''
-    # Job level: a run whose job is skipped (a title or description edit) never joins the
-    # group, so it cannot cancel a check in progress.
     concurrency:
       group: pyrefly-diff-${{ github.event.pull_request.number }}
       cancel-in-progress: true
