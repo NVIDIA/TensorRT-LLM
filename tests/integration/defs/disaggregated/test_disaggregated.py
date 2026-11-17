@@ -33,7 +33,7 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (get_ucx_tls, parse_gsm8k_output,
+from defs.common import (get_ucx_net_devices, get_ucx_tls, parse_gsm8k_output,
                          resolve_llm_model_path, wait_for_reported_addr,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
@@ -68,18 +68,6 @@ class TestConfig:
 
     def __str__(self):
         return self.test_desc
-
-
-def get_ucx_net_devices():
-    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
-
-    Every worker runs on this host, so loopback is the only TCP device UCX
-    needs. With every netdev enabled, UCX protocol selection re-queries each
-    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
-    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
-    nodes (https://nvbugs/6836097).
-    """
-    return "lo"
 
 
 def apply_pre_hopper_nccl_workaround(env: dict) -> None:

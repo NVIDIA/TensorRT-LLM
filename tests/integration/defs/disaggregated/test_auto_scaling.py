@@ -1,10 +1,10 @@
 import asyncio
 import os
-import platform
 
 import pytest
 import requests
-from defs.conftest import get_sm_version, llm_models_root
+from defs.common import get_ucx_net_devices, get_ucx_tls
+from defs.conftest import llm_models_root
 from disagg_test_utils import (CHECK_STATUS_INTERVAL, request_completion,
                                run_ctx_worker, run_disagg_server,
                                run_gen_worker, terminate, verify_cluster_info,
@@ -17,26 +17,11 @@ pytest_plugins = ["disagg_test_utils"]
 ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
 
 
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
-
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
-    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
-    explicitly to avoid UCX auto-selection picking a misbehaving NIC transport.
-    """
-    sm = get_sm_version()
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
-
-
 @pytest.fixture
 def worker_env():
-    """Per-worker environment with UCX_TLS set for the current GPU arch."""
     env = os.environ.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     return env
 
 

@@ -38,7 +38,7 @@ import pytest
 import requests
 import yaml
 from datasets import load_dataset
-from defs.common import wait_for_reported_addr
+from defs.common import get_ucx_net_devices, wait_for_reported_addr
 
 from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
 from tensorrt_llm.executor.result import GenerationResultBase
@@ -420,6 +420,7 @@ def launch_disaggregated_llm(
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
         env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_NET_DEVICES"] = get_ucx_net_devices()
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -450,6 +451,7 @@ def launch_disaggregated_llm(
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_NET_DEVICES"] = get_ucx_net_devices()
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))

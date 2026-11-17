@@ -50,7 +50,10 @@ def _run_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
     os.environ["TLLM_KV_CACHE_MANAGER_V2_BACKEND"] = "cpp"
+    # Literals: importing defs.common would import tensorrt_llm, whose MPI_Init
+    # initializes CUDA before CUDA_VISIBLE_DEVICES above takes effect.
     os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+    os.environ.setdefault("UCX_NET_DEVICES", "lo")
 
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig

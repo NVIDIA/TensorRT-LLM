@@ -40,12 +40,27 @@ def get_ucx_tls() -> str:
     from .conftest import get_sm_version
 
     sm = get_sm_version()
-    # GB300 ARM clusters need these transports enabled explicitly.
+    # Some GB300 ARM clusters need an explicit list: UCX auto-selection picks
+    # a misbehaving NIC transport there.
     if sm == 103 and "aarch" in platform.machine().lower():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
     return "^ib,gdr_copy"
+
+
+def get_ucx_net_devices() -> str:
+    """Get UCX_NET_DEVICES for tests whose disagg workers all run on this host.
+
+    All UCX peers of such workers are on this host, so loopback is the only
+    network device they need ("lo" also turns off IB devices). With every
+    device enabled, UCX re-queried each TCP interface for every new endpoint,
+    which delayed cold NIXL peer setup on bonded NICs
+    (https://nvbugs/6836097), and on R100 QA nodes it used an interface that
+    refuses local TCP connections, which failed MPI worker spawn
+    (https://nvbugs/7088367).
+    """
+    return "lo"
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):

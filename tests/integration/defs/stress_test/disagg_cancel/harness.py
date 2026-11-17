@@ -1166,6 +1166,7 @@ class DisaggCancellationStressHarness:
         from test_disaggregated import (
             build_worker_config,
             get_default_disagg_cluster_config,
+            get_ucx_net_devices,
             get_ucx_tls,
             setup_disagg_cluster,
         )
@@ -1179,6 +1180,7 @@ class DisaggCancellationStressHarness:
         server_start_timeout_s = int(self.config.raw.get("server_start_timeout_s", 1200))
         run_env = os.environ.copy()
         run_env["UCX_TLS"] = get_ucx_tls()
+        run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
         setup_yaml_path = self._write_sanitized_cluster_yaml(cluster_config)
         try:
