@@ -248,12 +248,14 @@ def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> N
         make_ctx_request(2, context_remaining_length=128),
         make_ctx_request(3, context_remaining_length=128),
     ]
-    for phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED):
+    phases = (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED)
+    for phase in phases:
         scheduler.set_remote_tail_phase(phase, context_ids, generation_ids)
         result = scheduler.schedule_request(active, set())
         assert not result.context_requests
         assert not result.generation_requests
-    assert manager.mock_calls == [call.begin_completion_admission(active)] * 2
+    # Each scheduling pass releases the completion gate once and touches no cache.
+    assert manager.mock_calls == [call.begin_completion_admission(active)] * len(phases)
 
 
 def test_disabled_phase_preserves_existing_request_selection() -> None:

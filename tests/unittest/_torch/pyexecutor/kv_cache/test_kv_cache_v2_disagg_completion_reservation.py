@@ -158,6 +158,8 @@ def _context_reservation_manager(available: int) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
     manager._reserves_disagg_completion = True
     manager._ledger_tokens_per_block = 4
+    manager.num_extra_kv_tokens = 0
+    manager._has_cp_helix = False
     manager.max_seq_len = 64
     manager._generation_kv_capacity_headroom = 1
     manager.enable_block_reuse = False
@@ -259,6 +261,45 @@ def test_conservative_headroom_is_capped_at_idle_capacity() -> None:
 
 
 @pytest.mark.cpu_only
+def test_context_only_completion_counts_speculative_padding() -> None:
+    manager = _context_reservation_manager(available=100)
+    manager._disagg_completion_capacity = 4
+    manager._completion_dummy_ids = set()
+    manager.num_extra_kv_tokens = 2
+    # The padded allocation of 16 + 2 tokens needs a fifth block.
+    with pytest.raises(ValueError, match="after retained padding allocations"):
+        manager.validate_completion_capacity(_first_chunk(prompt_len=16))
+    manager.validate_completion_capacity(_first_chunk(prompt_len=14))
+
+
+@pytest.mark.cpu_only
+def test_context_only_reservation_bound_covers_speculative_padding() -> None:
+    manager = _context_reservation_manager(available=100)
+    manager._disagg_completion_capacity = 40
+    manager._completion_dummy_ids = set()
+    manager.num_extra_kv_tokens = 2
+    # 14 + 2 padding + 1 headroom = 17 tokens: five 4-token blocks, not four.
+    assert manager.reserve_context_completion(_first_chunk(prompt_len=14))
+    assert manager._disagg_completion_limits == {7: 5}
+
+
+@pytest.mark.cpu_only
+def test_admission_revalidates_capacity_that_shrank_after_arrival() -> None:
+    manager = _context_reservation_manager(available=100)
+    manager._disagg_completion_capacity = 4
+    manager._completion_dummy_ids = set()
+    request = _first_chunk(prompt_len=16)
+    manager.validate_completion_capacity(request)
+    # Padding allocations grow after arrival and take half the idle capacity.
+    manager.kv_cache_map[99] = Mock(num_blocks=2)
+    manager._completion_dummy_ids = {99}
+    with pytest.raises(ValueError, match="after retained padding allocations"):
+        manager.reserve_context_completion(request)
+    assert manager._disagg_completion_limits == {}
+    assert manager._completion_waiter is None
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "request_overrides, released",
     [
@@ -352,7 +393,8 @@ def _gate_manager(**overrides: object) -> KVCacheManagerV2:
     manager._reserves_disagg_completion = True
     fields = dict(
         is_disagg=True,
-        can_evict=False,
+        _can_evict=False,
+        _only_remote_below_gpu=False,
         is_draft=False,
         max_beam_width=1,
         mapping=SimpleNamespace(pp_size=1),
@@ -378,7 +420,7 @@ def _gate_manager(**overrides: object) -> KVCacheManagerV2:
             True,
         ),
         (dict(is_disagg=False), False),
-        (dict(can_evict=True), False),
+        (dict(_can_evict=True), False),
         # With the configuration off, only a serving connector that declares it turns it on.
         (dict(kv_connector_manager=None), False),
         (dict(kv_connector_manager=_ConnectorDouble(declares=False)), False),
@@ -426,7 +468,7 @@ def _gate_manager(**overrides: object) -> KVCacheManagerV2:
             dict(
                 kv_connector_manager=None,
                 enable_disagg_completion_reservation=True,
-                can_evict=True,
+                _can_evict=True,
             ),
             False,
         ),

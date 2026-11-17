@@ -340,6 +340,42 @@ def _connector_runs_speculative_prefill_only(
                 worker_cls, scheduler_cls))
 
 
+def _refuse_speculation_next_to_connector(
+        spec_config: Optional[SpeculativeConfig],
+        use_kv_cache_manager_v2: bool | str, speculative_prefill_only: bool,
+        connector: KvCacheConnectorManager) -> None:
+    """Refuse speculative decoding next to a connector that moves KV.
+
+    Rejected draft tokens shrink a request's page list, and the freed slot
+    goes to whichever request allocates next. The connector is only told about
+    pages appended since the last report, so it would keep addressing a slot
+    another request now owns. Context-only requests never reject a draft token,
+    which is what the speculative-prefill-only mode relies on. A capacity_only
+    worker registers no KV pages, so it is exempt.
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        speculative_prefill_only: Whether the connector runs in that mode.
+        connector: The constructed connector manager.
+
+    Raises:
+        NotImplementedError: If speculation would run next to a KV-moving
+            connector outside the speculative-prefill-only mode.
+    """
+    if (spec_config is None or (spec_config.max_draft_len or 0) <= 0
+            or use_kv_cache_manager_v2 is not True or speculative_prefill_only
+            or connector.capacity_only):
+        return
+    raise NotImplementedError(
+        "KV connector is not supported with speculative decoding. "
+        "One-model MTP or EAGLE3 is supported on a disaggregated "
+        "context server when the connector scheduler and worker "
+        "both declare supports_speculative_prefill=True. Otherwise "
+        "disable speculative decoding to run a connector.")
+
+
 def _validate_speculative_connector_role(
         connector: KvCacheConnectorManager) -> None:
     """Reject a speculative KV-moving connector on a known generation server."""
@@ -1275,25 +1311,11 @@ def _create_py_executor(
                 pp_size=mapping.pp_size,
                 cp_size=mapping.cp_size)
 
-        # Rejected draft tokens shrink a request's page list, and the freed
-        # slot goes to whichever request allocates next. The connector is
-        # only told about pages appended since the last report, so it would
-        # keep addressing a slot another request now owns. Context-only
-        # requests never reject a draft token, which is what the
-        # speculative-prefill-only mode relies on. Checked once the classes
-        # are resolved, since the mode depends on their declarations, and
-        # still before any connector instance exists.
+        # The mode follows the classes' declarations. The speculation refusal
+        # runs after construction, because capacity_only is a worker property.
         speculative_prefill_only = _connector_runs_speculative_prefill_only(
             spec_config, worker_cls, scheduler_cls, cache_transceiver_config,
             v2_selection)
-        if (spec_config is not None and (spec_config.max_draft_len or 0) > 0
-                and v2_selection is True and not speculative_prefill_only):
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding. "
-                "One-model MTP or EAGLE3 is supported on a disaggregated "
-                "context server when the connector scheduler and worker "
-                "both declare supports_speculative_prefill=True. Otherwise "
-                "disable speculative decoding to run a connector.")
 
         try:
             rank = tensorrt_llm.mpi_rank()
@@ -1329,6 +1351,10 @@ def _create_py_executor(
             raise
 
         _validate_speculative_connector_role(kv_connector_manager)
+
+        _refuse_speculation_next_to_connector(spec_config, v2_selection,
+                                              speculative_prefill_only,
+                                              kv_connector_manager)
 
         if not kv_connector_manager.capacity_only and (
                 mapping.enable_attention_dp or speculative_prefill_only):

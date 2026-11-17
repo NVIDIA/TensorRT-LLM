@@ -508,6 +508,29 @@ class TestConnectorReuseStats:
         assert kv_cache.connector_reuse_calls == []
 
 
+class TestRetainContextAllocation:
+    """A skipped step keeps the allocation a connector already holds pages of."""
+
+    @pytest.mark.parametrize("is_draft", [False, True])
+    def test_capacity_stays_and_the_revert_marker_is_cleared(self, is_draft):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        manager.is_draft = is_draft
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        manager.kv_cache_map = {1: kv_cache}
+        req = FakeRequest()
+        req.py_ctx_pre_resize_cap = 64
+        req.py_draft_ctx_pre_resize_cap = 64
+
+        manager.retain_context_allocation(req)
+
+        assert kv_cache.resize_calls == []
+        assert kv_cache.capacity == PROMPT_LEN
+        marker = "py_draft_ctx_pre_resize_cap" if is_draft else "py_ctx_pre_resize_cap"
+        other = "py_ctx_pre_resize_cap" if is_draft else "py_draft_ctx_pre_resize_cap"
+        assert getattr(req, marker) is None
+        assert getattr(req, other) == 64
+
+
 class TestUnchunkedIsPureShrink:
     """With chunking off, ``resize_context`` already covered the whole prompt.
 

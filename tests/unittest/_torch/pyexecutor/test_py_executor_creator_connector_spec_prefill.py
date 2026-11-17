@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _connector_runs_speculative_prefill_only,
+    _refuse_speculation_next_to_connector,
     _validate_speculative_connector_role,
 )
 from tensorrt_llm.llmapi.llm_args import (
@@ -199,3 +200,34 @@ def test_speculative_role_checked_before_serving(
         with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger.warning") as warning:
             _validate_speculative_connector_role(connector)
         assert warning.called is (normalized_role is None and restricted)
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+@pytest.mark.parametrize("speculative_prefill_only", [False, True])
+@pytest.mark.parametrize("use_v2", [True, "auto", False], ids=["v2", "auto", "v1"])
+@pytest.mark.parametrize(
+    "make_spec_config", [None, _mtp_eagle, _eagle3], ids=["no_spec", "mtp_eagle", "eagle3"]
+)
+def test_speculation_is_refused_next_to_a_kv_moving_connector(
+    make_spec_config: Callable[[], SpeculativeConfig] | None,
+    use_v2: bool | str,
+    speculative_prefill_only: bool,
+    capacity_only: bool,
+) -> None:
+    spec_config = make_spec_config() if make_spec_config is not None else None
+    connector = SimpleNamespace(capacity_only=capacity_only)
+    refused = (
+        spec_config is not None
+        and use_v2 is True
+        and not speculative_prefill_only
+        and not capacity_only
+    )
+    if refused:
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            _refuse_speculation_next_to_connector(
+                spec_config, use_v2, speculative_prefill_only, connector
+            )
+    else:
+        _refuse_speculation_next_to_connector(
+            spec_config, use_v2, speculative_prefill_only, connector
+        )

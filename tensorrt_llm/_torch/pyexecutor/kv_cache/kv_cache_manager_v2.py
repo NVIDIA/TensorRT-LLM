@@ -6549,6 +6549,18 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(req.py_request_id, kv_cache)
 
+    def retain_context_allocation(self, req: LlmRequest) -> None:
+        """Keep a reported context allocation for the next attempt of a skipped step.
+
+        The connector already holds the allocation's page IDs. Shrinking it would free
+        pages that a same-length retry may replace without the connector noticing.
+        `resize_context` never shrinks, so the retry reuses or extends this allocation.
+        """
+        if self.is_draft:
+            req.py_draft_ctx_pre_resize_cap = None
+        else:
+            req.py_ctx_pre_resize_cap = None
+
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
         if kv_cache.batch_row is not None:
@@ -7183,8 +7195,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return True
         if self.completion_admission_blocked(req):
             return False
+        self.validate_completion_capacity(req)
         limit = (
-            self._disagg_completion_limit(req.prompt_len)
+            self._disagg_completion_limit(self._context_only_completion_end(req.prompt_len))
             if req.is_context_only_request
             else self._disagg_generation_limit(req, req.prompt_len)
         )
@@ -7227,20 +7240,32 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return max(0, self._disagg_completion_capacity - dummy_blocks)
 
+    def _context_only_completion_end(self, prompt_len: int) -> int:
+        """Tokens a context-only request allocates: its prompt plus the speculative padding."""
+        return prompt_len + self._kv_alloc_extra_tokens
+
+    def _completion_blocks_required(self, req: LlmRequest) -> int:
+        """Ledger blocks `req` needs to complete, excluding headroom and tail-copy extras."""
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        end = (
+            self._context_only_completion_end(prompt_len)
+            if req.is_context_only_request
+            else min(self.max_seq_len, prompt_len + req.max_new_tokens)
+        )
+        return ceil_div(end, self._ledger_tokens_per_block)
+
     def validate_completion_capacity(self, req: LlmRequest) -> None:
-        """Reject an impossible completion before it can become a waiter."""
+        """Reject an impossible completion before it can become a waiter.
+
+        Runs on arrival and again at admission, because retained padding allocations
+        can shrink the idle capacity in between.
+        """
         if not self._reserves_disagg_completion or req.is_dummy:
             return
         capacity = self.completion_capacity()
         if capacity is None:
             return
-        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        end = (
-            prompt_len
-            if req.is_context_only_request
-            else min(self.max_seq_len, prompt_len + req.max_new_tokens)
-        )
-        required = (end + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
+        required = self._completion_blocks_required(req)
         if required > capacity:
             raise ValueError(
                 f"Request {req.request_id} requires {required} completion blocks, "

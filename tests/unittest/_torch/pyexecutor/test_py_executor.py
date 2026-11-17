@@ -4467,6 +4467,37 @@ def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse() -> None:
     stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
 
 
+@pytest.mark.parametrize("capacity_only", [False, True])
+@pytest.mark.parametrize("reported", [False, True])
+def test_skipped_context_chunk_keeps_pages_a_moving_connector_was_told_about(
+    reported: bool, capacity_only: bool
+) -> None:
+    # Shrinking a reported context allocation frees pages the connector still
+    # addresses, and a same-length retry would not report their replacements.
+    stub = object.__new__(PyExecutor)
+    stub.kv_connector_manager = Mock(capacity_only=capacity_only)
+    stub._is_kv_manager_v2 = True
+    stub.kv_cache_manager = Mock()
+    stub.enable_joint_kv_cache_reuse = False
+    context_request = _make_adp_request(LlmRequestState.CONTEXT_INIT, request_id=5)
+    context_request.py_connector_allocation_reported = reported
+    context_request.is_dummy = False
+    context_request.context_chunk_size = 4
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.context_requests.append(context_request)
+
+    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
+
+    if reported and not capacity_only:
+        stub.kv_cache_manager.retain_context_allocation.assert_called_once_with(context_request)
+        stub.kv_cache_manager.revert_unexecuted_context_chunk.assert_not_called()
+    else:
+        stub.kv_cache_manager.revert_unexecuted_context_chunk.assert_called_once_with(
+            context_request
+        )
+        stub.kv_cache_manager.retain_context_allocation.assert_not_called()
+
+
 def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub = object.__new__(PyExecutor)
     stub.kv_cache_manager = Mock()

@@ -5697,9 +5697,9 @@ class PyExecutor:
         KV cache capacity of every scheduled request; give it back so it does
         not accumulate across skipped iterations, and so a context request
         rescheduled with another chunk still has capacity equal to history.
-        A KV-moving connector may already hold the generation page addresses;
-        keep that allocation and reuse it on retry without resetting the live
-        request's state.
+        A KV-moving connector may already hold the page addresses of generation
+        and reported context allocations; keep those and reuse them on retry
+        without resetting the live request's state.
 
         Only applies to KV cache manager V2 + scheduler V2, because the V2
         scheduler allocates KV cache capacity during scheduling, before the
@@ -5723,14 +5723,21 @@ class PyExecutor:
                     manager.retain_generation_allocation(req)
                 else:
                     manager.revert_allocate_generation(req)
+        reverted = []
         for req in scheduled_batch.context_requests:
+            retain = (self._kv_connector_moves_kv
+                      and req.py_connector_allocation_reported)
             for manager in managers:
-                manager.revert_unexecuted_context_chunk(req)
-        reverted = [
+                if retain:
+                    manager.retain_context_allocation(req)
+                else:
+                    manager.revert_unexecuted_context_chunk(req)
+            if not retain and not PyExecutor._is_stats_dummy_request(req):
+                reverted.append(req)
+        self._num_skipped_forward_ctx_chunks += len([
             req for req in scheduled_batch.context_requests
             if not PyExecutor._is_stats_dummy_request(req)
-        ]
-        self._num_skipped_forward_ctx_chunks += len(reverted)
+        ])
         self._num_reverted_ctx_tokens += sum(req.context_chunk_size
                                              for req in reverted)
 
