@@ -1,0 +1,11 @@
+DSparkDecodingConfig
+====================
+
+.. autoclass:: tensorrt_llm.llmapi.DSparkDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_construct,model_extra,model_copy,construct,from_orm,model_post_init,Config,model_validate_strings,schema_json,schema,validate,model_validate,model_validate_json,model_fields_set,model_parametrized_name,model_config,update_forward_refs,json,model_dump_json,parse_file,model_fields,copy,dict,model_json_schema,model_rebuild,parse_raw,model_computed_fields,model_dump,parse_obj
