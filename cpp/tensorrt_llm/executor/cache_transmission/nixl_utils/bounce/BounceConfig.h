@@ -192,6 +192,12 @@ struct BounceConfig
     // memory instead of staging them in device scratch first. Faster at every plan size (same
     // bytes over the bus, but no H2D-then-kernel serialization), so on by default.
     bool useZeroCopyArguments{true};
+    // push_gather: toward a peer whose arena this process can map (fabric memory in the same NVLink
+    // domain and IMEX channel), the gather kernel writes each chunk straight into the granted region
+    // of the peer's arena instead of into a local staging region followed by a NIXL write. A chunk's
+    // gather then starts only once its GRANT arrives (eager gather does not apply). Peers whose arena
+    // cannot be mapped keep the staged path.
+    bool pushGather{false};
 
     /// Re-derive the lease/quarantine values from the one user-visible timeout (see the field
     /// comments): the lease must exceed the peers' request timeout, and time is the only write
@@ -328,6 +334,10 @@ struct BounceConfig
         {
             setBool(cfg.useZeroCopyArguments);
         }
+        else if (key == "push_gather")
+        {
+            setBool(cfg.pushGather);
+        }
         else
         {
             return false;
@@ -344,7 +354,7 @@ struct BounceConfig
         // KEEP IN SYNC with AGENT_BOUNCE_PARAM_KEYS in
         // tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py, which the llm_args validator
         // uses to reject unknown agent_bounce_params keys upfront.
-        static constexpr std::array<std::pair<char const*, char const*>, 11> kEnvKnobs{{
+        static constexpr std::array<std::pair<char const*, char const*>, 12> kEnvKnobs{{
             {"max_chunk_size", "TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES"},
             {"arena_allocation_granularity", "TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES"},
             {"max_average_descriptor_size", "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES"},
@@ -356,6 +366,7 @@ struct BounceConfig
             {"disable_fabric_memory", "TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY"},
             {"enable_eager_gather", "TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER"},
             {"use_zero_copy_arguments", "TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS"},
+            {"push_gather", "TRTLLM_NIXL_BOUNCE_PUSH_GATHER"},
         }};
         BounceConfig cfg;
         for (auto const& [paramKey, envName] : kEnvKnobs)

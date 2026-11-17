@@ -159,6 +159,30 @@ public:
     /// the sender's releaseLocal/reclaim can free arena bytes that re-grant a waiting remote flow).
     void sendGrants(std::vector<Grant> const& grants);
 
+    /// The peer's mapped arena when push gather serves it (cfg.pushGather and the peer's arena mapped
+    /// in registerPeerHandshake), else nullptr. Thread-safe.
+    [[nodiscard]] std::shared_ptr<PeerArenaMapping> pushMapping(std::string const& peer) const
+    {
+        std::lock_guard<std::mutex> lk(pushMu);
+        auto it = pushMaps.find(peer);
+        return it == pushMaps.end() ? nullptr : it->second;
+    }
+
+    /// Install (or with nullptr, drop) the peer's arena mapping. Requests already holding the old
+    /// mapping keep it alive until their gathers finish. Thread-safe.
+    void setPushMapping(std::string const& peer, std::shared_ptr<PeerArenaMapping> mapping)
+    {
+        std::lock_guard<std::mutex> lk(pushMu);
+        if (mapping)
+        {
+            pushMaps[peer] = std::move(mapping);
+        }
+        else
+        {
+            pushMaps.erase(peer);
+        }
+    }
+
     std::string selfName;
     BounceConfig cfg;
     int deviceId{};
@@ -168,6 +192,8 @@ public:
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
     CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
+    mutable std::mutex pushMu; // guards pushMaps
+    std::unordered_map<std::string, std::shared_ptr<PeerArenaMapping>> pushMaps; // peer -> its mapped arena
 };
 
 /// Receiver role ([R]): WANT -> grant regions, DATA -> scatter into the caller's KV, then ACK. Owns
@@ -315,9 +341,13 @@ public:
     /// (drives the IO loop's 0ms busy-poll). Called on the IO thread.
     [[nodiscard]] bool busy() const
     {
-        // No mOrphanGather term: a parked gather still holds its region, so localHeldCount() > 0 covers it.
-        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty();
+        // A push gather holds no local region, so it is counted separately, and so is a parked one.
+        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty() || !mOrphanGather.empty()
+            || mPushGathers.load(std::memory_order_relaxed) > 0;
     }
+
+    /// localOffset of a chunk that holds no local region (push gather).
+    static constexpr std::uint64_t kNoLocalRegion = ~std::uint64_t{0};
 
 private:
     // A chunk's transfer state — the per-chunk view of the sender Request state machine.
@@ -358,6 +388,9 @@ private:
         std::uint64_t nvtxGather{0};  // gather launched -> event signaled (in-flight incl. GPU queueing)
         std::uint64_t nvtxWrite{0};   // RDMA write posted -> poll terminal
         std::uint64_t nvtxAckWait{0}; // DATA sent -> ACK received
+        // Push gather: the peer's mapped arena the gather kernel writes into (localOffset is then
+        // kNoLocalRegion). Held until the gather has finished.
+        std::shared_ptr<PeerArenaMapping> push;
     };
 
     struct Request
@@ -393,6 +426,9 @@ private:
         // Pipeline-starvation spans (can open/close several times per request, one range per period):
         std::uint64_t nvtxCreditStarved{0}; // every credit consumed, chunks left -> next GRANT (onGrant ends)
         std::uint64_t nvtxArenaStarved{0};  // credits parked: no local region / exec ctx -> parked credits drain
+        // Push gather toward this peer (taken at submit), else nullptr: chunks are gathered straight
+        // into the granted regions of the peer's arena.
+        std::shared_ptr<PeerArenaMapping> push;
     };
 
     // Regions of a FAILED request whose RDMA write was still in flight (state == Writing).
@@ -424,6 +460,9 @@ private:
         std::uint64_t rid{};
         std::chrono::steady_clock::time_point since{}; // when the gather was orphaned (age for the stall warning)
         bool warned{false};                            // stall WARNING already emitted once
+        // A push gather writes into the PEER's region: its mapping must outlive the kernel, and the
+        // flow's cancel waits for it like for an in-flight write.
+        std::shared_ptr<PeerArenaMapping> push;
     };
 
     /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk
@@ -449,8 +488,14 @@ private:
     /// and logging ONE warning with the request's progress context — the single choke point that
     /// keeps every failure mode observable. See the body for the region-recycling rules.
     void failRequest(std::uint64_t rid, Request& req, BounceFailReason reason);
+    /// The chunk's bytes are in the peer's region: send DATA (the scatter plan) and wait for the ACK.
+    void sendData(std::uint64_t rid, Request& req, Posted& p);
+    /// Send each deferred cancel whose flow no longer has a write or a push gather in flight.
+    bool sendDrainedCancels();
 
     BounceContext& mCtx;
+    // Push gathers launched and not yet observed complete (drives busy()).
+    std::atomic<std::size_t> mPushGathers{0};
 
     // request table (IO thread + submit() from app threads)
     std::mutex mReqMu;
@@ -564,6 +609,12 @@ private:
     // invalidateRemoteAgent) -> own mutex.
     mutable std::mutex mPeerMu;
     std::unordered_set<std::string> mHandshakedPeers;
+
+    // This arena's export for peers that push-gather into it (empty handle: not exported). Set once
+    // in the constructor.
+    std::uint64_t mArenaAllocBase{0};
+    std::uint64_t mArenaAllocBytes{0};
+    std::string mArenaFabricHandle;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

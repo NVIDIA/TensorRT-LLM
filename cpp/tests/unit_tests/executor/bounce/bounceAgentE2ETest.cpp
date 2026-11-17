@@ -199,6 +199,48 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     freeXferBufs(bufs);
 }
 
+// push_gather: the sender gathers each chunk straight into the receiver's mapped arena when it can map
+// it (fabric memory), else keeps the staged write. Either way the transfer must land intact.
+TEST(BounceAgentE2E, PushGatherTransfersIntact)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMsg;
+    auto senderCfg = makeBounceConfig("pushAgentA", /*arenaSizeMb=*/2, /*granularityBytes=*/"4096");
+    senderCfg.bounceParams["push_gather"] = "1";
+    auto a = tryMakeAgent(senderCfg, skipMsg);
+    auto b = a ? tryMakeAgent(makeBounceConfig("pushAgentB", /*arenaSizeMb=*/2, /*granularityBytes=*/"4096"), skipMsg)
+               : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    a->loadRemoteAgent("pushAgentB", b->getLocalAgentDesc());
+
+    // Several requests of several chunks each, so regions are granted, filled and recycled.
+    std::vector<XferBufs> bufs;
+    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
+    for (int i = 0; i < 4; ++i)
+    {
+        bufs.push_back(makeXferBufs(/*nDescs=*/64, /*descBytes=*/1000, /*seed=*/11 + i));
+        routes.emplace_back(a.get(), "pushAgentB");
+    }
+    EXPECT_EQ(runConcurrentFlows(routes, bufs), 4);
+    for (auto const& x : bufs)
+    {
+        EXPECT_TRUE(verifyXferBufs(x));
+    }
+
+    a->shutdown();
+    b->shutdown();
+    for (auto& x : bufs)
+    {
+        freeXferBufs(x);
+    }
+}
+
 // A non-power-of-two arena can clamp the effective chunk cap below the configured cap. A descriptor
 // between those limits must use ordinary NIXL instead of entering bounce and failing plan creation.
 TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)

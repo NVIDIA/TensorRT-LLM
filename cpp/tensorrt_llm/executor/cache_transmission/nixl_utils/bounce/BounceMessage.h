@@ -189,6 +189,12 @@ struct BounceHandshake
     // receiver-side peer teardown (forget()/invalidateRemoteAgent); on the lease path it needs no
     // extra margin of its own.
     std::int32_t requestTimeoutMs{0};
+    // The arena's backing allocation, for peers that map it (push gather): its virtual address range
+    // in this process and its CU_MEM_HANDLE_TYPE_FABRIC handle (raw CUmemFabricHandle bytes). The
+    // handle is empty when the arena is not fabric memory or could not be exported.
+    std::uint64_t arenaAllocBase{0};
+    std::uint64_t arenaAllocBytes{0};
+    std::string arenaFabricHandle;
     // Control-channel address: a zmq endpoint (kZMQ).
     std::string endpoint;
 };

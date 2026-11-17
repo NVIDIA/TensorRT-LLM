@@ -136,6 +136,7 @@ TEST(BounceConfig, DescriptiveNamesParse)
     env.set("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", "yes");
     env.set("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", "false");
     env.set("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", "false");
+    env.set("TRTLLM_NIXL_BOUNCE_PUSH_GATHER", "1");
 
     auto const cfg = b::BounceConfig::fromEnv();
     EXPECT_EQ(cfg.maxInflightChunksPerRequest, 5u);
@@ -149,6 +150,7 @@ TEST(BounceConfig, DescriptiveNamesParse)
     EXPECT_TRUE(cfg.disableFabricMemory);
     EXPECT_FALSE(cfg.enableEagerGather);
     EXPECT_FALSE(cfg.useZeroCopyArguments);
+    EXPECT_TRUE(cfg.pushGather);
 }
 
 TEST(BounceConfig, InvalidResourceCountsFallBackToDefaults)

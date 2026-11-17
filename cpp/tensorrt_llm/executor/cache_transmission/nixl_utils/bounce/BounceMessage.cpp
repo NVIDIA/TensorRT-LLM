@@ -181,7 +181,12 @@ namespace
 // layout (so the handshake itself can evolve); `wireVersion` inside is the control-message codec
 // version being negotiated.
 constexpr std::uint32_t kHandshakeMagic = 0x424E4853U; // 'B''N''H''S'
-constexpr std::uint16_t kHandshakeFormatVersion = 1U;
+// Format 2 adds the arena export (allocation base, size, fabric handle) before the endpoint; format 1
+// blobs still decode, without an export.
+constexpr std::uint16_t kHandshakeFormatVersion = 2U;
+constexpr std::uint16_t kHandshakeFormatVersionNoExport = 1U;
+// Upper bound on the exported handle's size (a CUmemFabricHandle is 64 bytes).
+constexpr std::size_t kMaxFabricHandleBytes = 256U;
 } // namespace
 
 std::string encodeHandshake(BounceHandshake const& handshake)
@@ -195,6 +200,9 @@ std::string encodeHandshake(BounceHandshake const& handshake)
     su::serialize(handshake.arenaUsableCapacityBytes, os);
     su::serialize(handshake.maxChunkSizeBytes, os);
     su::serialize(handshake.requestTimeoutMs, os);
+    su::serialize(handshake.arenaAllocBase, os);
+    su::serialize(handshake.arenaAllocBytes, os);
+    su::serialize(handshake.arenaFabricHandle, os);
     su::serialize(handshake.endpoint, os);
     return os.str();
 }
@@ -205,7 +213,8 @@ bool decodeHandshake(std::string const& blob, BounceHandshake& out)
     std::istringstream is(blob);
     auto const magic = su::deserialize<std::uint32_t>(is);
     auto const formatVersion = su::deserialize<std::uint16_t>(is);
-    if (is.fail() || magic != kHandshakeMagic || formatVersion != kHandshakeFormatVersion)
+    if (is.fail() || magic != kHandshakeMagic
+        || (formatVersion != kHandshakeFormatVersion && formatVersion != kHandshakeFormatVersionNoExport))
     {
         return false; // absent / foreign / future-format blob -> peer treated as non-bounce
     }
@@ -214,6 +223,24 @@ bool decodeHandshake(std::string const& blob, BounceHandshake& out)
     out.arenaUsableCapacityBytes = su::deserialize<std::uint64_t>(is);
     out.maxChunkSizeBytes = su::deserialize<std::uint64_t>(is);
     out.requestTimeoutMs = su::deserialize<std::int32_t>(is);
+    out.arenaAllocBase = 0;
+    out.arenaAllocBytes = 0;
+    out.arenaFabricHandle.clear();
+    if (formatVersion == kHandshakeFormatVersion)
+    {
+        out.arenaAllocBase = su::deserialize<std::uint64_t>(is);
+        out.arenaAllocBytes = su::deserialize<std::uint64_t>(is);
+        auto const handleLen = su::deserialize<std::size_t>(is);
+        if (is.fail() || handleLen > kMaxFabricHandleBytes)
+        {
+            return false;
+        }
+        out.arenaFabricHandle.resize(handleLen);
+        if (handleLen > 0 && !is.read(out.arenaFabricHandle.data(), static_cast<std::streamsize>(handleLen)))
+        {
+            return false;
+        }
+    }
     auto const endpointLen = su::deserialize<std::size_t>(is);
     if (is.fail())
     {

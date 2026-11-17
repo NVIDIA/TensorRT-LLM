@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 // Reuse the KV-cache transfer buffers' fabric allocator (batch_manager) rather than a private copy:
 // one MNNVL/GPUDirect-RDMA implementation, shared. Forward-declared here (the member is held by
@@ -92,12 +93,60 @@ public:
         return mFabric != nullptr;
     }
 
+    /// The allocation backing a fabric arena, as peers map it: its virtual address range in this process
+    /// and its CU_MEM_HANDLE_TYPE_FABRIC handle (raw CUmemFabricHandle bytes). Returns false, leaving `out`
+    /// untouched, when the arena is not fabric memory or the export fails.
+    [[nodiscard]] bool exportFabric(std::uint64_t& allocBase, std::uint64_t& allocBytes, std::string& handle) const;
+
 private:
     int mDeviceId{0};
     std::size_t mBytes{0};
     void* mBase{nullptr}; // the registered RDMA src/dst buffer (offset 0)
     // Non-null on MNNVL when fabric-backed; else null and mBase is cudaMalloc'd.
     std::unique_ptr<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory> mFabric;
+};
+
+/// A peer's fabric arena mapped into this process (push gather: the gather kernel writes a chunk
+/// straight into the peer's granted region). The mapping is removed on destruction, so every holder
+/// that may still have a kernel writing through it (an in-flight chunk, an orphaned gather) keeps a
+/// shared_ptr until that kernel has finished.
+class PeerArenaMapping
+{
+public:
+    /// Import `handle` (the peer's exportFabric output) and map its `allocBytes` for `deviceId`. Returns
+    /// nullptr and sets `error` when the import or map fails (another NVLink domain or IMEX channel,
+    /// or no fabric support).
+    [[nodiscard]] static std::shared_ptr<PeerArenaMapping> map(std::uint64_t remoteBase, std::uint64_t allocBytes,
+        std::string const& handle, int deviceId, std::string& error);
+
+    ~PeerArenaMapping();
+
+    PeerArenaMapping(PeerArenaMapping const&) = delete;
+    PeerArenaMapping& operator=(PeerArenaMapping const&) = delete;
+
+    /// Local address of the peer address range [remoteAddr, remoteAddr + len), or 0 when the range
+    /// is not inside the mapped arena.
+    [[nodiscard]] std::uint64_t translate(std::uint64_t remoteAddr, std::uint64_t len) const noexcept
+    {
+        if (remoteAddr < mRemoteBase || len > mBytes || remoteAddr - mRemoteBase > mBytes - len)
+        {
+            return 0;
+        }
+        return mLocalBase + (remoteAddr - mRemoteBase);
+    }
+
+    [[nodiscard]] std::uint64_t bytes() const noexcept
+    {
+        return mBytes;
+    }
+
+private:
+    PeerArenaMapping() = default;
+
+    std::uint64_t mRemoteBase{0};
+    std::uint64_t mLocalBase{0};
+    std::uint64_t mBytes{0};
+    bool mMapped{false};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

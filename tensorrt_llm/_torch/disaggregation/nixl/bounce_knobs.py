@@ -30,5 +30,6 @@ AGENT_BOUNCE_PARAM_KEYS: frozenset = frozenset(
         "disable_fabric_memory",
         "enable_eager_gather",
         "use_zero_copy_arguments",
+        "push_gather",
     }
 )

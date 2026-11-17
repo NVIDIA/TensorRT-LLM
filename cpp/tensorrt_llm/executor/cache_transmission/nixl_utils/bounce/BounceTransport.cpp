@@ -878,6 +878,7 @@ std::shared_future<BounceResult> BounceSender::submit(
         req.numChunks = numChunks;
         req.plan = std::move(plan);
         req.promise = promise;
+        req.push = mCtx.pushMapping(peer);
         req.lastProgress = std::chrono::steady_clock::now();
         req.nvtxReq = bounceRangeStart(kNvtxRequest, "req rid=%llu chunks=%u bytes=%llu",
             static_cast<unsigned long long>(rid), numChunks, static_cast<unsigned long long>(planBytes));
@@ -1045,9 +1046,9 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         bool const haveCredit = !req.pendingCredits.empty();
         if (!haveCredit)
         {
-            if (!mCtx.cfg.enableEagerGather)
+            if (!mCtx.cfg.enableEagerGather || req.push)
             {
-                break; // classic path: a chunk's gather starts only once its GRANT arrived
+                break; // classic path (and push gather): a chunk's gather starts only once its GRANT arrived
             }
             if (req.posted.size() >= mCtx.cfg.maxInflightChunksPerRequest)
             {
@@ -1070,11 +1071,37 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         {
             break;
         }
-        auto localOff = mCtx.scheduler.acquireLocal(chunk.packedBytes, /*eager=*/!haveCredit);
-        if (!localOff)
+        // Push gather writes the chunk straight into the granted region of the peer's mapped arena;
+        // otherwise it is staged in a local region of the shared arena and written by NIXL later.
+        std::optional<std::uint64_t> localOff;
+        std::uint64_t regionBase = 0;
+        if (req.push)
         {
-            mCtx.exec->release(ctx);
-            break;
+            regionBase = req.push->translate(req.pendingCredits.front().addr, chunk.packedBytes);
+            if (regionBase == 0)
+            {
+                mCtx.exec->release(ctx);
+                TLLM_LOG_WARNING(
+                    "BounceTransport(%s): rid=%llu chunk=%u granted region 0x%llx (+%zu B) is outside the peer's "
+                    "mapped arena; abandoning flow",
+                    mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx,
+                    static_cast<unsigned long long>(req.pendingCredits.front().addr),
+                    static_cast<std::size_t>(chunk.packedBytes));
+                req.abandonReason = BounceFailReason::kProtocolError;
+                req.pendingCredits.clear();
+                break;
+            }
+            localOff = kNoLocalRegion;
+        }
+        else
+        {
+            localOff = mCtx.scheduler.acquireLocal(chunk.packedBytes, /*eager=*/!haveCredit);
+            if (!localOff)
+            {
+                mCtx.exec->release(ctx);
+                break;
+            }
+            regionBase = mCtx.arena->baseAddr() + *localOff;
         }
         BounceCreditEntry credit{};
         if (haveCredit)
@@ -1088,7 +1115,6 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // the gather's GPU time is the async `gather` span ended in drainGatherReady).
         BounceNvtxScope gatherLaunchScope(kNvtxGatherLaunch, "gatherLaunch rid=%llu chunk=%u n=%u bytes=%llu",
             static_cast<unsigned long long>(rid), chunkIdx, nDesc, static_cast<unsigned long long>(chunk.packedBytes));
-        auto const regionBase = mCtx.arena->baseAddr() + *localOff;
         // Coalescing in the plan can leave very large per-desc runs; split them so the copy kernel
         // keeps its one-thread-block-per-entry parallelism (bounded by the scratch capacity).
         // Two passes: an exact piece count first (the packed [srcs|dsts|sizes] pinned layout needs
@@ -1110,7 +1136,10 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 "BounceTransport(%s): rid=%llu chunk=%u plan entries %zu > exec capacity %zu; abandoning flow",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, nTotal, maxEntries);
             mCtx.exec->release(ctx);
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
+            if (*localOff != kNoLocalRegion)
+            {
+                mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
+            }
             req.abandonReason = BounceFailReason::kProtocolError;
             // Abandon: pumpRequest ignores the request from now on; once its in-flight chunks
             // drain, lastProgress freezes and checkTimeouts fails it within one requestTimeoutMs.
@@ -1152,6 +1181,11 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         p.chunkIdx = chunkIdx;
         p.localOffset = *localOff;
         p.ctx = ctx;
+        p.push = req.push;
+        if (p.push)
+        {
+            mPushGathers.fetch_add(1, std::memory_order_relaxed);
+        }
         p.hasCredit = haveCredit;
         if (haveCredit)
         {
@@ -1252,6 +1286,15 @@ bool BounceSender::drainGatherReady()
                 p.ctx = nullptr;
                 p.state = PostState::Gathered;
                 didWork = true;
+                if (p.push)
+                {
+                    // Push gather: the kernel already wrote the chunk into the peer's region.
+                    p.push.reset();
+                    mPushGathers.fetch_sub(1, std::memory_order_relaxed);
+                    sendData(rid, req, p);
+                    req.lastProgress = std::chrono::steady_clock::now();
+                    continue;
+                }
             }
             // state == Gathered: issue the RDMA write once the credit is here (an eagerly-gathered
             // chunk may finish before its GRANT arrives; it then waits in place until attachCredits
@@ -1289,6 +1332,24 @@ bool BounceSender::drainGatherReady()
     return didWork;
 }
 
+void BounceSender::sendData(std::uint64_t rid, Request& req, Posted& p)
+{
+    auto const& chunk = req.plan.chunks()[p.chunkIdx];
+    // The DATA scatter plan is the chunk's COALESCED run list (built once at plan time): same bytes,
+    // but typically orders of magnitude fewer entries than the per-desc view — this message sits on
+    // the ACK critical path. Sent as-is, no per-send rebuild.
+    auto const nRuns = static_cast<std::uint32_t>(chunk.scatterRuns.size());
+    {
+        BounceNvtxScope dataScope(kNvtxDataSend, "dataSend rid=%llu chunk=%u n=%u bytes=%zu",
+            static_cast<unsigned long long>(rid), p.chunkIdx, nRuns,
+            static_cast<std::size_t>(nRuns) * sizeof(BounceScatterRun));
+        mCtx.channel->sendTo(req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
+    }
+    p.state = PostState::Sent;
+    p.nvtxAckWait
+        = bounceRangeStart(kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
+}
+
 bool BounceSender::pollSenderHandles()
 {
     std::lock_guard<std::mutex> lk(mReqMu);
@@ -1311,18 +1372,6 @@ bool BounceSender::pollSenderHandles()
                 // RDMA in-flight time; the DATA build/encode/enqueue cost gets its own span (it used
                 // to hide inside nixlWrite).
                 bounceRangeEnd(p.nvtxWrite);
-                auto const& chunk = req.plan.chunks()[p.chunkIdx];
-                // The DATA scatter plan is the chunk's COALESCED run list (built once at plan time):
-                // same bytes, but typically orders of magnitude fewer entries than the per-desc view
-                // — this message sits on the ACK critical path. Sent as-is, no per-send rebuild.
-                auto const nRuns = static_cast<std::uint32_t>(chunk.scatterRuns.size());
-                {
-                    BounceNvtxScope dataScope(kNvtxDataSend, "dataSend rid=%llu chunk=%u n=%u bytes=%zu",
-                        static_cast<unsigned long long>(rid), p.chunkIdx, nRuns,
-                        static_cast<std::size_t>(nRuns) * sizeof(BounceScatterRun));
-                    mCtx.channel->sendTo(
-                        req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
-                }
                 if (!p.xfer->release())
                 {
                     // The write is terminal, so progress is safe; the status object keeps the
@@ -1331,9 +1380,7 @@ bool BounceSender::pollSenderHandles()
                         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
                 }
                 p.xfer.reset();
-                p.state = PostState::Sent;
-                p.nvtxAckWait = bounceRangeStart(
-                    kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
+                sendData(rid, req, p);
                 didWork = true;
             }
             else if (st == TransferState::kFAILURE)
@@ -1410,7 +1457,10 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
             bounceRangeEnd(pit->nvtxAckWait);
             // Return the gather-staging region to the shared arena; re-schedule may hand the freed
             // bytes to a waiting remote flow.
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
+            if (pit->localOffset != kNoLocalRegion)
+            {
+                mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
+            }
             req.posted.erase(pit);
             found = true;
             break;
@@ -1484,7 +1534,7 @@ bool BounceSender::drainOrphanLocal()
 {
     if (mOrphanLocal.empty())
     {
-        return false;
+        return sendDrainedCancels();
     }
     bool didWork = false;
     std::vector<OrphanLocal> keep;
@@ -1523,13 +1573,22 @@ bool BounceSender::drainOrphanLocal()
         didWork = true;
     }
     mOrphanLocal.swap(keep);
-    // Send any deferred cancel whose flow now has NO in-flight write left: the receiver may safely
-    // reclaim its regions (the writes have landed/failed, no more DMA targets them).
+    didWork |= sendDrainedCancels();
+    return didWork;
+}
+
+bool BounceSender::sendDrainedCancels()
+{
+    // Send any deferred cancel whose flow now has NO in-flight write or push gather left: the receiver
+    // may safely reclaim its regions (nothing writes into them any more).
+    bool didWork = false;
     for (auto it = mPendingCancel.begin(); it != mPendingCancel.end();)
     {
         std::uint64_t const rid = it->first;
-        bool const stillInFlight = std::any_of(
-            mOrphanLocal.begin(), mOrphanLocal.end(), [rid](OrphanLocal const& o) { return o.rid == rid; });
+        bool const stillInFlight = std::any_of(mOrphanLocal.begin(), mOrphanLocal.end(),
+                                       [rid](OrphanLocal const& o) { return o.rid == rid; })
+            || std::any_of(mOrphanGather.begin(), mOrphanGather.end(),
+                [rid](OrphanGather const& o) { return o.rid == rid && o.push; });
         if (stillInFlight)
         {
             ++it;
@@ -1590,10 +1649,18 @@ bool BounceSender::drainOrphanGather()
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid), cudaGetErrorString(st));
         }
         mCtx.exec->release(o.ctx);
-        mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.localOffset));
+        if (o.push)
+        {
+            mPushGathers.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (o.localOffset != kNoLocalRegion)
+        {
+            mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.localOffset));
+        }
         didWork = true;
     }
     mOrphanGather.swap(keep);
+    didWork |= sendDrainedCancels();
     return didWork;
 }
 
@@ -1639,12 +1706,17 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         }
         if (p.ctx != nullptr) // Gathering or GatherFailed: the exec stream may still write the region
         {
-            mOrphanGather.push_back(
-                OrphanGather{p.ctx, p.localOffset, rid, std::chrono::steady_clock::now(), /*warned=*/false});
+            // A push gather may still be writing the PEER's region: defer the cancel like for a write.
+            deferredWrite |= p.push != nullptr;
+            mOrphanGather.push_back(OrphanGather{
+                p.ctx, p.localOffset, rid, std::chrono::steady_clock::now(), /*warned=*/false, std::move(p.push)});
             p.ctx = nullptr;
             continue; // do NOT release ctx or recycle the region yet
         }
-        mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
+        if (p.localOffset != kNoLocalRegion)
+        {
+            mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
+        }
     }
     // Retract the credit request so the receiver stops holding/granting for it. If any RDMA write is
     // still in flight it is landing on the receiver's region; sending the cancel NOW would let the
@@ -1859,6 +1931,14 @@ BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int dev
             mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), cap, cap);
         mCtx.cfg.maxChunkSizeBytes = cap;
     }
+    // Export the arena so peers with push_gather can map it and gather straight into their granted
+    // regions; the export is advertised whether or not this side pushes.
+    if (!arena->exportFabric(mArenaAllocBase, mArenaAllocBytes, mArenaFabricHandle))
+    {
+        mArenaAllocBase = 0;
+        mArenaAllocBytes = 0;
+        mArenaFabricHandle.clear();
+    }
     try
     {
         mReceiver.startWorkers();
@@ -1923,6 +2003,9 @@ std::string BounceTransport::localHandshakeBlob() const
     handshake.arenaUsableCapacityBytes = mCtx.scheduler.arenaCapacity();
     handshake.maxChunkSizeBytes = mCtx.cfg.maxChunkSizeBytes; // post-ctor-clamp effective value
     handshake.requestTimeoutMs = mCtx.cfg.requestTimeoutMs;
+    handshake.arenaAllocBase = mArenaAllocBase;
+    handshake.arenaAllocBytes = mArenaAllocBytes;
+    handshake.arenaFabricHandle = mArenaFabricHandle;
     handshake.endpoint = std::move(endpoint);
     return encodeHandshake(handshake);
 }
@@ -1933,6 +2016,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     // same name with bounce disabled or with changed settings; clear the previously validated route
     // first so any missing/malformed/incompatible replacement immediately falls back to NIXL.
     mCtx.channel->removePeer(peer);
+    mCtx.setPushMapping(peer, nullptr);
     {
         std::lock_guard<std::mutex> lk(mPeerMu);
         mHandshakedPeers.erase(peer);
@@ -2014,6 +2098,28 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
             mCtx.selfName.c_str(), peer.c_str());
         return false;
     }
+    if (mCtx.cfg.pushGather)
+    {
+        // Map the peer's arena so chunks are gathered straight into it. A peer whose arena cannot be
+        // mapped (not fabric memory, another NVLink domain or IMEX channel) keeps the staged path.
+        std::string error;
+        auto const t0 = std::chrono::steady_clock::now();
+        auto mapping = PeerArenaMapping::map(
+            handshake.arenaAllocBase, handshake.arenaAllocBytes, handshake.arenaFabricHandle, mCtx.deviceId, error);
+        double const ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (mapping)
+        {
+            TLLM_LOG_INFO("BounceTransport(%s): push gather to peer %s (its arena of %llu MiB mapped in %.1f ms)",
+                mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(mapping->bytes() >> 20), ms);
+            mCtx.setPushMapping(peer, std::move(mapping));
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): push gather to peer %s unavailable (%s): its chunks keep the staged write",
+                mCtx.selfName.c_str(), peer.c_str(), error.c_str());
+        }
+    }
     std::lock_guard<std::mutex> lk(mPeerMu);
     mHandshakedPeers.insert(peer);
     return true;
@@ -2041,6 +2147,7 @@ void BounceTransport::forgetPeer(std::string const& peer)
         std::lock_guard<std::mutex> lk(mPeerMu);
         mHandshakedPeers.erase(peer);
     }
+    mCtx.setPushMapping(peer, nullptr); // in-flight requests keep their own reference
     // The scheduler / request-table reclaim still runs on the IO thread (drainForgets) so that state
     // stays owned by a single thread. Safe to call from invalidateRemoteAgent.
     std::lock_guard<std::mutex> lk(mForgetMu);

@@ -16,10 +16,12 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <sstream>
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
 
@@ -240,6 +242,9 @@ TEST(BounceMessageCodec, HandshakeRoundTrip)
     in.arenaUsableCapacityBytes = 256ULL << 20;
     in.maxChunkSizeBytes = 32ULL << 20;
     in.requestTimeoutMs = 45000;
+    in.arenaAllocBase = 0x7f0000000000ULL;
+    in.arenaAllocBytes = 512ULL << 20;
+    in.arenaFabricHandle = std::string(64, '\x5a');
     in.endpoint = "tcp://10.0.0.1:5555";
     b::BounceHandshake out;
     ASSERT_TRUE(b::decodeHandshake(b::encodeHandshake(in), out));
@@ -248,7 +253,34 @@ TEST(BounceMessageCodec, HandshakeRoundTrip)
     EXPECT_EQ(out.arenaUsableCapacityBytes, in.arenaUsableCapacityBytes);
     EXPECT_EQ(out.maxChunkSizeBytes, in.maxChunkSizeBytes);
     EXPECT_EQ(out.requestTimeoutMs, in.requestTimeoutMs);
+    EXPECT_EQ(out.arenaAllocBase, in.arenaAllocBase);
+    EXPECT_EQ(out.arenaAllocBytes, in.arenaAllocBytes);
+    EXPECT_EQ(out.arenaFabricHandle, in.arenaFabricHandle);
     EXPECT_EQ(out.endpoint, in.endpoint);
+}
+
+TEST(BounceMessageCodec, HandshakeFormat1StillDecodes)
+{
+    // A format-1 blob (no arena export) from an older peer: magic, format 1, then the fixed fields and
+    // the endpoint, written with the same serialize_utils layout.
+    namespace su = tensorrt_llm::executor::serialize_utils;
+    std::ostringstream os;
+    su::serialize(std::uint32_t{0x424E4853U}, os);
+    su::serialize(std::uint16_t{1U}, os);
+    su::serialize(std::uint16_t{b::kBounceVersion}, os);
+    su::serialize(std::uint8_t{0}, os);
+    su::serialize(std::uint64_t{256ULL << 20}, os);
+    su::serialize(std::uint64_t{32ULL << 20}, os);
+    su::serialize(std::int32_t{30000}, os);
+    su::serialize(std::string{"tcp://10.0.0.1:5555"}, os);
+    b::BounceHandshake out;
+    out.arenaFabricHandle = "stale";
+    ASSERT_TRUE(b::decodeHandshake(os.str(), out));
+    EXPECT_EQ(out.maxChunkSizeBytes, 32ULL << 20);
+    EXPECT_EQ(out.requestTimeoutMs, 30000);
+    EXPECT_EQ(out.arenaAllocBytes, 0U);
+    EXPECT_TRUE(out.arenaFabricHandle.empty());
+    EXPECT_EQ(out.endpoint, "tcp://10.0.0.1:5555");
 }
 
 TEST(BounceMessageCodec, HandshakeEmptyEndpointRoundTrip)
@@ -278,4 +310,9 @@ TEST(BounceMessageCodec, HandshakeTruncatedRejected)
     b::BounceHandshake out;
     EXPECT_FALSE(b::decodeHandshake(blob.substr(0, blob.size() - 4), out)); // endpoint cut short
     EXPECT_FALSE(b::decodeHandshake(blob.substr(0, 10), out));              // fixed part cut short
+    in.arenaFabricHandle = std::string(64, '\x01');
+    blob = b::encodeHandshake(in);
+    auto const handleAt = blob.find(in.arenaFabricHandle);
+    ASSERT_NE(handleAt, std::string::npos);
+    EXPECT_FALSE(b::decodeHandshake(blob.substr(0, handleAt + 10), out)); // handle cut short
 }

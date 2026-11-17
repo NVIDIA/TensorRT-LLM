@@ -241,13 +241,13 @@ void NixlTransferAgent::maybeInitBounce(
             "maxInflightChunksPerRequest=%u "
             "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
             "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
-            "enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            "enableEagerGather=%d useZeroCopyArguments=%d pushGather=%d control=%s)",
             mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, st->transport->maxChunkSizeBytes(),
             cfg.maxChunkSizeBytes, static_cast<unsigned>(cfg.maxInflightChunksPerRequest),
             static_cast<unsigned>(cfg.copyStreamCount), static_cast<unsigned>(cfg.scatterWorkerCount),
             cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes, cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs,
             cfg.quarantineMs, static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
-            static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
+            static_cast<int>(cfg.useZeroCopyArguments), static_cast<int>(cfg.pushGather), controlDesc.c_str());
         if (cfg.maxAverageDescriptorSizeBytes == 0)
         {
             // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
