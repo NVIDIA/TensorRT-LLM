@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
+import functools
 import os
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import triton
@@ -70,6 +71,17 @@ from .v_cache import (
     _triton_prepack_v_enabled,
     _update_triton_v_packed_cache,
 )
+
+
+@functools.cache
+def _get_triton_tma_allocator(
+    device: torch.device,
+) -> Callable[[int, int, int | None], torch.Tensor]:
+    def _tma_alloc(size: int, alignment: int, stream: int | None) -> torch.Tensor:
+        del alignment, stream
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    return _tma_alloc
 
 
 @triton.jit
@@ -241,11 +253,7 @@ def _run_triton_attention_decode(
     # that run with a different Context — the kernel launch would then hit the
     # default NullAllocator and raise. Matches the cutile path.
     if use_tma_data_load:
-
-        def _tma_alloc(size: int, alignment: int, stream):
-            return torch.empty(size, device=q_fp4.device, dtype=torch.int8)
-
-        triton.set_allocator(_tma_alloc)
+        triton.set_allocator(_get_triton_tma_allocator(q_fp4.device))
 
     # cutile-equivalent launch meta. occupancy=2 lets two CTAs land per SM
     # which improves wave-tail efficiency at the bs=32 hot point.
@@ -538,6 +546,8 @@ def _run_triton_attention_decode(
         )
         if not partial_ready:
             page_split = 1
+    partial_out = None
+    split_pv_kwargs: dict[str, Any] = {}
     if page_split > 1:
         pages_per_split = max_pages // page_split
         partial_out = _ensure_workspace_tensor(
@@ -547,109 +557,107 @@ def _run_triton_attention_decode(
             dtype=torch.float32,
             device=q_fp4.device,
         )
-        if use_triton_v_packed_cache:
-            _attn_pv_prepacked_v_kernel[
-                (num_queries, num_head_blocks, num_dim_blocks * page_split)
-            ](
-                output,
-                p_fp4,
-                p_sf,
-                v_packed,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                PAGE_SPLIT=page_split,
-                PAGES_PER_SPLIT=pages_per_split,
-                PARTIAL_OUT=True,
-                partial_out_ptr=partial_out,
-                partial_s0=partial_out.stride(0),
-                partial_s1=partial_out.stride(1),
-                partial_s2=partial_out.stride(2),
-                partial_s3=partial_out.stride(3),
-                **pv_launch_meta,
-            )
-        else:
-            _attn_pv_kernel[(num_queries, num_head_blocks, num_dim_blocks * page_split)](
-                output,
-                p_fp4,
-                p_sf,
-                kv_cache,
-                kv_cache,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                kv_cache.stride(0),
-                kv_cache.stride(2),
-                kv_cache.stride(4),
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
-                USE_PREPACKED_V=False,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                PAGE_SPLIT=page_split,
-                PAGES_PER_SPLIT=pages_per_split,
-                PARTIAL_OUT=True,
-                partial_out_ptr=partial_out,
-                partial_s0=partial_out.stride(0),
-                partial_s1=partial_out.stride(1),
-                partial_s2=partial_out.stride(2),
-                partial_s3=partial_out.stride(3),
-                **pv_launch_meta,
-            )
+        split_pv_kwargs = {
+            "PAGE_SPLIT": page_split,
+            "PAGES_PER_SPLIT": pages_per_split,
+            "PARTIAL_OUT": True,
+            "partial_out_ptr": partial_out,
+            "partial_s0": partial_out.stride(0),
+            "partial_s1": partial_out.stride(1),
+            "partial_s2": partial_out.stride(2),
+            "partial_s3": partial_out.stride(3),
+        }
+
+    pv_grid = (num_queries, num_head_blocks, num_dim_blocks * page_split)
+    if use_triton_v_packed_cache:
+        _attn_pv_prepacked_v_kernel[pv_grid](
+            output,
+            p_fp4,
+            p_sf,
+            v_packed,
+            v_sf,
+            global_scale,
+            src_page_ids,
+            metadata.fp4_mla_state.paged_kv_indptr_decode,
+            kv_lens,
+            src_page_ids.shape[0],
+            kv_cache.shape[0],
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output.shape[0] * output.shape[1],
+            p_fp4.stride(0),
+            p_fp4.stride(1),
+            p_fp4.shape[0],
+            v_sf.stride(0),
+            NUM_HEADS=num_heads,
+            V_HEAD_D=kv_lora_rank,
+            PAGE_SIZE=metadata.page_size,
+            FP4_BLOCK=FP4_BLOCK_SIZE,
+            SF_PER_PAGE=sf_per_page,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
+            P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
+            BLOCK_H=block_h,
+            BLOCK_V=block_v,
+            USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+            USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
+            PV_LOOP_STAGES=pv_loop_stages,
+            ASSUME_FULL_HEADS=assume_full_heads,
+            ASSUME_FULL_PAGES=assume_full_pages,
+            ASSUME_FULL_V=assume_full_v,
+            ASSUME_VALID_PAGES=assume_valid_pages,
+            **split_pv_kwargs,
+            **pv_launch_meta,
+        )
+    else:
+        _attn_pv_kernel[pv_grid](
+            output,
+            p_fp4,
+            p_sf,
+            kv_cache,
+            kv_cache,
+            v_sf,
+            global_scale,
+            src_page_ids,
+            metadata.fp4_mla_state.paged_kv_indptr_decode,
+            kv_lens,
+            src_page_ids.shape[0],
+            kv_cache.shape[0],
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output.shape[0] * output.shape[1],
+            p_fp4.stride(0),
+            p_fp4.stride(1),
+            p_fp4.shape[0],
+            kv_cache.stride(0),
+            kv_cache.stride(2),
+            kv_cache.stride(4),
+            v_sf.stride(0),
+            NUM_HEADS=num_heads,
+            V_HEAD_D=kv_lora_rank,
+            PAGE_SIZE=metadata.page_size,
+            FP4_BLOCK=FP4_BLOCK_SIZE,
+            SF_PER_PAGE=sf_per_page,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
+            P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
+            BLOCK_H=block_h,
+            BLOCK_V=block_v,
+            USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
+            USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
+            USE_PREPACKED_V=False,
+            PV_LOOP_STAGES=pv_loop_stages,
+            ASSUME_FULL_HEADS=assume_full_heads,
+            ASSUME_FULL_PAGES=assume_full_pages,
+            ASSUME_FULL_V=assume_full_v,
+            ASSUME_VALID_PAGES=assume_valid_pages,
+            **split_pv_kwargs,
+            **pv_launch_meta,
+        )
+
+    if partial_out is not None:
         _attn_pv_reduce_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
             output,
             partial_out,
@@ -671,92 +679,6 @@ def _run_triton_attention_decode(
             ASSUME_FULL_V=assume_full_v,
             **launch_meta,
         )
-    else:
-        if use_triton_v_packed_cache:
-            _attn_pv_prepacked_v_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
-                output,
-                p_fp4,
-                p_sf,
-                v_packed,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                **pv_launch_meta,
-            )
-        else:
-            _attn_pv_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
-                output,
-                p_fp4,
-                p_sf,
-                kv_cache,
-                kv_cache,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                kv_cache.stride(0),
-                kv_cache.stride(2),
-                kv_cache.stride(4),
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
-                USE_PREPACKED_V=False,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                **pv_launch_meta,
-            )
 
 
 def _run_cutedsl_packed_decode(

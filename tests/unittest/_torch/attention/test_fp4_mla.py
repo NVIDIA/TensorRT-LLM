@@ -515,6 +515,7 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
             return True
 
         def mla_rope_generation(self, *args, **kwargs) -> None:
+            assert args[4:10] == (None, None, None, None, None, None)
             assert kwargs == {"fuse_fp4_q_quant": True}
             raise ReachedFusedCacheUpdate
 

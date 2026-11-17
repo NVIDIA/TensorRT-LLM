@@ -3778,12 +3778,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale: torch.Tensor,
-        mla_bmm2_scale: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        cu_q_seqlens: Optional[torch.Tensor] = None,
+        cu_kv_seqlens: Optional[torch.Tensor] = None,
+        fmha_scheduler_counter: Optional[torch.Tensor] = None,
+        mla_bmm1_scale: Optional[torch.Tensor] = None,
+        mla_bmm2_scale: Optional[torch.Tensor] = None,
+        quant_q_buffer: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
@@ -3840,6 +3840,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 fuse_q_quant=fuse_fp4_q_quant,
             )
             return
+
+        assert cu_q_seqlens is not None
+        assert cu_kv_seqlens is not None
+        assert fmha_scheduler_counter is not None
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -3904,7 +3908,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         fmha_scheduler_counter: torch.Tensor,
         mla_bmm1_scale: Optional[torch.Tensor],
         mla_bmm2_scale: Optional[torch.Tensor],
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         helix_tensor_params: List[Optional[torch.Tensor]],
         kv_norm_weight: Optional[torch.Tensor],
