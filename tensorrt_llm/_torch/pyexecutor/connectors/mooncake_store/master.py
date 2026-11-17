@@ -469,8 +469,18 @@ def _launch_master(
     eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
     binary: str = DEFAULT_MASTER_BINARY,
     timeout: float = DEFAULT_MASTER_TIMEOUT,
+    eviction_high_watermark_ratio: Optional[float] = None,
+    default_kv_lease_ttl_ms: Optional[int] = None,
+    glog_v: Optional[int] = None,
 ) -> LaunchedMaster:
-    """Start a master on this host and wait for it to answer."""
+    """Start a master on this host and wait for it to answer.
+
+    `eviction_high_watermark_ratio` (pool use above which the master evicts)
+    and `default_kv_lease_ttl_ms` (how long a read leases an object) are
+    passed on where given; otherwise the master's own defaults hold.
+    `glog_v` sets the master's log verbosity; None keeps GLOG_v of the
+    environment, else 1.
+    """
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
@@ -490,13 +500,20 @@ def _launch_master(
     # per-RPC lines showing segments registering and keys moving, which the
     # run's capacity report joins against.
     env = dict(os.environ, GLOG_logtostderr="1")
-    env.setdefault("GLOG_v", "1")
+    if glog_v is None:
+        env.setdefault("GLOG_v", "1")
+    else:
+        env["GLOG_v"] = str(glog_v)
     command = [
         resolved,
         f"--rpc_port={rpc_port}",
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
     ]
+    if eviction_high_watermark_ratio is not None:
+        command.append(f"--eviction_high_watermark_ratio={eviction_high_watermark_ratio}")
+    if default_kv_lease_ttl_ms is not None:
+        command.append(f"--default_kv_lease_ttl={default_kv_lease_ttl_ms}")
     # Flags this launcher does not model (for example
     # `--eviction_high_watermark_ratio=0.93`) pass straight to the binary.
     extra = os.environ.get(MASTER_EXTRA_ARGS_ENV, "").strip()
@@ -580,12 +597,16 @@ def running_master(
     namespace: str = DEFAULT_NAMESPACE,
     binary: str = DEFAULT_MASTER_BINARY,
     timeout: float = DEFAULT_MASTER_TIMEOUT,
+    eviction_high_watermark_ratio: Optional[float] = None,
+    default_kv_lease_ttl_ms: Optional[int] = None,
+    glog_v: Optional[int] = None,
 ) -> Iterator[LaunchedMaster]:
     """Run a master, and publish the manifest describing the pool it owns.
 
     `pool_file` receives the manifest once the master answers, so servers can
     name a path instead of an address nobody knows until the scheduler has
-    placed this process. One is written to `run_dir` either way.
+    placed this process. One is written to `run_dir` either way. The eviction
+    watermark, the read lease and the log verbosity go to `_launch_master`.
     """
     os.makedirs(run_dir, exist_ok=True)
     master = _launch_master(
@@ -595,6 +616,9 @@ def running_master(
         eviction_ratio=eviction_ratio,
         binary=binary,
         timeout=timeout,
+        eviction_high_watermark_ratio=eviction_high_watermark_ratio,
+        default_kv_lease_ttl_ms=default_kv_lease_ttl_ms,
+        glog_v=glog_v,
     )
     manifest = PoolManifest(
         master_server_address=master.address,

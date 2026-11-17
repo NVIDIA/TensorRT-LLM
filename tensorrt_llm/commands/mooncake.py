@@ -176,6 +176,29 @@ def _signal_handoff():
     show_default=True,
     help="Interval between liveness lines. 0 disables them.",
 )
+@click.option(
+    "--eviction_high_watermark_ratio",
+    type=click.FloatRange(0.0, 1.0, min_open=True),
+    default=None,
+    help="Fraction of the pool in use above which the master evicts. "
+    "Defaults to the master's own (0.90 in Mooncake 0.3.13).",
+)
+@click.option(
+    "--default_kv_lease_ttl",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Milliseconds a read leases an object for; the master neither "
+    "evicts nor removes (without force) a leased object. Defaults to the "
+    "master's own (10 s in Mooncake 0.3.13).",
+)
+@click.option(
+    "--glog_v",
+    type=click.IntRange(min=0),
+    default=None,
+    help="The master's log verbosity. Defaults to GLOG_v of the environment, "
+    "else 0. 1 adds the per-RPC lines mooncake_pool_report's block "
+    "placement table reads, and makes every put much slower.",
+)
 @_telemetry_option
 def mooncake_master(
     rpc_port: int,
@@ -189,6 +212,9 @@ def mooncake_master(
     binary: str,
     timeout: float,
     heartbeat_seconds: int,
+    eviction_high_watermark_ratio: Optional[float],
+    default_kv_lease_ttl: Optional[int],
+    glog_v: Optional[int],
     telemetry: bool,
 ):
     """Own a Mooncake pool for as long as this command runs.
@@ -204,6 +230,14 @@ def mooncake_master(
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import running_master
 
     run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
+    if glog_v is None:
+        inherited = os.environ.get("GLOG_v")
+        try:
+            glog_v = int(inherited) if inherited else 0
+        except ValueError:
+            raise click.BadParameter(
+                f"GLOG_v={inherited!r} in the environment is not a number", param_hint="--glog_v"
+            ) from None
 
     with (
         _signal_handoff(),
@@ -218,6 +252,9 @@ def mooncake_master(
             namespace=namespace,
             binary=binary,
             timeout=timeout,
+            eviction_high_watermark_ratio=eviction_high_watermark_ratio,
+            default_kv_lease_ttl_ms=default_kv_lease_ttl,
+            glog_v=glog_v,
         ) as master,
     ):
         logger.warning(

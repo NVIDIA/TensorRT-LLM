@@ -544,6 +544,12 @@ trtllm-serve mooncake_master --pool_file /shared/pool.json --run_dir /shared/run
 trtllm-serve mooncake_pool_report --run_dir /shared/run
 ```
 
+Where blocks landed comes from the master's per-request log lines, which it writes only at
+`--glog_v 1`; that verbosity slows every put several times, so the master logs at 0 unless asked
+(or unless `GLOG_v` is set in its environment). `--eviction_high_watermark_ratio` and
+`--default_kv_lease_ttl` pass the master's eviction threshold and read lease through; unset, the
+master's own defaults hold.
+
 Each server then renders its own Mooncake client config from the manifest and exports
 `MOONCAKE_CONFIG_PATH` for the ranks it spawns. A deployment that provisions the pool itself sets
 that variable instead, and an inherited value wins over the `mooncake_store` block.

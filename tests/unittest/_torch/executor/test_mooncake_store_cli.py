@@ -132,10 +132,12 @@ class Resource:
         #: `None` until the resource is taken, which distinguishes a command
         #: that gave up beforehand from one that took it.
         self.taken_with = None
+        self.taken_kwargs = None
 
     @contextlib.contextmanager
-    def holding(self, *args, **_kwargs):
+    def holding(self, *args, **kwargs):
         self.taken_with = args
+        self.taken_kwargs = kwargs
         try:
             yield self.held
         finally:
@@ -249,6 +251,81 @@ def test_the_opt_out_the_group_documents_is_accepted(master):
         master.run("--no-telemetry")
 
     assert master.resource.released
+
+
+@pytest.mark.parametrize(
+    "flags, environment, expected",
+    [
+        ([], None, (None, None, 0)),
+        ([], "2", (None, None, 2)),
+        (
+            [
+                "--eviction_high_watermark_ratio",
+                "0.8",
+                "--default_kv_lease_ttl",
+                "2000",
+                "--glog_v",
+                "1",
+            ],
+            "2",
+            (0.8, 2000, 1),
+        ),
+    ],
+)
+def test_the_master_options_reach_the_master(monkeypatch, master, flags, environment, expected):
+    """The watermark and the lease go to the master only where given; the log
+    verbosity is the flag's, else GLOG_v of the environment, else 0."""
+    if environment is None:
+        monkeypatch.delenv("GLOG_v", raising=False)
+    else:
+        monkeypatch.setenv("GLOG_v", environment)
+    signal_on_idle(master, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        master.run(*flags)
+
+    taken = master.resource.taken_kwargs
+    assert (
+        taken["eviction_high_watermark_ratio"],
+        taken["default_kv_lease_ttl_ms"],
+        taken["glog_v"],
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "flags", [["--eviction_high_watermark_ratio", "0"], ["--default_kv_lease_ttl", "0"]]
+)
+def test_out_of_range_master_options_are_refused(master, flags):
+    with pytest.raises(Exception, match="not in the range"):
+        master.run(*flags)
+    assert master.resource.taken_with is None
+
+
+def test_the_master_command_line_carries_only_the_options_given(monkeypatch, tmp_path):
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
+
+    launched = []
+
+    def popen(command, env, **_kwargs):
+        launched.append((command, env))
+        return SimpleNamespace(pid=1, poll=lambda: None)
+
+    monkeypatch.setattr(master_module.shutil, "which", lambda binary: f"/bin/{binary}")
+    monkeypatch.setattr(master_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(master_module, "local_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(master_module, "_wait_until_accepting", lambda *a, **k: 0.0)
+    monkeypatch.setenv("GLOG_v", "3")
+
+    master_module._launch_master(str(tmp_path))
+    master_module._launch_master(
+        str(tmp_path), eviction_high_watermark_ratio=0.8, default_kv_lease_ttl_ms=2000, glog_v=0
+    )
+
+    (plain, plain_env), (tuned, tuned_env) = launched
+    assert not any("watermark" in arg or "lease" in arg for arg in plain)
+    assert plain_env["GLOG_v"] == "3"  # an embedding caller keeps the environment's
+    assert tuned[-2:] == ["--eviction_high_watermark_ratio=0.8", "--default_kv_lease_ttl=2000"]
+    assert tuned_env["GLOG_v"] == "0"
 
 
 def test_the_pool_report_accepts_the_same_opt_out(monkeypatch, tmp_path):
