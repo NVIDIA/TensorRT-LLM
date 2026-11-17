@@ -641,6 +641,31 @@ class TestSplitGpuBudgetForDraft:
         assert target_config.max_gpu_total_bytes == expected_target
         assert draft_config.max_gpu_total_bytes == expected_draft
 
+    def test_windowed_draft_keeps_room_for_max_batch_size_mirrors(self):
+        # A windowed drafter costs 0 bytes/token, so per-token weighting gave it no share even
+        # though each request reserves a full-context mirror; the pool then held less than one
+        # long request.
+        c = _make_creator(max_gpu_total_bytes=100 * GB)
+        c._max_batch_size = 4
+        target = CacheCost(slope=15_360, intercept=0)
+        draft = CacheCost(slope=0, intercept=133_529_600, bytes_per_request=680_591_360)
+
+        target_budget, draft_budget = c._compute_draft_budget_shares(90 * GB, target, draft)
+
+        assert draft_budget == draft.intercept + 4 * draft.bytes_per_request
+        assert target_budget + draft_budget == 90 * GB
+
+    def test_windowed_draft_share_is_capped_at_half_the_budget(self):
+        c = _make_creator(max_gpu_total_bytes=10 * GB)
+        c._max_batch_size = 80
+        target = CacheCost(slope=15_360, intercept=0)
+        draft = CacheCost(slope=0, intercept=100, bytes_per_request=1 * GB)
+
+        target_budget, draft_budget = c._compute_draft_budget_shares(10 * GB, target, draft)
+
+        assert draft_budget == 100 + (10 * GB - 100) // 2
+        assert target_budget + draft_budget == 10 * GB
+
     def test_target_can_be_fixed_only(self):
         c = _make_creator(
             max_gpu_total_bytes=1_000,

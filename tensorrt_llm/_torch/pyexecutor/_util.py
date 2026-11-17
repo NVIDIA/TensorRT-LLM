@@ -3139,6 +3139,27 @@ class KvCacheCreator:
             max_useful_draft_bytes = (self._max_batch_size *
                                       draft_bytes_per_mirror)
             draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
+        elif (self._max_batch_size > 0 and draft_kv.bytes_per_request
+              and draft_kv.bytes_per_request > 0):
+            # Per-token weighting gives a windowed draft (0 bytes/token) no share
+            # at all, yet every request reserves a full-context draft mirror, so
+            # the pool can end up smaller than one long request and the executor
+            # fails with "Draft KV cache context resize failed" on every rank.
+            # Reserve room for max_batch_size mirrors, at most half the
+            # remaining budget so the target keeps the larger share.
+            draft_bytes_per_mirror = (draft_kv.quota_per_request
+                                      if draft_kv.quota_per_request is not None
+                                      else draft_kv.bytes_per_request)
+            wanted_draft_bytes = self._max_batch_size * draft_bytes_per_mirror
+            draft_slope_share = max(draft_slope_share,
+                                    min(wanted_draft_bytes, slope_budget // 2))
+            if wanted_draft_bytes > slope_budget // 2:
+                logger.warning(
+                    f"The draft KV cache can hold only "
+                    f"{draft_slope_share // max(draft_bytes_per_mirror, 1)} "
+                    f"full-length requests but max_batch_size is "
+                    f"{self._max_batch_size}; long requests may fail when "
+                    f"that many run at once.")
         if draft_kv.quota_per_request is not None:
             if draft_kv.quota_per_request > slope_budget:
                 # The allocator will raise the draft quota to this one-request
