@@ -31,6 +31,7 @@ failure, as in ``test_halo_r_relay.py``.
 """
 
 import atexit
+import ctypes
 import faulthandler
 import os
 import pickle
@@ -38,7 +39,7 @@ import signal
 import sys
 import time
 import traceback
-from concurrent.futures import wait
+from concurrent.futures import FIRST_EXCEPTION, wait
 from pathlib import Path
 from typing import Any
 
@@ -232,13 +233,14 @@ def _run_rank(unittest_root: str, log_dir: str) -> tuple[int, list[str]]:
         # The test utilities create weights and scales on the default device.
         with torch.device(f"cuda:{rank}"):
             return rank, _run_steps(rank)
-    except Exception:
-        # The pytest process is not in these ranks' MPI world, so the abort below ends the ranks
-        # but not the wait for their results: the marker tells it this rank failed.
-        print(_FAILED_MARKER, flush=True)
+    except BaseException:
+        # Traceback first, marker last: the pytest process reads the log once it sees the marker.
+        # It then fails at once and kills the other ranks, which may wait for this one in a
+        # collective. No MPI abort: the pytest process is not in these ranks' MPI world, so an
+        # abort would end the ranks without ending its wait for their results.
         traceback.print_exc()
         sys.stderr.flush()
-        MPI.COMM_WORLD.Abort(1)
+        print(_FAILED_MARKER, flush=True)
         raise
     finally:
         if dist.is_initialized():
@@ -573,29 +575,50 @@ def _end_ranks(logs: dict[int, str]) -> None:
             if line.startswith(_PID_LINE):
                 try:
                     os.kill(int(line[len(_PID_LINE) :]), signal.SIGKILL)
-                except ProcessLookupError:
+                except OSError:
                     pass
+
+
+def _stop_pool_threads() -> None:
+    """End the MPIPoolExecutor manager thread after the ranks are killed.
+
+    It polls for results that never come and is joined at interpreter exit, so without this the
+    pytest process would hang on exit after a failure.
+    """
+    import threading
+
+    for thread in threading.enumerate():
+        target = getattr(thread, "_target", None)
+        if thread.ident and getattr(target, "__name__", "").startswith("_manager"):
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(thread.ident), ctypes.py_object(SystemExit)
+            )
 
 
 def _wait_for_ranks(futures: list, log_dir: Path) -> list:
     """Return every rank's result; fail fast, with the ranks' log tails, if a rank fails or hangs."""
     deadline = time.monotonic() + _WORKER_TIMEOUT_S + 120
     while True:
-        _, pending = wait(futures, timeout=_POLL_S)
-        if not pending:
+        done, pending = wait(futures, timeout=_POLL_S, return_when=FIRST_EXCEPTION)
+        if not pending and not any(future.exception() for future in done):
             return [future.result() for future in futures]
-        logs = _rank_logs(log_dir)
-        dead = _dead_ranks(logs)
-        if dead or time.monotonic() > deadline:
-            _end_ranks(logs)
+        raised = [future.exception() for future in done if future.exception() is not None]
+        dead = _dead_ranks(_rank_logs(log_dir))
+        if raised or dead or time.monotonic() > deadline:
+            _end_ranks(_rank_logs(log_dir))
+            # Read the logs again after the kill, so a traceback written meanwhile is included.
+            logs = _rank_logs(log_dir)
             tails = "\n".join(
                 f"--- rank {rank} ({log_dir / f'rank{rank}.log'}), last {_LOG_TAIL_LINES} lines:\n"
                 + "\n".join(text.splitlines()[-_LOG_TAIL_LINES:])
                 for rank, text in sorted(logs.items())
             )
-            reason = (
-                f"ranks {dead} failed or exited" if dead else "the ranks did not finish in time"
-            )
+            if raised:
+                reason = f"a rank raised {raised[0]!r}"
+            elif dead:
+                reason = f"ranks {dead} failed or exited"
+            else:
+                reason = "the ranks did not finish in time"
             pytest.fail(f"{reason}; {len(logs)} of {_EP_SIZE} rank logs:\n{tails}", pytrace=False)
 
 
@@ -633,11 +656,15 @@ def test_halo_r_breakable_cuda_graph(tmp_path: Path) -> None:
             faulthandler.cancel_dump_traceback_later()
             parent_log.close()
         else:
-            # The ranks are gone or killed: do not wait for them. The timer stays armed, so a
-            # hang while this process exits still ends with its stacks in pytest_process.log.
+            # Kill any rank still alive (also when the test ends some other way) and do not wait
+            # for them. The timer stays armed, so a hang while this process exits still ends,
+            # with its stacks in pytest_process.log; the entry runs ISOLATION so that cannot
+            # end another test.
+            _end_ranks(_rank_logs(tmp_path))
             for future in futures:
                 future.cancel()
             executor.shutdown(wait=False)
+            _stop_pool_threads()
     skips = {error for _, errors in results for error in errors if error.startswith("skip: ")}
     if skips:
         _skip("; ".join(sorted(skips)))
