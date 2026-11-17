@@ -302,8 +302,12 @@ native authentication. Existing deployments that already set
 on upgrade as well. Set the same key on all communicating context/generation
 workers, or leave it unset on all of them; mixed configurations fail at the first
 RankInfo exchange with an error that names `internal_request_auth_key`, either
-because the reply fails verification or because the exchange times out. Older
-workers without native authentication cannot talk to workers that have a key.
+because the reply fails verification or because the exchange times out. The
+exchange times out when the context worker has a key and the generation worker
+has a different key or none. Every request that needs that context worker then
+waits for the full RankInfo deadline described below before it fails, and the
+generation worker does not make progress on its other requests during that wait.
+Older workers without native authentication cannot talk to workers that have a key.
 
 For gRPC, `internal_request_auth_key` is now accepted and forwarded to native
 transfer workers; previously the serving command rejected this field in gRPC mode.
