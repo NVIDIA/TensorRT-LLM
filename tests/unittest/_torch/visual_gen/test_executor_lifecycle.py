@@ -742,6 +742,64 @@ def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path) -> None:
         contender.bind(("127.0.0.1", master_ports[0]))
 
 
+@pytest.mark.parametrize(
+    ("failure_stage", "error_type"),
+    [("address", OSError), ("port", KeyboardInterrupt), ("atexit", RuntimeError)],
+)
+def test_local_rendezvous_port_is_released_after_metadata_failure(
+    tmp_path: Path, failure_stage: str, error_type: type[BaseException]
+) -> None:
+    clients = []
+    master_ports = []
+    create_store = executor_module.dist.TCPStore
+    select_port = executor_module.find_free_port
+    startup_error = error_type("coordinator metadata failed")
+    args = VisualGenArgs(model=str(tmp_path))
+
+    class RetainedClient(DiffusionRemoteClient):
+        def __init__(self) -> None:
+            clients.append(self)
+            super().__init__(args=args)
+
+    def record_store(*store_args, **store_kwargs):
+        store = create_store(*store_args, **store_kwargs)
+        master_ports.append(store.port)
+        return store
+
+    def select_ipc_port():
+        if failure_stage == "port":
+            raise startup_error
+        return select_port()
+
+    try:
+        with (
+            patch.object(executor_module, "_detect_external_launch", return_value=None),
+            patch.object(
+                executor_module,
+                "get_ip_address",
+                return_value="127.0.0.1",
+                side_effect=startup_error if failure_stage == "address" else None,
+            ),
+            patch.object(executor_module.dist, "TCPStore", side_effect=record_store),
+            patch.object(executor_module, "find_free_port", side_effect=select_ipc_port),
+            patch.object(
+                executor_module,
+                "_register_atexit",
+                side_effect=startup_error if failure_stage == "atexit" else None,
+            ),
+            pytest.raises(error_type, match="coordinator metadata failed") as error,
+        ):
+            RetainedClient()
+
+        assert error.value is startup_error
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            contender.bind(("127.0.0.1", master_ports[0]))
+    finally:
+        for client in clients:
+            client._rendezvous_store = None
+
+
 @pytest.mark.parametrize("fail_at_event_loop", [True, False], ids=["event-loop", "workers"])
 def test_local_rendezvous_port_is_released_after_startup_failure(fail_at_event_loop: bool) -> None:
     master_ports = []
@@ -768,7 +826,9 @@ def test_local_rendezvous_port_is_released_after_startup_failure(fail_at_event_l
         ),
         patch.object(executor_module, "_get_mp_context"),
         patch.object(executor_module, "_WorkerProcessSpawner"),
-        patch.object(DiffusionRemoteClient, "_wait_ready", side_effect=error_type("startup failed")),
+        patch.object(
+            DiffusionRemoteClient, "_wait_ready", side_effect=error_type("startup failed")
+        ),
         pytest.raises(error_type, match="startup failed"),
     ):
         DiffusionRemoteClient(args=args)
@@ -776,6 +836,107 @@ def test_local_rendezvous_port_is_released_after_startup_failure(fail_at_event_l
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
         contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         contender.bind(("127.0.0.1", master_ports[0]))
+
+
+@pytest.mark.timeout(_COLD_SPAWN_TIMEOUT)
+@pytest.mark.parametrize("startup_state", ["not-started", "before-ident", "identified", "started"])
+def test_background_thread_start_failure_releases_rendezvous_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup_state: str
+) -> None:
+    create_thread = executor_module._Thread
+    clients = []
+    master_ports = []
+    threads = []
+    bootstrap_entered = _THREADING_EVENT()
+    resume_bootstrap = _THREADING_EVENT()
+    thread_finished = _THREADING_EVENT()
+    startup_error = KeyboardInterrupt("background startup failed")
+    args = VisualGenArgs(model=str(tmp_path))
+
+    def create_client_thread(*thread_args, **thread_kwargs):
+        target = thread_kwargs["target"]
+        if target.__func__ is not DiffusionRemoteClient._serve_forever_thread:
+            return create_thread(*thread_args, **thread_kwargs)
+
+        def run_client_thread() -> None:
+            try:
+                target()
+            finally:
+                thread_finished.set()
+
+        thread_kwargs["target"] = run_client_thread
+        thread = create_thread(*thread_args, **thread_kwargs)
+        client = target.__self__
+        clients.append(client)
+        master_ports.append(client.master_port)
+        start_thread = thread.start
+        wait_started = thread._started.wait
+        threads.append((thread, wait_started))
+        wait_ready = client.event_loop_ready.wait
+
+        def resume_and_wait_ready(timeout=None):
+            resume_bootstrap.set()
+            return wait_ready(timeout=timeout)
+
+        monkeypatch.setattr(client.event_loop_ready, "wait", resume_and_wait_ready)
+        if startup_state in ("before-ident", "identified"):
+            if startup_state == "before-ident":
+                publish_start = thread._bootstrap_inner
+                pause_target = thread
+                pause_method = "_bootstrap_inner"
+            else:
+                publish_start = thread._started.set
+                pause_target = thread._started
+                pause_method = "set"
+
+            def pause_bootstrap() -> None:
+                bootstrap_entered.set()
+                assert resume_bootstrap.wait(timeout=_COLD_SPAWN_TIMEOUT)
+                publish_start()
+
+            def interrupt_wait(timeout=None):
+                assert bootstrap_entered.wait(timeout=_COLD_SPAWN_TIMEOUT)
+                assert (thread.ident is None) == (startup_state == "before-ident")
+                assert not thread._started.is_set()
+                raise startup_error
+
+            monkeypatch.setattr(pause_target, pause_method, pause_bootstrap)
+            monkeypatch.setattr(thread._started, "wait", interrupt_wait)
+        else:
+
+            def interrupt_start() -> None:
+                if startup_state == "started":
+                    start_thread()
+                raise startup_error
+
+            monkeypatch.setattr(thread, "start", interrupt_start)
+        return thread
+
+    try:
+        with (
+            patch.object(executor_module, "_detect_external_launch", return_value=None),
+            patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+            patch.object(executor_module, "_Thread", side_effect=create_client_thread),
+            patch.object(executor_module, "_register_atexit"),
+        ):
+            with pytest.raises(KeyboardInterrupt, match="background startup failed") as error:
+                DiffusionRemoteClient(args=args)
+
+        assert error.value is startup_error
+        assert thread_finished.is_set() == (startup_state != "not-started")
+        assert all(not thread.is_alive() for thread, _ in threads)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            contender.bind(("127.0.0.1", master_ports[0]))
+    finally:
+        resume_bootstrap.set()
+        if startup_state != "not-started":
+            for thread, wait_started in threads:
+                assert wait_started(timeout=_COLD_SPAWN_TIMEOUT)
+                thread.join(timeout=_COLD_SPAWN_TIMEOUT)
+                assert not thread.is_alive()
+        for client in clients:
+            client.shutdown()
 
 
 def test_cleanup_is_registered_before_waiting_for_ready() -> None:

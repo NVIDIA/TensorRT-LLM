@@ -903,92 +903,97 @@ class DiffusionRemoteClient:
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
 
-        if ext is None:
-            # Single-node: coordinator spawns all workers locally
-            # Setup distributed env
-            self.master_addr = "127.0.0.1"
-            self._rendezvous_store = dist.TCPStore(
-                self.master_addr,
-                0,
-                is_master=True,
-                wait_for_workers=False,
-                timeout=default_pg_timeout,
-            )
-            self.master_port = self._rendezvous_store.port
+        try:
+            if ext is None:
+                # Single-node: coordinator spawns all workers locally
+                # Setup distributed env
+                self.master_addr = "127.0.0.1"
+                # Bind before drawing ZMQ ports so they cannot reuse the rendezvous port.
+                self._rendezvous_store = dist.TCPStore(
+                    self.master_addr,
+                    0,
+                    is_master=True,
+                    wait_for_workers=False,
+                    timeout=default_pg_timeout,
+                )
+                self.master_port = self._rendezvous_store.port
 
-            # Setup IPC addresses
-            self.host_ip = get_ip_address()
-            req_port, resp_port = find_free_port(), find_free_port()
+                # Setup IPC addresses
+                self.host_ip = get_ip_address()
+                req_port, resp_port = find_free_port(), find_free_port()
 
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
-            self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+                self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+                self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
+                self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
 
-        else:
-            # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
-            rank, local_rank, world_size, master_addr, master_port = ext
-            req_port = find_free_port()
-            resp_port = find_free_port()
-            self.master_addr = master_addr
-            self.master_port = master_port
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
-            self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
+            else:
+                # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
+                rank, local_rank, world_size, master_addr, master_port = ext
+                req_port = find_free_port()
+                resp_port = find_free_port()
+                self.master_addr = master_addr
+                self.master_port = master_port
+                self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+                self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
+                self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
 
-        # Generate shared HMAC keys for IPC authentication
-        self.req_hmac_key = os.urandom(32)
-        self.resp_hmac_key = os.urandom(32)
+            # Generate shared HMAC keys for IPC authentication
+            self.req_hmac_key = os.urandom(32)
+            self.resp_hmac_key = os.urandom(32)
 
-        # IPC setup
-        self.requests_ipc = None
-        self.responses_ipc = None
-        self.pending_requests = queue.Queue()
-        self.completed_responses: Dict[int, DiffusionResponse] = {}
-        # Request ids the caller has given up on (e.g., aresult timed out).
-        # _store_response drops late-arriving responses for these ids so a
-        # full PipelineOutput tensor does not pin in completed_responses for
-        # the process lifetime.
-        self._abandoned_request_ids: Set[int] = set()
-        # Iteration-stats tracker — populated on lifecycle events (enqueue,
-        # request started, response received) and drained by
-        # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
-        # the LLM iteration-stats producer but with a visual-gen-shaped
-        # payload.
-        self._iter_stats = _IterationStatsTracker()
+            # IPC setup
+            self.requests_ipc = None
+            self.responses_ipc = None
+            self.pending_requests = queue.Queue()
+            self.completed_responses: Dict[int, DiffusionResponse] = {}
+            # Request ids the caller has given up on (e.g., aresult timed out).
+            # _store_response drops late-arriving responses for these ids so a
+            # full PipelineOutput tensor does not pin in completed_responses for
+            # the process lifetime.
+            self._abandoned_request_ids: Set[int] = set()
+            # Iteration-stats tracker — populated on lifecycle events (enqueue,
+            # request started, response received) and drained by
+            # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
+            # the LLM iteration-stats producer but with a visual-gen-shaped
+            # payload.
+            self._iter_stats = _IterationStatsTracker()
 
-        # We'll create asyncio primitives in the background thread's event loop
-        self._event_loop = None
-        self.response_event = None
-        self.lock = None
-        self.shutdown_event = _Event()
-        self.event_loop_ready = _Event()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_started = False
-        self._shutdown_complete = _Event()
-        self._shutdown_error: Optional[BaseException] = None
-        self._shutdown_thread: Optional[threading.Thread] = None
-        self.worker_processes: List[mp.Process] = []
-        self._worker_spawner: Optional[_WorkerProcessSpawner] = None
-        self._ext_worker_thread: Optional[threading.Thread] = None
-        self._monitor_worker_liveness = False
-        self._worker_failure: Optional[str] = None
-        self._request_to_send: Optional[DiffusionRequest] = None
+            # We'll create asyncio primitives in the background thread's event loop
+            self._event_loop = None
+            self.response_event = None
+            self.lock = None
+            self.shutdown_event = _Event()
+            self.event_loop_ready = _Event()
+            self._shutdown_lock = threading.Lock()
+            self._shutdown_started = False
+            self._shutdown_complete = _Event()
+            self._shutdown_error: Optional[BaseException] = None
+            self._shutdown_thread: Optional[threading.Thread] = None
+            self.worker_processes: List[mp.Process] = []
+            self._worker_spawner: Optional[_WorkerProcessSpawner] = None
+            self._ext_worker_thread: Optional[threading.Thread] = None
+            self._monitor_worker_liveness = False
+            self._worker_failure: Optional[str] = None
+            self._request_to_send: Optional[DiffusionRequest] = None
 
-        self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
+            self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
 
-        # Pipeline metadata — populated by _wait_ready from the READY signal.
-        self.default_generation_params: Dict = {}
-        self.extra_param_specs: Dict = {}
-        self.supports_image_edit: bool = False
-        self.ref_slot_specs: Dict = {}
+            # Pipeline metadata — populated by _wait_ready from the READY signal.
+            self.default_generation_params: Dict = {}
+            self.extra_param_specs: Dict = {}
+            self.supports_image_edit: bool = False
+            self.ref_slot_specs: Dict = {}
 
-        # --- Launch workers ---
-        # multiprocessing installs its own timeout-less child joins at import
-        # time. atexit is LIFO, so this callback must be registered afterward
-        # and before startup can block or fail.
-        _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
+            # --- Launch workers ---
+            # multiprocessing installs its own timeout-less child joins at import
+            # time. atexit is LIFO, so this callback must be registered afterward
+            # and before startup can block or fail.
+            _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
+        except BaseException:
+            self._rendezvous_store = None
+            raise
 
         try:
             self.background_thread.start()
@@ -1503,11 +1508,14 @@ class DiffusionRemoteClient:
 
             self.pending_requests.put(None)
 
-            self.background_thread.join(timeout=THREAD_TIMEOUT)
+            if not self.background_thread.is_alive():
+                self.event_loop_ready.wait(timeout=THREAD_TIMEOUT)
             if self.background_thread.is_alive():
-                logger.warning("DiffusionClient: Force stopping background thread")
-                self.shutdown_event.set()
-                self.background_thread.join(timeout=1.0)
+                self.background_thread.join(timeout=THREAD_TIMEOUT)
+                if self.background_thread.is_alive():
+                    logger.warning("DiffusionClient: Force stopping background thread")
+                    self.shutdown_event.set()
+                    self.background_thread.join(timeout=1.0)
         except BaseException as e:
             shutdown_error = e
             logger.error(f"DiffusionClient: Error stopping coordinator thread: {e}")
