@@ -1183,33 +1183,71 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 
 ArenaGpuCacheLevelStorage::ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     size_t arenaBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PooledPhysMemAllocator& physMemAllocator)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PooledPhysMemAllocator& physMemAllocator,
+    FixedSlotCounts const& fixedSlots, HostMemBackingOptions const& hostOptions,
+    std::optional<size_t> sparseReservation)
     : mArenaBytes(arenaBytes)
     // Mapped in full now and never remapped: rebalancing only moves windows.
     , mArena(arenaBytes, physMemAllocator, arenaBytes / physMemAllocator.physMemSize())
 {
+    PoolGroupIndex const numPg = slotDescList.size();
     TLLM_CHECK_WITH_INFO(arenaBytes > 0 && arenaBytes % physMemAllocator.physMemSize() == 0,
         "GPU arena size %zu must be a positive multiple of %zu", arenaBytes, physMemAllocator.physMemSize());
-    // Sparse pools (host memory, device-mapped; DeepSeek-V4 KV cache offload) live outside device
-    // memory and so outside any device arena. The arena has no layout for them.
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    TLLM_CHECK_WITH_INFO(fixedSlots.empty() || fixedSlots.size() == numPg,
+        "GPU arena: fixed slot counts must be empty or have one entry per pool group");
+    TLLM_CHECK_WITH_INFO(ratioList.size() == numPg && minSlots.size() == numPg,
+        "GPU arena: ratios and min slots must have one entry per pool group");
+    mInArena = TypedVec<PoolGroupIndex, std::uint8_t>(numPg, 1);
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+    sizes.reserve(numPg);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        for (PoolIndex p{0}; p < slotDescList[pgIdx].slotSizeList().size(); ++p)
+        sizes.push_back(slotDescList[pgIdx].slotSizeList());
+        bool const fixed = !fixedSlots.empty() && fixedSlots[pgIdx].has_value();
+        mInArena[pgIdx] = fixed ? 0 : 1;
+        if (!fixed)
         {
-            TLLM_CHECK_WITH_INFO(!slotDescList[pgIdx].isSparse(p),
-                "Copy-based rebalancing does not support sparse (host-backed) pools; pool group %d pool %d is sparse",
+            mElastic.push_back(pgIdx);
+        }
+        // Sparse pools (host memory, device-mapped; sparse attention KV cache offload) live outside device
+        // memory and so outside the arena. A fixed group, which never moves, can hold them in an allocation
+        // of its own.
+        for (PoolIndex p{0}; p < sizes[pgIdx].size(); ++p)
+        {
+            TLLM_CHECK_WITH_INFO(fixed || !slotDescList[pgIdx].isSparse(p),
+                "Copy-based rebalancing supports sparse (host-backed) pools only in a pool group of fixed size; "
+                "pool group %d pool %d is sparse",
                 pgIdx.value(), p.value());
         }
     }
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
-    sizes.reserve(slotDescList.size());
-    for (auto const& slotDesc : slotDescList)
-        sizes.push_back(slotDesc.slotSizeList());
-    auto const windows = computeArenaPoolWindows(arenaBytes, sizes, ratioList, minSlots);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    TLLM_CHECK_WITH_INFO(!mElastic.empty(), "GPU arena: every pool group is fixed, so there is nothing to rebalance");
+
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> elasticSizes;
+    TypedVec<PoolGroupIndex, float> elasticRatios;
+    TypedVec<PoolGroupIndex, SlotCount> elasticMinSlots;
+    for (PoolGroupIndex const pgIdx : mElastic)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(windows[pgIdx], growthFor(pgIdx, slotDescList.size()),
+        elasticSizes.push_back(sizes[pgIdx]);
+        elasticRatios.push_back(ratioList[pgIdx]);
+        elasticMinSlots.push_back(minSlots[pgIdx]);
+    }
+    auto const windows = computeArenaPoolWindows(arenaBytes, elasticSizes, elasticRatios, elasticMinSlots);
+    PoolGroupIndex const numElastic{static_cast<int>(mElastic.size())};
+    PoolGroupIndex position{0};
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        if (!mInArena[pgIdx])
+        {
+            TypedVec<PoolIndex, bool> sparsity;
+            for (PoolIndex p{0}; p < sizes[pgIdx].size(); ++p)
+                sparsity.push_back(slotDescList[pgIdx].isSparse(p));
+            mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(*fixedSlots[pgIdx], sizes[pgIdx], physMemAllocator,
+                std::move(sparsity), hostOptions, sparseReservation));
+            continue;
+        }
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(windows[position], growthFor(position, numElastic),
             sizes[pgIdx], arenaBase(), arenaBytes, physMemAllocator.physMemSize()));
+        ++position;
     }
 }
 
@@ -1224,13 +1262,15 @@ void ArenaGpuCacheLevelStorage::destroy()
     mArena.destroy();
 }
 
-TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> ArenaGpuCacheLevelStorage::slotSizes() const
+size_t ArenaGpuCacheLevelStorage::fixedBytes(CacheTier medium) const
 {
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
-    sizes.reserve(mPoolGroups.size());
-    for (auto const& pg : mPoolGroups)
-        sizes.push_back(pg->slotSize());
-    return sizes;
+    size_t total = 0;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+    {
+        if (!mInArena[pgIdx])
+            total += mPoolGroups[pgIdx]->roundedNumBytes(medium);
+    }
+    return total;
 }
 
 TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::windows() const
@@ -1246,11 +1286,15 @@ TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStor
 {
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> result;
     result.reserve(mPoolGroups.size());
-    for (auto const& pg : mPoolGroups)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
     {
+        auto const& pg = *mPoolGroups[pgIdx];
         TypedVec<PoolIndex, SlotWindow> pools;
-        for (PoolIndex poolIdx{0}; poolIdx < pg->numPools(); ++poolIdx)
-            pools.push_back(pg->arenaPool(poolIdx).window());
+        for (PoolIndex poolIdx{0}; poolIdx < pg.numPools(); ++poolIdx)
+        {
+            // A fixed group's pools share its slot ids, from 0.
+            pools.push_back(mInArena[pgIdx] ? pg.arenaPool(poolIdx).window() : pg.slotAllocator().window());
+        }
         result.push_back(std::move(pools));
     }
     return result;
@@ -1319,7 +1363,20 @@ size_t ArenaGpuCacheLevelStorage::minArenaBytes(TypedVec<PoolGroupIndex, TypedVe
 TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStorage::computePoolWindows(
     TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
-    return computeArenaPoolWindows(mArenaBytes, slotSizes(), ratioList, minSlots);
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+    TypedVec<PoolGroupIndex, float> ratios;
+    TypedVec<PoolGroupIndex, SlotCount> floors;
+    for (PoolGroupIndex const pgIdx : mElastic)
+    {
+        sizes.push_back(mPoolGroups[pgIdx]->slotSize());
+        ratios.push_back(ratioList.at(pgIdx));
+        floors.push_back(minSlots.at(pgIdx));
+    }
+    auto const elastic = computeArenaPoolWindows(mArenaBytes, sizes, ratios, floors);
+    auto result = poolWindows(); // fixed groups keep theirs
+    for (PoolGroupIndex position{0}; position < elastic.size(); ++position)
+        result[mElastic[static_cast<size_t>(position.value())]] = elastic[position];
+    return result;
 }
 
 bool ArenaGpuCacheLevelStorage::hasBoundPools() const noexcept

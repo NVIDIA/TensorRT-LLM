@@ -5885,7 +5885,10 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "With a host cache tier, the host quota is one arena as well, registered once. A pool group "
         "with several pools gives each pool its own window and block ids, which the model's cache "
         "manager must translate (DeepSeek-V4 does; other models with such pool groups are "
-        "rejected). The GPU and host quotas are fixed after startup.")
+        "rejected). The GPU and host quotas are fixed after startup. With sparse attention KV "
+        "cache offload (sparse_attention_config.enable_kv_cache_offload), pool groups holding "
+        "offloaded history keep their initial size beside the arena, and the other pool groups "
+        "are rebalanced.")
 
     drop_unreferenced_on_rebalance: bool = Field(
         default=False,

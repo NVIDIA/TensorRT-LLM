@@ -8428,7 +8428,7 @@ class KVCacheManagerV2(BaseResourceManager):
         and all of them raise when any rank cannot honor the settings.
 
         Raises:
-            ValueError: KV pool rebalancing, speculative decoding or pipeline
+            ValueError: KV pool rebalancing without copy-based rebalancing, speculative decoding or pipeline
                 parallelism is enabled, or the host history size, with an explicit
                 host cache tier, exceeds this rank's share of available host memory or
                 the pinned-memory limit.
@@ -8436,11 +8436,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         error: Optional[ValueError] = None
         host_history_size = offload_config.host_history_size
-        if kv_cache_config.enable_kv_pool_rebalance:
+        if (
+            kv_cache_config.enable_kv_pool_rebalance
+            and not _copy_based_rebalancing_flags(kv_cache_config)[0]
+        ):
+            # Copy-based rebalancing holds every pool group with host-backed history pools at its
+            # initial size and rebalances the others, so pinned host memory never changes.
             error = ValueError(
                 "Sparse KV cache offload is incompatible with "
-                "kv_cache_config.enable_kv_pool_rebalance=True: host-backed history pools "
-                "take their pool group's slot count, so a rebalance would resize pinned host "
+                "kv_cache_config.enable_kv_pool_rebalance=True unless "
+                "kv_pool_rebalance_config.copy_based_rebalancing=True: host-backed history pools "
+                "take their pool group's slot count, so a VMM rebalance would resize pinned host "
                 "memory outside the host budget."
             )
         elif spec_config is not None:

@@ -9,14 +9,17 @@ kv_pool_rebalance_config applies only with enable_kv_pool_rebalance.
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
     _copy_based_rebalancing_flags,
 )
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
     KvPoolRebalanceConfig,
+    SparseKvCacheOffloadConfig,
     TorchLlmArgs,
 )
+from tensorrt_llm.mapping import Mapping
 
 
 def _config(rebalance: bool, copy_based: bool, in_place: bool = False) -> KvCacheConfig:
@@ -85,3 +88,29 @@ def test_copy_based_flags_follow_enable_kv_pool_rebalance(rebalance, expected):
         ),
     )
     assert _copy_based_rebalancing_flags(cfg) == expected
+
+
+@pytest.mark.parametrize("copy_based", [False, True])
+def test_sparse_kv_offload_with_rebalancing_needs_copy_based(copy_based):
+    """Offload's host-backed history pools may not resize: VMM rebalancing is rejected.
+
+    Copy-based rebalancing holds the pool groups that hold them at a fixed size and rebalances the
+    others, so it is allowed.
+    """
+    kv_cache_config = KvCacheConfig(
+        enable_kv_pool_rebalance=True,
+        kv_pool_rebalance_config=KvPoolRebalanceConfig(copy_based_rebalancing=copy_based),
+    )
+
+    def check():
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(), kv_cache_config, Mapping(), spec_config=None
+        )
+
+    if copy_based:
+        check()
+    else:
+        with pytest.raises(
+            ValueError, match="unless kv_pool_rebalance_config.copy_based_rebalancing"
+        ):
+            check()

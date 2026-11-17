@@ -559,21 +559,71 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     if (mGpuArena)
     {
-        // The arena sizes every pool group from the ratio and moves windows between them, so a
-        // group whose capacity must stay fixed has no place in it yet.
-        if (std::any_of(mFixedSlots.begin(), mFixedSlots.end(), [](auto const& fixed) { return fixed.has_value(); }))
+        // Copy-based rebalancing moves pool windows inside one device arena, which has no room for host-backed
+        // (sparse) pools: they hold offloaded sparse attention history, whose pinned host memory is planned once
+        // (CoReba doc 38, phase 1). A group holding one is therefore fixed at the size the VMM allocator gives it
+        // now -- the same call, so the host plan sees the same counts -- and lives beside the arena.
+        auto const secondBudget = _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota);
+        bool const sparseToFix
+            = std::any_of(sparsePools.begin(), sparsePools.end(), [&](auto const& pools) { return !pools.empty(); });
+        if (sparseToFix)
         {
-            throw std::invalid_argument(
-                "copy-based KV pool rebalancing does not support fixed-capacity pool groups yet");
+            auto const initial = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio,
+                mHotMinSlots, gpuGranularity, secondBudget, mFixedSlots);
+            for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+            {
+                if (sparsePools[pgIdx].empty() || mFixedSlots[pgIdx].has_value())
+                    continue;
+                mFixedSlots[pgIdx] = initial[pgIdx];
+                mHotMinSlots[pgIdx] = initial[pgIdx];
+                TLLM_LOG_INFO(
+                    "KVCacheManagerV2: copy-based rebalancing holds GPU pool group %d (host-backed sparse pools) at "
+                    "%lld slots",
+                    pgIdx.value(), static_cast<long long>(initial[pgIdx]));
+            }
         }
-        // The whole GPU quota becomes one arena, rounded down to whole physical chunks. Like the VMM path
+        if (std::all_of(mFixedSlots.begin(), mFixedSlots.end(), [](auto const& fixed) { return fixed.has_value(); }))
+        {
+            // Nothing left to move: the VMM storage holds fixed groups as they are, and no rebalance changes them.
+            TLLM_LOG_INFO(
+                "KVCacheManagerV2: every GPU pool group has a fixed size; copy-based rebalancing has "
+                "nothing to rebalance and is not used");
+            mGpuArena = false;
+            mInPlaceRelocation = false;
+            mDropUnreferencedOnRebalance = false;
+        }
+    }
+    if (mGpuArena)
+    {
+        // Fixed groups (configured, or holding sparse pools) never move, so they are allocated as the VMM path
+        // allocates them, beside the arena; the arena holds the other ("elastic") groups.
+        size_t fixedDeviceBytes = 0;
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> elasticSizes;
+        TypedVec<PoolGroupIndex, SlotCount> elasticFloors;
+        auto const hotDescs = slotDescList(kHotLevel);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+        {
+            if (auto const fixed = mFixedSlots[pgIdx])
+            {
+                for (PoolIndex p{0}; p < slotSizeLists[pgIdx].size(); ++p)
+                {
+                    if (!hotDescs[pgIdx].isSparse(p))
+                        fixedDeviceBytes += roundUp(slotCountToSizeT(*fixed) * slotSizeLists[pgIdx][p], gpuGranularity);
+                }
+                continue;
+            }
+            elasticSizes.push_back(slotSizeLists[pgIdx]);
+            elasticFloors.push_back(mHotMinSlots[pgIdx]);
+        }
+        // The rest of the GPU quota becomes one arena, rounded down to whole physical chunks. Like the VMM path
         // (computeSlotCountForLevel), a quota below what minSlots needs is raised to it: the executor's
         // estimation pass sizes the first manager from free memory, which can be tiny (one GPU holding
         // most of DeepSeek-V4's weights leaves under 1 GiB).
-        size_t const arenaBytes = std::max(roundDown(gpuQuota, gpuGranularity),
-            roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(slotSizeLists, mHotMinSlots), gpuGranularity));
-        auto arena = std::make_unique<ArenaGpuCacheLevelStorage>(
-            slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator);
+        size_t const elasticQuota = gpuQuota > fixedDeviceBytes ? gpuQuota - fixedDeviceBytes : 0;
+        size_t const arenaBytes = std::max(roundDown(elasticQuota, gpuGranularity),
+            roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(elasticSizes, elasticFloors), gpuGranularity));
+        auto arena = std::make_unique<ArenaGpuCacheLevelStorage>(hotDescs, arenaBytes, hotRatio, mHotMinSlots,
+            *mGpuPhysMemAllocator, mFixedSlots, HostMemBackingOptions{}, mHostSparsePoolQuota);
         // Migration to and from lower tiers: a bound pool has its own slot ids, so the cold-page codec gets one
         // page-index array per pool (submitBoundPoolColdPageCodec), which it must accept.
         TLLM_CHECK_WITH_INFO(
@@ -3312,6 +3362,11 @@ void StorageManager::_relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx
     releaseDestinations.cancel();
 }
 
+bool StorageManager::isHotArenaGroup(PoolGroupIndex pgIdx) const
+{
+    return mGpuArena && static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage).inArena(pgIdx);
+}
+
 bool StorageManager::isArenaLevel(CacheLevel level) const
 {
     if (level == kHotLevel)
@@ -3396,8 +3451,13 @@ void StorageManager::adjustArenaLevel(CacheLevel level, std::optional<size_t> ne
     // by b before a may use it, so b moves first. Along a line of groups this order always exists:
     // a gaining from b means a's new range reaches past the boundary between them, so b cannot also
     // gain from a.
+    // A fixed group lives outside the arena (its window is in ids of its own allocation), so it neither moves
+    // nor overlaps anything.
+    auto inArena = [&](PoolGroupIndex pgIdx) { return !gpuArena || gpuArena->inArena(pgIdx); };
     auto gainsFrom = [&](PoolGroupIndex a, PoolGroupIndex b)
     {
+        if (!inArena(a) || !inArena(b))
+            return false;
         auto const [aBegin, aEnd] = byteRange(a, newWindows[a]);
         auto const [bBegin, bEnd] = byteRange(b, oldWindows[b]);
         return a != b && aBegin < bEnd && bBegin < aEnd;
@@ -3475,6 +3535,8 @@ void StorageManager::adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolInde
     std::vector<Entry> entries;
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
+        if (!arena.inArena(pgIdx))
+            continue; // fixed: outside the arena, never moves
         for (PoolIndex poolIdx{0}; poolIdx < oldWindows[pgIdx].size(); ++poolIdx)
             entries.push_back(Entry{pgIdx, poolIdx});
     }
@@ -3536,7 +3598,8 @@ void StorageManager::adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolInde
     // 3. Every slot id in a group's window is bound again, ready to be allocated.
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        arena.poolGroup(pgIdx).completeBindings();
+        if (arena.inArena(pgIdx))
+            arena.poolGroup(pgIdx).completeBindings();
     }
     arena.bumpBindingVersion();
 }
@@ -3601,7 +3664,7 @@ void StorageManager::remapArenaPool(PoolGroupIndex pgIdx, PoolIndex poolIdx, Slo
 
 SlotCount StorageManager::slotIdUpperBound(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
-    if (!mGpuArena)
+    if (!isHotArenaGroup(pgIdx))
     {
         // VMM pools share the group's slot ids, and a pool may hold more slots than the group uses (the group's
         // count is the minimum over its pools): views over any pool of the group cover the group's slots.
@@ -3621,7 +3684,7 @@ TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> StorageManager::hotPoo
         TypedVec<PoolIndex, SlotWindow> pools;
         for (PoolIndex poolIdx{0}; poolIdx < pg.numPools(); ++poolIdx)
         {
-            pools.push_back(mGpuArena ? pg.arenaPool(poolIdx).window() : pg.slotAllocator().window());
+            pools.push_back(isHotArenaGroup(pgIdx) ? pg.arenaPool(poolIdx).window() : pg.slotAllocator().window());
         }
         result.push_back(std::move(pools));
     }

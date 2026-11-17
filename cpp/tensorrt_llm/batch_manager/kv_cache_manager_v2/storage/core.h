@@ -1347,9 +1347,17 @@ class ArenaGpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
     //! arenaBytes must be a multiple of the allocator's physical chunk size.
+    //!
+    //! A group with a fixed slot count (`fixedSlots`) never resizes, so it does not live in the
+    //! arena: it is an ordinary GpuPoolGroup of its own, with slot ids from 0, built as the VMM
+    //! path builds it -- host-backed (sparse) pools included, from `hostOptions` and
+    //! `sparseReservation`. Only fixed groups may hold sparse pools. The arena holds the other
+    //! ("elastic") groups, laid out and moved among themselves; `arenaBytes` is their share of the
+    //! quota. At least one group must be elastic.
     ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, size_t arenaBytes,
         TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        PooledPhysMemAllocator& physMemAllocator);
+        PooledPhysMemAllocator& physMemAllocator, FixedSlotCounts const& fixedSlots = {},
+        HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
     //! Destroys the pool groups before the arena they point into.
     ~ArenaGpuCacheLevelStorage() override;
 
@@ -1358,16 +1366,29 @@ public:
         return CacheTier::GPU_MEM;
     }
 
-    //! The arena is the quota and cannot change size: every byte of it is paid for by the GPU
-    //! tier, whatever share the windows give each group. It holds no pool of any other medium.
+    //! The arena plus the fixed groups is the quota and cannot change size: every arena byte is
+    //! paid for by the GPU tier, whatever share the windows give each group. Pools of another
+    //! medium (sparse, host-backed) live only in fixed groups.
     [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override
     {
-        return medium == CacheTier::GPU_MEM ? mArenaBytes : 0;
+        return (medium == CacheTier::GPU_MEM ? mArenaBytes : 0) + fixedBytes(medium);
     }
 
     [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
     {
+        return mArenaBytes + fixedBytes(CacheTier::GPU_MEM);
+    }
+
+    //! Bytes of the arena alone: the one device range the elastic groups live in.
+    [[nodiscard]] size_t arenaBytes() const noexcept
+    {
         return mArenaBytes;
+    }
+
+    //! Whether the group lives in the arena (elastic) rather than in an allocation of its own (fixed).
+    [[nodiscard]] bool inArena(PoolGroupIndex pgIdx) const
+    {
+        return mInArena.at(pgIdx) != 0;
     }
 
     void destroy() override;
@@ -1383,7 +1404,8 @@ public:
     //! Window of every pool, in that pool's own ids.
     [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> poolWindows() const;
 
-    //! The pool windows this arena would get for `ratioList`.
+    //! The pool windows this arena would get for `ratioList`. Fixed groups keep their windows; the
+    //! ratios of the elastic groups are their shares of the arena.
     [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> computePoolWindows(
         TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
@@ -1432,11 +1454,14 @@ public:
     static SlotAllocator::Growth growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept;
 
 private:
-    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizes() const;
+    //! Bytes the fixed groups hold in pools of `medium`.
+    [[nodiscard]] size_t fixedBytes(CacheTier medium) const;
 
     size_t mArenaBytes;
     VirtMem mArena;
     uint64_t mBindingVersion = 0;
+    TypedVec<PoolGroupIndex, std::uint8_t> mInArena; // not bool: TypedVec wraps std::vector
+    std::vector<PoolGroupIndex> mElastic;            // the arena's groups, in layout order
 };
 
 class HostCacheLevelStorage : public CacheLevelStorage

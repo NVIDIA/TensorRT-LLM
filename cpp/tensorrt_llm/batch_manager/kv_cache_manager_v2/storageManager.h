@@ -246,6 +246,8 @@ public:
 
     //! Whether `level` is a copy-based rebalancing arena (the GPU level, or a host level built with it).
     [[nodiscard]] bool isArenaLevel(CacheLevel level) const;
+    //! Whether a hot pool group lives in the GPU arena: false without one, and for a fixed group beside it.
+    [[nodiscard]] bool isHotArenaGroup(PoolGroupIndex pgIdx) const;
 
     //! Whether adjust() relocates the blocks of ACTIVE caches instead of requiring them suspended.
     [[nodiscard]] bool isInPlaceRelocation() const noexcept
