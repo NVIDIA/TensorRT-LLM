@@ -206,7 +206,6 @@ class ChecksRaised(Exception):
     def __init__(self, failed: list[str], raised: Mapping[str, str]) -> None:
         super().__init__("; ".join(f"{key}: {why}" for key, why in raised.items()))
         self.failed = failed
-        self.raised = tuple(raised)
 
 
 def _failed(submitted: Sequence[tuple[str, Future]]) -> list[str]:
@@ -339,7 +338,7 @@ class GraphOrchestrator:
         self._receipts_landed: dict[str, int] = {
             str(k): int(v) for k, v in (saved.get("receipts_landed") or {}).items()
         }
-        #: Checks a finished task asked for whose run recorded no verdict (its session
+        #: Checks that were asked for and whose run recorded no verdict (its session
         #: was lost): each runs again, though an earlier pass of it stands.
         self._owed: set[str] = {str(k) for k in saved.get("owed") or ()}
         #: An event that needs the planner's judgement waits: it wakes the planner
@@ -501,16 +500,23 @@ class GraphOrchestrator:
         variant's benchmark, judged against its unit's) has it on this target
         before it starts, the other run here if it has none.
         """
-        first = self._check_by_key(check.after) if check.after else None
-        if first is not None:
-            with self._check_lock(first.key):
-                marker = self.s.marker()
-                with self._status_lock:
-                    had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
-                if had is None:
-                    self._run_check(first)
-        with self._check_lock(check.key):
-            return self._run_check_once(check)
+        try:
+            first = self._check_by_key(check.after) if check.after else None
+            if first is not None:
+                with self._check_lock(first.key):
+                    marker = self.s.marker()
+                    with self._status_lock:
+                        had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
+                    if had is None:
+                        self._run_check(first)
+            with self._check_lock(check.key):
+                return self._run_check_once(check)
+        except Exception:
+            # No verdict (its session was lost): whoever asked, the check is owed
+            # still, whatever an earlier pass of it says.
+            with self._status_lock:
+                self._owed.add(check.key)
+            raise
 
     def _run_check_once(self, check: contract_mod.Check) -> bool:
         marker = self.s.marker()
@@ -519,6 +525,8 @@ class GraphOrchestrator:
                 here = contract_mod.passed_here(
                     self.contract, self.status, check, marker, self.s.holds
                 )
+                if here:
+                    self._owed.discard(check.key)
             if here:
                 return True
         result = self.s.check(check)
@@ -572,9 +580,7 @@ class GraphOrchestrator:
             return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
         except ChecksRaised as exc:
             # The work stands and has landed; only these checks' outcome is unknown.
-            # They are owed still, whatever an earlier pass of theirs says.
-            with self._status_lock:
-                self._owed.update(exc.raised)
+            # They are owed still (:meth:`_run_check`).
             self._inconclusive[task.id] = str(exc)
             return decision, exc.failed
         finally:
@@ -1129,8 +1135,10 @@ class GraphOrchestrator:
         if task.status == "done" or landed or passed > self._passed_seen:
             self.revisions_since_progress = 0
         self._passed_seen = passed
-        self._save_graph()
+        # The events first: they hold the checks still owed, and a process that died
+        # between the two writes must not find the task done and nothing owed.
         self._save_events()
+        self._save_graph()
         self._correctness(marker, evaluation)
         self._persist("state", self.s.checkpoint)
         self.s.finished(task)

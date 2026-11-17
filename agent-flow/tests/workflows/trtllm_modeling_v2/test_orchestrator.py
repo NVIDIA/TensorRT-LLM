@@ -256,6 +256,50 @@ def test_a_check_a_task_asked_for_runs_again_when_its_run_was_lost(tmp_path):
     assert status.latest()[_CORE[0]].marker == "m2"
 
 
+def test_a_check_task_whose_run_is_lost_leaves_its_check_owed(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    recheck = g.Task(
+        id="recheck", kind="check", goal="the boot again", depends_on=["again"], satisfies=_CORE[:1]
+    )
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("again", "assemble", _CORE[1:], deps=["core"], touches=["models/core/"]),
+        recheck,
+    )
+    # Lost on both of the task's starts: the task fails, and the boot's pass on m1 stands.
+    services = _moving_target(plan, lost=[(_CORE[0], "m2"), (_CORE[0], "m2")])
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The planner asked for the boot on what `again` left, and it ran there before delivery.
+    assert status.latest()[_CORE[0]].marker == "m2"
+
+
+def test_an_owed_check_that_passed_on_this_tree_is_owed_no_more(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    status = c.ContractStatus.load(tmp_path)
+    for check in contract.checks:
+        result = SimpleNamespace(name=check.gate, member=check.member, passed=True, detail="")
+        status.record("core", result, marker="m1")
+    # What an earlier process left: the boot owed, though it has passed on this tree since.
+    (tmp_path / "planner_events.json").write_text('{"owed": ["core:boot@tp1"]}')
+    core = replace(_task("core", "assemble", _CORE), status="done")
+    plan = _plan_once(core)
+    landed = ["core"]
+    ran = []
+
+    def check(chk):
+        ran.append(chk.key)
+        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
+
+    services = Services(
+        plan=plan, work=lambda task: "UNIT_READY", check=check, free_gpus=lambda: 4,
+        marker=lambda: f"m{len(landed)}",
+    )  # fmt: skip
+    orchestrator = GraphOrchestrator(services, contract, status, tmp_path, poll_s=0)
+    assert orchestrator.run() == "delivered"
+    assert ran == [] and not orchestrator._owed
+
+
 def _three_benchmarks():
     """Three units' benchmarks at tp1, as a spec with one `accuracy` block for every unit owes."""
     checks = tuple(
