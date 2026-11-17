@@ -43,6 +43,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -483,6 +484,25 @@ def _store_shared_remote_v4(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Constexpr[int]) -> None:
+    """Spin until ``phase`` of a local mbarrier completes and acquire the peers' payload at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. A barrier completed by peer CTAs'
+    ``st.async ... mbarrier::complete_tx`` (``_store_shared_remote_v4``) is released at
+    cluster scope, so the wait has to synchronize at cluster scope before the reads that
+    follow it. A ``.acquire.cluster`` wait makes ptxas invalidate L1 after every poll; a
+    relaxed cluster-scope wait followed by ``fence.acquire.sync_restrict::shared::cluster``
+    is the PTX ISA's acquire pattern for shared memory published through the generic proxy
+    and costs no extra instruction.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
@@ -1219,6 +1239,12 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # Observe phase 0 (this warp's first arrival plus the 128 epilogue arrivals)
+        # before arriving again, so the arrival below lands in phase 1. Without this
+        # wait the second arrival can land while phase 0 is still open, in which case
+        # the parity-1 wait names the preceding phase, returns at once, and the dealloc
+        # races the epilogue warps' tcgen05.ld of the accumulator.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
@@ -1356,7 +1382,8 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbarrier_wait_acquire_cluster(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
