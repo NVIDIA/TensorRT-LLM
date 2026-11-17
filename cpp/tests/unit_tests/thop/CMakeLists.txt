@@ -35,13 +35,26 @@ if(${BUILD_PYT})
                              PRIVATE ${fmha_params_generated_include_dir})
 
   add_tllm_gtest(
+    allreduceTacticCacheTest
+    OWNER
+    common
+    SOURCES
+    allreduceTacticCacheTest.cpp
+    LINK_LIBRARIES
+    tllm::common_logging
+    ${TORCH_LIBRARIES}
+    CUDA::cudart
+    LABELS
+    "unit;common;host")
+  add_tllm_gtest(
     thUtilsTest
+    OWNER
+    runtime
     SOURCES
     thUtilsTest.cpp
     eagerMoeWorkspaceTest.cpp
-    FULL_STACK
+    LINK_LIBRARIES
+    tllm::torch_utils
     LABELS
-    "unit;full-stack;gpu")
-  target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
-                                           ${TORCH_LIBRARIES})
+    "unit;runtime;thop;gpu")
 endif()

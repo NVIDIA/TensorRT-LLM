@@ -672,15 +672,15 @@ protected:
     [[nodiscard]] static auto keyFields(Self& self)
     {
         return std::tie(self.device, self.type, self.is_fp8_out, self.is_fp4_out, self.use_kv_cache,
-            self.cross_attention, self.tokens_per_block, self.mask_type, self.position_embedding_type, self.num_heads,
-            self.num_kv_heads, self.head_size, self.q_scaling, self.rotary_embedding_dim, self.quant_mode,
-            self.uses_spcompress, self.paged_context_fmha, self.is_spec_decoding_enabled,
-            self.spec_decoding_target_max_gen_len, self.fuses_dsv4_inv_rope_fp8_quant, self.use_sparse_attention,
-            self.use_tllm_gen_sparse_attention, self.use_nvfp4_mla_kv_cache, self.is_mla_enable, self.q_lora_rank,
-            self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim,
-            self.predicted_tokens_per_seq, self.mla_layer_num, self.rope_append, self.sage_attn_num_elts_per_blk_q,
-            self.sage_attn_num_elts_per_blk_k, self.sage_attn_num_elts_per_blk_v, self.sage_attn_qk_int8,
-            self.sage_attn_smooth_k, self.skip_correction_threshold);
+            self.cross_attention, self.tokens_per_block, self.mask_type, self.use_variable_window,
+            self.position_embedding_type, self.num_heads, self.num_kv_heads, self.head_size, self.q_scaling,
+            self.rotary_embedding_dim, self.quant_mode, self.uses_spcompress, self.paged_context_fmha,
+            self.is_spec_decoding_enabled, self.spec_decoding_target_max_gen_len, self.fuses_dsv4_inv_rope_fp8_quant,
+            self.use_sparse_attention, self.use_tllm_gen_sparse_attention, self.use_nvfp4_mla_kv_cache,
+            self.is_mla_enable, self.q_lora_rank, self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim,
+            self.v_head_dim, self.predicted_tokens_per_seq, self.mla_layer_num, self.rope_append,
+            self.sage_attn_num_elts_per_blk_q, self.sage_attn_num_elts_per_blk_k, self.sage_attn_num_elts_per_blk_v,
+            self.sage_attn_qk_int8, self.sage_attn_smooth_k, self.skip_correction_threshold);
     }
 
     int device = 0;
@@ -691,6 +691,7 @@ protected:
     bool cross_attention = false;
     std::int64_t tokens_per_block = 0;
     AttentionMaskType mask_type = AttentionMaskType::CAUSAL;
+    bool use_variable_window = false;
     PositionEmbeddingType position_embedding_type = PositionEmbeddingType::kLEARNED_ABSOLUTE;
     std::int64_t num_heads = 0;
     std::int64_t num_kv_heads = 0;
@@ -753,6 +754,10 @@ private:
     friend bool attention_supports_nvfp4_output(std::int64_t num_heads, std::int64_t num_kv_heads,
         std::int64_t head_size, std::optional<std::int64_t> tokens_per_block, std::int64_t mask_type,
         std::int64_t quant_mode, bool use_paged_context_fmha, bool is_mla_enable);
+    friend bool attention_supports_variable_window(c10::ScalarType dtype, c10::ScalarType output_dtype,
+        int64_t num_heads, int64_t num_kv_heads, int64_t head_size, std::optional<int64_t> tokens_per_block,
+        int64_t quant_mode, int64_t max_num_requests, int64_t max_context_length, int64_t max_seq_len,
+        std::optional<int64_t> attention_chunk_size, bool use_kv_cache, bool use_paged_context_fmha);
 };
 
 struct KvCachePoolMapping

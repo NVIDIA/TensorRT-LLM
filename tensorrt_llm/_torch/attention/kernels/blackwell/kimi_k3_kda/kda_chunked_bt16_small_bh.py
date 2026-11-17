@@ -19,7 +19,9 @@ Vendored from flashinfer-ai/flashinfer commit
 b8e81a7dae6c2aa5c9aa19c06e81e9a729271493,
 flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py (Apache-2.0).
 Local changes add state-slot indirection and padded pool-row strides, reject
-unwarmed graph specializations, and use the active device SM count for scheduling.
+unwarmed graph specializations, use the active device SM count for
+scheduling, and fence K1's gate-stage shared-memory writes for the async
+proxy before the MMA warp TMA-stores them.
 The K1/K2 arithmetic and layouts are retained from upstream.
 """
 
@@ -1303,6 +1305,16 @@ class ChunkKdaFwdK1:
         chunk_offset: Optional[cutlass.Int32] = None,
         valid_tokens: Optional[cutlass.Int32] = None,
     ):
+        """Compute one tile's gate decay and hand its stage to the MMA warpgroup.
+
+        Consumes one loaded stage (sQ, sK, sG, sDtBias, sAlog) of the tile at
+        (t_idx, h_idx, b_idx), computes the sigmoid-gated decay, writes the
+        decayed q/k fragments into the shared-memory sQd/sKd/sKi stage that
+        the MMA warpgroup consumes, and writes Kr and Gk directly to global
+        memory. The shared-memory stores are fenced for the async proxy
+        before the stage is committed, so the TMA store reads this tile
+        rather than whichever tile last used the stage.
+        """
         alog = sAlog[h_idx]
 
         tma_full = tma_consumer.wait_and_advance()
@@ -1662,6 +1674,9 @@ class ChunkKdaFwdK1:
                 )
 
         tma_full.release()
+        # The MMA warpgroup TMA-stores sQd and sKd as soon as this stage is
+        # committed; make these shared-memory writes visible to the async proxy.
+        cute.arch.fence_view_async_shared()
         mma_empty.commit()
         return tma_consumer, gate_mma_producer
 

@@ -318,7 +318,7 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
         },
     }
     spec = TuneSpec.from_task(
-        task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/"
+        task, tmp_path / "ws", target="tensorrt_llm/_torch/modeling_v2/models/f/t/"
     )
     turns = []
     asks = {}
@@ -480,7 +480,7 @@ def test_a_fixable_loss_is_revised_once_and_every_later_request_carries_what_was
         },
     }
     spec = TuneSpec.from_task(
-        task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/"
+        task, tmp_path / "ws", target="tensorrt_llm/_torch/modeling_v2/models/f/t/"
     )
     turns, asks = ([], {})
 
@@ -652,7 +652,13 @@ def _budget_spec(tmp_path: Path, **campaign):
             "spools": ["s1"],
             "env_script": "/env.sh",
             "sol": {"enabled": False},
-            "campaign": {"max_parallel_tuners": 1, "kernel_ledger": "off", **campaign},
+            # A deferral ends the run at once unless a test waits it out.
+            "campaign": {
+                "max_parallel_tuners": 1,
+                "kernel_ledger": "off",
+                "max_retries": 0,
+                **campaign,
+            },
         },
     }
     return TuneSpec.from_task(task, tmp_path / "ws", target="t/")

@@ -201,15 +201,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             SELECT process_id,
                    case_stage_id,
                    SUM(CASE WHEN outcome != '' THEN 1 ELSE 0 END) AS outcome_count,
-                   MAX(CASE WHEN outcome NOT IN ('', 'passed') THEN 1 ELSE 0 END)
-                       AS has_non_passed
+                   MAX(CASE WHEN outcome = 'passed' THEN 1 ELSE 0 END) AS has_passed,
+                   MAX(CASE WHEN outcome NOT IN ('', 'passed', 'skipped') THEN 1 ELSE 0 END)
+                       AS has_failure
             FROM test_result
             GROUP BY process_id, case_stage_id
         ),
         result_summary AS (
             SELECT case_stage_id,
                    SUM(outcome_count) AS outcome_count,
-                   MAX(has_non_passed) AS has_non_passed
+                   MAX(has_passed) AS has_passed,
+                   MAX(has_failure) AS has_failure
             FROM per_process
             GROUP BY case_stage_id
         ),
@@ -234,7 +236,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                stage.name AS stage,
                CASE
                    WHEN COALESCE(result_summary.outcome_count, 0) = 0 THEN NULL
-                   WHEN result_summary.has_non_passed != 0 THEN 'incomplete'
+                   WHEN result_summary.has_failure != 0 OR result_summary.has_passed = 0
+                       THEN 'incomplete'
                    ELSE 'passed'
                END AS outcome,
                CASE

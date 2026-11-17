@@ -1371,12 +1371,14 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run dense FP4 MLA chunked prefill through FP8 context partitions.
+        """Run dense FP4 MLA context over a cached prefix through FP8 context partitions.
 
-        The current chunk is appended to the FP4 cache first. Each cached
-        prefix partition is then gathered from the FP4 cache, expanded, and
-        attended with a full mask; the current chunk is attended causally
-        last, and the partial outputs are merged with their softmax stats.
+        The prefix comes from earlier chunks of a chunked prefill or from
+        block reuse. The current chunk is appended to the FP4 cache first.
+        Each cached prefix partition is then gathered from the FP4 cache,
+        expanded, and attended with a full mask; the current chunk is
+        attended causally last, and the partial outputs are merged with their
+        softmax stats.
         """
         trtllm_attention = cast(TrtllmAttention, self.mha)
         if latent_cache is None:
@@ -1554,6 +1556,11 @@ class MLA(nn.Module):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype,
+                helix_plan=(
+                    attn_metadata.helix_mla_chunk_plans[loop_idx]
+                    if attn_metadata.helix_mla_chunk_plans is not None
+                    else None
+                ),
             )
 
             # up proj to uncompressed kv
@@ -1752,11 +1759,17 @@ class MLA(nn.Module):
 
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-            if (
-                attn_metadata.helix_context_local_slots is not None
-                and attn_metadata.num_ctx_cached_tokens > 0
-            ):
-                raise NotImplementedError("Helix cached context requires distributed KV gathering")
+            if attn_metadata.helix_context_local_slots is not None:
+                if self.mha.uses_fp4_mla_attention:
+                    raise NotImplementedError(
+                        "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                    )
+                if attn_metadata.num_ctx_cached_tokens > 0 and (
+                    not attn_metadata.runtime_features.chunked_prefill or get_sm_version() < 100
+                ):
+                    raise NotImplementedError(
+                        "Helix cached context requires chunked prefill on SM100 or newer"
+                    )
             trtllm_attention = cast(TrtllmAttention, self.mha)
             # Warm up maybe_compiled_cat for both the chunked-prefill path and
             # the cached-kv path; without this, the cached-kv prefill
@@ -1772,10 +1785,16 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
+            # FP4 MLA reads a cached prefix back from FP4 storage in partitions,
+            # whether block reuse or earlier chunked-prefill chunks wrote it.
+            fp4_mla_cached_context = (
+                trtllm_attention.uses_fp4_mla_attention
+                and trtllm_attention.has_cached_kv_for_mla_context(attn_metadata)
+            )
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
-                and get_sm_version() >= 100
-            ):
+                or fp4_mla_cached_context
+            ) and get_sm_version() >= 100:
                 if trtllm_attention.uses_fp4_mla_attention:
                     return self.forward_context_with_chunked_prefill_fp4(
                         q, compressed_kv, latent_cache, attn_metadata, output
@@ -1789,8 +1808,7 @@ class MLA(nn.Module):
                 if trtllm_attention.uses_fp4_mla_attention:
                     # The cached-KV path writes and reads a dense paged cache.
                     raise RuntimeError(
-                        "FP4 MLA attends a cached prefix only through chunked-prefill "
-                        "partitions on SM100+; enable chunked prefill."
+                        "FP4 MLA attends a cached prefix only through context partitions on SM100+."
                     )
                 return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
         return self.forward_context_default(

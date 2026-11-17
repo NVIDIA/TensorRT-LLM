@@ -180,6 +180,7 @@ class TestMediaRefValidation:
         from tensorrt_llm.visual_gen import MediaRef
 
         with pytest.raises(ValidationError, match=r"format\s+Field required"):
+            # pyrefly: ignore [missing-argument]
             MediaRef(content="a.png")
 
     @pytest.mark.parametrize(

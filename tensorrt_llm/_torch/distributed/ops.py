@@ -57,24 +57,26 @@ if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
         "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
         f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
 
-_thread_local = threading.local()
+# Allocating these workspaces is a TP-wide collective, so whether a rank
+# allocates must not depend on which thread builds its model: RpcWorker builds
+# rank 0 on an RPC executor thread and the other ranks on their main thread.
+# The caches are therefore shared by all threads of the process, and a
+# per-mapping lock serializes each allocation.
+_allreduce_workspaces: Dict[Mapping, Tuple[list, torch.Tensor]] = {}
+_lowprecision_allreduce_workspaces: Dict[Mapping, Tuple[list,
+                                                        torch.Tensor]] = {}
+_allreduce_workspace_locks: Dict[Mapping, threading.Lock] = {}
+_allreduce_workspace_locks_guard = threading.Lock()
+
+
+def _get_allreduce_workspace_lock(mapping: Mapping) -> threading.Lock:
+    with _allreduce_workspace_locks_guard:
+        return _allreduce_workspace_locks.setdefault(mapping, threading.Lock())
+
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
 # tracing the stateful AutoTuner singleton.
 _ALLREDUCE_AUTOTUNER_TUNING_MODE = False
-
-# Disabled only after the Python/C++ native-tactic contract cannot be honored.
-_ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
-
-
-def disable_native_allreduce_autotuner(reason: str) -> None:
-    """Use the Python AllReduce autotuner after a native compatibility failure."""
-    global _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
-    if _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
-        _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = False
-        logger.warning(
-            "Disabling native AllReduce autotuner (%s); falling back to the Python autotuner.",
-            reason)
 
 
 def set_allreduce_autotuner_tuning_mode(is_tuning_mode: bool) -> None:
@@ -156,35 +158,29 @@ def warmup_named_allreduce_topologies(model: nn.Module) -> None:
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
-    if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
-
-    allreduce_workspaces = getattr(_thread_local,
-                                   f'allreduce_workspaces_{mapping.pp_rank}')
-    if mapping not in allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
-            mapping,
-            CustomAllReduceHelper.max_workspace_size_auto(
-                mapping.tp_size, support_deterministic=False),
-        )
-        allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-    return allreduce_workspaces[mapping][1]
+    with _get_allreduce_workspace_lock(mapping):
+        if mapping not in _allreduce_workspaces:
+            ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
+                mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    mapping.tp_size, support_deterministic=False),
+            )
+            _allreduce_workspaces[mapping] = (ipc_buffers, workspace)
+        return _allreduce_workspaces[mapping][1]
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
-    if not hasattr(_thread_local, 'lowprecision_allreduce_workspaces'):
-        _thread_local.lowprecision_allreduce_workspaces = {}
-    lowprecision_allreduce_workspaces = _thread_local.lowprecision_allreduce_workspaces
-    if mapping not in lowprecision_allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
-            mapping,
-            CustomAllReduceHelper.max_workspace_size_lowprecision(
-                mapping.tp_size),
-        )
-        lowprecision_allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-        CustomAllReduceHelper.initialize_lowprecision_buffers(
-            workspace, mapping.tp_size)
-    return
+    with _get_allreduce_workspace_lock(mapping):
+        if mapping not in _lowprecision_allreduce_workspaces:
+            ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
+                mapping,
+                CustomAllReduceHelper.max_workspace_size_lowprecision(
+                    mapping.tp_size),
+            )
+            _lowprecision_allreduce_workspaces[mapping] = (ipc_buffers,
+                                                           workspace)
+            CustomAllReduceHelper.initialize_lowprecision_buffers(
+                workspace, mapping.tp_size)
 
 
 def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
@@ -881,6 +877,9 @@ class MNNVLAllReduce(nn.Module):
     # (mapping, hidden size), built with the first module of that pair; they share its workspace.
     fused_norm_kernels: typing.ClassVar[dict[tuple[Mapping, int], tuple]] = {}
 
+    # The GEMM + two-shot all-reduce + norm kernel (GemmTwoShotAllReduceNorm) on fused_norm's table, or None.
+    gemm_twoshot = None
+
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -958,6 +957,7 @@ class MNNVLAllReduce(nn.Module):
         # (see _fused_norm_call).
         self.fused_norm: Optional[MnnvlAllReduceNorm] = None
         self.gemm_norm: Optional[GemmAllReduceNorm] = None
+        self.gemm_twoshot = None
         if fused:
             key = (mapping, hidden_size)
             if key not in MNNVLAllReduce.fused_norm_kernels:
@@ -977,6 +977,13 @@ class MNNVLAllReduce(nn.Module):
                 MNNVLAllReduce.fused_norm_kernels[key] = kernels
             self.fused_norm, self.gemm_norm = MNNVLAllReduce.fused_norm_kernels[
                 key]
+            if self.fused_norm is not None:
+                from .mnnvl_fused_allreduce import GemmTwoShotAllReduceNorm
+                if GemmTwoShotAllReduceNorm.is_supported(
+                        mapping, dtype, hidden_size):
+                    self.gemm_twoshot = GemmTwoShotAllReduceNorm(
+                        mapping, hidden_size, self.fused_norm.table,
+                        _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
 
     @staticmethod
     def get_supported_dtypes():
@@ -1132,13 +1139,16 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
-            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
-            NVFP4 scale-factor output is 1-D).
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s), or None for an
+            unsupported fusion op, input dtype or size. Output tensors preserve the input's N-D shape
+            (NVFP4 quant output has its last dim halved; the NVFP4 scale-factor output is 1-D).
         """
 
         if isinstance(all_reduce_params, MoEAllReduceParams):
             return self._moe_fold_call(input, all_reduce_params)
+        if input.dtype != self.dtype:
+            # The workspace is sized and laid out for self.dtype.
+            return None
         fusion_op = all_reduce_params.fusion_op
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
@@ -1149,13 +1159,9 @@ class MNNVLAllReduce(nn.Module):
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
-        # We use uint32_t to store workspace size related info. Safeguard against overflow.
+        # The kernels keep workspace sizes in uint32; a larger input falls back to the next strategy.
         if workspace_size_bytes >= 2**32 - 1:
-            # Raise an error so we can fallback to other allreduce strategies
-            raise ValueError(
-                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
-                f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
-            )
+            return None
 
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
@@ -1225,7 +1231,8 @@ class MNNVLAllReduce(nn.Module):
                      params.eps,
                      x=input,
                      scale=params.scale if quant else None,
-                     norm_out=norm_out)
+                     norm_out=norm_out,
+                     l2_prefetch=params.l2_prefetch)
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
         """Whether ``forward`` takes MoEAllReduceParams (shared-expert gate combine, optionally with the
@@ -1244,6 +1251,10 @@ class MNNVLAllReduce(nn.Module):
         shared = params.shared_expert_output
         if (outputs is None or shared is None or
                 not self.supports_moe_fold(shared.shape[0], shared.shape[-1])):
+            if params.fc2_lamport:
+                # Only this fold resets the Lamport rows the experts wrote.
+                raise ValueError(
+                    "Lamport FC2 rows need the MoE fold of this all-reduce")
             return None
         if params.expanded_idx_to_permuted_idx is not None:
             routed = (routed, params.expert_scale_factor,
@@ -1255,7 +1266,9 @@ class MNNVLAllReduce(nn.Module):
                                moe_fold=(routed, params.shared_expert_output,
                                          params.shared_expert_gate),
                                scale=params.scale if quant else None,
-                               norm_out=norm_out)
+                               norm_out=norm_out,
+                               l2_prefetch=params.l2_prefetch,
+                               fc2_lamport=params.fc2_lamport)
 
     def gemm_allreduce_norm(self, input: torch.Tensor, weight: torch.Tensor,
                             weight_scale: torch.Tensor,
@@ -1283,8 +1296,46 @@ class MNNVLAllReduce(nn.Module):
                     scale=params.scale if quant else None,
                     norm_out=norm_out)
 
+    def gemm_twoshot_allreduce_norm(
+            self, input: torch.Tensor, weight: torch.Tensor,
+            weight_scale: torch.Tensor, input_scale: torch.Tensor,
+            params: AllReduceParams) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Row-parallel FP8 GEMM ``input @ weight.T`` + this all-reduce + ``params``' residual RMSNorm fusion in one
+        launch for the rows GemmTwoShotAllReduceNorm takes, or None. A BF16 input (the gated-attention o_proj) is
+        quantized with ``input_scale`` first, by the call FP8QDQLinearMethod.apply makes before cuBLAS. The kernel
+        exchanges BF16, so an E4M3-payload call (``params.fp8_payload``) stays on the library two-shot."""
+        kern = self.gemm_twoshot
+        outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
+        if (kern is None or outputs is None or params.bias is not None
+                or params.fp8_payload or weight.shape[0] != kern.hidden):
+            return None
+        if input.dtype == torch.bfloat16:
+            if (input.dim() != 2 or input.shape[1] != weight.shape[-1]
+                    or not kern.takes(input.shape[0], weight)):
+                return None
+            input, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                input, input_scale)
+        if not kern.supports(input, weight):
+            return None
+        quant, norm_out = outputs
+        return kern(input,
+                    weight,
+                    weight_scale,
+                    input_scale,
+                    params.residual,
+                    params.norm_weight,
+                    params.eps,
+                    scale=params.scale if quant else None,
+                    norm_out=norm_out)
+
 
 class AllReduce(nn.Module):
+
+    # TP2 residual RMSNorm fusion kernel, when the model declares allreduce_tp2_fused_norm.
+    tp2_allreduce = None
+    # (mapping, hidden, max tokens) -> the mapping's Tp2AllReduceNorm (built collectively once), or None where its
+    # setup failed.
+    tp2_fused_norm_kernels: typing.ClassVar[dict] = {}
 
     def __init__(self,
                  mapping: Mapping,
@@ -1338,6 +1389,7 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self.tp2_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
         self._group_name = (mapping.tp_group_name
@@ -1360,7 +1412,11 @@ class AllReduce(nn.Module):
         fused_norm = bool(
             extra_attrs
             and extra_attrs.get("allreduce_mnnvl_fused_norm", False))
+        # Declared by the model: a TP2 group without MNNVL runs large residual RMSNorm fusions on Tp2AllReduceNorm.
+        tp2_fused_norm = bool(
+            extra_attrs and extra_attrs.get("allreduce_tp2_fused_norm", False))
         fused_norm_max_num_tokens = fused_norm_hidden_size = None
+        max_num_tokens = hidden_size = None
         if extra_attrs:
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
                 AllReduceRunner
@@ -1440,6 +1496,40 @@ class AllReduce(nn.Module):
                         "MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+                tp_nodes = {
+                    self.mapping.get_node_rank(rank)
+                    for rank in self.mapping.tp_group
+                }
+                if self.mnnvl_allreduce is None and len(tp_nodes) > 1:
+                    # Without MNNVL the C++ op falls back to NCCL across nodes.
+                    reason = ("no dtype was given"
+                              if dtype is None else "MNNVL is unavailable")
+                    logger.warning_once(
+                        "AllReduce over a TP group spanning nodes falls back "
+                        f"to NCCL: {reason}.",
+                        key=("allreduce_multi_node_nccl", reason))
+
+            # AUTO, or TWOSHOT (the kernel is a reduce-scatter + all-gather); other strategies run as chosen.
+            if (tp2_fused_norm and self.strategy in (AllReduceStrategy.AUTO,
+                                                     AllReduceStrategy.TWOSHOT)
+                    and self.mapping.tp_size == 2 and not self._disable_mpi
+                    and self.mnnvl_allreduce is None
+                    and dtype in (None, torch.bfloat16)
+                    and hidden_size is not None and max_num_tokens is not None):
+                from .tp2_allreduce import Tp2AllReduceNorm
+                if Tp2AllReduceNorm.is_supported(self.mapping, hidden_size,
+                                                 max_num_tokens):
+                    key = (self.mapping, hidden_size, max_num_tokens)
+                    if key not in AllReduce.tp2_fused_norm_kernels:
+                        kernel = None
+                        try:
+                            kernel = Tp2AllReduceNorm(self.mapping, hidden_size,
+                                                      max_num_tokens)
+                        except RuntimeError as error:  # raised on every rank
+                            logger.warning(
+                                f"[TP2 all-reduce] unavailable: {error}")
+                        AllReduce.tp2_fused_norm_kernels[key] = kernel
+                    self.tp2_allreduce = AllReduce.tp2_fused_norm_kernels[key]
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
         """Whether ``forward`` takes MoEAllReduceParams for ``num_tokens`` tokens: the routed MoE output
@@ -1461,6 +1551,17 @@ class AllReduce(nn.Module):
                                                         input_scale,
                                                         all_reduce_params,
                                                         gemm_tactic)
+
+    def gemm_twoshot_allreduce_norm(
+        self, input: torch.Tensor, weight: torch.Tensor,
+        weight_scale: torch.Tensor, input_scale: torch.Tensor,
+        all_reduce_params: AllReduceParams
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """See ``MNNVLAllReduce.gemm_twoshot_allreduce_norm``; None without the MNNVL kernels."""
+        if self.mnnvl_allreduce is None:
+            return None
+        return self.mnnvl_allreduce.gemm_twoshot_allreduce_norm(
+            input, weight, weight_scale, input_scale, all_reduce_params)
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
@@ -1574,6 +1675,17 @@ class AllReduce(nn.Module):
             raise ValueError(
                 "AllReduce takes MoEAllReduceParams only where supports_moe_fold() holds"
             )
+        tp2 = self.tp2_allreduce
+        # A CuTe DSL host launch, which torch.compile cannot trace.
+        if (tp2 is not None and not torch.compiler.is_compiling()
+                and all_reduce_params.bias is None
+                and all_reduce_params.residual is not None
+                and all_reduce_params.norm_weight is not None and tp2.supports(
+                    input, all_reduce_params.fusion_op,
+                    all_reduce_params.residual, all_reduce_params.norm_weight)):
+            return tp2(input, all_reduce_params.residual,
+                       all_reduce_params.norm_weight, all_reduce_params.eps,
+                       all_reduce_params.fusion_op, all_reduce_params.scale)
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
@@ -1601,11 +1713,9 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
-            # Use native lookup after tuning unless its Python/C++ contract
-            # failed; then retain the existing Python cache and selection path.
-            if (_ALLREDUCE_AUTOTUNER_TUNING_MODE
-                    or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
-                    or exclude_nccl_symmetric):
+            # Profile in Python during warmup. The exclusion policy also needs
+            # Python lookup because the native cache does not encode it.
+            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or exclude_nccl_symmetric:
                 output = torch.ops.trtllm.tunable_allreduce(
                     input=input,
                     residual=all_reduce_params.residual,
