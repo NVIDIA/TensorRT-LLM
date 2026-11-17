@@ -767,10 +767,14 @@ class OpenAIServer(_VideoRoutesMixin):
         # Multi-frontend serving: see serve/multi_frontend.py.
         self._multi_frontend = multi_frontend_serving
         self._launcher_forwarder: Optional[LauncherForwarder] = None
+        self._launcher_watchdog: Optional[AttachedFrontendWatchdog] = None
         self._launcher_watchdog_task: Optional[asyncio.Task] = None
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
+            self._launcher_watchdog = AttachedFrontendWatchdog(
+                self._launcher_forwarder, multi_frontend_serving.launcher_pid,
+                self._on_launcher_lost)
         self._tokenization_owners: Optional[
             TokenizationOwners] = start_tokenization_owners(
                 multi_frontend_serving,
@@ -833,12 +837,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Start background iteration stats collector if metrics are enabled
                 # The PyTorch backend args include `enable_iter_perf_stats`.
                 # Attached frontends leave the engine queue to the launcher.
-                if self._launcher_forwarder is not None:
+                if self._launcher_watchdog is not None:
                     self._launcher_watchdog_task = asyncio.create_task(
-                        AttachedFrontendWatchdog(
-                            self._launcher_forwarder,
-                            self._multi_frontend.launcher_pid,
-                            self._on_launcher_lost).run())
+                        self._launcher_watchdog.run())
                     self._clock_offset_task = asyncio.create_task(
                         follow_clock_offset(self._shared_clock_offset,
                                             self._apply_shared_clock_offset))
@@ -4461,6 +4462,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                                 **config_kwargs)
         server = create_uvicorn_server(config)
+
+        if self._launcher_watchdog is not None:
+            try:
+                await self._launcher_watchdog.wait_until_ready(
+                    float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300")))
+            except BaseException:
+                await self._launcher_forwarder.close()
+                raise
 
         async def _register_after_serving():
             with _StartupTimer("http_server_start"):

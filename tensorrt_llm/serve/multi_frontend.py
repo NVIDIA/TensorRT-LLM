@@ -160,12 +160,14 @@ class LauncherForwarder:
             )
             if isinstance(error, asyncio.TimeoutError):
                 status_code = 504
+                headers = {"x-should-retry": "false"}
                 message = (
                     f"The launcher frontend did not respond to {request.url.path} in time; "
                     "the request may still be processed. Check its result before retrying."
                 )
             else:
                 status_code = 503
+                headers = None
                 message = (
                     f"The launcher frontend that serves {request.url.path} "
                     f"is unavailable: {error!r}"
@@ -173,9 +175,7 @@ class LauncherForwarder:
             return JSONResponse(
                 status_code=status_code,
                 content={"error": message},
-                headers={"x-should-retry": "false"}
-                if isinstance(error, asyncio.TimeoutError)
-                else None,
+                headers=headers,
             )
 
     async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
@@ -254,7 +254,7 @@ class AttachedFrontendWatchdog:
     def __init__(
         self,
         forwarder: LauncherForwarder,
-        launcher_pid: int,
+        launcher_pid: Optional[int],
         mark_dead: Callable[[BaseException], None],
         *,
         ppid_interval_s: float = 1.0,
@@ -262,18 +262,37 @@ class AttachedFrontendWatchdog:
         health_failures: int = 3,
     ):
         self._forwarder = forwarder
-        self._launcher_pid = launcher_pid
+        self._launcher_pid = launcher_pid if launcher_pid is not None else os.getppid()
         self._mark_dead = mark_dead
         self._ppid_interval = ppid_interval_s
         self._health_interval = health_interval_s
         self._health_failures = health_failures
+        self._launcher_answered = False
+
+    async def wait_until_ready(self, timeout_s: float) -> None:
+        """Wait for launcher HTTP serving, independently of health authorization."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            if os.getppid() != self._launcher_pid:
+                raise RuntimeError(
+                    f"Launcher frontend (pid {self._launcher_pid}) exited during startup"
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Launcher frontend not ready within {timeout_s:g}s "
+                    "(TLLM_FRONTEND_READY_TIMEOUT)"
+                )
+            status = await self._forwarder.get_status("/health", timeout_s=min(remaining, 5.0))
+            if status is not None:
+                self._launcher_answered = status == 200
+                return
+            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
-        # The launcher socket listens before its attached frontends start, but
-        # the launcher only answers once they are ready.
-        launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
             await asyncio.sleep(self._ppid_interval)
@@ -285,10 +304,10 @@ class AttachedFrontendWatchdog:
             next_health = loop.time() + self._health_interval
             status = await self._forwarder.get_status("/health")
             if status == 200:
-                launcher_answered = True
+                self._launcher_answered = True
                 failures = 0
                 continue
-            if not launcher_answered:
+            if not self._launcher_answered:
                 continue
             failures += 1
             if failures >= self._health_failures:

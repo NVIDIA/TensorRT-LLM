@@ -214,7 +214,13 @@ def test_failed_launcher_start_releases_queued_connections_before_stopping_front
             monkeypatch.setattr(serve, "_spawn_attached_frontends", fake_spawn)
             error = "server setup failed"
         else:
-            monkeypatch.setattr(processes.subprocess, "Popen", fake_popen)
+            monkeypatch.setattr(
+                processes,
+                "subprocess",
+                SimpleNamespace(
+                    Popen=fake_popen, TimeoutExpired=processes.subprocess.TimeoutExpired
+                ),
+            )
             error = "before signaling READY"
         monkeypatch.setattr(serve, "_watch_attached_frontends", lambda children: threading.Event())
         monkeypatch.setattr(serve, "_terminate_attached_frontends", stop_frontends)
@@ -229,3 +235,32 @@ def test_failed_launcher_start_releases_queued_connections_before_stopping_front
             )
 
     assert len(stopped) == 1
+
+
+def test_failed_frontend_cleanup_terminates_children_when_callback_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+    llm = Mock()
+    llm._executor = Mock(spec=GenerationExecutorProxy)
+    llm._executor.multi_frontend_attach_info.return_value = {}
+    llm.input_processor = SimpleNamespace(runs_without_gpu=False)
+    child = Mock(pid=1, returncode=0)
+    child.wait.return_value = 0
+    stopped = []
+
+    def fail_cleanup() -> NoReturn:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        processes,
+        "subprocess",
+        SimpleNamespace(
+            Popen=Mock(return_value=child), TimeoutExpired=processes.subprocess.TimeoutExpired
+        ),
+    )
+    monkeypatch.setattr(processes, "_terminate_attached_frontends", stopped.extend)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        processes._spawn_attached_frontends(llm, 2, before_terminate=fail_cleanup)
+    assert stopped == [child]

@@ -591,8 +591,8 @@ def _provision_kv_cache_pool(llm_args: dict,
 def _listen_on_launcher_uds(llm: PyTorchLLM) -> tuple[socket.socket, str]:
     """Bind and listen on the Unix socket for launcher-owned forwarded routes.
 
-    Attached frontends can serve before the launcher's uvicorn, so listen now
-    to queue their connections until uvicorn takes over the socket.
+    Listen before spawning attached frontends so their startup health probes
+    can queue until the launcher's uvicorn takes over the socket.
 
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed, socket file included, when the executor proxy shuts down.

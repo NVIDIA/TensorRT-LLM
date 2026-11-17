@@ -163,9 +163,11 @@ def _spawn_attached_frontends(
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
     except BaseException:
-        if before_terminate is not None:
-            before_terminate()
-        _terminate_attached_frontends(children)
+        try:
+            if before_terminate is not None:
+                before_terminate()
+        finally:
+            _terminate_attached_frontends(children)
         raise
     finally:
         for fd in ready_fds:
@@ -225,10 +227,9 @@ def _wait_attached_frontends_ready(
 def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     """Report READY to the launcher over the inherited pipe.
 
-    Called once everything fallible in an attached frontend's startup
-    (port bind, executor attach, LLM and OpenAIServer construction,
-    middleware registration) has succeeded; the launcher blocks group
-    startup on this byte (see _wait_attached_frontends_ready).
+    Called after port bind, executor attach, server construction and middleware
+    registration, before HTTP startup waits for the launcher to serve. The
+    launcher must receive this byte before it can start answering that probe.
     """
     ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
     if not (multi_frontend.is_attached_frontend and ready_fd):
