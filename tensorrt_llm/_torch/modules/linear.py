@@ -732,9 +732,11 @@ def _fixed_height_linear(input: torch.Tensor, weight: torch.Tensor,
     so one row can produce different bits at different batch heights. Short
     chunks are padded and the padding rows are dropped from the output.
     """
-    rows = input.reshape(-1, input.shape[-1])
-    if rows.shape[0] == 0:
+    if input.numel() == 0:
         return F.linear(input, weight, bias)
+    # Padded chunks are new contiguous tensors, so full chunks must be
+    # contiguous too: cuBLAS takes its arguments from the strides.
+    rows = input.reshape(-1, input.shape[-1]).contiguous()
     outputs = []
     for start in range(0, rows.shape[0], FIXED_GEMM_HEIGHT):
         chunk = rows[start:start + FIXED_GEMM_HEIGHT]

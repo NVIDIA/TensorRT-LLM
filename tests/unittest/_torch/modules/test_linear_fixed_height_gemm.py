@@ -37,7 +37,27 @@ def test_every_gemm_has_the_fixed_height(monkeypatch, rows):
     outputs = _fixed_height_linear(inputs, weight, bias)
 
     assert set(heights) == {FIXED_GEMM_HEIGHT}
-    assert torch.allclose(outputs, real_linear(inputs, weight, bias))
+    torch.testing.assert_close(outputs, real_linear(inputs, weight, bias))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows", ROW_COUNTS)
+def test_every_gemm_input_is_contiguous(monkeypatch, rows):
+    real_linear = torch.nn.functional.linear
+    contiguous = []
+
+    def spy(chunk, weight, bias=None):
+        contiguous.append(chunk.is_contiguous())
+        return real_linear(chunk, weight, bias)
+
+    monkeypatch.setattr(linear_module.F, "linear", spy)
+    inputs = torch.randn(8, rows).t()
+    weight = torch.randn(4, 8)
+
+    outputs = _fixed_height_linear(inputs, weight, None)
+
+    assert all(contiguous)
+    torch.testing.assert_close(outputs, real_linear(inputs, weight))
 
 
 @pytest.mark.cpu_only
@@ -46,6 +66,17 @@ def test_input_batch_dimensions_are_preserved(shape):
     outputs = _fixed_height_linear(torch.randn(*shape), torch.randn(4, 8), None)
 
     assert outputs.shape == (*shape[:-1], 4)
+
+
+@pytest.mark.cpu_only
+def test_zero_width_input_matches_linear():
+    inputs = torch.randn(2, 0)
+    weight = torch.randn(4, 0)
+    bias = torch.randn(4)
+
+    outputs = _fixed_height_linear(inputs, weight, bias)
+
+    assert torch.equal(outputs, torch.nn.functional.linear(inputs, weight, bias))
 
 
 @pytest.mark.cpu_only
