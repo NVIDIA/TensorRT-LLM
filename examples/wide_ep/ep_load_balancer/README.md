@@ -327,7 +327,7 @@ Every other target declines EPLB, so those deployments run the built-in model.
 
 ### Run EPLB on the Modeling V2 target
 
-The steps below run the DeepSeek-R1-0528 NVFP4 target with EPLB at dep8: attention DP with 8-way expert parallelism, on two GB200 or GB300 trays. They follow the steps above at the scale the target runs EPLB. `modeling_v2: require` builds the target or fails with the reason it does not fit; with `auto`, a deployment the target does not fit runs the built-in model instead.
+The steps below run the DeepSeek-R1-0528 NVFP4 target with EPLB at dep8: attention DP with 8-way expert parallelism, on two GB200 or GB300 trays. [Wide expert parallelism](#wide-expert-parallelism) takes them to the 32- and 36-way expert parallelism of the steps above. `modeling_v2: require` builds the target or fails with the reason it does not fit; with `auto`, a deployment the target does not fit runs the built-in model instead.
 
 Set up the environment:
 
@@ -462,8 +462,22 @@ The balancer writes expert weights into GPU memory from the host. Grace systems 
 
 On one GB200 or GB300 tray, generate the placement with `--ep_size 4` and run with `--tp 4 --ep 4` (`--tp_size 4 --ep_size 4` for `trtllm-serve`). 288 slots give 72 slots a rank.
 
+#### Wide expert parallelism
+
+From dep16 on, the target's routed experts exchange tokens with an alltoall over multi-node NVLink rather than gathering every rank's tokens, so dep16, dep32 and dep36 run on 4, 8 and 9 GB200 or GB300 trays of one NVL72 domain. The statistics of step 1 serve any EP size: generate the placement for the one you deploy at, for example 32 ranks,
+
+```bash
+python generate_eplb_config.py \
+    --ep_size 32 \
+    --num_slots 288 \
+    --expert_statistic_path $EXPERT_STATISTIC_PATH \
+    --output_path ./moe_load_balancer.yaml
+```
+
+and run the same configuration files with `--tp 32 --ep 32` (`--tp_size 32 --ep_size 32` for `trtllm-serve`). 288 slots give 18, 9 and 8 slots a rank at dep16, dep32 and dep36. dep36 runs as EPLB slots only: 256 experts do not split over 36 ranks, so a dep36 deployment needs `moe_config.load_balancer` with a slot count 36 divides, such as 288.
+
 #### Limits
 
-- The target runs EPLB at dep4 and dep8 only: attention DP with pure expert parallelism over 4 or 8 GPUs. With EPLB at any other layout, including the 32- and 36-way expert parallelism of the steps above, `auto` runs the built-in model and `require` fails, naming the layout.
+- The target runs EPLB at dep4, dep8, dep16, dep32 and dep36: attention DP with pure expert parallelism, from dep16 on over multi-node NVLink only. With EPLB at any other layout, or a slot count the EP size does not divide, `auto` runs the built-in model and `require` fails, naming the reason.
 - Static and online EPLB only. Per-layer dynamic EPLB runs the built-in model.
 - The statistics in step 1 come from the built-in model.
