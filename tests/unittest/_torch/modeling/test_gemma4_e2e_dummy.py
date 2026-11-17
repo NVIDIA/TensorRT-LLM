@@ -48,6 +48,8 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
+from utils.util import getSMVersion  # noqa: E402
+
 from tensorrt_llm._torch.pyexecutor.hang_diagnostics import HANG_DIAGNOSTICS_ENV  # noqa: E402
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
 
@@ -289,6 +291,35 @@ def test_e2e_text_e2b_dummy_small_max_seq_len(max_seq_len):
             attn_backend="FLASHINFER",
             dtype="bfloat16",
             max_seq_len=max_seq_len,
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
+        with llm:
+            output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
+            assert len(output) == 1
+            assert len(output[0].outputs[0].token_ids) > 0
+    finally:
+        shutil.rmtree(dummy_dir, ignore_errors=True)
+
+
+@requires_gemma4_transformers
+@pytest.mark.skipif(
+    not 100 <= getSMVersion() < 110,
+    reason="Gemma4 defaults to the TRTLLM backend (trtllm-gen kernels) only on SM100-family GPUs",
+)
+@pytest.mark.parametrize("variant", ["E2B", "E4B"])
+def test_e2e_text_kv_shared_trtllm_dummy(variant):
+    """E2E text generation for E2B/E4B on the TRTLLM backend.
+
+    Their KV-shared layers hand over only Q and attend to K/V an earlier layer wrote, which the
+    native trtllm-gen kernels must serve.
+    """
+    dummy_dir = _make_dummy_config_dir(MODEL_PATHS[variant])
+    try:
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="TRTLLM",
+            dtype="bfloat16",
             kv_cache_config=_KV_CACHE_CONFIG,
         )
         with llm:

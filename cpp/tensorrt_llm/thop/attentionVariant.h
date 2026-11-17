@@ -285,10 +285,11 @@ public:
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
     /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
-    /// Separate Q/K/V input is read only by cross attention and SageAttention.
+    /// Separate Q/K/V input is read only by cross attention and SageAttention; a Q-only input
+    /// reads its K/V from the paged cache.
     [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
     {
-        return (p.fwd.is_fused_qkv || p.is_cross || torch_ext::SageAttnFeature::isRequested(p))
+        return (p.fwd.is_fused_qkv || p.is_cross || torch_ext::SageAttnFeature::isRequested(p) || p.isQOnlyCachedKv())
             && checkFeatureParams(p, isGen);
     }
 

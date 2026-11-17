@@ -569,6 +569,13 @@ void MHA::enqueueFusedContext(
 
     T* attention_input = p.getQueryInput<T>();
     bool const enablePagedKVContextFMHA = mPagedKVCache && paged_context_fmha;
+    // A Q-only call's K/V is already in the paged cache: preprocessing only applies RoPE to Q, and the
+    // kernel reads K/V through the paged layout (its key sets paged_context_fmha).
+    bool const qOnlyInput = p.isQOnlyCachedKv();
+    TLLM_CHECK_WITH_INFO(!qOnlyInput || enablePagedKVContextFMHA,
+        "Q-only context attention reads its K/V from the paged cache, which requires paged-context FMHA.");
+    int const attentionInputHiddenUnits
+        = qOnlyInput ? local_hidden_units_qo : local_hidden_units_qo + 2 * local_hidden_units_kv;
     TLLM_CHECK_WITH_INFO(!(quant_mode.hasInt8KvCache() && enablePagedKVContextFMHA),
         "Paged Context FMHA doesn't work with int8 kv cache currently.");
 
@@ -611,6 +618,7 @@ void MHA::enqueueFusedContext(
     preprocessingParams.size_per_head = getHeadSize();
     preprocessingParams.cache_type = cache_type;
     preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA;
+    preprocessingParams.q_only_input = qOnlyInput;
     preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
     preprocessingParams.generation_phase = false;
     preprocessingParams.multi_processor_count = mMultiProcessorCount;
@@ -621,9 +629,9 @@ void MHA::enqueueFusedContext(
 
     {
         std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(p.attn.layer_idx);
-        TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
-                                       (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
-                                       const_cast<T*>(attention_input), stream, beforeRopeStr)
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens, attentionInputHiddenUnits, p.getType(),
+                const_cast<T*>(attention_input), stream, beforeRopeStr)
                 == false,
             "Found invalid number (NaN or Inf) in " + beforeRopeStr);
     }
@@ -696,9 +704,9 @@ void MHA::enqueueFusedContext(
     sync_check_cuda_error(stream);
     {
         std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(p.attn.layer_idx);
-        TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
-                                       (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
-                                       const_cast<T*>(attention_input), stream, afterRopeStr)
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens, attentionInputHiddenUnits, p.getType(),
+                const_cast<T*>(attention_input), stream, afterRopeStr)
                 == false,
             "Found invalid number (NaN or Inf) in " + afterRopeStr);
         sync_check_cuda_error(stream);
@@ -1226,8 +1234,9 @@ void MHA::prepareInputs(FmhaParams& p, bool isGen)
                 "variable-window bounds must have one element per packed context query token");
         }
     }
-    TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross,
-        "For non-cross, non-SageAttention attention, only fused QKV is supported now.");
+    TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross || p.isQOnlyCachedKv(),
+        "For non-cross, non-SageAttention attention, only fused QKV or Q-only input over cached K/V is supported "
+        "now.");
 
     if (isGen)
     {
@@ -2305,7 +2314,8 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.rotary_embedding_dim = attn.rope_params.dim;
     c.quant_mode = attn.quant_mode;
     c.uses_spcompress = attn.uses_spcompress;
-    c.paged_context_fmha = meta.use_paged_context_fmha;
+    // A Q-only call has no K/V of its own, so its context kernel must read K/V from the paged cache.
+    c.paged_context_fmha = meta.use_paged_context_fmha || p.isQOnlyCachedKv();
     c.is_spec_decoding_enabled = meta.is_spec_decoding_enabled;
     c.spec_decoding_target_max_gen_len
         = meta.max_total_draft_tokens.has_value() ? meta.max_total_draft_tokens.value() + 1 : 0;

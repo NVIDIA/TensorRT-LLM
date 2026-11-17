@@ -1233,6 +1233,8 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     preprocessingParms.position_shift_enabled = false;
     preprocessingParms.cache_type = cache_type;
     preprocessingParms.separate_q_kv_output = true;
+    // A Q-only call attends to K/V an earlier layer already wrote: apply RoPE to Q only.
+    preprocessingParms.q_only_input = p.isQOnlyCachedKv();
     preprocessingParms.quantized_fp8_output = is_fp8_q_input;
     preprocessingParms.generation_phase = true;
     preprocessingParms.multi_processor_count = op.getMultiProcessorCount();
@@ -1648,7 +1650,8 @@ bool FmhaV2Fmha<AttentionVariant>::isContextSupported(MHARunnerFixedParams fixed
 template <typename AttentionVariant>
 bool FmhaV2Fmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) const
 {
-    return isGen ? mGenerationRunner != nullptr : mContextRunner != nullptr;
+    // The generation path's preprocessing appends K/V; only the shared context path handles Q-only input.
+    return isGen ? mGenerationRunner != nullptr && !p.isQOnlyCachedKv() : mContextRunner != nullptr;
 }
 
 template <typename AttentionVariant>
@@ -1946,7 +1949,8 @@ bool XqaFmha<AttentionVariant>::fillParams(
 template <typename AttentionVariant>
 bool XqaFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) const
 {
-    if (!isGen || mRunner == nullptr)
+    // XQA's preprocessing appends K/V, so it cannot serve a Q-only call.
+    if (!isGen || mRunner == nullptr || p.isQOnlyCachedKv())
     {
         return false;
     }
@@ -2303,7 +2307,8 @@ bool MmhaFmha::isAvailable(AttentionBase const& key)
 
 bool MmhaFmha::isSupported(FmhaParams const& p, bool isGen) const
 {
-    if (!isGen)
+    // MMHA appends K/V inside the kernel, so it cannot serve a Q-only call.
+    if (!isGen || p.isQOnlyCachedKv())
     {
         return false;
     }
@@ -2523,7 +2528,8 @@ bool UnfusedFmha::isAvailable(AttentionBase const& key)
 
 bool UnfusedFmha::isSupported(FmhaParams const& p, bool isGen) const
 {
-    if (isGen)
+    // The unfused path reads K/V from the call's input, which a Q-only call does not carry.
+    if (isGen || p.isQOnlyCachedKv())
     {
         return false;
     }

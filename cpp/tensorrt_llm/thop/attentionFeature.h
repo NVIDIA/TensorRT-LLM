@@ -83,10 +83,10 @@ public:
     {
     }
 
-    /// Self-attention writes this call's K/V into the cache.
+    /// Self-attention writes this call's K/V into the cache, or reads K/V an earlier layer wrote.
     [[nodiscard]] static bool checkParams(FmhaParams const& p, bool /*isGen*/)
     {
-        return p.fwd.update_kv_cache || p.is_cross;
+        return p.fwd.update_kv_cache || p.is_cross || p.isQOnlyCachedKv();
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)

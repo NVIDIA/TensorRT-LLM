@@ -379,6 +379,8 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[512]
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_kv_shared_trtllm_dummy[E2B]
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_kv_shared_trtllm_dummy[E4B]
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
   # Muse Spark Open: the decoder's GPU module tests, the tower load and the
   # decoder's Triton fast paths, which need only CUDA. The GB300 kernels' tests

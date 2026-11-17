@@ -412,6 +412,14 @@ struct FmhaParams
             && meta.host_kv_cache_pool_mapping.has_value();
     }
 
+    /// Self-attention that hands over only Q and attends to K/V an earlier layer already wrote
+    /// to this layer's paged cache (e.g. the KV-shared layers of Gemma4 E2B/E4B).
+    [[nodiscard]] bool isQOnlyCachedKv() const
+    {
+        return !is_cross && !attn.is_mla_enable && !fwd.update_kv_cache && !fwd.is_fused_qkv && !key_input.has_value()
+            && !value_input.has_value() && hasKvCache();
+    }
+
     [[nodiscard]] torch::Tensor const& getHostKvCachePoolPointers() const
     {
         return meta.host_kv_cache_pool_pointers.value();
