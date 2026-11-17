@@ -3810,6 +3810,10 @@ def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
     tactics the results cannot be merged across ranks, so ranks could pick different
     algorithms, with different rounding, for a GEMM they all compute on the same input.
     With ``world_size > 1`` the knob is ignored.
+
+    It is also ignored when a row's output must not depend on its batch shape
+    (``FORCE_KV_REUSE_DETERMINISTIC`` or ``FORCE_DETERMINISTIC``): a decode row would then round
+    differently in a captured graph than in an eager mixed batch.
     """
     if not cuda_graph_gemm_tuning_enabled():
         yield
@@ -3819,6 +3823,13 @@ def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
             f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with world size {world_size}: "
             "TunableOp results are tuned per rank and cannot be kept the same across ranks.",
             key="cuda_graph_gemm_tuning_multi_rank")
+        yield
+        return
+    if is_batch_shape_deterministic():
+        logger.warning_once(
+            f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with batch-shape determinism: "
+            "tuned graphs and eager steps would round the same GEMM differently.",
+            key="cuda_graph_gemm_tuning_batch_shape_deterministic")
         yield
         return
     from torch.cuda import tunable

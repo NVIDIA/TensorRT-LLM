@@ -58,13 +58,29 @@ def test_cuda_graph_factory_preserves_input_preparer(
     assert graphs is graphs_type.return_value
 
 
+BATCH_SHAPE_SWITCHES = ("FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC")
+
+
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"])
-def test_batch_shape_determinism_keeps_final_context_on_context_path(
-    monkeypatch: pytest.MonkeyPatch, switch: str
+@pytest.mark.parametrize("switch", [None, *BATCH_SHAPE_SWITCHES])
+def test_batch_shape_switch_is_read_at_construction(
+    monkeypatch: pytest.MonkeyPatch, switch: str | None
 ) -> None:
-    for name in ("FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"):
+    for name in BATCH_SHAPE_SWITCHES:
         monkeypatch.delenv(name, raising=False)
+    if switch is not None:
+        monkeypatch.setenv(switch, "1")
+
+    graphs = decoder_graphs(decoder_config())
+    # Flipping the switches afterwards must not change the decision.
+    for name in BATCH_SHAPE_SWITCHES:
+        monkeypatch.setenv(name, "0" if switch else "1")
+
+    assert graphs._batch_shape_deterministic is (switch is not None)
+
+
+@pytest.mark.cpu_only
+def test_batch_shape_determinism_keeps_final_context_on_context_path() -> None:
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [_make_request_stub(10, prompt_len=1)]
     graphs = SimpleNamespace(
@@ -74,6 +90,7 @@ def test_batch_shape_determinism_keeps_final_context_on_context_path(
         _model_uses_ple_recurrent_state=False,
         mapping=SimpleNamespace(cp_size=1),
         _is_final_multimodal_context_decode_compatible=lambda request: True,
+        _batch_shape_deterministic=False,
     )
 
     def promote() -> tuple[ScheduledRequests, frozenset[int]]:
@@ -88,7 +105,7 @@ def test_batch_shape_determinism_keeps_final_context_on_context_path(
 
     assert promote()[1] == frozenset({10})
 
-    monkeypatch.setenv(switch, "1")
+    graphs._batch_shape_deterministic = True
     graph_batch, promoted_ids = promote()
 
     assert graph_batch is batch

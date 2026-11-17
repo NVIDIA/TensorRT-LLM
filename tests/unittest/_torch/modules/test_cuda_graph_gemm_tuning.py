@@ -59,6 +59,8 @@ def tunable(monkeypatch):
         CUDA_GRAPH_GEMM_TUNING_FILE_ENV,
         "PYTORCH_TUNABLEOP_ENABLED",
         "PYTORCH_TUNABLEOP_FILENAME",
+        "FORCE_DETERMINISTIC",
+        "FORCE_KV_REUSE_DETERMINISTIC",
     ):
         monkeypatch.delenv(env, raising=False)
     return fake
@@ -118,5 +120,15 @@ def test_ignored_with_multiple_ranks_or_user_tunableop(tunable, monkeypatch, ext
     world_size = 1 if extra_env else 2
     before = tunable.state()
     with cuda_graph_gemm_tuning(tune=True, world_size=world_size):
+        assert tunable.state() == before
+    assert tunable.state() == before
+
+
+@pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"])
+def test_ignored_with_batch_shape_determinism(tunable, monkeypatch, switch):
+    monkeypatch.setenv(CUDA_GRAPH_GEMM_TUNING_ENV, "1")
+    monkeypatch.setenv(switch, "1")
+    before = tunable.state()
+    with cuda_graph_gemm_tuning(tune=True):
         assert tunable.state() == before
     assert tunable.state() == before

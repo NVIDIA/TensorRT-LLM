@@ -226,6 +226,8 @@ class DecoderCudaGraphs:
 
     # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
     _inforward_split_warmed: bool = False
+    # Whether a row's output must not depend on the batch shape it ran in; read once, like Linear's.
+    _batch_shape_deterministic: bool = False
 
     def __init__(
         self,
@@ -268,6 +270,7 @@ class DecoderCudaGraphs:
         self._torch_compile_bypass = torch_compile_bypass
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
+        self._batch_shape_deterministic = is_batch_shape_deterministic()
         self._force_lora_graph_for_capture: bool | None = None
         self._inforward_split_warmed = False
         # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
@@ -560,7 +563,7 @@ class DecoderCudaGraphs:
             and self.mapping.cp_size == 1
             # The decode kernels round differently from the context kernels, so
             # promotion would make a repeat differ from the prompt's first call.
-            and not is_batch_shape_deterministic()
+            and not self._batch_shape_deterministic
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(
