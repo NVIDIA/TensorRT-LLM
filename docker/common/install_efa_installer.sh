@@ -25,7 +25,7 @@ if [ "${ID}" != ubuntu ]; then
     exit 0
 fi
 
-# NGC PyTorch 26.09 bundles EFA libraries here; the official installer updates
+# The NGC PyTorch image bundles EFA libraries here; the official installer updates
 # that existing installation in place. Use the same path for runtime lookup.
 EFA_LIB_DIR=/opt/amazon/efa/lib
 EFA_INSTALLER_VERSION="${EFA_INSTALLER_VERSION:-1.51.0}"

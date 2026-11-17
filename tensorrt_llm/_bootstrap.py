@@ -296,6 +296,8 @@ def _setup_vendored_triton_kernels():
 
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
+    # The legacy NCCL process group honors the CUDA device selected by each worker.
+    os.environ.setdefault("TORCH_DIST_USE_NCCL2", "0")
     _set_numexpr_thread_default()
     _keep_inductor_compile_pool_alive()
     _setup_jit_share()
