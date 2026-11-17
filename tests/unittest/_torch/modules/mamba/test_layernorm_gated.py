@@ -417,7 +417,32 @@ class TestRMSNormBasic:
         )
         assert torch.equal(dense, large)
         expected = reference_rmsnorm_gated(x.float(), weight.float(), z_rows.float(), eps=1e-6)
-        torch.testing.assert_close(large, expected.to(dtype), rtol=1e-2, atol=1e-2)
+        tol = 1e-5 if dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(large, expected.to(dtype), rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("N,heads,num_tokens", [(64, 3, 5), (128, 3, 3)])
+    def test_token_major_partial_tile_matches_reference(
+        self, N: int, heads: int, num_tokens: int
+    ) -> None:
+        """A token-major launch whose row count is not a multiple of the tile height
+        computes every row, reading z through its token stride."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_rows = num_tokens * heads
+        assert num_rows % layernorm_gated._multirow_rows(N, dtype.itemsize) != 0
+        torch.manual_seed(11)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+
+        actual = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        expected = reference_rmsnorm_gated(
+            x.float(), weight.float(), z.reshape(-1, N).float(), eps=1e-6
+        )
+        torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("N,extra_rows", [(128, 3), (128, 4), (64, 8)])
     def test_dense_launch_writes_no_row_past_the_end(self, N: int, extra_rows: int) -> None:
