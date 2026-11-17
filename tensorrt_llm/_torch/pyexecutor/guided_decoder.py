@@ -173,7 +173,7 @@ def _build_threads(backend) -> int:
     """
     if backend != GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
         return 1
-    default = min(8, os.cpu_count() or 1)
+    default = min(16, os.cpu_count() or 1)
     try:
         return max(
             1, int(os.getenv("TRTLLM_GUIDED_DECODING_BUILD_THREADS", default)))
