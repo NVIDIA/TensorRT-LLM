@@ -1387,6 +1387,34 @@ class TestModelDefaults:
         assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
         assert "modeling_v2" not in llm_args.model_fields_set
 
+    def test_applied_defaults_leave_nested_fields_unset(self):
+        """Nested configs keep only the fields the user set or a default applied."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config={"free_gpu_memory_fraction": 0.5},
+            sparse_attention_config={
+                "algorithm": "deepseek_v4",
+                "index_n_heads": 64,
+            },
+        )
+        sparse_before = set(llm_args.sparse_attention_config.model_fields_set)
+        assert "index_topk" not in sparse_before
+        scheduler_before = set(llm_args.scheduler_config.model_fields_set)
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "kv_cache_config": {
+                    "tokens_per_block": 128,
+                    "free_gpu_memory_fraction": 0.9,
+                }
+            })
+        assert llm_args.kv_cache_config.free_gpu_memory_fraction == 0.5
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.model_fields_set == {
+            "free_gpu_memory_fraction", "tokens_per_block"
+        }
+        assert llm_args.sparse_attention_config.model_fields_set == sparse_before
+        assert llm_args.scheduler_config.model_fields_set == scheduler_before
+
     def test_empty_nested_default_counts_as_set(self):
         """An empty nested default still counts as set.
 

@@ -4,9 +4,10 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import transformers
+from pydantic import BaseModel
 
 from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
@@ -537,7 +538,7 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
-    fields_set = set(llm_args.model_fields_set)
+    fields_set_before = _snapshot_fields_set(llm_args)
 
     # A user's ``moe_config.tactic`` already names the implementation, so a
     # model's preferred ``moe_config.backend`` yields to it instead of being
@@ -589,12 +590,46 @@ def apply_model_defaults_to_llm_args(
         return applied
 
     applied = _compute_applied(model_defaults_dict, user_overrides)
-    # Assigning every field above marks each one as set. Keep only the fields
-    # the user set and the ones the model defaults applied, so checks of
-    # whether a deployment set a field (``model_fields_set``) still hold.
-    object.__setattr__(llm_args, "__pydantic_fields_set__",
-                       fields_set | applied.keys())
+    # Rebuilding from a full dump marks every field, nested ones included, as
+    # set. Keep only the fields the user set and the ones the model defaults
+    # applied, at every level, so checks of whether a deployment set a field
+    # (``model_fields_set``) still hold.
+    _restore_fields_set(llm_args, fields_set_before, applied)
     return applied
+
+
+_FieldsSetSnapshot = Tuple[frozenset, Dict[str, Any]]
+
+
+def _snapshot_fields_set(config: BaseModel) -> _FieldsSetSnapshot:
+    """Record which fields are set on a config and on each nested config."""
+    nested = {}
+    for name in type(config).model_fields:
+        value = getattr(config, name, None)
+        if isinstance(value, BaseModel):
+            nested[name] = _snapshot_fields_set(value)
+    return frozenset(config.model_fields_set), nested
+
+
+def _restore_fields_set(config: BaseModel,
+                        snapshot: Optional[_FieldsSetSnapshot],
+                        applied: Any) -> None:
+    """Mark as set the fields in ``snapshot`` plus those ``applied`` names.
+
+    ``snapshot`` is None for a config that did not exist before the defaults
+    were applied; ``applied`` is the defaults applied at this level.
+    """
+    if isinstance(applied, BaseModel):
+        applied = {name: {} for name in applied.model_fields_set}
+    elif not isinstance(applied, dict):
+        applied = {}
+    fields_set, nested = snapshot or (frozenset(), {})
+    object.__setattr__(config, "__pydantic_fields_set__",
+                       set(fields_set) | applied.keys())
+    for name in type(config).model_fields:
+        value = getattr(config, name, None)
+        if isinstance(value, BaseModel):
+            _restore_fields_set(value, nested.get(name), applied.get(name))
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',

@@ -491,21 +491,15 @@ class DecoderCudaGraphs:
 
     @functools.cached_property
     def _model_resets_recurrent_state_in_context(self) -> bool:
-        """Whether the model declares recurrent state that only its context path resets.
+        """Whether the causal LM declares state that only its context path resets.
 
-        A model sets ``resets_recurrent_state_in_context = True`` when a fresh
-        cache slot is reset by its context forward and not by its decode forward.
-        The declaration may sit on the causal-LM wrapper the engine holds, on
-        the decoder inside it, or, for a multimodal wrapper, on its ``llm`` or
-        that model's decoder (``llm.model``), as the PLE check below reads it.
+        Reads ``DecoderModelForCausalLM.resets_recurrent_state_in_context`` from
+        the causal LM the engine holds or, for a multimodal wrapper, from its
+        ``llm``.
         """
-        wrapper = getattr(self.model, "_orig_mod", self.model)
-        top_level_model = get_top_level_model(self.model)
-        llm = getattr(top_level_model, "llm", None)
-        return any(
-            bool(getattr(model, "resets_recurrent_state_in_context", False))
-            for model in (wrapper, top_level_model, llm, getattr(llm, "model", None))
-        )
+        model = getattr(self.model, "_orig_mod", self.model)
+        causal_lm = getattr(get_top_level_model(model), "llm", model)
+        return bool(getattr(causal_lm, "resets_recurrent_state_in_context", False))
 
     @functools.cached_property
     def _model_uses_ple_recurrent_state(self) -> bool:
