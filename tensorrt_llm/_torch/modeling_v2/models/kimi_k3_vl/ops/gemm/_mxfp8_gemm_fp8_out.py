@@ -122,8 +122,9 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             self.use_tvm_ffi = use_tvm_ffi
 
         def untuned_default_tactic(self, m: int, n: int, k: int) -> Optional[tuple]:
-            """Base tactic for an untuned ``[m, k] x [n, k]`` GEMM (:data:`UNTUNED_TACTICS`), with split_k 1
-            and a tenth element, the epilogue subtile N; None keeps the fallback 128x128 1-CTA tile."""
+            """Base tactic for an untuned ``[m, k] x [n, k]`` GEMM (:data:`UNTUNED_TACTICS`), with split_k 1,
+            main's tenth element (swizzle size 1), and an eleventh element, the epilogue subtile N;
+            None keeps the fallback 128x128 1-CTA tile."""
             for min_m, by_scheduler, unpinned in UNTUNED_TACTICS:
                 if m < min_m:
                     continue
@@ -162,6 +163,7 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                     use_prefetch,
                     scheduler,
                     raster_order,
+                    1,
                     1,
                     epi_tile_n,
                 )
@@ -205,7 +207,7 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                 tactic: Tiling and cluster strategy:
                     base: ("base", mma_tiler_mnk, mma_inst_shape,
                     cluster_shape, swap_ab, use_prefetch, scheduler_mode,
-                    raster_order, split_k[, epi_tile_n]); a missing tactic
+                    raster_order, split_k[, swizzle_size[, epi_tile_n]]); a missing tactic
                     (cache miss or -1) of an FP8-output GEMM takes
                     ``untuned_default_tactic``.
                     mixed: ("mixed_clusters", mma_tiler_mnk,
@@ -226,16 +228,17 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                     tactic = untuned
             sf_vec_size = self.sf_vec_size
             split_k = 1
+            swizzle_size = 1
             epi_tile_n = None
 
             if isinstance(tactic, tuple) and len(tactic) > 0 and isinstance(tactic[0], str):
                 kernel_variant = tactic[0]
                 if kernel_variant == "mixed_clusters":
-                    if len(tactic) not in {7, 8, 9}:
+                    if len(tactic) not in {7, 8, 9, 10}:
                         raise ValueError(
                             "CuteDSL SM107 mixed-cluster tactics must use "
                             "Boolean use_prefetch with optional scheduler "
-                            "mode and raster order"
+                            "mode, raster order and swizzle size"
                         )
                     (
                         _,
@@ -258,14 +261,17 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                             raster_order = "m"
                         else:
                             raster_order = tuning_options[0]
-                    else:
+                    elif len(tuning_options) == 2:
                         scheduler_mode, raster_order = tuning_options
+                    else:
+                        scheduler_mode, raster_order, swizzle_size = tuning_options
                 else:
-                    if len(tactic) not in {6, 7, 8, 9, 10}:
+                    if len(tactic) not in {6, 7, 8, 9, 10, 11}:
                         raise ValueError(
                             "CuteDSL SM107 base tactics must use Boolean "
                             "use_prefetch with an optional scheduler mode, "
-                            "raster order, split_k and epilogue subtile N"
+                            "raster order, split_k and swizzle size, followed "
+                            "by the optional epilogue subtile N"
                         )
                     (
                         _,
@@ -285,8 +291,10 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                         raster_order = tuning_options[1]
                     if len(tuning_options) >= 3:
                         split_k = tuning_options[2]
-                    if len(tuning_options) == 4:
-                        epi_tile_n = tuning_options[3]
+                    if len(tuning_options) >= 4:
+                        swizzle_size = tuning_options[3]
+                    if len(tuning_options) == 5:
+                        epi_tile_n = tuning_options[4]
             elif isinstance(tactic, tuple) and len(tactic) == 5:
                 kernel_variant = "base"
                 (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab, use_prefetch) = tactic
@@ -310,6 +318,14 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             if not isinstance(split_k, int) or isinstance(split_k, bool) or split_k < 1:
                 raise ValueError(
                     f"CuteDSL SM107 split_k must be a positive integer, got {split_k!r}"
+                )
+            if (
+                not isinstance(swizzle_size, int)
+                or isinstance(swizzle_size, bool)
+                or swizzle_size < 1
+            ):
+                raise ValueError(
+                    f"CuteDSL SM107 swizzle_size must be a positive integer, got {swizzle_size!r}"
                 )
             if raster_order not in {"m", "n"}:
                 raise ValueError(
@@ -522,6 +538,7 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                 raster_order,
                 scheduler_mode,
                 split_k,
+                swizzle_size,
                 locality_domain_half_gemm,
                 self.use_tvm_ffi,
                 max_active_preferred_clusters,
@@ -579,6 +596,7 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                         preferred_cluster_shape_mn,
                         cluster_shape_mn,
                         None if use_prefetch else 0,
+                        swizzle_size=swizzle_size,
                         raster_order=raster_order,
                         scheduler_type=scheduler_type,
                     )
@@ -589,6 +607,7 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                         mma_tiler_mnk,
                         cluster_shape_mn,
                         None if use_prefetch else 0,
+                        swizzle_size=swizzle_size,
                         raster_order=raster_order,
                         scheduler_type=scheduler_type,
                         split_k=split_k,
