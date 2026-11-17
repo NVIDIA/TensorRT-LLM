@@ -10,10 +10,11 @@ supports the local cached-generation tests. Use `LLM()` or `trtllm-serve` for se
 Run tests through pytest with the repository's test import plugin. Existing L0 selectors
 retain the small single-GPU tests; the large component suites remain manual-only.
 
-TP1 normalization and activation use their FlashInfer contracts; the TP4 input norm
-and dense MLP use explicit FP32 Beam operators, so BF16 rounding can differ. TP1 also
-accepts a narrower RoPE schema. Compare each helper against its declared contract,
-not against the TP4 model as a bitwise reference.
+The dense and sparse helpers call the serving family's shared attention function,
+input normalization (`beam_rmsnorm_fp32`), and activation (`swiglu_fp32`); the other
+normalizations use the same FlashInfer entries as serving. Their TP1 geometry and
+narrower RoPE schema remain distinct from TP4. Compare each helper against its
+declared contract, not against the TP4 model as a bitwise reference.
 
 ## Manual QA reports
 

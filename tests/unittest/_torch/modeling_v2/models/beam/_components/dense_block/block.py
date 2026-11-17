@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 0-2 / sm_103 / tp1: one dense, sliding-attention block, constructed directly.
 
-This TP1 component uses FlashInfer normalization/activation kernels; see ``../README.md``
-for its numerical differences from the TP4 serving model.
+This TP1 component shares attention, normalization and activation operators with serving;
+see ``../README.md`` for the remaining geometry and configuration differences.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
