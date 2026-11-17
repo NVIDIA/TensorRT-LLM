@@ -5621,12 +5621,13 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
             try {
                 withEnv(watcher.env + [
                     "TIMEOUT_XML_SCRIPT=${llmSrc}/jenkins/scripts/generate_timeout_xml.py",
+                    "TIMEOUT_INPUT_FINAL=1",
                     "PROGRESS_DONE_FILE=${WORKSPACE}/.rerun${times}-done-${stageName}",
                     "LABEL_PREFIX=rerun${times} checkpoint",
                     "FINAL_LABEL=rerun${times} final snapshot",
                     "XML_PATH=${xmlFile}",
                 ]) {
-                    sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """#!/bin/bash
+                    sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
                         set +e
                         rm -f "\$PROGRESS_DONE_FILE"
                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
@@ -6522,7 +6523,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     "XML_PATH=${WORKSPACE}/${stageName}/results.xml",
                                     "FINAL_REQUIRES=${WORKSPACE}/${stageName}/results.xml",
                                 ]) {
-                                    sh(label: "Run pytest (regular)", script: """#!/bin/bash
+                                    sh(label: "Run pytest (regular)", script: """
                                         set +e
                                         rm -f "\$PROGRESS_DONE_FILE"
                                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &

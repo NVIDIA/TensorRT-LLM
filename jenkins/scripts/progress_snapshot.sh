@@ -26,8 +26,9 @@
 # Optional:
 #   POST_TAG            the attempt's suffix; renames results*.xml inside the tar, not on disk
 #   FINAL_SNAPSHOT      non-empty for the snapshot taken when the tests end
-#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; with FINAL_SNAPSHOT, regenerates
-#                       results-timeout.xml from unfinished_test.txt
+#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; regenerates results-timeout.xml
+#                       from unfinished_test.txt when the input belongs to a finished run
+#   TIMEOUT_INPUT_FINAL 1 during reruns: the stage-level unfinished_test.txt is already final
 #   TIMEOUT_EVIDENCE_FILE  pytest timeout and attempt records for the report, outside the stage
 #   PROGRESS_HASH_FILE  path that holds the content hash every upload target last received
 #                       (default: ${WORKSPACE}/${PROGRESS_TAR}.last_hash).
@@ -50,11 +51,11 @@ for _var in WORKSPACE STAGE_NAME PROGRESS_TAR LABEL; do
     fi
 done
 
-# --- Generate timeout XML from unfinished_test.txt (final snapshot only) ---
-# Skipped during periodic snapshots so incomplete unfinished_test.txt does not produce premature timeout reports.
+# The stage-level unfinished list is final once the run ends, including throughout its reruns.
+# Ordinary running checkpoints must not report their still-running tests as failures.
 timeout_xml="${WORKSPACE}/${STAGE_NAME}/results-timeout.xml"
 include_timeout_xml=0
-if [ -n "$FINAL_SNAPSHOT" ] && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
+if { [ -n "$FINAL_SNAPSHOT" ] || [ "$TIMEOUT_INPUT_FINAL" = 1 ]; } && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
     ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
         --stage-name "$STAGE_NAME" \
         --test-file-path "unfinished_test.txt" \
