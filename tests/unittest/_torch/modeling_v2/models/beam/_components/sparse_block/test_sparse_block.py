@@ -89,6 +89,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_disp
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
+    beam_rmsnorm_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
 )
@@ -176,7 +179,7 @@ ROUTE_GAP = 3e-3
 #: The forward's top-level op calls, in order: the composition this component claims to
 #: run. The experts' calls nest inside BeamDispatchCombine.
 EXPECTED_CALLS = (
-    "FlashinferRmsnorm",
+    "BeamRmsnormFp32",
     "CublasMm",
     "CublasMm",
     "CublasMm",
@@ -199,6 +202,7 @@ EXPECTED_CALLS = (
 EXPERT_CALLS = ("expert", "CublasMm", "CublasMm", "SwigluFp32", "CublasMm")
 #: Every catalog entry the block's forward can call.
 OPS = (
+    beam_rmsnorm_fp32,
     flashinfer_rmsnorm,
     cublas_mm,
     beam_neox_rope,

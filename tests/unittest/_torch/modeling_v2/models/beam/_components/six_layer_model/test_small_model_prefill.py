@@ -49,9 +49,6 @@ from _components.six_layer_model.model import (  # noqa: E501
     BeamSixLayerBf16Sm103Tp1,
     prefill_context,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
-    flashinfer_silu_and_mul,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -80,6 +77,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_disp
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
+    beam_rmsnorm_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
 )
@@ -106,6 +106,7 @@ HIDDEN = CONFIG["hidden_size"]
 
 #: Every catalog entry the forward can call.
 OPS = (
+    beam_rmsnorm_fp32,
     flashinfer_rmsnorm,
     cublas_mm,
     beam_neox_rope,
@@ -113,7 +114,6 @@ OPS = (
     thop_attention,
     beam_output_gate,
     beam_depth_residual,
-    flashinfer_silu_and_mul,
     beam_grouped_topk_router,
     beam_dispatch_combine,
     swiglu_fp32,
@@ -189,7 +189,12 @@ def recording(model):
     events: list = []
     current = [None]
     saved = []
-    weight_args_from = {"CublasMm": 1, "FlashinferRmsnorm": 1, "BeamGroupedTopkRouter": 1}
+    weight_args_from = {
+        "CublasMm": 1,
+        "FlashinferRmsnorm": 1,
+        "BeamRmsnormFp32": 1,
+        "BeamGroupedTopkRouter": 1,
+    }
     for w in OPS:
         cls = type(w)
         original = cls.__call__
@@ -659,6 +664,7 @@ def test_forward_composes_the_six_blocks(seed, length) -> None:
     assert bitwise_equal(embedded[0], model.embed_tokens[ids[0]])
     for i in range(6):
         block = [c for c in calls if c["block"] == i and c["op"] != "expert"]
+        assert block[0]["op"] == "BeamRmsnormFp32"
         attention = [c for c in block if c["op"] == "ThopAttention"]
         (att,) = attention
         assert att["kwargs"]["local_layer_idx"] == i
@@ -669,8 +675,8 @@ def test_forward_composes_the_six_blocks(seed, length) -> None:
             depth_scales(i, False),
         ]
         qkv = att["qkv"]
-        k_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][2]["output"]
-        q_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][1]["output"]
+        k_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][1]["output"]
+        q_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][0]["output"]
         packed_q = qkv[:, : 48 * 128].reshape(length, 48, 128)
         packed_k = qkv[:, 48 * 128 : 56 * 128].reshape(length, 8, 128)
         if i < 5:
@@ -709,7 +715,7 @@ def test_layer5_query_scale_is_visible() -> None:
         model(generate_ids(17, 129), positions_of(129), md)
         torch.cuda.synchronize()
     block = [c for c in calls if c["block"] == 5]
-    q_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][1]["output"].view(129, 48, 128)
+    q_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][0]["output"].view(129, 48, 128)
     (att,) = [c for c in block if c["op"] == "ThopAttention"]
     packed_q = att["qkv"][:, : 48 * 128].reshape(129, 48, 128)
     changed = (packed_q != q_norm).flatten(1).any(dim=1)
@@ -730,7 +736,7 @@ def test_causal_prefix_and_request_isolation() -> None:
             out = model(ids, positions_of(ids.shape[1]), md)
             torch.cuda.synchronize()
         pre_ff = [c["output"] for c in calls if c["block"] == 3 and c["op"] == "FlashinferRmsnorm"][
-            4
+            3
         ]
         return out, [x for kind, _, x in events if kind == "exit"], pre_ff
 

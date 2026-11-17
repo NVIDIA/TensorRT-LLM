@@ -59,9 +59,6 @@ from _validating import validating  # noqa: E402
 
 from _components.dense_block import block as block_module  # noqa: E501
 from _components.dense_block.block import BeamDenseBlockBf16Sm103Tp1  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
-    flashinfer_silu_and_mul,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -70,11 +67,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
     flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
+    swiglu_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
     beam_neox_rope,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
     beam_output_gate,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
+    beam_rmsnorm_fp32,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
@@ -156,7 +159,7 @@ RULES = types.MappingProxyType(
 
 #: The forward's op calls, in order: the composition this component claims to run.
 EXPECTED_CALLS = (
-    "FlashinferRmsnorm",
+    "BeamRmsnormFp32",
     "CublasMm",
     "CublasMm",
     "CublasMm",
@@ -172,19 +175,20 @@ EXPECTED_CALLS = (
     "FlashinferRmsnorm",
     "CublasMm",
     "CublasMm",
-    "FlashinferSiluAndMul",
+    "SwigluFp32",
     "CublasMm",
     "FlashinferRmsnorm",
     "BeamDepthResidual",
 )
 OPS = (
+    beam_rmsnorm_fp32,
     flashinfer_rmsnorm,
     cublas_mm,
     beam_neox_rope,
     thop_attention,
     beam_output_gate,
     beam_depth_residual,
-    flashinfer_silu_and_mul,
+    swiglu_fp32,
 )
 
 assert torch.cuda.is_available(), "the Beam dense block requires a CUDA device"
@@ -355,7 +359,7 @@ def replay(
         check(
             "input_layernorm",
             "rmsnorm",
-            flashinfer_rmsnorm(x, w["input_layernorm.weight"], eps),
+            beam_rmsnorm_fp32(x, w["input_layernorm.weight"], eps),
             "input_layernorm",
         )
     ]
@@ -467,9 +471,7 @@ def replay(
         )
     )
     out.append(check("mlp_up", "projection", cublas_mm(h2, w["mlp.up_proj.weight"].t()), "mlp_up"))
-    act = flashinfer_silu_and_mul(
-        torch.cat((flat("mlp_gate", inter), flat("mlp_up", inter)), dim=-1)
-    )
+    act = swiglu_fp32(flat("mlp_gate", inter), flat("mlp_up", inter))["act"]
     out.append(check("mlp_act", "swiglu_activation", act, "mlp_act"))
     out.append(
         check(
