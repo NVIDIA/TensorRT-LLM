@@ -371,6 +371,49 @@ def test_exported_slots_replace_the_mapping_bitwise(rows, heads):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="SM100/SM103 keys-as-M attention",
 )
+@torch.inference_mode()
+def test_exported_main_rows_replace_the_decode_bitwise():
+    """An index source storing its decoded main rows is unchanged, and a Reuse launch loading them
+    equals the one decoding them from the exported slots, eagerly and in graph replays."""
+    rows = 6
+    case = _case(rows, 8, 128, 512, mapped=True, seed=46)
+    q, swa, si, main, mi, sink, mapping = case
+    image = direct_decode.main_rows_bytes(8, 128, 512, q.device)
+    slots = torch.empty(rows, 512, dtype=torch.int64, device="cuda")
+    main_rows = torch.full((rows, image), 0xFF, dtype=torch.uint8, device="cuda")
+    outputs = [torch.empty_like(q) for _ in range(4)]
+    reuse = (q, swa, si, main, slots, sink, None)
+
+    def forward():
+        _run(case, output=outputs[0])
+        _run(case, output=outputs[1], slots_out=slots, rows_out=main_rows)
+        # main_ready: the launch before a Reuse decode starts only once the source completed.
+        slots.add_(0)
+        _run(reuse, output=outputs[2], main_ready=True)
+        _run(reuse, output=outputs[3], main_ready=True, rows_in=main_rows)
+
+    def check():
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(outputs[1]), _bits(outputs[0]))
+        assert torch.equal(_bits(outputs[3]), _bits(outputs[2]))
+        _assert_close_to_fp32(outputs[3], _reference(case))
+
+    forward()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for trial in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * (trial + 1) * 0.5).to(torch.bfloat16))
+        mi.copy_(mi.flip(1))
+        graph.replay()
+        check()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100/SM103 keys-as-M attention",
+)
 @pytest.mark.parametrize("selection", ["mapped"])
 @torch.inference_mode()
 def test_keys_as_m_attention_matches_the_two_part_launch(monkeypatch, selection):

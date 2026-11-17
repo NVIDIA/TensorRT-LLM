@@ -484,7 +484,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
     def _forward_direct(self, q, metadata, forward_args):
         """Publish this layer's rows (and run its indexer), then attend the selected packed rows
         in one launch. Nothing is staged, so no staging scale is derived."""
-        from .direct_decode import direct_sparse_decode
+        from .direct_decode import direct_sparse_decode, main_rows_bytes
 
         self._validate_helper_output(q, forward_args)
         module = forward_args.sparse_backend_args
@@ -515,7 +515,15 @@ class CSA2TrtllmAttention(TrtllmAttention):
             and is_blackwell_datacenter()
             and not (mapping is not None and mapping.enable_attention_dp)
         )
-        inputs, slots_out = self._exported_slots(inputs, metadata, module)
+        image = 0
+        if inputs.main_mapping is not None and inputs.topk_indices is not None:
+            image = main_rows_bytes(
+                self.num_heads,
+                int(inputs.swa_indices.shape[1]),
+                int(inputs.topk_indices.shape[1]),
+                q.device,
+            )
+        inputs, slots_out, rows = self._exported_slots(inputs, metadata, module, image)
         result = direct_sparse_decode(
             query,
             inputs.swa_pool,
@@ -532,18 +540,20 @@ class CSA2TrtllmAttention(TrtllmAttention):
             query_rope=None if state is None else state.query_rope,
             output_rope=state is not None and state.output_rope,
             slots_out=slots_out,
+            rows_out=rows if slots_out is not None else None,
+            rows_in=rows if main_ready else None,
         )
         return result.flatten(1)
 
-    def _exported_slots(self, inputs, metadata, module):
-        """An index-source layer's direct decode stores the slots its mapped selections resolve to
-        (returned as ``slots_out``), and a Reuse layer whose source exported them this forward
-        attends those slots unmapped instead (``inputs`` updated); the layout gives both layers one
-        cache owner and compression ratio, so the same visible lengths."""
+    def _exported_slots(self, inputs, metadata, module, image):
+        """An index source's direct decode exports the slots its mapped selections resolve to
+        (``slots_out``) and, with ``image`` bytes per query row, its decoded main rows (``rows``); a
+        Reuse layer of that source attends those slots unmapped and loads those rows. Both layers
+        have one cache owner and compression ratio, so the same visible lengths and main rows."""
         layout = self.sparse_params.layout
         state = module.state
         if layout is None or state is None or inputs.main_mapping is None:
-            return inputs, None
+            return inputs, None, None
         source = state.metadata
         exported = source.csa2_direct_slots
         layer = layout.layer(self.layer_idx)
@@ -551,16 +561,25 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if layer.mode == CSA2Mode.REUSE:
             slots = exported.get(layer.index_source)
             if slots is None or slots.shape[1] != inputs.topk_indices.shape[1]:
-                return inputs, None
+                return inputs, None, None
             inputs = replace(inputs, topk_indices=slots[start : start + count], main_mapping=None)
-            return inputs, None
+            rows = source.csa2_direct_rows.get(layer.index_source)
+            if rows is None or rows.shape[1] != image:
+                return inputs, None, None
+            return inputs, None, rows[start : start + count]
         slots = source._get_csa2_buffer(
             f"direct_slots/{self.layer_idx}",
             (state.swa_kv.shape[0], inputs.topk_indices.shape[1]),
             torch.int64,
         )
         exported[self.layer_idx] = slots
-        return inputs, slots[start : start + count]
+        if not image:
+            return inputs, slots[start : start + count], None
+        rows = source._get_csa2_buffer(
+            f"direct_rows/{self.layer_idx}", (state.swa_kv.shape[0], image), torch.uint8
+        )
+        source.csa2_direct_rows[self.layer_idx] = rows
+        return inputs, slots[start : start + count], rows[start : start + count]
 
     def forward_fused_context(self, q, metadata, forward_args):
         """FP8 context attention of a shared-bank tile with one fused kernel.
