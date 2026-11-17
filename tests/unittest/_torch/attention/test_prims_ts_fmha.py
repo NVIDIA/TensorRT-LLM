@@ -2450,6 +2450,7 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     assert run_kwargs["output_scale"] == 1.0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("seq_len_kv", [256, 257, 512, 513])
 def test_prims_ts_decode_task_manager_builds_schedule_without_gpu(seq_len_kv: int) -> None:
     pytest.importorskip("cutlass.experimental.task_scheduling")
