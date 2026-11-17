@@ -154,5 +154,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_q_cases -k "not [halo_q_reference]" TIMEOUT (10)
   # HALO-R trap cases fault every GPU of the node on purpose; they run only when named by node id.
   - unittest/_torch/moe/multi_gpu/test_halo_r_relay.py::test_halo_r_traps TIMEOUT (10) ISOLATION
+  # HALO-R under BreakableCUDAGraphRunner: two MegaMoE layers warmed up, captured, replayed, and a capture aborted.
+  - unittest/_torch/moe/multi_gpu/test_halo_r_breakable_graph.py TIMEOUT (20)
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
