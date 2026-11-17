@@ -29,7 +29,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-MODELING_V2_PACKAGE = "tensorrt_llm/_torch/_experimental/modeling_v2"
+MODELING_V2_PACKAGE = "tensorrt_llm/_torch/modeling_v2"
 CATALOG_DIR = f"{MODELING_V2_PACKAGE}/catalog"
 CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
 #: A target's own entries -- ops only it calls -- sit in this directory of the
@@ -37,9 +37,7 @@ CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
 #: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
 MODEL_OPS_DIRNAME = "ops"
 
-_CATALOG_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)"
-)
+_CATALOG_IMPORT = re.compile(r"tensorrt_llm\._torch\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)")
 
 
 #: The survey's product, in the run's workspace.

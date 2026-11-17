@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default_mtp_fused.modeling import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default_mtp_fused.modeling import (  # noqa: E501
     Glm5NextMtpStep,
     _check_speculation,
 )

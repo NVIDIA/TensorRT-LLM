@@ -4,7 +4,7 @@ Pick the subset of a QA test list a machine can run, before Slurm allocates it, 
 the result across GPU allocation sizes.
 
 The cluster pipeline sends the same flat list
-([`llm_function_core.txt`](../integration/test_lists/qa/llm_function_core.txt)) to every
+([`llm_function_core.txt`](../integration/test_lists/qa/functional/llm_function_core.txt)) to every
 architecture. A test that cannot run on the allocated machine still occupies it and skips there,
 because pytest evaluates skip conditions at run time. This plugin decides the same questions
 during collection instead.

@@ -569,7 +569,7 @@ def test_failed_receipt_integrates_only_entry_changes(tmp_path, monkeypatch):
     execution, _ = _planned_writer(tmp_path, monkeypatch)
     item = QueueItem(n=7, mode="onboard", target="norm/x")
     task = Task(id="kernel-x", kind="kernel", goal="Certify norm/x", ref="7")
-    paths = ["tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/x.py"]
+    paths = ["tensorrt_llm/_torch/modeling_v2/catalog/norm/x.py"]
     integrated, closed = [], []
     execution._integration = SimpleNamespace(
         changed_paths=lambda task_id: paths,

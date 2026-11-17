@@ -306,6 +306,10 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
+// True outside the official post-merge pipeline, where post-merge perf-sanity stages run only when
+// --stage-list or --extra-stage names them.
+@Field
+def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
 @Field
@@ -398,6 +402,7 @@ def testFilter = [
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
     (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
+    (SKIP_POST_MERGE_PERF_SANITY): !(env.JOB_NAME ==~ /.*PostMerge.*/),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
@@ -485,6 +490,10 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// BUILD_NUMBER of the official post-merge pipeline, passed to every L0_Test job so they all
+// apply consistent stage scheduling; null otherwise.
+@Field
+def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
 // The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
 // Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
 @Field
@@ -511,6 +520,7 @@ def globalVars = [
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
     (JOB_TYPE): env.JOB_BASE_NAME,
+    (POST_MERGE_BUILD_NUMBER): (env.JOB_NAME ==~ /.*PostMerge.*/) ? env.BUILD_NUMBER : null,
     (TRTLLM_RELEASE_REPO): null,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
@@ -518,9 +528,16 @@ globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
 // Scope variant publication to post-merge and nightly releases so pre-merge
 // consumption remains governed by its own rollout switch and explicit opt-in.
+// A bot-triggered NGC-Container-Scanning or Build-Docker-Images run leaves the
+// canonical tarball un-BOLTed so the image build is its only BOLT pass; BOLTing
+// it here too would leave the image-side pass with a wheel that has no .rela.text.
+def imageBuildRequested = [TEST_STAGE_LIST, EXTRA_STAGE_LIST].any {
+    (testFilter[it]?.contains("NGC-Container-Scanning") ||
+     testFilter[it]?.contains("Build-Docker-Images")) ?: false
+}
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
-    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
-        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    !imageBuildRequested && (ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true"),
     globalVars[TARGET_BRANCH],
     globalVars[BOLT_PUBLISH_VARIANT])
 if (runMode == "nightly_release") {
@@ -2806,6 +2823,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
     def buildAllDockerImages = false
+    def dockerImagesOnly = false
     def runContainerScanning = false
     stages = [
         "Release-Check": {
@@ -2949,7 +2967,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (runContainerScanning && runMode != "nightly_release") {
                     echo "Skipping x86_64 tests (PLC container scanning)"
                     return
                 }
@@ -3136,8 +3154,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (runContainerScanning && runMode != "nightly_release") {
                     echo "Skipping SBSA tests (PLC container scanning)"
+                    return
+                }
+                if (dockerImagesOnly) {
+                    echo "Skipping SBSA tests (Build-Docker-Images only: build stage only supplies the wheel tarball)"
                     return
                 }
                 if (testFilter[INFRA_DRY_RUN]) {
@@ -3495,11 +3517,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
             testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
             echo "Will run Build-Docker-Images job"
+            // Keep SBSA-Linux for its build only: the SBSA release image downloads
+            // the tarball it publishes to BOLT-optimize the wheel. Its tests are skipped.
             stages.remove("x86_64-Linux")
-            stages.remove("SBSA-Linux")
-            echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+            dockerImagesOnly = true
+            echo "Build-Docker-Images job is set explicitly. x86_64-Linux is disabled; SBSA-Linux runs its build only."
         }
-        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scanning")) {
             runContainerScanning = true
             testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
             echo "Will run job to build ngc containers and running in-pipeline scanning for them"
