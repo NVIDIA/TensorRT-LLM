@@ -3,7 +3,8 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
+                    Optional)
 
 if TYPE_CHECKING:
     import torch
@@ -122,8 +123,15 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    cache_identity: Optional[dict] = None,
+    context_state_exporter: Optional[Callable[[LlmRequest],
+                                              Optional[bytes]]] = None,
+    context_state_validator: Optional[Callable[[LlmRequest],
+                                               Optional[str]]] = None,
 ) -> Optional["KvCacheTransceiver"]:
+    """``cache_identity`` and the context-state exporter and validator are supported by
+    the Python (V2) transceiver only; see ``KvCacheTransceiverV2``."""
     resolve_cache_transceiver_config(cache_transceiver_config)
     lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
     bypasses_python = (cache_transceiver_config is None
@@ -224,9 +232,20 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        return KvCacheTransceiverV2(
+            mapping,
+            dist,
+            kv_cache_manager,
+            cache_transceiver_config,
+            cache_identity=cache_identity,
+            context_state_exporter=context_state_exporter,
+            context_state_validator=context_state_validator)
 
+    if (cache_identity is not None or context_state_exporter is not None
+            or context_state_validator is not None):
+        raise ValueError(
+            "cache identity validation and context state export need "
+            "transceiver_runtime='PYTHON' with backend='NIXL'")
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,

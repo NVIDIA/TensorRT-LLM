@@ -575,6 +575,7 @@ def _mask_wrapper(
     wrapper._is_dflash2 = is_dflash2
     wrapper._sliding_layers_causal = sliding_layers_causal
     wrapper.dflash_attention_backend = backend
+    wrapper._kv_cache_scales = None
     wrapper._layer_windows = list(layer_windows)
     return wrapper
 

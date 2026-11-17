@@ -63,12 +63,13 @@ The following is a table of supported models for the PyTorch backend:
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
-Beam uses the experimental ModelingV2/StairCase path on **four GB300 GPUs** with
-NVFP4 experts, TP4/EP1 and BF16 KV cache. This checkout supports eager baseline
-serving through `trtllm-serve` and `LLM()`, with overlap scheduling disabled.
-Speculative decoding, FP8 KV cache, disaggregated serving, Dynamo and CUDA graphs
-are outside this baseline. Follow the [Beam deployment guide](../deployment-guide/deployment-guide-for-beam-on-trtllm.md)
-for its configuration and build requirements; an older release image may not include it.
+Beam uses the experimental ModelingV2/StairCase path on **four GB300 GPUs per
+worker**, with NVFP4 weights and TP4. The [Beam deployment guide](../deployment-guide/deployment-guide-for-beam-on-trtllm.md)
+covers aggregated serving and native disaggregated serving (two four-GPU nodes),
+DFlash2 speculative decoding and FP8 KV cache with explicit per-layer scales.
+Execution remains eager with overlap scheduling disabled; Dynamo and CUDA graphs
+are outside these recipes. Follow the guide's configuration and build requirements;
+an older release image may not include this support.
 
 ## Models Supported outside main branch
 

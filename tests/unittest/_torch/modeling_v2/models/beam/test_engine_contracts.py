@@ -72,7 +72,6 @@ def test_default_weight_loader_is_refused_explicitly():
         ("attn_backend", "FLASHINFER"),
         ("lora_config", object()),
         ("kv_connector_config", object()),
-        ("cache_transceiver_config", object()),
         ("enable_return_routed_experts", True),
         ("max_num_tokens", 0),
         ("max_num_tokens", 8193),
@@ -80,6 +79,15 @@ def test_default_weight_loader_is_refused_explicitly():
 )
 def test_unsupported_engine_option_is_refused(field, value):
     assert routing.engine_refusal(NS(**{field: value})) is not None
+
+
+def test_python_cache_transceiver_is_supported() -> None:
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    transceiver = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=60000
+    )
+    assert routing.engine_refusal(NS(cache_transceiver_config=transceiver)) is None
 
 
 def test_engine_reports_all_refusals_and_accepts_auto_enum():
@@ -295,9 +303,14 @@ def test_checkpoint_digests_follow_diagnostic_mode(diagnostics, tmp_path) -> Non
     target = NS(
         checkpoint_dir=checkpoint,
         model=NS(diagnostics=diagnostics, load=load),
+        load_record=None,
+        kv_cache_quant_algo=None,
     )
+    target._check_kv_cache_scales = Target._check_kv_cache_scales.__get__(target)
+    target._apply_kv_cache_scales = Target._apply_kv_cache_scales.__get__(target)
     assert Target.load_checkpoint(target, checkpoint) is record
     load.assert_called_once_with(checkpoint, record_digests=diagnostics)
+    assert target.load_record is record
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64])

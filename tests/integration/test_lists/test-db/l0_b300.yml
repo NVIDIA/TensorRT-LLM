@@ -170,6 +170,8 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_cublas_mm.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_nvfp4_gemm.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_fp4_quantize.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_dflash2.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_disagg_handoff.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_dispatch_combine.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/_components/dense_block TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/_components/moe_expert TIMEOUT (30)

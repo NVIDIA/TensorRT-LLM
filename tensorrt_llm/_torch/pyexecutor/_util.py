@@ -3349,6 +3349,15 @@ class KvCacheCreator:
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
             return effective_draft_config
+        # A drafter that writes and reads FP8 codes with its own per-layer scales
+        # (DFlashForCausalLM.set_kv_cache_scales) keeps the fp8 algo: its pool is FP8.
+        draft_model = getattr(getattr(self._model_engine, "model", None),
+                              "draft_model", None)
+        if getattr(draft_model, "kv_cache_storage_dtype",
+                   None) == torch.float8_e4m3fn:
+            logger.info("External drafter KV pool is FP8: the drafter stores "
+                        "and reads it with its own per-layer scales.")
+            return effective_draft_config
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
             "the KV quantization inherited from the target.")
@@ -5830,9 +5839,37 @@ def create_py_executor_resources(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A model that declares a disaggregated handoff contributes its semantic cache
+    # identity and the record it freezes for each finished context request. Its draft
+    # layers must share the target manager so all required pages travel together.
+    # Models without a handoff declaration keep the standard transfer path.
+    transfer_kwargs = {}
+    cache_identity_fn = getattr(model_engine.model, "disagg_cache_identity",
+                                None)
+    if (cache_identity_fn is not None and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        transfer_kwargs["cache_identity"] = cache_identity_fn()
+        transfer_kwargs["context_state_exporter"] = getattr(
+            model_engine.model, "export_disagg_context_request", None)
+        transfer_kwargs["context_state_validator"] = getattr(
+            model_engine.model, "validate_disagg_generation_request", None)
+        # The drafter's context travels only in draft layers the target's KV cache
+        # manager owns; they move with the target's pages.
+        get_draft_view = getattr(kv_cache_manager, "get_draft_kv_cache_view",
+                                 None)
+        if (getattr(model_engine.model, "transfers_draft_kv_cache", False)
+                and (get_draft_view is None
+                     or get_draft_view() is not kv_cache_manager)):
+            raise ValueError(
+                "the model's disaggregated handoff carries the drafter's context, "
+                "which needs the drafter's KV layers in the target's KV cache "
+                "manager; this engine keeps a separate draft KV cache. Run DFlash "
+                "with attention_backend TRTLLM and without "
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both workers.")
+
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        cache_transceiver_config, mamba_cache_manager, **transfer_kwargs)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

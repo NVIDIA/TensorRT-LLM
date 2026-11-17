@@ -32,7 +32,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from .layout_bf16 import BF16, F32, FP8, TensorSpec
+from .._tp4.layout_bf16 import BF16, F32, FP8, TensorSpec
 
 INDEX_FILE = "model.safetensors.index.json"
 TILE_BYTES = 16 << 20

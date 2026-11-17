@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo,
@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+#: Proposals per DFlash draft block the target verifies: the drafter's serving block of eight
+#: rows (the pending token and seven proposals), the largest verification width the target's
+#: attention op is measured at.
+DFLASH_MAX_DRAFT_LEN = 7
+
 
 def _quant_algo(pretrained_config: PretrainedConfig | None) -> str | None:
     quant = getattr(pretrained_config, "quantization_config", None)
@@ -31,8 +36,48 @@ def _quant_algo(pretrained_config: PretrainedConfig | None) -> str | None:
     return canonicalize_quant_algo(getattr(quant, "quant_algo", None))
 
 
-def engine_refusal(llm_args: TorchLlmArgs | None) -> str | None:
-    """Report engine options this eager target cannot implement."""
+def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Optional[str]:
+    """Why the Beam target cannot run ``spec_config``, or None when it can.
+
+    The one speculative mode is DFlash with a separate drafter checkpoint, the TRTLLM draft
+    attention backend (the drafter's context in its paged KV-cache layers), a fixed
+    draft length of ``DFLASH_MAX_DRAFT_LEN`` and strict greedy verification (no rejection
+    sampling, no draft-length schedule). The engine must run it eagerly: the overlap
+    scheduler would hand the target device-corrected positions and KV lengths its host-side
+    step check cannot state.
+    """
+    if spec_config is None:
+        return None
+    mode = getattr(spec_config, "spec_dec_mode", None)
+    if mode is None or not mode.is_dflash():
+        return f"speculative decoding {type(spec_config).__name__} is not DFlash"
+    reasons = []
+    if spec_config.speculative_model is None:
+        reasons.append("DFlash needs its drafter checkpoint (speculative_model)")
+    if spec_config.attention_backend != "TRTLLM":
+        reasons.append(
+            f"DFlash attention_backend {spec_config.attention_backend!r}; the drafter's context "
+            "lives in paged KV-cache layers, which only the TRTLLM backend reads"
+        )
+    if spec_config.max_draft_len != DFLASH_MAX_DRAFT_LEN:
+        reasons.append(
+            f"DFlash max_draft_len {spec_config.max_draft_len}, not {DFLASH_MAX_DRAFT_LEN}"
+        )
+    if spec_config.draft_len_schedule:
+        reasons.append("a DFlash draft_len_schedule changes the verification width per step")
+    if spec_config.use_rejection_sampling:
+        reasons.append("DFlash rejection sampling; verification is strict greedy")
+    if llm_args is not None and not getattr(llm_args, "disable_overlap_scheduler", True):
+        reasons.append("the overlap scheduler with DFlash")
+    return "; ".join(reasons) or None
+
+
+def engine_refusal(llm_args: Optional[Any], spec_config: Optional[Any] = None) -> Optional[str]:
+    """Report all unsupported scheduling options and token budgets for this eager target.
+
+    CUDA graphs and overlap scheduling are unsupported by this target's host-synchronizing
+    expert provider. The per-step token budget must lie in ``[1, MAX_NUM_TOKENS]``.
+    """
     if llm_args is None:
         return None
     reasons = []
@@ -52,14 +97,16 @@ def engine_refusal(llm_args: TorchLlmArgs | None) -> str | None:
         reasons.append("beam search is not supported; max_beam_width must be 1")
     if getattr(llm_args, "attn_backend", "TRTLLM") != "TRTLLM":
         reasons.append("attn_backend must be TRTLLM")
-    for field in ("lora_config", "kv_connector_config", "cache_transceiver_config"):
+    for field in ("lora_config", "kv_connector_config"):
         if getattr(llm_args, field, None) is not None:
             reasons.append(f"{field} is not supported by this Beam target")
     if getattr(llm_args, "enable_return_routed_experts", False):
         reasons.append("returning routed experts is not supported")
     cache = getattr(llm_args, "kv_cache_config", None)
-    paged_context = getattr(llm_args, "enable_chunked_prefill", False) or getattr(
-        cache, "enable_block_reuse", True
+    paged_context = (
+        getattr(llm_args, "enable_chunked_prefill", False)
+        or getattr(cache, "enable_block_reuse", True)
+        or spec_config is not None
     )
     page_size = getattr(cache, "tokens_per_block", 32)
     if paged_context and page_size != 32:
@@ -74,6 +121,31 @@ def engine_refusal(llm_args: TorchLlmArgs | None) -> str | None:
     return "; ".join(reasons) or None
 
 
+def checkpoint_refusal(pretrained_config: Any, spec_config: Optional[Any]) -> Optional[str]:
+    """Why the target's construction would refuse this checkpoint or its drafter, or None.
+
+    Runs the target's own validators on the files its construction reads: the checkpoint's
+    ``config.json`` and NVFP4 recipe (``layout.check_checkpoint``) and, with DFlash, the
+    drafter's ``config.json`` against them (``layout.check_drafter_config``). Pure file reads;
+    nothing is allocated.
+    """
+    from .full_model_nvfp4__sm_103__tp4 import layout
+
+    try:
+        config = layout.check_checkpoint(layout.checkpoint_dir_of(pretrained_config))
+        if spec_config is not None:
+            drafter = layout.read_config(spec_config.speculative_model)
+            # Unset capture layers resolve from the drafter checkpoint, as the runtime
+            # resolves them (DFlashDecodingConfig.resolve_from_checkpoint).
+            layers = spec_config.target_layer_ids
+            if layers is None:
+                layers = (drafter.get("dflash_config") or {}).get("target_layer_ids")
+            layout.check_drafter_config(drafter, config, layers)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 @routes("BeamForCausalLM")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: tuple[int, int]
@@ -81,11 +153,15 @@ def route(
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     The one target is the 52-layer NVFP4-expert checkpoint on four sm_103 ranks: attention
-    TP4, MoE TP4/EP1, PP1, BF16 KV cache, no attention data parallelism, no speculative
-    decoding. ``kv_cache_quant_algo`` is the effective engine setting, including runtime
-    overrides. No additional engine choice in ``model_config`` or ``llm_args`` selects a
+    TP4, MoE TP4/EP1, PP1, a BF16 or FP8 KV cache, no attention data parallelism, without
+    speculative decoding or with the DFlash drafter ``speculation_refusal`` admits.
+    ``kv_cache_quant_algo`` is the effective engine setting, including runtime overrides; an
+    FP8 cache holds the target's and the drafter's K/V with per-layer scales the checkpoint
+    loader supplies. No other engine choice in ``model_config`` or ``llm_args`` selects a
     different target.
     """
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
     pretrained_config = model_config.pretrained_config
     mapping = model_config.mapping
     spec_config = model_config.spec_config
@@ -103,7 +179,6 @@ def route(
         mapping.moe_ep_size,
         bool(mapping.enable_attention_dp),
     )
-    refusal = engine_refusal(llm_args)
     try:
         quant_algo = _quant_algo(pretrained_config)
     except ValueError as exc:
@@ -111,6 +186,9 @@ def route(
     if quant_algo is None:
         algo = getattr(model_config.quant_config, "quant_algo", None)
         quant_algo = getattr(algo, "value", algo)
+    speculation = speculation_refusal(spec_config, llm_args)
+    engine = engine_refusal(llm_args, spec_config)
+    refusal = None
     if (
         compute_capability == SM
         and shape
@@ -119,9 +197,9 @@ def route(
         )
         and layout == (WORLD_SIZE, WORLD_SIZE, 1, WORLD_SIZE, 1, False)
         and quant_algo == "NVFP4"
-        and spec_config is None
-        and kv_cache_quant_algo is None
-        and refusal is None
+        and speculation is None
+        and engine is None
+        and kv_cache_quant_algo in (None, QuantAlgo.FP8)
     ):
         from .full_model_nvfp4__sm_103__tp4.weights import BeamNvfp4CheckpointLoader
 
@@ -135,21 +213,23 @@ def route(
                 "checkpoint_loader=BeamNvfp4CheckpointLoader(); "
                 "the default HF checkpoint loader cannot populate its packed weights"
             )
-        from .full_model_nvfp4__sm_103__tp4.layout import check_checkpoint, checkpoint_dir_of
+        refusal = checkpoint_refusal(pretrained_config, spec_config)
+        if refusal is None:
+            from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
 
-        try:
-            check_checkpoint(checkpoint_dir_of(pretrained_config))
-        except ValueError as exc:
-            raise NoTarget(str(exc)) from exc
-        from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
-
-        return ModelingV2BeamFullModelNvfp4Sm103Tp4
+            return ModelingV2BeamFullModelNvfp4Sm103Tp4
 
     raise NoTarget(
+        f"{f'the checkpoint is not one the target computes: {refusal}; ' if refusal else ''}"
         f"compute capability {compute_capability}, config shape {shape}, quantization "
         f"{quant_algo}, layout (world, tp, pp, moe_tp, moe_ep, attention_dp) {layout}, "
-        f"speculative decoding {type(spec_config).__name__ if spec_config is not None else 'off'}; "
-        f"KV cache {kv_cache_quant_algo or 'bf16'}; engine: {refusal or 'supported'}; "
+        f"speculative decoding {type(spec_config).__name__ if spec_config is not None else 'off'}"
+        f"{f' ({speculation})' if speculation else ''}; "
+        f"KV cache {kv_cache_quant_algo or 'bf16'}; "
+        f"{f'{engine}; ' if engine else ''}"
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
-        "TP4/EP1, PP1, with BF16 KV cache and without attention DP or speculative decoding"
+        f"TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, at most {MAX_NUM_TOKENS} "
+        "tokens per engine step, with speculative decoding "
+        f"off or DFlash (TRTLLM draft attention, max_draft_len {DFLASH_MAX_DRAFT_LEN}, strict "
+        "greedy verification, no overlap scheduler)"
     )

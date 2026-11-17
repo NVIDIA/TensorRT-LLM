@@ -114,6 +114,52 @@ def build_aux_transfer_layout(
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
+# The context handoff record a model may attach to a context request
+# (``LlmRequest.py_disagg_handoff``): one int64 word per field, the identity digest's first
+# 128 bits as four 32-bit words. A slot without a record has ``present`` 0.
+HANDOFF_RECORD_WORDS = 10
+_NO_VALUE = -1
+
+
+def encode_handoff_record(record: dict | None) -> list[int]:
+    """Fixed-width words of a handoff record (see ``decode_handoff_record``)."""
+    if record is None:
+        return [0] * HANDOFF_RECORD_WORDS
+    identity = str(record["identity"])
+    if len(identity) < 32:
+        raise ValueError("the handoff identity digest needs at least 128 bits")
+    draft = record.get("draft")
+    words = [
+        1,
+        int(record["version"]),
+        int(record["transfer_id"]),
+        int(record["prompt_len"]),
+        _NO_VALUE if draft is None else int(draft["draft_ctx_len"]),
+        _NO_VALUE if draft is None else int(draft["next_position"]),
+    ] + [int(identity[i : i + 8], 16) for i in range(0, 32, 8)]
+    return words
+
+
+def decode_handoff_record(words: list[int]) -> dict | None:
+    """The record ``encode_handoff_record`` wrote, or None for an empty slot. ``identity``
+    comes back as the digest's first 32 hex digits."""
+    if len(words) != HANDOFF_RECORD_WORDS:
+        raise ValueError(f"a handoff record has {HANDOFF_RECORD_WORDS} words, got {len(words)}")
+    if words[0] == 0:
+        return None
+    draft = (
+        None
+        if words[4] == _NO_VALUE and words[5] == _NO_VALUE
+        else {"draft_ctx_len": int(words[4]), "next_position": int(words[5])}
+    )
+    return {
+        "version": int(words[1]),
+        "transfer_id": int(words[2]),
+        "prompt_len": int(words[3]),
+        "draft": draft,
+        "identity": "".join(f"{int(w):08x}" for w in words[6:10]),
+    }
+
 
 class AuxBufferBase(ABC):
     """
@@ -199,37 +245,22 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        # The model's context handoff record (encode_handoff_record), when it attaches one.
+        self._handoff_buffer = torch.zeros(
+            self._max_slot_num, HANDOFF_RECORD_WORDS, dtype=torch.int64, device=self._device
+        )
 
+        buffers = (
+            self._first_tokens_buffer,
+            self._draft_tokens_buffer,
+            self._token_counts_buffer,
+            self._prompt_token_counts_buffer,
+            self._handoff_buffer,
+        )
         self._meta = AuxBufferMeta(
-            ptrs=np.array(
-                [
-                    self._first_tokens_buffer.data_ptr(),
-                    self._draft_tokens_buffer.data_ptr(),
-                    self._token_counts_buffer.data_ptr(),
-                    self._prompt_token_counts_buffer.data_ptr(),
-                ],
-                dtype=np.int64,
-            ),
-            size=np.array(
-                [
-                    self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer.numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
-                dtype=np.int64,
-            ),
-            item_sizes=np.array(
-                [
-                    self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer[0].numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
-                dtype=np.int64,
-            ),
+            ptrs=np.array([b.data_ptr() for b in buffers], dtype=np.int64),
+            size=np.array([b.numel() * b.element_size() for b in buffers], dtype=np.int64),
+            item_sizes=np.array([b[0].numel() * b.element_size() for b in buffers], dtype=np.int64),
             device=self._device,
         )
 
@@ -305,6 +336,13 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer[slot].copy_(
             torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
         )
+        self._handoff_buffer[slot].copy_(
+            torch.tensor(
+                encode_handoff_record(getattr(request, "py_disagg_handoff", None)),
+                dtype=torch.int64,
+                device=self._device,
+            )
+        )
 
     @staticmethod
     def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
@@ -335,3 +373,9 @@ class AuxBuffer(AuxBufferBase):
         first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
         prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
         return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))
+
+    def get_slot_handoff(self, slot: int) -> dict | None:
+        """The context handoff record written into ``slot``, or None if it carries none."""
+        if slot not in self._occupied_slots:
+            raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        return decode_handoff_record(self._handoff_buffer[slot].tolist())

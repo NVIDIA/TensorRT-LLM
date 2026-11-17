@@ -77,6 +77,10 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    # Semantic identity of the cached state (model, layout, cache format, scales and the
+    # transferred managers), compared by the peer registrar before any transfer; None for
+    # peers that declare none. Carries digests only, never scale values or weights.
+    cache_identity: Optional[dict] = None
     protocol_version: int = NATIVE_TRANSFER_PROTOCOL_VERSION
     context_first_ownership: bool = False
     # Layers a unified KV cache manager owns for the drafter (layer specs with
@@ -118,6 +122,7 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        cache_identity: Optional[dict] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
@@ -173,6 +178,7 @@ class RankInfo:
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
             num_draft_layers=len(draft_layer_ids),
             draft_kv_dtype=draft_kv_dtype,
+            cache_identity=cache_identity,
             draft_layers_reshard_across_tp=shares_draft_layers
             and getattr(kvm, "hosts_unified_draft_layers", False),
         )

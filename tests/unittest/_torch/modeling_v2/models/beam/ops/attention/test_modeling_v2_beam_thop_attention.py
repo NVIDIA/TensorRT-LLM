@@ -65,6 +65,29 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ("prefix at window", (512,), (1,), 1),
             ("decode across window", (511, 512, 513), (1, 1, 1), 0),
         )
+    )
+    + tuple(
+        Cell(
+            why=f"beam TP4 P=8 {name}, {'full' if window is None else 'sliding'} attention",
+            spec=dict(
+                _BEAM_SLIDING,
+                num_heads=12,
+                num_kv_heads=2,
+                num_blocks=96,
+                max_num_requests=4,
+                max_blocks_per_seq=24,
+                window=window,
+                cached=cached,
+                new=new,
+                num_contexts=contexts,
+                predicted_tokens_per_seq=8,
+            ),
+        )
+        for window in (512, None)
+        for name, cached, new, contexts in (
+            ("verify across window", (503, 504, 505), (8, 8, 8), 0),
+            ("mixed prefill and verify", (31, 17, 600, 129), (20, 8, 8, 8), 1),
+        )
     ),
     "beam/six_layer_model": (
         *(

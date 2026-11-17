@@ -36,7 +36,11 @@ def config():
 @pytest.mark.parametrize("retention", ["sliding", "full", "normalized", "extended"])
 def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
     component = NS(
-        head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
+        kv_cache_dtype=DataType.BF16,
+        head_dim=128,
+        local_kv_heads=2,
+        window=512,
+        schedule=layout.check_config(config()),
     )
     window = {"sliding": 512, "full": length, "normalized": None, "extended": 1024}[retention]
     manager = NS(
@@ -55,7 +59,11 @@ def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
 )
 def test_cache_rejects_incompatible_retention(length, layer, window):
     component = NS(
-        head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
+        kv_cache_dtype=DataType.BF16,
+        head_dim=128,
+        local_kv_heads=2,
+        window=512,
+        schedule=layout.check_config(config()),
     )
     manager = NS(
         layer_offsets=dict(enumerate(range(52))),
@@ -217,7 +225,7 @@ def test_flat_recipe_never_silently_disables_requested_kv_quantization(recipe_sp
         layout as nvfp4_layout,
     )
 
-    with pytest.raises(ValueError, match="BF16 KV cache"):
+    with pytest.raises(ValueError, match="kv_cache_scheme"):
         nvfp4_layout.check_recipe(
             dict(
                 quant_method="modelopt", quant_algo="NVFP4", group_size=16, kv_cache_scheme=scheme

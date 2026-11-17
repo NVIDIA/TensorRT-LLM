@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -260,6 +261,95 @@ class TestConfigDatabaseSync(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
             RecipeList.model_validate(duplicate_profile)
+
+    def test_curated_recipe_page_record_links_without_a_command(self):
+        """A recipe-page record yields links only; ordinary curated rows are unchanged."""
+        curated = REPO_ROOT / "examples/configs/curated/lookup.yaml"
+        raw = yaml.safe_load(curated.read_text(encoding="utf-8"))
+        rows = _module.build_curated_rows(curated)
+        ordinary = [e for e in raw if "recipe_page" not in e and not e.get("disagg")]
+        self.assertEqual(
+            [(r.model, r.config_path, r.scenario) for r in rows],
+            [(e["model"], e["config_path"], e.get("scenario", "")) for e in ordinary],
+        )
+        for row in rows:
+            self.assertIn(f"trtllm-serve {row.model} --config ", row.command)
+
+        pages = [
+            p
+            for p in _module.build_curated_pages(curated)
+            if p.recipe_page.endswith("deployment-guide-for-beam-on-trtllm.md")
+        ]
+        self.assertEqual(len(pages), 1)
+        page = asdict(pages[0])
+        self.assertEqual(
+            set(page),
+            {
+                "title",
+                "recipe_page",
+                "recipe_page_html",
+                "recipe_page_github_url",
+                "gpu_compatibility",
+                "configs",
+            },
+        )
+        self.assertTrue((REPO_ROOT / page["recipe_page"]).is_file())
+        self.assertEqual(
+            page["recipe_page_html"], "deployment-guide/deployment-guide-for-beam-on-trtllm.html"
+        )
+        self.assertEqual(
+            [c["config_filename"] for c in page["configs"]],
+            [
+                "beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+                "beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+                "beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+            ],
+        )
+        for config in page["configs"]:
+            self.assertTrue((REPO_ROOT / config["config_path"]).is_file())
+            self.assertTrue(config["config_github_url"].endswith(config["config_path"]))
+            self.assertTrue(config["config_raw_url"].endswith(config["config_path"]))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "config_db.json"
+            generate_json(
+                REPO_ROOT / "examples/configs/database/lookup.yaml",
+                output_file=output,
+                curated_yaml_path=curated,
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertIn(page, payload["curated_pages"])
+        self.assertEqual(len(payload["curated_entries"]), len(rows))
+        page_text = json.dumps(payload["curated_pages"])
+        self.assertNotIn("huggingface.co", page_text)
+        self.assertNotIn("trtllm-serve", page_text)
+        for config in page["configs"]:
+            self.assertNotIn(
+                config["config_path"], [e["config_path"] for e in payload["curated_entries"]]
+            )
+
+    def test_curated_recipe_page_record_validation(self):
+        page = {
+            "title": "A documented deployment",
+            "recipe_page": "docs/source/deployment-guide/example.md",
+            "config_paths": ["examples/configs/curated/example.yaml"],
+            "gpu_compatibility": "GB300",
+        }
+        parsed = list(_module.CuratedRecipeList.model_validate([page]))
+        self.assertIsInstance(parsed[0], _module.CuratedRecipePage)
+        for change, reason in [
+            ({"model": "org/model"}, "Extra inputs are not permitted"),
+            ({"recipe_page": "README.md"}, "docs/source"),
+            ({"config_paths": []}, "at least 1 item"),
+            ({"config_paths": ["/abs/example.yaml"]}, "Invalid config path"),
+            ({"title": ""}, "at least 1 character"),
+        ]:
+            with self.assertRaisesRegex(ValueError, reason):
+                _module.CuratedRecipeList.model_validate([{**page, **change}])
+        with self.assertRaisesRegex(ValueError, "arch"):
+            _module.CuratedRecipeList.model_validate(
+                [{"model": "org/model", "config_path": "examples/configs/curated/example.yaml"}]
+            )
 
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.

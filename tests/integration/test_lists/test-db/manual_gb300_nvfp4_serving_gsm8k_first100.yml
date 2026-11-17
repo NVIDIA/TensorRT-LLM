@@ -1,0 +1,18 @@
+version: 0.0.1
+# Optional manual context for the same first-100 regression listed in QA/LR.
+manual_gb300_nvfp4_serving_gsm8k_first100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: manual
+      backend: pytorch
+  tests:
+  - accuracy/test_nvfp4_serving_gsm8k.py::test_gsm8k_first100 TIMEOUT (45)

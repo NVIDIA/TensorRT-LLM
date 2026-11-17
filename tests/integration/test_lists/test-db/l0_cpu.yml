@@ -205,6 +205,12 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/models/test_minimax_m3.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_cache_contract.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving_cli.py
+  - unittest/_torch/modeling_v2/models/beam/test_routing.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/test_component_support.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
   # leaves the checkpoint-backed tests out.

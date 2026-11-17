@@ -227,6 +227,21 @@ has a dedicated on-demand selector in
 These entries define how the gate is selected; they do not establish that a particular
 revision has passed it. Full 1,319-question GSM8K evaluation remains manual-only.
 
+## Optimized aggregated recipe test
+
+The separate `tests/integration/defs/accuracy/test_nvfp4_serving_gsm8k.py` test uses
+`examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml` with DFlash2 and FP8 KV cache
+on four GB300 GPUs. Its selector is
+`tests/integration/test_lists/test-db/manual_gb300_nvfp4_serving_gsm8k_first100.yml`;
+it is manual-only, not the baseline QA gate above.
+
+This test stages the target, drafter, scale table and dataset below `LLM_MODELS_ROOT`, renders
+the recipe and runs the same evaluator with 100 questions and the recipe's `max_batch_size`
+as concurrency. The 45-minute timeout includes a cleanup reserve. Its criterion is at least
+95 correct answers, defined in `tests/integration/defs/accuracy/gsm8k_first100/criterion.json`
+and bound to the protocol manifest. Results go to
+`<--output-dir>/nvfp4_serving_gsm8k_first100`.
+
 ## Comparing results
 
 Compare runs using the same dataset revision and question selection, prompt and request
