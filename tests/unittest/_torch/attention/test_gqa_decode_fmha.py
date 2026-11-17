@@ -28,6 +28,7 @@ from kv_cache_utils import fill_kv_cache_logical
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha import gqa_kv_replica_fused as F
 from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
+    _ATTENTION_DP_MIN_KV_SPLITS,
     FoldInputs,
     GqaDecodeFmha,
     GqaDecodeSetup,
@@ -520,6 +521,26 @@ def test_min_kv_splits_need_one_q_tile_and_the_counters(
     num_heads: int, num_kv_heads: int, tokens_per_gen_step: int, splits: int
 ) -> None:
     assert GqaDecodeFmha._min_kv_splits_for(num_heads, num_kv_heads, tokens_per_gen_step) == splits
+
+
+def test_min_kv_split_decode_matches_unforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prepared-query decode planned for more SMs than the device has (FmhaParams.multi_processor_count: more KV
+    splits per sequence, a larger multi-CTA scratch) writes what the device's own split writes, up to the order of
+    the FP32 partial sums."""
+    cached, q_len = [900, 3000, 4100, 70, 8000], 7
+    reference, reference_cache = _generation_step(True, cached, q_len)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    planned = []
+
+    def forced(self, batch: int) -> int:
+        planned.append(_ATTENTION_DP_MIN_KV_SPLITS * self.attn.num_kv_heads * batch + sms)
+        return planned[-1]
+
+    monkeypatch.setattr(GqaDecodeFmha, "_min_kv_split_sm_count", forced)
+    output, cache = _generation_step(True, cached, q_len)
+    assert planned and all(n > sms for n in planned)
+    assert torch.equal(cache.view(torch.uint8), reference_cache.view(torch.uint8))
+    torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
 def test_min_kv_split_stops_above_the_largest_graph_batch() -> None:

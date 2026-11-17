@@ -223,6 +223,95 @@ def test_fmha_paged_context_fp8_last_rows_match_full_call(head_dim_per_stage_kv)
     assert torch.equal(last_rows.view(torch.int16), full[last].view(torch.int16))
 
 
+def _native_context_forward(q_lens, last_rows_only, head_dim_per_stage_kv):
+    """One context-only forward of a TRTLLM attention layer (FP8 KV cache, paged context FMHA, BF16 output) over
+    fresh requests of ``q_lens`` tokens: (output [tokens, heads * head_dim], the layer's K / V cache)."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.utils import create_attention
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    num_heads, num_seqs = 16, len(q_lens)
+    attn = create_attention(
+        "TRTLLM",
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=_HEAD_DIM,
+        num_kv_heads=1,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        context_last_rows_only=last_rows_only,
+        context_fmha_head_dim_per_stage_kv=head_dim_per_stage_kv,
+    )
+    request_ids = list(range(num_seqs))
+    pages = (max(q_lens) + _TOKENS_PER_PAGE - 1) // _TOKENS_PER_PAGE
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=num_seqs * pages * _TOKENS_PER_PAGE),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        tokens_per_block=_TOKENS_PER_PAGE,
+        max_seq_len=pages * _TOKENS_PER_PAGE,
+        max_batch_size=num_seqs,
+        mapping=mapping,
+        dtype=DataType.FP8,
+    )
+    try:
+        manager.add_dummy_requests(request_ids, list(q_lens))
+        metadata = TrtllmAttentionMetadata(
+            num_contexts=num_seqs,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * num_seqs),
+            seq_lens=torch.tensor(q_lens, dtype=torch.int),
+            max_num_requests=num_seqs,
+            max_num_tokens=sum(q_lens),
+            kv_cache_manager=manager,
+            request_ids=request_ids,
+            prompt_lens=list(q_lens),
+            mapping=mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+        )
+        metadata.prepare()
+        assert metadata.use_paged_context_fmha
+        g = torch.Generator(device="cuda").manual_seed(5)
+        qkv = torch.randn(sum(q_lens), (num_heads + 2) * _HEAD_DIM, generator=g, device="cuda").to(
+            torch.bfloat16
+        )
+        with torch.no_grad():
+            out, _ = attn.forward(qkv, None, None, metadata)
+        torch.cuda.synchronize()
+        cache = manager.get_buffers(0, kv_layout="HND").clone()
+    finally:
+        manager.shutdown()
+    return out.view(sum(q_lens), -1), cache
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="stage-256 cubins exist for SM100 / SM103",
+)
+@pytest.mark.parametrize("head_dim_per_stage_kv", [0, _HEAD_DIM], ids=["unstaged", "stage256"])
+def test_native_context_last_rows_only(head_dim_per_stage_kv):
+    """The native context attention with context_last_rows_only: in a context-only step each request's last output
+    row matches the full call's, the other rows are zero, and every row's K / V is still written."""
+    q_lens = [700, 1, 129, 64]
+    full, full_cache = _native_context_forward(q_lens, False, head_dim_per_stage_kv)
+    last_only, last_cache = _native_context_forward(q_lens, True, head_dim_per_stage_kv)
+    last = torch.tensor(q_lens, device="cuda").cumsum(0) - 1
+    others = torch.ones(sum(q_lens), dtype=torch.bool, device="cuda")
+    others[last] = False
+    assert torch.equal(last_cache.view(torch.uint8), full_cache.view(torch.uint8))
+    assert bool((last_only[others] == 0).all())
+    torch.testing.assert_close(last_only[last], full[last], atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="stage-256 cubins exist for SM100 / SM103",
