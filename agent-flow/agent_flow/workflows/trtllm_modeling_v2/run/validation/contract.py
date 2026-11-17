@@ -393,6 +393,11 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     :func:`equivalence_key`; a configuration variant's do not, so a variant
     never shares a verdict. Every check carries its :func:`check_inputs`.
 
+    A unit or variant owes no boot at a member where its benchmark or its
+    acceptance gate loads the same engine, unless the boot observes what those
+    do not (:func:`_boot_observes`): a check that starts the engine and
+    scores it has shown that it starts.
+
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
     ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
@@ -411,6 +416,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     checks: list[Check] = []
     notes: list[str] = []
     confirm = ""
+    reuses = {kv.name for kv in check_config.launch_kv_caches(task_data) if kv.reuse}
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
         members = order_members_by_cost(members_for(task_data, unit, world_size))
@@ -439,13 +445,23 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                 f"({why}); its boot and accuracy would run one aggregated engine"
             )
             continue
-        add("boot", TIER_INNER)
         if level == PROFILE_SMOKE:
+            add("boot", TIER_INNER)
             notes.append(f"{unit}: the smoke profile owes its boot alone")
             confirm = Check(unit, "boot", members[0], TIER_INNER).key if members else confirm
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
         benchmarked = benchmark_members(task_data, unit, members)
+        drafts = bool(SPECULATORS & implemented)
+        loaded = set(members) if drafts else set(benchmarked)
+        if _boot_observes(unit in reuses, drafts, "multimodal" in implemented):
+            loaded = set()
+        add("boot", TIER_INNER, at=[m for m in members if m not in loaded])
+        if loaded:
+            notes.append(
+                f"{unit}: no boot at {', '.join(m for m in members if m in loaded)}; a stronger "
+                "check loads the same engine there"
+            )
         add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmarked)
         if benchmarked:
             confirm = Check(unit, f"accuracy[{benchmark}]", benchmarked[0], TIER_INNER).key
@@ -454,7 +470,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows
         # only as speed: per-prompt acceptance is the detector.
-        if SPECULATORS & implemented:
+        if drafts:
             add("acceptance", TIER_PROOF)
     for name in () if lean else variants_mod.variants(task_data):
         level = profile_of(task_data, name)
@@ -482,14 +498,24 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         relative = variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE
         if relative and "accuracy" in gates:
             notes.append(f"{name}: its anchor is {base}'s own score at the same member and target")
+        scored = members if "accuracy" in gates else []
+        if scored and not named and level != PROFILE_CERTIFIED and len(scored) > 1:
+            member, why = benchmark_member(spec, members)
+            scored = [member]
+            notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+        loaded = set(members) if "acceptance" in gates else set(scored)
+        if check_config.sets_chunking(task_data, name) or _boot_observes(
+            name in reuses, "acceptance" in gates, "multimodal" in built
+        ):
+            loaded = set()
         for gate in gates:
             at = members
-            if gate == "boot" and "acceptance" not in gates:
-                at = [*members, *(m for m in everywhere if m not in members)]
-            elif gate == "accuracy" and not named and level != PROFILE_CERTIFIED and len(at) > 1:
-                member, why = benchmark_member(spec, members)
-                at = [member]
-                notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+            if gate == "boot":
+                if "acceptance" not in gates:
+                    at = [*members, *(m for m in everywhere if m not in members)]
+                at = [m for m in at if m not in loaded]
+            elif gate == "accuracy":
+                at = scored
             owned = {c.key for c in checks}
             checks.extend(
                 Check(
@@ -515,6 +541,16 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
             checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
     return Contract(checks=tuple(checks), notes=tuple(notes), confirm=confirm)
+
+
+def _boot_observes(reuses: bool, drafts: bool, multimodal: bool) -> bool:
+    """Whether a boot observes what a benchmark or an acceptance load of the same engine does not.
+
+    The reuse probe, which the acceptance gate runs too and the benchmark does
+    not; and an image prompt. (A variant that sets chunked prefill also owes
+    the boot's split prompt: ``check_config.sets_chunking``.)
+    """
+    return multimodal or (reuses and not drafts)
 
 
 def write_contract(workspace: Path, contract: Contract) -> Path:

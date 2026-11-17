@@ -277,8 +277,9 @@ class GraphOrchestrator:
                 "[resume] the tasks running when the last process stopped start again: "
                 + ", ".join(t.id for t in restarted)
             )
-        #: The feature units and variants (their ``ref``), and the core's boot checks: a
-        #: worker's task on one of them starts once any of those checks has passed.
+        #: The feature units and variants (their ``ref``), and the checks that show the
+        #: core runs (its boots, or its other checks where it owes no boot): a worker's
+        #: task on one of them starts once any of those checks has passed.
         refs, boots = after_core
         self._feature_refs, self._core_boots = frozenset(refs), tuple(boots)
         self.revision_cap = revision_cap
@@ -696,9 +697,9 @@ class GraphOrchestrator:
         )
 
     def _waiting_for_core(self) -> set[str]:
-        """The pending feature-unit and variant tasks that build on the core and wait for it to boot.
+        """The pending feature-unit and variant tasks that build on the core and wait for it to run.
 
-        Until a boot of the core passes, a feature's work that builds on the
+        Until one of the core's first checks passes, a feature's work that builds on the
         core's code (its task reaches a task claiming a core boot through hard
         or soft dependencies) builds on a target nobody has seen run, and takes
         the slots the core's repair needs. A feature's work with no such edge

@@ -41,9 +41,10 @@ features: []
 #   kv_fp8:
 #     unit: core                    # default core
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
-#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at every
-#                                   # member of its unit; accuracy alone checks the setting took
-#                                   # effect (spec/INTAKE.md). `acceptance` needs a speculator unit
+#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at the
+#                                   # members of its unit its benchmark does not run at; accuracy
+#                                   # alone judges the setting by its score (spec/INTAKE.md).
+#                                   # `acceptance` needs a speculator unit
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment

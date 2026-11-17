@@ -127,9 +127,9 @@ class ExecutionStage:
         contract = self.workflow._contract
         self.state = state
         units = assembly_units(self.workflow.task_data)
-        core_boots = [
-            c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
-        ]
+        # What shows the core runs: its boots, or its other checks where it owes no boot.
+        core_first = [c for c in contract.required() if units and c.unit == units[0]]
+        core_boots = [c.key for c in core_first if c.gate == "boot"] or [c.key for c in core_first]
         feature_refs = [*units[1:], *variants_mod.variants(self.workflow.task_data)]
         total = max(len(state.devices), self.workflow._gate_env().world_size, 1)
         self._integration = self._make_integration(state)

@@ -897,7 +897,7 @@ class TrtllmModelingV2Workflow:
             sha,
             "trtllm-modeling-v2: "
             + (
-                "the first unit's boot and accuracy hold at one rank"
+                "the first unit's bring-up checks hold at one member"
                 if bringup
                 else "every required check of the contract holds"
             ),

@@ -234,6 +234,33 @@ def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
     assert "0, the final tree" in c.measured_where(here, status, "m1")
 
 
+def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
+    spec = {
+        "checkpoint_path": "/ckpt/m",
+        "parallel": "unified",
+        "features": ["mtp"],
+        "members": ["tp1", "tp4"],
+        "accuracy": {"benchmark": "gsm8k"},
+    }
+
+    def boots(data):
+        return [x.key for x in c.compile_contract(data, world_size=4).checks if x.gate == "boot"]
+
+    # The core's benchmark and the drafter's acceptance load every member's engine.
+    assert boots(spec) == []
+    assert c.compile_contract(spec, world_size=4).confirm == "mtp:accuracy[gsm8k]@tp1"
+    # The reuse probe is the boot's (and the acceptance gate's), not the benchmark's.
+    reuse = {**spec, "runtime": {"default": {"kv_cache_reuse": True}}}
+    assert boots(reuse) == ["core:boot@tp1", "core:boot@tp4"]
+    # A variant boots at the members its benchmark does not run at.
+    fp8 = {"base": "core", "gates": ["boot", "accuracy"]}
+    fp8["llm_api_options"] = {"kv_cache_config": {"dtype": "fp8"}}
+    assert boots({**spec, "features": [], "variants": {"kv_fp8": fp8}}) == ["kv_fp8:boot@tp1"]
+    # The smoke profile owes the boot alone, which then confirms the final tree.
+    smoke = c.compile_contract({**spec, "features": [], "profile": "smoke"}, world_size=4)
+    assert [x.gate for x in smoke.checks] == ["boot", "boot"] and smoke.confirm == "core:boot@tp1"
+
+
 def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):
     contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
     repaired = []
