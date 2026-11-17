@@ -29,9 +29,57 @@ from cbts.coverage.collection.compact_db import (
     validate_database,
     write_leaf_database,
 )
+from cbts.coverage.selection.selector import CoverageSelector
 from cbts.coverage.selection.touch_db import TouchDB
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "nodeid",
+    [
+        "test_unittests.py::test_unittests_v2[unittest/disaggregated/test_msgspec_route.py]",
+        "disaggregated/test_disaggregated.py::test_request",
+    ],
+)
+@pytest.mark.parametrize(
+    ("outcome", "taint_kind", "drove_inference", "unsafe"),
+    [
+        ("passed", None, False, False),
+        ("passed", "attribution", False, True),
+        ("passed", "incomplete", False, True),
+        ("failed", None, False, True),
+        (None, None, False, True),
+        ("passed", None, True, True),
+    ],
+)
+def test_disaggregated_capture_trust_uses_evidence(
+    tmp_path: Path,
+    nodeid: str,
+    outcome: str | None,
+    taint_kind: str | None,
+    drove_inference: bool,
+    unsafe: bool,
+) -> None:
+    """Paths alone do not force a worker footprint; capture failures still force a run."""
+    database_path = tmp_path / "coverage.sqlite"
+    stage = "A10-PyTorch-1"
+    touches = {("tensorrt_llm/serve/openai_server.py", f"helper_{i}") for i in range(30)}
+    if drove_inference:
+        touches.add(("tensorrt_llm/llmapi/llm.py", "LLM.generate"))
+    write_leaf_database(
+        database_path,
+        stage=stage,
+        process_uid="coordinator",
+        touches={nodeid: touches},
+        outcomes={nodeid: outcome} if outcome is not None else {},
+        taints=[("worker", nodeid, taint_kind, "subscriber_confirmed_dead")]
+        if taint_kind is not None
+        else [],
+    )
+    with TouchDB.open(database_path) as database:
+        selector = CoverageSelector(database, tmp_path)
+        assert selector.untrusted_tests() == ({f"{stage}/{nodeid}"} if unsafe else set())
 
 
 def test_report_counts_tainted_complete_tests_as_unsafe(tmp_path: Path) -> None:
@@ -72,6 +120,113 @@ def _merge(inputs: list[Path], output: Path) -> None:
     connection = merge_databases(inputs, output)
     connection.close()
     validate_database(output)
+
+
+@pytest.mark.parametrize("legacy_view", [False, True])
+@pytest.mark.parametrize(
+    ("outcomes", "taint_kind", "expected_outcome"),
+    [
+        (("passed", "skipped"), None, "passed"),
+        (("skipped", "passed"), None, "passed"),
+        (("skipped",), None, "incomplete"),
+        (("skipped", "skipped"), None, "incomplete"),
+        (("passed", "failed"), None, "incomplete"),
+        (("passed", "error"), None, "incomplete"),
+        (("passed", "skipped", "failed"), None, "incomplete"),
+        (("passed", "unknown"), None, "incomplete"),
+        (("", "skipped"), None, "incomplete"),
+        (("",), None, None),
+        (("passed", "skipped"), "incomplete", "passed"),
+        (("passed", "skipped"), "attribution", "passed"),
+    ],
+)
+def test_retry_outcomes_preserve_passes_without_hiding_failures(
+    tmp_path: Path,
+    outcomes: tuple[str, ...],
+    taint_kind: str | None,
+    expected_outcome: str | None,
+    legacy_view: bool,
+) -> None:
+    """A skipped attempt does not veto a pass; failures and taints remain unsafe."""
+    nodeid = "test_unittests.py::test_unittests_v2[unittest/_torch/debugger]"
+    stage = "DGX_H100-PyTorch-6"
+    leaves = []
+    for index, outcome in enumerate(outcomes):
+        leaf = tmp_path / f"attempt-{index}.sqlite"
+        write_leaf_database(
+            leaf,
+            stage=stage,
+            process_uid=f"attempt-{index}",
+            touches={nodeid: {("tensorrt_llm/debug.py", f"helper_{i}") for i in range(30)}},
+            outcomes={nodeid: outcome} if outcome else {},
+            taints=[(f"attempt-{index}", nodeid, taint_kind, "subscriber_confirmed_dead")]
+            if taint_kind is not None and index == len(outcomes) - 1
+            else [],
+        )
+        leaves.append(leaf)
+
+    merged = tmp_path / "merged.sqlite"
+    _merge(leaves, merged)
+    qualified_test = f"{stage}/{nodeid}"
+    if legacy_view:
+        # Existing schema-5 artifacts store the old outcome reducer in their view.
+        with sqlite3.connect(merged) as connection:
+            view_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='test_case_meta'"
+            ).fetchone()[0]
+            connection.execute("DROP VIEW test_case_meta")
+            connection.execute(
+                view_sql.replace("NOT IN ('', 'passed', 'skipped')", "NOT IN ('', 'passed')")
+            )
+    else:
+        assert _rows(merged, "SELECT outcome FROM test_case_meta") == [(expected_outcome,)]
+
+    with TouchDB.open(merged) as database:
+        unsafe = expected_outcome != "passed" or taint_kind is not None
+        expected = {qualified_test} if unsafe else set()
+        assert database.incomplete_capture_tests() == expected
+        assert CoverageSelector(database, tmp_path).untrusted_tests() == expected
+
+
+def test_pass_in_another_stage_does_not_validate_a_skipped_capture(tmp_path: Path) -> None:
+    """Outcome reduction is scoped to a test and stage, not just the test name."""
+    nodeid = "test_unittests.py::test_unittests_v2[unittest/_torch/debugger]"
+    leaves = []
+    for stage, outcome in [("A10-PyTorch-1", "passed"), ("DGX_H100-PyTorch-6", "skipped")]:
+        leaf = tmp_path / f"{stage}.sqlite"
+        write_leaf_database(
+            leaf,
+            stage=stage,
+            process_uid="coordinator",
+            touches={nodeid: {("tensorrt_llm/debug.py", "helper")}},
+            outcomes={nodeid: outcome},
+        )
+        leaves.append(leaf)
+    merged = tmp_path / "merged.sqlite"
+    _merge(leaves, merged)
+    with TouchDB.open(merged) as database:
+        assert database.incomplete_capture_tests() == {f"DGX_H100-PyTorch-6/{nodeid}"}
+
+
+@pytest.mark.parametrize(
+    "path", ["tests/integration/defs/conftest.py", "tests/test_common/llm_data.py"]
+)
+def test_empty_context_rows_do_not_make_a_python_file_eligible(tmp_path: Path, path: str) -> None:
+    """A session import is not test-attributed coverage, even when the file is in the DB."""
+    leaf = tmp_path / "leaf.sqlite"
+    write_leaf_database(
+        leaf,
+        stage="A10-PyTorch-1",
+        process_uid="coordinator",
+        touches={"": {(path, "<module>")}},
+        outcomes={},
+    )
+    merged = tmp_path / "merged.sqlite"
+    _merge([leaf], merged)
+
+    with TouchDB.open(merged) as database:
+        assert not database.file_has_touch_rows(path)
+        assert not database.tests_touching_file(path)
 
 
 class CompactDatabaseTest(unittest.TestCase):
@@ -279,7 +434,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     database.untrusted_tests(
                         "tensorrt_llm/worker.py",
                         (("tensorrt_llm/a.py", "run"),),
-                        (),
                         2,
                     ),
                     {sbsa_test},

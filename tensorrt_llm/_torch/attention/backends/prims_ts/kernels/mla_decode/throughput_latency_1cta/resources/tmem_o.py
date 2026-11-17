@@ -32,15 +32,18 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ....tcgen05_compat import tcgen05_mma_ws
 from ...helpers.constants import (
     WARP_LANES,
 )
 
 from ...helpers.layout import (
+    _TASK_CACHE_LOCAL_KV_TILES,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     SMEM_ROW_BYTES,
     decode_gen_task_cache,
     o_stage_tmem_col_offset,
+    smem_array,
     q_p_desc_k_block_wrap_bytes,
 )
 from ...helpers.math import (
@@ -143,6 +146,10 @@ class TmemOResource(MlaResource):
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):
         """Return whether tail PV should accumulate into existing O state."""
+        if cutlass.const_expr(self.runtime_split_kv is not None):
+            return Int32(
+                decode_gen_task_cache(stage_info)[_TASK_CACHE_LOCAL_KV_TILES]
+            ) > Int32(self.cfg.num_insts_kv)
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(
@@ -152,9 +159,9 @@ class TmemOResource(MlaResource):
             self.cu_seqlens_q,
             batch_idx,
         )
-        return runtime_local_kv_tiles(self.cfg, seq_len_kv) > Int32(
-            self.cfg.num_insts_kv
-        )
+        return runtime_local_kv_tiles(
+            self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
+        ) > Int32(self.cfg.num_insts_kv)
 
     @cute.jit
     def _p_desc_for_inst(self, p_inst: int):
@@ -370,6 +377,47 @@ class TmemOResource(MlaResource):
     ):
         """Issue PV MMA for keeps-MMA-AB with P sourced from TMEM."""
         cfg = self.cfg
+        if cutlass.const_expr(cfg.ws_pv):
+            assert (
+                cfg.async_nvfp4_kv_gather
+                and cfg.tile_size_q == 64
+                and cfg.tile_size_kv == 128
+            )
+            p_smem = smem_array(
+                stage_info.context, self.p_tmem_ref._ws_p_alloc, Int32, 4096
+            )
+            p_desc = cprims.Tcgen05SmemDesc.build(
+                p_smem.data_ptr(p_stage_idx * Int32(2048)),
+                leading_byte_offset=16,
+                stride_byte_offset=1024,
+                layout=qkv_smem_swizzle(cfg),
+            )
+            idesc = cprims.Tcgen05InstrDesc.build(
+                c_dtype=Float32,
+                a_dtype=qkv_dtype(cfg),
+                b_dtype=qkv_dtype(cfg),
+                a_major=0,
+                b_major=1,
+                n_dim=256,
+                m_dim=64,
+            )
+            if prims.elect_sync():
+                base_addr = self._pv_o_base_addr(
+                    stage_info, v_subtile_idx=v_subtile_idx
+                )
+                for _kb in cutlass.range_constexpr(4):
+                    tcgen05_mma_ws(
+                        mma_kind_for_qkv(cfg),
+                        prims.make_tmem_ptr(base_addr, Float32),
+                        p_desc,
+                        v_desc,
+                        idesc,
+                        scale_d,
+                    )
+                    scale_d = Boolean(True)
+                    p_desc = p_desc + Int32(2)
+                    v_desc = v_desc + Int32(256)
+            return
         v_stage_idx = v_subtile_idx % cfg.v_head_dim_stages
         task_cache = decode_gen_task_cache(stage_info)
         p_addr = (

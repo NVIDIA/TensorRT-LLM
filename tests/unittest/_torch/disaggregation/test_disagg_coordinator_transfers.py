@@ -17,7 +17,10 @@ from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -402,6 +405,71 @@ def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) ->
     h.send(_Request(1))
     h.coordinator.check_transfer_timeouts(only_with_context_sends=True)
     assert gen.py_kv_transfer_timed_out
+
+
+def test_context_timeout_does_not_count_the_wait_for_the_peer_to_ask(clock) -> None:
+    """Nothing is written until the generation peer asks, and under load its
+    request can queue past the timeout; that wait must not expire the send
+    (nvbugs/6621362). Once the peer has asked, the transfer gets the full
+    budget."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    clock["t"] += 2.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    peer_ready_at = clock["t"]
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: False
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 0.5
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.0
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_transfer_is_timed_from_when_its_peers_asked(clock) -> None:
+    """Peers that ask between two checks start the transfer clock themselves.
+
+    The check may first see the send only after the peers asked, e.g. after a
+    long executor iteration; the time before they asked is still not charged.
+    """
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(1)
+    h.send(req)
+    peer_ready_at = clock["t"] + 2.5
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 3.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 0.6
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_send_whose_peer_never_asks_still_times_out(clock) -> None:
+    """The deadline is the only thing that ends a send whose peer never asks,
+    so the peer wait is bounded."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    ceiling_s = coordinator_module._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER * 1.0
+
+    clock["t"] += ceiling_s
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.5
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
 
 
 def test_timeout_check_is_inert_without_a_configured_timeout(clock) -> None:
@@ -808,6 +876,92 @@ def test_consecutive_sends_release_every_pinned_block_exactly_once() -> None:
 
 
 # -- pacing ------------------------------------------------------------------
+
+
+def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
+    """Fleet liveness must not hide a rank-local allocation deadlock."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [_Harness(dist=group.rank(rank), enable_attention_dp=True) for rank in range(2)]
+    schedulers = []
+    for h in ranks:
+        manager = Mock(
+            spec=KVCacheManagerV2,
+            enable_joint_kv_cache_reuse=False,
+            enable_block_reuse=False,
+            can_share_inflight_prefix=False,
+            tokens_per_block=16,
+            _has_cp_helix=False,
+            inforward_snapshot_rows=0,
+            has_cache_tier_below_gpu=False,
+            kv_connector_manager=None,
+        )
+        manager.has_pending_preemption.return_value = False
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=1,
+            max_num_tokens=16,
+            kv_cache_manager=manager,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            enable_prefix_aware_scheduling=False,
+        )
+        scheduler._DEADLOCK_STALL_ITERS = 1
+        scheduler.set_retiring_gen_receives_probe(
+            lambda coordinator=h.coordinator: coordinator.has_local_retiring_gen_receives
+        )
+        schedulers.append(scheduler)
+
+    blocked = _Request(
+        10,
+        state_value=LlmRequestState.CONTEXT_INIT.value,
+        is_generation_in_progress_state=False,
+    )
+
+    def detect_stall(rank: int) -> None:
+        """Run the real deadlock detector against the selected rank's ownership.
+
+        Args:
+            rank: Scheduler rank to check.
+        """
+        schedulers[rank]._detect_deadlock([blocked], set(), [blocked], set(), made_progress=False)
+
+    # A newly retained local receive is visible before the next fleet vote.
+    ranks[1].coordinator._retiring_gen_receives[1] = _Request(1)
+    assert not any(h.coordinator.has_retiring_gen_receives for h in ranks)
+    detect_stall(1)
+    assert schedulers[1]._stalled_schedules == 0
+
+    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        detect_stall(0)
+    detect_stall(1)
+    assert schedulers[1]._stalled_schedules == 0
+
+    # Local retirement is equally visible before the fleet snapshot refreshes.
+    ranks[1].coordinator._retiring_gen_receives.clear()
+    assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        detect_stall(1)
+
+
+def test_pace_idle_observes_off_list_receive_retirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pace retained receives even after logical requests leave the active list.
+
+    Args:
+        monkeypatch: Replaces wall-clock sleeping with an observable boundary.
+    """
+    sleep = Mock()
+    monkeypatch.setattr(coordinator_module.time, "sleep", sleep)
+    h = _Harness()
+    h.coordinator._retiring_gen_receives[1] = _Request(1)
+    assert h.active == []
+
+    h.coordinator.pace_idle()
+    sleep.assert_called_once_with(0.001)
+
+    h.coordinator._retiring_gen_receives.clear()
+    sleep.reset_mock()
+    h.coordinator.pace_idle()
+    sleep.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -151,6 +151,8 @@ class GPUClockLock:
         Returns the clock frequencies from gpu_configs.yml
         """
         if self._gpu_handles and len(self._gpu_handles) > 0:
+            config_path = os.path.join(os.path.dirname(__file__),
+                                       "../../perf_configs/gpu_configs.yml")
             try:
                 # Get GPU name and clean it
                 handle = self._gpu_handles[0]
@@ -158,10 +160,6 @@ class GPUClockLock:
                 cleaned_gpu_name = clean_device_product_name(gpu_name)
 
                 # Load clock frequencies from gpu_configs.yml
-                config_path = os.path.join(
-                    os.path.dirname(__file__),
-                    "../../perf_configs/gpu_configs.yml")
-
                 with open(config_path, 'r') as f:
                     gpu_configs = yaml.safe_load(f)
 

@@ -24,22 +24,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
-    cublas_mm as mtp_cublas_mm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as mtp_cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (
     qwen4_exp_gated_residual,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
     qwen4_exp_hc_inject_norm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
     flashinfer_gemma_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as MOD,
 )
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import unittest
 import weakref
 from ast import literal_eval
@@ -26,6 +27,8 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+from tensorrt_llm._torch.distributed import ops as distributed_ops
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
@@ -42,7 +45,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -652,19 +655,45 @@ def test_model_engine_rejects_encode_only() -> None:
         )
 
 
-class ModelEngineTestCase(unittest.TestCase):
-    def test_breakable_rejects_multimodal_models(self) -> None:
-        engine = object.__new__(ModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-        engine.input_processor = None
-        engine.llm_args = SimpleNamespace(
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+@pytest.mark.parametrize("mm_encoder_only", [False, True])
+def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
+    monkeypatch: pytest.MonkeyPatch, backend: str, mm_encoder_only: bool
+) -> None:
+    model = DummyLegacyMultimodalIndexModel()
+    model.model_config = SimpleNamespace(is_generation=not mm_encoder_only)
+    llm_args = TorchLlmArgs(
+        model="dummy", mm_encoder_only=mm_encoder_only, prefill_cuda_graph_backend=backend
+    )
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(
+        model_engine_module,
+        "create_input_processor",
+        Mock(return_value=Mock(spec=BaseMultimodalInputProcessor)),
+    )
+    monkeypatch.setattr(
+        ModelEngine,
+        "_init_from_model",
+        Mock(side_effect=RuntimeError("model configuration resolved")),
+    )
+    monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
+    engine = ModelEngine.__new__(ModelEngine)
+    rejects_breakable = not mm_encoder_only and backend == "breakable"
+    expected_error = ValueError if rejects_breakable else RuntimeError
+    message = "multimodal models" if rejects_breakable else "model configuration resolved"
+    with pytest.raises(expected_error, match=message):
+        ModelEngine.__init__(
+            engine, model_path="dummy", llm_args=llm_args, mapping=Mapping(), model=model
         )
 
-        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
-        with self.assertRaisesRegex(ValueError, "multimodal models"):
-            engine._validate_breakable_cuda_graph_compatibility()
+    expected_backend = "disabled" if mm_encoder_only else backend
+    assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(expected_backend)
+    if mm_encoder_only:
+        assert engine.llm_args.torch_compile_config is None
 
+
+class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)
         engine.model = Mock(spec=DecoderModelForCausalLM)
@@ -777,7 +806,7 @@ class ModelEngineTestCase(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
-        runner = Mock(spec=NoKVCacheRunner)
+        runner = Mock(spec=MultimodalEncoderRunner)
         engine = object.__new__(ModelEngine)
         engine._runner = runner
         engine._torch_compile_backend = None
@@ -1121,17 +1150,98 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
+    def test_allreduce_tuning_uses_resolved_token_budget(self) -> None:
+        """Use the post-clamp budget, independently of the encoder configuration."""
+        engine = object.__new__(ModelEngine)
+        engine.llm_args = SimpleNamespace(enable_autotuner=True)
+        engine.max_seq_len = 2048
+        engine.batch_size = 2
+        engine.encoder_max_num_tokens = 65536
+        engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
+        for configured, expected in (
+            (40000, 4096),
+            (None, 4096),
+            (3000, 3000),
+        ):
+            with (
+                self.subTest(configured=configured),
+                patch.object(AllReduceRunner, "configure_tuning_buckets") as configure,
+                patch.object(model_engine_module, "resolve_max_seq_len", return_value=2048),
+            ):
+                engine.max_num_tokens = configured
+                engine._init_model_capacity()
+                engine._configure_allreduce_tuning()
+                configure.assert_called_once_with(expected)
+        engine.llm_args.enable_autotuner = False
+        with patch.object(AllReduceRunner, "configure_tuning_buckets") as configure:
+            engine._configure_allreduce_tuning()
+            configure.assert_not_called()
+
+    @pytest.mark.cpu_only
+    def test_allreduce_configuration_precedes_runner_warmup(self) -> None:
+        engine = object.__new__(ModelEngine)
+        engine._runner = Mock(spec=model_engine_module.ScheduledModelRunner)
+        events = []
+        engine._runner.warmup.side_effect = lambda *args: events.append("warmup")
+        with patch.object(
+            engine,
+            "_configure_allreduce_tuning",
+            side_effect=lambda: events.append("configure"),
+        ):
+            engine._warmup_impl(Mock(spec=ResourceManager))
+        self.assertEqual(events, ["configure", "warmup"])
+
+    @pytest.mark.cpu_only
+    def test_allreduce_forward_routes_tuning_and_inference(self) -> None:
+        """Select Python profiling or native dispatch without executing a collective."""
+        layer = object.__new__(distributed_ops.AllReduce)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = SimpleNamespace(tp_size=2, tp_group=[0, 1])
+        layer.strategy = distributed_ops.AllReduceStrategy.AUTO
+        layer.symm_mem_allreduce = None
+        layer.mnnvl_allreduce = None
+        layer._disable_mpi = False
+        layer.workspace = None
+        inputs = torch.ones(2, 4)
+        output = torch.zeros_like(inputs)
+        with (
+            patch.dict(os.environ, {"TLLM_DISABLE_ALLREDUCE_AUTOTUNE": "0"}),
+            patch.object(distributed_ops, "_ALLREDUCE_AUTOTUNER_TUNING_MODE", False),
+            patch.object(torch.ops.trtllm, "tunable_allreduce", return_value=[output]) as tunable,
+            patch.object(torch.ops.trtllm, "autotuned_allreduce", return_value=[output]) as native,
+        ):
+            for tuning in (True, False):
+                for exclude_nccl_symmetric in (True, False):
+                    with self.subTest(tuning=tuning, exclude_nccl_symmetric=exclude_nccl_symmetric):
+                        layer._exclude_nccl_symmetric = exclude_nccl_symmetric
+                        tunable.reset_mock()
+                        native.reset_mock()
+                        distributed_ops.set_allreduce_autotuner_tuning_mode(tuning)
+                        self.assertIs(layer.forward(inputs), output)
+                        use_python = tuning or exclude_nccl_symmetric
+                        selected, unused = (tunable, native) if use_python else (native, tunable)
+                        selected.assert_called_once()
+                        self.assertIs(selected.call_args.kwargs["input"], inputs)
+                        if use_python:
+                            self.assertEqual(
+                                selected.call_args.kwargs["exclude_nccl_symmetric"],
+                                exclude_nccl_symmetric,
+                            )
+                        unused.assert_not_called()
+
+    @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(ModelEngine)
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=NoKVCacheRunner)
+        model_engine._runner = Mock(spec=MultimodalEncoderRunner)
         runner = model_engine._runner
-        runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
-        runner.warmup.side_effect = NoKVCacheRunner.warmup.__get__(runner)
+        runner._validate_resources = MultimodalEncoderRunner._validate_resources.__get__(runner)
+        runner.warmup.side_effect = MultimodalEncoderRunner.warmup.__get__(runner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -1233,7 +1343,7 @@ def test_engine_passes_call_state_and_returns_length_update(
     is_dummy: bool,
     enable_spec_decode: bool,
 ) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     outputs = {"logits": object()}
     if effective_length is not None:
         outputs["runtime_draft_len"] = effective_length
@@ -1415,7 +1525,7 @@ def test_layerwise_nvtx_flag_controls_real_forward_markers(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fails", [False, True])
 def test_warmup_restores_serving_state_after_success_or_failure(fails: bool) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
     engine._metrics = {}
     balancer = engine.moe_load_balancer = Mock()

@@ -6,9 +6,13 @@ from __future__ import annotations
 import types
 from unittest.mock import Mock
 
+import torch
+from _torch.pyexecutor.multimodal_utils import make_mm_request
+
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 
 
@@ -63,6 +67,34 @@ def test_recompute_pause_skips_request_finished_during_overlap() -> None:
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor.sampler.release_request.assert_called_once_with(request)
     request.reset_for_recompute.assert_not_called()
+
+
+def test_recompute_pause_keeps_multimodal_inputs_for_replay() -> None:
+    """A recompute-paused request replays its prefill, so pausing must leave its
+    multimodal payload and its encoder-cache references in place."""
+    cache = TensorLRUCache(16)
+    executor = _make_executor(None)
+    executor.model_engine = types.SimpleNamespace(mm_encoder_cache=cache)
+    request = make_mm_request(7, [4, 4], interleaved=True)
+    state = request.py_mm_encoder_state
+    cache_key = ("mm_transient", request.request_id, 1)
+    cache.acquire(cache_key, 4, retain_after_release=False)
+    cache.commit(cache_key, torch.ones(1))
+    state.set_item_cache_key(1, cache_key, ready=True)
+    # Paused after a first chunk that covered item 0.
+    request.context_current_position = 2
+    executor.active_requests = [request]
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.recompute_paused_requests = [request]
+
+    executor._terminate_recompute_paused_requests(scheduled_batch)
+    executor._pause_recompute_paused_requests(scheduled_batch)
+
+    assert request.context_current_position == 0
+    assert request.py_mm_encoder_state is state
+    assert state.item_cache_keys == [None, cache_key]
+    assert "image" in request.py_multimodal_data
+    assert cache.stats().in_use_bytes == 4
 
 
 def test_recompute_pause_defers_reset_until_pp_consensus() -> None:

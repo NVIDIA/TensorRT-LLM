@@ -16,7 +16,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models import glm_moe_dsa
+from tensorrt_llm._torch.modeling_v2.models import glm_moe_dsa
 
 # Load the Python bridge under a private package so CPU reference tests do not
 # initialize the CUDA-only target or alter its production import state.
