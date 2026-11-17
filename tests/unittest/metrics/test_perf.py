@@ -237,6 +237,7 @@ def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> Non
         prev_device_step_time_ms=1.0,
         scheduler_mode="overlap",
         gpu_forward_time_ms=2.0,
+        mm_encoder_stats={"gpuTimesMS": [2.5]},
         executor_loop=loop,
     )
     expected = {
@@ -248,6 +249,7 @@ def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> Non
         "gpuForwardTimeMS": 2.0,
         "schedulerMode": "overlap",
         "executorLoop": loop,
+        "multimodalEncoderStats": {"gpuTimesMS": [2.5]},
     }
     if tp_rank is None:
         expected["attentionDpRank"] = 2

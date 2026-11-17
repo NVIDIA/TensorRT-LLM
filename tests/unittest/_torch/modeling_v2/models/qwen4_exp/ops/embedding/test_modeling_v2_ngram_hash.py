@@ -45,7 +45,7 @@ NGRAM_HEADS = len(CKPT_HEAD_VOCAB_SIZES)
 PADDED_TABLE_ROWS = 320001536  # sum(head_vocab_sizes) rounded up to a multiple of 128
 
 
-def _constants():
+def _constants() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.tensor(CKPT_MULTIPLIERS, dtype=torch.long, device=DEV),
         torch.tensor(CKPT_HEAD_VOCAB_SIZES, dtype=torch.long, device=DEV),
@@ -143,4 +143,7 @@ def test_cuda_graph_capture_and_replay(windows) -> None:
     ids.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(captured, op.reference(fresh, *constants, EOS, 1))
+    assert torch.equal(
+        captured,
+        op.reference(fresh, *constants, EOS, 1),
+    )

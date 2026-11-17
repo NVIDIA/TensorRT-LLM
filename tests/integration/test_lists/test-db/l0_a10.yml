@@ -54,7 +54,6 @@ l0_a10:
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py
-  - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/inputs/test_prefix_token_cache.py
@@ -255,7 +254,7 @@ l0_a10:
   - thirdparty/test_git_modules.py::test_gitmodules
   # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
-  - unittest/kv_cache_manager_v2_tests # 4 min
+  - unittest/kv_cache_manager_v2_tests
   - unittest/api_stability
   - unittest/bindings
 - condition:

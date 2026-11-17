@@ -467,6 +467,7 @@ def test_separate_replay_slots_match_coupled(
             act = coupled.inputs()
             a, b = _gates(coupled, act, True)
             outs = []
+            ref = None
             for side in sides:
                 kw = dict(side.kwargs(layer, act), g=a, beta=b, launch_with_pdl=True)
                 if in_kernel:
@@ -623,9 +624,11 @@ def test_precompile_covers_every_step(heads, separate) -> None:
     replay slot (`_ReplaySlotBench`)."""
     t, partition_from = 4, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     width = trep.REPLAY_WORK_ITEM_WIDTH
+    call_h, call_hv = heads
     kernels = cr.precompile(
         t,
-        *heads,
+        call_h,
+        call_hv,
         40,
         pdl=True,
         partition_from=partition_from,

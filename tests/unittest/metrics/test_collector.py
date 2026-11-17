@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+from collections.abc import Iterator
 from typing import Dict
 
 import pytest
@@ -28,18 +29,17 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
-def clean_registry():
+def clean_registry() -> Iterator[None]:
     """Unregister all custom collectors between tests to avoid duplicate metric errors."""
-    collectors_to_remove = []
-    for collector in REGISTRY._names_to_collectors.values():
-        if hasattr(collector, "_name") and collector._name.startswith("trtllm_"):
-            collectors_to_remove.append(collector)
-    for collector in set(collectors_to_remove):
-        try:
-            REGISTRY.unregister(collector)
-        except Exception:
-            pass
+
+    def clear() -> None:
+        for metric in tuple(REGISTRY._collector_to_names):
+            if getattr(metric, "_name", "").startswith("trtllm_"):
+                REGISTRY.unregister(metric)
+
+    clear()
     yield
+    clear()
 
 
 @pytest.fixture
@@ -124,6 +124,40 @@ class TestIterationStatsTopLevel:
     def test_iteration_latency_ms_to_seconds(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
         assert _get_gauge_value(collector, "iteration_latency_seconds") == pytest.approx(0.0155)
+
+    def test_encoder_samples_preserve_calls_and_convert_units(self, collector):
+        collector.log_iteration_stats({"multimodalEncoderStats": {"gpuTimesMS": [2.0, 4.0]}})
+        collector.log_iteration_stats({})
+        labels = collector.labels
+        assert (
+            REGISTRY.get_sample_value("trtllm_multimodal_encoder_gpu_time_seconds_count", labels)
+            == 2
+        )
+        assert REGISTRY.get_sample_value(
+            "trtllm_multimodal_encoder_gpu_time_seconds_sum", labels
+        ) == pytest.approx(0.006)
+
+    def test_input_processing_separates_stages_and_worker_queue(self, collector):
+        collector.log_input_processing("media_load", 0.25)
+        collector.log_input_processing("processor", 0.04)
+        collector.log_input_processing("processor_queue", 0.1)
+        for stage, elapsed in (("media_load", 0.25), ("processor", 0.04)):
+            assert REGISTRY.get_sample_value(
+                "trtllm_input_processing_seconds_sum", {**collector.labels, "stage": stage}
+            ) == pytest.approx(elapsed)
+        assert REGISTRY.get_sample_value(
+            "trtllm_input_processing_queue_seconds_sum", collector.labels
+        ) == pytest.approx(0.1)
+
+    def test_media_processing_is_labeled_per_item(self, collector):
+        collector.log_input_processing("download", 0.1, "image")
+        collector.log_input_processing("decode", 0.02, "image")
+        collector.log_input_processing("decode", 0.03, "image")
+        labels = {**collector.labels, "stage": "decode", "modality": "image"}
+        assert REGISTRY.get_sample_value("trtllm_media_processing_seconds_count", labels) == 2
+        assert REGISTRY.get_sample_value(
+            "trtllm_media_processing_seconds_sum", labels
+        ) == pytest.approx(0.05)
 
     def test_memory_usage(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)

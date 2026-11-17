@@ -297,7 +297,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertIs(result.kwargs, fast_inputs.kwargs)
         self.assertEqual(result.runtime_draft_len, 3)
         inputs.guided_decoder.add_batch.assert_called_once_with(
-            batch, new_tokens=new_tokens, runtime_draft_len=3
+            batch, new_tokens=new_tokens, runtime_draft_len=3, is_cuda_graph=False
         )
         inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
             batch, new_tokens, None, None, True

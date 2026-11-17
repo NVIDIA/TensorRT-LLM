@@ -256,7 +256,26 @@ def test_input_contract_and_mutation_schema():
     writes = {a.name for a in schema.arguments if a.alias_info and a.alias_info.is_write}
     assert writes == {"row_counters", "workspace"}
     with pytest.raises(RuntimeError, match="workspace"):
-        op(*inputs, state.row_counters, state.workspace[:16])
+        (
+            call_logits,
+            call_temperatures,
+            call_top_ks,
+            call_top_ps,
+            call_min_ps,
+            call_seed,
+            call_offset,
+        ) = inputs
+        op(
+            call_logits,
+            call_temperatures,
+            call_top_ks,
+            call_top_ps,
+            call_min_ps,
+            call_seed,
+            call_offset,
+            state.row_counters,
+            state.workspace[:16],
+        )
 
 
 @pytest.mark.parametrize("k,min_p", [(0, 0.0), (1, 0.0), (8, 0.05), (VOCAB_SIZE, 1.0)])

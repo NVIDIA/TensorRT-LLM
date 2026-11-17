@@ -105,7 +105,14 @@ def _coordinator(
         transfer_manager=None,
         kv_cache_manager=None,
         dist=SimpleNamespace(
-            rank=4, world_size=8, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1, cp_size=1
+            rank=4,
+            tp_rank=1,
+            pp_rank=0,
+            cp_rank=0,
+            tp_size=1,
+            pp_size=1,
+            cp_size=1,
+            world_size=1,
         ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
         registry=SimpleNamespace(active_requests=lambda: list(active_requests)),

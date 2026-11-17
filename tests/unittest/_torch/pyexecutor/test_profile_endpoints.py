@@ -53,6 +53,7 @@ def _bare_executor():
     # the bare-bones test double so ``executor.start_profile``,
     # ``executor.stop_profile``, etc. delegate correctly.
     executor._perf_metrics = PerfMetricsCollector()
+    executor.perf_manager = SimpleNamespace(take_encoder_gpu_times_ms=lambda: [])
     executor._profile_manager = PyExecutorProfileManager(executor)
     return executor
 

@@ -215,7 +215,7 @@ class _MlaCache:
         self.mgr.shutdown()
 
 
-def _inputs(seed: int, m: int, heads: int):
+def _inputs(seed: int, m: int, heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """q (fused_q rows), the v_b weight and the gate (sigmoid values at GATE_COL0 + 128 h)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     q = (torch.randn(m, heads * DQK, generator=gen, device="cuda") * 0.5).bfloat16()

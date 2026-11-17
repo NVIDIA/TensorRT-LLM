@@ -155,6 +155,7 @@ class TestStatsSerializer:
             prev_device_step_time_ms=1.25,
             scheduler_mode="overlap",
             gpu_forward_time_ms=4.25,
+            mm_encoder_stats={"gpuTimesMS": [2.5]},
             executor_loop=loop,
         )
         expected = {
@@ -166,11 +167,12 @@ class TestStatsSerializer:
             "schedulerMode": "overlap",
             "gpuForwardTimeMS": 4.25,
             "executorLoop": loop,
+            "multimodalEncoderStats": {"gpuTimesMS": [2.5]},
         }
         assert json.loads(BaseWorker._stats_serializer(record)) == expected
         assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
 
-    @pytest.mark.parametrize("field_count", range(2, 11))
+    @pytest.mark.parametrize("field_count", range(2, 12))
     def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
         iter_stats = _make_mock_iteration_stats()
         loop = {"kind": "loop", "per_iter": {"iter": 9}}
@@ -183,6 +185,7 @@ class TestStatsSerializer:
             1.25,
             "overlap",
             4.25,
+            {"gpuTimesMS": [2.5]},
             loop,
             "future field",
         )[:field_count]
@@ -195,7 +198,8 @@ class TestStatsSerializer:
             (6, "prevDeviceStepTimeMS", 1.25),
             (7, "schedulerMode", "overlap"),
             (8, "gpuForwardTimeMS", 4.25),
-            (9, "executorLoop", loop),
+            (9, "multimodalEncoderStats", {"gpuTimesMS": [2.5]}),
+            (10, "executorLoop", loop),
         ):
             if field_count >= required_fields:
                 expected[key] = value
@@ -208,6 +212,15 @@ class TestStatsSerializer:
             "kvCacheStats": {"maxNumBlocks": 10, "usedNumBlocks": 4},
         }
         assert json.loads(BaseWorker._stats_serializer(("per_rank_dict", stats))) == stats
+
+    @pytest.mark.parametrize("times", [[], [0.0, 2.5]])
+    def test_serializer_encoder_gpu_samples(self, times):
+        iter_stats = _make_mock_iteration_stats()
+        stats = (iter_stats, None, None, 0, None, None, "overlap", None, {"gpuTimesMS": times})
+        result = json.loads(BaseWorker._stats_serializer(stats))
+        assert result["multimodalEncoderStats"]["gpuTimesMS"] == times
+        legacy = json.loads(BaseWorker._stats_serializer(stats[:8]))
+        assert "multimodalEncoderStats" not in legacy
 
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
@@ -389,7 +402,7 @@ class TestStatsSerializer:
             },
         }
         result = BaseWorker._stats_serializer(
-            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25, loop)
+            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25, None, loop)
         )
         data = json.loads(result)
         assert data["executorLoop"] == loop

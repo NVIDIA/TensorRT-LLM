@@ -38,7 +38,7 @@ from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          ModelExpressConfig,
+                                          ModelExpressConfig, MultimodalConfig,
                                           PrefillCudaGraphBackend,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
@@ -203,6 +203,56 @@ def _with_fp8_block_scale_weights(
 _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
     _with_fp8_block_scale_weights(_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
                                   {90}))
+
+
+def _validate_encoder_attention_backend_support(
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
+    """Reject unsupported encoder selections before allocating model weights."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    supported = getattr(model_cls, "supported_encoder_attention_backends", {})
+    model_name = model_cls.__name__ if model_cls is not None else "The model"
+    for encoder, backend in mm_config.encoder_attention_backend.items():
+        if not supported or encoder in supported and not supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder's attention backend cannot be changed "
+                f"for {model_name}")
+        if encoder not in supported:
+            raise ValueError(f"Unknown encoder {encoder!r} for {model_name}; "
+                             f"available encoders: {sorted(supported)}")
+        if backend not in supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder does not support attention backend {backend!r}; "
+                f"supported backends: {sorted(supported[encoder])}")
+        if backend == "FLASHINFER":
+            from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+            if not IS_FLASHINFER_AVAILABLE:
+                raise ValueError(
+                    f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
+                )
+
+
+def _validate_encoder_attention_backend_enabled(
+        mm_config: MultimodalConfig | None,
+        pretrained_config: object,
+        *,
+        disable_mm_encoder: bool = False) -> None:
+    """Reject selections for encoders that the effective model config omits."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    if disable_mm_encoder:
+        # Text-only runs, such as trtllm-bench without --modality, reuse
+        # serving configs. A skipped encoder never applies the selection, and
+        # models that ignore disable_mm_encoder still build it with the setting.
+        logger.info(
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True")
+        return
+    for encoder in mm_config.encoder_attention_backend:
+        if getattr(pretrained_config, f"{encoder}_config", None) is None:
+            raise ValueError(
+                f"The {encoder} encoder is not enabled in the model config")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -942,6 +992,28 @@ def _checkpoint_io_policy_metadata(
     }
 
 
+def captured_cuda_graph_batch_sizes(
+        llm_args: TorchLlmArgs, max_num_tokens: int,
+        spec_config: Optional[DecodingBaseConfig]) -> Tuple[int, ...]:
+    """The decode CUDA-graph batch sizes the engine captures
+    (``engine.cuda_graph.plan_cuda_graphs``): the configured ones within
+    max_batch_size and max_num_tokens // tokens per request; () without
+    CUDA graphs. Sizes above them never run, so buffers sized by the largest
+    graph batch (``ModelConfig.cuda_graph_batch_sizes``) stop there."""
+    config = llm_args.cuda_graph_config
+    if config is None or not config.batch_sizes:
+        return ()
+    from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+    max_batch_size = (llm_args.max_batch_size if llm_args.max_batch_size
+                      is not None else max(config.batch_sizes))
+    tokens_per_request = (spec_config.tokens_per_gen_step
+                          if spec_config is not None else 1)
+    return tuple(
+        filter_cuda_graph_batch_sizes(list(config.batch_sizes), max_batch_size,
+                                      max_num_tokens, tokens_per_request,
+                                      config.enable_padding))
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -1178,6 +1250,9 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
+
+        _validate_encoder_attention_backend_support(preference_cls,
+                                                    llm_args.multimodal_config)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -2363,9 +2438,8 @@ class ModelLoader:
             mnnvl_allreduce_fp8_payload=self.llm_args.
             mnnvl_allreduce_fp8_payload,
             replicate_embedding=self.llm_args.replicate_embedding,
-            cuda_graph_batch_sizes=tuple(
-                self.llm_args.cuda_graph_config.batch_sizes or
-                ()) if self.llm_args.cuda_graph_config else (),
+            cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
+                self.llm_args, self.max_num_tokens, self.spec_config),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
@@ -2403,6 +2477,11 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Check after model_kwargs, which can remove an encoder.
+        _validate_encoder_attention_backend_enabled(
+            self.llm_args.multimodal_config,
+            config.pretrained_config,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder)
 
         # Decided here, after `load_config_and_apply_defaults` resolved the
         # built-in class and applied its model defaults to `llm_args`: a

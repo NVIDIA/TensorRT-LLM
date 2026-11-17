@@ -20,6 +20,8 @@ import pytest
 
 from tensorrt_llm._torch.weight_sharing import ArtifactIdentity
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _write_checkpoint(path: Path, weights: bytes = b"weights") -> None:
     path.mkdir(parents=True)

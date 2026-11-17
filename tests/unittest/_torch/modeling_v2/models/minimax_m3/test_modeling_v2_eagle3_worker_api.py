@@ -58,7 +58,6 @@ def _load_dispatch(path: Path, fused: bool):
                 keywords=[],
                 body=[parent],
                 decorator_list=[],
-                type_params=[],
             ),
             ast.ClassDef(
                 name="Worker",
@@ -66,7 +65,6 @@ def _load_dispatch(path: Path, fused: bool):
                 keywords=[],
                 body=[method],
                 decorator_list=[],
-                type_params=[],
             ),
         ],
         type_ignores=[],
@@ -131,10 +129,11 @@ def test_external_shared_kv_keeps_the_parent_tensor_return_contract(path: Path):
     forward = next(
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_forward_impl"
     )
+    # ast.walk: the parent nests the branch in a try / finally (the side-stream join).
     branch = copy.deepcopy(
         next(
             n
-            for n in forward.body
+            for n in ast.walk(forward)
             if isinstance(n, ast.If)
             and ast.unparse(n.test) == "self._uses_external_shared_target_kv"
         )

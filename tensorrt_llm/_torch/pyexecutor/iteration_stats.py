@@ -30,6 +30,7 @@ class IterationStatsRecord(NamedTuple):
     prev_device_step_time_ms: float | None = None
     scheduler_mode: Literal["overlap", "non_overlap"] | None = None
     gpu_forward_time_ms: float | None = None
+    mm_encoder_stats: dict[str, object] | None = None
     executor_loop: dict[str, object] | None = None
 
     @classmethod
@@ -79,6 +80,7 @@ class IterationStatsRecord(NamedTuple):
             ("prevDeviceStepTimeMS", self.prev_device_step_time_ms),
             ("gpuForwardTimeMS", self.gpu_forward_time_ms),
             ("schedulerMode", self.scheduler_mode),
+            ("multimodalEncoderStats", self.mm_encoder_stats),
             ("executorLoop", self.executor_loop),
         )
         for name, value in optional_fields:
