@@ -21,7 +21,6 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
-from .config import resolve_fp4_mla_lazy_anchor_rebase_log2
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 from .cutedsl_common import (
     CUDA_GRID_Z_MAX,
@@ -116,7 +115,9 @@ SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_PAGE_PLAN_PROFILE_KV // TRTLLM_PAGE_SIZE
 SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 2
 SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
-SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = resolve_fp4_mla_lazy_anchor_rebase_log2(1.0)
+# Lazy-anchor rebase threshold (log2), fixed for this kernel: TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 tunes the 2x and 4x
+# kernels only.
+SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = 1.0
 SMEM_P4_PIPELINE_DIRECT_TARGET_PAGE_SIZE = 128
 RUBIN_TMEM_CAPACITY_KB = 288
 TMEM_BYTES_PER_COL = 512

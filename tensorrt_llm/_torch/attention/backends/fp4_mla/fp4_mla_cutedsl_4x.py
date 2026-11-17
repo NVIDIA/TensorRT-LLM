@@ -148,6 +148,12 @@ SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_RUNTIME_MAX_PAGES
 SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 2
 SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
+# Lazy-anchor rebase threshold (log2): a tile rescales the running O accumulator ("correction") only when the row
+# maximum grew by more than this since the current anchor. Every rebase drains the PV pipeline of all warps (and of
+# the whole 4-CTA cluster in the 4x kernel). Measured 2026-11-01 (DS-R1 shapes, logits scaled x1..x32): with 1.0,
+# realistic logits (x4) cost the 4x kernel 18-19 % and the 2x kernel 2-6 %; 4.0 removes the stalls up to x8 logits and
+# 6.0 up to ~x16 with FP32 cosine unchanged (the P scale saturates only above ~6.5 log2 at kv_gs 89.6; 8.0 breaks
+# accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it within [0, 8].
 SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = resolve_fp4_mla_lazy_anchor_rebase_log2(4.0)
 
 
