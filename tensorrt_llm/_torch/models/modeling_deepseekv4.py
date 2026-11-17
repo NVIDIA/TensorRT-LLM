@@ -3539,11 +3539,15 @@ class DeepseekV4Model(DecoderModel):
 
 # The step-loop hooks validated on DeepSeek-V4 and V4.1.
 _DEEPSEEK_V4_RUNTIME_HOOKS = RuntimeHooks(
-    stage_decode_inputs=True, prioritize_decode_graphs=True, prompts_to_owners=True
+    stage_decode_inputs=True,
+    prioritize_decode_graphs=True,
+    disagg_gen_receive_ahead=True,
+    prompts_to_owners=True,
 )
 _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
     stage_decode_inputs=True,
     prioritize_decode_graphs=True,
+    disagg_gen_receive_ahead=True,
     loop_on_execution_stream=True,
     prompts_to_owners=True,
     skip_adp_count_gather=True,

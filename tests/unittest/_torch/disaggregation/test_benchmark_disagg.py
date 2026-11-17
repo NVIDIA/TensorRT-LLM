@@ -964,6 +964,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
         ex.adp_router = Mock()
+        ex.adp_router.pop_requests.return_value = ([], {})
         return ex
 
     @staticmethod
@@ -1745,6 +1746,7 @@ class TestFillPhaseEndToEnd:
         # pulls only tp_size requests per iteration, rather than the full
         # tp_size * max_batch_size queue.
         ex.adp_router = Mock()
+        ex.adp_router.pop_requests.return_value = ([], {})
         ex._pop_from_waiting_queue(
             waiting_queue=Mock(),
             total_num_active_requests=0,

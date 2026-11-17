@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -17,7 +18,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm.bindings.executor import Request
+from tensorrt_llm.bindings.executor import Request, RequestType
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -175,3 +177,62 @@ def test_adp_replacements_acquire_slots_before_retiring_requests_release_them(
         for request in requests:
             manager.free_resources(request)
         assert len(manager.slot_manager.free_slots) == capacity
+
+
+def _generation_only_item(request_id: int, child_req_ids=None) -> RequestQueueItem:
+    request = SimpleNamespace(
+        request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        num_input_tokens=2,
+        py_scheduling_params=None,
+        priority=DEFAULT_REQUEST_PRIORITY,
+    )
+    return RequestQueueItem(request_id, request, child_req_ids=child_req_ids)
+
+
+@pytest.mark.parametrize("blocker", ["context", "child-bearing"])
+def test_adp_receive_ahead_admits_only_the_leading_generation_only_run(blocker: str) -> None:
+    # Under attention DP the executor gives batch 3 two slots, leaving the padding dummy a seat.
+    rank_count, batch_size, slots = 2, 3, 2
+    mapping = Mapping(world_size=rank_count, tp_size=rank_count, enable_attention_dp=True)
+    headroom = should_enable_overlap_headroom(mapping, False, kv_cache_manager_is_v2=True)
+    capacity = compute_max_num_sequences(
+        mapping, batch_size, False, enable_overlap_headroom=headroom
+    )
+    executors = [
+        _admission_executor(rank, rank_count, batch_size, headroom) for rank in range(rank_count)
+    ]
+    queues = [FCFSWaitingQueue() for _ in executors]
+    _enqueue_cohort(queues, 1, rank_count * batch_size)
+    resident = _fetch_all_ranks(executors, queues, [[] for _ in executors])
+    for requests in resident:
+        for request in requests:
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    # Rank 0 decodes a full batch; rank 1 decodes one request beside a retiring one.
+    resident[1][0].state = LlmRequestState.GENERATION_TO_COMPLETE
+
+    for queue in queues:
+        queue.add_requests(
+            [
+                _generation_only_item(101),
+                _generation_only_item(102),
+                RequestQueueItem(104, Request(input_token_ids=[1, 2], max_tokens=1))
+                if blocker == "context"
+                else _generation_only_item(104, child_req_ids=[1104]),
+                _generation_only_item(105),
+            ]
+        )
+    for executor in executors:
+        executor._receive_ahead_slots = slots
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        side_effect=lambda requests, **_: requests,
+    ):
+        incoming = _fetch_all_ranks(executors, queues, resident)
+
+    # The batches have room for one request: the rest of the leading run goes
+    # beyond them, and the blocker and the request behind it wait, though the
+    # raised room would fit the blocker too.
+    assert sorted(item.id for items in incoming for item in items) == [101, 102]
+    assert all([item.id for item in queue] == [104, 105] for queue in queues)
+    for active, items in zip(resident, incoming, strict=True):
+        assert len(active) + len(items) <= min(batch_size + slots, capacity)

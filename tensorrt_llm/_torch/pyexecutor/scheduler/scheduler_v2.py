@@ -200,6 +200,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     _num_gen_init_transfer_budget_holds = 0
     _num_ctx_decoder_hold_passes = 0
     _num_ctx_decoder_held_requests = 0
+    # Scheduling for the executor's receive-ahead admission (set_gen_init_receive_ahead).
+    _gen_init_receive_ahead = False
+    _gen_init_seats = 0
+    # (request id, free GPU blocks before its receive-ahead allocation) for the last one that did not fit.
+    _receive_ahead_floor: Optional[tuple[int, int]] = None
 
     def __init__(
         self,
@@ -451,6 +456,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         defer them and revert the allocation.
         """
         self._disagg_transfer_controller = controller
+
+    @property
+    def prioritizes_first_token_gen(self) -> bool:
+        """Whether first-token generation-only requests go ahead of running decodes
+        (TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN)."""
+        return self._prioritize_first_token_gen
+
+    def set_gen_init_receive_ahead(self, seats: int) -> None:
+        """Schedule for the executor's receive-ahead admission, whose per-rank request cap is ``seats``:
+        generation-init requests behind a full batch still allocate and start receiving, and received
+        ones join behind running decodes."""
+        self._gen_init_receive_ahead = True
+        self._gen_init_seats = seats
 
     def _pregrown_context_tokens(self, req: LlmRequest) -> int:
         """KV capacity a context request holds past its position, left by a skipped forward.
@@ -722,9 +740,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduled_beam_width = 0
         has_chunking = False
 
+        # With receive-ahead a rank holds more requests than the executor's cap, which still bounds the batch.
         budget = BudgetTracker(
             self.max_num_tokens,
-            self.max_num_requests,
+            min(self.max_num_requests, self._gen_init_seats)
+            if self._gen_init_receive_ahead
+            else self.max_num_requests,
             self.peft_cache_manager,
         )
 
@@ -760,6 +781,34 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             )
 
+        # With receive-ahead a rank holds more requests than its batch, so a received request
+        # (FIFO among them) takes only a slot that no running decode holds. A generation-init
+        # request past the batch seats receives ahead only while the GPU pools keep a free block
+        # for the next step of every request in them.
+        receive_ahead_seats = None
+        receive_ahead_closed = False
+        if self._gen_init_receive_ahead:
+            trans_complete = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value
+            requests_list.sort(key=lambda req: req.state_value == trans_complete)
+            seated = (
+                LlmRequestState.GENERATION_IN_PROGRESS.value,
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+                trans_complete,
+                self._context_init_state_value,
+                self._encoder_init_state_value,
+            )
+            # Counted over every active request: a remote-tail phase pass leaves some out.
+            receive_ahead_seats = self._gen_init_seats - sum(
+                1 for req in active_requests if req.state_value in seated
+            )
+            # A floor lasts only while the request that set it still waits to allocate.
+            if self._receive_ahead_floor is not None and not any(
+                req.py_request_id == self._receive_ahead_floor[0]
+                and req.state_value == self._disagg_gen_init_state_value
+                for req in active_requests
+            ):
+                self._receive_ahead_floor = None
+
         # Resume deadlines take precedence over the first-token preference.
         if self._gen_resumed_ids:
             requests_list.sort(key=lambda req: req.py_request_id not in self._gen_resumed_ids)
@@ -782,6 +831,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         pending_ctx: RequestList = []
         # Index of each pending context request in requests_list.
         pending_ctx_index: dict[int, int] = {}
+        # Index of the last disagg gen-init request, found once the batch is full.
+        last_gen_init_it = None
 
         # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
         # every live decode, including requests omitted from this batch.
@@ -854,12 +905,35 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
 
+                receives_ahead = receive_ahead_seats is not None and receive_ahead_seats <= 0
+                if receives_ahead and not receive_ahead_closed:
+                    free_blocks = self.kv_cache_manager.num_free_gpu_blocks()
+                    # After one did not fit, allocate again only once more blocks are free.
+                    floor = self._receive_ahead_floor
+                    receive_ahead_closed = floor is not None and free_blocks <= floor[1]
+                if receives_ahead and receive_ahead_closed:
+                    req_it += 1
+                    continue
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
+                    if receives_ahead:
+                        self._receive_ahead_floor = (req.py_request_id, free_blocks)
+                        receive_ahead_closed = True
                     req_it += 1
                     continue
+                if receives_ahead:
+                    if self.kv_cache_manager.num_free_gpu_blocks() < self._gen_init_seats:
+                        # No receive is posted yet, so its pages can go back.
+                        self.kv_cache_manager.revert_allocate_context(req)
+                        self._receive_ahead_floor = (req.py_request_id, free_blocks)
+                        receive_ahead_closed = True
+                        req_it += 1
+                        continue
+                    self._receive_ahead_floor = None
+                if receive_ahead_seats is not None:
+                    receive_ahead_seats -= 1
                 disagg_candidates.append(req)
                 if disagg_gate is not None:
                     disagg_gate.observe_candidate(req)
@@ -874,9 +948,25 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             # Budget check for non-disagg requests (disagg bypasses this
-            # because it doesn't participate in the forward pass).
+            # because it doesn't participate in the forward pass). With
+            # receive-ahead, gen-init requests behind a full batch still
+            # allocate and start receiving.
             if budget.requests_full:
-                break
+                if not self._gen_init_receive_ahead:
+                    break
+                if last_gen_init_it is None:
+                    last_gen_init_it = max(
+                        (
+                            it
+                            for it in range(req_it + 1, req_it_end)
+                            if requests_list[it].state_value == self._disagg_gen_init_state_value
+                        ),
+                        default=-1,
+                    )
+                if req_it > last_gen_init_it:
+                    break
+                req_it += 1
+                continue
 
             if not (
                 req_state_value >= self._no_schedule_until_state_value
