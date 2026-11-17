@@ -8,6 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
                     Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
                     Union)
@@ -58,6 +59,22 @@ def timing_metric(metric_name: str, metric_dict: dict[str,
     finally:
         metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
                                     time.perf_counter() - start)
+
+
+class ModelLoaderMetricNames(Enum):
+    """Names of the model loader's startup timing metrics."""
+
+    TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
+    CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
+    WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    CHECKPOINT_FINALIZATION_SECONDS = "checkpoint_finalization_seconds"
+    DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
+        "draft_checkpoint_preparation_seconds")
+    DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
+        "draft_checkpoint_finalization_seconds")
+    POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 @dataclass
@@ -299,6 +316,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
     embed_tokens: Embedding
     layers: nn.ModuleList
     norm: RMSNorm
+    # Whether a prefill forward can replay one captured graph of the whole body.
+    supports_prefill_cuda_graph: bool = True
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
@@ -521,7 +540,9 @@ def apply_quant_config_exclude_modules(
     kv_cache_quant_algo takes precedence over exclude_modules.
     kv_cache_quant_algo, if not None, is set for non-Attention
     modules too, which is the same practice as when there's no
-    exclude_modules.
+    exclude_modules. An excluded module that sets
+    _preserve_kv_cache_quant_algo keeps its own kv_cache_quant_algo
+    instead of the global one.
     """
     quant_config = model_config.quant_config
     kv_cache_quant_algo = None
@@ -565,7 +586,12 @@ def apply_quant_config_exclude_modules(
                     for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    module.quant_config = new_config
+                    if getattr(module, '_preserve_kv_cache_quant_algo', False):
+                        module.quant_config = QuantConfig(
+                            kv_cache_quant_algo=module.quant_config.
+                            kv_cache_quant_algo)
+                    else:
+                        module.quant_config = new_config
                     # Reset _weights_created so create_weights() in
                     # __post_init__ will re-create this module's weights
                     # with the updated (non-quantized) config. Some
@@ -911,6 +937,12 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether the speculative worker samples greedy and temperature-only target rows from
+        vocabulary shards; known after weight loading."""
+        return False
 
     def setup_aliases(self) -> None:
         """Wire structural Python references between modules.

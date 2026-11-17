@@ -986,9 +986,9 @@ def _build_decode_gen_schedule(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
             stage_page_ids_per_tile=stage_page_ids_per_tile,
-            # The full membership row has no static allocation extent when
-            # KV lengths are runtime. Read its immutable GMEM words on demand.
-            cache_memberships_in_smem=cfg.fixed_seqlen,
+            # Runtime query planes use a bounded prefix cache with a GMEM
+            # fallback, so its allocation never specializes sequence lengths.
+            cache_memberships_in_smem=(cfg.fixed_seqlen or cfg.query_major_memberships),
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
             num_heads_kv=num_heads_kv,

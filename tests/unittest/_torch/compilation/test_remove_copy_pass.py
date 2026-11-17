@@ -30,8 +30,9 @@ from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_sigmoid_mul_inplace,  # noqa: F401
 )
 
+pytestmark = pytest.mark.cpu_only
 
-@pytest.mark.cpu_only
+
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_remove_copy_preserves_minimax_producer_outputs(use_v2: bool) -> None:
     """Preserve query outputs and cache aliases when removing functionalization."""

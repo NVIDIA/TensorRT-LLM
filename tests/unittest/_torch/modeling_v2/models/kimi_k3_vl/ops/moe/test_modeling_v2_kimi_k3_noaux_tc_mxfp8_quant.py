@@ -7,11 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization import (
-    mxfp8_quantize as mxfp8,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
+from tensorrt_llm._torch.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
+from tensorrt_llm._torch.modeling_v2.catalog.quantization import mxfp8_quantize as mxfp8
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
     kimi_k3_noaux_tc_mxfp8_quant,
 )
 
@@ -30,7 +28,9 @@ HIDDEN = 3584
 SF_COLS = HIDDEN // 32
 
 
-def _inputs(num_tokens: int, logit_scale: float = 2.5, seed: int = 0):
+def _inputs(
+    num_tokens: int, logit_scale: float = 2.5, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=gen, device="cuda") * logit_scale
     bias = torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.1
