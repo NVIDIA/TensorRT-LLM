@@ -725,9 +725,11 @@ def evaluate(
     check is missing and runs again. A verdict whose :attr:`Verdict.inputs` are
     not the check's is dropped too (one without inputs counts as the check's).
     With an established ``marker``, a check with no verdict of its own passes
-    when an equivalent check (the same :attr:`Check.equivalence`) passed. A
-    check's own verdict always wins over an equivalent's, so a check that
-    failed here stays failed.
+    when an equivalent check (the same :attr:`Check.equivalence`) passed on
+    this very state: two checks are equivalent on one tree, and a pass that
+    stands from an earlier tree speaks for its own check alone. A check's own
+    verdict always wins over an equivalent's, so a check that failed here
+    stays failed.
     """
     latest = (
         verdicts.latest()
@@ -746,7 +748,12 @@ def evaluate(
     if marker:
         for check in contract.checks:
             verdict = latest.get(check.key)
-            if check.equivalence and verdict is not None and verdict.passed:
+            if (
+                check.equivalence
+                and verdict is not None
+                and verdict.passed
+                and _here(verdict, marker, holds)
+            ):
                 holders.setdefault(check.equivalence, check)
     passed, failed, missing, shared = [], [], [], []
     for check in contract.required():

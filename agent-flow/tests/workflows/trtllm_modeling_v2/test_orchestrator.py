@@ -234,6 +234,80 @@ def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
     assert "0, the final tree" in c.measured_where(here, status, "m1")
 
 
+def _equivalent_units():
+    """Three units' benchmarks at tp1; the core's and the multimodal unit's are one command.
+
+    As `intake derive` writes a spec: a unit that drafts has a benchmark of its own.
+    """
+    checks = tuple(
+        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER, equivalence=key)
+        for unit, key in (("core", "text"), ("multimodal", "text"), ("mtp", ""))
+    )
+    return c.Contract(checks=checks, confirm=checks[-1].key)
+
+
+def test_an_earlier_pass_of_an_equivalent_check_does_not_pass_a_check_that_failed(tmp_path):
+    contract = _equivalent_units()
+    core, multimodal, _ = contract.checks
+    status = c.ContractStatus.load(tmp_path)
+
+    def result(check, passed):
+        return SimpleNamespace(name=check.gate, member=check.member, passed=passed, detail="")
+
+    status.record("core", result(core, True), marker="m1")
+    status.record("multimodal", result(multimodal, False), marker="m2")
+    # Another task lands. The failure is due again; the core's pass on m1 says nothing of it.
+    later = c.evaluate(contract, status, marker="m3")
+    assert multimodal.key in [x.key for x in later.missing] and not later.shared
+    # On one tree, an equivalent pass does stand in for a check with no verdict there.
+    status.record("core", result(core, True), marker="m3")
+    same_tree = c.evaluate(contract, status, marker="m3")
+    assert (multimodal.key, core.key) in [(x.key, by.key) for x, by in same_tree.shared]
+
+
+def test_a_run_is_not_delivered_on_a_failure_it_measured(tmp_path):
+    contract = _equivalent_units()
+    core, multimodal, mtp = (x.key for x in contract.checks)
+    landed, ran, turns = [], [], []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            tasks = [
+                _task("core", "assemble", [core]),
+                _task("multimodal", "feature", [multimodal], deps=["core"]),
+                _task("mtp", "feature", [mtp], deps=["core"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        return PlannerAnswer("DONE", "all green")  # a planner that repairs nothing
+
+    def work(task):
+        if task.id == "mtp":  # lands once the multimodal benchmark has been judged
+            deadline = time.monotonic() + 20
+            while multimodal not in ran and time.monotonic() < deadline:
+                time.sleep(0.01)
+        landed.append(task.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        ran.append(chk.key)
+        # The multimodal landing broke the text benchmark served without drafts, from then on.
+        broken = chk.key in (core, multimodal) and len(landed) >= 2
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not broken)  # fmt: skip
+
+    services = Services(
+        plan=plan, work=work, check=check, free_gpus=lambda: 4, marker=lambda: f"m{len(landed)}"
+    )
+    status = c.ContractStatus.load(tmp_path)
+    verdict = GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run()
+    # The core passed before the break and mtp passed after it. Neither speaks for the
+    # multimodal benchmark, which the run measured once and saw fail.
+    assert landed == ["core", "multimodal", "mtp"] and ran.count(mtp) == 1
+    assert verdict != "delivered"
+    assert any("the contract does not hold" in e for turn in turns for e in turn.events)
+
+
 def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
     spec = {
         "checkpoint_path": "/ckpt/m",
