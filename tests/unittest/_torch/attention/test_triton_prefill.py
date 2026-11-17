@@ -379,8 +379,6 @@ class TestTritonPrefillNoPrefix:
 
         # Reuse the image/text batch to check compact global and sliding-window
         # masks against the dense kernel and the same independent SDPA reference.
-        image_ids = torch.zeros(total, dtype=torch.int32, device=device)
-        image_ids[48 + 5 : 48 + 25] = 1
         for window_left in (-1, 7):
             window_masks = []
             for length, mask in zip(seq_lens, masks):
@@ -404,6 +402,13 @@ class TestTritonPrefillNoPrefix:
                 page_size=1,
                 sm_scale=sm_scale,
             )
+            # Derive interval bounds from the independent dense masks, without
+            # sharing the model's interval builder with this kernel reference.
+            starts, ends = [], []
+            for mask in window_masks:
+                positions = torch.arange(mask.shape[1], device=device)
+                starts.append(torch.where(mask, positions, mask.shape[1]).min(dim=1).values)
+                ends.append(torch.where(mask, positions, -1).max(dim=1).values)
             dense_output = torch.empty_like(q)
             triton_prefill_with_custom_mask(
                 **args,
@@ -414,7 +419,8 @@ class TestTritonPrefillNoPrefix:
                 **args,
                 output=output,
                 custom_mask=None,
-                image_token_block_ids=image_ids,
+                variable_window_token_starts=torch.cat(starts).to(torch.int32),
+                variable_window_token_ends=torch.cat(ends).to(torch.int32),
                 window_left=window_left,
                 max_len_extend=max(seq_lens),
             )
