@@ -538,7 +538,7 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
-                    height=384, width=384, num_frames=124, num_inference_steps=28, seed=42
+                    height=384, width=384, num_frames=124, num_inference_steps=50, seed=42
                 ),
             )
             video = torch.as_tensor(output.video).cpu()
@@ -614,7 +614,7 @@ def test_minimax_h3_tp2_example_lpips(tmp_path):
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
-                    height=128, width=128, num_frames=124, num_inference_steps=28, seed=42
+                    height=128, width=128, num_frames=124, num_inference_steps=50, seed=42
                 ),
             )
             video = torch.as_tensor(output.video).cpu()

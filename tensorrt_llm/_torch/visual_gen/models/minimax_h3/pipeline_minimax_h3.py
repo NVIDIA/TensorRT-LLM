@@ -405,7 +405,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
+            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 50)),
         }
 
     @property
