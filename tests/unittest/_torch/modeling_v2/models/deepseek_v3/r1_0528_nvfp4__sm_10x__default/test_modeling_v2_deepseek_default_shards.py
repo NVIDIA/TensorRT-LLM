@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 import zlib
-from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -47,7 +46,6 @@ from tensorrt_llm._torch.modeling_v2.models.deepseek_v3 import routing
 from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as D,
 )
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -730,115 +728,3 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             and not (".mlp.experts." in k and not lo <= int(k.split(".")[5]) < hi)
         }
         assert read_mtp == want, (sorted(want - read_mtp)[:4], sorted(read_mtp - want)[:4])
-
-
-# --- static EPLB: a rank's slots hold the experts the placement gives them ---
-
-_EPLB_LAYOUTS = sorted(routing._EPLB_LAYOUTS)
-
-
-def _placement(layer: int, num_experts: int, ep_size: int, spare: int) -> list[int]:
-    """A placement unlike the default one: the experts shuffled per layer, then `spare`
-    more slots a rank holding other experts again -- on rank 0 a second copy of an expert
-    it already holds."""
-    order = torch.randperm(num_experts, generator=torch.Generator().manual_seed(layer)).tolist()
-    per_rank = num_experts // ep_size
-    out = []
-    for rank in range(ep_size):
-        own = order[rank * per_rank : (rank + 1) * per_rank]
-        extra = [order[(rank * per_rank + per_rank + k) % num_experts] for k in range(spare)]
-        if rank == 0:
-            extra[0] = own[0]
-        out += own + extra
-    return out
-
-
-def _eplb_core(layout, rank: int, cfg, mtp: bool, spare: int = 2):
-    """`_default_core` under static EPLB: the config names the architecture the engine
-    balances, and the load balancer config places the experts of every routed layer."""
-    ep = layout[3]
-    layers = range(cfg.first_k_dense_replace, cfg.num_hidden_layers + int(mtp))
-    assignments = {i: _placement(i, cfg.n_routed_experts, ep, spare) for i in layers}
-    pretrained = SimpleNamespace(**vars(cfg), architectures=["DeepseekV3ForCausalLM"])
-    core = SimpleNamespace(
-        model_config=SimpleNamespace(
-            pretrained_config=pretrained,
-            mapping=_mapping(layout, rank),
-            torch_dtype=torch.bfloat16,
-            spec_config=object() if mtp else None,
-            moe_load_balancer=MoeLoadBalancerConfig(
-                num_slots=cfg.n_routed_experts + ep * spare,
-                initial_global_assignments=assignments,
-            ),
-        )
-    )
-    core.dims = D.MODEL_WEIGHTS.dims(core)
-    return core, assignments
-
-
-@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
-def test_eplb_slots_hold_the_placed_experts(layout):
-    """Rank r holds slots [r * S, (r + 1) * S) of every routed layer, S = num_slots / ep,
-    and each slot the expert the placement puts there; together the ranks hold every
-    expert of every layer, the MTP layer's included."""
-    cfg = SimpleNamespace(**_TINY)
-    ep = layout[3]
-    held: dict = {}
-    for rank in range(layout[0]):
-        core, assignments = _eplb_core(layout, rank, cfg, mtp=True)
-        d = core.dims
-        local = (cfg.n_routed_experts + 2 * ep) // ep
-        assert (d.eplb, d.num_slots, d.local_slots, d.slot_offset) == (
-            "static",
-            local * ep,
-            local,
-            rank * local,
-        )
-        for i, placement in assignments.items():
-            mine = tuple(placement[rank * local : (rank + 1) * local])
-            assert d.slots[i].slot_experts == mine, (layout, rank, i)
-            held.setdefault(i, set()).update(mine)
-    assert all(experts == set(range(cfg.n_routed_experts)) for experts in held.values())
-
-
-@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
-@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
-def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
-    """`load` under static EPLB: coverage holds both ways, a rank reads each expert's
-    tensors once per slot that holds it and no expert it does not hold, and every slot
-    holds exactly what the world-size-1 table, which has no EPLB, loads for that slot's
-    expert."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
-    cfg = SimpleNamespace(**_TINY)
-    keys = _tiny_keys(cfg)
-    oracle = _default_core(_WS1, 0, cfg, mtp)
-    oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
-    for rank in range(layout[0]):
-        core, assignments = _eplb_core(layout, rank, cfg, mtp)
-        d = core.dims
-        core.w = D.MODEL_WEIGHTS.declare(d)
-        lm_head = nn.Parameter(torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=torch.bfloat16))
-        params = [("lm_head.weight", lm_head)] + [(f"model.w.{k}", p) for k, p in core.w.items()]
-        model = SimpleNamespace(
-            model=core, lm_head=SimpleNamespace(weight=lm_head), named_parameters=lambda: params
-        )
-        ckpt = _Checkpoint(cfg, keys)
-        D.MODEL_WEIGHTS.load(model, ckpt)
-
-        reads = Counter(k for k, _, _ in ckpt.reads)
-        for i in assignments:
-            mine = d.slots[i].slot_experts
-            names = (
-                ("fc1_w", "fc1_s", "fc2_w", "fc2_s")
-                if i < cfg.num_hidden_layers
-                else ("fc1", "fc2")
-            )
-            for e in range(cfg.n_routed_experts):
-                key = f"model.layers.{i}.mlp.experts.{e}.down_proj.weight"
-                assert reads[key] == mine.count(e), (layout, rank, i, e)
-            for slot, e in enumerate(mine):
-                for name in names:
-                    ckpt_key, _, cut, transform = oracle.manifest[f"l{i}_{name}"][e]
-                    want = D.MODEL_WEIGHTS.read(_Checkpoint(cfg), ckpt_key, cut, transform, oracle)
-                    assert torch.equal(core.w[f"l{i}_{name}"][slot], want), (rank, i, slot, name)
