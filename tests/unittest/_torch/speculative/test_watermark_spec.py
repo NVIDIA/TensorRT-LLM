@@ -58,7 +58,7 @@ def _model_paths():
     return target, draft
 
 
-def _generate(config, speculative, use_cuda_graph, sampling_params):
+def _generate(config, speculative, use_cuda_graph, sampling_params, prompts=PROMPTS):
     target, draft = _model_paths()
     kwargs = dict(
         model=target,
@@ -73,7 +73,7 @@ def _generate(config, speculative, use_cuda_graph, sampling_params):
         )
     llm = LLM(**kwargs)
     try:
-        outputs = llm.generate(PROMPTS, sampling_params)
+        outputs = llm.generate(prompts, sampling_params)
         return [(o.prompt_token_ids, list(o.outputs[0].token_ids)) for o in outputs]
     finally:
         llm.shutdown()
@@ -195,3 +195,20 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
     # only part of the texts carry a detectable mark (a third to a half in calibration runs); require
     # a quarter.
     assert flagged >= len(outputs) // 4, f"only {flagged}/{len(outputs)} outputs carry the mark"
+
+
+@pytest.mark.high_cuda_memory
+def test_dual_key_routing_diversifies_repeated_prompts():
+    if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
+        pytest.skip("Not enough memory to load the target model")
+    # The same prompt twice: with the first key only the two requests repeat each other; routing
+    # tokens to the second key at random makes them diverge, and a seed reproduces its choices.
+    config = WatermarkConfig(key=0x5EED5EED, algorithm="gumbel_dual_key", alpha=0.25)
+    prompts = PROMPTS * 2
+    params = dict(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
+    unseeded = _generate(config, False, False, SamplingParams(**params), prompts)
+    seeded = _generate(config, False, False, SamplingParams(seed=7, **params), prompts)
+    count = len(PROMPTS)
+    differ = sum(unseeded[i][1] != unseeded[i + count][1] for i in range(count))
+    assert differ == count, f"only {differ}/{count} repeated prompts diverged"
+    assert all(seeded[i][1] == seeded[i + count][1] for i in range(count))

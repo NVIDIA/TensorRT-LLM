@@ -2474,6 +2474,11 @@
       "path": "watermark_config.allow_target_only_watermarking"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "watermark_config.alpha"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "watermark_config.context_width"

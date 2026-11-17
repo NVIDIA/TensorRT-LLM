@@ -35,6 +35,12 @@ of a window sees the context ``tail ++ drafts[:j]``. Verification accepts a draf
 the target's own sample equals it, so the context of every position that is committed equals
 the committed prefix and the output matches what non-speculative decoding would produce.
 
+With ``algorithm="gumbel_dual_key"`` and ``alpha > 0`` an ordinary decoding position is drawn under
+the second key with probability ``alpha`` (and under the first key otherwise). The choice is the
+Philox stream of a per-slot routing seed at the position's index in the request's output, so it
+does not depend on the batch, the speculation depth or the TP rank, and a request with a seed
+reproduces it.
+
 :meth:`WatermarkHandler.plan` and :meth:`WatermarkHandler.commit` use static shapes and no
 host synchronization, so they can be captured in a CUDA graph.
 """
@@ -47,11 +53,18 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
-from tensorrt_llm.watermark.prf import PAD_TOKEN, context_seeds_torch, secondary_key
+from tensorrt_llm.watermark.prf import (
+    PAD_TOKEN,
+    context_seeds_torch,
+    philox_uniform_torch,
+    route_seed,
+    secondary_key,
+)
 from tensorrt_llm.watermark.state_kernels import commit_windows, plan_windows
 from tensorrt_llm.watermark.step_kernel import StepScratch, watermark_step
 
 from ..llm_request import LlmRequest
+from .sampler_common import request_random_seed
 
 if TYPE_CHECKING:
     from tensorrt_llm.watermark.config import WatermarkConfig
@@ -133,6 +146,9 @@ class WatermarkRows:
     # Seeds of the second key, for the tokens that follow a rejection (dual-key watermarking
     # with rejection sampling); equal to ``seeds`` when there is a single key.
     seeds_secondary: Optional[torch.Tensor] = None
+    # With dual-key routing: the seed each position is drawn with (first or second key). ``seeds``
+    # remains the first key's, which identifies the context for the repeat check.
+    draw_seeds: Optional[torch.Tensor] = None  # [B, K1] int64
     skip: Optional[torch.Tensor] = None  # [B] int64, reference path only (``"all"`` scope)
 
 
@@ -144,7 +160,14 @@ class WatermarkHandler:
         max_num_sequences: int,
         max_seq_len: int,
         device: str | torch.device = "cuda",
+        route_alpha: Optional[float] = None,
     ):
+        """
+        Args:
+            route_alpha: probability that an ordinary decoding position is drawn under the second
+                key. Defaults to ``config.alpha`` for the dual-key algorithm; one-model speculation
+                with rejection sampling passes 0, because the speculative protocol picks the key.
+        """
         self.config = config
         self._device = torch.device(device)
         self._secondary_key = (
@@ -153,6 +176,17 @@ class WatermarkHandler:
         num_rows = max_num_sequences + 1  # the extra row is the scratch slot of padding requests
         width = config.context_width
         self._dual = self._secondary_key != config.key
+        if route_alpha is None:
+            route_alpha = config.alpha if self._dual else 0.0
+        self._alpha = float(route_alpha) if self._dual else 0.0
+        self._route = self._alpha > 0.0
+        # Seed of each slot's routing stream, set when the slot gets a new occupant.
+        self._route_seeds = (
+            torch.zeros(num_rows, dtype=torch.int64, device=device) if self._route else None
+        )
+        # Streams handed out to requests without a seed. Every rank sees the same requests in the
+        # same order, so the numbering agrees across ranks.
+        self._unseeded_streams = 0
         self._keys = torch.tensor(
             [_signed64(config.key), _signed64(self._secondary_key)],
             dtype=torch.int64,
@@ -214,6 +248,7 @@ class WatermarkHandler:
         width = self.config.context_width
         new_slots: list[int] = []
         new_tails: list[list[int]] = []
+        new_routes: list[int] = []
         prefills: list[tuple[int, torch.Tensor, int]] = []
         for request in requests:
             slot = request.py_seq_slot
@@ -241,6 +276,11 @@ class WatermarkHandler:
             tokens = all_tokens[-width:]
             new_slots.append(slot)
             new_tails.append([PAD_TOKEN] * (width - len(tokens)) + list(tokens))
+            if self._route:
+                seed = request_random_seed(request)
+                new_routes.append(route_seed(seed, self._unseeded_streams))
+                if seed is None:
+                    self._unseeded_streams += 1
             if self._dedupe:
                 # Seed the repeat ring with the contexts that already exist when the request
                 # reaches the sampler: the generated positions (a request can arrive with tokens
@@ -269,6 +309,11 @@ class WatermarkHandler:
         )
         self._tail.index_copy_(0, slots, tails)
         self._count.index_fill_(0, slots, 0)
+        if self._route:
+            routes = torch.tensor(new_routes, dtype=torch.int64, pin_memory=pin).to(
+                self._device, non_blocking=True
+            )
+            self._route_seeds.index_copy_(0, slots, routes)
         for slot, recent, skip in prefills:
             recent = recent.to(self._device, non_blocking=True)
             num_contexts = max(recent.shape[0] - width, 0)
@@ -297,7 +342,7 @@ class WatermarkHandler:
                 ``k + 1`` positions, otherwise one. Position ``j`` sees the last
                 ``context_width`` tokens of ``tail ++ drafts[:j]``.
         """
-        seeds, seeds_secondary, active = plan_windows(
+        seeds, seeds_secondary, active, draw_seeds = plan_windows(
             slots,
             enabled,
             self._tail,
@@ -308,6 +353,8 @@ class WatermarkHandler:
             self._dual,
             drafts,
             self._skip,
+            self._route_seeds,
+            self._alpha,
         )
         return WatermarkRows(
             slots=slots,
@@ -315,6 +362,7 @@ class WatermarkHandler:
             seeds=seeds,
             active=active,
             seeds_secondary=seeds if seeds_secondary is None else seeds_secondary,
+            draw_seeds=draw_seeds,
         )
 
     def plan_reference(
@@ -370,6 +418,11 @@ class WatermarkHandler:
             seeds_secondary = context_seeds_torch(
                 self._secondary_key, contexts.reshape(-1, width)
             ).reshape(batch, num_positions)
+        draw_seeds = None
+        if self._route:
+            index = count.unsqueeze(1) + torch.arange(num_positions, device=count.device)
+            uniform = philox_uniform_torch(self._route_seeds.index_select(0, slots), index)
+            draw_seeds = torch.where(uniform < self._alpha, seeds_secondary, seeds)
         return WatermarkRows(
             slots=slots,
             enabled=enabled,
@@ -378,6 +431,7 @@ class WatermarkHandler:
             seeds=seeds,
             active=active,
             seeds_secondary=seeds_secondary,
+            draw_seeds=draw_seeds,
             skip=skip,
         )
 
@@ -574,6 +628,8 @@ class WatermarkHandler:
             self._step_scratch,
             from_probs=from_probs,
             skip=self._skip,
+            route_seeds=self._route_seeds,
+            alpha=self._alpha,
         )
 
 
@@ -631,6 +687,8 @@ class WatermarkSpecState:
             max_num_sequences=num_slots,
             max_seq_len=self.max_seq_len or 1 << 20,
             device=device,
+            # With rejection sampling the speculative protocol picks the key of each token.
+            route_alpha=0.0 if use_rejection_sampling else None,
         )
         self.enabled = torch.zeros(max_num_requests, dtype=torch.bool, device=device)
         if self.keys_drafts:

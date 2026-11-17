@@ -35,7 +35,7 @@ import triton
 import triton.language as tl
 
 from .sampling import _philox_uniform
-from .state_kernels import _context_seed
+from .state_kernels import _context_seed, _uses_second_key
 
 __all__ = ["StepScratch", "watermark_step"]
 
@@ -73,16 +73,19 @@ def _step_kernel(
     partial_index_ptr,
     counter_ptr,
     skip_ptr,
+    route_ptr,
     stride_values,
     stride_tail,
     stride_ring,
     ring_size,
     vocab_size,
+    alpha,
     NUM_SPLITS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK_WIDTH: tl.constexpr,
     FROM_PROBS: tl.constexpr,
     DEDUPE: tl.constexpr,
+    ROUTE: tl.constexpr,
     SKIP: tl.constexpr,
     HAS_FALLBACK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -98,15 +101,21 @@ def _step_kernel(
     tail_row = tail_ptr + slot * stride_tail
     key = tl.load(keys_ptr).to(tl.uint64)
     seed = _context_seed(tail_row, tail_row, 0, key, WIDTH, 0)
+    # The context's identity, which the repeat ring records; the token is drawn with `draw_seed`.
     seed_signed = seed.to(tl.int64, bitcast=True)
+    draw_seed = seed_signed
+    if ROUTE:
+        second = _context_seed(tail_row, tail_row, 0, tl.load(keys_ptr + 1).to(tl.uint64), WIDTH, 0)
+        use_second = _uses_second_key(tl.load(route_ptr + slot), tl.load(count_ptr + slot), alpha)
+        draw_seed = tl.where(use_second, second.to(tl.int64, bitcast=True), seed_signed)
 
     # Scan this program's slice of the row (a row without a watermark scans nothing).
     low = split * CHUNK
     high = tl.minimum(low + CHUNK, vocab_size)
     if not enabled:
         high = low
-    key0 = (seed_signed & 0xFFFFFFFF).to(tl.uint32)
-    key1 = ((seed_signed >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    key0 = (draw_seed & 0xFFFFFFFF).to(tl.uint32)
+    key1 = ((draw_seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
     neg_inf = float("-inf")
     best_value = tl.full([BLOCK], neg_inf, dtype=tl.float32)
     best_index = tl.zeros([BLOCK], dtype=tl.int32)
@@ -203,6 +212,8 @@ def watermark_step(
     *,
     from_probs: bool,
     skip: Optional[torch.Tensor] = None,
+    route_seeds: Optional[torch.Tensor] = None,
+    alpha: float = 0.0,
 ) -> torch.Tensor:
     """One decode step for ``R`` rows. Device-only; safe to capture in a CUDA graph.
 
@@ -220,6 +231,9 @@ def watermark_step(
             :class:`~tensorrt_llm._torch.pyexecutor.sampler.watermark.WatermarkHandler`.
         scratch: partial-result buffers with at least ``R`` rows.
         skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
+        route_seeds: optional ``[rows]`` int64 routing-stream seeds of the dual-key algorithm. With
+            them a row is drawn under the second key (``keys[1]``) with probability ``alpha``.
+        alpha: the probability of the second key.
 
     Returns:
         ``[R]`` int32 tokens.
@@ -247,11 +261,13 @@ def watermark_step(
         scratch.index,
         scratch.counter,
         skip if skip is not None else count,
+        route_seeds if route_seeds is not None else count,
         values.stride(0),
         tail.stride(0),
         ring.stride(0) if ring is not None else 0,
         ring_size,
         vocab_size,
+        alpha,
     )
     constexprs = dict(
         NUM_SPLITS=num_splits,
@@ -259,6 +275,7 @@ def watermark_step(
         BLOCK_WIDTH=triton.next_power_of_2(width),
         FROM_PROBS=from_probs,
         DEDUPE=ring is not None,
+        ROUTE=route_seeds is not None,
         SKIP=skip is not None,
         HAS_FALLBACK=fallback is not None,
         BLOCK=_BLOCK,
@@ -274,7 +291,7 @@ def watermark_step(
     key = (
         values.dtype,
         values.data_ptr() % 16 == 0,
-        tuple(runtime_args[14:]),
+        tuple(runtime_args[15:]),
         tuple(constexprs.values()),
     )
     compiled = _COMPILED.get(key)

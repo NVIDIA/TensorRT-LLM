@@ -34,6 +34,8 @@ import torch
 __all__ = [
     "PAD_TOKEN",
     "secondary_key",
+    "route_seed",
+    "route_uniform",
     "context_seed",
     "context_seeds",
     "context_seeds_torch",
@@ -69,6 +71,31 @@ def secondary_key(key: int) -> int:
     """
     with np.errstate(over="ignore"):
         return int(_mix64(np.array([(key & _MASK64) ^ _SECONDARY_SALT], dtype=np.uint64))[0])
+
+
+_ROUTE_SEEDED_SALT = 0xA24BAED4963EE407
+_ROUTE_UNSEEDED_SALT = 0x9FB21C651E98DF25
+
+
+def route_seed(request_seed: "int | None", stream: int) -> int:
+    """Seed of a request's key-routing stream, as an int64 bit pattern.
+
+    Dual-key decoding draws each token under the first or the second key; this stream decides
+    which. A request with its own ``SamplingParams.seed`` gets a stream that depends on that seed
+    alone, so it reproduces. A request without one gets a stream of its own, numbered ``stream``
+    in the order requests reach the sampler, so identical prompts diverge.
+    """
+    with np.errstate(over="ignore"):
+        if request_seed is not None:
+            value = (request_seed & _MASK64) ^ _ROUTE_SEEDED_SALT
+        else:
+            value = (((stream + 1) * _GOLDEN) & _MASK64) ^ _ROUTE_UNSEEDED_SALT
+        return _signed64(int(_mix64(np.array([value], dtype=np.uint64))[0]))
+
+
+def route_uniform(seed: int, positions: np.ndarray) -> np.ndarray:
+    """Uniform numbers in (0, 1) of the routing stream ``seed`` at generation ``positions``."""
+    return philox_uniform(seed & _MASK64, positions)
 
 
 def _signed64(value: int) -> int:
