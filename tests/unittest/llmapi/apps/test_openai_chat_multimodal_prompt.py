@@ -56,6 +56,18 @@ def test_pre_tokenized_prompt_is_not_marked():
     assert prompt == {"prompt_token_ids": [7, 11, 13], "multi_modal_data": media}
 
 
+def test_base64_pre_tokenized_prompt_is_not_marked():
+    token_ids = object()
+    prompt = {"prompt_token_ids": token_ids}
+    media = {"image": [object()]}
+    request = SimpleNamespace(prompt_token_ids=None, prompt_token_ids_b64="AQAAAA==")
+    OpenAIServer._attach_multimodal_data(prompt, request, media)
+    assert prompt == {
+        "prompt_token_ids": token_ids,
+        "multi_modal_data": media,
+    }
+
+
 def test_item_order_is_attached_only_when_given():
     order = [{"modality": "image", "index": 0, "placeholder": "<image>"}]
     prompt = {"prompt": "<image> describe"}
