@@ -288,15 +288,17 @@ recommended (for example `openssl rand -hex 32`). A native transfer worker that 
 given a shorter key fails at startup with an error that names
 `internal_request_auth_key`.
 
-With a key, every native control message between context and generation workers
-(RankInfo exchange and reply, peer registration, KV/aux transfer results, cancels)
-carries an HMAC-SHA256 tag derived from the key. Workers drop messages that are
-unsigned, signed with another key, altered, or addressed to another worker, and keep
-serving. This protects against hosts that can reach the worker ports but do not hold
-the key. It does not protect against a worker that holds the key and is compromised;
-receive-side bounds checks limit what such a peer can write. KV data itself moves over
-NIXL/UCX and is not covered. Each signed message also carries a sequence number,
-so a captured control message replayed later is dropped as well.
+With a key, every control message sent through the native Python messenger between
+context and generation workers (RankInfo exchange and reply, peer registration,
+KV/aux transfer results, cancels) carries an HMAC-SHA256 tag derived from the key.
+Workers drop messages that are unsigned, signed with another key, altered, or
+addressed to another worker, and keep serving. Authentication relies on the shared
+key only: every worker that holds the key is trusted. KV data itself moves over
+NIXL/UCX and is not covered. Each signed message also carries a per-socket sequence
+number. A receiver accepts a message only when its number is higher than the last
+one it accepted from that socket, so a repeated message is dropped; so is a message
+that arrives after a later one, which can happen when a connection is
+re-established.
 
 Upgrade communicating context and generation workers together before enabling
 native authentication. Existing deployments that already set
