@@ -34,6 +34,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayLayerCache,
     KDAReplayState,
     KimiK3HybridCacheManager,
+    create_kda_replay_state,
 )
 from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
@@ -322,11 +323,8 @@ def test_k3_initializes_only_the_selected_state(
         "KDAIntermediateState",
         intermediate_factory,
     )
-    monkeypatch.setitem(
-        manager_cls._initialize_spec_state.__globals__,
-        "KDAReplayState",
-        replay_factory,
-    )
+    # Both managers build the fused-verify state through create_kda_replay_state.
+    monkeypatch.setitem(create_kda_replay_state.__globals__, "KDAReplayState", replay_factory)
     monkeypatch.setitem(
         manager_cls._initialize_spec_state.__globals__,
         "get_kda_replay_num_spec",
@@ -337,10 +335,9 @@ def test_k3_initializes_only_the_selected_state(
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
-        replay_kwargs = {"stochastic_rounding": False}
-        if manager_cls is KimiK3HybridCacheManager:
-            replay_kwargs["draft_records"] = False
-        replay_factory.assert_called_once_with(num_spec, **replay_kwargs)
+        replay_factory.assert_called_once_with(
+            num_spec, stochastic_rounding=False, draft_records=False
+        )
         assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
     else:
