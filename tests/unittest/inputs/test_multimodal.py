@@ -1191,6 +1191,7 @@ def test_runtime_data_cumsum_math_with_specials_mistral_shape():
 def test_runtime_data_requires_cumsum():
     """embed_mask_cumsum is required."""
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5)
 
 

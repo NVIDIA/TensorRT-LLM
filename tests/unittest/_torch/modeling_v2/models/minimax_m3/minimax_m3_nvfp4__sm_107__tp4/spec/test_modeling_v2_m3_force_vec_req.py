@@ -7,7 +7,7 @@ a request's forced count does not depend on the call history, on its slot in the
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_force_vec_req import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_force_vec_req import (  # noqa: E501
     m3_force_vec_req as op,
 )
 from tensorrt_llm._torch.speculative.interface import (

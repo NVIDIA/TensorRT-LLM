@@ -36,6 +36,26 @@ if TYPE_CHECKING:
 # makes the metrics-side limit its own explicit concern.
 MAX_SPEC_DECODE_POSITION_LABELS = 16
 
+_PROCESSING_TIME_BUCKETS = (
+    0.0001,
+    0.00025,
+    0.0005,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+)
+
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
@@ -68,6 +88,9 @@ class MetricsCollector:
             trtllm_prefill_perplexity
             trtllm_generation_perplexity
             trtllm_request_error_total
+            trtllm_input_processing_seconds
+            trtllm_input_processing_queue_seconds
+            trtllm_media_processing_seconds
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -113,6 +136,7 @@ class MetricsCollector:
             trtllm_spec_decode_draft_overhead
             trtllm_prefill_batch_occupancy
             trtllm_prefill_batch_tokens
+            trtllm_multimodal_encoder_gpu_time_seconds
 
         Config info metrics (logged once at startup via log_config_info):
             trtllm_model_config_info
@@ -470,6 +494,56 @@ class MetricsCollector:
             documentation="Average number of decoded tokens per iteration",
             labelnames=self.labels.keys())
 
+        # KV cache scheduling decisions and host memory (KV cache manager V2)
+        self.ctx_chunks_reverted = Counter(
+            name=self.metric_prefix + "ctx_chunks_reverted_total",
+            documentation=
+            "Context chunks whose KV growth was given back, by reason",
+            labelnames=(*iteration_labelnames, "reason"))
+        self.ctx_tokens_reverted = Counter(
+            name=self.metric_prefix + "ctx_tokens_reverted_total",
+            documentation=
+            "Context tokens of the chunks whose KV growth was given back",
+            labelnames=iteration_labelnames)
+        self.gen_deferred_receives = Gauge(
+            name=self.metric_prefix + "gen_deferred_receives",
+            documentation=
+            "Most disaggregated generation receives waiting at once to be posted",
+            labelnames=iteration_labelnames)
+        self.gen_receive_ready_wait_seconds = Counter(
+            name=self.metric_prefix + "gen_receive_ready_wait_seconds_total",
+            documentation=
+            "Host time blocked on KV admission work before posting generation receives",
+            labelnames=iteration_labelnames)
+        self.gen_init_holds = Counter(
+            name=self.metric_prefix + "gen_init_holds_total",
+            documentation=
+            "Generation-init requests left for a later pass, by reason",
+            labelnames=(*iteration_labelnames, "reason"))
+        self.ctx_decoder_hold_passes = Counter(
+            name=self.metric_prefix + "ctx_decoder_hold_passes_total",
+            documentation=
+            "Scheduling passes in which decoder-tail batching held final windows",
+            labelnames=iteration_labelnames)
+        self.ctx_decoder_held_requests = Counter(
+            name=self.metric_prefix + "ctx_decoder_held_requests_total",
+            documentation=
+            "Context requests whose final window decoder-tail batching held",
+            labelnames=iteration_labelnames)
+        self.kv_cache_host_slab_bytes = Gauge(
+            name=self.metric_prefix + "kv_cache_host_slab_bytes",
+            documentation="Host bytes held by live KV cache page slabs",
+            labelnames=iteration_labelnames)
+        self.kv_cache_page_table_conversions = Counter(
+            name=self.metric_prefix + "kv_cache_page_table_conversions_total",
+            documentation="Sparse-attention page-table conversions, by path",
+            labelnames=(*iteration_labelnames, "path"))
+        self.kv_cache_page_table_full_build_seconds = Counter(
+            name=self.metric_prefix +
+            "kv_cache_page_table_full_build_seconds_total",
+            documentation="Host time in full sparse page-table rebuilds",
+            labelnames=iteration_labelnames)
+
         # Speculative decoding metrics
         self.counter_spec_decode_num_draft_tokens = Counter(
             name=self.metric_prefix + "spec_decode_num_draft_tokens_total",
@@ -569,6 +643,38 @@ class MetricsCollector:
             documentation="Histogram of total context tokens per iteration.",
             buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
             labelnames=iteration_labelnames)
+
+        self.histogram_input_processing = Histogram(
+            name=self.metric_prefix + "input_processing_seconds",
+            documentation=(
+                "Server input processing wall time per stage. Media loading "
+                "and chat template stages can overlap and include async waits; "
+                "processor time excludes its thread-pool queue wait. Includes "
+                "failed attempts. Stages must not be added to obtain TTFT."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage"])
+        self.histogram_input_processing_queue = Histogram(
+            name=self.metric_prefix + "input_processing_queue_seconds",
+            documentation="Time waiting for a server input-processor thread.",
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
+        self.histogram_media_processing = Histogram(
+            name=self.metric_prefix + "media_processing_seconds",
+            documentation=
+            ("Per-media-item download, decode execution and decode "
+             "worker queue times. Local file decode includes file IO; "
+             "data-URI decode includes base64 conversion. Includes failed attempts."
+             ),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage", "modality"])
+        self.histogram_multimodal_encoder_gpu_time = Histogram(
+            name=self.metric_prefix + "multimodal_encoder_gpu_time_seconds",
+            documentation=
+            ("Rank-0 GPU elapsed time per completed multimodal encoder "
+             "call through MultimodalModelMixin. Excludes pre-encoder H2D, cache-only "
+             "lookups and warmup. Batched work is not per-request latency."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
 
         # HTTP error counter
         self.labelname_http_code = "http_code"
@@ -940,6 +1046,25 @@ class MetricsCollector:
 
             self.last_log_time = time.time()
 
+    def log_input_processing(
+        self,
+        stage: str,
+        duration_seconds: float,
+        modality: str | None = None,
+    ) -> None:
+        """Observe the same input-stage sample stored in the request record."""
+        if modality is not None:
+            self.histogram_media_processing.labels(**self.labels,
+                                                   stage=stage,
+                                                   modality=modality).observe(
+                                                       duration_seconds)
+        elif stage == "processor_queue":
+            self._log_histogram(self.histogram_input_processing_queue,
+                                duration_seconds)
+        else:
+            self.histogram_input_processing.labels(
+                **self.labels, stage=stage).observe(duration_seconds)
+
     def log_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
 
@@ -981,6 +1106,11 @@ class MetricsCollector:
         Args:
             iteration_stats: Serialized iteration measurements from rank 0.
         """
+        for elapsed_ms in (iteration_stats.get("multimodalEncoderStats")
+                           or {}).get("gpuTimesMS", ()):
+            self._log_histogram(self.histogram_multimodal_encoder_gpu_time,
+                                elapsed_ms / 1000.0)
+
         # Top-level queue & load metrics
         if "numActiveRequests" in iteration_stats:
             self._log_gauge(self.num_requests_running,
@@ -1049,6 +1179,37 @@ class MetricsCollector:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
+    def _log_scheduling_decisions(self, ifb_stats: dict,
+                                  rank_labels: Dict[str, str]) -> None:
+        """Log one rank's KV scheduling decision counters from its inflightBatchingStats."""
+        for key, reason in (("numSkippedForwardCtxChunks", "skipped_forward"),
+                            ("numDroppedCtxChunks", "dropped")):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(self.ctx_chunks_reverted, {
+                    **rank_labels, "reason": reason
+                }, ifb_stats[key])
+        for key, reason in (("numGenInitCapHolds", "admission_cap"),
+                            ("numGenInitTransferBudgetHolds",
+                             "transfer_budget")):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(self.gen_init_holds, {
+                    **rank_labels, "reason": reason
+                }, ifb_stats[key])
+        for key, counter in (("numRevertedCtxTokens", self.ctx_tokens_reverted),
+                             ("numCtxDecoderHoldPasses",
+                              self.ctx_decoder_hold_passes),
+                             ("numCtxDecoderHeldRequests",
+                              self.ctx_decoder_held_requests)):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(counter, rank_labels, ifb_stats[key])
+        if ifb_stats.get("genReceiveReadyWaitMs", 0) > 0:
+            self._log_counter(self.gen_receive_ready_wait_seconds, rank_labels,
+                              ifb_stats["genReceiveReadyWaitMs"] / 1e3)
+        if "numDeferredGenReceives" in ifb_stats:
+            self._log_gauge(self.gen_deferred_receives,
+                            ifb_stats["numDeferredGenReceives"],
+                            labels=rank_labels)
+
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:
         """Log local KV and scheduling measurements for one rank.
@@ -1103,6 +1264,21 @@ class MetricsCollector:
                 self._log_gauge(self.kv_cache_tokens_per_block,
                                 kv_stats["tokensPerBlock"],
                                 labels=rank_labels)
+            if "hostSlabBytes" in kv_stats:
+                self._log_gauge(self.kv_cache_host_slab_bytes,
+                                kv_stats["hostSlabBytes"],
+                                labels=rank_labels)
+            for key, path in (("numPageTableReuses",
+                               "reused"), ("numPageTableRowUpdates", "rows"),
+                              ("numPageTableFullBuilds", "full")):
+                if kv_stats.get(key, 0) > 0:
+                    self._log_counter(self.kv_cache_page_table_conversions, {
+                        **rank_labels, "path": path
+                    }, kv_stats[key])
+            if kv_stats.get("pageTableFullBuildMs", 0) > 0:
+                self._log_counter(self.kv_cache_page_table_full_build_seconds,
+                                  rank_labels,
+                                  kv_stats["pageTableFullBuildMs"] / 1e3)
 
         # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):
@@ -1131,6 +1307,7 @@ class MetricsCollector:
                     self._log_histogram(self.histogram_prefill_batch_tokens,
                                         num_ctx_tokens,
                                         labels=rank_labels)
+            self._log_scheduling_decisions(ifb_stats, rank_labels)
             # Prefill batch occupancy: context_requests / max_active_requests
             num_context = ifb_stats.get("numContextRequests", 0)
             max_active = iteration_stats.get("maxNumActiveRequests", 0)
