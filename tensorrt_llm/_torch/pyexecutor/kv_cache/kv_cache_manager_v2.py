@@ -685,6 +685,23 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
     return HostMemoryLimits(local_ranks, mem_available, memlock_limit)
 
 
+def _copy_based_rebalancing_flags(kv_cache_config: KvCacheConfig) -> tuple[bool, bool, bool]:
+    """(copy_based_rebalancing, drop_unreferenced_on_rebalance, in_place_relocation) to build with.
+
+    kv_pool_rebalance_config only applies with enable_kv_pool_rebalance. Without it the GPU arena
+    would buy nothing, and building it anyway would bypass checks keyed on rebalancing, such as
+    sparse KV cache offload's (the arena cannot hold host-backed pools).
+    """
+    if not kv_cache_config.enable_kv_pool_rebalance:
+        return False, False, False
+    cfg = kv_cache_config.kv_pool_rebalance_config
+    return (
+        cfg.copy_based_rebalancing,
+        cfg.drop_unreferenced_on_rebalance,
+        cfg.in_place_relocation,
+    )
+
+
 def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> bool:
     """Whether to leave out the automatic host tier.
 
@@ -794,6 +811,28 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     if mapping.world_size > 1:
         host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
     return host_quota
+
+
+def bound_pool_ids(impl: KVCacheManagerPy) -> List[Tuple[int, int]]:
+    """Pools that copy-based rebalancing addresses with slot ids of their own ("bound pools").
+
+    With ``copy_based_rebalancing``, a pool group whose buffers have several sizes gets one arena
+    window per pool. Pool 0 uses the group's slot ids (the base page indices); every other pool has
+    its own ids, so a buffer there is addressed through
+    ``impl.get_page_index_bindings(layer_id, role)[base_page_index]``, never through the base page
+    index itself. Returns ``(layer group id, pool index)`` per bound pool; empty without
+    copy-based rebalancing or without multi-pool groups.
+    """
+    bound = []
+    for pool_group in impl.pool_group_descs:
+        for variant in pool_group.slot_desc.variants:
+            for pool_idx, coalesced in enumerate(variant.coalesced_buffers):
+                if not coalesced.buffer_ids:
+                    continue
+                buffer_id = coalesced.buffer_ids[0]
+                if impl.get_page_index_bindings(buffer_id.layer_id, buffer_id.role) is not None:
+                    bound.append((int(variant.layer_group_id), pool_idx))
+    return bound
 
 
 class _KVCacheManagerInitStatus(IntEnum):
@@ -2357,6 +2396,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # The manager config offload is sized from, built once with a placeholder
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
+    # Whether this manager builds its page tables for bound pools through
+    # get_page_index_bindings (see bound_pool_ids). Copy-based rebalancing with
+    # multi-pool pool groups is rejected for managers that do not.
+    _translates_bound_pools = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -3310,6 +3353,17 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         if host_tier_numa_node is not None:
             logger.info(f"KV cache manager v2 host tier bound to NUMA node {host_tier_numa_node}")
+        if not self._translates_bound_pools:
+            bound = bound_pool_ids(candidate)
+            if bound:
+                candidate.shutdown()
+                raise ValueError(
+                    "kv_pool_rebalance_config.copy_based_rebalancing: pool groups with several "
+                    f"pools give each pool its own block ids (bound pools {bound}, as (layer group, "
+                    f"pool)), but {type(self).__name__} does not translate them through "
+                    "get_page_index_bindings and would read the wrong pages. Disable "
+                    "copy_based_rebalancing for this model."
+                )
         if self._get_external_cache_bytes(candidate):
             config = replace(
                 config,
@@ -3422,6 +3476,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # so downstream int-only consumers (torch.randint size, range)
             # stay int.
             self.max_seq_len = int(max_num_tokens)
+
+        if kv_cache_config.enable_kv_pool_rebalance:
+            self._raise_rebalance_floors()
 
         self.max_blocks_per_seq = self._get_max_blocks_per_seq(self.max_seq_len)
 
@@ -4775,6 +4832,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
+        copy_based, drop_unreferenced, in_place = _copy_based_rebalancing_flags(kv_cache_config)
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -4815,6 +4873,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
                 ratio_tolerance=rebalance_cfg.ratio_tolerance,
                 moving_average_decay=rebalance_cfg.moving_average_decay,
+                copy_based_rebalancing=copy_based,
+                drop_unreferenced_on_rebalance=drop_unreferenced,
+                in_place_relocation=in_place,
             ),
             cold_tier_offload_min_priority=(
                 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
@@ -6059,6 +6120,30 @@ class KVCacheManagerV2(BaseResourceManager):
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
+
+    def _raise_rebalance_floors(self) -> None:
+        """Keep one ``max_seq_len`` request schedulable under pool rebalancing.
+
+        Construction clamps ``max_seq_len`` to what the initial split holds, but the
+        only floor rebalancing respects comes from the warmup constraint (one fresh
+        ``max_num_tokens`` chunk). The tuner could then shrink a pool group below one
+        request, and the V2 scheduler deadlocks once a request needs more than the
+        group holds (seen with Gemma-3-12B at TP1 under a KV cap). The floor
+        here is one request at its last prefill chunk: ``max_seq_len`` blocks in
+        full-attention groups, window + one chunk in sliding-window groups. The
+        manager caps it at the current slot counts, so nothing moves now.
+        """
+        # The same extra tokens the max_seq_len clamp counts (get_num_available_tokens).
+        capacity = self.max_seq_len + self._kv_alloc_extra_tokens
+        chunk = self.max_num_tokens if self.max_num_tokens is not None else capacity
+        history = max(0, capacity - chunk)
+        floors = self.impl.raise_hot_min_slots(
+            BatchDesc([KVCacheDesc(capacity=capacity, history_length=history)])
+        )
+        logger.info(
+            f"KV pool rebalancing: per-pool-group slot floors {list(floors)} keep one "
+            f"{self.max_seq_len}-token request schedulable (prefill chunk {chunk})"
+        )
 
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
@@ -8444,7 +8529,7 @@ class KVCacheManagerV2(BaseResourceManager):
         and all of them raise when any rank cannot honor the settings.
 
         Raises:
-            ValueError: KV pool rebalancing, speculative decoding or pipeline
+            ValueError: KV pool rebalancing without copy-based rebalancing, speculative decoding or pipeline
                 parallelism is enabled, or the host history size, with an explicit
                 host cache tier, exceeds this rank's share of available host memory or
                 the pinned-memory limit.
@@ -8452,11 +8537,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         error: Optional[ValueError] = None
         host_history_size = offload_config.host_history_size
-        if kv_cache_config.enable_kv_pool_rebalance:
+        if (
+            kv_cache_config.enable_kv_pool_rebalance
+            and not _copy_based_rebalancing_flags(kv_cache_config)[0]
+        ):
+            # Copy-based rebalancing holds every pool group with host-backed history pools at its
+            # initial size and rebalances the others, so pinned host memory never changes.
             error = ValueError(
                 "Sparse KV cache offload is incompatible with "
-                "kv_cache_config.enable_kv_pool_rebalance=True: host-backed history pools "
-                "take their pool group's slot count, so a rebalance would resize pinned host "
+                "kv_cache_config.enable_kv_pool_rebalance=True unless "
+                "kv_pool_rebalance_config.copy_based_rebalancing=True: host-backed history pools "
+                "take their pool group's slot count, so a VMM rebalance would resize pinned host "
                 "memory outside the host budget."
             )
         elif spec_config is not None:
