@@ -59,7 +59,9 @@ def _make_timeout_request(request_id=7, in_progress=False):
         is_attention_dp_dummy=False,
         py_kv_transfer_timed_out=True,
         py_request_id=request_id,
+        is_disagg_generation_init_state=False,
         is_disagg_generation_transmission_in_progress=in_progress,
+        is_disagg_generation_transmission_complete=False,
         state=object(),
     )
 

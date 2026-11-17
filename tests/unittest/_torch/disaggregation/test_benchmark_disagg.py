@@ -72,6 +72,7 @@ def _make_active_request(
     req.is_encoder_init_state = False
     req.is_context_init_state = False
     req.is_generation_in_progress_state = req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_kv_transfer_timed_out = False
     req.py_encoder_output_ready_event = None
     return req
 

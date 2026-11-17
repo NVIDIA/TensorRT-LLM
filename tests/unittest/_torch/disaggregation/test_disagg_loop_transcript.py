@@ -229,6 +229,8 @@ _SCHEDULE_HEAD = [
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
+    ("inflight_cancel_active",),
+    ("fail_timed_out", []),
     ("admit", []),
     ("align_gen_admission_across_cp", []),
     # No step is in flight in an idle iteration, so no receive is deferred.
@@ -539,7 +541,7 @@ def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
     calls = []
     executor = _idle_executor(monkeypatch, calls)
     executor.dist = Mock(tp_size=1, world_size=1)
-    executor.active_requests = [Mock(), Mock()]
+    executor.active_requests = [Mock(py_kv_transfer_timed_out=False) for _ in range(2)]
     executor.benchmark_req_queues_size = 2  # quoted in the error message
     executor._sync_gen_only_benchmark_has_insufficient_kv = Mock(return_value=True)
     executor._handle_errors = lambda error_msg, *, requests: calls.append(
