@@ -2,8 +2,9 @@
 
 This example serves Muse Spark Open (816B-A42B) with TensorRT-LLM on a single
 4-GPU NVIDIA Blackwell node. It provides the validated aggregated serving
-configuration (TP4/EP4); the opt-in speculative-decoding recipe is covered in
-the speculative-decoding deployment guide linked below.
+configuration (TP4/EP4) and two configurations for agentic workloads; the
+opt-in speculative-decoding recipe is covered in the speculative-decoding
+deployment guide linked below.
 
 For the full walkthrough — model facts, key YAML options, multimodal token
 budgets, benchmarking, and troubleshooting — see the
@@ -94,6 +95,35 @@ this disappears into ordinary sampling variation.
 Model-free suffix-automaton (SA) drafting is also available; see the
 [speculative-decoding guide](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md)
 for its configuration and measured trade-offs.
+
+## Agentic workloads
+
+Agentic coding sessions resend their whole conversation with every request,
+up to the model's 1M-token context. Two configurations serve this traffic by
+keeping the KV cache of earlier turns, in GPU memory and in a host-memory tier
+of 160 GiB per GPU (640 GiB per node):
+
+- `serve_config_agentx_max_throughput.yaml` serves the most sessions per
+  node: 48 concurrent sessions;
+- `serve_config_agentx_balanced.yaml` gives each session faster first tokens
+  and output: 24 concurrent sessions.
+
+Launch them like `serve_config.yaml`:
+
+```bash
+trtllm-serve ${MODEL} \
+    --host 0.0.0.0 --port 8000 \
+    --config serve_config_agentx_max_throughput.yaml \
+    --custom_tokenizer musespark_open \
+    --tool_parser musespark \
+    --reasoning_parser musespark
+```
+
+Both serve text only (`disable_mm_encoder: true`) and run without
+speculative decoding. The
+[Agentic Workloads](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md#agentic-workloads)
+section of the deployment guide lists what they change, their measured
+throughput and latency, and the AgentX benchmark command behind the numbers.
 
 ## Configuration notes
 
