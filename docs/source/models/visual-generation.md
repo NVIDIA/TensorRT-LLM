@@ -225,7 +225,7 @@ are not supported. See the
   `variants/<variant>/*`, then pass the local directory.
 - SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`.
 - The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
-  `--visual_gen_args`.
+  `--visual_gen_args` or `--enable_visual_gen`.
 
 ## Optimizations
 

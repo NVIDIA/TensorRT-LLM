@@ -1297,14 +1297,15 @@ def test_cuda_graphs_match_eager_and_warmed_keys_replay(tmp_path, monkeypatch, f
     runner = graphed._cuda_graph_runners["transformer"]
     try:
         graphed.warmup()
-        # One graph per task and warmup text window.
-        assert len(runner.graphs) == 2 * len(WARMUP_TEXT_WINDOWS)
-        for image in (None, png_bytes(64, 64)):
+        # One text-to-image graph per warmup text window; edits run outside CUDA graphs.
+        assert len(runner.graphs) == len(WARMUP_TEXT_WINDOWS)
+        # The 96 x 80 reference is a shape warmup never saw.
+        for image in (None, png_bytes(64, 64), png_bytes(96, 80)):
             kwargs = dict(height=64, width=64, num_inference_steps=2, seed=0, image=image)
             expected = eager.forward("a red fox", **kwargs).image
             actual = graphed.forward("a red fox", **kwargs).image
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert len(runner.graphs) == 2 * len(WARMUP_TEXT_WINDOWS)
+        assert len(runner.graphs) == len(WARMUP_TEXT_WINDOWS)
     finally:
         runner.clear()
 
@@ -1356,8 +1357,9 @@ def test_sol_pipeline_keeps_the_dense_prefix_and_graphs_match_eager(
     runner = graphed._cuda_graph_runners["transformer"]
     try:
         graphed.warmup()
-        # Warmup steps at 1.0 and 0.874 capture both phases per task and text window.
-        num_graphs = 2 * 2 * len(WARMUP_TEXT_WINDOWS)
+        # Text-to-image warmup steps at 1.0 and 0.874 capture both phases per text window;
+        # edits run outside CUDA graphs.
+        num_graphs = 2 * len(WARMUP_TEXT_WINDOWS)
         assert len(runner.graphs) == num_graphs
         for image, image_expected in expected.items():
             actual = graphed.forward("a red fox", image=image, **kwargs).image

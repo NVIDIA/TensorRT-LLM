@@ -10,8 +10,9 @@ import dataclasses
 import math
 import os
 import time
+from contextlib import contextmanager
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -670,6 +671,23 @@ class Flux3Pipeline(BasePipeline):
             return ((_COND,) if vgm.is_cfg_conditional else (_UNCOND,)), True
         return (_COND, _UNCOND), False
 
+    @contextmanager
+    def _temporarily_disable_cuda_graphs(self, disable: bool) -> Iterator[None]:
+        """Bypass CUDA graphs for a request without discarding captured graphs."""
+        runners = list(getattr(self, "_cuda_graph_runners", {}).values())
+        if not disable or not runners:
+            yield
+            return
+
+        previous_states = [runner.enabled for runner in runners]
+        for runner in runners:
+            runner.enabled = False
+        try:
+            yield
+        finally:
+            for runner, enabled in zip(runners, previous_states):
+                runner.enabled = enabled
+
     @torch.inference_mode()
     def forward(
         self,
@@ -715,15 +733,18 @@ class Flux3Pipeline(BasePipeline):
         latents, latent_ids = self._prepare_latents(height, width, seed)
 
         timer.mark_denoise_start()
-        latents = self._denoise(
-            latents,
-            latent_ids,
-            contexts,
-            conditioning,
-            num_inference_steps,
-            guidance_scale,
-            cfg_parallel,
-        )
+        # Reference count and sizes set the sequence length, so edits run outside CUDA graphs
+        # instead of retaining one graph per reference shape; torch.compile stays active.
+        with self._temporarily_disable_cuda_graphs(disable=references is not None):
+            latents = self._denoise(
+                latents,
+                latent_ids,
+                contexts,
+                conditioning,
+                num_inference_steps,
+                guidance_scale,
+                cfg_parallel,
+            )
         timer.mark_post_start()
         crop = references.crop if references is not None else None
         output = self.decode_latents(latents, lambda x: self._decode(x, height, width, crop))
