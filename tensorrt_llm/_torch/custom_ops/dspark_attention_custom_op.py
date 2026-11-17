@@ -55,7 +55,13 @@ _DSV4_DSPARK_SUPPORTED_NUM_HEADS = (8, 16, 32, 64, 128)
 _DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
-_dspark_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
+_dspark_attention_kernel_cache: dict[tuple[int, int, int, str, bool], Callable[..., None]] = {}
+
+
+def _attention_pdl(pdl: bool, arch_str: str) -> bool:
+    from ..flashinfer_utils import get_env_enable_pdl
+
+    return pdl and arch_str in ("sm_100", "sm_103") and get_env_enable_pdl()
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -73,6 +79,7 @@ def _compile_dspark_attention(
     arch_str: str,
     page_size: int,
     num_heads: int,
+    use_pdl: bool = False,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
     head_dim = _DSV4_DSPARK_HEAD_DIM
@@ -105,6 +112,7 @@ def _compile_dspark_attention(
         arch_str=arch_str,
         history_page_size=page_size,
         num_heads=num_heads,
+        use_pdl=use_pdl,
     )
     # Scalars and typed, aligned compile-only pointers define the runtime ABI.
     # ``output_fake`` keeps one tensor argument for TVM-FFI environment-stream
@@ -132,7 +140,7 @@ def _compile_dspark_attention(
     )
     logger.info(
         "DSpark Attention enabled: implementation=dspark_attn, "
-        f"block={block_size}, heads={num_heads}, head_dim={head_dim}"
+        f"block={block_size}, heads={num_heads}, head_dim={head_dim}, pdl={use_pdl}"
     )
     return compiled
 
@@ -151,8 +159,10 @@ def fused_dsv4_dspark_attention(
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
+    pdl: bool = False,
 ) -> torch.Tensor:
-    """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
+    """Attend to a 128-token context window and fuse the inverse-RoPE epilogue; ``pdl`` takes
+    effect on SM100 / SM103 only."""
     arch_str = _get_dspark_arch_str()
     if arch_str is None:
         raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
@@ -243,12 +253,13 @@ def fused_dsv4_dspark_attention(
         )
     ):
         raise ValueError("All DSpark attention inputs must be on the same CUDA device")
-    cache_key = (block, heads, page_size, arch_str)
+    use_pdl = _attention_pdl(pdl, arch_str)
+    cache_key = (block, heads, page_size, arch_str, use_pdl)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
-        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads, use_pdl)
         _dspark_attention_kernel_cache[cache_key] = compiled
     output = torch.empty_like(q)
     compiled(
@@ -284,6 +295,7 @@ def _(
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
+    pdl: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 

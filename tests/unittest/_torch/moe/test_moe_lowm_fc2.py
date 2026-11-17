@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The decode-sized CuTe DSL FC2 (decode_moe CUTE_FC2) after the FC1-only trtllm-gen runner vs the runner's own FC2
-cubin: bit-identical un-finalized outputs (gemm2 rows, expert weights, expanded -> permuted index), on the runner's
-routing or a route kernel's tables, eager and replayed in a CUDA graph."""
+cubin: bit-identical un-finalized outputs (gemm2 rows, expert weights, expanded -> permuted index), for the NVFP4 and
+the MXFP4 x MXFP8 runners, on the runner's routing or a route kernel's tables, eager and replayed in a CUDA graph."""
 
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -537,3 +537,75 @@ def test_cute_fc2_opt_in_matches_the_fc2_cubin(num_tokens, inter, local_offset, 
         expected = cubin.forward(inputs, tactic=tactic, **table_kwargs)
         _assert_same_table_rows(captured, expected, table_kwargs, num_tokens, shape.top_k)
         calls.clear()
+
+
+# An MXFP4 x MXFP8 MoE (the DSpark draft MoE's format), all experts local: 768 intermediate columns take more K tiles
+# than the kernel's five K stages; the FC2 cubins' 256 / 512-column K tiles leave a zero-filled tail.
+_MX = _Shape(32, 32, 1024, 768, 4, 4)
+
+
+def _mx_inputs(m, shape):
+    """MxE4m3MxE2m1BlockScaleMoERunner inputs: MXFP8 activations, MXFP4 experts, and the top-k routes."""
+    torch.manual_seed(29 + shape.inter)
+    dev = "cuda"
+    e, hidden, inter = shape.local, shape.hidden, shape.inter
+
+    def ue8m0(*size):  # 2^-9 .. 2^8
+        return torch.randint(118, 136, size, dtype=torch.uint8, device=dev)
+
+    def packed(*size):
+        return torch.randint(0, 256, size, dtype=torch.uint8, device=dev)
+
+    x = torch.randn(m, hidden, device=dev).to(torch.float8_e4m3fn)
+    ids = torch.stack([torch.randperm(e, device=dev)[: shape.top_k] for _ in range(m)]).int()
+    w = torch.softmax(torch.randn(m, shape.top_k, device=dev), -1).to(torch.bfloat16)
+    return [
+        None, None, x, ue8m0(m * hidden // 32),
+        packed(e, 2 * inter, hidden // 2), ue8m0(e, 2 * inter, hidden // 32),
+        None, None, None, torch.full((e,), 10.0, device=dev),
+        packed(e, hidden, inter // 2), ue8m0(e, hidden, inter // 32), None,
+        w, ids,
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize("inter", [768])
+@torch.inference_mode()
+def test_mx_cute_fc2_matches_the_fc2_cubin(inter, monkeypatch):
+    """The MXFP4 x MXFP8 runner's un-finalized calls (``mxe4m3_mxe2m1_block_scale_moe_runner_ext``) with
+    ``cute_fc2_rows``: the CuTe FC2 in ``mx`` mode after the FC1-only ``run_moe_ext``, bit for bit the FC2 cubin."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import MxE4m3MxE2m1BlockScaleMoERunner
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    m, shape = 6, _MX._replace(inter=inter)
+    inputs = _mx_inputs(m, shape)
+
+    def runner(cute_fc2_rows):
+        return MxE4m3MxE2m1BlockScaleMoERunner(
+            shape.num_experts, shape.top_k, None, None, inter, None, None, 0, shape.local, None, 1, 0,
+            do_finalize=False, cute_fc2_rows=cute_fc2_rows,
+        )  # fmt: skip
+
+    cute, cubin = runner(16), runner(0)
+    kernel_runner = cute.get_runner()
+    tactics = [
+        list(t)
+        for t in kernel_runner.get_valid_configs(
+            shape.top_k, shape.hidden, inter, shape.local, m, shape.hidden, inter
+        )
+        if t[0] == _TILE
+        and decode_moe.cute_fc2_reproduces(kernel_runner.get_gemm2_kernel_options(*t), mx=True)
+    ]
+    assert tactics, "no tile-8 tactic whose MXFP4 x MXFP8 FC2 cubin the CuTe FC2 reproduces"
+    calls = []
+    run_cute_fc2 = decode_moe.run_cute_fc2
+    monkeypatch.setattr(
+        decode_moe, "run_cute_fc2", lambda *a, **kw: calls.append(1) or run_cute_fc2(*a, **kw)
+    )
+    for tactic in tactics:
+        ref = cubin.forward(inputs, tactic=tactic)
+        assert not calls
+        got = cute.forward(inputs, tactic=tactic)
+        assert len(calls) == 1
+        calls.clear()
+        torch.cuda.synchronize()
+        _assert_same_expert_rows(got, ref)

@@ -19,9 +19,15 @@ import os
 import torch
 
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEFusedRouteQuant, MoEProblem
+from ..impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEFusedRouteQuant,
+    MoEProblem,
+    MoERoutingTables,
+)
 from ..impl_identity import register_moe_impl
 from ..routing import DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod
 from .eligibility import check_trtllm_gen_leaf
@@ -43,9 +49,35 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
     #: this is declared per leaf rather than on the shared format base.
     supports_situ = True
 
+    #: Whether the draft route kernel also lays out the runner's routing tables; set after loading.
+    _builds_routing_tables = False
+
+    #: Set by the DSpark draft MoE, whose next all-reduce boundary combines the expert rows.
+    unfinalized_output_opt_in = False
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(cls, p, d)
+
+    def supports_unfinalized_output(self) -> bool:
+        return self.unfinalized_output_opt_in and is_blackwell_datacenter()
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        # Tables number the rank's experts, not slots; attention-DP dispatch would regroup tokens.
+        self._builds_routing_tables = (
+            not self.use_dp
+            and self.layer_load_balancer is None
+            and self.num_slots == self.num_experts
+            and self.supports_unfinalized_output()
+        )
+        self._table_tile_by_rows = {}
+
+    def ran_on_routing_tables(self, rows: int, tile: int | None) -> None:
+        if tile is None:
+            self._table_tile_by_rows.pop(rows, None)
+        else:
+            self._table_tile_by_rows[rows] = tile
 
     def try_fused_route_quant(
         self,
@@ -68,8 +100,9 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         """The DeepSeek-V4 DSpark draft bank's routing (top-3 of 128, bias-selected) and the MXFP8
         quantization of its input in one launch: the ids and weights of
         ``DeepSeekV4MoeRoutingMethod.apply`` in the expert kernels' dtype and the bytes of
-        ``quantize_input``. Declines for any other bank, a hashed gate, a routing method whose
-        ``apply`` was replaced on the instance, or an input that needs padding.
+        ``quantize_input``; for up to eight tokens also the runner's routing tables of this rank's
+        experts. Declines for any other bank, a hashed gate, a routing method whose ``apply`` was
+        replaced on the instance, or an input that needs padding.
         """
         from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
@@ -93,17 +126,35 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         bias = routing.callable_e_score_correction_bias()
         if bias is None or bias.dtype != torch.float32 or not bias.is_contiguous():
             return None
-        from ....attention.kernels.blackwell.dspark.draft_routing import dspark_draft_route_mxfp8
+        from ....attention.kernels.blackwell.dspark.draft_routing import (
+            can_build_draft_routing_tables,
+            dspark_draft_route_mxfp8,
+        )
+        from ....moe.kernels.blackwell.dsv4_route_quant import ROUTING_TABLE_TILES
 
+        rows = x.shape[0]
+        local_experts = tiles = None
+        if self._builds_routing_tables and can_build_draft_routing_tables(rows, routing.top_k):
+            local_experts = (self.slot_start, self.expert_size_per_partition)
+            # A size that already ran on tables needs only the table of the tile it used.
+            tile = self._table_tile_by_rows.get(rows)
+            tiles = ROUTING_TABLE_TILES if tile is None else (tile,)
+        ids, weights, x_fp8, x_sf, tables = dspark_draft_route_mxfp8(
+            router_logits,
+            bias,
+            x,
+            routing.top_k,
+            routing.routed_scaling_factor,
+            self.input_requirement.routing_scales_dtype or torch.float32,
+            local_experts=local_experts,
+            routing_tiles=tiles or ROUTING_TABLE_TILES,
+        )
         return MoEFusedRouteQuant(
-            *dspark_draft_route_mxfp8(
-                router_logits,
-                bias,
-                x,
-                routing.top_k,
-                routing.routed_scaling_factor,
-                self.input_requirement.routing_scales_dtype or torch.float32,
-            )
+            ids,
+            weights,
+            x_fp8,
+            x_sf,
+            routing_tables=None if tables is None else MoERoutingTables(tables, tiles),
         )
 
     def _try_kimi_k3_route_quant(

@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Routed NVFP4 MoE FC2 for decode-sized batches, bit-identical to the trtllm-gen tile-8 FC2 cubins
-``bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x*`` (Gemm2 of ``moe/trtllmGen/runner.cu``), with a shared-memory and
+"""Routed MoE FC2 for decode-sized batches, bit-identical to the trtllm-gen tile-8 FC2 cubins (Gemm2 of
+``moe/trtllmGen/runner.cu``) ``bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x*`` (NVFP4) and, with ``mx``,
+``bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x*`` (MXFP4 weights x MXFP8 activations), with a shared-memory and
 register footprint that fits ``CTAS_PER_SM`` CTAs per SM.
 
 ``out[p, h] = bf16_satfinite(scale[e] * sum_k act[p, k] * w2[e, h, k])`` for every permuted row ``p`` of a token tile
-(8 rows) of local expert ``e``. Operands and routing tables are the trtllm-gen MoE runner's buffers (``moe_lowm_fc2``):
-``w2`` rows shuffled in 32-row blocks with 128x4 E4M3 scales, the FC1 output with 8x4 scales.
+(8 rows) of local expert ``e`` (``mx``: no ``scale``). Operands and routing tables are the trtllm-gen MoE runner's
+buffers (``moe_lowm_fc2``): ``w2`` rows shuffled in 32-row blocks with 128x4 scales, the FC1 output with 8x4 scales.
 
-Bit-exactness: the cubin's MMA (``tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X``, M 128, N 8, K 64) in its K
-order, the +0 of the cubin's zero-filled K tail where the kernel has none of its own, one FP32 ``mul.rn`` by
-``scale[e]`` and ``cvt.rn.satfinite.bf16x2.f32``.
+Bit-exactness: the cubin's MMA (``tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X``, M 128, N 8, K 64; ``mx``:
+``kind::mxf8f6f4``, K 32) in its K order, the +0 of the cubin's zero-filled K tail where the kernel has none of its own,
+one FP32 ``mul.rn`` by ``scale[e]`` and ``cvt.rn.satfinite.bf16x2.f32``.
 
 Work: a persistent grid walks the (m tile, token tile) pairs. Warp 0 streams weights by TMA before the PDL wait, warp 1
 activations after it, warp 2 issues the MMAs into two TMEM accumulators, warp 3 L2-prefetches later tiles' weights and
@@ -51,9 +52,12 @@ TILE_M = 128
 TILE_N = 8
 TILE_K = 256
 SF_VEC = 16
+MX_TILE_K = 128  # unpacked FP4 weights take a byte per value in shared memory
+MX_SF_VEC = 32
 EPI_WARP0 = 4
 NUM_ACC = 2
 NUM_STAGES = 4  # K stages per CTA
+MX_NUM_STAGES = 5  # the five K tiles of a 640-column FC2 in flight at once
 CTAS_PER_SM = 2
 
 
@@ -88,6 +92,23 @@ def _prefetch_bulk_l2(addr: Int64, nbytes: Int32) -> None:
     )
 
 
+def _pack_bf16x2(lo, hi) -> Int32:
+    return cute.arch.inline_ptx(
+        "cvt.rn.satfinite.bf16x2.f32 {$w0}, {$r1}, {$r0};",
+        write_only_types=[Int32],
+        read_only_args=[lo, hi],
+    )
+
+
+def _pack_bf16x2_tail(lo, hi) -> Int32:
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 a, b; add.rn.f32 a, {$r0}, 0f00000000; add.rn.f32 b, {$r1}, 0f00000000;"
+        " cvt.rn.satfinite.bf16x2.f32 {$w0}, b, a; }",
+        write_only_types=[Int32],
+        read_only_args=[lo, hi],
+    )
+
+
 def _scale_pack_bf16x2_tail(lo, hi, s) -> Int32:
     """Adds the +0 of the cubins' zero-filled K-tail MMAs first (a -0 accumulator becomes +0)."""
     return cute.arch.inline_ptx(
@@ -99,16 +120,27 @@ def _scale_pack_bf16x2_tail(lo, hi, s) -> Int32:
 
 
 class MoeLowMFc2Nvfp4:
-    """Routed NVFP4 FC2, tile 128 (hidden) x 8 (rows) x 256 (K), ``NUM_STAGES`` K stages per CTA."""
+    """Routed NVFP4 (``mx``: MXFP4 x MXFP8) FC2, tile 128 (hidden) x 8 (rows) x ``tile_k``, with the cubins'
+    block-scaled MMAs (M128 N8 K64; ``mx``: K32) in their K order, ``num_stages`` K stages per CTA."""
 
-    def __init__(self, k_tiles: int, k_groups: int, zero_tail: bool, use_pdl: bool = True):
+    def __init__(
+        self,
+        mx: bool,
+        k_tiles: int,
+        k_groups: int,
+        zero_tail: bool,
+        num_stages: int,
+        use_pdl: bool = True,
+    ):
+        self.mx = mx
+        self.tile_k = MX_TILE_K if mx else TILE_K
+        self.sf_vec = MX_SF_VEC if mx else SF_VEC
         self.use_pdl = use_pdl
         self.k_tiles = k_tiles
-        self.k_groups = k_groups  # 4-scale groups per activation row (I / 64)
+        self.k_groups = k_groups  # 4-scale groups per activation row (I / (4 sf_vec))
         self.zero_tail = zero_tail
-        self.tile_k = TILE_K
-        self.gps = TILE_K // (4 * SF_VEC)  # 4-scale groups per K tile
-        self.num_stages = NUM_STAGES
+        self.gps = self.tile_k // (4 * self.sf_vec)  # 4-scale groups per K tile
+        self.num_stages = num_stages
         self.cta_group = tcgen05.CtaGroup.ONE
         self.acc_dtype = cutlass.Float32
         self.threads_per_cta = 256
@@ -128,7 +160,7 @@ class MoeLowMFc2Nvfp4:
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
-            SF_VEC,
+            self.sf_vec,
             self.cta_group,
             (TILE_M, TILE_N),
         )
@@ -146,13 +178,13 @@ class MoeLowMFc2Nvfp4:
         )
         tiler = (TILE_M, TILE_N, self.tile_k)
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            self.tiled_mma, tiler, self.a_dtype, self.num_stages
+            self.tiled_mma, tiler, self.smem_a_dtype, self.num_stages
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, tiler, self.b_dtype, self.num_stages
         )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
-            self.tiled_mma, tiler, SF_VEC, self.num_stages
+            self.tiled_mma, tiler, self.sf_vec, self.num_stages
         )
         self.mma_tiler_sfb = (TILE_M, self.sfb_n, self.tile_k)
         self.tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -161,12 +193,12 @@ class MoeLowMFc2Nvfp4:
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
-            SF_VEC,
+            self.sf_vec,
             tcgen05.CtaGroup.ONE,
             (TILE_M, self.sfb_n),
         )
         self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
-            self.tiled_mma_sfb, self.mma_tiler_sfb, SF_VEC, self.num_stages
+            self.tiled_mma_sfb, self.mma_tiler_sfb, self.sf_vec, self.num_stages
         )
 
     @cute.jit
@@ -186,17 +218,22 @@ class MoeLowMFc2Nvfp4:
         grid_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        """problem = (H, I, E, padded rows); the grid is ``grid_ctas`` persistent CTAs; the tables hold ``max_ctas``
-        entries."""
-        h, k, e, rows = problem
+        """problem = (H, I, E, padded rows, valid I); the grid is ``grid_ctas`` persistent CTAs; the tables hold
+        ``max_ctas`` entries."""
+        h, k, e, rows, k_valid = problem
         a = cute.make_tensor(a_ptr, cute.make_ordered_layout((h, k, e), order=(1, 0, 2)))
-        b = cute.make_tensor(b_ptr, cute.make_ordered_layout((rows, k, 1), order=(1, 0, 2)))
+        # Activation columns past the valid I load as zeros, as in the cubins.
+        b = cute.make_tensor(b_ptr, cute.make_layout((rows, k_valid, 1), stride=(k, 1, rows * k)))
         self.a_dtype = a_ptr.value_type
         self.b_dtype = b_ptr.value_type
         self.sf_dtype = sfa_ptr.value_type
+        # kind::mxf8f6f4 reads the FP4 weights as one value per byte (the TMA unpacks them).
+        self.smem_a_dtype = cutlass.Int8 if self.mx else self.a_dtype
         self.a_major_mode = cutlass.utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.b_major_mode = cutlass.utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        sfa = cute.make_tensor(sfa_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, SF_VEC))
+        sfa = cute.make_tensor(
+            sfa_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec)
+        )
         self._setup_attributes()
         tiled_mma = self.tiled_mma
         a_op = sm100_utils.cluster_shape_to_tma_atom_A((1, 1), tiled_mma.thr_id)
@@ -208,6 +245,7 @@ class MoeLowMFc2Nvfp4:
             (TILE_M, TILE_N, self.tile_k),
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=self.smem_a_dtype if self.mx else None,
         )
         b_op = sm100_utils.cluster_shape_to_tma_atom_B((1, 1), tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
@@ -348,7 +386,7 @@ class MoeLowMFc2Nvfp4:
                 cute.arch.mbarrier_init(tmem_bar, 32 + 128)
 
         sA = smem.allocate_tensor(
-            element_type=self.a_dtype,
+            element_type=self.smem_a_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=1024,
             swizzle=a_smem_layout_staged.inner,
@@ -367,7 +405,7 @@ class MoeLowMFc2Nvfp4:
         )
         # SFB: only rows 0..7 of each 128-row atom are ever written; zero the rest once.
         sfb_base = sSFB.iterator.toint()
-        sfb_words = Stages * (self.sfb_n * (self.tile_k // SF_VEC)) // 4
+        sfb_words = Stages * (self.sfb_n * (self.tile_k // self.sf_vec)) // 4
         for i in cutlass.range(tidx, sfb_words, self.threads_per_cta, unroll=1):
             _st_shared(sfb_base + i * 4, Int32(0))
         _fence_proxy_async_smem()
@@ -446,7 +484,7 @@ class MoeLowMFc2Nvfp4:
                         ey = Int64(_ld_s32(cta_batch_addr + Int64(yq) * 4))
                         mt = Int64(mq)
                         a_tile = Int64(TILE_M) * Int64(k_total // 2)
-                        s_tile = Int64(TILE_M) * Int64(k_total // SF_VEC)
+                        s_tile = Int64(TILE_M) * Int64(k_total // self.sf_vec)
                         if lane % 2 == 0:
                             _prefetch_bulk_l2(
                                 a_base + (ey * Int64(m_tiles) + mt) * a_tile, Int32(a_tile)
@@ -580,7 +618,7 @@ class MoeLowMFc2Nvfp4:
         cute.arch.griddepcontrol_launch_dependents()
         lane = cute.arch.lane_idx()
         groups = self.k_groups
-        stage_bytes = self.sfb_n * (self.tile_k // SF_VEC)
+        stage_bytes = self.sfb_n * (self.tile_k // self.sf_vec)
         gps = self.gps
         own = lane // 8 < gps  # lanes of the stage's 128x4 atoms
         sf = cute.make_rmem_tensor((self.k_tiles,), Int32)
@@ -684,13 +722,13 @@ class MoeLowMFc2Nvfp4:
         tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma,
             tiled_mma.shape_mnk,
-            SF_VEC,
+            self.sf_vec,
             cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
         )
         tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma,
             tiled_mma.shape_mnk,
-            SF_VEC,
+            self.sf_vec,
             cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
         )
         tCtSFA = cute.make_tensor(
@@ -784,7 +822,9 @@ class MoeLowMFc2Nvfp4:
             if t != bidx:
                 ey = _ld_s32(cta_batch_addr + Int64(y) * 4)
             limit = _ld_s32(cta_limit_addr + Int64(y) * 4)
-            s = _ld_nc_f32(scale_addr + Int64(ey) * 4)
+            s = cutlass.Float32(1.0)
+            if cutlass.const_expr(not self.mx):
+                s = _ld_nc_f32(scale_addr + Int64(ey) * 4)
             cute.arch.mbarrier_wait(acc_full + acc_st.index, acc_st.phase)
             tAcc = cute.flat_divide(
                 cute.make_tensor(tmem_ptr + acc_st.index * TILE_N, tCtAcc_fake.layout)[
@@ -804,7 +844,11 @@ class MoeLowMFc2Nvfp4:
                 r = y * TILE_N + j
                 if lead:
                     if r < limit:
-                        if cutlass.const_expr(self.zero_tail):
+                        if cutlass.const_expr(self.mx and self.zero_tail):
+                            packed = _pack_bf16x2_tail(rAcc[j], partner)
+                        elif cutlass.const_expr(self.mx):
+                            packed = _pack_bf16x2(rAcc[j], partner)
+                        elif cutlass.const_expr(self.zero_tail):
                             packed = _scale_pack_bf16x2_tail(rAcc[j], partner, s)
                         else:
                             packed = _scale_pack_bf16x2(rAcc[j], partner, s)
@@ -823,12 +867,22 @@ def num_sms(device: Optional[torch.device] = None) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count - sm_reserve()
 
 
-def supports(w2_shape: Tuple[int, ...], cubin_k_tile: int) -> bool:
+def supports(
+    w2_shape: Tuple[int, ...], cubin_k_tile: int, mx: bool = False, k_valid: Optional[int] = None
+) -> bool:
     """Whether :func:`moe_lowm_fc2` reproduces the FC2 cubin of tile K ``cubin_k_tile`` on uint8 FC2 weights
-    [E, H, I / 2]."""
+    [E, H, I / 2] with ``k_valid`` valid columns."""
     _, h, half_k = w2_shape
     k = 2 * half_k
-    return h % TILE_M == 0 and k % (4 * SF_VEC) == 0 and cubin_k_tile % TILE_K == 0
+    tile_k, sf_vec = (MX_TILE_K, MX_SF_VEC) if mx else (TILE_K, SF_VEC)
+    k_valid = k if k_valid is None else k_valid
+    return (
+        h % TILE_M == 0
+        and k % (4 * sf_vec) == 0
+        and 0 < k_valid <= k
+        and k_valid % sf_vec == 0
+        and cubin_k_tile % tile_k == 0
+    )
 
 
 def moe_lowm_fc2(
@@ -836,27 +890,33 @@ def moe_lowm_fc2(
     act_sf: torch.Tensor,
     w2: torch.Tensor,
     w2_sf: torch.Tensor,
-    scale: torch.Tensor,
+    scale: Optional[torch.Tensor],
     cta_batch: torch.Tensor,
     cta_limit: torch.Tensor,
     num_non_exiting: torch.Tensor,
     out: torch.Tensor,
     cubin_k_tile: Optional[int] = None,
+    mx: bool = False,
+    k_valid: Optional[int] = None,
 ) -> torch.Tensor:
     """FC2 of the trtllm-gen MoE path, bit for bit the FC2 cubin of tile K ``cubin_k_tile`` (None: the kernel's).
-    ``act`` [rows, I/2] uint8 (E2M1 x2), ``act_sf`` 8x4 E4M3 (uint8), ``w2`` [E, H, I/2] uint8, ``w2_sf``
-    [E, H, I/16] (128x4), ``scale`` [E] fp32, tables int32 (``cta_batch`` / ``cta_limit`` per token tile,
-    ``num_non_exiting`` [1]), ``out`` [padded rows, H] bf16 with at least the total padded rows (rows of a tile past
-    its limit are not written)."""
+    ``act`` [rows, I/2] uint8 (E2M1 x2; ``mx``: [rows, I] E4M3), ``act_sf`` 8x4 E4M3 (``mx``: UE8M0) scales (uint8),
+    ``w2`` [E, H, I/2] uint8, ``w2_sf`` [E, H, I/16] (``mx``: I/32) 128x4 scales, ``scale`` [E] fp32 (``mx``: None),
+    tables int32 (``cta_batch`` / ``cta_limit`` per token tile, ``num_non_exiting`` [1]), ``out`` [padded rows, H] bf16
+    with at least the total padded rows (rows of a tile past its limit are not written). ``k_valid``: the FC2 reads
+    that many of the I columns (``mx``)."""
     import torch
 
-    cubin_k_tile = TILE_K if cubin_k_tile is None else cubin_k_tile
-    rows, half_k = act.shape
-    e, h, half_k2 = w2.shape
+    tile_k, sf_vec = (MX_TILE_K, MX_SF_VEC) if mx else (TILE_K, SF_VEC)
+    cubin_k_tile = tile_k if cubin_k_tile is None else cubin_k_tile
+    rows, act_cols = act.shape
+    e, h, half_k = w2.shape
     k = 2 * half_k
-    if half_k2 != half_k or not supports(w2.shape, cubin_k_tile):
+    k_valid = k if k_valid is None else k_valid
+    if act_cols != (k if mx else half_k) or not supports(w2.shape, cubin_k_tile, mx, k_valid):
         raise ValueError(
-            f"unsupported FC2 shape rows {rows} H {h} I {k} E {e}, cubin K tile {cubin_k_tile}"
+            f"unsupported FC2 shape rows {rows} H {h} I {k} (valid {k_valid}) E {e}, "
+            f"cubin K tile {cubin_k_tile}"
         )
     if (
         out.dim() != 2
@@ -865,32 +925,40 @@ def moe_lowm_fc2(
         or not out.is_contiguous()
     ):
         raise ValueError("out must be a contiguous bf16 [padded rows, H] tensor")
+    k_tiles = -(-k_valid // tile_k)
     # A cubin's zero-filled K tail adds an exact +0, which the kernel re-applies when it has no tail of its own.
-    zero_tail = k % cubin_k_tile != 0 and k % TILE_K == 0
+    zero_tail = k_valid % cubin_k_tile != 0 and k_valid % tile_k == 0
     grid_ctas = num_sms(act.device) * CTAS_PER_SM
     ptrs = (
         gmem_ptr(w2, cutlass.Float4E2M1FN, 32),
-        gmem_ptr(w2_sf, cutlass.Float8E4M3FN, 16),
-        gmem_ptr(act, cutlass.Float4E2M1FN, 32),
+        gmem_ptr(w2_sf, cutlass.Float8E8M0FNU if mx else cutlass.Float8E4M3FN, 16),
+        gmem_ptr(act, cutlass.Float8E4M3FN if mx else cutlass.Float4E2M1FN, 32),
     )
     addrs = (
         Int64(act_sf.data_ptr()),
         Int64(out.data_ptr()),
-        Int64(scale.data_ptr()),
+        Int64(0 if scale is None else scale.data_ptr()),
         Int64(cta_batch.data_ptr()),
         Int64(cta_limit.data_ptr()),
         Int64(num_non_exiting.data_ptr()),
         Int32(cta_batch.numel()),
     )
-    problem = (Int32(h), Int32(k), Int32(e), Int32(rows))
+    problem = (Int32(h), Int32(k), Int32(e), Int32(rows), Int32(k_valid))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     use_pdl = get_env_enable_pdl()
-    key = (k, zero_tail, use_pdl)
+    key = (mx, k, k_tiles, zero_tail, use_pdl)
     fn = _COMPILED.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("compile the low-M MoE FC2 before CUDA graph capture")
-        kern = MoeLowMFc2Nvfp4(-(-k // TILE_K), k // (4 * SF_VEC), zero_tail, use_pdl)
+        kern = MoeLowMFc2Nvfp4(
+            mx,
+            k_tiles,
+            k // (4 * sf_vec),
+            zero_tail,
+            MX_NUM_STAGES if mx else NUM_STAGES,
+            use_pdl,
+        )
         fn = cute.compile(kern, *ptrs, *addrs, problem, Int32(grid_ctas), stream)
         _COMPILED[key] = fn
     fn(*ptrs, *addrs, problem, Int32(grid_ctas), stream)

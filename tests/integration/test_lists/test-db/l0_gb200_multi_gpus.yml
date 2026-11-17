@@ -54,6 +54,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_megamoe_default_tactics.py
   # DSpark Markov chain, forked draft prep and peer buffers over IPC and MNNVL.
   - unittest/_torch/speculative/test_dspark_markov_chain.py
+  - unittest/_torch/multi_gpu/test_dspark_group_draft_head.py
   - unittest/_torch/multi_gpu/test_dspark_draft_prep.py
   - unittest/_torch/multi_gpu/test_peer_buffers.py
   - unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_allreduce_boundary_matches_allreduce_then_boundary

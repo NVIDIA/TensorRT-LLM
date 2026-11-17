@@ -42,6 +42,11 @@ from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from tensorrt_llm._torch.kernels.blackwell.utils import (
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
+
 try:
     from cutlass import memory as cutlass_memory
 except ImportError:
@@ -123,6 +128,9 @@ class DSparkAttentionKernel:
         # right before the store, preserving the former kernel boundary's BF16
         # rounding. 0 keeps the generic DSpark attention output path unchanged.
         self.inverse_rope_dim = 0
+        # PDL: only setup (prefetch, barrier init, cluster sync) runs before griddepcontrol.wait;
+        # the dependent grid is released once the epilogue has the final PV result.
+        self.use_pdl = False
         self.seq_len_q = seq_len_q
         # Query tokens per M tile; with two, each CTA of the pair owns one token.
         self.q_tokens_per_tile = 1
@@ -538,6 +546,7 @@ class DSparkAttentionKernel:
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -717,6 +726,8 @@ class DSparkAttentionKernel:
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
@@ -2359,6 +2370,9 @@ class DSparkAttentionKernel:
             self.epilogue_exchange_sync_bar.wait()
         # mma_o pipeline consumer wait
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
+        if cutlass.const_expr(self.use_pdl):
+            # Released late so the dependent's weight loads stay clear of this grid's K/V loads.
+            griddepcontrol_launch_dependents()
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             # tmem load tiled copy and partition results.
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
