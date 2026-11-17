@@ -67,15 +67,15 @@ goal words cannot say.
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
-large checkpoint), and every change to the target runs the stale checks again, so the contract's
-size is paid once per fix, not once per run. Prove each requested feature **once**, at the member
+large checkpoint). A check that passed stands, so each is paid once, and again only after it
+failed or when a task that claims it lands. Prove each requested feature **once**, at the member
 the request validates fully. One check of any kind covers a feature; the delivery report lists
 the checks behind each (`coverage.yaml`):
 
 - A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
-  The accuracy check loads the same engine and fails unless each rank reports the variant's
-  setting (its KV dtype, its chunking); a variant that boots, boots at **every** member of its
-  unit.
+  That gate judges the variant's score against its unit's. No gate reads the dtype, the
+  chunking or the reuse the engine resolved, and such a variant owes no boot. A variant whose
+  gates include `boot` boots at the members of its unit where its benchmark does not run.
 - Members the request scopes to text-only or aggregate take core alone, not the variants.
 - A feature unit runs at one member (`members: {<feature>: [X]}`), and every variant stays on
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
@@ -94,7 +94,7 @@ than two engines at its member's width.
 
 `cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
 (the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
-is 10-50x slower, each fix-and-recheck pays it, and it scores a path the target does not serve.
+is 10-50x slower and scores a path the target does not serve.
 Run a unit or variant's accuracy eager only on purpose (a short subset, a capture still being
 built), and say so in `notes`; a benchmark you start by hand runs captured too.
 

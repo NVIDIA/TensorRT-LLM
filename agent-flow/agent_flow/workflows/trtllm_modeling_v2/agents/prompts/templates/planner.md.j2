@@ -35,7 +35,7 @@ tasks:
   - id: core
     kind: assemble
     tags: []                    # further kinds of work it does, e.g. [investigate]
-    goal: the target's core forward and weight loading at tep4; finished when it boots
+    goal: the target's core forward and weight loading at tep4; finished when its benchmark passes
     depends_on: [k-rmsnorm, k-moe]
     depends_on_soft: []         # tasks it may start beside; it waits for them only to integrate
     touches:
@@ -43,7 +43,7 @@ tasks:
       - {{ MODELING_V2_PACKAGE }}/models/<family>/<target>/weights.py
       - {{ MODELING_V2_PACKAGE }}/models/<family>/routing.py
     resources: {gpus: 1, est_minutes: 240}
-    satisfies: ["core:boot@tep4", "core:accuracy[gsm8k]@tep4"]
+    satisfies: ["core:accuracy[gsm8k]@tep4"]   # the keys `contract.yaml` lists for the unit
     priority: required          # or nice_to_have, from the feature's status
     exclusive: false            # true only for work that needs the tree to itself
     ref: core                   # what it works on: the unit (assemble, feature),
@@ -258,9 +258,9 @@ the existing target closest to it.
 **Do not idle behind a gate.** A `depends_on` edge says a task needs another's
 result; an edge that only keeps two tasks apart delays everything downstream
 of it and buys nothing: leave it out, and let integration put the two in
-order. Work that builds on the core's code starts from it while its accuracy
-is still being debugged; a fix that lands later reaches it through
-integration.
+order. Work that builds on the core's code starts once a check of the core
+has shown its engine answering, while its accuracy is still being debugged; a
+fix that lands later reaches it through integration.
 
 Once full support holds (every required check, the delivery files on disk, no
 local variant waiting), the orchestrator records that commit and the run is

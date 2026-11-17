@@ -805,7 +805,7 @@ def check_multirank_substrate(
     environment: RunEnvironment,
     runner: CommandRunner = _default_runner,
 ) -> None:
-    """Exercise an NCCL collective and an MPI dynamic spawn under a deadline: both hang rather than raise."""
+    """Exercise one NCCL collective across the ranks, under a deadline: it hangs rather than raises."""
     if world_size <= 1:
         return
     script = (

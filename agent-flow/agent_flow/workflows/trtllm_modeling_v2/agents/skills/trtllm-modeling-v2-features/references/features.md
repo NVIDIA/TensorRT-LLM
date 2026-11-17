@@ -105,12 +105,15 @@ V2 pool, `TRTLLM_KV_FRESH_PAGE_FILL=nan` and `TRTLLM_KV_GUARD_PAGE=nan`
 (diagnostic only) make a read of a page the request does not own visible
 instead of returning another request's KV.
 
-**Flow proof.** Every boot runs the reuse probe (`checks/harness/reuse_probe.py`):
-one prompt (the smallest snapshot boundary, else one block, plus two blocks)
-sent twice after completion under a fresh `cache_salt`, pinned to attention-DP
-rank 0, `max_tokens` 1. With reuse declared, the gate fails if the second
-response reports zero `cached_tokens`, or if the engine logged that it turned
-reuse off. A probe that could not run records UNKNOWN, never a failure.
+**Flow proof.** A boot and an acceptance load run the reuse probe
+(`checks/harness/reuse_probe.py`): one prompt (the smallest snapshot boundary,
+else one block, plus two blocks) sent twice after completion under a fresh
+`cache_salt`, pinned to attention-DP rank 0, `max_tokens` 1. With reuse
+declared, the gate fails if the second response reports zero `cached_tokens`,
+or if the engine logged that it turned reuse off. A probe that could not run
+records UNKNOWN, never a failure. A benchmark runs no probe: a `reuse` variant
+with `gates: [accuracy]` is judged by its score alone, and nothing observes
+that it reused. Report such a feature as configured, not verified.
 
 **Blind spots.** The probe proves the manager matched blocks, not that the
 forward over the cached prefix is right: its one token is compared with
@@ -161,12 +164,13 @@ MLA entries `mla_rope_append_paged_kv_assign_q` and
 a prompt longer than 2n tokens; compare greedy token ids with a run whose
 `--max_num_tokens` exceeds the prompt.
 
-**Flow proof.** `runtime.chunked_prefill: true` in every gate plus one `chunked`
-variant (`gates: [accuracy]`) whose `max_num_tokens` is below the benchmark's
-prompts (`spec/INTAKE.md`: e.g. 512 for 8-shot GSM8K). A boot of a check about
-chunking appends a probe of about twice `max_num_tokens` and fails unless some
-request computed more than `max_num_tokens` tokens past what the cache resumed
-(`chunk_shortfall`, `checks/boot.py`).
+**Flow proof.** One `chunked` variant (`gates: [accuracy]`) whose
+`max_num_tokens` is below the benchmark's prompts (`spec/INTAKE.md`), so the
+engine must split every prompt, and the result is scored. A variant whose
+gates include `boot` also sends, in that boot, a prompt of about twice
+`max_num_tokens`, and fails unless some request computed more than
+`max_num_tokens` tokens past what the cache resumed (`chunk_shortfall`,
+`checks/boot.py`).
 
 **Blind spots.** The boot evidence is inferred from lengths, not a chunk count,
 and the probe's single token is compared with nothing. A wrong later-chunk path
@@ -331,7 +335,8 @@ run with the native storage on.
 
 **Blind spots.** No gate reads the dtype the engine resolved: an NVFP4 request
 that fell back to FP8 passes unless the score shows it, and the loader's
-KV-quantization log line is the place to read it. A missing or unit scale shows
+KV-quantization log line is the place to read it. Read it, and report the
+dtype as verified only if the line says so. A missing or unit scale shows
 only as an accuracy shift against `auto`, which a relative floor catches when
 it is larger than the two runs' noise. Whether
 `kv_quant` really stores fewer bytes per token is not checked: the engine's

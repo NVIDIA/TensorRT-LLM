@@ -32,10 +32,10 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
 derive` writes a starting spec (no `site.yaml` needed). The spec should be the smallest contract
 that covers the request: one check of any kind covers a feature, and `--dry-run` journals the
-contract's checks per unit and variant before anything is spent. Preflight probes the host with small scripts (the devices, the
-checkpoint, an NCCL collective and an MPI spawn across the ranks) and loads no model: a host
-fault those do not show appears at the first load, where the first thing to settle is whether
-it is the host's or the target's.
+contract's checks per unit and variant before anything is spent. Preflight reads the checkpoint and the spec and loads no model. On a `local`
+host it also claims the devices and runs one NCCL collective across the ranks; on a session the
+allocation is the claim and nothing probes its host. A host fault appears at the first load,
+where the first thing to settle is whether it is the host's or the target's.
 
 **Example prompt** — replace placeholders and omit requirements you do not need.
 
