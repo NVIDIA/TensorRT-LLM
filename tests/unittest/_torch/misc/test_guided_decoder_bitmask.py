@@ -256,6 +256,107 @@ def test_build_dead_end_isolates_the_failing_request(monkeypatch):
     assert decoder.num_advanced_tokens[1] == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_build_on_thread_pool_matches_serial_build(monkeypatch):
+    """The thread-pool build equals the serial build, with real xgrammar matchers.
+
+    A byte-level vocabulary and a real JSON-schema grammar drive real matchers:
+    a context step creates them, then a generation step advances each through
+    its drafted tokens and fills one bitmask row per position. Each request
+    drafts a different prefix, one of them with a token the grammar rejects.
+    The pool must reproduce the serial counters and every bitmask row, and the
+    rows must be restrictive, so a build that skipped the grammar cannot pass.
+    """
+    import json
+
+    from tensorrt_llm.bindings.executor import GuidedDecodingParams
+
+    vocab = [bytes([i]) for i in range(256)] + [b"<EOS>"]
+    schema = json.dumps({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "maxLength": 8},
+            "age": {"type": "integer", "minimum": 0, "maximum": 120},
+        },
+        "required": ["name", "age"],
+        "additionalProperties": False,
+    })
+    params = GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, schema)
+    num_draft = 4
+    texts = ['{"name"', '{"na', '{"age', '{"name": "A", "age": 3}']
+    drafted = [[ord(c) for c in t[1 : 1 + num_draft]] for t in texts]
+    drafted[1][2] = ord("}")  # '}' is not valid after '{"n': the grammar rejects it
+
+    def build(threads: int):
+        monkeypatch.setenv("TRTLLM_GUIDED_DECODING_BUILD_THREADS", str(threads))
+        decoder = GuidedDecoder(
+            GuidedDecodingConfig(
+                encoded_vocab=[v.decode("latin-1") for v in vocab], stop_token_ids=[256]
+            ),
+            max_num_sequences=len(texts),
+            vocab_size_padded=len(vocab),
+            max_num_draft_tokens=num_draft,
+        )
+        assert decoder._build_pool_size == threads
+        context = GuidedRequests(
+            [
+                GuidedRequest(
+                    guided_decoding_params=params,
+                    request_id=100 + slot,
+                    seq_slot=slot,
+                    is_context_init_state=True,
+                    is_last_context_chunk=True,
+                    draft_tokens=[],
+                )
+                for slot in range(len(texts))
+            ],
+            num_contexts=len(texts),
+            num_generations=0,
+            max_num_draft_tokens=num_draft,
+        )
+        assert decoder._build(context) == []
+        decoder.token_mask_host.zero_()
+        generation = GuidedRequests(
+            [
+                GuidedRequest(
+                    guided_decoding_params=params,
+                    request_id=100 + slot,
+                    seq_slot=slot,
+                    is_generation_in_progress_state=True,
+                    new_token=ord("{"),
+                    draft_tokens=drafted[slot],
+                )
+                for slot in range(len(texts))
+            ],
+            num_contexts=0,
+            num_generations=len(texts),
+            max_num_draft_tokens=num_draft,
+        )
+        failed = decoder._build(generation)
+        assert (decoder._build_pool is not None) == (threads > 1)
+        decoder.shutdown()
+        assert decoder._build_pool is None
+        return (
+            failed,
+            decoder.bitmask_host[: generation.num_bitmask_tokens].clone(),
+            decoder.token_mask_host[: generation.num_bitmask_tokens].clone(),
+            decoder.num_advanced_tokens[: len(texts)],
+            decoder.num_guided_tokens[: len(texts)],
+        )
+
+    serial, parallel = build(1), build(4)
+    assert serial[0] == [] and parallel[0] == []
+    assert torch.equal(serial[1], parallel[1])
+    assert torch.equal(serial[2], parallel[2])
+    assert serial[3:] == parallel[3:]
+    # The grammar really constrains: every guided row forbids some tokens, and
+    # the request with the rejected drafted token stops advancing early.
+    guided_rows = serial[1][serial[2].bool()]
+    assert guided_rows.shape[0] > len(texts)
+    assert (guided_rows != -1).any(dim=1).all()
+    assert serial[3][1] < serial[3][0]
+
+
 # --- disagg generation matcher initialization --------------------------------
 
 _INVALID_PARAMS = object()

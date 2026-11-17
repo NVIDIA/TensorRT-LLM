@@ -495,6 +495,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     # derived weights cache_derived_state builds (set_draft_model).
     _forks_backfill = True
     _draft_model_ref: Optional[weakref.ref] = None
+    # Whether guided decoding drafts the block position by position under the grammar mask.
+    # Off: the block is sampled unmasked and verification against the masked target keeps
+    # the output valid, without a host round-trip per draft position.
+    _guided_draft_loop = False
 
     def __init__(
         self,
@@ -505,6 +509,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._guided_draft_loop = bool(
+            getattr(spec_config, "guided_draft_loop", self._guided_draft_loop)
+        )
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
@@ -1471,44 +1478,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._confidence_stamp[slots] = self._draft_seq_cuda
         return draft_output[0].to(torch.int32) if return_tokens else draft_output[2]
 
-    def _sample_draft_tokens_guided(
-        self,
-        gen_logits: torch.Tensor,
-        spec_metadata: "DSparkSpecMetadata",
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-        K: int,
-    ):
-        """
-        Grammar-constrained draft sampling for the guided-decoding path.
-        """
-        vocab = gen_logits.shape[-1]
-        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
-        # a contiguous [batch, vocab] tensor.
-        if num_contexts > 0:
-            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
-            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
-        else:
-            full_logits = gen_logits.transpose(0, 1).contiguous()
-
-        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
-        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
-
-        gen_draft_tokens = []
-        for k in range(K):
-            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
-            step_logits = full_logits[k]
-            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
-            step_tokens = self.sample_draft_tokens(
-                step_logits, spec_metadata, batch_size, draft_step=k
-            )
-            gen_draft_tokens.append(step_tokens[num_contexts:])
-            new_tokens = step_tokens
-        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
-        return gen_draft_tokens
-
     def _forward_impl(
         self,
         input_ids,
@@ -1627,6 +1596,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
         )
 
+        guided_draft_loop_ran = False
         if num_gens > 0:
             reuse_draft_tokens = self._can_reuse_draft_tokens(draft_model, spec_metadata)
             draft_output = self._draft_gen_block_batched(
@@ -1648,7 +1618,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 gen_vocab = None
             elif draft_output is not None:
                 gen_logits = draft_output
-                if self.guided_decoder is not None:
+                if (
+                    self.guided_decoder is not None
+                    and self._guided_draft_loop
+                    and spec_metadata.use_rejection_sampling
+                ):
                     gen_draft_tokens = self._sample_draft_tokens_guided(
                         gen_logits,
                         spec_metadata,
@@ -1658,6 +1632,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                         batch_size,
                         K,
                     )
+                    guided_draft_loop_ran = True
                 else:
                     # SpecWorkerBase samples the draft tokens.
                     gen_draft_tokens = self.sample_draft_tokens(
@@ -1691,6 +1666,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         else:
             next_draft_tokens = gen_draft_tokens
+
+        if not guided_draft_loop_ran:
+            self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
@@ -1765,6 +1743,12 @@ class DSparkWorker(DFlashWorker):
     draft K/V here, a worker-owned rolling window in
     :class:`DSv4DSparkWorker`.
     """
+
+    # The per-position masked draft loop is off: verification against the
+    # grammar-masked target is correct without it, and it costs a host
+    # round-trip per draft position, which halves guided throughput on small
+    # models and gains little on large ones.
+    _guided_draft_loop = False
 
     def set_draft_model(self, draft_model) -> None:
         """Reject an unsupported vocab mapping here rather than mid-decode.

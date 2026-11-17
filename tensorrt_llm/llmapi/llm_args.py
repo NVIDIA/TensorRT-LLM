@@ -4439,6 +4439,17 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
+    guided_draft_loop: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, with guided decoding and rejection sampling, draft the block "
+        "one position at a time under the grammar mask instead of sampling it "
+        "unmasked. This raises acceptance length but costs a host round trip "
+        "per draft position, which lowers throughput in the measured cases. "
+        "Output is grammar-valid either way, because the target step always "
+        "applies the grammar.")
+
     mask_token_id: Optional[int] = Field(
         default=None,
         description=
@@ -9434,7 +9445,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
                 rs_parallel_active = self.context_parallel_size > 1
-                rs_guided_active = self.guided_decoding_backend is not None
+                # DSpark verifies against the grammar-masked target, and
+                # rejection sampling stays correct for any draft distribution q,
+                # so guided decoding is allowed with it. The draft block is
+                # sampled unmasked by default; the per-position masked draft loop
+                # (which makes q grammar-masked too) is an internal opt-in.
+                rs_guided_active = (self.guided_decoding_backend is not None
+                                    and not spec_mode.is_dspark())
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None
                 rs_relaxed_active = getattr(
@@ -9468,7 +9485,7 @@ class TorchLlmArgs(BaseLlmArgs):
                             reasons.append(
                                 f"spec mode {spec_mode.name} is not a supported "
                                 "rejection-sampling path (supported: the Eagle3 "
-                                "one-model path, vanilla MTP, PARD, DFlash, and "
+                                "one-model path, vanilla MTP, PARD, DFlash, DSpark, and "
                                 "DraftTarget one-model)")
                         if rs_sa_active:
                             reasons.append("SA (sa_config) is active")

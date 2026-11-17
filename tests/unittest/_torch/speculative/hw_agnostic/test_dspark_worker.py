@@ -112,6 +112,20 @@ def _make_worker(enable_confidence_scheduling=False, enable_fused_confidence_sch
     return DSv4DSparkWorker(cfg, Mapping())
 
 
+def test_guided_draft_loop_field_reaches_the_worker():
+    """The ``guided_draft_loop`` config field defaults to off, reaches the worker, and survives the
+    dump-and-validate round trip that rebuilds the arguments for multi-rank workers."""
+    from tensorrt_llm.llmapi import DSparkDecodingConfig
+    from tensorrt_llm.mapping import Mapping
+
+    assert DSv4DSparkWorker(DSparkDecodingConfig(max_draft_len=5), Mapping())._guided_draft_loop is False
+    cfg = DSparkDecodingConfig(max_draft_len=5, guided_draft_loop=True)
+    assert DSv4DSparkWorker(cfg, Mapping())._guided_draft_loop is True
+    rebuilt = DSparkDecodingConfig.model_validate(cfg.model_dump())
+    assert rebuilt.guided_draft_loop is True
+    assert DSv4DSparkWorker(rebuilt, Mapping())._guided_draft_loop is True
+
+
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
@@ -839,7 +853,7 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
 
 
 def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
-    """Guided mixed (context + gen) batch: ``forward`` must walk the K draft
+    """Guided mixed (context + gen) batch with the draft loop enabled: ``forward`` must walk the K draft
     positions left-to-right, advancing the grammar matcher
     (``add_draft_batch``) and masking each position's logits in place
     (``execute_draft_batch``) BEFORE that position is sampled.
@@ -902,7 +916,7 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
             self.add_steps.append(draft_step)
             self.add_tokens.append(new_tokens.clone())
 
-        def execute_draft_batch(self, logits, draft_step=0):
+        def execute_draft_batch(self, logits, d2t=None, draft_step=0):
             # Record the exact tensor properties the bitmask kernel requires,
             # BEFORE mutating: contiguous [batch, vocab] with zero-padded
             # context rows.
@@ -919,6 +933,9 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
 
     guided = FakeGuidedDecoder()
     worker.guided_decoder = guided
+    # The per-position loop is opt-in (off by default); this test pins its behavior.
+    monkeypatch.setattr(worker, "_guided_draft_loop", True)
+    meta.use_rejection_sampling = True
 
     sampled_per_step = []
 
