@@ -27,18 +27,18 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2 import _native
-from tensorrt_llm._torch._experimental.modeling_v2._native import (
+from tensorrt_llm._torch.modeling_v2 import _native
+from tensorrt_llm._torch.modeling_v2._native import (
     NativeLoadError,
     load_family_ops,
     load_target_ops,
     namespace_of,
 )
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.gpt_oss"
 _TARGET = f"{_FAMILY}.gpt_oss_120b__sm_10x__default"
 _TARGET_NS = "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
 
@@ -145,7 +145,7 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     import json, sys
     import torch
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
-    from tensorrt_llm._torch._experimental.modeling_v2 import _native
+    from tensorrt_llm._torch.modeling_v2 import _native
 
     family = sys.argv[1]
     built = sorted(_native._load_family_library(family))

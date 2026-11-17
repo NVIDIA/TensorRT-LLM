@@ -54,16 +54,14 @@ from typing import Mapping
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 from ..moe.moe import BeamMoeBf16Sm103Tp1, check_weights
 from ..moe.moe import check_config as check_moe_config

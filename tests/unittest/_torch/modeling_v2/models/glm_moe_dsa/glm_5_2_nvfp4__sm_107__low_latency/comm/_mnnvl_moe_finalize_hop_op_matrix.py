@@ -353,7 +353,7 @@ CHECKS = (
 def _run_one_rank() -> None:
     global entry, hop, ws, validating, RANK, WORLD, MAPPING
     RANK, WORLD, MAPPING = ranks.init_rank()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm import (  # noqa: E501
         _mnnvl_workspace,
         mnnvl_hop,
         mnnvl_moe_finalize_hop,

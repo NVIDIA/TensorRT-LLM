@@ -17,9 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import (
-    attn_res_fwd,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

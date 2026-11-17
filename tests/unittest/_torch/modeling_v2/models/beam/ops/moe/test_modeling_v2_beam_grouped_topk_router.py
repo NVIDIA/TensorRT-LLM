@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router as op,
 )
 
