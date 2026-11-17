@@ -3128,21 +3128,29 @@ class PyExecutor:
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
+            not self._has_pending_native_sends() and \
             not self.disagg.has_retiring_gen_receives
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is None and self.dist.world_size != 1:
-            # Native-only idle polling currently requires a single-rank worker.
+        if connector is None:
             return False
-        if self.enable_attention_dp and connector is not None:
+        if self.enable_attention_dp:
             # Fleet-wide snapshot from the routing allgather; a rank-local
             # decision here can strand peers in request broadcast or shutdown.
             return self._kv_connector_has_pending
         transfers = getattr(self, "async_transfer_manager", None)
-        return ((connector is not None and connector.has_pending_loads())
+        return (connector.has_pending_loads()
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
+
+    def _has_pending_native_sends(self) -> bool:
+        # Native-only idle polling currently requires a single-rank worker.
+        if (getattr(self, "kv_connector_manager", None) is not None
+                or self.dist.world_size != 1):
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return transfers is not None and transfers.has_any_inflight_requests()
 
     # ------------------------------------------------------------------
     # TLLM_EXECUTOR_STAGE_TIMING=1: coarse wall / thread-CPU stage timers of the
@@ -8866,6 +8874,7 @@ class PyExecutor:
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not pending_cancel_holds_vote and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
+                and not self._has_pending_native_sends()
                 and not pending_retirement)
         # Only trust the hint on the busy path; `idle`, `control_pending` and
         # the hint are identical on all ranks, so every rank takes the same

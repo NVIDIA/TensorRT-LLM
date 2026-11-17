@@ -1019,6 +1019,7 @@ def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
     executor.control_requests = []
     executor._disable_mpi = False
     executor.request_accumulated = []
+    executor.canceled_req_ids = []
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     executor.request_broadcaster = RequestBroadcaster(executor.dist, executor.hang_detector)
     executor.executor_request_queue = Mock()

@@ -18,6 +18,7 @@ from safetensors.torch import save_file
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.logger import logger
 
 from .bindings import generation_pb2
@@ -267,6 +268,8 @@ class EncoderCache:
 
 def encoder_role(llm: Any, cache: EncoderCache | None) -> str:
     if cache is None or not getattr(llm.input_processor, "support_mm_disagg", False):
+        return ""
+    if resolve_top_level_model_type(llm.input_processor.config) != "qwen3_vl":
         return ""
     if any(
         getattr(llm.args, name, 1) != 1
