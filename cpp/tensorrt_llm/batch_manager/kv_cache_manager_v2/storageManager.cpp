@@ -2979,12 +2979,10 @@ void StorageManager::shrinkPoolGroup(
 // adjustCacheLevel — mirrors Python _storage_manager.py::adjust_cache_level
 // ---------------------------------------------------------------------------
 
-void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
-    TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::planCacheLevel(
+    CacheLevel level, std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList) const
 {
-    auto& lvlStorage = *mLevels.at(level).storage;
-    auto oldNumSlots = lvlStorage.slotCountList();
+    auto const& lvlStorage = *mLevels.at(level).storage;
     size_t quota = newQuota.has_value()
         ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity(lvlStorage.cacheTier()))
         : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
@@ -3005,7 +3003,16 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
     // Fixed hot-tier groups keep their size; only elastic groups are resized.
-    auto newNumSlots = slotCountsForLevel(level, quota, ratioList);
+    return slotCountsForLevel(level, quota, ratioList);
+}
+
+void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
+    TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+{
+    auto& lvlStorage = *mLevels.at(level).storage;
+    auto oldNumSlots = lvlStorage.slotCountList();
+    auto newNumSlots = planCacheLevel(level, newQuota, ratioList);
     for (PoolGroupIndex pgIdx{0}; level == kHotLevel && pgIdx < newNumSlots.size(); ++pgIdx)
     {
         TLLM_CHECK_DEBUG(!mFixedSlots[pgIdx] || newNumSlots[pgIdx] == oldNumSlots[pgIdx]);

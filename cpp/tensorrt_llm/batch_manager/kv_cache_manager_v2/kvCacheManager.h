@@ -408,6 +408,9 @@ public:
     // All KvCaches must be suspended before calling adjust().
     bool needAdjustment() const;
     void adjust();
+    // Hot-level slot count per pool group after the next adjust(): the current counts when it
+    // would leave the hot level alone. Valid until the tuner's state changes (a new sample).
+    TypedVec<PoolGroupIndex, SlotCount> plannedSlotCounts() const;
 
     // ---- Internals used by KvCache ----------------------------------------
 
@@ -704,6 +707,8 @@ private:
 
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
+    // getQuota without taking the API lock; the caller must hold it.
+    size_t _getQuota(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
 
