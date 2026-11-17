@@ -321,6 +321,43 @@ def test_signed_router_refuses_reply_to_unauthenticated_peer(signed_pair):
         router.send([b"unknown-routing-id", b"reply"])
 
 
+def test_signed_router_bounds_reply_targets_and_adds_them_after_verification(
+    signed_pair, monkeypatch
+):
+    router, dealer = signed_pair
+    monkeypatch.setattr(ZMQMessenger, "_MAX_PEER_IDS", 2)
+    with ZMQMessenger("DEALER", router.endpoint, signer=None) as unsigned:
+        unsigned.send([b"REQUEST_INSTANCE_INFO"])
+        with pytest.raises(FrameAuthenticationError):
+            router.receive(timeout_ms=1000)
+    assert not router._peer_ids
+
+    def request_from(sender):
+        sender.send([b"REQUEST_INSTANCE_INFO"])
+        return router.receive(timeout_ms=1000)[0]
+
+    with (
+        ZMQMessenger(
+            "DEALER", router.endpoint, signer=_signer(), identity="tcp://127.0.0.1:40004"
+        ) as second,
+        ZMQMessenger(
+            "DEALER", router.endpoint, signer=_signer(), identity="tcp://127.0.0.1:40005"
+        ) as third,
+    ):
+        first_id = request_from(dealer)
+        second_id = request_from(second)
+        # `dealer` sends again after `second`, so its routing id is the one that is kept.
+        request_from(dealer)
+        third_id = request_from(third)
+        assert len(router._peer_ids) == 2
+        with pytest.raises(FrameAuthenticationError, match="No authenticated peer"):
+            router.send([second_id, b"reply"])
+        router.send([first_id, b"reply"])
+        assert dealer.receive(timeout_ms=1000) == [b"reply"]
+        router.send([third_id, b"reply"])
+        assert third.receive(timeout_ms=1000) == [b"reply"]
+
+
 def test_signed_listener_drops_forged_messages_and_keeps_running(signed_pair):
     router, dealer = signed_pair
     received = []
@@ -373,6 +410,22 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(sign
         dealer._verify(from_other)
 
 
+def test_signed_dealer_rejects_repeated_reply(signed_pair):
+    router, dealer = signed_pair
+    reply = [b"reply"] + _signer().sign(
+        [b"reply"],
+        sender_id=router.endpoint.encode(),
+        recipient_id=b"tcp://127.0.0.1:40001",
+        flow=FrameSigner.FLOW_TO_DEALER,
+        seq=1,
+        stream_id=os.urandom(16),
+    )
+    assert dealer._verify(reply) == [b"reply"]
+    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+        dealer._verify(reply)
+    assert dealer.replays_rejected == 1
+
+
 def _raw_signed(router, seq, stream_id, payload=(b"TAG",), sender_id=b"tcp://127.0.0.1:40009"):
     payload = list(payload)
     return payload + _signer().sign(
@@ -415,6 +468,23 @@ def test_replay_accepts_gaps_and_new_stream_ids(replay_router):
         raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
         assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
     assert router.replays_rejected == 0
+
+
+def test_replay_state_is_bounded_and_keeps_recently_used_streams(replay_router, monkeypatch):
+    router, raw = replay_router
+    monkeypatch.setattr(ZMQMessenger, "_MAX_REPLAY_STATE", 2)
+    first, second, third = (os.urandom(16) for _ in range(3))
+    for seq, stream_id in ((1, first), (1, second), (2, first), (1, third)):
+        raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
+        router.receive(timeout_ms=1000)
+    assert len(router._last_seq) == 2
+    # `first` was used after `second`, so its state is the one that is kept.
+    raw.send(_raw_signed(router, seq=2, stream_id=first))
+    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+        router.receive(timeout_ms=1000)
+    # The state of `second` was dropped, so its seq starts over.
+    raw.send(_raw_signed(router, seq=1, stream_id=second))
+    assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
 
 
 def test_replay_state_survives_a_rewritten_sender_id(replay_router):
