@@ -210,6 +210,11 @@ when its summary or entry point changes.
   times when evaluating shard balance; summing old per-function startup costs does
   not estimate the new batch correctly. Preserve the existing waiver rules above.
 
-Follow the [unit-test coverage guidance](../../unittest/AGENTS.md) when adding or
-reducing cases. These rules preserve useful coverage and efficient execution,
-without fixing a maximum test count or preventing justified new regression tests.
+## Test coverage
+
+When adding or reducing cases, follow the shared
+[test-value and placement rules](../../AGENTS.md#test-value-and-execution-placement).
+For unit-test-specific details, follow the
+[unit-test coverage guidance](../../unittest/AGENTS.md#coverage-and-execution-cost).
+Preserve useful coverage and efficient execution without fixing a maximum test
+count or preventing justified new regression tests.
