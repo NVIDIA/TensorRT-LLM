@@ -564,8 +564,9 @@ class GraphOrchestrator:
     def _run_task(self, task: graph_mod.Task) -> tuple[str, list[str]]:
         """A task's worker, then, in the same thread, the checks it claims.
 
-        The delivery-tier checks it claims wait for the delivery tier, which
-        runs once on the target as it is delivered.
+        The delivery-tier checks it claims wait for the delivery tier. They are
+        owed from here on: an earlier pass of one does not answer for the tree
+        this task left.
         """
         try:
             with turn_priority(self._priority_of(task)):
@@ -575,6 +576,8 @@ class GraphOrchestrator:
         if decision.partition("\n")[0] not in FINISHED:
             return decision, []
         delivery = self._delivery_keys()
+        with self._status_lock:
+            self._owed.update(k for k in task.satisfies if k in delivery)
         self._agentless.add(task.id)
         try:
             return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
@@ -766,7 +769,8 @@ class GraphOrchestrator:
           otherwise at once. A benchmark among them waits until no required
           task is open, unless the bring-up still needs it;
         - with no required task open and every other required check passed,
-          the delivery tier, on the target as it is;
+          the delivery tier: its checks with no pass, and those a task that
+          landed since claims;
         - then, when no benchmark has scored the target as it is, the one check
           that confirms the final tree (:attr:`~.contract.Contract.confirm`).
 
@@ -779,6 +783,7 @@ class GraphOrchestrator:
         marker, evaluation = self._evaluated()
         with self._status_lock:
             latest = self.status.latest()
+            owed_tier = set(self._owed) & delivery
             owed = set(self._owed) - delivery
         if not open_work:
             # The repairs are in: a check that ran and failed runs again on what they
@@ -809,8 +814,9 @@ class GraphOrchestrator:
             # the target changes; running it again would measure the same thing.
             missing = {c.key for c in evaluation.missing}
             failed_here = {c.key for c, _ in evaluation.failed}
-            if missing and (missing | failed_here) <= delivery:
-                what, keys = "delivery checks failed: ", sorted(missing)
+            tier = missing | owed_tier
+            if tier and (missing | failed_here) <= delivery:
+                what, keys = "delivery checks failed: ", sorted(tier)
             elif evaluation.holds and self.contract.confirm and not self._confirmed(marker):
                 what, keys = "the check of the final tree failed: ", [self.contract.confirm]
         submitted = self._submit_checks(self._check_pool, keys) if keys else []

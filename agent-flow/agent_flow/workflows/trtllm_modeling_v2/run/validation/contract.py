@@ -10,8 +10,9 @@ gate and member, with a tier:
   gate where the spec turns it on or can derive it);
 - ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
   test), and the checks of each configuration variant (``spec/variants.py``);
-- ``delivery``: once, on the tree being delivered (the
-  serve gate at one rank).
+- ``delivery``: once every other required check has passed (the serve gate
+  at one rank). Its pass stands like any other, and it runs again when a task
+  that claims it lands.
 
 A check runs when the task that claims it lands. Verdicts are appended to
 ``contract_status.jsonl`` as gates return, keyed by unit. Delivery evaluates
@@ -103,9 +104,10 @@ class Contract:
     checks: tuple[Check, ...]
     #: Why a unit or variant owes less than every check at every member, one line each.
     notes: tuple[str, ...] = ()
-    #: The key of the check that confirms the final tree when no check has run
-    #: on it (:func:`confirmed`): the benchmark of the last unit that owes one,
-    #: at its cheapest member.
+    #: The key of the check that confirms the final tree when none of its kind
+    #: has passed on it (:func:`confirmed`): the benchmark of the last unit that
+    #: owes one, at its cheapest member; the last boot where the run owes no
+    #: benchmark at all.
     confirm: str = ""
 
     def required(self) -> tuple[Check, ...]:
@@ -328,7 +330,8 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
     checks: list[Check] = []
     notes: list[str] = []
-    confirm = ""
+    # What confirms the final tree: the last benchmark owed, else (boots alone) the last boot.
+    confirm = boot_alone = ""
     reuses = {kv.name for kv in check_config.launch_kv_caches(task_data) if kv.reuse}
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
@@ -360,7 +363,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if level == PROFILE_SMOKE:
             add("boot", TIER_INNER)
             notes.append(f"{unit}: the smoke profile owes its boot alone")
-            confirm = Check(unit, "boot", members[0], TIER_INNER).key if members else confirm
+            boot_alone = Check(unit, "boot", members[0], TIER_INNER).key if members else boot_alone
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
         benchmarked = benchmark_members(task_data, unit, members)
@@ -452,7 +455,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if single is not None:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
             checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
-    return Contract(checks=tuple(checks), notes=tuple(notes), confirm=confirm)
+    return Contract(checks=tuple(checks), notes=tuple(notes), confirm=confirm or boot_alone)
 
 
 def _boot_observes(reuses: bool, drafts: bool, multimodal: bool) -> bool:

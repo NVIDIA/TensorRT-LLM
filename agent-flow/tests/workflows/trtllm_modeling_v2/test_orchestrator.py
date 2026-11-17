@@ -206,6 +206,39 @@ def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final
     assert services.ran[-2:] == [(serve.key, "m2"), (_CORE[1], "m2")]
 
 
+@pytest.mark.parametrize("claims, served_on", [(True, "m3"), (False, "m2")])
+def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
+    tmp_path, claims, served_on
+):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("the check of the final tree failed" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            fix = _task("fix", "assemble", [serve.key] if claims else [], touches=["models/core/"])
+            graph.tasks.append(fix)
+            return PlannerAnswer("GRAPH_UPDATED", "repair", graph)
+        if not repaired:
+            tasks = [
+                _task("core", "assemble", [_CORE[1], serve.key]),
+                _task("tidy", "kernel", deps=["core"], touches=["catalog/k.py"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        return PlannerAnswer("DONE", "all green")
+
+    # The serve passes on what `tidy` left (m2); the benchmark fails there, and a repair lands (m3).
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[1], "m2"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    assert status.latest()[_CORE[1]].marker == "m3"
+    # A repair that claims the serve has it run on what the repair left. One that does not
+    # leaves the serve's pass standing, as any other check's.
+    assert status.latest()[serve.key].marker == served_on
+
+
 def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):
     turns = []
 
@@ -463,6 +496,9 @@ def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
     # The smoke profile owes the boot alone, which then confirms the final tree.
     smoke = c.compile_contract({**spec, "features": [], "profile": "smoke"}, world_size=4)
     assert [x.gate for x in smoke.checks] == ["boot", "boot"] and smoke.confirm == "core:boot@tp1"
+    # A later unit on the smoke profile does not take the confirmation from a benchmark.
+    mixed = {**spec, "features": ["multimodal"], "profile": {"multimodal": "smoke"}}
+    assert c.compile_contract(mixed, world_size=4).confirm == "core:accuracy[gsm8k]@tp1"
 
 
 def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):
