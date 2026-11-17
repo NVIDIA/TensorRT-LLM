@@ -5,7 +5,8 @@
 * ``_Fp8BlockScaleWeightReadLinear.from_linear`` on a ``core.Fp8BlockScaleLinear`` (loaded, or
   loaded and prepared; one rank or a COLUMN / ROW shard) gives the projection built from the codes
   and scales that main's ``Linear(FP8_BLOCK_SCALES)`` loads from the same checkpoint tensors.
-* ``_shard_dim`` slices as main's ``load_weight_shard`` on every split K3 loads through it.
+* ``_shard_dim`` is the same code in every target; its splits are checked in
+  ``kimi_k3_nvfp4__sm_107__dep16/test_dep16_k3_glue.py``.
 """
 
 import importlib
@@ -16,7 +17,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm import sm107_linear as linear
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, load_weight_shard
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -139,27 +140,3 @@ def test_weight_read_from_sharded_core_linear_matches_main_linear(n, k, mode, tp
         )
         core.load(codes.clone(), scale.clone())
         _assert_same_projection(_swapped(core), _from_main_linear(main), core.in_features)
-
-
-# (shape, dim) of the splits K3 loads through ``_shard_dim``: KDA head-major rows (dim 0) and o_proj
-# columns (dim 1), 1-D head vectors, width-1 dims, the dense / shared-expert gate, up (dim 0) and
-# down (dim 1) halves.
-SPLITS = [
-    ((4096, 7168), 0),
-    ((7168, 4096), 1),
-    ((64,), 0),
-    ((64,), 1),
-    ((1, 1, 64, 1), 0),
-    ((18432, 7168), 0),
-    ((7168, 18432), 1),
-]
-
-
-@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("shape,dim", SPLITS)
-def test_shard_dim_matches_main_load_weight_shard(shape, dim, tp):
-    tensor = torch.randn(shape)
-    mode = COL if dim == 0 else ROW
-    for rank in range(tp):
-        got = _weights()._shard_dim(tensor, dim, tp, rank, torch.device("cpu"))
-        assert torch.equal(got, load_weight_shard(tensor, tp, rank, mode)), (rank, tp)

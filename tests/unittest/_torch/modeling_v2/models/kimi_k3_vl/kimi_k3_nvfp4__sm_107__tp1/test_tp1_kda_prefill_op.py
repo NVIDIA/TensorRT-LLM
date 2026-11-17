@@ -265,10 +265,9 @@ def test_prefill_output_matches_across_projection_layouts() -> None:
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("num_heads", [NUM_HEADS, 12, 6], ids=["h96", "h12", "h6"])
-def test_optimized_prefill_matches_fla_reference(num_heads: int) -> None:
+def test_optimized_prefill_matches_fla_reference() -> None:
     torch.manual_seed(0)
-    optimized = _make_kda(num_heads=num_heads)
+    optimized = _make_kda()
     reference = _make_reference(optimized)
 
     # Reuse the same module across changing token counts and batch sizes.

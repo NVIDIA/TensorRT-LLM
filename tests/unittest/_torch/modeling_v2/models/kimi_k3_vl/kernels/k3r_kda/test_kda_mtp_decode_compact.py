@@ -298,14 +298,14 @@ def test_mxfp8_two_cta_is_bitwise_identical(H, N, num_spec, initial_state, monke
     _assert_bitwise(ref, new, H)
 
 
-@pytest.mark.parametrize("initial_state", ["zero", "populated"])
 @pytest.mark.parametrize("quantize_output", [False, True], ids=["bf16_out", "mxfp8_out"])
-@pytest.mark.parametrize("H,N,num_spec", DECODE_SHAPES)
-def test_decode_shapes_default_matches_one_cta_kernels(
-    H, N, num_spec, quantize_output, initial_state, monkeypatch
-):
-    """The variants selected by default on this GPU reproduce the one-CTA kernels."""
-    inp = _make_inputs(N, H, num_spec, seed=99 + 7 * N + H, zero_state=initial_state == "zero")
+def test_decode_default_selection_matches_one_cta_kernels(quantize_output, monkeypatch):
+    """The variants this GPU selects by default, on one served decode shape (dep16, 16 requests,
+    MTP 7), reproduce the one-CTA kernels. The selection does not depend on the decode shape here;
+    the two-CTA MXFP8 kernel's own equivalence over the decode shapes is
+    ``test_mxfp8_two_cta_is_bitwise_identical``."""
+    H, N, num_spec = 96, 16, 7
+    inp = _make_inputs(N, H, num_spec, seed=99 + 7 * N + H, zero_state=False)
     ref = _run_rounds(inp, quantize_output, {COMPACT: False, MXFP8_2CTA: False}, monkeypatch)
     new = _run_rounds(inp, quantize_output, {COMPACT: None, MXFP8_2CTA: None}, monkeypatch)
     assert ref[3] == (["v1"] if quantize_output else ["v2"]), ref[3]

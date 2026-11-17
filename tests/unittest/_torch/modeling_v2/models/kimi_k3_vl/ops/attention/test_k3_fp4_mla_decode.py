@@ -309,12 +309,12 @@ def _assert_close_rows(got, ref):
     assert float(cosine.min()) > 0.998, float(cosine.min())
 
 
-@pytest.mark.parametrize("helix", [True, False], ids=["helix", "no-helix"])
 @pytest.mark.parametrize("seq_lens", list(_SEQ_LENS.values()), ids=list(_SEQ_LENS))
-@pytest.mark.parametrize("target", list(_TARGETS))
-def test_decode_matches_backend_decode(target, seq_lens, helix):
+@pytest.mark.parametrize("target,helix", [("helix8", True), ("dep16", False)], ids=list(_TARGETS))
+def test_decode_matches_backend_decode(target, helix, seq_lens):
     """K3's decode against the FP4 MLA backend's decode (its own kernel, plan and reduction) of
-    the same cache and query rows, under each target's settings."""
+    the same cache and query rows, under each target's settings: helix8 decodes with Helix
+    statistics, dep16 without."""
     from tensorrt_llm._torch.attention.backends import fp4_mla
 
     mgr, md, qf = _decode_case(seq_lens, seed=11 + len(seq_lens), helix=helix)

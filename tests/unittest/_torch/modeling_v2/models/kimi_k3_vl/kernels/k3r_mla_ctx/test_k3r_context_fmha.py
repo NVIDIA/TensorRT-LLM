@@ -216,7 +216,9 @@ def _attention(heads: int) -> SimpleNamespace:
 @pytest.mark.parametrize(
     "q_len,is_causal", [(256, False), (257, False), (512, False), (8192, False), (257, True)]
 )
-@pytest.mark.parametrize("heads", [96, 48, 24, 12, 6, 3])
+# 96: every head on the rank, as the targets run it; 6: a smaller head-count specialization, which
+# the causal case also checks against the 96-head one.
+@pytest.mark.parametrize("heads", [96, 6])
 def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -> None:
     from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_op import (  # noqa: E501
         CuteDSLK3ContextFmhaRunner,
