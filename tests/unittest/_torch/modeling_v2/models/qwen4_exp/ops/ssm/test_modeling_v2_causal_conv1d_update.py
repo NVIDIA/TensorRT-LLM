@@ -7,14 +7,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     CKPT_DIM,
     CKPT_X_STRIDE,
     RANK_DIM,
     RANK_X_STRIDE,
     _decode_conv_ok,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     causal_conv1d_update as op,
 )
 

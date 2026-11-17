@@ -37,6 +37,8 @@ def _metadata(**overrides):
         dummy_slot_row=8,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         use_rejection_sampling=False,
         enable_penalty=False,
     )

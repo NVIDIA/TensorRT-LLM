@@ -9,10 +9,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models import beam
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import layout_bf16 as layout
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import loader_bf16 as loader
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
+from tensorrt_llm._torch.modeling_v2.models import beam
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import layout_bf16 as layout
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import loader_bf16 as loader
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
     BeamFullModelNvfp4Sm103Tp4 as Component,
 )
 from tensorrt_llm.bindings import DataType
@@ -150,7 +150,7 @@ def test_benign_config_metadata_and_supported_optional_values():
 
 @pytest.fixture
 def recipe_specs():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -168,7 +168,7 @@ def recipe_specs():
     ["model.layers.*.self_attn.*", "model.layers.3.self_attn", "re:.*self_attn"],
 )
 def test_shared_quantization_shapes_and_exclusions(recipe_specs, flat, attention_pattern):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -183,7 +183,7 @@ def test_shared_quantization_shapes_and_exclusions(recipe_specs, flat, attention
 
 
 def test_parent_exclusion_cannot_hide_quantized_experts(recipe_specs):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -199,7 +199,7 @@ def test_parent_exclusion_cannot_hide_quantized_experts(recipe_specs):
 def test_quantization_file_precedes_inline_recipe(tmp_path):
     import json
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -213,7 +213,7 @@ def test_quantization_file_precedes_inline_recipe(tmp_path):
 
 @pytest.mark.parametrize("scheme", ["FP8", "NVFP4", "unknown", {"type": "float", "num_bits": 8}])
 def test_flat_recipe_never_silently_disables_requested_kv_quantization(recipe_specs, scheme):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -232,7 +232,7 @@ def test_checkpoint_validation_uses_shared_recipe_reader(
 ):
     import json
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -276,8 +276,8 @@ def test_components_do_not_import_full_model_internals():
 
 @pytest.mark.parametrize("local_rank", range(4))
 def test_load_failures_identify_remote_rank_on_every_rank(monkeypatch, local_rank):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
     from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.modeling_v2.models.beam._load import load_failure_details
 
     outcomes = [
         (True, ""),
@@ -294,7 +294,7 @@ def test_load_failures_identify_remote_rank_on_every_rank(monkeypatch, local_ran
 
 
 def test_local_load_success_and_incomplete_coverage():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
+    from tensorrt_llm._torch.modeling_v2.models.beam._load import load_failure_details
 
     mapping = NS(world_size=1)
     assert load_failure_details(mapping, True, None) is None
@@ -313,7 +313,7 @@ def test_malformed_layer_schedule_is_value_error(field, value):
 def test_direct_call_device_and_metadata_admission(monkeypatch):
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._validation import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._validation import (
         check_positions,
         explicit_device,
         metadata_values,
@@ -365,10 +365,8 @@ def test_checkpoint_load_transaction(
     import torch
     from safetensors.torch import save_file
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         component as nvfp4,
     )
 
@@ -467,7 +465,7 @@ def test_checkpoint_load_transaction(
 
 @pytest.mark.parametrize("dtype,itemsize", [("BF16", 2), ("F32", 4), ("F8_E4M3", 1), ("U8", 1)])
 def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.loader import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.loader import (
         validate,
     )
 
@@ -483,10 +481,8 @@ def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
 def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) -> None:
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         component as nvfp4,
     )
 
