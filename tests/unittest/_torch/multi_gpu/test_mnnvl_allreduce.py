@@ -461,16 +461,16 @@ def mnnvl_rejects_shifted_workspace(
         tensor_parallel_size: int,
         tensor_parallel_rank: int,
         use_qualified_workspace: bool = False) -> bool:
-    from tensorrt_llm._torch._experimental.modeling_v2._native import (
-        load_family_ops, load_target_ops)
+    from tensorrt_llm._torch.modeling_v2._native import (load_family_ops,
+                                                         load_target_ops)
 
     kimi_ops = load_family_ops(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
     glm_ops = load_target_ops(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__low_latency")
     glm_throughput_ops = load_target_ops(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__high_throughput")
     rank = tensorrt_llm.mpi_rank()
     assert rank == tensor_parallel_rank

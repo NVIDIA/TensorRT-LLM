@@ -559,7 +559,7 @@ def test_allreduce_constructs_mnnvl_for_supported_policy(
 )
 @pytest.mark.parametrize("cross_node_tp", [False, True])
 def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross_node_tp):
-    prefix = "tensorrt_llm._torch._experimental.modeling_v2.models."
+    prefix = "tensorrt_llm._torch.modeling_v2.models."
     if kind.startswith("draft_exchange"):
         target = "high_throughput" if kind == "draft_exchange_throughput" else "low_latency"
         module = importlib.import_module(
@@ -609,7 +609,7 @@ def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross
 
 @pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
 def test_router_uses_shared_mnnvl_eligibility(monkeypatch, mnnvl_capable_hardware, arch):
-    router = importlib.import_module("tensorrt_llm._torch._experimental.modeling_v2._router_index")
+    router = importlib.import_module("tensorrt_llm._torch.modeling_v2._router_index")
     mapping = _FakeMapping()
     mapping.multi_node = True
     monkeypatch.setattr(platform, "machine", lambda: arch)
