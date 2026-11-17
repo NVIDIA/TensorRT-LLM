@@ -17,10 +17,10 @@ import pytest
 import torch
 from transformers import DeepseekV3Config
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling import (  # noqa: E501
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling import (  # noqa: E501
     DeepseekV3DefaultModelingV2,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MTPDecodingConfig
