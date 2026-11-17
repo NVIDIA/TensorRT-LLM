@@ -147,15 +147,19 @@ def _prepare_fp4_mla_q_buffers(
         raise RuntimeError("Fused FP4 MLA Q quantization requires a KV cache manager.")
     if num_heads <= 0 or num_heads > 128:
         raise ValueError(f"FP4 MLA Q buffers require 1-128 local heads, got {num_heads}.")
-    buffers = getattr(owner, "_fp4_mla_q_buffers", None)
-    if buffers is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Cannot create FP4 MLA Q buffers while capturing a CUDA graph. "
-                "Run a warmup forward first."
-            )
-        buffers = {}
-        setattr(owner, "_fp4_mla_q_buffers", buffers)
+    get_or_create = getattr(owner, "get_or_create_fp4_mla_q_buffers", None)
+    if callable(get_or_create):
+        buffers = get_or_create()
+    else:
+        buffers = getattr(owner, "_fp4_mla_q_buffers", None)
+        if buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cannot create FP4 MLA Q buffers while capturing a CUDA graph. "
+                    "Run a warmup forward first."
+                )
+            buffers = {}
+            setattr(owner, "_fp4_mla_q_buffers", buffers)
 
     max_num_tokens = int(getattr(metadata, "max_num_tokens", num_queries) or num_queries)
     max_num_sequences = int(

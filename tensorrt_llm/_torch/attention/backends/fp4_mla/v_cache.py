@@ -27,6 +27,7 @@ from .config import (
     _env_int,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
+    has_fp4_mla_cache_layout,
 )
 from .fp4_mla_kernels import _fp4_mla_rebuild_v_scale_from_k_scale_kernel
 from .layout import _ensure_workspace_tensor, get_fp4_mla_v_scale_pool_size
@@ -582,7 +583,7 @@ def rebuild_fp4_mla_disagg_imported_cache(
         or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4
         or getattr(kv_cache_manager, "kv_factor", None) != 1
         or getattr(kv_cache_manager, "mla_v_scale_head_dim", None) is None
-        or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
+        or not has_fp4_mla_cache_layout(kv_cache_manager)
     ):
         return False
     if len(request_ids) != len(prompt_lens):

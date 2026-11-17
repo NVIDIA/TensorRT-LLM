@@ -361,6 +361,41 @@ def _build_fp8_mla_context_metadata(
     return fp8_meta
 
 
+def get_or_create_fp8_mla_context_scratch(
+    kv_cache_manager: object,
+    meta: "TrtllmAttentionMetadata",
+    *,
+    device: torch.device,
+    head_dim: int,
+) -> "_Fp8MlaContextScratch":
+    """Return the manager-owned FP8 MLA context scratch, creating or validating it."""
+    if kv_cache_manager is None:
+        raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
+
+    def create_scratch() -> _Fp8MlaContextScratch:
+        return _Fp8MlaContextScratch.create(meta, device=device, head_dim=head_dim)
+
+    get_or_create = getattr(kv_cache_manager, "get_or_create_fp8_context_scratch", None)
+    if callable(get_or_create):
+        had_scratch = getattr(kv_cache_manager, "_fp8_context_scratch", None) is not None
+        scratch = get_or_create(create_scratch)
+    else:
+        scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
+        had_scratch = scratch is not None
+        if scratch is None:
+            scratch = create_scratch()
+            setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
+
+    assert isinstance(scratch, _Fp8MlaContextScratch)
+    if had_scratch:
+        fp8_context_state = meta.fp4_mla_state.fp8_context_state
+        if fp8_context_state is None or fp8_context_state[0] is not scratch:
+            assert scratch.matches(meta, device=device, head_dim=head_dim), (
+                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
+            )
+    return scratch
+
+
 def _get_fp8_mla_context_metadata(
     meta: "TrtllmAttentionMetadata",
     scratch: _Fp8MlaContextScratch,

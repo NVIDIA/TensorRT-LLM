@@ -374,10 +374,11 @@ def populate_helix_spec_buffers(
 
 
 def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
-    get_spec = getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)
-    if not callable(get_spec):
+    from .config import has_fp4_mla_cache_layout
+
+    if not has_fp4_mla_cache_layout(kv_cache_manager):
         raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
-    spec = get_spec()
+    spec = kv_cache_manager.get_fp4_mla_page_table_spec()
     for field_name in (
         "cache_pool_id",
         "cache_page_index_scale",
