@@ -34,7 +34,7 @@ In PR CI, Jenkins normally merges the PR list with the latest target-branch
 list (tip of tree, or TOT), then applies exact-line removals from the PR diff.
 Pytest receives this effective list via `--waives-file`: waives from the PR's
 target branch can therefore affect the run even when absent from the PR
-checkout. This applies to both main and release-branch targets.
+checkout, regardless of the target branch's name.
 
 ### Writing a waive
 

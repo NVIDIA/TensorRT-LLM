@@ -1,6 +1,42 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # AGENTS.md — tests
 
 Scope: this directory and everything under it. Supplements the repo-root `AGENTS.md`.
+
+## Test value and execution placement
+
+Before adding a test or parameterized variant, record in the PR:
+
+- Which regression do its assertions catch?
+- What coverage does it add beyond existing tests?
+- Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
+  check, and why is that frequency worth its setup and execution cost?
+
+Keep focused, reliable regression coverage in pre-merge CI; justify expensive
+or broad coverage there instead of registering every new test automatically.
+Use post-merge or QA for coverage suited to those schedules. Keep one-time
+investigation checks out of recurring CI unless they protect a lasting
+regression. Prune redundant cases while preserving meaningful failure modes.
+
+For Python unit-test case design, parameter matrices and native helpers, follow
+the [unit-test guidance](unittest/AGENTS.md). For C++ targets, build artifacts and
+execution, follow the [C++ test guidance](../cpp/tests/AGENTS.md).
 
 ## Whether a new test runs in CI
 

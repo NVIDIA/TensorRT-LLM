@@ -21,18 +21,8 @@ Scope: this directory and its descendants. Supplements `../AGENTS.md`.
 
 ## Coverage and execution cost
 
-Before adding a unit test or parameterized variant, record in the PR:
-
-- Which regression do its assertions catch?
-- What coverage does it add beyond existing tests?
-- Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
-  check, and why is that frequency worth its setup and execution cost?
-
-Keep focused, reliable regression coverage in pre-merge CI; justify expensive
-or broad coverage there instead of registering every new test automatically.
-Use post-merge or QA for coverage suited to those schedules. Keep one-time
-investigation checks out of recurring CI unless they protect a lasting
-regression. Prune redundant cases while preserving meaningful failure modes.
+Apply the shared [test-value and placement rules](../AGENTS.md#test-value-and-execution-placement).
+For unit-test implementation and parameter matrices:
 
 - Prefer strengthening an existing test when that protects the behavior without
   another setup or process. Preserve distinct boundary, error, backend and
@@ -69,8 +59,8 @@ For unit tests in CI that need native helpers or executables, build them in the
 build stage and consume matching artifacts in the test stage. Do not introduce
 ad hoc compiler, CMake, or extension builds in pytest collection, fixtures, or
 test bodies merely to prepare a helper. Reuse the existing build targets and
-artifact flow; for C++ tests, see the repository-root
-[C++ test build guidance](../../AGENTS.md#ci--testing).
+artifact flow. For C++ executables and their packaging, follow the
+[C++ test build guidance](../../cpp/tests/AGENTS.md#build-and-execution).
 
 Keep intentional runtime compilation when it is part of the behavior under
 test (for example, a JIT kernel), and account for its cost when choosing the CI
