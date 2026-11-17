@@ -69,14 +69,24 @@ def _persistent_cache_view_mode() -> torch.inference_mode:
     return torch.inference_mode(False)
 
 
-def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
+def is_fp4_mla_context_only_cache(
+    is_disagg: bool, spec_config: Optional["DecodingBaseConfig"] = None
+) -> bool:
     """Whether this worker keeps a single-copy FP4 MLA cache.
 
-    A disaggregated context worker never decodes, so it omits the
-    generation-only V scales and packed V; the generation worker rebuilds
-    them from the transferred K and K scales.
+    Context workers omit generation-only V scales and packed V unless
+    multi-step MTP drafting needs them for later draft steps. Generation
+    workers rebuild omitted views from the transferred K and K scales.
     """
-    return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
+    return (
+        bool(is_disagg)
+        and os.getenv(_DISAGG_ROLE_ENV) == "context"
+        and (
+            spec_config is None
+            or not spec_config.spec_dec_mode.is_mtp_one_model()
+            or (spec_config.max_draft_len or 0) <= 1
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -241,7 +251,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             if manager._fp4_mla_storage_backend in _FP4_MLA_K_RESIDUAL_BACKENDS
             else 0
         )
-        manager.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(is_disagg)
+        manager.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(
+            is_disagg, spec_config
+        )
         if manager.fp4_mla_context_only_cache:
             logger.info(
                 "FP4 MLA KV cache on a disaggregated context worker: omitting "
@@ -1279,7 +1291,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             )
         residual = FP4_MLA_K_RESIDUAL_DIM if backend in _FP4_MLA_K_RESIDUAL_BACKENDS else 0
         storage_head_dim = logical_head_dim + residual
-        context_only = is_fp4_mla_context_only_cache(bool(kwargs.get("is_disagg", False)))
+        context_only = is_fp4_mla_context_only_cache(
+            bool(kwargs.get("is_disagg", False)), spec_config
+        )
         v_scale_page = (
             0
             if context_only

@@ -28,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
     is_context_only_kv_cache,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
@@ -37,7 +37,8 @@ DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
 @pytest.mark.parametrize("role", ["context", "generation", None])
 @pytest.mark.parametrize("is_disagg", [False, True])
 @pytest.mark.parametrize("fused", [False, True])
-def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fused):
+@pytest.mark.parametrize("draft_len", [None, 1, 2, 3])
+def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fused, draft_len):
     if role is None:
         monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
     else:
@@ -45,6 +46,8 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
     monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, str(int(fused)))
     monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    spec_config = None if draft_len is None else MTPDecodingConfig(max_draft_len=draft_len)
+
     config = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
     Fp4MlaKVCacheManagerV2.configure_manager(
@@ -56,13 +59,15 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
         head_dim=576,
         pretrained_config=config,
         is_disagg=is_disagg,
+        spec_config=spec_config,
     )
     manager.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
 
-    # Only a disaggregated context worker omits the generation-only sidecars.
-    context_only = is_disagg and role == "context"
+    # Multi-step MTP needs generation views even on a context worker.
+    context_only = is_disagg and role == "context" and (draft_len is None or draft_len <= 1)
     assert manager.fp4_mla_context_only_cache == context_only
-    assert is_fp4_mla_context_only_cache(is_disagg) == context_only
+    if spec_config is None:
+        assert is_fp4_mla_context_only_cache(is_disagg) == context_only
     assert is_context_only_kv_cache(manager) == context_only
     assert manager.mla_v_head_dim == (None if context_only or fused else 512)
     assert (manager._v_scale_bytes_per_page() == 0) == context_only
@@ -77,12 +82,13 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         max_batch_size=2,
         is_disagg=is_disagg,
+        spec_config=spec_config,
     )
     # K (320 B) and K scales (40 B) per token; V scales add 32 B and the
     # unfused CuTe DSL packed V another 256 B.
     assert slope == (360 if context_only else 392 if fused else 648)
     # The HP ring stays: the context worker writes and transfers it.
-    assert intercept == 2 * 16 * 576 * 2
+    assert intercept == 2 * (16 + (draft_len or 0)) * 576 * 2
 
 
 def test_context_only_layer_bytes_exclude_v_scales(monkeypatch):
