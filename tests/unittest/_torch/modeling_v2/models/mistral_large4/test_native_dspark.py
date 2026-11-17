@@ -84,6 +84,19 @@ def test_indexer_preserves_request_geometry(
         _max_ctx_len=max_seq_len,
         unfused_glue=unfused,
     )
+    # A target with a compiled verification selector routes generation rows through its own
+    # `_select_indexer_decode`; none is compiled here, so it takes the generic and radix paths.
+    selector = next(
+        (
+            vars(cls)["_select_indexer_decode"]
+            for cls in vars(modeling).values()
+            if isinstance(cls, type) and "_select_indexer_decode" in vars(cls)
+        ),
+        None,
+    )
+    if selector is not None:
+        core._ix_topk_verify = None
+        core._select_indexer_decode = MethodType(selector, core)
     ix = SimpleNamespace(
         rope=True,
         wk_wp=None,
