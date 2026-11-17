@@ -3,6 +3,7 @@
 
 import copy
 import os
+import time
 from dataclasses import replace
 from typing import Any, Callable, Optional, Tuple
 
@@ -19,7 +20,9 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     ArtifactIdentity, PostTransformConfigIdentity,
     PostTransformQualificationDecision, SourceIdentity)
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, get_sm_version,
+                                 local_mpi_comm, mpi_disabled,
+                                 str_dtype_to_torch)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -36,6 +39,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
+                          wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
 from ..modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..models import AutoModelForCausalLM
@@ -1015,6 +1020,96 @@ def captured_cuda_graph_batch_sizes(
                                       config.enable_padding))
 
 
+_RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+_CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS = "checkpoint_page_cache_release_seconds"
+# Smaller files can free too little memory to set off compaction worth
+# waiting for.
+_MIN_ADVISED_BYTES_TO_SETTLE = 1 << 30
+
+
+def _drop_page_cache_of_dirs(checkpoint_dirs: list[str]) -> None:
+    """Drop the page cache of the top-level files in ``checkpoint_dirs``.
+
+    Then waits for the page migration that follows to settle, unless the files
+    total less than 1 GiB. The wait depends on the files' size, not on how
+    much of them was cached: the drop in the host's page cache, which the log
+    reports, also counts what other processes read meanwhile.
+    """
+    try:
+        files = []
+        for checkpoint_dir in checkpoint_dirs:
+            if not os.path.isdir(checkpoint_dir):
+                continue
+            with os.scandir(checkpoint_dir) as entries:
+                files += [entry.path for entry in entries if entry.is_file()]
+    except OSError as error:
+        logger.warning(f"Skipping the checkpoint page-cache release: {error}")
+        return
+    start = time.monotonic()
+    cached_before = page_cache_bytes()
+    advised_bytes = release_file_page_cache(files)
+    cached_after = page_cache_bytes()
+    release_seconds = time.monotonic() - start
+    if advised_bytes >= _MIN_ADVISED_BYTES_TO_SETTLE:
+        settle = (f"page migration settled after "
+                  f"{wait_for_page_migration_to_settle():.1f} s")
+    else:
+        settle = "no wait for page migration"
+    shrank = ("by an unknown amount"
+              if cached_before is None or cached_after is None else
+              f"by {(cached_before - cached_after) / 2**30:.1f} GiB")
+    logger.info(
+        f"Advised DONTNEED on {len(files)} checkpoint files "
+        f"({advised_bytes / 2**30:.1f} GiB) in {release_seconds:.1f} s; "
+        f"the host's page cache shrank {shrank}; {settle}")
+
+
+def _release_checkpoint_page_cache(
+        checkpoint_dirs: list[str]) -> Optional[float]:
+    """Drop the page cache of the checkpoint files this server read on this node.
+
+    Opt-in with ``TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE=1``. The weights are on the
+    GPU at this point. Left cached, the files are dropped later, at a time the
+    process does not choose, and the kernel's compaction of the freed memory then
+    stalls the server's host threads while it serves. Dropping them here, and
+    waiting for the page migration that follows to settle, moves both into
+    startup. A later restart reads the checkpoint from storage again.
+
+    Every rank of this server calls it after loading, with the directories it
+    read files from (top-level files only). Once all of them have finished,
+    rank 0 of each node drops the files of every directory any rank on its node
+    read; the others wait for it. Other servers on the node that read the same
+    files are not coordinated with.
+
+    Returns the seconds this rank spent here, or None if the release is off.
+    """
+    if os.environ.get(_RELEASE_CHECKPOINT_PAGE_CACHE_ENV, "0") != "1":
+        return None
+    if ENABLE_MULTI_DEVICE and mpi_disabled():
+        logger.warning_once(
+            f"{_RELEASE_CHECKPOINT_PAGE_CACHE_ENV}=1 is ignored without MPI, which "
+            "tells when every rank on the node has finished reading.",
+            key=_RELEASE_CHECKPOINT_PAGE_CACHE_ENV)
+        return None
+    start = time.monotonic()
+    checkpoint_dirs = sorted({d for d in checkpoint_dirs if d})
+    node_comm = None
+    is_dropper = True
+    if ENABLE_MULTI_DEVICE:
+        # Returns once every rank on the node has finished reading.
+        node_comm = local_mpi_comm()
+        checkpoint_dirs = sorted(
+            set().union(*node_comm.allgather(checkpoint_dirs)))
+        is_dropper = node_comm.Get_rank() == 0
+    try:
+        if is_dropper and checkpoint_dirs:
+            _drop_page_cache_of_dirs(checkpoint_dirs)
+    finally:
+        if node_comm is not None:
+            node_comm.Barrier()
+    return time.monotonic() - start
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -1259,11 +1354,19 @@ class ModelLoader:
         """
         # Reset before the total timer starts: the timer writes into this dict.
         self._metrics = {}
+        # Directories _timed_load read checkpoint files from.
+        self._checkpoint_dirs_read: list[str] = []
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
                 self._metrics):
             model, moe_load_balancer = self._timed_load(checkpoint_dir,
                                                         checkpoint_loader)
+
+        release_seconds = _release_checkpoint_page_cache(
+            self._checkpoint_dirs_read)
+        if release_seconds is not None:
+            self._metrics[
+                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
 
         metrics = ", ".join(f"{name}={value:.4f}"
                             for name, value in self._metrics.items())
@@ -1347,6 +1450,8 @@ class ModelLoader:
             )
 
         weights_preloaded = False
+        weights_checkpoint_dir = getattr(model, "llm_checkpoint_dir",
+                                         checkpoint_dir)
         if load_format == LoadFormat.AUTO:
             # read the checkpoint with the checkpoint loader, built-in or custom
             self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
@@ -1361,6 +1466,11 @@ class ModelLoader:
                 qualification=post_transform_qualification,
                 metrics=self._metrics,
                 startup_metadata=self._startup_metadata)
+            if not weights_preloaded:
+                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
+            if loads_draft_weights:
+                self._checkpoint_dirs_read.append(
+                    self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.GMS:
             gms_result = gms_loading.load_gms_weights(
@@ -1383,6 +1493,15 @@ class ModelLoader:
             weights_preloaded = gms_result.weights_preloaded
             if gms_result.weight_mapper is not None:
                 self.weight_mapper = gms_result.weight_mapper
+            # A writer reads the checkpoint unless its loader preloaded the
+            # weights, and reads a separate draft; a reader reads neither.
+            gms_writer = (gms_result.weight_mapper is not None
+                          or gms_result.weights_preloaded)
+            if gms_result.weight_mapper is not None:
+                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
+            if gms_writer and loads_draft_weights:
+                self._checkpoint_dirs_read.append(
+                    self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.DUMMY:
             self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
