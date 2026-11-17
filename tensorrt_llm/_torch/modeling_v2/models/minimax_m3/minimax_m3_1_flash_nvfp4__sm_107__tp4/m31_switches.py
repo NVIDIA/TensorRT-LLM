@@ -127,7 +127,7 @@ ITEMS: Dict[str, str] = {
 # Default-off item id -> what TRTLLM_M31_ENABLE_<id>=1 turns on. The item's TRTLLM_M31_DISABLE_<id>=1 still wins.
 OPT_INS: Dict[str, str] = {
     "AR_AUTOTUNE": "leaves the AllReduce autotune on (the target turns it off by default for run-to-run determinism)",
-    "DHEAD_MX4": "accepted; the MXFP8 draft head is on by default",
+    "DHEAD_MX4": "the drafter head's MXFP8 shard copy (not bitwise; default off: the head stays BF16)",
     "DRAFTER_MXFP8": "the drafter's projections on the MXFP8 GEMV (drafter-only precision)",
     "DRAFT_AR_NORM_FUSED": "the drafter's all-reduce fused with the add + RMSNorm after it (not bitwise)",
     "MARKOV_GRID": "the batch-1 Markov kernel on this target's wider grid",

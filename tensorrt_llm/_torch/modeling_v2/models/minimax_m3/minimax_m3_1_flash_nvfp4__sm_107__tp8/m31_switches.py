@@ -199,6 +199,8 @@ OPT_INS: Dict[str, str] = {
         "the spec sampler's slot-id table uploaded only when it changes (RuntimeHooks spec_slot_ids_changed_only)"
     ),
     "TP8_ANCESTRAL_DRAFT": "the in-tree DSpark ancestral draft under advanced draft sampling",
+    "TP8_CAUSAL_DRAFT": "the drafter's causal in-block window decode (not bitwise: changes the draft distribution)",
+    "TP8_DRAFT_HEAD_MXFP8": "the drafter head's MXFP8 shard copy (not bitwise; default off: the head stays BF16)",
     "TP8_SHORT_FAMILY": "a separate decode CUDA graph family for short steps (not bitwise)",
 }
 

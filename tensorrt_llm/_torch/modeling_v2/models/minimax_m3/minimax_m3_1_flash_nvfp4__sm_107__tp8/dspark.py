@@ -145,9 +145,9 @@ FOLD_F6 = not m31_disabled("FOLD_ACCEPT_COUNTS_INT32")
 # TP8 CAUSAL_DRAFT (not bitwise: changes the draft distribution): the DSpark drafter's windowed block decode runs
 # causal in-block (each block query attends the block keys up to itself) with the same left window, instead of the
 # non-causal in-block window the drafter was trained with. Drops each windowed layer's log-sum-exp output and the merge
-# of the later block keys (two launches per drafter layer). Default ON for this target; kill switch
-# TRTLLM_M31_DISABLE_TP8_CAUSAL_DRAFT=1 (the non-causal decode). Read at import.
-TP8_CAUSAL_DRAFT = not m31_disabled("TP8_CAUSAL_DRAFT")
+# of the later block keys (two launches per drafter layer). Default off, so the drafter runs as it ships;
+# TRTLLM_M31_ENABLE_TP8_CAUSAL_DRAFT=1 opts in and TRTLLM_M31_DISABLE_TP8_CAUSAL_DRAFT=1 still wins. Read at import.
+TP8_CAUSAL_DRAFT = m31_enabled("TP8_CAUSAL_DRAFT") and not m31_disabled("TP8_CAUSAL_DRAFT")
 _APPEND_FUSE_TAKEN = [0]
 
 
@@ -844,7 +844,7 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         causal = install_causal_draft(draft_model) if TP8_CAUSAL_DRAFT else 0
         logger.info(
             f"M3.1 DSpark TP8 CAUSAL_DRAFT: causal in-block drafter decode on {causal} layers "
-            f"({'on' if TP8_CAUSAL_DRAFT else 'killed'}) on rank {rank}"
+            f"({'on' if TP8_CAUSAL_DRAFT else 'off'}) on rank {rank}"
         )
 
     _n3a_kv_buf = None  # the persistent rewind amounts of the fused KV rewind (int32, MAX_REQUESTS)

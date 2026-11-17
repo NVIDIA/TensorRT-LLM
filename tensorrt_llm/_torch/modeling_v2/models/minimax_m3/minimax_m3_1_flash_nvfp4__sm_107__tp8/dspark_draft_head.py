@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MXFP8 draft head (DHEAD_MX4): the DSpark drafter's Markov-chain head GEMM on an MXFP8 copy of this rank's vocab
-shard, written straight into the chain's padded logits buffer (this target's kill switch:
-TRTLLM_M31_DISABLE_TP8_DRAFT_HEAD_MXFP8=1).
+shard, written straight into the chain's padded logits buffer. Default off on this target (the drafter head stays in
+the checkpoint's BF16); opt in with TRTLLM_M31_ENABLE_TP8_DRAFT_HEAD_MXFP8=1.
 
 The drafter borrows the target's BF16 head. Under the one-launch Markov chain every generation step computes this
 rank's vocab shard of the block logits, [B x K, 6144] x [shard, 6144]^T, with the head's own BF16 GEMM and then copies

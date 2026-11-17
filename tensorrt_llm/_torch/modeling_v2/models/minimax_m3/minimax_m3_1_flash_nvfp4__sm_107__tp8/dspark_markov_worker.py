@@ -59,7 +59,7 @@ from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN
 from tensorrt_llm.logger import logger
 
 from ..kernels.m3ll.prob1 import draft_prob1 as prob1
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 from .ops.sampling import m31_topp_det as _topp_det
 
 MARKOV_RANK = 256
@@ -101,9 +101,12 @@ _F5B_ARM = "minimax_m3_1_flash_nvfp4__sm_107__tp8 FOLD_F5B" if FOLD_F5B else Non
 # TP8_DRAFT_HEAD_MXFP8: the drafter head's Markov-chain shard GEMM on an MXFP8 copy of the head (the DHEAD_MX4 module,
 # dspark_draft_head.DraftHeadMx4, on this target's shard), written into the padded buffer through FOLD_F5B's strided
 # arm; set up at the end of prebuild_s4 on every rank or none. Drafter-only precision (the verify head stays BF16):
-# changes draft tokens, not the target's distribution. Default ON (needs FOLD_F5B); kill switch
-# TRTLLM_M31_DISABLE_TP8_DRAFT_HEAD_MXFP8=1, read at import.
-DHEAD8 = FOLD_F5B and not m31_disabled("TP8_DRAFT_HEAD_MXFP8")
+# changes draft tokens, not the target's distribution. Default off, so the drafter head stays in the checkpoint's
+# BF16; TRTLLM_M31_ENABLE_TP8_DRAFT_HEAD_MXFP8=1 opts in (needs FOLD_F5B) and TRTLLM_M31_DISABLE_TP8_DRAFT_HEAD_MXFP8=1
+# still wins. Read at import.
+DHEAD8 = (
+    FOLD_F5B and m31_enabled("TP8_DRAFT_HEAD_MXFP8") and not m31_disabled("TP8_DRAFT_HEAD_MXFP8")
+)
 #: Decode batches whose B x K block rows the MXFP8 copy serves (the TP8 decode worker runs batch 1).
 DHEAD8_BATCHES = (1,)
 # FOLD_F1: the draft block's top-p renorm (TOPP_DET) also writes its output rows into their request slots
@@ -429,7 +432,12 @@ class S4WorkerMixin:
         tactic, source = _dhead4.pinned_tactic() if DHEAD8 else (None, "default")
         # Off by switch still goes through the agreements below (a rank leaving here alone would hang the others).
         if not DHEAD8:
-            why = "TRTLLM_M31_DISABLE_TP8_DRAFT_HEAD_MXFP8 set" if FOLD_F5B else "FOLD_F5B off"
+            if not FOLD_F5B:
+                why = "FOLD_F5B off"
+            elif m31_disabled("TP8_DRAFT_HEAD_MXFP8"):
+                why = "TRTLLM_M31_DISABLE_TP8_DRAFT_HEAD_MXFP8 set"
+            else:
+                why = "default off: opt in with TRTLLM_M31_ENABLE_TP8_DRAFT_HEAD_MXFP8=1"
         else:
             why = _dhead4.unfit(lm_head, state.shard, block, state.rows)
         if why is None and source != "default":

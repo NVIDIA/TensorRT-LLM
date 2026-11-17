@@ -234,9 +234,10 @@ MXDRAFT = m31_enabled("DRAFTER_MXFP8") and not m31_disabled("DRAFTER_MXFP8")
 # written), replacing the BF16 head GEMM (47.1-47.3 us) and the buffer copy (3.2 us) at the K7 batch-1 rows; any call
 # it declines (another row count, another head) keeps the BF16 head: PADFOLD (dspark_markov_worker.PADFOLD) when on,
 # else the GEMM + copy. One path writes per call. Not bitwise (drafter-only precision); adds 317.1 MB per GPU at
-# prebuild (before the KV cache is sized). Natural acceptance length is unchanged within noise. Default ON at TP4; kill
-# switch TRTLLM_M31_DISABLE_DHEAD_MX4=1 (TRTLLM_M31_ENABLE_DHEAD_MX4=1 is accepted and changes nothing). Read at import.
-DHEAD_MX4_DEFAULT_ON = True
+# prebuild (before the KV cache is sized). Natural acceptance length is unchanged within noise. Default off, so the
+# drafter head stays in the checkpoint's BF16; TRTLLM_M31_ENABLE_DHEAD_MX4=1 opts in and TRTLLM_M31_DISABLE_DHEAD_MX4=1
+# still wins. Read at import.
+DHEAD_MX4_DEFAULT_ON = False
 DHEAD_MX4 = (DHEAD_MX4_DEFAULT_ON or m31_enabled("DHEAD_MX4")) and not m31_disabled("DHEAD_MX4")
 # HISLAYOUT (GV_C; drafter_mxfp8.route_his_layout): the reference drafter GEMV layout on this target's MXFP8 GEMV for
 # the decode rows <= drafter_mxfp8.HIS_MAX_ROWS (qkv / o_proj / gate_up at the reference configs; SwiGLU + down fused).
