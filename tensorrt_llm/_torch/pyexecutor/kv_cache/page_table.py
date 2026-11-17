@@ -22,12 +22,11 @@ import types
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
-from ...disaggregation.base.role_layout import RankTopology
-
 # The role layouts a manager's spec names (disaggregation.base.role_layout), for managers to
 # import from here.
 from ...disaggregation.base.role_layout import ByHead as ByHead
 from ...disaggregation.base.role_layout import Own as Own
+from ...disaggregation.base.role_layout import RankTopology
 from ...disaggregation.base.role_layout import Replicated as Replicated
 from ...disaggregation.base.role_layout import RingSlots as RingSlots
 from ...disaggregation.base.role_layout import RoleLayoutV2 as RoleLayoutV2
