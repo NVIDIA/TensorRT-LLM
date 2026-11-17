@@ -7,8 +7,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.attention.sparse_mla_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.attention.sparse_mla_decode import (  # noqa: E501
     WORKSPACE_BYTES,
     counter_bytes,
     sparse_mla_decode,

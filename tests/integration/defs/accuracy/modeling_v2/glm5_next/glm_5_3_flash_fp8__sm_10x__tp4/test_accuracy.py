@@ -24,7 +24,7 @@ disabled.
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
+from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 

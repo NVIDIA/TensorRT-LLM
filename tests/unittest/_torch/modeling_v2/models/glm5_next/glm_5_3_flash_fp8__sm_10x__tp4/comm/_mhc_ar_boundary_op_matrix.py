@@ -292,12 +292,12 @@ def check_tuned_fused_hc_tactic_is_shared() -> None:
     the ranks' replicated streams (and the router logits computed from them) stay bitwise equal."""
     import zlib
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
         fused_hc_scratch,
         fused_hc_tactic,
         mhc_fused_hc,
     )
-    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
     for name in ("FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"):
         os.environ.pop(name, None)
@@ -353,10 +353,10 @@ def check_matches_the_unfused_boundary() -> None:
     """
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.layers.mhc import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.layers.mhc import (  # noqa: E501
         Mhc,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (  # noqa: E501
         DecodeTarget,
     )
 
@@ -421,11 +421,11 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     HOST_GROUP = dist.new_group(backend="gloo")
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as ar_entry
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.distributed import communicator
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allreduce as ar_entry
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.comm import (  # noqa: E501
         mhc_ar_boundary as boundary_module,
     )
-    from tensorrt_llm._torch.distributed import communicator
     from tensorrt_llm._utils import torch_pybind11_abi
     from tensorrt_llm.bindings.internal.process_group import init_pg
     from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy

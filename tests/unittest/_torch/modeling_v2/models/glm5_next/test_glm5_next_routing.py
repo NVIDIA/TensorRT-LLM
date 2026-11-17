@@ -530,7 +530,7 @@ def test_fp8_on_other_gpus_does_not_match(monkeypatch, sm):
 
 def test_fp8_constructor_refuses_what_route_declines():
     """A direct construction raises on the facts ``route`` declines, before building anything."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (
         ModelingV2Glm53FlashFp8Sm10xTp4,
     )
 
@@ -557,7 +557,7 @@ def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
     """The text-only target fails a media request on admission, as that request's own error."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (
         ModelingV2Glm53FlashFp8Sm10xTp4,
     )
 

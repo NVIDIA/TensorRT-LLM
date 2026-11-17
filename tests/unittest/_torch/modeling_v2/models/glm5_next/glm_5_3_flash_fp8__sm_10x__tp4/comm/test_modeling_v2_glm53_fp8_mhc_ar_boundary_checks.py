@@ -10,10 +10,10 @@ The collective itself is certified by ``_mhc_ar_boundary_op_matrix.py``.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4 import (  # noqa: E501
     native_ops,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.comm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.comm import (  # noqa: E501
     mhc_ar_boundary as boundary,
 )
 from tensorrt_llm._utils import get_sm_version

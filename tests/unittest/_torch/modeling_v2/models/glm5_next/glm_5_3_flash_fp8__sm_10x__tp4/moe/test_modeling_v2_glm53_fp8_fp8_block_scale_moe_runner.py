@@ -15,15 +15,15 @@ from collections.abc import Callable, Iterator
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     BLOCK,
     ROUTING_DEEPSEEK_V3,
     ROUTING_RENORMALIZE,
     Fp8BlockScaleMoeRunner,
     route_deepseek_v3,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     fp8_block_scale_moe_runner as op,
 )
 from tensorrt_llm._utils import get_sm_version

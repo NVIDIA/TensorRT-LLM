@@ -20,7 +20,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[8]
 _TARGET_CSRC = (
     _ROOT
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next"
+    / "tensorrt_llm/_torch/modeling_v2/models/glm5_next"
     / "glm_5_3_flash_fp8__sm_10x__tp4/csrc/mhcArBoundary.cu"
 )
 _COMM_KERNELS = _ROOT / "cpp/tensorrt_llm/kernels/communicationKernels"

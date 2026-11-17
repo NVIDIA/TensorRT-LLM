@@ -13,11 +13,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.low_m_bf16_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.low_m_bf16_gemm import (  # noqa: E501
     _CHOICES,
     low_m_choice,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.low_m_bf16_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.low_m_bf16_gemm import (  # noqa: E501
     low_m_bf16_gemm as op,
 )
 from tensorrt_llm._utils import get_sm_version

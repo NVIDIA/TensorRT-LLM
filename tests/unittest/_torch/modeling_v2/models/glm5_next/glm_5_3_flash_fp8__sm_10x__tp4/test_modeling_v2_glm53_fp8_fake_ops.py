@@ -18,12 +18,10 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
-_TARGET = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4"
-)
+_TARGET = "tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4"
 
 try:
     _target = importlib.import_module(_TARGET)

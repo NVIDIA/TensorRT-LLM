@@ -12,21 +12,21 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
     BLOCK,
     GLM_DENSE_DOWN,
     GLM_DENSE_GATE_UP,
     GLM_SHARED_DOWN,
     GLM_SHARED_GATE_UP,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
     fp8_blockwise_gemm as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]

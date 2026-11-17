@@ -7,12 +7,12 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_gemm_sqrsum import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_gemm_sqrsum import (  # noqa: E501
     TILE_N_OPTIONS,
     gemm_sqrsum_tile_n,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_gemm_sqrsum import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_gemm_sqrsum import (  # noqa: E501
     mhc_gemm_sqrsum as op,
 )
 from tensorrt_llm._utils import get_sm_version

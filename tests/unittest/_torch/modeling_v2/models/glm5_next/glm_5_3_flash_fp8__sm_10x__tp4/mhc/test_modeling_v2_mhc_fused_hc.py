@@ -12,7 +12,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
     DETERMINISTIC_TACTIC,
     HIDDEN,
     default_fused_hc_tactic,
@@ -21,10 +22,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flas
     fused_hc_tactic,
     fused_hc_tactics,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.mhc.mhc_fused_hc import (  # noqa: E501
     mhc_fused_hc as op,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = [".", "../../../.."]
