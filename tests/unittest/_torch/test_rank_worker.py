@@ -20,6 +20,12 @@ from tensorrt_llm._torch.rank_worker import RankWorker
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _every_build_to_a_worker(monkeypatch):
+    """Workers take every build, however short; the tests of that rule set it themselves."""
+    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
+
+
 @pytest.fixture
 def worker_env(monkeypatch):
     """Worker processes that import rank_worker_targets, started from a launcher's environment."""
@@ -206,6 +212,42 @@ def test_no_worker_starts_while_the_gpu_lacks_room(worker, monkeypatch):
         assert not targets.compile_kernel.submit(5)
     assert targets.compile_kernel(5).pid == os.getpid()
     assert worker._workers_started == 0
+
+
+def test_a_worker_takes_only_builds_long_enough_to_repay_it(worker):
+    worker.min_build_s = 5.0
+    with worker.pass_scope():
+        # Neither measured nor expected: built where it is first needed.
+        assert not worker.worth_a_worker("new")
+        assert worker.worth_a_worker("new", expected_s=30.0)
+        assert not worker.worth_a_worker("new", expected_s=1.0)
+        # Once measured, the measure decides.
+        worker.record_build("new", 0.5)
+        assert not worker.worth_a_worker("new", expected_s=30.0)
+        worker.record_build("slow", 10.0)
+        assert worker.worth_a_worker("slow")
+    assert not worker.worth_a_worker("slow")
+    worker.min_build_s = 0.0
+    with worker.pass_scope():
+        assert worker.worth_a_worker("new")
+
+
+def test_a_process_built_function_measures_its_compiles(worker):
+    worker.min_build_s = 5.0
+    with worker.pass_scope():
+        # Never measured: the call compiles it here, and measures it.
+        assert not targets.compile_kernel.submit(50)
+        assert targets.compile_kernel(50).pid == os.getpid()
+        assert worker.build_seconds(targets.NAME) < 5.0
+        assert not targets.compile_kernel.submit(51)
+    assert worker.counts() == {}
+
+
+def test_a_build_in_a_worker_measures_its_kind(worker):
+    with worker.pass_scope():
+        assert targets.compile_kernel.submit(52)
+        worker.join()
+    assert worker.build_seconds(targets.NAME) is not None
 
 
 def test_arguments_that_do_not_pickle_are_built_here(worker):

@@ -18,9 +18,9 @@ from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_PLUS_SF_VEC_SIZE
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+from ..autotuner import (AutoTuner, BuildStrategy, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE,
                               reserved_max_active_clusters, sm_reserve)
@@ -3434,7 +3434,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               10, 0,
                                               helper.infer_shape_input5_rows)),
                         use_cold_l2_cache=True,
-                        share_jit_builds=True)
+                        build_strategy=BuildStrategy.PARALLEL)
                     return self.__class__.tuning_config_cache[key]
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3450,7 +3450,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
-                    share_jit_builds=True,
+                    build_strategy=BuildStrategy.PARALLEL,
                     # The dynamic dimension is input 0's (permuted) rows.
                     tune_max_num_tokens=helper.get_max_num_permuted_tokens(
                         self.weights_evict_first_max_tokens)
@@ -4336,7 +4336,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         constraint_specs=(ConstraintSpec(
                             2, 0, helper.infer_shape_input0_rows), ),
                         use_cold_l2_cache=True,
-                        share_jit_builds=True)
+                        build_strategy=BuildStrategy.PARALLEL)
                     return self.__class__.tuning_config_cache[key]
                 helper = GatherGroupedGemmInputsHelper(
                     self.num_experts,
@@ -4365,7 +4365,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
                     use_cold_l2_cache=True,
-                    share_jit_builds=True,
+                    build_strategy=BuildStrategy.PARALLEL,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -13122,7 +13122,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     constraint_specs=(batch_constraints + static_constraints +
                                       stats_constraints),
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
-                    share_jit_builds=True,
+                    build_strategy=BuildStrategy.PARALLEL,
                 )
             return cache[key]
 

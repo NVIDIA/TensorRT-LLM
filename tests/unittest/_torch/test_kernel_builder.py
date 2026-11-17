@@ -7,16 +7,31 @@ The builds are rank_worker_targets.py's, which write a file, so no GPU is needed
 """
 
 import os
+import threading
 import time
 
 import pytest
 import rank_worker_targets as targets
 
+from tensorrt_llm import _jit_share
 from tensorrt_llm._torch import rank_worker
-from tensorrt_llm._torch.kernel_builder import BuildConfig, BuildTask, DynamicSpec, KernelBuilder
+from tensorrt_llm._torch.kernel_builder import (
+    BuildConfig,
+    BuildStrategy,
+    BuildTask,
+    DynamicSpec,
+    KernelBuilder,
+)
 from tensorrt_llm._torch.rank_worker import RankWorker
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _every_build_to_a_worker(monkeypatch):
+    """Workers take every build, however short; the tests of that rule set it themselves."""
+    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
+
 
 _RECORD = f"{targets.__name__}:record"
 _HOLD = f"{targets.__name__}:hold"
@@ -143,3 +158,120 @@ def test_with_kernel_builder_off_nothing_is_listed(monkeypatch, tmp_path):
         assert not kb.active()
         kb.prebuild("op", "sig", _CONFIG, {"m": 2}, _lister(tmp_path, calls))
     assert calls == []
+
+
+def test_builds_too_short_for_a_worker_are_not_listed(builder, tmp_path):
+    RankWorker.get().min_build_s = 5.0
+    calls = []
+    with builder.build_pass("test"):
+        # Neither measured nor expected: the op builds them on first use.
+        builder.prebuild("op", "sig", _CONFIG, {"m": 2}, _lister(tmp_path, calls))
+        RankWorker.get().record_build("measured", 6.0)
+        builder.prebuild("measured", "sig", _CONFIG, {"m": 2}, _lister(tmp_path, calls))
+        expected = BuildConfig(_CONFIG.dynamic_specs, build_seconds=30.0)
+        builder.prebuild("expected", "sig", expected, {"m": 1}, _lister(tmp_path, calls))
+        RankWorker.get().join()
+    assert calls == [[1, 2], [1]]
+
+
+@pytest.fixture
+def shared(monkeypatch, tmp_path):
+    """Ranks that share their JIT builds through a directory."""
+    share = tmp_path / "share"
+    share.mkdir()
+    monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, str(share))
+    monkeypatch.setattr(_jit_share, "enabled", lambda: True)
+    return share
+
+
+def _parallel(scope="here"):
+    return BuildConfig(strategy=BuildStrategy.PARALLEL, share_scope=lambda: scope)
+
+
+def test_ranks_split_parallel_builds(builder, shared, tmp_path):
+    other = KernelBuilder(enabled=True)  # Another rank of the launch.
+    with builder.build_pass("a"), other.build_pass("b"):
+        assert builder.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "k"), 1)), _parallel())
+        # The other rank finds the build claimed, and leaves it to the first.
+        assert other.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "k2"), 1)), _parallel())
+        RankWorker.get().join()
+        assert other.state("op", "k") == "done"
+        assert other.wait("op", "k") == 0.0
+    assert (tmp_path / "k").exists() and not (tmp_path / "k2").exists()
+    assert other.stats("op").elsewhere == 1
+
+
+def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_path):
+    other = KernelBuilder(enabled=True)
+    with builder.build_pass("a"), other.build_pass("b"):
+        assert builder.submit(
+            "op", "k", BuildTask(_RECORD, (str(tmp_path / "a"), 1)), _parallel("a")
+        )
+        # Another scope, another claim: the second rank builds the kernel rather than wait.
+        assert other.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "b"), 1)), _parallel("b"))
+        assert other.stats("op").elsewhere == 0
+        RankWorker.get().join()
+    claims = [name for name in os.listdir(shared / "kernel_builder") if name.endswith(".claim")]
+    assert len(claims) == 2
+
+
+def test_a_rank_waits_for_a_build_another_started_and_makes_one_it_has_not(
+    builder, shared, tmp_path
+):
+    RankWorker.get().max_workers = 1
+    other = KernelBuilder(enabled=True)
+    started, release = tmp_path / "started", tmp_path / "release"
+    with builder.build_pass("a"), other.build_pass("b"):
+        try:
+            assert builder.submit(
+                "op", "busy", BuildTask(_HOLD, (str(started), str(release))), _parallel()
+            )
+            deadline = time.monotonic() + 60
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            # Queued behind the busy build: claimed, and not started.
+            assert builder.submit(
+                "op", "queued", BuildTask(_RECORD, (str(tmp_path / "q"), 1)), _parallel()
+            )
+            assert other.submit(
+                "op", "busy", BuildTask(_RECORD, (str(tmp_path / "x"), 1)), _parallel()
+            )
+            assert other.submit(
+                "op", "queued", BuildTask(_RECORD, (str(tmp_path / "y"), 1)), _parallel()
+            )
+            assert other.state("op", "busy") == "elsewhere"
+            # Not started by the rank that claimed it: the op makes it now.
+            assert other.wait("op", "queued") == 0.0
+            # Started there: the op waits for it.
+            threading.Timer(0.5, release.touch).start()
+            assert other.wait("op", "busy") >= 0.3
+        finally:
+            release.touch()
+    assert not (tmp_path / "x").exists() and not (tmp_path / "y").exists()
+
+
+def test_a_parallel_build_a_rank_takes_back_is_waited_for_until_it_is_made(
+    builder, shared, tmp_path
+):
+    RankWorker.get().max_workers = 1
+    other = KernelBuilder(enabled=True)
+    started, release = tmp_path / "started", tmp_path / "release"
+    with builder.build_pass("a"), other.build_pass("b"):
+        try:
+            assert builder.submit("op", "busy", BuildTask(_HOLD, (str(started), str(release))))
+            deadline = time.monotonic() + 60
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert builder.submit(
+                "op", "k", BuildTask(_RECORD, (str(tmp_path / "k"), 1)), _parallel()
+            )
+            assert other.submit(
+                "op", "k", BuildTask(_RECORD, (str(tmp_path / "x"), 1)), _parallel()
+            )
+            # This rank takes its queued build back to make it: the other rank waits for it.
+            assert builder.wait("op", "k") == 0.0
+            threading.Timer(0.5, builder.op_compiled, ("op", "k", 2.0)).start()
+            assert other.wait("op", "k") >= 0.3
+            assert RankWorker.get().build_seconds("op") == 2.0
+        finally:
+            release.touch()

@@ -13,6 +13,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_kernel_builds
 from tensorrt_llm._torch.kernel_builder import KernelBuilder
+from tensorrt_llm._torch.rank_worker import RankWorker
 
 _OP = msa_kernel_builds._OP
 # The stand-in's variants: a 64-row query tile up to 64 rows, a 128-row one above.
@@ -37,6 +38,7 @@ def package(monkeypatch, tmp_path):
         _variant_manager=manager,
         _variant_key_from_runtime=lambda tile, split: (f"v{tile}_{int(split)}", {"tile": tile}),
         _built_dir=lambda name, library: tmp_path / name,
+        _jit_base=lambda: tmp_path,
         _acquire_file_lock=None,
         _release_file_lock=None,
         _do_compile_plan=None,
@@ -65,6 +67,8 @@ def package(monkeypatch, tmp_path):
     msa_kernel_builds._route(module, api, msa_kernel_builds._Package(module, api, jit))
     builder = KernelBuilder(enabled=True)
     monkeypatch.setattr(KernelBuilder, "_instance", builder)
+    # The variants take long enough for a worker; none is started here.
+    monkeypatch.setattr(RankWorker, "worth_a_worker", lambda self, family, expected_s=None: True)
     monkeypatch.setattr(builder, "wait", lambda op, key: events.append(("wait", key)) or 0.0)
     return types.SimpleNamespace(module=module, builder=builder, events=events, fail=fail)
 
@@ -83,7 +87,9 @@ def build_mode(package, monkeypatch):
     submitted = []
     monkeypatch.setattr(package.builder, "active", lambda: True)
     monkeypatch.setattr(
-        package.builder, "submit", lambda op, key, task: submitted.append((key, task)) or True
+        package.builder,
+        "submit",
+        lambda op, key, task, config=None: submitted.append((key, task)) or True,
     )
     return submitted
 
@@ -120,7 +126,7 @@ def test_a_replay_that_raises_leaves_the_variants_to_their_first_use(package, bu
 def test_in_inference_mode_a_lookup_waits_for_its_build_once(package, monkeypatch):
     submitted = []
     monkeypatch.setattr(
-        package.builder, "submit", lambda op, key, task: submitted.append(key) or True
+        package.builder, "submit", lambda op, key, task, config=None: submitted.append(key) or True
     )
     _call(package.module, 40)
     _call(package.module, 40)

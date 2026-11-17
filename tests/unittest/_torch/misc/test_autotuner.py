@@ -36,7 +36,8 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
 from tensorrt_llm import _jit_share as jit_share
-from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
+from tensorrt_llm._torch.autotuner import (AutoTuner, BuildStrategy,
+                                           DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
                                            FakeTensor, OptimizationProfile,
                                            StaticDim, TunableRunner,
@@ -2434,7 +2435,7 @@ def test_parallel_deal_start_is_stable_and_spread():
     assert set(starts) == set(range(group_size)), sorted(set(starts))
 
 
-def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
+def test_parallel_builds_set_aside_profiles_built_elsewhere(
         monkeypatch, tmp_path):
     """With DeepGEMM's builds shared across ranks, a rank runs the profiles it
     claims first. One whose kernel another rank is building is set aside rather
@@ -2471,10 +2472,10 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::share_jit_builds"
+    op = "autotuner_test::parallel_builds"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4, 8)), ),
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.PARALLEL)
     real_claim = jit_share.SharedSweep.claim
     # Another rank holds the claim on the last profile (M = 8) and has run it.
     monkeypatch.setattr(jit_share.SharedSweep, "claim",
@@ -2491,7 +2492,7 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     assert jit_share._DEADLINE_ENV not in os.environ
 
 
-def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
+def test_parallel_builds_set_aside_a_timed_profile_whose_kernel_is_busy(
         monkeypatch, tmp_path):
     """The ranks split a sweep by profile when its first profile has one tactic.
     A later profile with several tactics is timed, and a tactic whose kernel
@@ -2530,10 +2531,10 @@ def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::share_jit_builds_timed_busy"
+    op = "autotuner_test::parallel_builds_timed_busy"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4)), ),
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.PARALLEL)
     runners = [MixedTacticsRunner()]
     with autotune():
         tuner.choose_one(op, runners, config,
@@ -2942,7 +2943,7 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
     tuner.clear_cache()
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
                                                                   (2, 4)), ),
-                          share_jit_builds=True,
+                          build_strategy=BuildStrategy.PARALLEL,
                           build_in_workers=workers_on)
     with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one("autotuner_test::build_across_ranks",
@@ -3132,16 +3133,22 @@ def test_default_parallel_jit_warmup_threads(monkeypatch, host_cpus, affinity,
 
 
 @pytest.mark.parametrize("sharing", [False, True])
-def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
-                                                   sharing):
-    """An op with both parallel_jit_warmup and share_jit_builds runs its sweep on
-    the warmup pool only when the processes do not share their JIT builds. When
-    they do, the claims split the builds and every profile runs on the calling
-    thread."""
+def test_the_warmup_pool_runs_the_profiles_this_process_claims(
+        monkeypatch, tmp_path, sharing):
+    """An op with both parallel_jit_warmup and the PARALLEL build strategy runs
+    its sweep on the warmup pool. When the processes share their JIT builds,
+    the pool runs only the profiles this process claims; the profiling then
+    runs every profile on the calling thread, a profile another process claimed
+    once that process ran it or the wait ran out."""
     monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
     monkeypatch.setattr(jit_share, "enabled", lambda: sharing)
     monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    # Another process holds the odd profiles, and never runs them.
+    monkeypatch.setenv("TLLM_JIT_SHARE_WAIT_S", "0.2")
+    real_claim = jit_share.SharedSweep.claim
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, i: i % 2 == 0 and real_claim(self, i))
     tuner = AutoTuner.get()
     tuner.clear_cache()
     ThreadRecordingRunner.calls.clear()
@@ -3149,18 +3156,18 @@ def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, buckets), ),
                           parallel_jit_warmup=4,
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.PARALLEL)
     x = torch.randn(128, 64, device="cuda")
     w = torch.randn(64, 128, device="cuda")
     caller = threading.get_ident()
     with autotune():
-        tuner.choose_one(f"autotuner_test::shared_builds_or_pool_{sharing}",
+        tuner.choose_one(f"autotuner_test::shared_builds_on_pool_{sharing}",
                          [ThreadRecordingRunner()], config, [x, w])
 
     on_caller = {m for m, t in ThreadRecordingRunner.calls if t == caller}
     on_pool = sorted(m for m, t in ThreadRecordingRunner.calls if t != caller)
     assert on_caller == set(buckets)
-    assert on_pool == ([] if sharing else sorted(buckets))
+    assert on_pool == sorted(buckets[0::2] if sharing else buckets)
     tuner.clear_cache()
 
 
@@ -3180,6 +3187,8 @@ def tune_mode_workers(monkeypatch):
         return env
 
     monkeypatch.setattr(rank_worker, "_worker_env", worker_env)
+    # Every build goes to the workers, however short (the tests of that rule set it).
+    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
     rank = rank_worker.RankWorker(workers=2, enabled=True)
     monkeypatch.setattr(rank_worker.RankWorker, "_instance", rank)
     yield rank
@@ -3235,6 +3244,43 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
         assert tune_mode_workers._pool is None
     else:
         assert built == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("build_s, in_workers", [(0.0, False), (0.4, True)],
+                         ids=["short", "long"])
+def test_tune_mode_measures_a_build_before_the_workers_take_any(
+        tune_mode_workers, tmp_path, build_s, in_workers):
+    """Until an op's builds are measured, tune mode builds one itself, timed; the workers
+    build the others only if it took TLLM_KERNEL_BUILDER_MIN_BUILD_S seconds."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.min_build_s = 0.2
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path), build_s)
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one(f"test::measured_builds_{build_s}", [runner], config,
+                         [x])
+    builders = {
+        name: (tmp_path / name).read_text().split()
+        for name in os.listdir(tmp_path)
+    }
+    here = str(os.getpid())
+    measured = [name for name, pids in builders.items() if pids[0] == here]
+    assert len(measured) == 1
+    if in_workers:
+        assert sorted(builders) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
+                                          for t in (0, 1))
+        assert all(pids[-1] != here for pids in builders.values())
+    else:
+        assert builders == {measured[0]: [here]}
     tuner.clear_cache()
 
 

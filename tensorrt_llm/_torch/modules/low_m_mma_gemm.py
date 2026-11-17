@@ -24,6 +24,7 @@ from ..autotuner import (
 )
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
+from ..rank_worker import process_built
 
 _NUM_SMS_DEFAULT = 148
 # SM100/SM103 opt-in shared memory per block; stands in for the device without CUDA (CPU-only test collection).
@@ -201,7 +202,7 @@ def _row_view(rows: int, cols: int, stride: int, dtype, device) -> torch.Tensor:
     return torch.empty((rows, stride), dtype=dtype, device=device)[:, :cols]
 
 
-@functools.lru_cache(maxsize=None)
+@process_built("low_m_mma_gemm")
 def _compiled(
     m: int,
     k: int,

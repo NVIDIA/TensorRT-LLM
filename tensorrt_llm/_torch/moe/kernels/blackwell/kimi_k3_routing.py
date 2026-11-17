@@ -47,7 +47,9 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ....kernel_builder import KernelBuilder
 from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
+from ....rank_worker import process_built
 from . import raw_ptx as ptx
 
 #: Experts selected per token.
@@ -984,7 +986,7 @@ def _config(m: int) -> tuple[int, int]:
     return 1, 16
 
 
-@functools.cache
+@process_built("kimi_k3_routing")
 def _compiled_kernel(
     num_experts: int,
     num_warps: int,
@@ -1054,7 +1056,9 @@ def precompile(num_experts: int, use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
         if num_experts > _SMALL_LOCAL_CAP:
             local_caps.add(_SMALL_LOCAL_CAP)
         for local_cap in sorted(local_caps):
-            _compiled_kernel(num_experts, num_warps, warps_per_token, local_cap, use_pdl=use_pdl)
+            args = (num_experts, num_warps, warps_per_token, local_cap, use_pdl)
+            if not (KernelBuilder.get().active() and _compiled_kernel.submit(*args)):
+                _compiled_kernel(*args)
             compiled += 1
     return compiled
 
@@ -1119,7 +1123,7 @@ def run_route_sort(
     warps_per_token, num_warps = _config(m)
     local_cap = _SMALL_LOCAL_CAP if local_num_experts <= _SMALL_LOCAL_CAP else num_experts
     compiled = _compiled_kernel(
-        num_experts, num_warps, warps_per_token, local_cap, use_pdl=TRTLLM_ENABLE_PDL
+        num_experts, num_warps, warps_per_token, local_cap, TRTLLM_ENABLE_PDL
     )
     tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_buffers)
     scale_bits = struct.unpack("<q", struct.pack("<d", float(routed_scaling_factor)))[0]

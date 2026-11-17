@@ -18,7 +18,13 @@ The ranks of a launch compile the same kernels, each on its own. With
 ``TLLM_JIT_SHARE_DIR`` set to a directory that every process of the launch
 can see (on a multi-node launch, a shared file system; use a fresh directory
 per launch), the first process to claim a kernel builds it and the others
-reuse the result. Every process runs the kernels it finds there, so
+reuse the result. Without it, the processes of a launch that run on one node
+share their builds through the launch's directory on the node's local disk,
+``/tmp/tllm-jit-<uid>/<launch>`` (:func:`_default_share_dir`): a launch of
+several processes per node that the launcher names (PMIx namespace, Slurm job
+step, torchrun run, DWDP rendezvous). That directory leaves DeepGEMM's disk
+cache where it is; ``TLLM_JIT_SHARE_DEFAULT=0`` or ``TLLM_KERNEL_BUILDER=0``
+turns it off. Every process runs the kernels it finds there, so
 :func:`install` shares builds only when the directory, and the ones it holds
 kernels in, belong to this user and other users cannot write to them (group
 members who can write to them must be trusted). Where the directory cannot be
@@ -95,6 +101,19 @@ _SHEBANG_LIMIT = 127
 
 # Set in a RankWorker worker process (tensorrt_llm._torch.rank_worker): its rank's store.
 _RANK_STORE_ENV = "TLLM_RANK_WORKER_STORE"
+# "1" when TLLM_JIT_SHARE_DIR is the launch's directory that install() chose, not one the user set;
+# "0", set by the user, leaves the launch without a default directory.
+_DEFAULT_ENV = "TLLM_JIT_SHARE_DEFAULT"
+# A DWDP rendezvous over a store (tensorrt_llm._torch.modules.dwdp.rendezvous).
+_DWDP_RANK_ENV = "TRTLLM_DWDP_RANK"
+_DWDP_ADDR_ENV = "TRTLLM_DWDP_MASTER_ADDR"
+_DWDP_PORT_ENV = "TRTLLM_DWDP_MASTER_PORT"
+# "0" (tensorrt_llm._torch.rank_worker.ENABLE_ENV) leaves a launch without a default directory.
+_KERNEL_BUILDER_ENV = "TLLM_KERNEL_BUILDER"
+# Where the launches' default directories are made: this node's local disk.
+_DEFAULT_ROOT = "/tmp"
+# A launch directory is removed once its processes have exited and it is older than this.
+_PRUNE_AFTER_S = 6 * 3600
 
 _installed = False
 _slot: int | None = None
@@ -470,15 +489,23 @@ def _load_kernel(obj: str, name: str, meta: str):
 
 
 def install() -> bool:
-    """Make this file DeepGEMM's compiler if ``TLLM_JIT_SHARE_DIR`` is set.
+    """Make this file DeepGEMM's compiler, sharing builds through ``TLLM_JIT_SHARE_DIR`` or, when
+    it is not set, through the launch's directory on this node's local disk
+    (:func:`_default_share_dir`).
 
     Must run before the process's first DeepGEMM call, which reads
     ``DG_JIT_NVCC_COMPILER``. Returns whether sharing is active.
     """
     global _installed
-    share_dir = os.environ.get(SHARE_DIR_ENV)
-    if _installed or not share_dir or os.name != "posix":
+    if _installed or os.name != "posix":
         return _installed
+    share_dir = os.environ.get(SHARE_DIR_ENV)
+    # A process started by one that chose the launch's directory inherits it.
+    default = bool(share_dir) and os.environ.get(_DEFAULT_ENV) == "1"
+    if not share_dir:
+        share_dir, default = _default_share_dir(), True
+    if not share_dir:
+        return False
     # A process started by one that installed inherits the variables below;
     # its compiler is still the real one, not the parent's wrapper.
     compiler = (
@@ -488,26 +515,28 @@ def install() -> bool:
     )
     if not compiler or not os.access(compiler, os.X_OK):
         return False
-    # Every process runs the kernels it finds in these directories.
+    # Every process runs the kernels it finds in these directories. The launch's own directory
+    # leaves DeepGEMM's disk cache where it is, since that cache outlives the launch.
     deep_gemm = os.path.join(share_dir, "deep_gemm")
     code_dirs = [share_dir, os.path.join(share_dir, "kernels"), os.path.join(share_dir, "cute")]
-    if os.environ.get("DG_JIT_CACHE_DIR", deep_gemm) == deep_gemm:
+    if not default and os.environ.get("DG_JIT_CACHE_DIR", deep_gemm) == deep_gemm:
         code_dirs.append(deep_gemm)
     try:
         for path in code_dirs:
-            os.makedirs(path, mode=0o755, exist_ok=True)
+            os.makedirs(path, mode=0o700 if default else 0o755, exist_ok=True)
     except OSError:
         return False
     untrusted = next((path for path in code_dirs if not _trusted_dir(path)), None)
     if untrusted is not None:
-        import warnings
+        if not default:
+            import warnings
 
-        warnings.warn(
-            f"{SHARE_DIR_ENV} is ignored: {untrusted} must be a directory of this user "
-            "that other users cannot write to",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+            warnings.warn(
+                f"{SHARE_DIR_ENV} is ignored: {untrusted} must be a directory of this user "
+                "that other users cannot write to",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return False
     wrapper = None
     for bin_dir in _wrapper_dirs(share_dir):
@@ -524,8 +553,117 @@ def install() -> bool:
         os.environ[_SALT_ENV] = _salt(compiler)
     os.environ[_PROCESS_ENV] = f"{os.uname().nodename}-{os.getpid()}"
     os.environ["DG_JIT_NVCC_COMPILER"] = wrapper
-    os.environ.setdefault("DG_JIT_CACHE_DIR", os.path.join(share_dir, "deep_gemm"))
+    if default:
+        os.environ[SHARE_DIR_ENV] = share_dir
+        os.environ[_DEFAULT_ENV] = "1"
+        _register_process(share_dir)
+    else:
+        os.environ.setdefault("DG_JIT_CACHE_DIR", os.path.join(share_dir, "deep_gemm"))
     _installed = True
+    return True
+
+
+def _default_share_dir() -> str | None:
+    """The directory on this node's local disk through which the processes of this launch that
+    run on the node share their builds; None outside a launch of several processes per node,
+    with ``TLLM_KERNEL_BUILDER=0`` or ``TLLM_JIT_SHARE_DEFAULT=0``, and where no directory of
+    this user alone can be made."""
+    if os.environ.get(_KERNEL_BUILDER_ENV, "1") == "0" or os.environ.get(_DEFAULT_ENV) == "0":
+        return None
+    launch = _launch_id()
+    if launch is None or _processes_per_node() < 2:
+        return None
+    root = os.path.join(_DEFAULT_ROOT, f"tllm-jit-{os.getuid()}")
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    if not _private_dir(root):
+        return None
+    _prune_launch_dirs(root)
+    name = hashlib.sha256(f"{launch}|{os.uname().nodename}".encode()).hexdigest()[:16]
+    return os.path.join(root, name)
+
+
+def _launch_id() -> str | None:
+    """What every process of a launch finds in its environment, and no other launch: the PMIx
+    namespace (Open MPI, ``srun --mpi=pmix``, the processes one ``MPI_Comm_spawn`` starts), the
+    store of a DWDP rendezvous (context workers launched one ``trtllm-serve`` each), the Slurm
+    job step, or the torchrun run."""
+    if os.environ.get(_DWDP_RANK_ENV) and os.environ.get(_DWDP_ADDR_ENV):
+        return f"dwdp:{os.environ[_DWDP_ADDR_ENV]}:{os.environ.get(_DWDP_PORT_ENV, '29600')}"
+    namespace = os.environ.get("PMIX_NAMESPACE")
+    if namespace:
+        return f"pmix:{namespace}"
+    job, step = os.environ.get("SLURM_JOB_ID"), os.environ.get("SLURM_STEP_ID")
+    if job and step:
+        return f"slurm:{job}.{step}"
+    run = os.environ.get("TORCHELASTIC_RUN_ID")
+    if run:
+        return f"torchrun:{run}"
+    return None
+
+
+def _processes_per_node() -> int:
+    """How many processes of the launch run on this node, as the launcher tells; 1 if it does
+    not. A DWDP rendezvous joins several workers, without telling how many share a node: it
+    counts as two."""
+    if os.environ.get(_DWDP_RANK_ENV) and os.environ.get(_DWDP_ADDR_ENV):
+        return 2
+    for name in ("OMPI_COMM_WORLD_LOCAL_SIZE", "LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS"):
+        value = os.environ.get(name, "")
+        if value.isdigit():
+            return int(value)
+    tasks = os.environ.get("SLURM_STEP_TASKS_PER_NODE") or os.environ.get("SLURM_TASKS_PER_NODE")
+    # "4", "4(x2)" or "2,1": the most on one node.
+    counts = [part.split("(")[0] for part in (tasks or "").split(",")]
+    return max((int(count) for count in counts if count.isdigit()), default=1)
+
+
+def _register_process(share_dir: str) -> None:
+    """Record this process in the launch's directory, which stays until no process of it runs."""
+    try:
+        procs = os.path.join(share_dir, "procs")
+        os.makedirs(procs, mode=0o700, exist_ok=True)
+        os.close(os.open(os.path.join(procs, str(os.getpid())), os.O_CREAT | os.O_WRONLY, 0o600))
+    except OSError:
+        pass  # The directory is then removed once it is old, whether or not its launch runs.
+
+
+def _prune_launch_dirs(root: str) -> None:
+    """Remove the launch directories under ``root`` that are older than ``_PRUNE_AFTER_S`` and
+    whose processes have all exited: no process of a launch knows it is the last one."""
+    import shutil
+
+    now = time.time()
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if now - entry.stat(follow_symlinks=False).st_mtime < _PRUNE_AFTER_S:
+                continue
+            pids = os.listdir(os.path.join(entry.path, "procs"))
+        except FileNotFoundError:
+            pids = []
+        except OSError:
+            continue
+        if not any(_process_alive(pid) for pid in pids):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _process_alive(pid: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ValueError:
+        return False
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # It runs, as another user's process.
     return True
 
 

@@ -35,9 +35,10 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig, autotune)
+from ..autotuner import (AutoTuner, BuildStrategy, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig,
+                         autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -2298,15 +2299,16 @@ class fp8SwapABGemmRunner(TunableRunner):
     # and inference falls back to a slower uncompiled path.
     # `exclude_from_cache=True` keeps the in-process cache working but
     # ensures the tuning (and the JIT warmup it triggers) repeats on
-    # every process startup. `share_jit_builds=True` lets the ranks split
-    # those builds, instead of each running them on its thread pool, when
-    # they share JIT builds (TLLM_JIT_SHARE_DIR).
+    # every process startup. `build_strategy=BuildStrategy.PARALLEL` lets the
+    # ranks split those builds, instead of each running them on its thread
+    # pool, when they share JIT builds (TLLM_JIT_SHARE_DIR, or by default the
+    # launch's directory on each node).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        share_jit_builds=True,
+        build_strategy=BuildStrategy.PARALLEL,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2362,7 +2364,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        share_jit_builds=True,
+        build_strategy=BuildStrategy.PARALLEL,
     )
 
     def __init__(self, output_dtype: torch.dtype,

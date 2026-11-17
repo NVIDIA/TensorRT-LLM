@@ -4,27 +4,31 @@
 module."""
 
 import os
+import time
 
 from tensorrt_llm._torch.autotuner import TunableRunner
 
 
 class RecordingRunner(TunableRunner):
-    """A runner whose build records, as a file in ``directory``, the rows and the tactic it
-    builds and the process that builds them; its tactics double the input."""
+    """A runner whose build takes ``build_s`` seconds and records the process that built it, as a
+    line of the file in ``directory`` named for the rows and the tactic; its tactics double the
+    input."""
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, build_s: float = 0.0):
         self.directory = directory
+        self.build_s = build_s
 
     def unique_id(self):
-        return (self.directory,)
+        return (self.directory, self.build_s)
 
     def get_valid_tactics(self, inputs, profile, **kwargs):
         return [0, 1]
 
     def build(self, inputs, *, tactic=-1, **kwargs) -> None:
+        time.sleep(self.build_s)
         name = f"m{inputs[0].shape[0]}-t{tactic}"
-        with open(os.path.join(self.directory, name), "w") as f:
-            f.write(str(os.getpid()))
+        with open(os.path.join(self.directory, name), "a") as f:
+            f.write(f"{os.getpid()}\n")
 
     def forward(self, inputs, tactic=-1, **kwargs):
         return inputs[0] * 2

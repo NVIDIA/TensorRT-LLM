@@ -20,10 +20,15 @@ same way.
   builds. Each holds a CUDA context while it runs, which must be gone before the KV cache
   estimation measures free memory; a warmup with the final KV cache starts none. Outside a pass
   no worker takes a build, and the caller builds in this process.
-* With ``TLLM_JIT_SHARE_DIR`` set (see ``tensorrt_llm._jit_share``), the store is
-  ``<TLLM_JIT_SHARE_DIR>/cute`` and the ranks of a launch claim each kernel there: the rank that
-  claims a kernel first builds it, and the others load it. Otherwise every rank builds each
-  kernel into a store of its own, removed when the process exits.
+* When the ranks share JIT builds (``TLLM_JIT_SHARE_DIR``, or by default the launch's directory
+  on each node; see ``tensorrt_llm._jit_share``), the store is ``<that directory>/cute`` and the
+  ranks claim each kernel there: the rank that claims a kernel first builds it, and the others
+  load it. Otherwise every rank builds each kernel into a store of its own, removed when the
+  process exits.
+* A worker takes a build only when builds of its kind take long enough to repay a worker
+  (:meth:`RankWorker.worth_a_worker`): ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds (default 5),
+  as measured so far in this process and its workers, or as the caller expects until one is
+  measured. Shorter builds are made where they are first needed.
 * The workers start with ``subprocess`` in an environment of their own: without the launcher's
   MPI, PMIx and Slurm variables, since importing TensorRT-LLM initializes MPI, and with only this
   rank's GPU visible.
@@ -39,6 +44,7 @@ import atexit
 import collections
 import contextlib
 import dataclasses
+import enum
 import faulthandler
 import functools
 import hashlib
@@ -59,10 +65,14 @@ from typing import IO, Any, Callable, Dict, Iterator, List, NamedTuple, Optional
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["RankWorker", "process_built"]
+__all__ = ["BuildStrategy", "RankWorker", "process_built"]
 
 ENABLE_ENV = "TLLM_KERNEL_BUILDER"
 _WORKERS_ENV = "TLLM_KERNEL_BUILDER_WORKERS"
+_MIN_BUILD_ENV = "TLLM_KERNEL_BUILDER_MIN_BUILD_S"
+# A build goes to a worker only when builds of its kind take at least this long: a worker
+# spends seconds starting and loading its compiler, which a short build does not repay.
+_MIN_BUILD_S = 5.0
 # Each worker holds a CUDA context (about a GiB) on the rank's GPU while the pass lasts.
 _MAX_DEFAULT_WORKERS = 8
 # Set in a worker: the store its CuTe DSL kernels go to, and whether the ranks share it.
@@ -92,7 +102,24 @@ _TAKEN = "taken"
 _CacheInfo = collections.namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
-def process_built(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+class BuildStrategy(enum.Enum):
+    """How the processes of a launch split an op's kernel builds (the autotuner's
+    ``TuningConfig.build_strategy``, KernelBuilder's ``BuildConfig.strategy``).
+
+    * ``INDEPENDENT``: each process builds every kernel it needs.
+    * ``PARALLEL``: the processes that share their JIT builds (``TLLM_JIT_SHARE_DIR``, or by
+      default the launch's directory on each node; see ``tensorrt_llm._jit_share``) split the
+      builds: the process that claims a kernel builds it, and the others load it. Only for
+      kernels that the other processes can load from where the builder leaves them.
+    """
+
+    INDEPENDENT = "independent"
+    PARALLEL = "parallel"
+
+
+def process_built(
+    name: str, build_seconds: Optional[float] = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Memoize a CuTe DSL kernel compile function whose kernels worker processes can build.
 
     Use it in place of ``functools.cache`` on a function that compiles one kernel from hashable,
@@ -106,6 +133,8 @@ def process_built(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
 
     Args:
         name: Names the function's kernels in the store; unique per compile function.
+        build_seconds: How long one compile takes, until compiles of it are measured; ``submit``
+            leaves shorter ones to the caller (:meth:`RankWorker.worth_a_worker`).
     """
 
     def decorate(raw: Callable[..., Any]) -> Callable[..., Any]:
@@ -125,7 +154,9 @@ def process_built(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
                         worker = RankWorker.get()
                         kernel = worker.take(name, args)
                         if kernel is None:
+                            t0 = time.perf_counter()
                             kernel = raw(*args)
+                            worker.record_build(name, time.perf_counter() - t0)
                             worker.store(name, args, kernel)
                         memo[args] = kernel
                         return kernel
@@ -135,7 +166,7 @@ def process_built(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
         def submit(*args) -> bool:
             if args in memo:
                 return False
-            return RankWorker.get().submit(name, where, args)
+            return RankWorker.get().submit(name, where, args, build_seconds)
 
         def cache_info() -> _CacheInfo:
             return _CacheInfo(counts["hits"], counts["misses"], None, len(memo))
@@ -173,6 +204,8 @@ class _Task:
     started: bool = False
     taken: bool = False
     settled: bool = False
+    # What kind of build it is, for the rank's measure of how long such builds take.
+    family: Optional[str] = None
 
 
 def _gpu_has_room() -> bool:
@@ -233,6 +266,9 @@ class RankWorker:
         self._counts: collections.Counter = collections.Counter()
         self._build_s = 0.0
         self._workers_started = 0
+        self.min_build_s = float(os.environ.get(_MIN_BUILD_ENV, _MIN_BUILD_S))
+        # family -> [builds measured, their seconds]
+        self._build_times: Dict[str, List[float]] = {}
 
     @classmethod
     def get(cls) -> "RankWorker":
@@ -280,9 +316,42 @@ class RankWorker:
             return False
         return len(message) <= _MAX_MESSAGE_BYTES
 
+    def worth_a_worker(self, family: str, expected_s: Optional[float] = None) -> bool:
+        """Whether a worker should take a build of ``family`` now: while workers take builds,
+        when builds of the family take at least ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
+        (default 5; 0 sends every build to the workers). How long they take is their mean so far,
+        here or in a worker, or ``expected_s`` until one is measured; a family that has neither
+        builds in this process."""
+        if not self.accepting():
+            return False
+        if self.min_build_s <= 0:
+            return True
+        estimate = self.build_seconds(family)
+        if estimate is None:
+            estimate = expected_s
+        return estimate is not None and estimate >= self.min_build_s
+
+    def build_seconds(self, family: str) -> Optional[float]:
+        """The mean of the builds of ``family`` measured so far, or None."""
+        with self._lock:
+            measured = self._build_times.get(family)
+        return measured[1] / measured[0] if measured else None
+
+    def record_build(self, family: str, seconds: float) -> None:
+        """Measure a build of ``family`` that took ``seconds`` here."""
+        with self._lock:
+            self._record_build(family, seconds)
+
+    def _record_build(self, family: str, seconds: float) -> None:
+        measured = self._build_times.setdefault(family, [0, 0.0])
+        measured[0] += 1
+        measured[1] += seconds
+
     # Builds.
 
-    def run(self, key: str, function: str, args: tuple) -> Optional[Future]:
+    def run(
+        self, key: str, function: str, args: tuple, family: Optional[str] = None
+    ) -> Optional[Future]:
         """Have a worker call ``function`` (``"module:qualname"`` of a module-level function)
         with ``args``; the build's kernel reaches this process through its compiler's cache or
         the store. Returns a future of ``(status, seconds, error)`` (status ``"done"`` or
@@ -308,18 +377,21 @@ class RankWorker:
                 return None
             future = Future()
             self._futures[key] = future
-            task = self._tasks[key] = _Task(key, message, future, True)
+            task = self._tasks[key] = _Task(key, message, future, True, family=family)
         pool.put(task)
         return future
 
-    def submit(self, name: str, function: str, args: tuple) -> bool:
+    def submit(
+        self, name: str, function: str, args: tuple, build_seconds: Optional[float] = None
+    ) -> bool:
         """Have a worker build the kernel of ``function`` (``"module:qualname"`` of a
         ``process_built`` function) for ``args`` into the store.
 
-        Returns False when the kernel was asked for before or is in the store already, and when
-        no worker takes it (see :meth:`run`).
+        Returns False when the kernel was asked for before or is in the store already, when its
+        builds are too short for a worker (:meth:`worth_a_worker`; ``build_seconds`` is how long
+        one takes until one is measured), and when no worker takes it (see :meth:`run`).
         """
-        if not self.accepting() or self._usable_store() is None:
+        if not self.worth_a_worker(name, build_seconds) or self._usable_store() is None:
             return False
         key, paths = self._paths(name, args)
         with self._lock:
@@ -342,7 +414,7 @@ class RankWorker:
                 future.set_result((_PRESENT, 0.0, ""))
                 self._counts[_PRESENT] += 1
                 return False
-            task = self._tasks[key] = _Task(key, message, future, True)
+            task = self._tasks[key] = _Task(key, message, future, True, family=name)
         return pool.put(task)
 
     def take(self, name: str, args: tuple) -> Any:
@@ -477,6 +549,8 @@ class RankWorker:
                 self._counts[result[0]] += 1
                 if result[0] in (_BUILT, _DONE):
                     self._build_s += result[1]
+                    if task.family is not None:
+                        self._record_build(task.family, result[1])
         task.future.set_result(result)
 
     def _ensure_pool(self) -> Optional["_Pool"]:

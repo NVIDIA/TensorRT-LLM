@@ -45,7 +45,7 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._torch.rank_worker import RankWorker
+from tensorrt_llm._torch.rank_worker import BuildStrategy, RankWorker
 from tensorrt_llm._utils import (confidential_compute_enabled, local_mpi_size,
                                  mpi_disabled, nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
@@ -167,9 +167,11 @@ class TuningConfig:
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
             TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
-        share_jit_builds (bool): For runners whose kernels are DeepGEMM builds or CuTe DSL
-            kernels kept in their class's ``kernel_cache``. When the processes of the launch
-            share their JIT builds (TLLM_JIT_SHARE_DIR, see tensorrt_llm._jit_share), each
+        build_strategy (BuildStrategy): How the processes of a launch split the op's kernel
+            builds. INDEPENDENT: each builds every kernel it needs. PARALLEL, for runners whose
+            kernels are DeepGEMM builds or CuTe DSL kernels kept in their class's
+            ``kernel_cache``: when the processes share their JIT builds (TLLM_JIT_SHARE_DIR, or
+            by default the launch's directory on each node; see tensorrt_llm._jit_share), each
             kernel is built by one process and loaded by the others. They split the profiles
             not yet tuned through claims in that directory: for a single tactic, each rank
             runs the profiles it claims first, setting aside one whose kernel another rank is
@@ -190,6 +192,9 @@ class TuningConfig:
             several threads (CuTe DSL), which ``parallel_jit_warmup`` cannot take, and whose
             builds are small: each worker allocates its build's inputs and outputs on the
             rank's GPU. The runners and their tactics must pickle, and must not be collective.
+            The workers take the builds only when they take long enough to repay a worker
+            (``RankWorker.worth_a_worker``): until the op's builds are measured, tune mode
+            builds one itself, timed; shorter ones build as the op profiles.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -200,7 +205,7 @@ class TuningConfig:
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
     parallel_jit_warmup: int = 0
-    share_jit_builds: bool = False
+    build_strategy: BuildStrategy = BuildStrategy.INDEPENDENT
     cold_l2_flush_bytes: int = 0
     build_in_workers: bool = False
 
@@ -1523,8 +1528,8 @@ class AutoTuner:
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
-            share_builds = (tuning_config.share_jit_builds
-                            and jit_share.enabled())
+            share_builds = (tuning_config.build_strategy
+                            is BuildStrategy.PARALLEL and jit_share.enabled())
             built_in_pool = False
             if self._builds_in_pool(tuning_config):
                 jit_share.share_kernel_caches(runners)
@@ -1540,8 +1545,17 @@ class AutoTuner:
                 pass
             elif share_builds:
                 jit_share.share_kernel_caches(runners)
-                if (not one_pair and tuning_config.distributed_tuning_strategy
-                        == DistributedTuningStrategy.INDEPENDENT):
+                if one_pair:
+                    # This rank's share of the sweep runs on its warmup threads.
+                    self._parallel_jit_warmup(custom_op,
+                                              runners,
+                                              profiles,
+                                              inputs,
+                                              tuning_config,
+                                              shared_pending=is_pending,
+                                              **kwargs)
+                elif (tuning_config.distributed_tuning_strategy ==
+                      DistributedTuningStrategy.INDEPENDENT):
                     self._build_across_ranks(custom_op, runners, profiles,
                                              inputs, tuning_config, is_pending,
                                              **kwargs)
@@ -1617,6 +1631,34 @@ class AutoTuner:
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
 
+    def _measure_build(self, custom_op: str, runners: List[TunableRunner],
+                       pending: List[OptimizationProfile],
+                       inputs: List[torch.Tensor], tuning_config: TuningConfig,
+                       item: Tuple[int, int,
+                                   int], prepare: bool, **kwargs) -> bool:
+        """For an op whose builds are not measured yet: build ``item`` (profile, runner,
+        tactic) here, timed, and tell whether its builds take long enough for the rank's
+        workers (``RankWorker.worth_a_worker``). An op already measured as too short builds
+        nothing here: its profiling builds its kernels."""
+        worker = RankWorker.get()
+        if worker.build_seconds(custom_op) is not None:
+            return False
+        i, r, tactic = item
+        runner = runners[r]
+        tensors = self._tuning_tensors(pending[i], inputs, tuning_config)
+        t0 = time.perf_counter()
+        try:
+            if prepare:
+                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
+            runner.build(tensors, tactic=tactic, **kwargs)
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001 - the profiling reports a tactic that fails
+            logger.debug(f"[Autotuner] {custom_op}: measuring a build failed: "
+                         f"{type(e).__name__}: {e}")
+            return False
+        worker.record_build(custom_op, time.perf_counter() - t0)
+        return worker.worth_a_worker(custom_op)
+
     def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
         """Whether tune mode builds the op's kernels in the rank's worker processes before it
         profiles: an op that sets ``build_in_workers``, whose runners are not collective (MERGE),
@@ -1639,8 +1681,9 @@ class AutoTuner:
         profiles (PARALLEL), since any of them may win. With shared JIT builds the ranks claim
         the items, and each builds the ones it claims; the profiling waits for the others.
         Returns False, before claiming any item, when the runners cannot go to a worker (they
-        do not pickle), and the caller builds as without workers. An item whose inputs cannot
-        go to a worker is left to the profiling.
+        do not pickle) and when the op's builds are too short for one (:meth:`_measure_build`),
+        and the caller builds as without workers. An item whose inputs cannot go to a worker
+        is left to the profiling.
         """
         pending = [p for p in profiles if is_pending(p)]
         items = []
@@ -1671,6 +1714,10 @@ class AutoTuner:
                 f"[Autotuner] {custom_op}: its runners do not go to worker "
                 "processes; its kernels build as it profiles.",
                 key=(custom_op, "builds_in_pool_refused"))
+            return False
+        if not worker.worth_a_worker(custom_op) and not self._measure_build(
+                custom_op, runners, pending, inputs, tuning_config,
+                items[start], prepares[items[start][1]], **kwargs):
             return False
         task_keys = []
         refused = 0
@@ -2138,15 +2185,26 @@ class AutoTuner:
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
 
-    def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
+    def _parallel_jit_warmup(self,
+                             custom_op: str,
+                             runners: List[TunableRunner],
                              profiles: List[OptimizationProfile],
                              inputs: List[torch.Tensor],
-                             tuning_config: TuningConfig, **kwargs) -> None:
+                             tuning_config: TuningConfig,
+                             shared_pending: Optional[Callable[
+                                 [OptimizationProfile], bool]] = None,
+                             **kwargs) -> None:
         """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
 
         See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
         discarded, and a failure here is left to the profiling loop, which
         runs every profile again and handles errors as usual.
+
+        With ``shared_pending`` (the processes share their JIT builds), the
+        profiles it selects are claimed in the sweep that
+        :meth:`_profile_sharing_jit_builds` walks next, from this process's
+        offset: the threads run the ones this process claims, and the sweep
+        then finds them run, and waits for the ones other processes claimed.
         """
         num_threads = int(
             os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
@@ -2155,15 +2213,25 @@ class AutoTuner:
             num_threads = _default_parallel_jit_warmup_threads()
         if num_threads < 2:
             return
-        pending = [
-            p for p in profiles if not self.profiling_cache.search_cache(
-                custom_op,
-                runners,
-                p.get_opt_shapes(),
-                tuning_config,
-                apply_map_to_tuning_buckets=False,
-            )[0]
-        ]
+        sweep = None
+        if shared_pending is not None:
+            indices = [i for i, p in enumerate(profiles) if shared_pending(p)]
+            sweep = jit_share.SharedSweep(
+                repr(
+                    (custom_op, [profiles[i].get_opt_shapes()
+                                 for i in indices])))
+            start = int(jit_share.start_fraction() * len(indices))
+            pending = [(i, profiles[i])
+                       for i in indices[start:] + indices[:start]]
+        else:
+            pending = [(i, p) for i, p in enumerate(profiles)
+                       if not self.profiling_cache.search_cache(
+                           custom_op,
+                           runners,
+                           p.get_opt_shapes(),
+                           tuning_config,
+                           apply_map_to_tuning_buckets=False,
+                       )[0]]
         num_threads = min(num_threads, len(pending))
         if num_threads < 2:
             return
@@ -2178,8 +2246,12 @@ class AutoTuner:
         # the profiling loop below allocates, and GPU time is not the cost here.
         stream = torch.cuda.current_stream()
         failures = []
+        ran = []
 
-        def warm(profile: OptimizationProfile) -> None:
+        def warm(item: Tuple[int, OptimizationProfile]) -> None:
+            index, profile = item
+            if sweep is not None and not sweep.claim(index):
+                return  # Another process runs it.
             torch.cuda.set_device(device)
             try:
                 with torch.cuda.stream(stream):
@@ -2193,13 +2265,17 @@ class AutoTuner:
                     stream.synchronize()
             except Exception as e:  # noqa: BLE001 - the profiling loop reports it
                 failures.append(e)
+            finally:
+                ran.append(index)
+                if sweep is not None:
+                    sweep.done(index)
 
         start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=num_threads,
                 thread_name_prefix="autotuner_jit_warmup") as pool:
             list(pool.map(warm, order))
-        logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
+        logger.info(f"[Autotuner] {custom_op}: ran {len(ran)} profiles on "
                     f"{num_threads} threads to drive their JIT in "
                     f"{time.perf_counter() - start:.1f}s" +
                     (f"; {len(failures)} failed and are left to profiling "

@@ -123,6 +123,9 @@ class _CuBLASGemmRunner(TunableRunner):
     ) -> List[Any]:
         return [self._TACTIC]
 
+    def build(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs: Any) -> None:
+        """Nothing to build: cuBLAS ships its kernels."""
+
     def forward(
         self,
         inputs: List[torch.Tensor],
@@ -640,6 +643,10 @@ class LowMGemmDispatcher:
                 if self.per_rank_tuning
                 else DistributedTuningStrategy.PARALLEL
             ),
+            # The race's FlashInfer and CuTe DSL kernels build in the rank's worker
+            # processes before the race is timed, when they take long enough to repay
+            # a worker.
+            build_in_workers=True,
         )
         # Mark prepared only after all runners and the tuning config exist so the
         # invariant "_prepared implies runners are non-None" always holds.

@@ -21,6 +21,7 @@ build mode submits them.
 from __future__ import annotations
 
 import functools
+import os
 import threading
 import time
 import types
@@ -28,7 +29,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.kernel_builder import BuildConfig, BuildTask, DynamicSpec, KernelBuilder
+from tensorrt_llm._torch.kernel_builder import (
+    BuildConfig,
+    BuildStrategy,
+    BuildTask,
+    DynamicSpec,
+    KernelBuilder,
+)
 from tensorrt_llm.logger import logger
 
 _OP = "fmha_sm100"
@@ -41,12 +48,25 @@ def _query_len_buckets(longest: int) -> Tuple[int, ...]:
     return tuple(range(1, min(longest, 129) + 1)) + ((256,) if longest >= 256 else ())
 
 
+def _cache_scope() -> str:
+    """Where the package's builds land: the ranks whose lookups read the same directory on this
+    host split the builds."""
+    return f"{os.uname().nodename}:{os.path.realpath(str(_package.jit._jit_base()))}"
+
+
+# A variant or module takes 35-60 s to compile on GB300.
+_BUILD_SECONDS = 40.0
 _QUERY_LEN = DynamicSpec("qo_len", _query_len_buckets)
+_SHARED = dict(
+    strategy=BuildStrategy.PARALLEL, share_scope=_cache_scope, build_seconds=_BUILD_SECONDS
+)
 # A call's query segment lengths.
-_CONFIG = BuildConfig((_QUERY_LEN,))
+_CONFIG = BuildConfig((_QUERY_LEN,), **_SHARED)
 # The MSA indexer's maximum-score pass also chooses whether to split KV, per batch
 # (msa_indexer._proxy_kv_splits); a variant depends only on whether it splits.
-_PROXY_CONFIG = BuildConfig((_QUERY_LEN, DynamicSpec("num_kv_splits", (1, 2))))
+_PROXY_CONFIG = BuildConfig((_QUERY_LEN, DynamicSpec("num_kv_splits", (1, 2))), **_SHARED)
+# The k2q CSR extension builds into PyTorch's extension directory, under PyTorch's own lock.
+_K2Q_CONFIG = BuildConfig(build_seconds=_BUILD_SECONDS)
 # Plan options a replay does not pass through: it plans its own lengths and offsets, and a
 # swept split count.
 _PLAN_SKIP = ("qo_offset", "device", "stream", "num_kv_splits")
@@ -103,7 +123,7 @@ class _Package:
         # Checked here so that a package without them is left alone.
         for name in ("_compile_only", "_load_templates", "_loaded", "_ensure_all_module"):
             getattr(self.manager, name)
-        for name in ("_built_dir", "_acquire_file_lock", "_release_file_lock"):
+        for name in ("_built_dir", "_jit_base", "_acquire_file_lock", "_release_file_lock"):
             getattr(jit, name)
         for _, _, compile_fn in _MODULES:
             getattr(jit, compile_fn)
@@ -128,9 +148,9 @@ class _Package:
         builder = KernelBuilder.get()
         for name, library, compile_fn in _MODULES:
             builder.submit(
-                _OP, name, BuildTask(f"{_HERE}:build_module", (name, library, compile_fn))
+                _OP, name, BuildTask(f"{_HERE}:build_module", (name, library, compile_fn)), _CONFIG
             )
-        builder.submit(_OP, _K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"))
+        builder.submit(_OP, _K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG)
 
     def run(self, q, k, v, plan_info, *args, **kwargs):
         builder = KernelBuilder.get()

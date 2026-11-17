@@ -15,6 +15,13 @@ KernelBuilder has two modes:
   parallel while the warmup goes on; the op's later calls find a kernel built, or wait for its
   build (:meth:`KernelBuilder.wait`).
 
+Workers take only builds long enough to repay them (``RankWorker.worth_a_worker``): an op's builds
+go to workers once they are measured, or expected (``BuildConfig.build_seconds``), to take
+``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds; shorter ones are the op's own. With the PARALLEL
+strategy (``BuildConfig.strategy``), the ranks that share JIT builds (``tensorrt_llm._jit_share``)
+and the place the op's kernels land (``BuildConfig.share_scope``) split the builds: each rank
+builds the kernels it claims, and waits for the others' once they have started.
+
 A build is a module-level function and picklable arguments (:class:`BuildTask`). The worker
 calls it; the kernel reaches this process through its compiler's disk cache or, for a CuTe DSL
 kernel, through the rank's store (``process_built``). A CuTe DSL compile function decorated with
@@ -28,11 +35,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import itertools
 import os
 import threading
 import time
 from typing import (
+    Any,
     Callable,
     ContextManager,
     Dict,
@@ -49,11 +58,12 @@ from typing import (
 
 import torch
 
+from tensorrt_llm import _jit_share
 from tensorrt_llm.logger import logger
 
-from .rank_worker import ENABLE_ENV, RankWorker
+from .rank_worker import ENABLE_ENV, BuildStrategy, RankWorker, _resolve
 
-__all__ = ["BuildConfig", "BuildTask", "DynamicSpec", "KernelBuilder"]
+__all__ = ["BuildConfig", "BuildStrategy", "BuildTask", "DynamicSpec", "KernelBuilder"]
 
 # A wait for a build shorter than this is a lookup, not a wait.
 _WAIT_REPORT_S = 0.1
@@ -85,9 +95,24 @@ class DynamicSpec:
 
 @dataclasses.dataclass(frozen=True)
 class BuildConfig:
-    """The dimensions an op's kernels depend on, as a ``TuningConfig`` declares its own."""
+    """The dimensions an op's kernels depend on, as a ``TuningConfig`` declares its own, and how
+    the ranks build them.
+
+    Args:
+        dynamic_specs: The dimensions, swept as their ``DynamicSpec`` says.
+        strategy: ``BuildStrategy.PARALLEL`` splits the builds with the other ranks that share JIT
+            builds and ``share_scope``; ``INDEPENDENT`` builds every kernel on this rank.
+        share_scope: For PARALLEL: names where the op's kernels land, such as its compiler's disk
+            cache on this host. Only ranks with the same scope split the builds: each loads the
+            kernels the others built from there.
+        build_seconds: How long one build of the op takes, until builds of it are measured; it
+            decides whether workers take them (``RankWorker.worth_a_worker``).
+    """
 
     dynamic_specs: Tuple[DynamicSpec, ...] = ()
+    strategy: BuildStrategy = BuildStrategy.INDEPENDENT
+    share_scope: Optional[Callable[[], str]] = None
+    build_seconds: Optional[float] = None
 
     def shapes(self, observed: Mapping[str, int]) -> List[Dict[str, int]]:
         """Every combination of the dimensions' buckets for a call that has ``observed``."""
@@ -110,6 +135,51 @@ class _OpStats:
     waited_s: float = 0.0
     late: int = 0
     late_s: float = 0.0
+    elsewhere: int = 0
+
+
+_DEFAULT_CONFIG = BuildConfig()
+
+
+class _Claim(NamedTuple):
+    """The files through which the ranks that share a build learn which of them builds it, and
+    when it has started and ended."""
+
+    claim: str
+    started: str
+    done: str
+    failed: str
+
+
+def _claim_files(op: str, key: Hashable, scope: str) -> Optional[_Claim]:
+    """The claim of ``(op, key)`` among the ranks of ``scope``, in the directory through which
+    they share JIT builds; None when they do not share one."""
+    share_dir = os.environ.get(_jit_share.SHARE_DIR_ENV)
+    if not share_dir or not _jit_share.enabled():
+        return None
+    name = hashlib.sha256(f"{op}|{key!r}|{scope}".encode()).hexdigest()[:32]
+    base = os.path.join(share_dir, "kernel_builder", name)
+    return _Claim(base + ".claim", base + ".started", base + ".done", base + ".failed")
+
+
+def _mark(path: str) -> None:
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o644))
+    except OSError:
+        pass  # The other ranks then wait for the build until their wait runs out.
+
+
+def _build_claimed(claim: _Claim, function: str, args: tuple) -> Any:
+    """In a worker process: a build this rank claimed for the ranks that share it, marked
+    started, then done or failed, for them."""
+    _mark(claim.started)
+    try:
+        result = _resolve(function)(*args)
+    except BaseException:
+        _mark(claim.failed)
+        raise
+    _mark(claim.done)
+    return result
 
 
 class KernelBuilder:
@@ -132,6 +202,9 @@ class KernelBuilder:
         self._listed: Dict[Tuple[str, Hashable], set] = {}
         # The worker task key of each (op, key) submitted.
         self._tasks: Dict[Tuple[str, Hashable], str] = {}
+        # The claims of the PARALLEL builds this rank submitted, and of those another rank claimed.
+        self._claims: Dict[Tuple[str, Hashable], _Claim] = {}
+        self._elsewhere: Dict[Tuple[str, Hashable], _Claim] = {}
         self._stats: Dict[str, _OpStats] = {}
 
     @classmethod
@@ -192,9 +265,10 @@ class KernelBuilder:
         ``(key, BuildTask)``, where ``shapes`` are those ``config`` sweeps for a call that has
         ``observed`` and that no earlier call of ``(op, signature)`` swept.
 
-        A failure to list leaves the kernels to the op.
+        A failure to list leaves the kernels to the op, and so do builds of ``op`` too short for
+        a worker (``RankWorker.worth_a_worker``), which are not listed.
         """
-        if not self.active():
+        if not self.active() or not RankWorker.get().worth_a_worker(op, config.build_seconds):
             return
         swept = config.shapes(observed)
         with self._lock:
@@ -214,7 +288,7 @@ class KernelBuilder:
             )
             return
         list_s = time.perf_counter() - t0
-        queued = sum(self.submit(op, key, task) for key, task in self._rotated(builds))
+        queued = sum(self.submit(op, key, task, config) for key, task in self._rotated(builds))
         with self._lock:
             stats = self._op_stats(op)
             stats.signatures += new_signature
@@ -225,35 +299,85 @@ class KernelBuilder:
             f"({list_s:.1f}s to list)"
         )
 
-    def submit(self, op: str, key: Hashable, task: BuildTask) -> bool:
-        """Hand one build to a worker; False when ``(op, key)`` was submitted before, outside
-        build mode, and when no worker takes it (the op then builds it on first use)."""
+    def submit(
+        self, op: str, key: Hashable, task: BuildTask, config: Optional[BuildConfig] = None
+    ) -> bool:
+        """Hand one build to a worker, or, with the PARALLEL strategy, leave it to the rank that
+        claimed it; True when either does. False when ``(op, key)`` was submitted before, outside
+        build mode, when builds of ``op`` are too short for a worker, and when no worker takes it:
+        the op then builds it on first use. ``config`` is the op's: its ``build_seconds``,
+        ``strategy`` and ``share_scope``."""
         if not self.active():
             return False
+        config = config or _DEFAULT_CONFIG
+        worker = RankWorker.get()
         task_key = f"kernel_builder|{op}|{key!r}"
         with self._lock:
-            if (op, key) in self._tasks:
+            if (op, key) in self._tasks or (op, key) in self._elsewhere:
                 return False
             self._tasks[(op, key)] = task_key
-        taken = RankWorker.get().run(task_key, task.function, task.args) is not None
+        claim, ours = None, True
+        if worker.worth_a_worker(op, config.build_seconds):
+            claim, ours = self._claim(op, key, config)
+            if not ours:
+                with self._lock:
+                    del self._tasks[(op, key)]
+                    self._elsewhere[(op, key)] = claim
+                    self._op_stats(op).elsewhere += 1
+                return True
+            function, args = task.function, task.args
+            if claim is not None:
+                function, args = f"{__name__}:_build_claimed", (claim, task.function, task.args)
+            taken = worker.run(task_key, function, args, family=op) is not None
+        else:
+            taken = False
         with self._lock:
             stats = self._op_stats(op)
             if taken:
                 stats.submitted += 1
+                if claim is not None:
+                    self._claims[(op, key)] = claim
             else:
                 stats.inline += 1
                 del self._tasks[(op, key)]
+        if not taken and claim is not None:
+            _mark(claim.failed)  # The other ranks build it themselves rather than wait for it.
         return taken
 
+    def _claim(self, op: str, key: Hashable, config: BuildConfig) -> Tuple[Optional[_Claim], bool]:
+        """The claim of a PARALLEL build in the directory the ranks share, and whether this rank
+        holds it; ``(None, True)`` for a build that is this rank's alone."""
+        if config.strategy is not BuildStrategy.PARALLEL:
+            return None, True
+        try:
+            scope = config.share_scope() if config.share_scope is not None else ""
+            claim = _claim_files(op, key, scope)
+            if claim is None:
+                return None, True
+            os.makedirs(os.path.dirname(claim.claim), exist_ok=True)
+            return claim, _jit_share._claim(claim.claim)
+        except Exception as e:  # noqa: BLE001 - the op's scope or the directory failed: build here
+            logger.debug(f"[KernelBuilder] {op} {key}: built on this rank. {type(e).__name__}: {e}")
+            return None, True
+
     def wait(self, op: str, key: Hashable) -> float:
-        """Wait for the build of ``(op, key)`` when a worker is making it, so that the op's own
-        lookup finds the kernel instead of compiling it again; when no worker has started it, take
-        it back for the op to make now. Returns the seconds waited."""
+        """Wait for the build of ``(op, key)`` when a worker of this rank, or the rank that claimed
+        it, is making it, so that the op's own lookup finds the kernel instead of compiling it
+        again; when no one has started it, take it back for the op to make now. Returns the
+        seconds waited."""
         with self._lock:
             task_key = self._tasks.get((op, key))
-        if task_key is None:
+            claim = self._claims.get((op, key))
+            elsewhere = self._elsewhere.get((op, key))
+        if task_key is not None:
+            worker = RankWorker.get()
+            seconds = worker.wait(task_key)
+            if claim is not None and worker.state(task_key) == "taken":
+                _mark(claim.started)  # The op makes it now: the other ranks wait for it.
+        elif elsewhere is not None:
+            seconds = self._wait_elsewhere(elsewhere)
+        else:
             return 0.0
-        seconds = RankWorker.get().wait(task_key)
         if seconds >= _WAIT_REPORT_S:
             with self._lock:
                 stats = self._op_stats(op)
@@ -261,12 +385,28 @@ class KernelBuilder:
                 stats.waited_s += seconds
         return seconds
 
+    @staticmethod
+    def _wait_elsewhere(claim: _Claim) -> float:
+        """Wait for a build another rank claimed, once that rank has started it (at most
+        ``TLLM_JIT_SHARE_WAIT_S`` seconds); one it has not started is the op's to make."""
+        if os.path.exists(claim.done) or not os.path.exists(claim.started):
+            return 0.0
+        t0 = time.perf_counter()
+        _jit_share._wait(claim.done, claim.failed)
+        return time.perf_counter() - t0
+
     def state(self, op: str, key: Hashable) -> Optional[str]:
         """``"queued"``, the build's status once it ended (``"done"``, ``"failed"``, or
-        ``"taken"`` when the op made it itself), or None for a kernel never submitted."""
+        ``"taken"`` when the op made it itself), ``"elsewhere"`` while another rank makes it, or
+        None for a kernel never submitted."""
         with self._lock:
             task_key = self._tasks.get((op, key))
-        return None if task_key is None else RankWorker.get().state(task_key)
+            elsewhere = self._elsewhere.get((op, key))
+        if task_key is not None:
+            return RankWorker.get().state(task_key)
+        if elsewhere is not None:
+            return "done" if os.path.exists(elsewhere.done) else "elsewhere"
+        return None
 
     def stats(self, op: str) -> _OpStats:
         """A copy of ``op``'s counts so far."""
@@ -274,13 +414,17 @@ class KernelBuilder:
             return dataclasses.replace(self._op_stats(op))
 
     def op_compiled(self, op: str, key: Hashable, seconds: float) -> None:
-        """Record a kernel the op's own call had to compile."""
+        """Record a kernel the op's own call had to compile: it measures the op's builds."""
         if not self.enabled:
             return
+        RankWorker.get().record_build(op, seconds)
         with self._lock:
             stats = self._op_stats(op)
             stats.late += 1
             stats.late_s += seconds
+            claim = self._claims.get((op, key))
+        if claim is not None:
+            _mark(claim.done)
         logger.info(
             f"[KernelBuilder] {op} {key}: not built ahead, the op compiled it in {seconds:.1f}s"
         )
@@ -300,6 +444,8 @@ class KernelBuilder:
                 f"{stats.signatures} call signatures listed in {stats.list_s:.1f}s",
                 f"{stats.submitted} builds in worker processes ({failed} failed)",
             ]
+            if stats.elsewhere:
+                parts.append(f"{stats.elsewhere} built by other ranks")
             if stats.inline:
                 parts.append(f"{stats.inline} left to the op")
             if stats.waited:
