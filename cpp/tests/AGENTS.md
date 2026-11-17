@@ -28,7 +28,8 @@ coverage, CI placement and building helpers before the test stage.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
+when the test needs the full TensorRT-LLM library; otherwise link only its needed
+components. Include `gpu` in `LABELS` for tests that need a GPU.
 CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
 C++ source-build fallbacks build the collected tests with incremental native targets.

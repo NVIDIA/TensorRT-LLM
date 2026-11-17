@@ -61,25 +61,26 @@ layer.
 
 ## Whether a new test runs in CI
 
-This is a reminder for whoever adds a test, not a hard gate. Not every test runs
-in CI — a test is a CI test, a QA test, or a local developer test:
+This is a reminder for whoever adds a test, not a hard gate. Not every test
+belongs in recurring CI; QA-only and local developer tests are valid choices.
 
-- If a newly added test needs to be protected by CI, it must be included in at
-  least one CI test list under `tests/integration/test_lists/test-db/` (e.g.
-  `l0_cpu.yml`, `l0_b200.yml`, `l0_dgx_b200.yml`). A CI test that no list
-  references — directly or through a listed parent directory — is never
-  collected: it reports nothing, so a regression in it merges unnoticed, a
-  silent false green.
-- A test that is not included in any CI test list is treated as intended for
-  local developer testing or QA rather than CI.
+For the list-driven CI pipeline, ensure the intended case is selected by an
+entry under `tests/integration/test_lists/test-db/`. Python unit tests may be
+covered by an existing file or parent-directory bridge entry. Native C++ cases
+are reached through registered integration wrappers and their CTest or binary
+selection; they do not each need a YAML entry.
 
-So when you add a test, confirm with the author/reviewer whether it should run
-in CI and, if so, which platform's test list(s) should carry it. Leaving a new
-test out of every CI list is fine for QA-only or local-only tests — but make it
-a deliberate, confirmed decision rather than a forgotten step.
+Check the effective pre-merge/post-merge stage, options, marker filters and
+waivers. A parent entry alone does not prove a case runs. A case that no entry
+selects will not execute in this pipeline and cannot protect it from regressions.
+Record whether a new test belongs in CI, QA or local testing, and confirm the
+intended placement with the author/reviewer rather than leaving it accidental.
 
-Choose the list by where a CI test runs: CPU-only tests go in `l0_cpu.yml`;
-single-GPU tests in the per-GPU list for their target (e.g. `l0_b200.yml`);
-multi-GPU tests in a multi-GPU list (e.g. `l0_dgx_b200.yml`,
-`l0_gb300_multi_gpus.yml`). If you are unsure which list(s) a test belongs in,
-ask the author/reviewer rather than leaving it unlisted.
+Choose the list by the execution requirements: CPU-only unit tests go in
+`l0_cpu.yml` and must carry `pytest.mark.cpu_only`; the CPU stages select that
+marker. Standard GPU stages select `not cpu_only` (sanity stages are exceptions).
+Single-GPU tests use the target platform's list (e.g. `l0_b200.yml`); multi-GPU
+tests use a suitable multi-GPU list (e.g. `l0_dgx_b200.yml`,
+`l0_gb300_multi_gpus.yml`). If the intended list or selection is unclear, ask the
+author/reviewer. Follow the [test-list guidance](integration/test_lists/AGENTS.md)
+when adding or changing registrations.

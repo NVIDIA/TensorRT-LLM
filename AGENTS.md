@@ -153,7 +153,7 @@ Key files:
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
 - **Protected APIs exist** — changes to LLM API signatures will fail `tests/unittest/api_stability` tests. Get code owner review.
-- **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
+- **Test hardware and model weights** — set `LLM_MODELS_ROOT` for tests that use model weights. Unit tests can also require GPUs; only `cpu_only`-marked unit tests run in the CPU-only stages.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
