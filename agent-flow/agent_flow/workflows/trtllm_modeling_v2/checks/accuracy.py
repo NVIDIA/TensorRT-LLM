@@ -18,10 +18,10 @@ from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
 from ..spec.task_schema import resolve_per_unit, resolve_samples
-from . import accuracy_policy, check_config, feature_evidence
-from .check_config import check_configuration, engine_declaration, resolve_llm_api_options
+from . import accuracy_policy, check_config
+from .check_config import check_configuration, resolve_llm_api_options
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
-from .runtime_evidence import EVAL_NOT_ATTESTED, attest_engine, engine_failure, engine_records
+from .runtime_evidence import reuse_failure
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 ACCURACY_TIMEOUT_S = 4 * 60 * 60
@@ -75,7 +75,7 @@ def eval_command(
     unit: str | None = None,
     member: str | None = None,
 ) -> list[str]:
-    """Public trtllm-eval CLI using the same resolved configuration the verdict attests."""
+    """Public trtllm-eval CLI using the same resolved configuration the other gates send."""
     accuracy = dict(task_data.get("accuracy") or {})
     options = dict(config["llm"])
     options.pop("model")
@@ -265,8 +265,7 @@ def run_accuracy_gate(
     fixed ``reference - tolerance`` under ``accuracy.floor.rule: tolerance``.
     ``relative``: ``reference`` is the unit's own score at this member on this
     target (a configuration variant's ``anchor: relative``), and the SE is that
-    of the difference. The engine is held to the unit's options file
-    (:func:`engine_declaration`).
+    of the difference.
     """
     accuracy = dict(task_data.get("accuracy") or {})
     timeout = int(accuracy.get("timeout", ACCURACY_TIMEOUT_S)) if timeout is None else timeout
@@ -321,22 +320,11 @@ def run_accuracy_gate(
             **ran,
             **floor_fields(planned),
         )
-    options = resolve_llm_api_options(accuracy, unit)
-    declared = engine_declaration(config, mode=MODE_REQUIRE)
-    asks = bool(declared.get("block_reuse"))
-    attested = attest_engine(combined, declared, absent=EVAL_NOT_ATTESTED)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(combined, attested, options=options, asks=asks)
+    failure = reuse_failure(
+        combined, config["llm"], options=resolve_llm_api_options(accuracy, unit)
+    )
     if failure:
         return _verdict(passed=False, detail=failure, **ran, **floor_fields(planned))
-    unobserved = feature_evidence.unobserved(attested, check_config.subject_fields(task_data, unit))
-    if unobserved:
-        return _verdict(
-            passed=False,
-            detail=feature_evidence.unobserved_detail(unobserved),
-            **ran,
-            **floor_fields(planned),
-        )
 
     pattern = resolve_per_unit(accuracy, "score_pattern", unit)
     measured = parse_eval_score(combined, pattern)
@@ -363,12 +351,7 @@ def run_accuracy_gate(
         detail=(
             f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
             f"({floor.describe()}; count from {source}); score validation only; "
-            + (
-                f"engine observability UNKNOWN for {', '.join(attested.not_attested)}; "
-                if attested.not_attested
-                else ""
-            )
-            + "eval cache reuse was not probed (zero hits are not a failure)"
+            "eval cache reuse was not probed (zero hits are not a failure)"
         ),
         measured=measured,
         **ran,

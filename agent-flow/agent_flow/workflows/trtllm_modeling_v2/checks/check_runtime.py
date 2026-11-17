@@ -52,12 +52,8 @@ def default_shell_runner(
     return _LOCAL_EXECUTOR.execute(CommandSpec(argv=command, env=env, timeout_s=timeout))
 
 
-#: Set in every engine gate's environment, so each rank's worker prints its record.
-RANK_FACTS_ENV = "MV2FLOW_RANK_FACTS"
-
-
 #: Put first on every engine gate's ``PYTHONPATH``: its ``sitecustomize`` has
-#: each rank's worker print the record.
+#: each process write which of the tree's modules it imported.
 RANK_HOOK_DIR = Path(__file__).resolve().parent / "harness" / "rankhook"
 
 
@@ -66,8 +62,7 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
 
     Exported into the launch prefix, not into this process: worker ranks
     receive the environment as it stood when MPI initialized. The same prefix
-    puts :data:`RANK_HOOK_DIR` first on ``PYTHONPATH`` and sets
-    :data:`RANK_FACTS_ENV`, so every rank's worker prints what its engine runs.
+    puts :data:`RANK_HOOK_DIR` first on ``PYTHONPATH``.
     """
     python_path = [str(RANK_HOOK_DIR)]
     if environment.env.get("PYTHONPATH"):
@@ -78,7 +73,6 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
             **environment.env,
             MODELING_V2_ENV: mode,
             STEP_CONTRACT_ENV: "1",
-            RANK_FACTS_ENV: "1",
             "PYTHONPATH": os.pathsep.join(python_path),
         },
     )
@@ -87,7 +81,7 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
 # ------------------------------------------------------------ the engine driver
 #
 # The measured interpreter constructs public LLM/SamplingParams from one JSON
-# spec and emits MV2FLOW_RECORD results; rank observations are a separate seam.
+# spec and emits MV2FLOW_RECORD results.
 
 #: The driver script, run as a file under the measured tree's interpreter.
 ENGINE_DRIVER = Path(__file__).resolve().parent / "harness" / "engine_driver.py"
@@ -206,7 +200,6 @@ __all__ = [
     "MODELING_V2_ENV",
     "MODE_OFF",
     "MODE_REQUIRE",
-    "RANK_FACTS_ENV",
     "RANK_HOOK_DIR",
     "RUN_TRITON_CACHE_DIRNAME",
     "STEP_CONTRACT_ENV",

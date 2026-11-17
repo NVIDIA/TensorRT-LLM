@@ -19,7 +19,7 @@ Agents write code; Python owns scheduling, integration and correctness verdicts.
 | Member | One parallel configuration, such as `tp4`, `tep4` or `dep4` |
 | Coverage cell | One unit or variant at one member, with the required checks that prove it |
 | Entry | A kernel wrapper with executable input, architecture and correctness contracts |
-| Receipt | A task's recorded decision, commits, checks and measured runtime facts |
+| Receipt | A task's recorded decision, commits and checks |
 | Session | A process on a compute node that watches a spool and runs its queued commands |
 
 ## Use through your agent

@@ -31,15 +31,9 @@ from typing import Any, Iterable, Mapping
 RECORD_MARKER = "MV2FLOW_RECORD"
 #: What the driver imported, once, before the engine starts.
 DRIVER_MARKER = "MV2FLOW_DRIVER"
-#: What the engine runs once it is up, once per engine a harness builds (see
-#: :mod:`.engine_facts`).
-ENGINE_MARKER = "MV2FLOW_ENGINE"
 #: What the engine reused from its KV cache over the workload, once per engine,
 #: after the workload (see :mod:`.reuse_probe`).
 REUSE_MARKER = "MV2FLOW_REUSE"
-#: What one rank's executor worker runs, printed by that worker as it sets its
-#: engine up, once per rank (see ``rankhook/sitecustomize.py``).
-RANK_ENGINE_MARKER = "MV2FLOW_RANK_ENGINE"
 
 #: Fields tried, in order, when a dataset does not say which one holds the prompt.
 TEXT_FIELDS: tuple[str, ...] = (
@@ -316,9 +310,7 @@ def normalize_file(source: str, target: str) -> None:
 __all__ = [
     "DRIVER_MARKER",
     "DatasetError",
-    "ENGINE_MARKER",
     "KNOWN_DATASETS",
-    "RANK_ENGINE_MARKER",
     "RECORD_MARKER",
     "REUSE_MARKER",
     "TEXT_FIELDS",

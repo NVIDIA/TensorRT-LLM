@@ -20,7 +20,6 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import engine_facts  # noqa: E402
 import reuse_probe  # noqa: E402
 import workload_io as wio  # noqa: E402
 
@@ -222,7 +221,6 @@ def main(argv: list[str] | None = None) -> int:
     wio.emit(wio.DRIVER_MARKER, {"tensorrt_llm": str(tensorrt_llm.__file__), "api": "LLM"})
     llm, base = build_llm(spec)
     try:
-        engine_facts.emit(llm, requested=spec["llm"])
         run_workload(llm, base, spec)
     finally:
         llm.shutdown()

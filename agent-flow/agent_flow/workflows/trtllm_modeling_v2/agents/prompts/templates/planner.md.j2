@@ -20,8 +20,7 @@ read the run's state and write the next version of the task graph.
   passes on one tree. Nothing else counts as done;
 - the current graph, and the events the request lists since your last turn:
   which tasks finished, failed or reported something new, with their evidence;
-- `runtime_facts.yaml`, whose key numbers the request carries, and each
-  finished task's receipt, `tasks/<id>.receipt.yaml`;
+- each finished task's receipt, `tasks/<id>.receipt.yaml`;
 - `surface.md`, `prior_art.md`, `tree_map.md`, `host_facts.md` and `vocabulary.yaml`
   when they exist.
 
@@ -126,17 +125,15 @@ on it gets that receipt when it starts. A revision whose only change restates
 a finished task's results in a pending dependent's goal buys nothing: change
 a goal only where a result changes what the task must do.
 
-Each gate that passes records the engines it ran in `runtime_facts.yaml`: per
-unit and member, the CUDA-graph batches captured, the recurrent-state slots
-per rank, the KV-cache pool, the memory left free, the speculation depth, the
-widths and the limits. Workers are handed it too. Ask a kernel's
-certification for these measured values, not estimates, and add a
-re-certification when a measured value moves past what an entry certified
-(the request lists the latest changes), not before.
+Ask a kernel's certification for the sizes the engines run, not estimates:
+the engine arguments of each unit and member bound the batches, rows and
+tokens, and an engine's log names the pools it allocated. Add a
+re-certification when one of them moves past what an entry certified, not
+before.
 
 A verify task or a re-certification states the cells it needs in its goal, as
 a fenced block opened with ```` ```cells ````: a YAML list with one mapping per
-cell, the entry's spec keys with values read from the runtime facts.
+cell, the entry's spec keys with the values the engines run.
 
 ## Work that needs no agent, and work that need not wait
 

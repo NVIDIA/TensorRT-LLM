@@ -13,9 +13,7 @@ move while checks run. Its verdict names that commit, is recorded under its
 marker, and is void when a command imported any other tree.
 
 A task that finishes leaves its receipt (``run/execution/handoff.py``), and a task
-that starts carries the receipt of each task it depends on. A gate that
-passes adds the engines it attested to ``runtime_facts.yaml``, which the
-planner's and every worker's prompt carries.
+that starts carries the receipt of each task it depends on.
 """
 
 from __future__ import annotations
@@ -58,7 +56,6 @@ from ..orchestrator import (
 from ..records.state import WorkflowState
 from ..validation import completion as deliver
 from ..validation import contract as contract_mod
-from ..validation import runtime_facts
 from ..validation.check_runner import CheckRunner
 from ..workspace import snapshots as snapshots_mod
 from ..workspace.integration import (
@@ -93,8 +90,6 @@ SURVEY_TASK_ID = "survey"
 PLANNER_ROLE = "planner"
 PROPOSED_GRAPH = "graph.proposed.yaml"
 TASKS_DIRNAME = "tasks"
-#: How many of the latest measured changes the planner's request lists.
-PLANNER_FACT_CHANGES = 8
 #: How many events, and operator messages, one planner turn lists (the newest), and
 #: the most of each one: a burst while a long turn ran must not swamp the next.
 PLANNER_EVENTS = 40
@@ -534,9 +529,6 @@ class ExecutionStage:
             "",
             self._start_member(contract),
         ]
-        facts = runtime_facts.render(self.workflow.workspace, changes=PLANNER_FACT_CHANGES)
-        if facts:
-            lines += ["", facts]
         own = getattr(self, "_own_paths", ())
         if own:
             lines += [
@@ -875,18 +867,17 @@ class ExecutionStage:
             return next((q for q in queue if str(q.n) == task.ref), None)
         return queue_item_from_ref(task.ref, task.id, task.goal)
 
-    # ---------------------------------------------- receipts, runtime facts
+    # ------------------------------------------------------------- receipts
     def _task_context(
         self, receipts: list[dict], unit: str | None, task: graph_mod.Task | None = None
     ) -> str:
         """What a task's turn carries beside its goal.
 
-        Its dependencies' receipts, the runtime facts, and, for a task that
-        starts beside its soft dependencies, where each of them stands.
+        Its dependencies' receipts and, for a task that starts beside its
+        soft dependencies, where each of them stands.
         """
         blocks = (
             handoff_mod.render(receipts),
-            runtime_facts.render(self.workflow.workspace, unit=unit),
             self._soft_block(task) if task is not None else "",
         )
         return "\n\n".join(block for block in blocks if block)

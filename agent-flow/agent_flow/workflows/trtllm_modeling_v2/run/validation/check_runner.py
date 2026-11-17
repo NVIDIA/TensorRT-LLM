@@ -39,7 +39,6 @@ from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
 from . import anchors as anchors_mod
 from . import contract as contract_mod
-from . import runtime_facts
 
 #: How many times in a row one gate may be lost to its session and re-run.
 #: Each re-run waits for a heartbeat first, so this only binds on a session
@@ -225,31 +224,6 @@ class CheckRunner:
             spec, model_key=resolve_model_key(spec, unit), unit=unit
         )
 
-    def _note_runtime_facts(self, check: contract_mod.Check, result: Any, marker: str) -> None:
-        """A passed gate's engines into ``runtime_facts.yaml``; a measured change is journaled.
-
-        ``marker`` is the target the gate measured, read as it started.
-        """
-        engines = tuple(getattr(result, "engine", ()) or ())
-        if not result.passed or not engines:
-            return
-        try:
-            changes = runtime_facts.record(
-                self.workspace,
-                unit=check.unit,
-                member=check.member,
-                gate=check.gate,
-                engines=engines,
-                tree=str(getattr(result, "tree_state", "") or ""),
-                marker=marker,
-                current=self.workflow._target_marker(),
-            )
-        except OSError as exc:
-            self.journal.event("runtime facts not written", f"{check.key}: {exc}")
-            return
-        if changes:
-            self.journal.event("runtime facts changed", "; ".join(changes))
-
     # ----------------------------------------------------------------- checks
     def _prioritized_check(self, check: contract_mod.Check, log) -> Any:
         """:meth:`_run_contract_check`, its jobs queued at the check's class (:func:`job_priority`).
@@ -266,27 +240,22 @@ class CheckRunner:
         """Run one contract check and return its gate result.
 
         On a git checkout the check measures a snapshot of the commit the
-        checkout is at as it starts (``_snapshots``). A check that passes adds
-        the engines it attested to the runtime facts.
+        checkout is at as it starts (``_snapshots``).
         """
         snapshots = getattr(self.workflow, "_snapshots", None)
         if snapshots is None:
-            marker = self.workflow._target_marker()
-            result = self._gate(check, log)
-        else:
-            result, marker = self._gate_on_snapshot(snapshots, check, log)
-        self._note_runtime_facts(check, result, marker)
-        return result
+            return self._gate(check, log)
+        return self._gate_on_snapshot(snapshots, check, log)
 
     def _gate_on_snapshot(
         self, snapshots: snapshots_mod.Snapshots, check: contract_mod.Check, log
-    ) -> tuple[Any, str]:
-        """``check``'s result on a snapshot of the checkout's head, and the marker it measured."""
+    ) -> Any:
+        """``check``'s result on a snapshot of the checkout's head."""
         repo = str(self.task_data.get("trtllm_repo_path") or "")
         head = resolve_commit(repo)
         if head is None:
             why = f"git could not name the commit {repo} is at, so there was nothing to snapshot"
-            return snapshots_mod.void_result(check.gate, check.member, why), ""
+            return snapshots_mod.void_result(check.gate, check.member, why)
         pin = snapshots_mod.CheckTree(
             commit=head,
             tree=snapshots.tree(head),
@@ -296,11 +265,11 @@ class CheckRunner:
         )
         try:
             with snapshots.lease(head):
-                return self._on_snapshot(pin)._gate(check, log), pin.marker
+                return self._on_snapshot(pin)._gate(check, log)
         except snapshots_mod.SnapshotError as exc:
             result = snapshots_mod.void_result(check.gate, check.member, str(exc))
             self.journal.event("gate", result.summary())
-            return result, pin.marker
+            return result
 
     def _on_snapshot(self, pin: snapshots_mod.CheckTree) -> "CheckRunner":
         """The runner as one check sees it: the target is ``pin``'s snapshot.

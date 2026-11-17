@@ -71,14 +71,13 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 3. **One-member boot with the feature on.** `trtllm-modeling-v2 gate boot
    --task task.yaml --unit <unit or variant> --member <m>` runs it as the
    orchestrator does, with `modeling_v2="require"` for target evidence;
-   `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every declared field is
-   read back from every rank's worker (`MV2FLOW_RANK_ENGINE`), with the reuse
-   probe and pool sizes. A field read as UNKNOWN, or only from the request, is
-   not evidence. *Blind to* accuracy: boot checks only that a few short
-   continuations are not empty.
+   `--mode off` reruns the same command on the stock path as a control. The
+   gate sends the unit's options and does not read back what the engine
+   resolved: whether a setting took effect is in the engine's own log.
+   *Blind to* accuracy: boot checks only that a few short continuations are
+   not empty.
 4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
-   with CUDA graphs and re-attests each
-   rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's
+   with CUDA graphs; `gate disagg --unit disagg` runs the target's
    disaggregated-serving test as CI does; `gate acceptance` judges
    speculators. *Blind spots* are per feature in the reference; they are why
    each feature carries a proof of its own.
@@ -87,12 +86,12 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 |---|---|---|---|
 | block reuse | a `reuse` variant (`kv_cache_config.enable_block_reuse: true`); off in core | reuse probe: a repeated prompt reports `cached_tokens` > 0 | variant accuracy |
 | chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | a prompt longer than `max_num_tokens` past the cache, served | variant accuracy |
-| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | each rank's resolved `kv_cache_quant_algo` | variant accuracy |
-| CUDA graphs | `runtime.cuda_graph` | each rank's graph settings and capture plan (not replays) | accuracy (graphs always on) |
+| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no gate reads | variant accuracy |
+| CUDA graphs | `runtime.cuda_graph` | the options sent; no gate reads the captures | accuracy (graphs always on) |
 | overlap scheduler | `runtime.overlap_scheduler` (default on, core) | the argument only | nothing of its own |
 | disaggregation | feature `disagg` + `accuracy.disagg.test` | a benchmark scored through `trtllm-serve disaggregated` | the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
-| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | each rank's algorithm and depth; accepted tokens per iteration | acceptance gate |
+| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | acceptance gate |
 
 ## Rules that save hours
 

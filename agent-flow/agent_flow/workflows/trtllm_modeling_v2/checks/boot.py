@@ -13,13 +13,8 @@ from typing import Any, Mapping, Sequence
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
-from . import check_config, feature_evidence
-from .check_config import (
-    EngineLimits,
-    check_configuration,
-    engine_declaration,
-    resolve_llm_api_options,
-)
+from . import check_config
+from .check_config import EngineLimits, check_configuration, resolve_llm_api_options
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -31,7 +26,7 @@ from .check_runtime import (
     with_mode,
     write_driver_spec,
 )
-from .runtime_evidence import attest_engine, engine_failure, engine_records
+from .runtime_evidence import reuse_failure
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 #: The image a multimodal unit's boot sends when the task declares none: a
@@ -193,8 +188,8 @@ def run_boot_gate(
 
     ``features`` is the features the target under test implements, not those
     the run will finish with (default the run's). ``spec`` is the workload
-    (:func:`resolve_boot_spec`). The engine is held to what the gate declared
-    (:func:`engine_failure`). ``mode`` other than ``require`` is a control run
+    (:func:`resolve_boot_spec`). An engine asked for block reuse is held to it
+    (:func:`reuse_failure`). ``mode`` other than ``require`` is a control run
     on the stock implementation, recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
@@ -212,10 +207,9 @@ def run_boot_gate(
     requests = spec.requests(task_data.get("trtllm_repo_path"))
     declared_requests = len(requests)
     limits = EngineLimits.from_config(config)
-    subjects = check_config.subject_fields(task_data, unit)
     # A prompt the engine must split proves chunking only where the engine chunks: a variant
     # that turns chunked prefill off is about chunking too, and owes no split prompt.
-    chunks = feature_evidence.about(subjects, feature_evidence.CHUNKED) and limits.chunked_prefill
+    chunks = check_config.sets_chunking(task_data, unit) and limits.chunked_prefill
     if chunks:
         length = chunk_probe_tokens(limits.max_num_tokens, limits.max_seq_len)
         if length is None:
@@ -260,20 +254,13 @@ def run_boot_gate(
         )
     if not result.ok:
         return _verdict(passed=False, detail=f"exited {result.returncode}", **ran)
-    declared = engine_declaration(config, mode=mode)
-    attested = attest_engine(combined, declared)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(
+    failure = reuse_failure(
         combined,
-        attested,
+        config["llm"],
         options=resolve_llm_api_options(task_data.get("accuracy") or {}, unit),
-        asks=bool(declared.get("block_reuse")),
     )
     if failure:
         return _verdict(passed=False, detail=failure, **ran)
-    unobserved = feature_evidence.unobserved(attested, subjects)
-    if unobserved:
-        return _verdict(passed=False, detail=feature_evidence.unobserved_detail(unobserved), **ran)
 
     records = {int(r.get("index", -1)): r for r in parse_driver_records(combined)}
     texts = [

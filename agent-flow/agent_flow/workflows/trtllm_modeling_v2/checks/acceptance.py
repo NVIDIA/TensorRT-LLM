@@ -20,7 +20,7 @@ from ..spec.task_schema import (
     resolve_gate_timeout,
     resolve_per_unit,
 )
-from .check_config import check_configuration, engine_declaration, resolve_llm_api_options
+from .check_config import check_configuration, resolve_llm_api_options
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -33,7 +33,7 @@ from .check_runtime import (
     write_driver_spec,
 )
 from .harness import workload_io
-from .runtime_evidence import attest_engine, engine_failure, engine_records
+from .runtime_evidence import reuse_failure
 from .verdict import GateResult, inspect_tree, verdict_factory
 
 #: Tokens each acceptance prompt may generate when the task declares none.
@@ -380,14 +380,8 @@ def run_acceptance_gate(
     if not result.ok:
         ended = ended_early(result, timeout) if result.timed_out else f"exited {result.returncode}"
         return _verdict(passed=False, detail=f"the acceptance load {ended}", **ran)
-    declared = engine_declaration(config, mode=MODE_REQUIRE)
-    attested = attest_engine(combined, declared)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(
-        combined,
-        attested,
-        options=resolve_llm_api_options(accuracy, unit),
-        asks=bool(declared.get("block_reuse")),
+    failure = reuse_failure(
+        combined, config["llm"], options=resolve_llm_api_options(accuracy, unit)
     )
     if failure:
         return _verdict(passed=False, detail=failure, **ran)
