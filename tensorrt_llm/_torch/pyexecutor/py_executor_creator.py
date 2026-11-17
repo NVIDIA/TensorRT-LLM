@@ -43,12 +43,13 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+from ..attention.backends.fp4_mla.config import \
+    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE
+from ..attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
 from ..models.modeling_utils import timing_metric
-from ..attention.backends.fp4_mla.config import (
-    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE, FP4_MLA_TOKENS_PER_BLOCK)
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
                            should_use_separate_draft_kv_cache)

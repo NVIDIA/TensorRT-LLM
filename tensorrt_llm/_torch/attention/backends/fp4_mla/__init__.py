@@ -56,6 +56,7 @@ from .config import (
     FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
+    has_fp4_mla_cache_layout,
 )
 from .config import FP4_MLA_CUTEDSL_4X_ENV as FP4_MLA_CUTEDSL_4X_ENV
 from .config import _ceil_div as _ceil_div
@@ -71,7 +72,6 @@ from .config import _fp4_mla_cutedsl_kernel_module as _fp4_mla_cutedsl_kernel_mo
 from .config import _fp4_mla_q1_kv_blocks_per_program as _fp4_mla_q1_kv_blocks_per_program
 from .config import _fp4_mla_q1_prefix_blocks_per_program as _fp4_mla_q1_prefix_blocks_per_program
 from .config import _HPUpdatePhase as _HPUpdatePhase
-from .config import has_fp4_mla_cache_layout
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode

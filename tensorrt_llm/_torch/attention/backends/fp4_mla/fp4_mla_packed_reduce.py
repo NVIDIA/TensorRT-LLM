@@ -29,11 +29,7 @@ from .cutedsl_common import (
     _validate_output_dtype,
     _validate_tensor_pointer_alignment,
 )
-from .fp4_mla_cutedsl_mufu16 import (
-    KV_TILE,
-    PACKED_MIN_TILES_PER_TASK,
-    _packed_query_bound,
-)
+from .fp4_mla_cutedsl_mufu16 import KV_TILE, PACKED_MIN_TILES_PER_TASK, _packed_query_bound
 
 _PACKED_REDUCE_COMPILE_CACHE: dict[tuple[int, bool, torch.dtype], Callable] = {}
 _PACKED_PLAN_COMPILE_CACHE: dict[tuple[int, bool, bool, bool], Callable] = {}

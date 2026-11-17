@@ -10,17 +10,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
+from . import config as _config
 from . import fp4_mla_dispatch, packed_plan
-from .config import (
-    FP4_MLA_SCALE_ROW_GROUP,
-    FP4_MLA_TOKENS_PER_BLOCK,
-    _fp4_mla_cutedsl_4x_enabled,
-    _fp4_mla_packed_q_enabled,
-    _fp4_mla_packed_rows_per_seq,
-    _fp4_mla_split_kv_override,
-    _fp4_mla_split_on_demand_enabled,
-    has_fp4_mla_cache_layout,
-)
 
 if TYPE_CHECKING:
     from torch import nn
@@ -54,9 +45,9 @@ def resolve_fp4_mla_kv_regimes(
     four_x_unavailable_fn: Callable[[], str | None] = fp4_mla_4x_unavailable,
 ) -> Callable[[int, int], tuple[int, ...]] | None:
     """Build the per-shape KV-regime resolver for FP4 MLA 4x decode graphs, or None when inactive."""
-    if not has_fp4_mla_cache_layout(kv_cache_manager):
+    if not _config.has_fp4_mla_cache_layout(kv_cache_manager):
         return None
-    if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
+    if not (_config._fp4_mla_cutedsl_4x_enabled() and _config._fp4_mla_packed_q_enabled()):
         return None
     if mapping.has_cp_helix():
         return None
@@ -68,7 +59,7 @@ def resolve_fp4_mla_kv_regimes(
 
     from .fp4_mla_cutedsl_4x_host import envelope_reason_static
 
-    capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
+    capacity = int(kv_cache_manager.max_blocks_per_seq) * _config.FP4_MLA_TOKENS_PER_BLOCK
     sm_count = sm_count_fn()
 
     @functools.cache
@@ -78,7 +69,7 @@ def resolve_fp4_mla_kv_regimes(
             num_requests=int(batch_size),
             query_len=query_len,
             num_heads=num_heads,
-            rows_per_seq=_fp4_mla_packed_rows_per_seq(num_heads, query_len),
+            rows_per_seq=_config._fp4_mla_packed_rows_per_seq(num_heads, query_len),
             kv_capacity=capacity,
             sm_count=sm_count,
             envelope_reason=envelope_reason_static,
@@ -96,34 +87,32 @@ def resolve_fp4_mla_packed_split(
     resolver_cls: Callable[..., _ResolverT],
 ) -> _ResolverT | None:
     """Build the packed-split resolver for FP4 MLA packed decode graphs, or None when inactive."""
-    if not has_fp4_mla_cache_layout(kv_cache_manager):
+    if not _config.has_fp4_mla_cache_layout(kv_cache_manager):
         return None
-    if not _fp4_mla_split_on_demand_enabled():
+    if not _config._fp4_mla_split_on_demand_enabled():
         return None
-    if _fp4_mla_split_kv_override() != "auto":
+    if _config._fp4_mla_split_kv_override() != "auto":
         return None
     if mapping.has_cp_helix():
         return None
     num_heads = fp4_mla_decode_heads(model)
     if num_heads is None:
         return None
-    if not _fp4_mla_packed_q_enabled():
+    if not _config._fp4_mla_packed_q_enabled():
         return None
     sm_count = sm_count_fn()
 
     @functools.cache
     def m_tiles(draft_len: int) -> int:
-        rows = _fp4_mla_packed_rows_per_seq(num_heads, int(draft_len) + 1)
-        return rows // FP4_MLA_SCALE_ROW_GROUP
+        rows = _config._fp4_mla_packed_rows_per_seq(num_heads, int(draft_len) + 1)
+        return rows // _config.FP4_MLA_SCALE_ROW_GROUP
 
     @functools.cache
     def variants(batch_size: int, draft_len: int) -> tuple[bool, ...]:
         tiles = m_tiles(draft_len)
         if tiles <= 0:
             return (True,)
-        return packed_plan.packed_split_variants(
-            int(batch_size), m_tiles=tiles, sm_count=sm_count
-        )
+        return packed_plan.packed_split_variants(int(batch_size), m_tiles=tiles, sm_count=sm_count)
 
     def decide(batch_size: int, draft_len: int, kv_lens: list[int]) -> bool:
         del batch_size

@@ -19,8 +19,8 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
-                    List, Optional, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
+                    Iterator, List, Optional, Tuple)
 
 import numpy as np
 import torch
@@ -3458,7 +3458,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         *,
         kv_cache_manager: Any,
         model: torch.nn.Module,
-        mapping: Mapping,
+        mapping: "Mapping",
         sm_count_fn: Callable[[], int],
         four_x_unavailable_fn: Optional[Callable[[], Optional[str]]] = None,
     ) -> Optional[Callable[[int, int], Tuple[int, ...]]]:
@@ -3483,7 +3483,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         *,
         kv_cache_manager: Any,
         model: torch.nn.Module,
-        mapping: Mapping,
+        mapping: "Mapping",
         sm_count_fn: Callable[[], int],
         resolver_cls: Callable[..., Any],
     ) -> Optional[Any]:

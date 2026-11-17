@@ -45,26 +45,20 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     resolve_fp4_mla_lazy_anchor_rebase_log2,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
-    _compile_cutedsl,
-    _current_cu_stream,
+    _compile_cutedsl as _compile_cutedsl,
+)
+from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
+    _current_cu_stream as _current_cu_stream,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     CUDA_GRID_Z_MAX,
-    FP4_MLA_E4M3_MAX_FINITE,
     FP4_MLA_P_GLOBAL_SCALE,
     LOG2_6,
-    LOG2_E,
-    PREPARED_BUFFER_ALIGNMENT_BYTES,
     KvCache3DLayout,
     _as_shared_cta,
-    _ceil_div,
-    _compact_sfb_copy_cols_per_scale_chunk,
-    _compact_sfb_mma_cols_per_scale_chunk,
     _cutlass_output_dtype,
     _derive_qk_scale_burst_kblocks,
     _fence_async_shared_cta,
-    _float_to_ordered_u32_for_atomic_max,
-    _horizontal_pack_two_f16x2_sums,
     _mapa_shared_cluster,
     _mask_invalid_score,
     _mbarrier_arrive_release_cta_shared_cluster,
@@ -72,32 +66,23 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     _mma_scale_format,
     _mma_scale_vec_size_enum,
     _ordered_u32_to_float_after_atomic_max,
-    _p4_n256_prequant_rowsum_from_f16x2_psf,
-    _p4_n256_rowsum_from_packed_psf_word,
     _pack_e2m1x8,
     _pack_e2m1x8_from_f16x2,
     _pack_e4m3x4_natural,
-    _pack_e4m3x4_natural_from_f16x2,
-    _pack_f32_pair_to_f16x2,
     _publish_p4_n256_atomic_rowmax,
     _qk_compact_sfb_cols_per_scale_chunk,
-    _qk_sfb_cols_per_kblock,
     _qk_sfb_smem_nchunks_per_cta,
     _scale_pack_e4m3x4_natural_from_f16x2,
     _scale_words_for_k,
     _sfa_tmem_cols_for_scale_chunks,
-    _smem_atomic_max_ordered_u32,
     _softmax_exp2_pair,
     _softmax_exp2_pair_packed_f16x2,
-    _sum_p4_n256_psf_row_parts,
     _tcgen05_ld_red_32x32b_x16_max_f32,
-    _unpack_f16x2_to_f32_pair,
-    _validate_output_dtype,
     _validate_tensor_pointer_alignment,
-    nvvm_add_packed_f32x2,
     nvvm_fma_packed_f32x2,
     nvvm_mul_packed_f32x2,
 )
+from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import LOG2_E as LOG2_E
 
 # FULL-only envelope (BRIEF 'Fair envelope'): host-gated, the kernel has no batch bound of its own
 # besides grid.z = runtime_l // 2 (see full_validate_envelope below SMEM_P4_RUNTIME_MAX_KV).

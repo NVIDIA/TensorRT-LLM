@@ -287,7 +287,9 @@ def _run_mla_chunked_prefill_partitions(
         dtype=q.dtype,
     )
 
-    def make_partition_forward_args(attention_mask: PredefinedAttentionMask) -> AttentionForwardArgs:
+    def make_partition_forward_args(
+        attention_mask: PredefinedAttentionMask,
+    ) -> AttentionForwardArgs:
         return AttentionForwardArgs(
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,

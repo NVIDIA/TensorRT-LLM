@@ -44,6 +44,7 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_cache_mixin import Fp4MlaV2CacheLayoutMixin
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
@@ -229,7 +230,9 @@ def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
     ]
 
 
-class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
+class MambaHybridCacheManagerV2(
+    Fp4MlaV2CacheLayoutMixin, KVCacheManagerV2, MambaHybridCacheManager
+):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
     Attention KV pages and Mamba recurrent-state pages are both owned by the

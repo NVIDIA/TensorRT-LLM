@@ -17,6 +17,7 @@ from .config import (
     _fp4_mla_split_kv_override,
     _fp4_mla_split_on_demand_enabled,
 )
+from .config import _FP4_MLA_SPLIT_KV_ENV as _FP4_MLA_SPLIT_KV_ENV
 from .layout import _ensure_workspace_tensor, _max_sequences
 
 _SM_COUNT_CACHE: dict[int, int] = {}

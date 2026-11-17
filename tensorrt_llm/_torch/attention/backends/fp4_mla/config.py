@@ -148,7 +148,10 @@ def _env_flag_not_disabled(name: str, default: bool) -> bool:
 
 
 def has_fp4_mla_cache_layout(kv_cache_manager: object) -> bool:
-    """Return whether ``kv_cache_manager`` exposes the FP4 MLA page-table contract."""
+    """Return whether ``kv_cache_manager`` exposes an active FP4 MLA page-table layout."""
+    flag = getattr(kv_cache_manager, "uses_fp4_mla_cache_layout", None)
+    if flag is not None:
+        return bool(flag)
     return callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
 
 
@@ -235,9 +238,7 @@ def _env_float(name: str, default: float) -> float:
 def resolve_fp4_mla_lazy_anchor_rebase_log2(default: float) -> float:
     threshold = _env_float(FP4_MLA_LAZY_ANCHOR_LOG2_ENV, default)
     if not 0.0 <= threshold <= 8.0:
-        raise ValueError(
-            f"{FP4_MLA_LAZY_ANCHOR_LOG2_ENV} must be in [0, 8], got {threshold}"
-        )
+        raise ValueError(f"{FP4_MLA_LAZY_ANCHOR_LOG2_ENV} must be in [0, 8], got {threshold}")
     return threshold
 
 
