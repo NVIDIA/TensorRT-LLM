@@ -1004,15 +1004,18 @@ def captured_cuda_graph_batch_sizes(
 
 _RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
 _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS = "checkpoint_page_cache_release_seconds"
-# A smaller drop frees too little memory to set off compaction worth waiting for.
-_MIN_DROPPED_BYTES_TO_SETTLE = 1 << 30
+# Smaller files can free too little memory to set off compaction worth
+# waiting for.
+_MIN_ADVISED_BYTES_TO_SETTLE = 1 << 30
 
 
 def _drop_page_cache_of_dirs(checkpoint_dirs: list[str]) -> None:
     """Drop the page cache of the top-level files in ``checkpoint_dirs``.
 
-    Then waits for the page migration that follows to settle, unless the drop
-    freed less than 1 GiB.
+    Then waits for the page migration that follows to settle, unless the files
+    total less than 1 GiB. The wait depends on the files' size, not on how
+    much of them was cached: the drop in the host's page cache, which the log
+    reports, also counts what other processes read meanwhile.
     """
     try:
         files = []
@@ -1029,19 +1032,18 @@ def _drop_page_cache_of_dirs(checkpoint_dirs: list[str]) -> None:
     advised_bytes = release_file_page_cache(files)
     cached_after = page_cache_bytes()
     release_seconds = time.monotonic() - start
-    dropped_bytes = (None if cached_before is None or cached_after is None else
-                     max(0, cached_before - cached_after))
-    if dropped_bytes is None or dropped_bytes >= _MIN_DROPPED_BYTES_TO_SETTLE:
+    if advised_bytes >= _MIN_ADVISED_BYTES_TO_SETTLE:
         settle = (f"page migration settled after "
                   f"{wait_for_page_migration_to_settle():.1f} s")
     else:
         settle = "no wait for page migration"
-    dropped = ("an unknown amount of page cache" if dropped_bytes is None else
-               f"{dropped_bytes / 2**30:.1f} GiB of page cache")
+    shrank = ("by an unknown amount"
+              if cached_before is None or cached_after is None else
+              f"by {(cached_before - cached_after) / 2**30:.1f} GiB")
     logger.info(
         f"Advised DONTNEED on {len(files)} checkpoint files "
         f"({advised_bytes / 2**30:.1f} GiB) in {release_seconds:.1f} s; "
-        f"the host dropped {dropped}; {settle}")
+        f"the host's page cache shrank {shrank}; {settle}")
 
 
 def _release_checkpoint_page_cache(

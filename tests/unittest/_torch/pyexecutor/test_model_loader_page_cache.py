@@ -148,12 +148,15 @@ def test_a_single_device_build_drops_without_collectives(
 
 @pytest.fixture
 def released(monkeypatch: pytest.MonkeyPatch) -> dict:
-    """Record what the drop advises and whether it waits, instead of doing either."""
-    record: dict = {"files": None, "waited": False}
+    """Record what the drop advises and whether it waits, instead of doing either.
+
+    The advise reports ``record["advised"]`` bytes.
+    """
+    record: dict = {"files": None, "waited": False, "advised": 2 << 30}
 
     def release(paths: list[str]) -> int:
         record["files"] = sorted(paths)
-        return 123
+        return record["advised"]
 
     def wait() -> float:
         record["waited"] = True
@@ -191,22 +194,27 @@ def test_the_drop_covers_the_top_level_files_of_existing_dirs(
 
 
 @pytest.mark.parametrize(
-    "before, after, waits",
+    "advised, before, after, waits",
     [
-        (5 << 30, (4 << 30) + 1, False),  # 1 byte short of 1 GiB dropped
-        (5 << 30, 4 << 30, True),
-        (None, 4 << 30, True),  # unknown: wait
+        ((1 << 30) - 1, 5 << 30, 1 << 30, False),  # files short of 1 GiB
+        (1 << 30, 5 << 30, 4 << 30, True),
+        # Others filled the page cache meanwhile: an unchanged page cache
+        # must not skip the wait.
+        (5 << 30, 5 << 30, 5 << 30, True),
+        (1 << 30, None, None, True),
     ],
 )
-def test_the_drop_waits_for_page_migration_after_dropping_1_gib(
+def test_the_drop_waits_for_page_migration_when_the_files_total_1_gib(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     released: dict,
+    advised: int,
     before: int | None,
     after: int | None,
     waits: bool,
 ) -> None:
     (tmp_path / "model.safetensors").write_bytes(b"w")
+    released["advised"] = advised
     _page_cache(monkeypatch, before, after)
 
     model_loader._drop_page_cache_of_dirs([str(tmp_path)])

@@ -4685,11 +4685,14 @@ class PerfSanityTestConfig:
         )
         self.gpu_type = get_gpu_type()
         self.page_cache_release_default = default_release_checkpoint_page_cache(self.gpu_type)
-        if self.page_cache_release_default is not None:
+        if (
+            self.page_cache_release_default is not None
+            or self.gpu_type in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES
+        ):
             print_info(
-                f"{RELEASE_CHECKPOINT_PAGE_CACHE_ENV}={self.page_cache_release_default} "
-                f"for servers whose env_vars do not set it (gpu {self.gpu_type}, Lustre "
-                f"lock lru_max_age {lustre_lock_max_age_ms()} ms)"
+                f"{RELEASE_CHECKPOINT_PAGE_CACHE_ENV} for servers whose env_vars do not "
+                f"set it: {self.page_cache_release_default or 'unset'} (gpu {self.gpu_type}, "
+                f"Lustre lock lru_max_age {lustre_lock_max_age_ms()} ms)"
             )
 
         # Parse test case name to get config_base_name, select_pattern, runtime,

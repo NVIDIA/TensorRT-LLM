@@ -449,8 +449,8 @@ Once every rank of the server on a node has finished loading, rank 0 of the node
 advises the kernel to drop (`POSIX_FADV_DONTNEED`) the page cache of the
 top-level files of every directory the load read checkpoint files from: the
 checkpoint (or a multimodal model's LLM checkpoint) and a separate draft model.
-If that dropped at least 1 GiB, it then waits, up to 120 s, until page migration
-(`pgmigrate_success` in `/proc/vmstat`) settles. Loads that read no checkpoint
+If the files total at least 1 GiB, it then waits, up to 120 s, until page
+migration (`pgmigrate_success` in `/proc/vmstat`) settles. Loads that read no checkpoint
 files, such as GMS read-only instances and ModelExpress P2P receivers, drop
 nothing. The time spent is reported as the
 `checkpoint_page_cache_release_seconds` startup metric.
