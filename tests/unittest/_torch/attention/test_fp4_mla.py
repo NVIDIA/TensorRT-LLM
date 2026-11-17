@@ -3644,13 +3644,12 @@ def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
     monkeypatch: pytest.MonkeyPatch, masked: bool
 ) -> None:
     """Delaying the second score half must not expose the next tile's row max."""
-    from collections import OrderedDict
-
     import cutlass as ctm
     import cutlass.cute as cute
     from cutlass.experimental import primitives as prims
 
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_mufu16 as kernel
+    from tensorrt_llm._torch.attention.backends.fp4_mla.call_cache import LruCache
 
     original_load = kernel._load_p4_n256_atomic_running_rowmax
     original_load_with_validity = kernel._load_p4_n256_atomic_running_rowmax_with_validity
@@ -3683,8 +3682,14 @@ def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
     )
     # Force compilation of the delayed helpers and keep that executable out of other tests.
     monkeypatch.setattr(kernel, "_FUSED_COMPILE_CACHE", {})
-    monkeypatch.setattr(kernel, "_FUSED_EXECUTOR_CACHE", OrderedDict())
-    monkeypatch.setattr(kernel, "_PREPARED_FUSED_CALL_CACHE", OrderedDict())
+    monkeypatch.setattr(
+        kernel, "_FUSED_EXECUTOR_CACHE", LruCache(kernel._FUSED_EXECUTOR_CACHE_CAPACITY)
+    )
+    monkeypatch.setattr(
+        kernel,
+        "_PREPARED_FUSED_CALL_CACHE",
+        LruCache(kernel._PREPARED_FUSED_CALL_CACHE_CAPACITY),
+    )
     for seed in (41, 53, 67):
         _assert_fp4_mla_attention_decode_accuracy(
             monkeypatch,

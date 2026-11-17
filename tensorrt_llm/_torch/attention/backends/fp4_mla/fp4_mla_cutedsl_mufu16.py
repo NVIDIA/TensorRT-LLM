@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import threading
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +17,7 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
+from .call_cache import LruCache, class_defines_callables
 from .config import resolve_fp4_mla_lazy_anchor_rebase_log2
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 from .cutedsl_common import (
@@ -6641,58 +6640,10 @@ class _PreparedFusedCall:
         return self.executor.run_compiled_program(self.execution_args)
 
 
-_PREPARED_FUSED_CALL_CACHE: OrderedDict[tuple[object, ...], _PreparedFusedCall] = OrderedDict()
-_FUSED_EXECUTOR_CACHE: OrderedDict[tuple[object, ...], Any] = OrderedDict()
-_PREPARED_FUSED_CALL_CACHE_LOCK = threading.Lock()
-
-
-def _class_defines_callables(value: object, *names: str) -> bool:
-    value_type = type(value)
-    return all((callable(getattr(value_type, name, None)) for name in names))
-
-
-def _get_fused_executor(cache_key: tuple[object, ...]) -> Any | None:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        executor = _FUSED_EXECUTOR_CACHE.get(cache_key)
-        if executor is not None:
-            _FUSED_EXECUTOR_CACHE.move_to_end(cache_key)
-        return executor
-
-
-def _get_prepared_fused_call(
-    cache_key: tuple[object, ...],
-) -> _PreparedFusedCall | None:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        prepared = _PREPARED_FUSED_CALL_CACHE.get(cache_key)
-        if prepared is not None:
-            _PREPARED_FUSED_CALL_CACHE.move_to_end(cache_key)
-        return prepared
-
-
-def _cache_prepared_fused_call(
-    cache_key: tuple[object, ...], candidate: _PreparedFusedCall
-) -> _PreparedFusedCall:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        prepared = _PREPARED_FUSED_CALL_CACHE.get(cache_key)
-        if prepared is not None:
-            _PREPARED_FUSED_CALL_CACHE.move_to_end(cache_key)
-            return prepared
-        _PREPARED_FUSED_CALL_CACHE[cache_key] = candidate
-        if len(_PREPARED_FUSED_CALL_CACHE) > _PREPARED_FUSED_CALL_CACHE_CAPACITY:
-            _PREPARED_FUSED_CALL_CACHE.popitem(last=False)
-        return candidate
-
-
-def _cache_fused_executor(cache_key: tuple[object, ...], candidate: Any) -> Any:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        executor = _FUSED_EXECUTOR_CACHE.get(cache_key)
-        if executor is not None:
-            _FUSED_EXECUTOR_CACHE.move_to_end(cache_key)
-            return executor
-        _FUSED_EXECUTOR_CACHE[cache_key] = candidate
-        if len(_FUSED_EXECUTOR_CACHE) > _FUSED_EXECUTOR_CACHE_CAPACITY:
-            _FUSED_EXECUTOR_CACHE.popitem(last=False)
-        return candidate
+_PREPARED_FUSED_CALL_CACHE: LruCache[_PreparedFusedCall] = LruCache(
+    _PREPARED_FUSED_CALL_CACHE_CAPACITY
+)
+_FUSED_EXECUTOR_CACHE: LruCache[Any] = LruCache(_FUSED_EXECUTOR_CACHE_CAPACITY)
 
 
 def _compile_fused(
@@ -7327,7 +7278,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         packed_query_heads=packed_query_heads,
         row_state_align=row_state_align,
     )
-    supports_prepared = _class_defines_callables(
+    supports_prepared = class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
     )
     prepared_key = (
@@ -7374,7 +7325,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         use_consecutive_page_pair,
     )
     if supports_prepared:
-        prepared = _get_prepared_fused_call(prepared_key)
+        prepared = _PREPARED_FUSED_CALL_CACHE.get(prepared_key)
         if prepared is not None:
             prepared.run()
             return
@@ -7426,7 +7377,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         fused(*runtime_args)
         return
     executor_key = (fused, device_index, int(current_context))
-    executor = _get_fused_executor(executor_key)
+    executor = _FUSED_EXECUTOR_CACHE.get(executor_key)
     if executor is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -7434,14 +7385,14 @@ def run_trtllm_fp4_mla_decode_page_native(
                 "compiled kernel, device, and CUDA context."
             )
         candidate = fused.to(device_index)
-        if not _class_defines_callables(
+        if not class_defines_callables(
             candidate, "generate_execution_args", "run_compiled_program"
         ):
             fused(*runtime_args)
             return
-        executor = _cache_fused_executor(executor_key, candidate)
+        executor = _FUSED_EXECUTOR_CACHE.put(executor_key, candidate)
     execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
-    prepared = _cache_prepared_fused_call(
+    prepared = _PREPARED_FUSED_CALL_CACHE.put(
         prepared_key,
         _PreparedFusedCall(
             executor=executor,

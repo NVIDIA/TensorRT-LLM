@@ -23,13 +23,13 @@ import importlib.util
 import math
 import sys
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from .call_cache import LruCache, class_defines_callables
 from .config import _env_flag_not_disabled as _env_flag
 from .config import _env_int
 
@@ -756,11 +756,10 @@ def zero_queries(kv_lens: list[int] | torch.Tensor, query_len_per_seq: int) -> l
 
 
 # --- compile / launch ------------------------------------------------------------------------------------------------
-_COMPILE_CACHE: dict[tuple, Any] = {}
-_EXECUTOR_CACHE: OrderedDict[tuple, Any] = OrderedDict()
-_PREPARED_CACHE: OrderedDict[tuple, Any] = OrderedDict()
-_CACHE_LOCK = threading.Lock()
 _CACHE_CAPACITY = 256  # X79:9934-9935
+_COMPILE_CACHE: dict[tuple, Any] = {}
+_EXECUTOR_CACHE: LruCache[Any] = LruCache(_CACHE_CAPACITY)
+_PREPARED_CACHE: LruCache[Any] = LruCache(_CACHE_CAPACITY)
 _VALIDATED_BINDINGS: set[tuple] = set()
 _HEADER_SCRATCH: dict[torch.device, torch.Tensor] = {}
 _SCRATCH_FILL = 1  # if the kernel implementer kept the header[576] gate (X79:8845-8847), a positive word passes it
@@ -1120,31 +1119,6 @@ def compile_variant(
         return _compile(geom, ptrs, _current_cu_stream(), enable_mxi_imlp)
 
 
-def _class_defines_callables(value: object, *names: str) -> bool:  # X79:9954-9956
-    value_type = type(value)
-    return all(callable(getattr(value_type, name, None)) for name in names)
-
-
-def _cache_get(cache: OrderedDict, key):
-    with _CACHE_LOCK:
-        v = cache.get(key)
-        if v is not None:
-            cache.move_to_end(key)
-        return v
-
-
-def _cache_put(cache: OrderedDict, key, value):
-    with _CACHE_LOCK:
-        existing = cache.get(key)
-        if existing is not None:
-            cache.move_to_end(key)
-            return existing
-        cache[key] = value
-        if len(cache) > _CACHE_CAPACITY:
-            cache.popitem(last=False)
-        return value
-
-
 def run_fp4_mla_decode_4x_full(
     q_fp4: torch.Tensor,
     q_sf: torch.Tensor,
@@ -1324,7 +1298,7 @@ def run_fp4_mla_decode_4x_full(
         compiled = _compile(
             geom, _make_wrapper_ptrs(addresses, output.dtype), stream, enable_mxi_imlp
         )
-    supports_prepared = _class_defines_callables(
+    supports_prepared = class_defines_callables(
         compiled, "to", "generate_execution_args", "run_compiled_program"
     )
     prepared_key = (
@@ -1353,7 +1327,7 @@ def run_fp4_mla_decode_4x_full(
         geom.used_tasks,
     )
     if supports_prepared:
-        prepared = _cache_get(_PREPARED_CACHE, prepared_key)
+        prepared = _PREPARED_CACHE.get(prepared_key)
         if prepared is not None:
             prepared.run()
             return prepared.geometry
@@ -1381,22 +1355,21 @@ def run_fp4_mla_decode_4x_full(
         compiled(*runtime_args)
         return geom
     executor_key = (id(compiled), device_index, int(current_context))
-    executor = _cache_get(_EXECUTOR_CACHE, executor_key)
+    executor = _EXECUTOR_CACHE.get(executor_key)
     if executor is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "FP4 MLA CUDA Graph capture requires an eager warmup for the compiled kernel, device, and CUDA context."
             )
         candidate = compiled.to(device_index)  # X79:10539
-        if not _class_defines_callables(
+        if not class_defines_callables(
             candidate, "generate_execution_args", "run_compiled_program"
         ):
             compiled(*runtime_args)
             return geom
-        executor = _cache_put(_EXECUTOR_CACHE, executor_key, candidate)
+        executor = _EXECUTOR_CACHE.put(executor_key, candidate)
     execution_args, adapted_args = executor.generate_execution_args(*runtime_args)  # X79:10546
-    prepared = _cache_put(
-        _PREPARED_CACHE,
+    prepared = _PREPARED_CACHE.put(
         prepared_key,
         _PreparedCall(executor, runtime_args, execution_args, adapted_args, geom),
     )
