@@ -7,10 +7,12 @@
 ``post_load_weights()``, on every module that defines it. Modules opt in by
 defining the hook; no base class is needed. The post-load walks skip a module
 whose ``_weights_removed`` flag is set, because its weights were freed on
-purpose.
+purpose. A draft model may declare the checkpoint key prefixes it reads as
+``checkpoint_key_prefixes``; the draft read then gets only those keys.
 """
 
 import inspect
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from torch import nn
@@ -52,6 +54,25 @@ def call_load_weights(
             "allow_partial_loading is not supported for this model"
         )
     load_method(weights, **kwargs)
+
+
+def draft_checkpoint_load_kwargs(model: nn.Module) -> dict[str, Any]:
+    """Name the checkpoint key prefixes the draft reads, so loaders may skip files without them."""
+    key_prefixes = getattr(getattr(model, "draft_model", None), "checkpoint_key_prefixes", None)
+    if isinstance(key_prefixes, str):
+        key_prefixes = (key_prefixes,)
+    if isinstance(key_prefixes, Sequence) and key_prefixes:
+        return {"key_prefixes": tuple(key_prefixes)}
+    return {}
+
+
+def select_draft_weights(
+    weights: dict[str, Any], key_prefixes: tuple[str, ...] | None
+) -> dict[str, Any]:
+    """Keep only the draft's keys, so it gets the same keys whichever files were read."""
+    if not key_prefixes:
+        return weights
+    return {name: value for name, value in weights.items() if name.startswith(key_prefixes)}
 
 
 def setup_aliases(model: nn.Module) -> None:

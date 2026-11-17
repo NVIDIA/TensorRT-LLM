@@ -815,7 +815,8 @@ def _load_checkpoint_into_model(
         mapping: parallel mapping of this rank
         weight_mapper: initialized weight mapper for this checkpoint
         extra_load_weights_kwargs: extra kwargs for the read, e.g.
-            ``source_identity`` and the MX kwargs for the target; or None
+            ``source_identity`` and the MX kwargs for the target, or the
+            draft's ``key_prefixes``, outside which no key is copied; or None
         metrics: model loader timing metrics, updated in place
 
     Returns:
@@ -837,6 +838,7 @@ def _load_checkpoint_into_model(
         # the target checkpoint lazily.
         load_weights_kwargs["model"] = model
     load_weights_kwargs.update(extra_load_weights_kwargs or {})
+    key_prefixes = load_weights_kwargs.get("key_prefixes")
 
     # If possible, use rank-striped read-ahead IO policy to faster reading:
     # - Must be HfCheckpointLoader, not its derived class
@@ -853,8 +855,10 @@ def _load_checkpoint_into_model(
         weight_loader = checkpoint_loader.weight_loader
         with weight_loader.open_weight_session(
                 checkpoint_dir, **load_weights_kwargs) as weights:
-            _copy_weights_into_model(model_load_weights, weights, weight_mapper,
-                                     population_metric.value, metrics)
+            _copy_weights_into_model(
+                model_load_weights,
+                model_hooks.select_draft_weights(weights, key_prefixes),
+                weight_mapper, population_metric.value, metrics)
         # The weight loader's session records its own timings.
         io_status = weight_loader.last_checkpoint_io_status
         metrics[preparation_metric.value] = io_status.preparation_seconds
@@ -877,8 +881,10 @@ def _load_checkpoint_into_model(
         # `weights` as empty. It does not yet support draft model.
         if (weights or is_draft_model
                 or not checkpoint_loader.is_weights_preloaded()):
-            _copy_weights_into_model(model_load_weights, weights, weight_mapper,
-                                     population_metric.value, metrics)
+            _copy_weights_into_model(
+                model_load_weights,
+                model_hooks.select_draft_weights(weights, key_prefixes),
+                weight_mapper, population_metric.value, metrics)
         metrics.setdefault(finalization_metric.value, 0.0)
 
     _inspect_shadow_weight_load_plan(checkpoint_loader, checkpoint_dir,
@@ -973,6 +979,7 @@ def load_model_from_auto_load_format(
     if spec_config is not None and spec_config.needs_separate_draft_weights:
         draft_weight_mapper = checkpoint_loader.get_initialized_draft_weight_mapper(
             model, weight_mapper)
+        draft_load_kwargs = model_hooks.draft_checkpoint_load_kwargs(model)
         startup_metadata[
             "draft_checkpoint_io_policy"] = _load_checkpoint_into_model(
                 checkpoint_loader,
@@ -981,7 +988,7 @@ def load_model_from_auto_load_format(
                 is_draft_model=True,
                 mapping=mapping,
                 weight_mapper=draft_weight_mapper,
-                extra_load_weights_kwargs=None,
+                extra_load_weights_kwargs=draft_load_kwargs,
                 metrics=metrics)
     return weight_mapper, weights_preloaded
 
