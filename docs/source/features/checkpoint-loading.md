@@ -41,6 +41,7 @@ The `BaseCheckpointLoader` is the central base interface for all checkpoint load
 Responsible for loading model configurations from checkpoint directories and parsing them into TRTLLM `ModelConfig`:
 
 ```python
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 
 class CustomConfigLoader(BaseConfigLoader):
@@ -48,8 +49,10 @@ class CustomConfigLoader(BaseConfigLoader):
         # Load and parse configuration from your custom format
         pretrained_config = self._get_pretrained_config(checkpoint_dir, **kwargs)
 
-        return ModelConfig(pretrained_config=pretrained_config,
-                            ...)
+        return ModelConfig(
+            pretrained_config=pretrained_config,
+            # Add other ModelConfig parameters as needed
+        )
 
     def _get_pretrained_config(self, checkpoint_dir, **kwargs):
         ...
@@ -66,10 +69,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 
 class CustomWeightLoader(BaseWeightLoader):
-    def load_weights(self, checkpoint_dir: str, mapping: Mapping) -> dict[str, Any]:
-        # Load weights from your custom format
-        # Return a dictionary mapping parameter names to tensors
-        return weights_dict
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
+        weights = {}
+        # Load weights from your custom format into `weights`
+        return weights
 ```
 
 ### BaseWeightMapper
