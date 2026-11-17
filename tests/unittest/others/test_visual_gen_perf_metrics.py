@@ -116,14 +116,20 @@ def test_video_without_generation_does_not_fall_back_to_e2e(modules: _Modules) -
         producer.extract_visual_gen_metrics(result)
 
 
-@pytest.mark.parametrize("backend", ["openai-videos", "openai-images"])
+@pytest.mark.parametrize(
+    ("backend", "field"),
+    [
+        ("openai-videos", "gen_latency"),
+        ("openai-videos", "e2e_latency"),
+        ("openai-images", "e2e_latency"),
+    ],
+)
 @pytest.mark.parametrize("invalid", [float("nan"), 0, -1, "missing_p99"])
-def test_invalid_selected_client_series_is_rejected(
-    modules: _Modules, backend: str, invalid: float | str
+def test_invalid_client_series_is_rejected(
+    modules: _Modules, backend: str, field: str, invalid: float | str
 ) -> None:
     _, harness = modules
     result = _result(backend)
-    field = "gen_latency" if backend == "openai-videos" else "e2e_latency"
     if invalid == "missing_p99":
         del result[field]["percentiles"]["p99"]
     else:
