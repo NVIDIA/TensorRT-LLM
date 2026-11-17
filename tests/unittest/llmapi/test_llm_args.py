@@ -1415,6 +1415,43 @@ class TestModelDefaults:
         assert llm_args.sparse_attention_config.model_fields_set == sparse_before
         assert llm_args.scheduler_config.model_fields_set == scheduler_before
 
+    def test_applied_defaults_leave_configs_in_containers_unset(self):
+        """Configs held in a dict keep only the fields the user set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                multimodal_config={
+                                    "encoder_side_stream_max_ahead": 0,
+                                    "encoder_cuda_graph": {
+                                        "image": {
+                                            "max_batch_size": 4
+                                        }
+                                    },
+                                })
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+        image = llm_args.multimodal_config.encoder_cuda_graph["image"]
+        assert image.max_batch_size == 4
+        assert image.model_fields_set == {"max_batch_size"}
+
+    def test_config_object_default_keeps_its_nested_fields_set(self):
+        """A default given as a config object counts its nested fields as set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "scheduler_config":
+                SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+            })
+        scheduler_config = llm_args.scheduler_config
+        assert scheduler_config.gen_preemption.tpot_budget == 0.1
+        assert scheduler_config.model_fields_set == {"gen_preemption"}
+        assert scheduler_config.gen_preemption.model_fields_set == {
+            "tpot_budget"
+        }
+        assert llm_args.model_dump(exclude_unset=True)["scheduler_config"] == {
+            "gen_preemption": {
+                "tpot_budget": 0.1
+            }
+        }
+
     def test_empty_nested_default_counts_as_set(self):
         """An empty nested default still counts as set.
 

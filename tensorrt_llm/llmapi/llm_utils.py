@@ -4,7 +4,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
 from pydantic import BaseModel
@@ -598,38 +598,55 @@ def apply_model_defaults_to_llm_args(
     return applied
 
 
-_FieldsSetSnapshot = Tuple[frozenset, Dict[str, Any]]
+def _snapshot_fields_set(value: Any) -> Any:
+    """Record which fields are set on each config in ``value``.
+
+    Descends into config fields and into dicts and lists that hold configs.
+    A config maps to ``(fields_set, {field: snapshot})``; a dict or list maps
+    to the same container of snapshots; anything else maps to None.
+    """
+    if isinstance(value, BaseModel):
+        return (frozenset(value.model_fields_set), {
+            name: _snapshot_fields_set(getattr(value, name, None))
+            for name in type(value).model_fields
+        })
+    if isinstance(value, dict):
+        return {key: _snapshot_fields_set(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_fields_set(item) for item in value]
+    return None
 
 
-def _snapshot_fields_set(config: BaseModel) -> _FieldsSetSnapshot:
-    """Record which fields are set on a config and on each nested config."""
-    nested = {}
-    for name in type(config).model_fields:
-        value = getattr(config, name, None)
-        if isinstance(value, BaseModel):
-            nested[name] = _snapshot_fields_set(value)
-    return frozenset(config.model_fields_set), nested
+def _restore_fields_set(value: Any, snapshot: Any, applied: Any) -> None:
+    """Mark the snapshot's fields and the applied names as set.
 
-
-def _restore_fields_set(config: BaseModel,
-                        snapshot: Optional[_FieldsSetSnapshot],
-                        applied: Any) -> None:
-    """Mark as set the fields in ``snapshot`` plus those ``applied`` names.
-
-    ``snapshot`` is None for a config that did not exist before the defaults
-    were applied; ``applied`` is the defaults applied at this level.
+    Applies to each config in ``value``. ``snapshot`` comes from
+    ``_snapshot_fields_set`` and is None where no config existed before the
+    defaults were applied; ``applied`` is the defaults applied at this level.
     """
     if isinstance(applied, BaseModel):
-        applied = {name: {} for name in applied.model_fields_set}
-    elif not isinstance(applied, dict):
-        applied = {}
-    fields_set, nested = snapshot or (frozenset(), {})
-    object.__setattr__(config, "__pydantic_fields_set__",
-                       set(fields_set) | applied.keys())
-    for name in type(config).model_fields:
-        value = getattr(config, name, None)
-        if isinstance(value, BaseModel):
-            _restore_fields_set(value, nested.get(name), applied.get(name))
+        applied = applied.model_dump(exclude_unset=True)
+    if isinstance(value, BaseModel):
+        applied = applied if isinstance(applied, dict) else {}
+        fields_set, nested = (snapshot if isinstance(snapshot, tuple) else
+                              (frozenset(), {}))
+        object.__setattr__(value, "__pydantic_fields_set__",
+                           set(fields_set) | applied.keys())
+        for name in type(value).model_fields:
+            _restore_fields_set(getattr(value, name, None), nested.get(name),
+                                applied.get(name))
+    elif isinstance(value, dict):
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        applied = applied if isinstance(applied, dict) else {}
+        for key, item in value.items():
+            _restore_fields_set(item, snapshot.get(key), applied.get(key))
+    elif isinstance(value, (list, tuple)):
+        snapshot = snapshot if isinstance(snapshot, list) else []
+        applied = applied if isinstance(applied, (list, tuple)) else []
+        for index, item in enumerate(value):
+            _restore_fields_set(
+                item, snapshot[index] if index < len(snapshot) else None,
+                applied[index] if index < len(applied) else None)
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
