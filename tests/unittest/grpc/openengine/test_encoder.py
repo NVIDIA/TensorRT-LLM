@@ -166,7 +166,8 @@ def test_shared_handoff_rejects_malformed_hashes_and_releases_exports(
     _check_malformed_handoff_hashes(cache, cache, hashes, monkeypatch)
 
 
-def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(monkeypatch):
+@pytest.mark.parametrize("location", ["top", "output", "both"])
+def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(monkeypatch, location):
     incoming, _ = native_result()
     params = incoming.disaggregated_params
     inputs = [params.mrope_position_ids_handle, params.mrope_position_deltas_handle]
@@ -194,7 +195,15 @@ def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(mon
             fresh.disaggregated_params.mrope_position_ids_handle,
             fresh.disaggregated_params.mrope_position_deltas_handle,
         ]
-        owner.release(fresh)
+        result = SimpleNamespace(
+            disaggregated_params=(fresh.disaggregated_params if location != "output" else params),
+            outputs=[SimpleNamespace(disaggregated_params=fresh.disaggregated_params)]
+            if location != "top"
+            else [],
+        )
+        assert owner.has_exports(result)
+        assert owner.release(result)
+        assert released == handles
         # Native result snapshots can repeat the same handles in new dictionaries.
         owner.release(
             SimpleNamespace(
@@ -205,6 +214,42 @@ def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(mon
             )
         )
         assert released == handles
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_encoder_release_reports_failure_and_deduplicates_output_exports(monkeypatch, failure):
+    result, _tensors = native_result()
+    params = result.disaggregated_params
+    handles = [
+        *params.multimodal_embedding_handles,
+        params.mrope_position_ids_handle,
+        params.mrope_position_deltas_handle,
+    ]
+    result.outputs = [
+        SimpleNamespace(
+            disaggregated_params=DisaggregatedParams(
+                multimodal_embedding_handles=[dict(handles[0])],
+                mrope_position_ids_handle=dict(handles[1]),
+                mrope_position_deltas_handle=dict(handles[2]),
+            )
+        )
+    ]
+    release = SharedTensorContainer.release_dict
+    released = []
+
+    def record(handle):
+        released.append(handle)
+        if failure and handle == handles[0]:
+            raise RuntimeError("release failed")
+        release(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    assert oe.release_encoder_result(result) is not failure
+    assert released == handles
+    assert oe.release_encoder_result(result)
+    assert released == handles
+    if failure:
+        release(handles[0])
 
 
 def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):

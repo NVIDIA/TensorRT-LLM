@@ -302,11 +302,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
         role = getattr(self._inference, "encoder_role", "")
         if role:
-            backend = (
-                ""
-                if getattr(self._inference._encoder_cache, "failed", False)
-                else self._inference._encoder_cache.backend
-            )
+            backend = self._inference._encoder_cache.backend
             info.encoder.CopyFrom(
                 model_pb2.EncoderCapabilities(
                     schema_version=1,

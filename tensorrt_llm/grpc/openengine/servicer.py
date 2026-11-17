@@ -642,7 +642,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         async def release_prefill_result(result: Any) -> None:
             if prefill_exports is not None and prefill_exports.has_exports(result):
                 if not await asyncio.to_thread(prefill_exports.release, result):
-                    self._encoder_cleanup_failed = True
+                    logger.error("Failed to release native prefill exports")
+                    if self.encoder_role:
+                        self._encoder_cleanup_failed = True
 
         if local_request.aborted or (reservation is not None and reservation.aborted):
             await context.abort(grpc.StatusCode.CANCELLED, "Request aborted before submission")
@@ -745,7 +747,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     await self._run_encoder_cleanup(release_prefill_result(result))
                 if context.cancelled():
                     if encoder_action == "encode":
-                        await asyncio.to_thread(release_encoder_result, result)
+                        if not await asyncio.to_thread(release_encoder_result, result):
+                            self._encoder_cleanup_failed = True
                     abort_request("RPC cancelled")
                     return
                 if encoder_action == "encode" and not result.error:
@@ -866,14 +869,16 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         ):
                             await asyncio.wait_for(complete(), timeout=30)
                     except asyncio.TimeoutError:
-                        self._encoder_cleanup_failed = True
-                        logger.error("Native export cleanup timed out; refusing further requests")
+                        logger.error("Native export cleanup timed out")
+                        if self.encoder_role:
+                            self._encoder_cleanup_failed = True
                     except Exception:
                         # Native abort completion may raise after updating the result.
                         pass
                     finally:
                         if prefill_exports is None:
-                            await asyncio.to_thread(release_encoder_result, handle)
+                            if not await asyncio.to_thread(release_encoder_result, handle):
+                                self._encoder_cleanup_failed = True
                         else:
                             await release_prefill_result(handle)
 

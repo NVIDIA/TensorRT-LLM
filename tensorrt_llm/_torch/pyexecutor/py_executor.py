@@ -11902,11 +11902,12 @@ class PyExecutor:
         self._release_multimodal_resources(request)
         # Finished requests can remain in the last batch. Generation no longer
         # needs the retained MRoPE delta, including its CUDA IPC storage.
-        if getattr(request, "py_mrope_position_delta", None) is not None:
-            request.py_mrope_position_delta = None
-        mm_data = getattr(request, "py_multimodal_data", None)
-        if mm_data:
-            mm_data.clear()
+        if request.is_finished:
+            if getattr(request, "py_mrope_position_delta", None) is not None:
+                request.py_mrope_position_delta = None
+            mm_data = getattr(request, "py_multimodal_data", None)
+            if mm_data:
+                mm_data.clear()
         if getattr(request, "py_encoder_output", None) is not None:
             request.py_encoder_output = None
             request.py_encoder_output_ready_event = None

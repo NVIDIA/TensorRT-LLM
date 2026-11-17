@@ -9,6 +9,7 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -60,11 +61,24 @@ def take_encoder_exports(params: Any) -> tuple[list[dict], list[dict | None]]:
     return embeddings, mrope
 
 
-def release_encoder_result(result: Any) -> None:
+def _result_disaggregated_params(result: Any) -> Iterator[DisaggregatedParams]:
     params = getattr(result, "disaggregated_params", None)
     if params is not None:
+        yield params
+    outputs = getattr(result, "outputs", None)
+    if outputs:
+        output_params = getattr(outputs[0], "disaggregated_params", None)
+        if output_params is not None and output_params is not params:
+            yield output_params
+
+
+def release_encoder_result(result: Any) -> bool:
+    pending = {}
+    for params in _result_disaggregated_params(result):
         embeddings, mrope = take_encoder_exports(params)
-        _release([*embeddings, *(handle for handle in mrope if handle is not None)])
+        for handle in [*embeddings, *(handle for handle in mrope if handle is not None)]:
+            pending.setdefault(json.dumps(handle, sort_keys=True), handle)
+    return _release(list(pending.values()))
 
 
 class PrefillResultExports:
@@ -80,25 +94,26 @@ class PrefillResultExports:
 
     @staticmethod
     def has_exports(result: Any) -> bool:
-        params = getattr(result, "disaggregated_params", None)
-        return params is not None and (
+        return any(
             params.mrope_position_ids_handle is not None
             or params.mrope_position_deltas_handle is not None
+            for params in _result_disaggregated_params(result)
         )
 
     def release(self, result: Any) -> bool:
-        params = getattr(result, "disaggregated_params", None)
-        if params is None:
-            return True
         pending = []
         with _EXPORT_LOCK:
-            for handle in (params.mrope_position_ids_handle, params.mrope_position_deltas_handle):
-                if handle is None:
-                    continue
-                key = json.dumps(handle, sort_keys=True)
-                if key not in self._seen:
-                    self._seen.add(key)
-                    pending.append(handle)
+            for params in _result_disaggregated_params(result):
+                for handle in (
+                    params.mrope_position_ids_handle,
+                    params.mrope_position_deltas_handle,
+                ):
+                    if handle is None:
+                        continue
+                    key = json.dumps(handle, sort_keys=True)
+                    if key not in self._seen:
+                        self._seen.add(key)
+                        pending.append(handle)
         return _release(pending)
 
 

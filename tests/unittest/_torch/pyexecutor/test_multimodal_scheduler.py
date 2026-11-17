@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderProgress,
@@ -1181,6 +1182,12 @@ def test_mrope_storage_is_retained_for_generation_and_released_at_termination() 
     assert not storage_ref.expired()
     assert set(request.py_multimodal_data) == {"mrope_config"}
 
+    executor._do_terminate_request(request)
+    assert tensor_ref() is request.py_mrope_position_delta
+    assert not storage_ref.expired()
+    assert set(request.py_multimodal_data) == {"mrope_config"}
+
+    request.state = LlmRequestState.GENERATION_COMPLETE
     executor._do_terminate_request(request)
     assert request.py_mrope_position_delta is None
     assert request.py_multimodal_data == {}

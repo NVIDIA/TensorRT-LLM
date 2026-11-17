@@ -2577,6 +2577,7 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
     separate_prefill_decode = request_type == "context_only"
     capability_llm, _ = image_llm
     processor = capability_llm.input_processor
+    monkeypatch.setattr(type(processor.config), "model_type", "qwen3_vl")
     processor.support_mm_disagg = True
     processor.config.to_dict = lambda: {"model_type": processor.config.model_type}
     encoder = _ImageLlm(processor, processor.config)
@@ -2703,6 +2704,7 @@ async def test_encoder_prefill_rejects_unusable_decode_state_and_reclaims_inputs
 ):
     capability_llm, _ = image_llm
     processor = capability_llm.input_processor
+    monkeypatch.setattr(type(processor.config), "model_type", "qwen3_vl")
     processor.support_mm_disagg = True
     processor.config.to_dict = lambda: {"model_type": processor.config.model_type}
     consumer = _ImageLlm(processor, processor.config)

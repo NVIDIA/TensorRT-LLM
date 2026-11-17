@@ -46,20 +46,22 @@ async def test_encoder_health_skips_language_probe_without_masking_unhealthy_eng
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "ending",
+    "ending,epd",
     [
-        "done",
-        "error",
-        "format_error",
-        "cancelled",
-        "abort_late",
-        "cancel_in_release",
-        "release_error",
-        "aggregate",
-        "decode",
+        ("done", False),
+        ("postprocess", False),
+        ("error", False),
+        ("format_error", False),
+        ("cancelled", False),
+        ("abort_late", False),
+        ("cancel_in_release", False),
+        ("release_error", False),
+        ("release_error", True),
+        ("aggregate", False),
+        ("decode", False),
     ],
 )
-async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, ending):
+async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, ending, epd):
     llm, _ = model()
     llm.args = SimpleNamespace(guided_decoding_backend=None)
     llm.tokenizer = None
@@ -96,7 +98,10 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
         async def __aiter__(self):
             if ending == "abort_late":
                 raise asyncio.CancelledError
-            self.disaggregated_params = params
+            if ending == "postprocess":
+                self.outputs = [SimpleNamespace(disaggregated_params=params)]
+            else:
+                self.disaggregated_params = params
             self.finished = False
             yield self
             self.finished = True
@@ -139,6 +144,8 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
     elif ending != "aggregate":
         req.extra.update({"request_type": "context_only"})
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    if epd:
+        inference.encoder_role = "consume"
     if ending == "abort_late":
 
         async def load_multimodal_input(*args):
@@ -179,14 +186,19 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
         assert released == expected
         assert completed == expected[1:]
         assert not inference.active_request_count()
-        assert inference._encoder_cleanup_failed
-        assert not OpenEngineControlServicer(llm, "qwen", inference)._engine_is_healthy()
-        next_context = FakeServicerContext()
-        with pytest.raises(AbortError, match="cleanup failed"):
-            _ = [value async for value in inference.Generate(req, next_context)]
-        assert next_context.abort_code == servicer.grpc.StatusCode.UNAVAILABLE
-        assert released == expected
+        assert inference._encoder_cleanup_failed is epd
+        assert OpenEngineControlServicer(llm, "qwen", inference)._engine_is_healthy() is not epd
         release(expected[0])
+        params.mrope_position_ids_handle = params.mrope_position_deltas_handle = None
+        next_context = FakeServicerContext()
+        if epd:
+            with pytest.raises(AbortError, match="cleanup failed"):
+                _ = [value async for value in inference.Generate(req, next_context)]
+            assert next_context.abort_code == servicer.grpc.StatusCode.UNAVAILABLE
+        else:
+            req.request_id = "later-prefill"
+            _ = [value async for value in inference.Generate(req, next_context)]
+        assert released == expected
     else:
         assert released == expected
         assert completed == expected
@@ -194,9 +206,9 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize("multimodal,epd", [(False, False), (True, False), (True, True)])
 async def test_prefill_cancel_waits_for_late_exports_only_for_multimodal_inputs(
-    monkeypatch, multimodal
+    monkeypatch, multimodal, epd
 ):
     llm, _ = model()
     llm.args = SimpleNamespace(guided_decoding_backend=None)
@@ -235,19 +247,21 @@ async def test_prefill_cancel_waits_for_late_exports_only_for_multimodal_inputs(
     monkeypatch.setattr(servicer, "_engine_error_response", lambda *args: None)
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
     assert not inference.encoder_role
+    if epd:
+        inference.encoder_role = "consume"
     req = request()
     req.ClearField("media")
     req.extra.update({"request_type": "context_only"})
     with pytest.raises(asyncio.CancelledError):
         _ = [value async for value in inference.Generate(req, FakeServicerContext())]
     assert bool(waits) is multimodal
-    assert inference._encoder_cleanup_failed is multimodal
+    assert inference._encoder_cleanup_failed is epd
     assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
-    assert OpenEngineControlServicer(llm, "qwen", inference)._engine_is_healthy() is not multimodal
-    if not multimodal:
+    assert OpenEngineControlServicer(llm, "qwen", inference)._engine_is_healthy() is not epd
+    if not epd:
         req.request_id = "later-prefill"
         _ = [value async for value in inference.Generate(req, FakeServicerContext())]
-        assert not waits and not inference._encoder_cleanup_failed
+        assert len(waits) == int(multimodal) and not inference._encoder_cleanup_failed
 
 
 @pytest.mark.asyncio
@@ -296,10 +310,11 @@ async def test_cancelled_encode_reclaims_native_exports(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["", "encode", "consume"])
 @pytest.mark.parametrize("backend", ["trtllm-shared-safetensors-v1", "trtllm-nixl-encoder-v1"])
-async def test_encoder_capability_discovery_is_typed_and_role_specific(role, backend):
+@pytest.mark.parametrize("failed", [False, True])
+async def test_encoder_capability_discovery_is_typed_and_role_specific(role, backend, failed):
     inference = _inference()
     inference.encoder_role = role
-    inference._encoder_cache = SimpleNamespace(backend=backend)
+    inference._encoder_cache = SimpleNamespace(backend=backend, failed=failed)
     inference._media_capabilities = MediaCapabilities({"image": "<image_{}>"})
     info = await _servicer(inference=inference).GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
@@ -329,6 +344,64 @@ async def test_encoder_capability_discovery_is_typed_and_role_specific(role, bac
     if role == "encode":
         assert info.generation.output_logprobs.supported is False
         assert info.generation.guided_decoding.supported is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True])
+async def test_encode_export_release_failure_withdraws_readiness(tmp_path, monkeypatch, late):
+    llm, _ = model()
+    llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
+    llm.tokenizer = None
+    llm._check_health = lambda: True
+    released = []
+
+    class Handle:
+        error = None
+        finished = True
+        disaggregated_params = None
+
+        async def __aiter__(self):
+            if late:
+                raise asyncio.CancelledError
+            yield self
+
+        async def aresult(self):
+            return self
+
+        def abort(self):
+            pass
+
+    handle = Handle()
+    llm.generate_async = lambda **kwargs: handle
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        servicer,
+        "_prepare_input_from_request",
+        lambda *args: SimpleNamespace(media=(), inputs="prompt"),
+    )
+
+    def release(result):
+        released.append(result)
+        return False
+
+    monkeypatch.setattr(servicer, "release_encoder_result", release)
+    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    req = request()
+    req.encoder.encode_only.SetInParent()
+    context = FakeServicerContext()
+    context.is_cancelled = not late
+    if late:
+        with pytest.raises(asyncio.CancelledError):
+            _ = [value async for value in inference.Generate(req, context)]
+    else:
+        _ = [value async for value in inference.Generate(req, context)]
+    assert released and all(result is handle for result in released)
+    assert inference._encoder_cleanup_failed
+    control = OpenEngineControlServicer(llm, "qwen", inference)
+    assert not control._engine_is_healthy()
+    with pytest.raises(AbortError, match="cleanup failed"):
+        _ = [value async for value in inference.Generate(req, FakeServicerContext())]
+    assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
 
 
 @pytest.mark.asyncio

@@ -1051,20 +1051,20 @@ async def test_encoder_cache_requirement_is_distinct_from_consumption_capability
     inference = _inference()
     inference.encoder_role = role
     inference._encoder_cache = SimpleNamespace(backend="test-encoder", failed=failed)
-    info = await _servicer(inference=inference).GetModelInfo(
+    control = _servicer(inference=inference)
+    info = await control.GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
+    assert control._engine_is_healthy() is not failed
     assert info.HasField("encoder") is bool(role)
     assert info.encoder.encoder_only is (role == "encode")
     assert info.encoder.accepts_handoff is (role == "consume")
     assert info.encoder.supports_abort_cleanup is (role == "encode")
     assert info.encoder.requires_handoff is (role == "consume")
     assert info.encoder.HasField("transfer_backend") is (role == "encode")
-    assert info.encoder.transfer_backend == (
-        "test-encoder" if role == "encode" and not failed else ""
-    )
+    assert info.encoder.transfer_backend == ("test-encoder" if role == "encode" else "")
     assert list(info.encoder.supported_transfer_backends) == (
-        ["test-encoder"] if role == "consume" and not failed else []
+        ["test-encoder"] if role == "consume" else []
     )
     for name in (
         "schema_version",
