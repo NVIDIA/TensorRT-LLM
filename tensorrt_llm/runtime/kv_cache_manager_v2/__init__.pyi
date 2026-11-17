@@ -461,6 +461,8 @@ class ReusePolicy(enum.IntEnum):
 class AttentionLayerConfig:
     """One attention layer's buffers and its history rules.
 
+    Buffers with an effective OPTIONAL reuse policy require a sliding window.
+
     A sparse layer may also declare a sliding window, though the combination is unusual:
     sparsity already bounds how much history a step reads. Where both apply, the window
     bounds what is *selectable* as well as what is retained -- the indexer producing the

@@ -100,6 +100,7 @@ may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
 constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
 explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+Attention buffers with an effective `OPTIONAL` policy require a sliding window.
 A buffer may override its layer's default through `BufferConfig::reusePolicy`.
 This applies to attention and SSM buffers, so one model layer may span several
 lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
