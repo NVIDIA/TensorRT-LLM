@@ -44,13 +44,12 @@ def format_reason(reason: object) -> str:
 class PRInputs:
     """PR data, with executable diffs and verified docstring/formatting facts.
 
-    ``raw_diffs`` preserves source reconstruction input. ``post_merge``
-    reflects /bot run --post-merge.
+    ``raw_diffs`` preserves source reconstruction input. Stage scheduling
+    belongs to the downstream command scope, not the selector.
     """
 
     changed_files: list[str]
     diffs: dict[str, str]
-    post_merge: bool = False
     raw_diffs: dict[str, str] = field(default_factory=dict)
     # Documentation contributions can coexist with executable edits in one file.
     docstring_files: set[str] = field(default_factory=set)
