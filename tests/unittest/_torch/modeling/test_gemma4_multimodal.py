@@ -1595,11 +1595,31 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         model = _Gemma4EncoderCacheHarness()
         shared_hash = [1] * 8
         model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
-        param = _make_keyed_video_param([shared_hash, [2] * 8])
-        video = param.multimodal_data["video"]
-        # Three frames for two videos and no frame counts: no item axis to select by.
-        video["pixel_values"] = torch.arange(3).reshape(3, 1, 1)
-        param.item_metadata.input_partitions.clear()
+        # Three frames for two videos and no frame counts: no item axis to select by. The frame
+        # fields agree, and the two videos give two and four rows.
+        param = MultimodalParams(
+            multimodal_input=MultimodalInput(
+                multimodal_hashes=[shared_hash, [2] * 8],
+                multimodal_positions=[0, 0],
+                multimodal_lengths=[2, 4],
+            ),
+            multimodal_data={
+                "video": {
+                    "pixel_values": torch.arange(3).reshape(3, 1, 1),
+                    "image_position_ids": torch.zeros(3, 1, 2, dtype=torch.int64),
+                    "image_seq_lens": [1, 1, 1],
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", 0), ("video", 1)], output_embedding_lengths=[2, 4]
+                ),
+                "mm_processor_kwargs_hash": "kwargs-a",
+            },
+            multimodal_runtime=MultimodalRuntimeData(
+                embed_mask_cumsum=torch.arange(1, 7, dtype=torch.int64),
+                past_seen_token_num=0,
+                chunk_end_pos=6,
+            ),
+        )
 
         with unittest.mock.patch(
             "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
@@ -1609,6 +1629,15 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         self.assertTrue(partition.is_full_miss)
         self.assertEqual(partition.miss_indices, [0, 1])
         warning_once.assert_called_once()
+
+        # The whole payload is encoded in one call: all three frames, both videos' rows.
+        with unittest.mock.patch(
+            "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
+        ):
+            embeddings = model._get_or_encode_multimodal_embeddings([param])
+        self.assertEqual(model.encoder_calls, 2)
+        torch.testing.assert_close(embeddings, torch.full((6, model.embedding_dim), 2.0))
+        self.assertEqual(param.item_metadata.input_partitions, {})
 
     @pytest.mark.cpu_only
     def test_encoder_cache_video_partial_hit_encodes_by_num_frames_spans(self):

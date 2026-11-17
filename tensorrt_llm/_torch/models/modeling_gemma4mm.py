@@ -221,6 +221,14 @@ _GEMMA4_ENCODER_INPUTS = (
 )
 
 
+# The payload keys of each Gemma4 encoder input that hold one entry per image, frame or clip.
+_GEMMA4_ITEM_FIELDS = {
+    "image": ("pixel_values", "image_position_ids", "image_seq_lens"),
+    "video": ("pixel_values", "image_position_ids", "image_seq_lens"),
+    "audio": ("audio_features", "audio_features_mask"),
+}
+
+
 def _padded_patches_per_frame(processor) -> int:
     """Return the patch count a Gemma4 image or video processor pads every image or frame to."""
     return int(processor.max_soft_tokens) * int(processor.pooling_kernel_size) ** 2
@@ -231,21 +239,39 @@ def _padded_patches_per_frame(processor) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _gemma4_payload_partitions(
+    data: dict[str, Any],
+    modality: str,
+    item_lengths: Optional[tuple[int, ...]] = None,
+) -> dict[str, MultimodalItemPartition]:
+    """Declare the per-entry fields that one payload has, on their leading axis.
+
+    ``item_lengths`` gives each item's span of entries (the frames of a video). Without them,
+    each entry is one item, or, when the payload's items are unknown, the encoder batches the
+    entries as one piece.
+    Position ids pad with their -1 padding sentinel when frames of different patch counts share
+    one encoder call.
+    """
+    partitions = {
+        name: MultimodalItemPartition(
+            item_lengths=item_lengths,
+            padding_value=-1 if name == "image_position_ids" else 0,
+        )
+        for name in _GEMMA4_ITEM_FIELDS[modality]
+        if data.get(name) is not None
+    }
+    if "vision_normalization" in data:
+        partitions["vision_normalization"] = MultimodalItemPartition(item_axis=None)
+    return partitions
+
+
 def _gemma4_input_partitions(
     multimodal_data: dict[str, Any],
     metadata: MultimodalItemMetadata,
 ) -> dict[str, dict[str, MultimodalItemPartition]]:
-    """Declare item-major inputs and the packed frame spans of whole videos.
-
-    Position ids pad with their -1 padding sentinel when frames of different patch counts share
-    one encoder call.
-    """
+    """Declare item-major inputs and the packed frame spans of whole videos."""
     partitions = {}
-    for modality, fields in (
-        ("image", ("pixel_values", "image_position_ids", "image_seq_lens")),
-        ("video", ("pixel_values", "image_position_ids", "image_seq_lens")),
-        ("audio", ("audio_features", "audio_features_mask")),
-    ):
+    for modality, fields in _GEMMA4_ITEM_FIELDS.items():
         data = multimodal_data.get(modality)
         if not isinstance(data, dict):
             continue
@@ -255,7 +281,6 @@ def _gemma4_input_partitions(
         field_count = sum(item_lengths) if item_lengths is not None else item_count
         value = data.get(fields[0])
         if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == field_count:
-            modality_partitions = {}
             for name in fields:
                 value = data.get(name)
                 if value is None:
@@ -270,14 +295,7 @@ def _gemma4_input_partitions(
                     raise ValueError(
                         f"{modality}.{name} must have {field_count} entries on its leading axis"
                     )
-                modality_partitions[name] = MultimodalItemPartition(
-                    item_lengths=item_lengths,
-                    padding_value=-1 if name == "image_position_ids" else 0,
-                )
-            if "vision_normalization" in data:
-                modality_partitions["vision_normalization"] = MultimodalItemPartition(
-                    item_axis=None
-                )
+            modality_partitions = _gemma4_payload_partitions(data, modality, item_lengths)
             if frame_counts is not None:
                 modality_partitions["num_frames"] = MultimodalItemPartition()
             partitions[modality] = modality_partitions
@@ -1226,7 +1244,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         """Encode image, video, and audio groups, restoring the request item order.
 
         A payload whose item metadata declares no partitions is batched by the partitions that
-        item selection uses (`get_multimodal_item_partitions`), on a view of the request.
+        item selection uses (`get_multimodal_item_partitions`), on a view of the request. If its
+        items cannot be found that way (frames without `num_frames`), the whole payload is
+        encoded, as the encoder cache expects when it re-encodes such a request in full.
         """
         views = []
         for param in multimodal_params:
@@ -1243,16 +1263,17 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             metadata = param.item_metadata
             if inputs and metadata is not None and inputs[0] not in metadata.input_partitions:
                 partitions = self.get_multimodal_item_partitions(param, inputs[0])
-                if partitions is not None:
-                    metadata = MultimodalItemMetadata(
-                        metadata.item_refs,
-                        metadata.encoder_token_lengths,
-                        metadata.output_embedding_lengths,
-                        {**metadata.input_partitions, inputs[0]: partitions},
-                    )
-                    param = MultimodalParams(
-                        multimodal_data={**data, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
-                    )
+                if partitions is None:
+                    partitions = _gemma4_payload_partitions(data[inputs[0]], inputs[0])
+                metadata = MultimodalItemMetadata(
+                    metadata.item_refs,
+                    metadata.encoder_token_lengths,
+                    metadata.output_embedding_lengths,
+                    {**metadata.input_partitions, inputs[0]: partitions},
+                )
+                param = MultimodalParams(
+                    multimodal_data={**data, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+                )
             views.append(param)
         return encode_multimodal_by_groups(
             self.mm_encoder_groups,
