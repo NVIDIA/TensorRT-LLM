@@ -13,7 +13,7 @@ import socket
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
@@ -23,6 +23,7 @@ from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
+    BinaryIO,
     ClassVar,
     Dict,
     Generic,
@@ -835,6 +836,272 @@ _VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
 )
 
 
+# A keyframe seek pays off only when it skips a long run of decodes. Shorter
+# gaps are cheaper to decode through than to restart from a keyframe.
+_VIDEO_SEEK_MIN_SKIP_FRAMES = 64
+# Seek only when the plan decodes at most this fraction of the frames that
+# sequential decoding reads. A failed seek check decodes the video again from
+# the start, so this also keeps that case near (1 + ratio) x sequential.
+_VIDEO_SEEK_MAX_DECODE_RATIO = 0.5
+# OpenCV's FFmpeg backend asks for the keyframe at or before `target - 16` and
+# decodes forward to the target. FFmpeg picks that keyframe in decode order, so
+# with reordered frames it can start at a later keyframe; the planned anchor
+# never understates how many frames a seek decodes.
+_CV2_SEEK_PREROLL_FRAMES = 16
+# Bounds on the container index read to plan seeks. `mdat` is never read.
+_ISO_MAX_BOXES = 4096
+_ISO_MAX_TABLE_BYTES = 8 * 1024 * 1024
+
+
+def _iso_video_seek_anchors(
+    reader: BinaryIO, frame_count: int, targets: Sequence[int]
+) -> Optional[List[int]]:
+    """Return, per target frame, the earliest frame a keyframe seek starts decoding from.
+
+    Frame ordinals follow from the container index only for an unfragmented
+    ISO-BMFF file with one constant-rate video track: one `stts` entry covering
+    `frame_count` samples, composition offsets that form a contiguous
+    presentation grid, and at most one plain edit. The anchor of a target is the
+    last sync frame (from `stss`; every frame when it is absent) at or before
+    `target - _CV2_SEEK_PREROLL_FRAMES`, or -1 when there is none.
+
+    Returns None for any other input, so the caller decodes sequentially.
+    `reader` must not share its cursor with the decoder.
+    """
+    try:
+        reader.seek(0, os.SEEK_END)
+        source_end = reader.tell()
+        headers = 0
+
+        def read_at(start: int, size: int, end: int) -> bytes:
+            if start + size > end:
+                raise ValueError("short MP4 metadata")
+            reader.seek(start)
+            data = reader.read(size)
+            if len(data) != size:
+                raise ValueError("short MP4 metadata")
+            return data
+
+        def read_table(extent: Tuple[int, int]) -> bytes:
+            start, end = extent
+            if end - start > _ISO_MAX_TABLE_BYTES:
+                raise ValueError("MP4 table too large")
+            return read_at(start, end - start, end)
+
+        def boxes(start: int, end: int) -> List[Tuple[bytes, int, int]]:
+            nonlocal headers
+            result = []
+            while start < end:
+                headers += 1
+                if headers > _ISO_MAX_BOXES:
+                    raise ValueError("too many MP4 boxes")
+                header = read_at(start, 8, end)
+                size = int.from_bytes(header[:4], "big")
+                header_size = 8
+                if size == 1:
+                    size = int.from_bytes(read_at(start + 8, 8, end), "big")
+                    header_size = 16
+                elif size == 0:
+                    size = end - start
+                if size < header_size or start + size > end:
+                    raise ValueError("invalid MP4 box")
+                result.append((header[4:], start + header_size, start + size))
+                start += size
+            return result
+
+        def one(children: List[Tuple[bytes, int, int]], kind: bytes) -> Tuple[int, int]:
+            matches = [(start, end) for tag, start, end in children if tag == kind]
+            if len(matches) != 1:
+                raise ValueError("missing or ambiguous MP4 box")
+            return matches[0]
+
+        top = boxes(0, source_end)
+        ftyp = one(top, b"ftyp")
+        if ftyp[1] - ftyp[0] < 8 or (ftyp[1] - ftyp[0]) % 4:
+            return None
+        movie = boxes(*one(top, b"moov"))
+        if any(tag == b"moof" for tag, _, _ in top) or any(tag == b"mvex" for tag, _, _ in movie):
+            return None
+        video_tables = []
+        for tag, start, end in movie:
+            if tag != b"trak":
+                continue
+            track = boxes(start, end)
+            media = boxes(*one(track, b"mdia"))
+            hdlr_start, hdlr_end = one(media, b"hdlr")
+            handler = read_at(hdlr_start, 12, hdlr_end)
+            if handler[:4] != b"\0\0\0\0":
+                return None
+            if handler[8:12] != b"vide":
+                continue
+            edits = [(a, b) for tag, a, b in track if tag == b"edts"]
+            if edits:
+                if len(edits) != 1:
+                    return None
+                a, b = one(boxes(*edits[0]), b"elst")
+                if b - a not in (20, 28):
+                    return None
+                edit = read_at(a, b - a, b)
+                if (
+                    edit[0] > 1
+                    or len(edit) != (20 if edit[0] == 0 else 28)
+                    or edit[1:8] != b"\0\0\0\0\0\0\1"
+                    or edit[-4:] != b"\0\1\0\0"
+                    or int.from_bytes(
+                        edit[12:16] if edit[0] == 0 else edit[16:24], "big", signed=True
+                    )
+                    < 0
+                ):
+                    return None
+            video_tables.append(boxes(*one(boxes(*one(media, b"minf")), b"stbl")))
+        if len(video_tables) != 1:
+            return None
+        table = video_tables[0]
+
+        timing = read_table(one(table, b"stts"))
+        if len(timing) != 16 or timing[:8] != b"\0\0\0\0\0\0\0\1":
+            return None
+        count = int.from_bytes(timing[8:12], "big")
+        delta = int.from_bytes(timing[12:16], "big")
+        if count != frame_count or delta <= 0:
+            return None
+
+        # A frame's presentation ordinal is its decode ordinal plus its
+        # composition offset in frames (constant within a `ctts` run), counted
+        # from the earliest presentation slot.
+        run_ends = np.array([count], dtype=np.int64)
+        run_shifts = np.zeros(1, dtype=np.int64)
+        composition = [(start, end) for tag, start, end in table if tag == b"ctts"]
+        if composition:
+            if len(composition) != 1:
+                return None
+            payload = read_table(composition[0])
+            if len(payload) < 8 or payload[0] > 1 or payload[1:4] != b"\0\0\0":
+                return None
+            entries = int.from_bytes(payload[4:8], "big")
+            if not 0 < entries <= count or len(payload) != 8 + 8 * entries:
+                return None
+            values = np.frombuffer(payload, dtype=">u4", offset=8).reshape(-1, 2)
+            runs = values[:, 0].astype(np.int64)
+            offsets = values[:, 1]
+            if payload[0] == 1:
+                offsets = offsets.view(">i4")
+            offsets = offsets.astype(np.int64)
+            if np.any(runs == 0) or runs.sum() != count or np.any(offsets % delta):
+                return None
+            run_shifts = offsets // delta
+            run_ends = np.cumsum(runs)
+            starts = run_ends - runs + run_shifts
+            order = np.argsort(starts)
+            if np.any(starts[order][1:] != (starts + runs)[order][:-1]):
+                return None
+            run_shifts -= starts.min()
+
+        latest = np.asarray(targets, dtype=np.int64) - _CV2_SEEK_PREROLL_FRAMES
+        sync = [(start, end) for tag, start, end in table if tag == b"stss"]
+        if not sync:
+            return np.maximum(latest, -1).tolist()
+        if len(sync) != 1:
+            return None
+        payload = read_table(sync[0])
+        if len(payload) < 8 or payload[:4] != b"\0\0\0\0":
+            return None
+        entries = int.from_bytes(payload[4:8], "big")
+        if not 0 < entries <= count or len(payload) != 8 + 4 * entries:
+            return None
+        samples = np.frombuffer(payload, dtype=">u4", offset=8).astype(np.int64) - 1
+        if samples[0] < 0 or samples[-1] >= count or np.any(np.diff(samples) <= 0):
+            return None
+        sync_frames = np.sort(
+            samples + run_shifts[np.searchsorted(run_ends, samples, side="right")]
+        )
+        position = np.searchsorted(sync_frames, latest, side="right") - 1
+        return np.where(position >= 0, sync_frames[np.maximum(position, 0)], -1).tolist()
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def _plan_video_seeks(indices: Sequence[int], anchors: Sequence[int]) -> Tuple[Dict[int, int], int]:
+    """Plan the keyframe seeks for the sampled frame `indices`.
+
+    `anchors[i]` is the first frame a seek to `indices[i]` decodes, from
+    `_iso_video_seek_anchors`. Frames 0 and 1 are always decoded, because the
+    seek checks need them. Then, at frame 2 and at the frame after each sampled
+    frame, the next sampled frame is reached by a seek when its anchor is at
+    least `_VIDEO_SEEK_MIN_SKIP_FRAMES` ahead, and by decoding on otherwise.
+    Later frames only bring the anchor closer, so that first check decides.
+    The decode loop follows the returned plan, so the plan and the loop cannot
+    differ.
+
+    Returns `(seeks, decoded)`. `seeks` maps each frame position where the loop
+    seeks to the sampled frame it seeks to. `decoded` is the planned number of
+    decoded frames; a seek decodes `target - anchor + 1` frames.
+    """
+    seeks: Dict[int, int] = {}
+    frame_idx = min(2, indices[-1] + 1)
+    decoded = frame_idx
+    for target, anchor in zip(indices, anchors):
+        if target < frame_idx:
+            continue
+        if anchor - frame_idx >= _VIDEO_SEEK_MIN_SKIP_FRAMES:
+            seeks[frame_idx] = target
+            decoded += target - anchor + 1
+        else:
+            decoded += target - frame_idx + 1
+        frame_idx = target + 1
+    return seeks, decoded
+
+
+# Failed seek checks in this process. Each one reopens the video and decodes it
+# sequentially; only the first one is logged.
+_video_seek_fallbacks = 0
+_video_seek_fallbacks_lock = threading.Lock()
+
+
+def _count_video_seek_fallback(target: int) -> None:
+    """Count a failed seek check and log the first one in this process."""
+    global _video_seek_fallbacks
+    with _video_seek_fallbacks_lock:
+        _video_seek_fallbacks += 1
+        first = _video_seek_fallbacks == 1
+    if first:
+        logger.warning(
+            f"Video seek to frame {target} failed its position check "
+            f"(OpenCV {_get_cv2().__version__}); decoding the video sequentially "
+            "instead. The frames are the same, only slower. Later fallbacks are "
+            "counted but not logged."
+        )
+
+
+def _cv2_seek_and_grab(
+    capture: Any, target: int, first_pts: float, first_msec: float, fps: float
+) -> bool:
+    """Seek `capture` to frame `target`, grab it and verify the decoder landed there.
+
+    The position must read `target` before and `target + 1` after the grab, and
+    the frame's PTS and time must continue the first frame's on a constant-rate
+    grid. Returns False on any mismatch, non-finite value or OpenCV error; the
+    capture position is then unknown.
+    """
+    cv2 = _get_cv2()
+    try:
+        if not (
+            capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+            and capture.get(cv2.CAP_PROP_POS_FRAMES) == target
+            and capture.grab()
+        ):
+            return False
+        msec = capture.get(cv2.CAP_PROP_POS_MSEC)
+        return (
+            capture.get(cv2.CAP_PROP_POS_FRAMES) == target + 1
+            and capture.get(cv2.CAP_PROP_PTS) == first_pts + target
+            and math.isfinite(msec)
+            and abs(msec - first_msec - target * 1000 / fps) <= 1
+        )
+    except cv2.error:
+        return False
+
+
 def _load_video_by_cv2(
     video: Union[str, bytes],
     num_frames: int = 10,
@@ -881,17 +1148,21 @@ def _load_video_by_cv2(
     #       the caller-supplied stream-buffered backend. The buffer is held
     #       alive in `video_buf` because cv2 keeps a non-owning view into it.
     video_buf: Optional[BytesIO] = None
-    if isinstance(video, (bytes, bytearray, memoryview)):
-        if cv2_backend is None:
-            raise ValueError(
-                "cv2_backend must be provided when `video` is bytes; "
-                "callers without a stream-buffered backend should spill "
-                "the bytes to a tempfile and pass the path instead."
-            )
-        video_buf = BytesIO(bytes(video))
-        vidcap = cv2.VideoCapture(video_buf, cv2_backend, [])
-    else:
-        vidcap = cv2.VideoCapture(video)
+
+    def open_capture() -> "cv2.VideoCapture":
+        nonlocal video_buf
+        if isinstance(video, (bytes, bytearray, memoryview)):
+            if cv2_backend is None:
+                raise ValueError(
+                    "cv2_backend must be provided when `video` is bytes; "
+                    "callers without a stream-buffered backend should spill "
+                    "the bytes to a tempfile and pass the path instead."
+                )
+            video_buf = BytesIO(bytes(video))
+            return cv2.VideoCapture(video_buf, cv2_backend, [])
+        return cv2.VideoCapture(video)
+
+    vidcap = open_capture()
 
     decoded_memory_reservation: Optional[_DecodedMemoryReservation] = None
     try:
@@ -935,13 +1206,71 @@ def _load_video_by_cv2(
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
         frame_idx = 0
+        # Seek past long runs of unselected frames when the container index
+        # gives exact frame ordinals and the plan skips most of the decode.
+        # Dense sampling never reads the index; other containers are rejected
+        # after their first few header bytes.
+        seek_plan: Optional[Dict[int, int]] = None
+        if hasattr(cv2, "CAP_PROP_PTS") and any(
+            b - a >= _VIDEO_SEEK_MIN_SKIP_FRAMES for a, b in zip(indices, indices[1:])
+        ):
+            try:
+                # Read the index through a cursor the decoder does not use.
+                with (
+                    BytesIO(video_buf.getvalue()) if video_buf is not None else open(video, "rb")
+                ) as reader:
+                    seek_anchors = _iso_video_seek_anchors(reader, frame_count, indices)
+                if seek_anchors is not None:
+                    seek_plan, planned_frames = _plan_video_seeks(indices, seek_anchors)
+                    if (
+                        planned_frames > _VIDEO_SEEK_MAX_DECODE_RATIO * (max_idx + 1)
+                        or vidcap.get(cv2.CAP_PROP_BACKEND) != cv2.CAP_FFMPEG
+                    ):
+                        seek_plan = None
+            except (OSError, cv2.error):
+                seek_plan = None
+        first_msec = None
+        first_pts = None
         while frame_idx <= max_idx:
             if decoded_memory_reservation is not None:
                 decoded_memory_reservation.check_cancelled()
-            if not vidcap.grab():
+            target = seek_plan.get(frame_idx) if seek_plan is not None else None
+            if target is not None:
+                if not _cv2_seek_and_grab(vidcap, target, first_pts, first_msec, original_fps):
+                    # A failed seek may have moved the decoder. Only a fresh
+                    # capture gives a known ordinal, including early EOF in
+                    # overstated metadata.
+                    _count_video_seek_fallback(target)
+                    vidcap.release()
+                    vidcap = open_capture()
+                    seek_plan = None
+                    frame_idx = 0
+                    valid_indices.clear()
+                    continue
+                frame_idx = target
+                grabbed = True
+            else:
+                grabbed = vidcap.grab()
+            if not grabbed:
                 break
             if decoded_memory_reservation is not None:
                 decoded_memory_reservation.check_cancelled()
+            if seek_plan is not None and frame_idx < 2:
+                # Seek verification extrapolates the first two frames' PTS and
+                # time; require them to step by exactly one frame.
+                try:
+                    msec = vidcap.get(cv2.CAP_PROP_POS_MSEC)
+                    pts = vidcap.get(cv2.CAP_PROP_PTS)
+                    if not (math.isfinite(msec) and math.isfinite(pts)):
+                        seek_plan = None
+                    elif frame_idx == 0:
+                        first_msec, first_pts = msec, pts
+                    elif not (
+                        pts == first_pts + 1 and abs(msec - first_msec - 1000 / original_fps) <= 1
+                    ):
+                        seek_plan = None
+                except cv2.error:
+                    seek_plan = None
             if frame_idx in target_set:
                 # Reuse a single BGR buffer across retrieves; cv2 replaces its
                 # contents in place when the argument is shape-compatible.

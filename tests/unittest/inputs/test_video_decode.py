@@ -42,6 +42,501 @@ def sample_video_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     return str(path)
 
 
+@pytest.fixture(scope="module")
+def seek_video_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Encode enough tiny frames to exercise sparse sampling and seeking."""
+    path = tmp_path_factory.mktemp("video_seek") / "sample.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (64, 64))
+    assert writer.isOpened(), "OpenCV must support the mp4v test codec"
+    rng = np.random.default_rng(0)
+    for _ in range(1025):
+        writer.write(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8))
+    writer.release()
+    return str(path)
+
+
+def _sequential_sample(path: str, num_frames: int = 3) -> tuple[list[int], np.ndarray]:
+    capture = cv2.VideoCapture(path)
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        indices = np.linspace(0, frame_count - 1, num_frames, dtype=int).tolist()
+        frames = []
+        valid_indices = []
+        for index in range(indices[-1] + 1):
+            if not capture.grab():
+                break
+            if index in indices:
+                ok, frame = capture.retrieve()
+                assert ok
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                valid_indices.append(index)
+        return valid_indices, np.stack(frames)
+    finally:
+        capture.release()
+
+
+# A real H.264 clip with B-frames (keyframes every 4 frames) kept for other tests.
+_H264_B_FRAMES_VIDEO = (
+    Path(__file__).parents[1] / "_torch/visual_gen/test_data/cosmos3_v2v_ref_9f_bframes.mp4"
+)
+
+
+def _mp4_box(kind: bytes, payload: bytes = b"") -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+
+def _mp4_timing_box(kind: bytes, entries: list[tuple[int, int]], version: int = 0) -> bytes:
+    payload = b"".join(
+        count.to_bytes(4, "big") + value.to_bytes(4, "big", signed=version == 1)
+        for count, value in entries
+    )
+    return _mp4_box(kind, bytes([version]) + bytes(3) + len(entries).to_bytes(4, "big") + payload)
+
+
+def _mp4_sync_box(samples: list[int]) -> bytes:
+    numbers = b"".join(sample.to_bytes(4, "big") for sample in samples)
+    return _mp4_box(b"stss", bytes(4) + len(samples).to_bytes(4, "big") + numbers)
+
+
+def _mp4_index(table: bytes, track_extra: bytes = b"") -> bytes:
+    """Return the `ftyp` and `moov` boxes of a one-video-track MP4 with sample table `table`."""
+    media = _mp4_box(b"hdlr", bytes(8) + b"vide") + _mp4_box(b"minf", _mp4_box(b"stbl", table))
+    track = _mp4_box(b"mdia", media) + track_extra
+    return _mp4_box(b"ftyp", b"isom" + bytes(4)) + _mp4_box(b"moov", _mp4_box(b"trak", track))
+
+
+@pytest.mark.parametrize("format", ["np", "pt", "pil"])
+def test_sparse_seek_matches_sequential_frames(seek_video_path: str, format: str) -> None:
+    indices, expected = _sequential_sample(seek_video_path)
+    capture_type = cv2.VideoCapture
+    captures = []
+
+    def open_capture(*args: object) -> Mock:
+        capture = Mock(wraps=capture_type(*args))
+        captures.append(capture)
+        return capture
+
+    with patch.object(cv2, "VideoCapture", side_effect=open_capture):
+        video = _load_video_by_cv2(seek_video_path, num_frames=3, fps=-1, format=format)
+
+    assert video.metadata["frames_indices"] == indices
+    if hasattr(cv2, "CAP_PROP_PTS"):
+        assert any(capture.set.called for capture in captures)
+    if format == "pt":
+        expected_pt = expected.astype(np.float32)
+        expected_pt *= 1.0 / 255.0
+        assert torch.equal(
+            torch.stack(video.frames), torch.from_numpy(expected_pt).permute(0, 3, 1, 2)
+        )
+    else:
+        actual = video.frames if format == "np" else np.stack([np.asarray(f) for f in video.frames])
+        assert actual.dtype == np.uint8
+        assert np.array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "failure", ["set", "position", "pts", "nan_msec", "grab_error", "get_error"]
+)
+def test_sparse_seek_failure_falls_back_to_sequential(
+    seek_video_path: str, failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(cv2, "CAP_PROP_PTS"):
+        pytest.skip("OpenCV cannot verify seek timestamps")
+    monkeypatch.setattr(media_io, "_video_seek_fallbacks", 0)
+    indices, expected = _sequential_sample(seek_video_path)
+    capture_type = cv2.VideoCapture
+    captures = []
+
+    def open_capture(*args: object) -> Mock:
+        source = capture_type(*args)
+        capture = Mock(wraps=source)
+        captures.append(capture)
+        if len(captures) == 1:
+            if failure == "set":
+                capture.set.side_effect = lambda key, value: source.set(key, value) and False
+            elif failure == "grab_error":
+
+                def grab() -> bool:
+                    if capture.set.called:
+                        raise cv2.error("seek decode failed")
+                    return source.grab()
+
+                capture.grab.side_effect = grab
+            else:
+
+                def get(key: int) -> float:
+                    if capture.set.called:
+                        if failure == "get_error":
+                            raise cv2.error("seek position unavailable")
+                        if failure == "nan_msec" and key == cv2.CAP_PROP_POS_MSEC:
+                            return float("nan")
+                        property_id = (
+                            cv2.CAP_PROP_POS_FRAMES if failure == "position" else cv2.CAP_PROP_PTS
+                        )
+                        if key == property_id and failure in ("position", "pts"):
+                            return -1
+                    return source.get(key)
+
+                capture.get.side_effect = get
+        return capture
+
+    with patch.object(cv2, "VideoCapture", side_effect=open_capture):
+        video = _load_video_by_cv2(seek_video_path, num_frames=3, fps=-1, format="np")
+
+    assert captures[0].set.called
+    assert len(captures) >= 2
+    assert media_io._video_seek_fallbacks == 1
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+@pytest.mark.parametrize("failure", ["backend_error", "first_pts_error", "second_msec_nan"])
+def test_sparse_seek_unverifiable_preflight_stays_sequential(
+    seek_video_path: str, failure: str
+) -> None:
+    indices, expected = _sequential_sample(seek_video_path)
+    source = cv2.VideoCapture(seek_video_path)
+    capture = Mock(wraps=source)
+
+    def get(key: int) -> float:
+        position = source.get(cv2.CAP_PROP_POS_FRAMES)
+        if failure == "backend_error" and key == cv2.CAP_PROP_BACKEND:
+            raise cv2.error("backend unavailable")
+        if (
+            failure == "first_pts_error"
+            and key == getattr(cv2, "CAP_PROP_PTS", None)
+            and position == 1
+        ):
+            raise cv2.error("presentation timestamp unavailable")
+        if failure == "second_msec_nan" and key == cv2.CAP_PROP_POS_MSEC and position == 2:
+            return float("nan")
+        return source.get(key)
+
+    capture.get.side_effect = get
+    with patch.object(cv2, "VideoCapture", return_value=capture):
+        video = _load_video_by_cv2(seek_video_path, num_frames=3, fps=-1, format="np")
+    capture.set.assert_not_called()
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+@pytest.mark.parametrize(
+    "metadata_case",
+    [
+        "cfr",
+        "integer_ctts",
+        "signed_ctts",
+        "valid_single_edit",
+        "sync_frames",
+        "long_gop",
+        "bad_sync_frames",
+        "complex_edits",
+        "unknown",
+        "multi_stts",
+        "wrong_count",
+        "fractional_ctts",
+        "ctts_gap",
+        "bad_extent",
+        "fragmented",
+    ],
+)
+def test_sparse_seek_requires_indexed_constant_rate_metadata(
+    seek_video_path: str, metadata_case: str
+) -> None:
+    indices, expected = _sequential_sample(seek_video_path)
+
+    timing = [(1025, 512)]
+    if metadata_case == "multi_stts":
+        timing = [(512, 512), (513, 512)]
+    elif metadata_case == "wrong_count":
+        timing = [(1024, 512)]
+    table = _mp4_timing_box(b"stts", timing)
+    if metadata_case == "integer_ctts":
+        # Reordered presentation timestamps still cover one contiguous grid.
+        table += _mp4_timing_box(b"ctts", [(1, 1024), (1, 0)] * 512 + [(1, 512)])
+    elif metadata_case == "signed_ctts":
+        table += _mp4_timing_box(b"ctts", [(1, 512), (1, -512)] * 512 + [(1, 0)], version=1)
+    elif metadata_case == "fractional_ctts":
+        table += _mp4_timing_box(b"ctts", [(1025, 1)])
+    elif metadata_case == "ctts_gap":
+        table += _mp4_timing_box(b"ctts", [(1, 0), (1024, 1024)])
+    elif metadata_case == "sync_frames":
+        table += _mp4_sync_box(list(range(1, 1026, 30)))
+    elif metadata_case == "long_gop":
+        # The only keyframe is the first frame: seeking would decode from it again.
+        table += _mp4_sync_box([1])
+    elif metadata_case == "bad_sync_frames":
+        table += _mp4_sync_box([1, 2000])
+    track_extra = b""
+    if metadata_case in ("valid_single_edit", "complex_edits"):
+        edit_count = 1 if metadata_case == "valid_single_edit" else 2
+        edit = (1025 * 512).to_bytes(4, "big") + (1024).to_bytes(4, "big") + b"\0\1\0\0"
+        track_extra = _mp4_box(
+            b"edts", _mp4_box(b"elst", bytes(4) + edit_count.to_bytes(4, "big") + edit * edit_count)
+        )
+    metadata = _mp4_index(table, track_extra)
+    if metadata_case == "unknown":
+        metadata = b"not an indexed MP4"
+    elif metadata_case == "bad_extent":
+        metadata = metadata[:-1]
+    elif metadata_case == "fragmented":
+        metadata += _mp4_box(b"moof")
+
+    capture = Mock(wraps=cv2.VideoCapture(seek_video_path))
+    with (
+        patch("builtins.open", side_effect=lambda *_args, **_kwargs: BytesIO(metadata)),
+        patch.object(cv2, "VideoCapture", return_value=capture),
+    ):
+        video = _load_video_by_cv2(seek_video_path, num_frames=3, fps=-1, format="np")
+    expected_seek = metadata_case in (
+        "cfr",
+        "integer_ctts",
+        "signed_ctts",
+        "valid_single_edit",
+        "sync_frames",
+    ) and hasattr(cv2, "CAP_PROP_PTS")
+    assert capture.set.called == expected_seek
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+@pytest.mark.parametrize("sync_frames", [False, True])
+def test_seek_anchors_follow_presentation_order(sync_frames: bool) -> None:
+    # Decode order I P B B per group of four; composition offsets of 2/4/1/1
+    # frames present them as I B B P, so each I frame is presentation frame 4k.
+    count = 1200
+    table = _mp4_timing_box(b"stts", [(count, 512)])
+    table += _mp4_timing_box(b"ctts", [(1, 1024), (1, 2048), (2, 512)] * (count // 4))
+    if sync_frames:
+        table += _mp4_sync_box(list(range(1, count + 1, 4)))
+    anchors = media_io._iso_video_seek_anchors(BytesIO(_mp4_index(table)), count, [0, 600, 1199])
+    # A seek starts at the last sync frame at or before target - 16.
+    assert anchors == ([-1, 584, 1180] if sync_frames else [-1, 584, 1183])
+
+
+def test_dense_sampling_keeps_sequential_decode(seek_video_path: str) -> None:
+    # No gap reaches the seek threshold, so decoding matches the sequential
+    # path call for call: no index read and no timestamp or backend queries.
+    indices, expected = _sequential_sample(seek_video_path, num_frames=32)
+    assert max(b - a for a, b in zip(indices, indices[1:])) < media_io._VIDEO_SEEK_MIN_SKIP_FRAMES
+    capture = Mock(wraps=cv2.VideoCapture(seek_video_path))
+    with (
+        patch("builtins.open", side_effect=AssertionError("index must not be read")),
+        patch.object(cv2, "VideoCapture", return_value=capture),
+    ):
+        video = _load_video_by_cv2(seek_video_path, num_frames=32, fps=-1, format="np")
+    queried = {call.args[0] for call in capture.get.call_args_list}
+    assert queried == {cv2.CAP_PROP_FRAME_COUNT, cv2.CAP_PROP_FPS}
+    capture.set.assert_not_called()
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+def test_sparse_seek_h264_b_frames_fixture_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The clip is short, so lower the thresholds to seek between its keyframes.
+    if not hasattr(cv2, "CAP_PROP_PTS"):
+        pytest.skip("OpenCV cannot verify seek timestamps")
+    monkeypatch.setattr(media_io, "_VIDEO_SEEK_MIN_SKIP_FRAMES", 1)
+    monkeypatch.setattr(media_io, "_CV2_SEEK_PREROLL_FRAMES", 0)
+    path = str(_H264_B_FRAMES_VIDEO)
+    indices, expected = _sequential_sample(path)
+    capture_type = cv2.VideoCapture
+    captures = []
+
+    def open_capture(*args: object) -> Mock:
+        capture = Mock(wraps=capture_type(*args))
+        captures.append(capture)
+        return capture
+
+    with patch.object(cv2, "VideoCapture", side_effect=open_capture):
+        video = _load_video_by_cv2(path, num_frames=3, fps=-1, format="np")
+    # Seeks were verified on the reordered stream without a sequential replay.
+    assert len(captures) == 1
+    assert captures[0].set.call_count == 2
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+def test_sparse_seek_bytes_matches_sequential_frames(seek_video_path: str) -> None:
+    backend = media_io._select_cv2_stream_buffered_backend()
+    if backend is None:
+        pytest.skip("OpenCV has no stream-buffered video backend")
+    indices, expected = _sequential_sample(seek_video_path)
+    video = _load_video_by_cv2(
+        Path(seek_video_path).read_bytes(),
+        num_frames=3,
+        fps=-1,
+        format="np",
+        cv2_backend=backend,
+    )
+    assert video.metadata["frames_indices"] == indices
+    assert np.array_equal(video.frames, expected)
+
+
+def test_sparse_seek_overstated_frame_count_stops_at_eof(seek_video_path: str) -> None:
+    indices, expected = _sequential_sample(seek_video_path)
+    capture_type = cv2.VideoCapture
+
+    def open_capture(*args: object) -> Mock:
+        source = capture_type(*args)
+        capture = Mock(wraps=source)
+        capture.get.side_effect = lambda key: (
+            2049 if key == cv2.CAP_PROP_FRAME_COUNT else source.get(key)
+        )
+        return capture
+
+    with patch.object(cv2, "VideoCapture", side_effect=open_capture):
+        video = _load_video_by_cv2(seek_video_path, num_frames=3, fps=-1, format="np")
+
+    assert video.metadata["frames_indices"] == [indices[0], indices[-1]]
+    assert np.array_equal(video.frames, expected[[0, -1]])
+    assert video.frames.base is None
+
+
+class _KeyframeCapture:
+    """Constant-rate capture that counts decoded frames like OpenCV's FFmpeg backend.
+
+    `grab()` decodes one frame. A seek to `target` decodes from the last
+    keyframe at or before `target - 16` up to the frame before `target`, and
+    the next `grab()` decodes `target`.
+    """
+
+    def __init__(self, frame_count: int, keyframes: list[int], fail_seeks: bool) -> None:
+        self.frame_count = frame_count
+        self.keyframes = keyframes
+        self.fail_seeks = fail_seeks
+        self.position = 0
+        self.decoded = 0
+        self.seeks: list[int] = []
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, key: int) -> float:
+        last = self.position - 1
+        return {
+            cv2.CAP_PROP_FRAME_COUNT: self.frame_count,
+            cv2.CAP_PROP_FPS: 30.0,
+            cv2.CAP_PROP_BACKEND: cv2.CAP_FFMPEG,
+            cv2.CAP_PROP_POS_FRAMES: self.position,
+            cv2.CAP_PROP_PTS: last,
+            cv2.CAP_PROP_POS_MSEC: last * 1000 / 30.0,
+        }[key]
+
+    def grab(self) -> bool:
+        if self.position >= self.frame_count:
+            return False
+        self.position += 1
+        self.decoded += 1
+        return True
+
+    def set(self, key: int, target: float) -> bool:
+        assert key == cv2.CAP_PROP_POS_FRAMES
+        target = int(target)
+        self.seeks.append(target)
+        self.decoded += target - max(k for k in self.keyframes if k <= max(target - 16, 0))
+        self.position = target
+        return not self.fail_seeks
+
+    def retrieve(self, scratch: np.ndarray | None = None) -> tuple[bool, np.ndarray]:
+        return True, np.full((2, 2, 3), (self.position - 1) % 256, dtype=np.uint8)
+
+    def release(self) -> None:
+        pass
+
+
+def _keyframe_index(frame_count: int, keyframes: list[int]) -> bytes:
+    table = _mp4_timing_box(b"stts", [(frame_count, 512)])
+    return _mp4_index(table + _mp4_sync_box([k + 1 for k in keyframes]))
+
+
+def _decode_with_keyframes(
+    frame_count: int, keyframes: list[int], num_frames: int, fail_first_seek: bool = False
+) -> tuple[VideoData, list[_KeyframeCapture]]:
+    metadata = _keyframe_index(frame_count, keyframes)
+    captures: list[_KeyframeCapture] = []
+
+    def open_capture(*_args: object) -> _KeyframeCapture:
+        captures.append(_KeyframeCapture(frame_count, keyframes, fail_first_seek and not captures))
+        return captures[-1]
+
+    with (
+        patch("builtins.open", side_effect=lambda *_args, **_kwargs: BytesIO(metadata)),
+        patch.object(cv2, "VideoCapture", side_effect=open_capture),
+    ):
+        video = _load_video_by_cv2("video.mp4", num_frames=num_frames, fps=-1, format="np")
+    return video, captures
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "num_frames", "max_ratio", "planned_frames"),
+    [
+        # About 17 minutes at 30 fps with a keyframe every 250 frames.
+        (30000, 10, None, 1502),
+        (30000, 64, None, 9002),
+        # A 785-frame clip: its one seek saves too little, so the gate keeps it sequential.
+        (785, 10, None, 721),
+        (785, 10, 1.0, 721),
+        # Many samples between keyframes: some seeks pay, but not most of the decode.
+        (30000, 128, None, 18803),
+        (30000, 128, 1.0, 18803),
+    ],
+)
+def test_seek_plan_gates_and_matches_decoded_frames(
+    frame_count: int,
+    num_frames: int,
+    max_ratio: float | None,
+    planned_frames: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(cv2, "CAP_PROP_PTS"):
+        pytest.skip("OpenCV cannot verify seek timestamps")
+    if max_ratio is not None:
+        monkeypatch.setattr(media_io, "_VIDEO_SEEK_MAX_DECODE_RATIO", max_ratio)
+    keyframes = list(range(0, frame_count, 250))
+    indices = np.linspace(0, frame_count - 1, num_frames, dtype=int).tolist()
+    anchors = media_io._iso_video_seek_anchors(
+        BytesIO(_keyframe_index(frame_count, keyframes)), frame_count, indices
+    )
+    seeks, planned = media_io._plan_video_seeks(indices, anchors)
+    assert planned == planned_frames
+
+    video, captures = _decode_with_keyframes(frame_count, keyframes, num_frames)
+
+    [capture] = captures
+    assert video.metadata["frames_indices"] == indices
+    assert video.frames[:, 0, 0, 0].tolist() == [i % 256 for i in indices]
+    if planned <= media_io._VIDEO_SEEK_MAX_DECODE_RATIO * frame_count:
+        # The loop seeks exactly where the plan does and decodes what it counted.
+        assert seeks and capture.seeks == list(seeks.values())
+        assert capture.decoded == planned
+    else:
+        # The index is read, but the weak plan keeps the sequential path.
+        assert seeks
+        assert capture.seeks == []
+        assert capture.decoded == frame_count
+
+
+def test_seek_fallback_warns_once_and_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not hasattr(cv2, "CAP_PROP_PTS"):
+        pytest.skip("OpenCV cannot verify seek timestamps")
+    monkeypatch.setattr(media_io, "_video_seek_fallbacks", 0)
+    keyframes = list(range(0, 30000, 250))
+    indices = np.linspace(0, 29999, 10, dtype=int).tolist()
+    with patch.object(media_io.logger, "warning") as warning:
+        for _ in range(2):
+            video, captures = _decode_with_keyframes(30000, keyframes, 10, fail_first_seek=True)
+            # The failed seek reopens the video; the new capture decodes it in order.
+            assert [len(capture.seeks) for capture in captures] == [1, 0]
+            assert captures[1].decoded == 30000
+            assert video.metadata["frames_indices"] == indices
+    assert media_io._video_seek_fallbacks == 2
+    warning.assert_called_once()
+    assert "decoding the video sequentially" in warning.call_args.args[0]
+
+
 def test_np_format_returns_stacked_uint8_ndarray(sample_video_path: str) -> None:
     video = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
     assert isinstance(video.frames, np.ndarray)
