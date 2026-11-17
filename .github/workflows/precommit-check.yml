@@ -68,6 +68,18 @@ jobs:
           fi
           python3 -u scripts/release_check.py $args
 
+      - name: Fetch LFS sources for the C++ license check
+        run: |
+          # Match the source extensions in check_cpp_licenses.py, excluding binary assets.
+          include=()
+          for directory in cpp/include cpp/tensorrt_llm; do
+            for extension in h cpp cuh cu inl map py; do
+              include+=("$directory/**/*.$extension")
+            done
+          done
+          IFS=,
+          git lfs pull --include="${include[*]}" --exclude="" origin
+
       - name: Check C++ license headers
         run: python3 scripts/check_cpp_licenses.py
 

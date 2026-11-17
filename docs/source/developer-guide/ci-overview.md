@@ -42,8 +42,10 @@ the pre-commit checks, within the **Pre-commit Check** job. It scans `cpp/includ
 and `cpp/tensorrt_llm`, including the Python helpers in those directories. It
 checks full Apache license headers and uses the filters and exceptions in
 `jenkins/license_cpp.json`. Jenkins Release-Check retains its Go license checker;
-the GHA checker shares its policy configuration. Run the GHA checker locally
-without installing dependencies:
+the GHA checker shares its policy configuration. The workflow fetches Git LFS
+source files in the scanned directories before checking their headers, without
+fetching binary assets. Run the GHA checker locally without installing dependencies
+after materializing any LFS source files:
 
 ```bash
 python3 scripts/check_cpp_licenses.py
