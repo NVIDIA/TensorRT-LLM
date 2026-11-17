@@ -173,6 +173,37 @@ TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
 effective policy, so `auto` selection and native fallback remain observable;
 activation logs also report the local reader assignment.
 
+### Releasing the page cache after loading
+
+Once the weights are loaded, the checkpoint files stay in the host's page cache
+until the kernel needs the memory or the file system drops them. A Lustre client
+drops a file's cached pages once its lock has been idle for
+`ldlm.namespaces.*.lru_max_age`. When that is 10 minutes, the drop of a few
+hundred GB, and the kernel's compaction of the freed memory, can land about 10
+minutes into serving, where host threads that touch pages under migration stall.
+
+`TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE=1` (default: off) moves both into startup.
+Once every rank of the server on a node has finished loading, rank 0 of the node
+advises the kernel to drop (`POSIX_FADV_DONTNEED`) the page cache of the
+top-level files of every directory the load read checkpoint files from: the
+checkpoint (or a multimodal model's LLM checkpoint) and a separate draft model.
+If that dropped at least 1 GiB, it then waits, up to 120 s, until page migration
+(`pgmigrate_success` in `/proc/vmstat`) settles. Loads that read no checkpoint
+files, such as GMS read-only instances and ModelExpress P2P receivers, drop
+nothing. The time spent is reported as the
+`checkpoint_page_cache_release_seconds` startup metric.
+
+- A later restart reads the checkpoint from storage again.
+- Other servers on the node that read the same files are not coordinated with.
+- The setting is ignored when MPI is disabled (`TLLM_DISABLE_MPI=1`, as under Ray).
+
+Perf-sanity turns it on for its GB300 servers on nodes whose Lustre client ages
+idle locks out within 10 minutes (`lru_max_age` of at most 600000 ms), as on
+oci-jhb and oci-aga. It sets it through `env_overrides` in the generated server
+config, which every rank applies before loading, and leaves DWDP context
+instances out. A server's YAML `env_vars`, then the job's environment, take
+precedence.
+
 ### CI startup experiment
 
 Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
@@ -183,8 +214,10 @@ numeric root Jenkins build number modulo 2 to assign `native` to even builds and
 50/50 assignment across consecutive root builds without adding CI stages or
 model launches; successful observations may not be evenly split. Every rank
 and node in one distributed startup receives the same concrete policy. The
-experiment version is `checkpoint-io-v4-postmerge-50-auto-50-native`, distinct
-from the previous 75/25 assignment.
+experiment version is `checkpoint-io-v5-postmerge-50-auto-50-native`. Version 4
+had the same assignment, before GB300 perf-sanity servers on Lustre nodes
+started releasing the page cache after loading (see above), so that later
+loads there no longer find a checkpoint an earlier load left cached.
 Non-telemetry runs, invalid or missing post-merge build identities,
 incompatible configurations, and purpose-built configs with an explicit
 `checkpoint_io_policy` are not assigned and retain their normal configuration,
