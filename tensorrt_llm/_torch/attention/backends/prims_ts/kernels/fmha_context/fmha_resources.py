@@ -3915,9 +3915,14 @@ class TmemSPResource(MemoryResource):
         self._init_work_tile_state(stage_info)
         if cutlass.const_expr(self.cfg.fixed_dense_k_tail > 0):
             # Bind after the softmax register allocation, like its TMEM addresses.
-            self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
-                self.cfg.kv_tile_n
-            ) + Int32(1)
+            # V repair pads the K/V rows to whole tiles and the row count holds
+            # no tail. A repair plan is fixed and knows the tail at compile time.
+            if cutlass.const_expr(self.vc_repair_tiles > 0):
+                self.k_tail_rows = Int32(self.cfg.fixed_dense_k_tail)
+            else:
+                self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
+                    self.cfg.kv_tile_n
+                ) + Int32(1)
         return (
             Float32(_SOFTMAX_MASK_VALUE),
             Float32(_SOFTMAX_MASK_VALUE),

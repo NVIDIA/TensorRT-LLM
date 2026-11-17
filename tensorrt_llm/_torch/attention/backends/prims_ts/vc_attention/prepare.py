@@ -540,23 +540,24 @@ class VcKvPass2(_Shape):
                 ).store(acc)
 
         # Step 2. Reload the permuted V rows, subtract the tile mean, quantize the
-        # residuals to E4M3 and store them at the shifted output row.
+        # residuals to E4M3 and store them at the shifted output row. Rows past
+        # the sequence read the last token's slot and are skipped below. No row
+        # address needs a predicate.
         mean = _load_row_f32(mean_base + col0 * 4)
         raw = cutlass.Array(
             Int32, _ROWS_PER_THREAD * _WORDS, space=cutlass.AddressSpace.rmem
         )
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
-            pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
-            tok = Int32(0)
-            if pos < self.seq_len_kv:
-                tok = pos
-                if cutlass.const_expr(mPerm is not None):
-                    tok = cutlass.inttoptr(
-                        mPerm.iterator.toint()
-                        + (Int64(bh) * self.seq_len_kv + pos) * 4,
-                        mem_space=1,
-                        dtype=Int32,
-                    ).load()
+            pos = cute.math.min(
+                t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i, Int32(self.seq_len_kv - 1)
+            )
+            tok = pos
+            if cutlass.const_expr(mPerm is not None):
+                tok = cutlass.inttoptr(
+                    mPerm.iterator.toint() + (Int64(bh) * self.seq_len_kv + pos) * 4,
+                    mem_space=1,
+                    dtype=Int32,
+                ).load()
             _load_raw(raw, i * _WORDS, v_base + Int64(tok) * self.row_bytes)
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i

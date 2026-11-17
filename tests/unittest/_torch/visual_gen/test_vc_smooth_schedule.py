@@ -8,10 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import (
-    vc_denoise_step_for_phase,
-    vc_smooth_phase,
-)
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import VC_PHASE_MODES, vc_smooth_phase
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -22,11 +19,11 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_smooth_phase_follows_the_schedule():
-    """The first quarter of the steps smooths V and regroups every fourth step; the rest is plain.
-    The representative step of each phase under CUDA graph capture lands in that phase."""
+    """The first quarter of the steps smooths V. Step 0 starts cold, every fourth step regroups
+    warm and the others keep the grouping. The rest is plain. Each phase names a preprocessor path."""
     schedule = {
         None: None,
-        (0, 50): 2,
+        (0, 50): 3,
         (1, 50): 1,
         (4, 50): 2,
         (12, 50): 2,
@@ -34,7 +31,7 @@ def test_smooth_phase_follows_the_schedule():
         (49, 50): 0,
     }
     assert [vc_smooth_phase(step) for step in schedule] == list(schedule.values())
-    assert [vc_smooth_phase(vc_denoise_step_for_phase(phase)) for phase in (0, 1, 2)] == [0, 1, 2]
+    assert [VC_PHASE_MODES[phase] for phase in (3, 2, 1, 0)] == ["cold", "warm", "keep", "plain"]
 
 
 def test_profile_denoise_steps_publishes_and_clears_the_step():
@@ -85,7 +82,7 @@ def test_graph_key_follows_the_published_step():
     for step in ((0, 8), (1, 8), (4, 8), None):
         state["denoise_step"] = step
         keys[step] = runner.get_graph_key(x)
-    assert ("vc_smooth_phase", 2) in keys[(0, 8)]
+    assert ("vc_smooth_phase", 3) in keys[(0, 8)]
     assert ("vc_smooth_phase", 1) in keys[(1, 8)]
     assert ("vc_smooth_phase", 0) in keys[(4, 8)]
     assert keys[None] == runner._get_tensor_shape_key(x)
