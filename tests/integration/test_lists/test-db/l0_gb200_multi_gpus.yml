@@ -55,7 +55,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_peer_buffers.py
   - unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_allreduce_boundary_matches_allreduce_then_boundary
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_rms_norm_without_residual
-  # ---- curated pre-merge smoke set: diversify moe_backend across CUTLASS/TRTLLM/CUTEDSL ----
+  # ---- curated pre-merge smoke set: diversify moe_tactic across cutlass/trtllm_gen/cutedsl.grouped_gemm ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=trtllm_gen-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=0-tp2pp2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]

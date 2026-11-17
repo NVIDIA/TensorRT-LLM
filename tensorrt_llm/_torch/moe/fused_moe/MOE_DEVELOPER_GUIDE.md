@@ -844,7 +844,8 @@ explicit input instead of a growing set of implicit ones.
 
 ### Pin or auto: what a selection promises
 
-A MoE selection is one of two kinds, and they make opposite promises.
+A MoE selection is a pin or auto, and the two make opposite promises. A
+`moe_backend` literal is a legacy third kind (below).
 
 - **Pin** (`moe_config.tactic`, `speculative_config.moe_tactic`): the user's
   choice is honoured exactly. Each layer runs one of the implementations the
@@ -852,7 +853,10 @@ A MoE selection is one of two kinds, and they make opposite promises.
   Nothing is substituted, because running another implementation would answer
   a question the user did not ask. A tactic whose implementations do not run on
   the GPU, or decline the layer, is a configuration error to fix, not something
-  to route around.
+  to route around. The exception is a layer that model code re-points and
+  warns the tactic does not apply to: Qwen3-Next's excluded (bf16) target
+  expert layers run on CUTLASS, and MuseSpark Open's on the model's literal
+  (see Backend Selection).
 - **Auto** (no tactic, `backend` left at `AUTO`): the code chooses. The goal
   is that auto always ends on an implementation that runs, because production
   depends on it: an unquantized MTP draft layer in a MIXED_PRECISION checkpoint
@@ -890,16 +894,23 @@ configured is what runs.
 Tests that pin a tactic keep its promise and do not rely on a fallback
 (`tests/test_common/moe_tactics.py`):
 
-- A case runs only on the GPUs its tactic's implementations run on (the
-  catalog's SM ranges). Elsewhere it skips when its name or id names the
-  implementation, or when a cutlass case covers those GPUs, and otherwise runs
-  CUTLASS (`sm100f_moe_tactic_or_cutlass`). FP8 block-scale experts set no
-  tactic there instead (`sm100f_moe_tactic_or_auto`): their SM90 and SM120/121
-  leaves are in the CUTLASS family, but `cutlass` names neither.
+- A case whose tactic names implementations of the SM100 family only
+  (`SM100F_ONLY_MOE_TACTICS`, which a CPU test checks against their
+  `can_implement`) runs only on that family. Elsewhere it skips when its name
+  or id names the implementation, or when a cutlass case covers those GPUs, and
+  otherwise runs CUTLASS (`sm100f_moe_tactic_or_cutlass`). FP8 block-scale
+  experts set no tactic there instead (`sm100f_moe_tactic_or_auto`): their SM90
+  and SM120/121 leaves are in the CUTLASS family, but `cutlass` names neither.
+  The helpers gate no other tactic, so a case pinning one gates itself (the
+  `b12x` cases carry `skip_no_sm120`).
 - A tactic reaches the target only, so a case whose draft has to stay on the
   target's implementation pins it as well (`speculative_config.moe_tactic`),
-  or sets `speculative_config.moe_backend` to keep the draft on its family with
-  that literal's fallback.
+  for the draft's own format: bf16 MTP layers under a `trtllm_gen` target pin
+  `trtllm_gen`, and FP8 block-scale MTP layers pin
+  `fp8_block_scales_moe_tactic()`. A draft stays unpinned when the target's
+  tactic cannot serve its experts on the case's GPUs (the CuTe DSL grouped GEMM
+  runs bf16 on SM107 only), or when the modeling_v2 target honors no draft
+  tactic (`draft_moe_impls_honored`).
 - A deployment that a modeling_v2 target serves keeps its backend literal
   unless the target honors the tactic (`moe_impls_honored`). Under the default
   `modeling_v2='auto'` the tactic makes the target decline and the built-in

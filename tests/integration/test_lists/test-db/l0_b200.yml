@@ -310,8 +310,8 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  # B-tier only runs the FP8 MoE parametrize (DEEPGEMM path is SM100-only via
-  # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
+  # B-tier only runs the FP8 MoE parametrize (deepgemm.grouped_gemm, SM100 family
+  # only, via fp8_block_scales_moe_config); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
   # UUID KV-event tests hardcode Qwen3-VL-2B (no model_dir fixture id), so they

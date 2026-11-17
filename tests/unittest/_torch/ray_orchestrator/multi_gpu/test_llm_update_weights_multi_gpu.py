@@ -18,7 +18,11 @@ from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
     run_generate,
 )
 from safetensors import safe_open
-from test_common.moe_tactics import fp8_block_scales_moe_tactic, sm100f_moe_tactic_or_auto
+from test_common.moe_tactics import (
+    fp8_block_scales_moe_tactic,
+    sm100f_moe_tactic_or_auto,
+    sm100f_moe_tactic_or_cutlass,
+)
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import (
     AutoConfig,
@@ -281,6 +285,17 @@ def _qwen35_35b_model_kwargs() -> dict:
         },
         "vision_config": {"depth": 1},
     }
+
+
+def _qwen35_35b_bf16_moe_config(tp_size: int) -> MoeConfig:
+    """``MoeConfig`` for the BF16 experts split over ``tp_size`` ranks.
+
+    TRTLLM-Gen's BF16 cubins need a multiple of 128 intermediate columns per
+    rank, and the experts are 512 wide, so TP8 (64 per rank) runs CUTLASS.
+    """
+    if 512 // tp_size % 128 != 0:
+        return MoeConfig(tactic="cutlass")
+    return MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen"))
 
 
 def _qwen35_35b_sampling_params() -> SamplingParams:
@@ -607,7 +622,7 @@ def _run_qwen35_35b_update(
             ),
             **({"cuda_graph_config": cuda_graph_config} if cuda_graph_config is not None else {}),
             "model_kwargs": _qwen35_35b_model_kwargs(),
-            "moe_config": MoeConfig(backend="TRTLLM"),
+            "moe_config": _qwen35_35b_bf16_moe_config(tp_size),
         },
         sampling_params=_qwen35_35b_sampling_params(),
         partial=partial,
@@ -757,7 +772,7 @@ def _run_qwen35_35b_tp8_multinode_update() -> None:
             mamba_ssm_cache_dtype="bfloat16",
         ),
         model_kwargs=_qwen35_35b_model_kwargs(),
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=_qwen35_35b_bf16_moe_config(_QWEN35_35B_TP8),
     ) as llm:
         device_names = llm._collective_rpc("get_test_device_name")
         assert all("B200" in name.upper() for name in device_names), (

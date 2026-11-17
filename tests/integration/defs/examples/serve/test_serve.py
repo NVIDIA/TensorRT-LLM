@@ -444,9 +444,10 @@ _NEMOTRON35_LIGHTNING_COMMON_CONFIG = "Nemotron35_Lightning_30B.yml"
 _NEMOTRON35_LIGHTNING_VARIANTS = {
     "nvfp4": {
         "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+        # FlashInfer's CuTe DSL b12x MoE (W4A16_NVFP4 experts), SM120/SM121
+        # only.
+        "marks": [skip_no_sm120],
         "config_overrides": {
-            # FlashInfer's CuTe DSL b12x MoE (W4A16_NVFP4 experts), SM120/SM121
-            # only.
             "moe_config": {
                 "tactic": "b12x"
             },
@@ -458,6 +459,7 @@ _NEMOTRON35_LIGHTNING_VARIANTS = {
     },
     "bf16": {
         "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "marks": [],
         "config_overrides": {
             "moe_config": {
                 "tactic": "cutlass"
@@ -469,8 +471,8 @@ _NEMOTRON35_LIGHTNING_VARIANTS = {
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("precision", [
-    pytest.param("nvfp4", marks=skip_no_sm120),
-    "bf16",
+    pytest.param(precision, marks=variant["marks"])
+    for precision, variant in _NEMOTRON35_LIGHTNING_VARIANTS.items()
 ])
 def test_nemotron35_lightning_30b(serve_test_root, tmp_path, precision):
     """Nemotron 3.5 Lightning 30B-A3B with chunked prefill + MTP=3."""

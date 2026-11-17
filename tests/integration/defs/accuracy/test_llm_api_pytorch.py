@@ -131,10 +131,10 @@ def _deepseek_v3_mtp_config(mtp_nextn: int,
                             moe_tactic: str) -> Optional[MTPDecodingConfig]:
     """MTP config for a DeepSeek-V3 case that pins the target by moe_tactic.
 
-    A target tactic leaves the MTP layers' BF16 experts on AUTO, which is
-    CUTLASS for DeepSeek-V3. The trtllm_gen cases keep them on the TRTLLM
-    family, which runs TRTLLM-Gen where the layer allows it and CUTLASS
-    elsewhere.
+    The target's tactic does not reach the MTP layers, whose experts are
+    BF16, so the draft pins the same tactic. cutedsl.grouped_gemm is the
+    exception: CuTe DSL's BF16 grouped GEMM runs on SM107 only, so those
+    cases leave the MTP layers on AUTO, which is CUTLASS for DeepSeek-V3.
 
     Args:
         mtp_nextn: Draft length; 0 disables MTP.
@@ -147,7 +147,7 @@ def _deepseek_v3_mtp_config(mtp_nextn: int,
         return None
     return MTPDecodingConfig(
         max_draft_len=mtp_nextn,
-        moe_backend="TRTLLM" if moe_tactic == "trtllm_gen" else None)
+        moe_tactic=None if moe_tactic == "cutedsl.grouped_gemm" else moe_tactic)
 
 
 def _latest_kv_cache_stats(llm):
@@ -729,10 +729,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         mtp_nextn = 2
         if mtp == "eagle":
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                moe_tactic=fp8_block_scales_moe_tactic())
         elif mtp == "vanilla":
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn,
-                                           use_mtp_vanilla=True)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                use_mtp_vanilla=True,
+                moe_tactic=fp8_block_scales_moe_tactic())
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                  kv_cache_config=kv_cache_config,
@@ -787,7 +791,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                moe_tactic=fp8_block_scales_moe_tactic())
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(
@@ -813,7 +819,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                moe_tactic=fp8_block_scales_moe_tactic())
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(enable_padding=True),
@@ -866,7 +874,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                moe_tactic=fp8_block_scales_moe_tactic())
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                  tensor_parallel_size=tp_size,
@@ -1953,9 +1963,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_tactic",
-        [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
-         (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
-         (8, 1, 8, 1, True, True, True, True, 24, "_DEFAULT"),
+        [(8, 1, 4, 3, False, False, True, True, 1, None),
+         (8, 1, 8, 0, True, True, True, True, 24, None),
+         (8, 1, 8, 1, True, True, True, True, 24, None),
          (8, 1, 8, 1, True, True, True, True, 24, "trtllm_gen")],
         ids=[
             "latency", "throughput", "throughput_mtp", "throughput_mtp_trtllm"
@@ -1963,14 +1973,16 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_tactic):
+        # None selects the FP8 block-scale default for this GPU.
+        if moe_tactic is None:
+            moe_tactic = fp8_block_scales_moe_tactic()
+        else:
+            skip_unless_moe_tactic_runs_here(moe_tactic)
         if is_sm_100f():
-            if moe_tactic == "_DEFAULT":
-                moe_tactic = fp8_block_scales_moe_tactic()
             moe_config = MoeConfig(tactic=moe_tactic, max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
-            skip_unless_moe_tactic_runs_here(moe_tactic)
-            moe_config = MoeConfig()
+            moe_config = MoeConfig(tactic=moe_tactic)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
         pytorch_config = dict(
@@ -1984,7 +1996,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn,
+                                           moe_tactic=moe_tactic)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2031,7 +2044,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+            mtp_config = MTPDecodingConfig(
+                max_draft_len=mtp_nextn,
+                moe_tactic=fp8_block_scales_moe_tactic())
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2579,17 +2594,18 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        # Unset, the drafter's moe_tactic resolves AUTO instead of the
-        # target's tactic.
+        # A target tactic does not reach the drafter; pin it to the same
+        # implementation.
+        moe_tactic = "deepgemm.mega_moe"
         spec_config = DSparkDecodingConfig(max_draft_len=5,
                                            speculative_model=self.MODEL_PATH,
-                                           moe_tactic="deepgemm.mega_moe")
+                                           moe_tactic=moe_tactic)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=tp_size,
                  enable_attention_dp=attention_dp,
-                 moe_config=MoeConfig(tactic="deepgemm.mega_moe"),
+                 moe_config=MoeConfig(tactic=moe_tactic),
                  max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
                  max_num_tokens=4096,
@@ -2626,12 +2642,13 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         # OOM.
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        # Unset, the drafter's moe_tactic resolves AUTO instead of the
-        # target's tactic.
+        # A target tactic does not reach the drafter; pin it to the same
+        # implementation.
+        moe_tactic = "cutedsl.mega_moe"
         spec_config = DSparkDecodingConfig(
             max_draft_len=5,
             speculative_model=self.NVFP4_MODEL_PATH,
-            moe_tactic="cutedsl.mega_moe")
+            moe_tactic=moe_tactic)
         # Build the evaluator (dataset and harness) before the LLM claims the
         # GPUs.
         task = GSM8K(self.MODEL_NAME)
@@ -2642,7 +2659,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
                  enable_attention_dp=True,
-                 moe_config=MoeConfig(tactic="cutedsl.mega_moe"),
+                 moe_config=MoeConfig(tactic=moe_tactic),
                  max_batch_size=64,
                  cuda_graph_config=CudaGraphConfig(max_batch_size=64),
                  max_seq_len=4096,
@@ -3472,10 +3489,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_dummy_load_format(self):
-        # The CUTLASS family runs FP8 block scales on SM90 (DeepGEMM's Hopper
-        # grouped GEMM) and SM120/121 (a Triton GEMM) only, so on Blackwell
-        # datacenter GPUs (SM 100/103) pin the TRTLLM-Gen MoE. SM 120/121 is
-        # excluded because TRTLLM-Gen MoE is
+        # The CUTLASS family has no FP8 block-scale GEMM on Blackwell
+        # datacenter GPUs (SM 100/103), so pin the TRTLLM-Gen MoE there.
+        # SM 120/121 is excluded because TRTLLM-Gen MoE is
         # unsupported on those architectures (see other tests in this file).
         sm_version = get_sm_version()
         if is_sm_120f(sm_version):
@@ -3885,7 +3901,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler, moe_tactic, eagle3):
-        # The cutlass eagle3 case covers the other GPUs.
+        # Off the SM100 family the test lists run latency_moe_cutlass only,
+        # not the eagle3 case.
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         pytorch_config = dict(
@@ -4074,8 +4091,7 @@ GPT_OSS_MOE_KWARGS = [
 # GPT_OSS_MOE_KWARGS for the cases whose Triton run also needs the MXFP4
 # swizzle.
 GPT_OSS_MOE_KWARGS_SWIZZLED_TRITON = [
-    pytest.param({"tactic": "cutlass"}, id="cutlass"),
-    pytest.param({"tactic": "trtllm_gen"}, id="trtllm", marks=skip_no_sm100f),
+    *GPT_OSS_MOE_KWARGS[:2],
     pytest.param({"backend": "TRITON"},
                  id="triton",
                  marks=[skip_no_hopper, skip_no_mxfp4_swizzle]),
@@ -5183,7 +5199,10 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
     def _run_bf16_2gpu_mtp_ar(self):
         max_draft_len = 3
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
+        moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
+        # The target's tactic does not reach the MTP layers, so they pin it too.
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len,
+                                       moe_tactic=moe_tactic)
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
 
         llm_common_config = dict(
@@ -5199,8 +5218,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(max_batch_size=4,
                                               enable_padding=True),
             disable_overlap_scheduler=False,
-            moe_config=MoeConfig(
-                tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen")),
+            moe_config=MoeConfig(tactic=moe_tactic),
         )
 
         llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
@@ -5900,7 +5918,9 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                                         mamba_ssm_cache_dtype="bfloat16")
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=128)
-        mtp_config = MTPDecodingConfig(max_draft_len=3)
+        moe_tactic = "trtllm_gen"
+        # The target's tactic does not reach the MTP layer, so it pins it too.
+        mtp_config = MTPDecodingConfig(max_draft_len=3, moe_tactic=moe_tactic)
 
         with LLM(model_path,
                  trust_remote_code=True,
@@ -5911,7 +5931,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  max_batch_size=128,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
-                 moe_config=MoeConfig(tactic="trtllm_gen"),
+                 moe_config=MoeConfig(tactic=moe_tactic),
                  enable_attention_dp=False,
                  speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -6025,7 +6045,10 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
         if max_draft_len is None:
             mtp_config = None
         else:
-            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+            # The target's tactic does not reach the MTP layer, so it pins
+            # it too.
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                           moe_tactic=moe_tactic)
 
         with LLM(model_path,
                  trust_remote_code=True,
@@ -6091,7 +6114,10 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
         if max_draft_len is None:
             mtp_config = None
         else:
-            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+            # The target's tactic does not reach the MTP layer, so it pins
+            # it too.
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                           moe_tactic=moe_tactic)
 
         with LLM(model_path,
                  trust_remote_code=True,
@@ -6565,7 +6591,8 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
-        mtp_config = MTPDecodingConfig(max_draft_len=3)
+        mtp_config = MTPDecodingConfig(max_draft_len=3,
+                                       moe_tactic=fp8_block_scales_moe_tactic())
 
         moe_config = fp8_block_scales_moe_config(max_num_tokens=32000)
 
@@ -7032,7 +7059,14 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
                                      use_mtp):
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
+        moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
+        # The target's tactic does not reach the MTP layers. Their BF16
+        # experts, 2688 wide, meet TRTLLM-Gen's 128-element alignment only
+        # when MoE TP leaves them whole, so TP4_MTP (672 per rank) runs them
+        # on CUTLASS.
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            moe_tactic=moe_tactic if tp_size == ep_size else "cutlass")
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
@@ -7051,8 +7085,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
-                moe_config=MoeConfig(
-                    tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen")),
+                moe_config=MoeConfig(tactic=moe_tactic),
                 speculative_config=mtp_config if use_mtp else None,
                 max_stats_len=-1,
                 enable_iter_perf_stats=True,
@@ -7434,7 +7467,8 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
         ],
     )
     def test_nvfp4_8gpus(self, attention_dp, moe_tactic):
-        # The cutlass case covers the other GPUs.
+        # No test list runs the cutlass case, so this test does not run off
+        # the SM100 family.
         skip_unless_moe_tactic_runs_here(moe_tactic)
         max_batch_size = 4 if attention_dp else 32
         with LLM(
@@ -7476,7 +7510,10 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
                                      use_mtp):
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
+        moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
+        # The target's tactic does not reach the MTP layers, so they pin it too.
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       moe_tactic=moe_tactic)
         max_batch_size = 4 if attention_dp else 32
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
@@ -7496,8 +7533,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
-                moe_config=MoeConfig(
-                    tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen")),
+                moe_config=MoeConfig(tactic=moe_tactic),
                 speculative_config=mtp_config if use_mtp else None,
         ) as llm:
             task = MMLU(self.MODEL_NAME)

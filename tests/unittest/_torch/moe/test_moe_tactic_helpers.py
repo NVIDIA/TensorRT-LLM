@@ -14,12 +14,15 @@
 # limitations under the License.
 """test_common.moe_tactics: the MoE tactic a test pins on the GPU it runs on."""
 
+import dataclasses
 from typing import Callable, Optional
 
 import pytest
+import torch
 from test_common import moe_tactics
 from test_common.moe_tactics import (
-    SM100F_MOE_TACTICS,
+    SM100F_ONLY_MOE_TACTICS,
+    cutedsl_grouped_gemm_moe_tactic,
     fp8_block_scales_moe_config,
     fp8_block_scales_moe_tactic,
     moe_tactic_runs_here,
@@ -28,20 +31,31 @@ from test_common.moe_tactics import (
     sm100f_moe_tactic_or_cutlass,
 )
 
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEEnvironment,
+    MoEProblem,
+    MoERejectReason,
+    identity_quant_of,
+)
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MoeConfig
 
 pytestmark = pytest.mark.cpu_only
 
-SM100_FAMILY = [100, 103, 107]
+# The SMs of the GPUs MoE implementations are built for, Ampere onward.
+GPU_SMS = [80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 # -1 is the SM tensorrt_llm._utils.get_sm_version reports without a GPU.
-OTHER_SMS = [-1, 89, 90, 110, 120, 121]
+SMS = [-1] + GPU_SMS
 
-# Each names implementations that run on the SM100 family only: an entry of
-# SM100F_MOE_TACTICS, or one narrowed by more segments, reordered, or in another case.
-SM100F_ONLY_TACTICS = [
+# An entry of SM100F_ONLY_MOE_TACTICS, or one narrowed by more segments,
+# reordered, or in another case.
+GATED_TACTICS = [
     "trtllm_gen",
     "trtllm_gen.nvfp4",
-    " TRTLLM_GEN.NVFP4 ",
+    pytest.param(" TRTLLM_GEN.NVFP4 ", id="padded-uppercase"),
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
     "cutedsl.grouped_gemm",
     "nvfp4.grouped_gemm.cutedsl",
@@ -50,25 +64,25 @@ SM100F_ONLY_TACTICS = [
     "deepgemm.mega_moe",
     "cutedsl.mega_moe",
     "trtllm.mega_moe",
-    "nvfp4_plus",
-    "cutedsl.none",
-    "fused_fc12",
-    "dense_gemm",
-    "w4a8_nvfp4_fp8",
 ]
 
-# Each names at least one implementation that runs off the SM100 family.
-TACTICS_BEYOND_SM100F = [
-    "cutlass",
-    "cutlass.nvfp4",
-    "cutedsl",
-    "deepgemm",
-    "grouped_gemm",
-    "hopper_grouped_gemm",
-    "triton",
-    "b12x",
-    "marlin",
-]
+
+def _deployment(sm_version: int) -> MoEDeployment:
+    """One EP-only rank on ``sm_version`` with every optional dependency installed."""
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=sm_version, available_deps=tuple(dep.value for dep in MoEDep)),
+    )
+
+
+def _own_format_problem(impl_cls: type) -> MoEProblem:
+    """A problem in ``impl_cls``'s own format, so its identity check admits it."""
+    quant = identity_quant_of(impl_cls)
+    return MoEProblem(quant=None if quant == "none" else quant.upper(), dtype_act=torch.bfloat16)
 
 
 @pytest.fixture
@@ -81,26 +95,38 @@ def pretend_sm100f(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
     return pretend
 
 
-@pytest.mark.parametrize("tactic", sorted(SM100F_MOE_TACTICS))
+@pytest.mark.parametrize("tactic", sorted(SM100F_ONLY_MOE_TACTICS))
 def test_listed_tactic_names_registered_implementations(tactic: str) -> None:
     assert MoeConfig(tactic=tactic).tactic == tactic
 
 
-@pytest.mark.parametrize("sm_version", SM100_FAMILY)
-@pytest.mark.parametrize("tactic", SM100F_ONLY_TACTICS)
-def test_sm100f_only_tactic_runs_on_the_family(tactic: str, sm_version: int) -> None:
-    assert moe_tactic_runs_here(tactic, sm_version)
+@pytest.mark.parametrize("sm_version", GPU_SMS)
+@pytest.mark.parametrize("tactic", sorted(SM100F_ONLY_MOE_TACTICS))
+def test_listed_tactic_runs_on_the_family_only(tactic: str, sm_version: int) -> None:
+    # Every implementation these tactics name checks its format and SM before
+    # anything else, so for a problem in its own format SM_UNSUPPORTED is the
+    # SM's verdict, and any other answer means it has a kernel for the SM.
+    deployment = _deployment(sm_version)
+    runs = []
+    for impl_cls in moe_impl_request(tactic=tactic).impls:
+        verdict = impl_cls.can_implement(_own_format_problem(impl_cls), deployment)
+        if verdict.reject_reason is not MoERejectReason.SM_UNSUPPORTED:
+            runs.append(impl_cls.__name__)
+    if is_sm_100f(sm_version):
+        assert runs, f"{tactic!r} names no implementation for SM{sm_version}"
+    else:
+        assert not runs, f"{tactic!r} names {runs}, which run on SM{sm_version}"
 
 
-@pytest.mark.parametrize("sm_version", OTHER_SMS)
-@pytest.mark.parametrize("tactic", SM100F_ONLY_TACTICS)
-def test_sm100f_only_tactic_runs_nowhere_else(tactic: str, sm_version: int) -> None:
-    assert not moe_tactic_runs_here(tactic, sm_version)
+@pytest.mark.parametrize("sm_version", SMS)
+@pytest.mark.parametrize("tactic", GATED_TACTICS)
+def test_gated_tactic_runs_on_the_family_only(tactic: str, sm_version: int) -> None:
+    assert moe_tactic_runs_here(tactic, sm_version) == is_sm_100f(sm_version)
 
 
-@pytest.mark.parametrize("sm_version", SM100_FAMILY + OTHER_SMS)
-@pytest.mark.parametrize("tactic", [None] + TACTICS_BEYOND_SM100F)
-def test_other_tactic_runs_on_every_sm(tactic: Optional[str], sm_version: int) -> None:
+@pytest.mark.parametrize("sm_version", [90, 120])
+@pytest.mark.parametrize("tactic", [None, "cutlass"])
+def test_unlisted_tactic_is_not_gated(tactic: Optional[str], sm_version: int) -> None:
     assert moe_tactic_runs_here(tactic, sm_version)
 
 
@@ -123,6 +149,32 @@ def test_or_auto_drops_the_tactic_off_the_family(
     moe_config = fp8_block_scales_moe_config(max_num_tokens=16384)
     assert moe_config.tactic == expected
     assert moe_config.max_num_tokens == 16384
+
+
+@pytest.mark.parametrize(
+    "sm_version, fused_finalize, expected",
+    [
+        (100, False, "cutedsl.grouped_gemm"),
+        (107, True, "cutedsl.grouped_gemm"),
+        (107, False, "cutlass"),
+        (90, True, "cutlass"),
+    ],
+)
+def test_cutedsl_grouped_gemm_tactic_falls_to_cutlass_where_it_cannot_serve(
+    monkeypatch: pytest.MonkeyPatch, sm_version: int, fused_finalize: bool, expected: str
+) -> None:
+    monkeypatch.setattr(moe_tactics, "get_sm_version", lambda: sm_version)
+    assert cutedsl_grouped_gemm_moe_tactic(fused_finalize=fused_finalize) == expected
+
+
+def test_cutedsl_grouped_gemm_needs_fused_finalize_on_sm107() -> None:
+    deployment = dataclasses.replace(_deployment(107), fused_finalize_enabled=False)
+    for impl_cls in moe_impl_request(tactic="cutedsl.grouped_gemm").impls:
+        verdict = impl_cls.can_implement(_own_format_problem(impl_cls), deployment)
+        assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED, (
+            impl_cls.__name__,
+            verdict.detail,
+        )
 
 
 def test_skip_unless_runs_here_skips_off_the_family(

@@ -16,9 +16,9 @@ context_servers:
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
-    # The MTP layer's experts are BF16, which the target's tactic leaves on
-    # AUTO (CUTLASS); keep them on the TRTLLM family.
-    moe_backend: TRTLLM
+    # The target's tactic does not reach the MTP layer, whose experts are
+    # BF16; pin it to TRTLLM-Gen as well.
+    moe_tactic: trtllm_gen
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
@@ -50,7 +50,7 @@ generation_servers:
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
-    moe_backend: TRTLLM
+    moe_tactic: trtllm_gen
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8

@@ -1259,22 +1259,25 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
+    moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
     llm_common_config = dict(
         model=model_path,
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
         pipeline_parallel_size=1,
-        moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen")),
+        moe_config=MoeConfig(tactic=moe_tactic),
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
     )
+    # The target's tactic does not reach the MTP layers, so they pin it too.
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
-                                    max_total_draft_tokens=31)
+                                    max_total_draft_tokens=31,
+                                    moe_tactic=moe_tactic)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     prompt = llm_spec.tokenizer.apply_chat_template(

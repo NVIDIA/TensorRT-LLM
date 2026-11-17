@@ -39,7 +39,8 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
-from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
+from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
+                                     sm100f_moe_tactic_or_cutlass)
 
 from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
 from tensorrt_llm.executor.result import GenerationResultBase
@@ -51,9 +52,9 @@ from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer, load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, get_sm_version, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper, skip_no_rubin,
-                        skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
+                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
+                        skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
                             LlmapiAccuracyTestHarness, LongBenchV2,
@@ -2764,11 +2765,9 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
         }
-        # _test_sparse_offload_long_context disables finalize fusion, and the
-        # CuteDSL grouped GEMM has only a fused-finalize FC2 on SM107.
+        # _test_sparse_offload_long_context disables finalize fusion.
         moe_config = {
-            "tactic": ("cutlass" if get_sm_version() == 107 else
-                       sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm"))
+            "tactic": cutedsl_grouped_gemm_moe_tactic(fused_finalize=False)
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -3035,6 +3034,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
         # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
+        moe_tactic = "cutedsl.mega_moe"
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -3042,7 +3042,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             "enable_attention_dp": True,
             # MegaMoE CuTe DSL is the backend that serves the NVFP4 export.
             "moe_config": {
-                "tactic": "cutedsl.mega_moe"
+                "tactic": moe_tactic
             },
             "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
@@ -3065,9 +3065,9 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 "decoding_type": "DSpark",
                 "max_draft_len": 5,
                 "speculative_model": model_path,
-                # Unset, the drafter resolves AUTO instead of the target's
-                # tactic.
-                "moe_tactic": "cutedsl.mega_moe",
+                # A target tactic does not reach the drafter; pin it to the
+                # same implementation.
+                "moe_tactic": moe_tactic,
             },
             # Acceptance length is read back off this worker's /metrics.
             # Without return_perf_metrics the server never builds its tee
@@ -3319,8 +3319,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 },
                 "kv_transfer_timeout_ms": 600000,
             },
+            # Stays on a backend literal: on SM103 and SM107 the MiniMax-M3
+            # modeling_v2 targets serve these deployments and honor no
+            # tactic, so a tactic would build the built-in model.
             "moe_config": {
-                "tactic": "cutlass"
+                "backend": "CUTLASS"
             },
             "scheduler_config": {
                 "capacity_scheduler_policy": "MAX_UTILIZATION"
