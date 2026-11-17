@@ -20,10 +20,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 import torch
 import triton
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .config import require_fp4_mla_fp8_context_support as require_fp4_mla_fp8_context_support
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
 
 if TYPE_CHECKING:
@@ -33,21 +34,7 @@ if TYPE_CHECKING:
     )
 
 
-_FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
 _FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
-
-
-def require_fp4_mla_fp8_context_support() -> None:
-    """Validate support for TRT-LLM's FP8 MLA context FMHA."""
-    sm = get_sm_version()
-    if sm not in _FP8_CONTEXT_SUPPORTED_SMS:
-        supported_sms = ", ".join(
-            str(supported_sm) for supported_sm in sorted(_FP8_CONTEXT_SUPPORTED_SMS)
-        )
-        raise RuntimeError(
-            f"FP4 MLA context requires TRT-LLM FP8 FMHA, which is not "
-            f"supported on SM{sm}. Supported SM versions: {supported_sms}."
-        )
 
 
 def _execute_fp8_context_with_cache_update(
