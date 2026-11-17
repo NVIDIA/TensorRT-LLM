@@ -47,8 +47,11 @@ exchange) are passed explicitly from the layer to the producer and back.
 
 **What this target asserts rather than adapts**: SM 10.3, the topology and checkpoint (``routing.py``); the
 MiniMax-M3 MSA sparse attention runtime with the fused five-way QKV/index projection, an FP8 indexer and an FP8 or
-NVFP4 KV cache, no torch.compile and no piecewise prefill graphs (``_validate_runtime``); text-only input (the vision
+NVFP4 KV cache (``_validate_runtime``); text-only input (the vision
 tower is not built and a step carrying image input raises).
+
+With piecewise CUDA graphs, only eligible prefill/mixed batches use torch.compile; decode and above-ceiling
+prefill keep their eager dispatch.
 """
 
 from __future__ import annotations
@@ -2695,7 +2698,7 @@ class PrefillTarget:
         """``capture_target`` is unused: the generic boundary takes no multicast all-reduce at this TP
         (``GENERIC_MC_AR_MAX_TOKENS`` 0), so a capture layer always runs its own capture norm."""
         core = self.core
-        if is_in_breakable_cuda_graph():
+        if not is_torch_compiling() and is_in_breakable_cuda_graph():
             raise RuntimeError(
                 "this MiniMax-M3 target does not run under piecewise (breakable) prefill CUDA graphs"
             )
@@ -5546,6 +5549,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    # Keep decode and above-ceiling prefill on their hand-fused eager paths.
+    use_fx_for_pcg_fallback = False
 
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no

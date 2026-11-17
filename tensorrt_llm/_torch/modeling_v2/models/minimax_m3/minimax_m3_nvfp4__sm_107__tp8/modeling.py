@@ -54,8 +54,11 @@ steps; a CUDA-graph capture only reads it, so a capture that finds it missing is
 
 **What this target asserts rather than adapts**: SM 10.7, the topology and checkpoint (``routing.py``); the
 MiniMax-M3 MSA sparse attention runtime with the fused five-way QKV/index projection, an FP8 indexer and an FP8 or
-NVFP4 KV cache, no torch.compile and no piecewise prefill graphs (``_validate_runtime``); text-only input (the vision
+NVFP4 KV cache (``_validate_runtime``); text-only input (the vision
 tower is not built and a step carrying image input raises).
+
+With piecewise CUDA graphs, only eligible prefill/mixed batches use torch.compile; decode and above-ceiling
+prefill keep their eager dispatch.
 """
 
 from __future__ import annotations
@@ -232,7 +235,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.speculative.interface import (
     should_use_separate_draft_kv_cache as should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, is_torch_compiling
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -1591,10 +1594,6 @@ def _nvfp4_fused_write_layout(data: torch.Tensor, scales: torch.Tensor, num_head
     return _modeling_support._nvfp4_fused_write_layout(_SUPPORT_TARGET, data, scales, num_heads)
 
 
-#: The step phases ("decode" / "prefill") whose producer engagement has been logged, once per process.
-_PRODUCER_ENGAGED: set = set()
-
-
 def _producer_miss(covered: bool, rows: Optional[int], reason: str) -> None:
     if covered:
         missed(PRODUCER.path, rows, reason)
@@ -1749,13 +1748,11 @@ def _sparse_qkv_producer(
             PRODUCER_EARLY_TRIGGER,
             PRODUCER_PREWAIT_STEP_INPUTS,
         )
-        phase = "decode" if rows <= DECODE_MAX_TOKENS else "prefill"
-        if phase not in _PRODUCER_ENGAGED:
-            _PRODUCER_ENGAGED.add(phase)
-            logger.info(
-                f"[M3 sm107 tp8] fast path engaged: m3_producer ({phase}, T={rows}, "
-                f"early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS})"
-            )
+        taken(
+            PRODUCER.path,
+            rows,
+            f"early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS}",
+        )
     else:
         if layer_uses_nvfp4 and covered:
             missed(
@@ -1928,7 +1925,7 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
     params = (core.swiglu_alpha, core.swiglu_limit, core.swiglu_beta)
     act = None
     if rows > max_rows:
-        uncovered(path, f"{rows} rows, past its certified {max_rows}")
+        uncovered(path, f"more than {max_rows} rows")
     elif params != (DENSE_ALPHA, DENSE_LIMIT, DENSE_BETA):
         uncovered(path, f"activation parameters {params}")
     else:
@@ -2759,7 +2756,7 @@ class PrefillTarget:
     ):
         """``capture_target`` is the decode boundaries' (unused: no prefill boundary writes a capture norm)."""
         core = self.core
-        if is_in_breakable_cuda_graph():
+        if not is_torch_compiling() and is_in_breakable_cuda_graph():
             raise RuntimeError(
                 "this MiniMax-M3 target does not run under piecewise (breakable) prefill CUDA graphs"
             )
@@ -5769,6 +5766,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp8(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    # Keep decode and above-ceiling prefill on their hand-fused eager paths.
+    use_fx_for_pcg_fallback = False
 
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no

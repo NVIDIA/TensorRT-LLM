@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import reporting
 
@@ -41,9 +42,14 @@ def test_fullgraph_reporting_leaves_host_state_untouched() -> None:
         reporting.capture_missed(state, "capture", x.shape[0], "engine")
         return x + 1
 
-    compiled = torch.compile(forward, fullgraph=True, backend="eager")
-    x = torch.ones(2)
-    torch.testing.assert_close(compiled(x), x + 1)
+    counter = CompileCounter()
+    compiled = torch.compile(forward, fullgraph=True, dynamic=True, backend=counter)
+    # More distinct row counts than the engine's recompile limit: diagnostics
+    # must not specialize the symbolic token dimension.
+    for rows in range(9, 49):
+        x = torch.ones(rows)
+        torch.testing.assert_close(compiled(x), x + 1)
+    assert counter.frame_count == 1
     state.mpi_rank.assert_not_called()
     state.logger.info.assert_not_called()
     state.logger.warning.assert_not_called()

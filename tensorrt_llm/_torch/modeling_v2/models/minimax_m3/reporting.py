@@ -40,6 +40,7 @@ def require_mode(state: ReportingTarget, /) -> bool:
 def _log_once(
     state: ReportingTarget, /, level: Callable[[str], None], path: str, reason: str, message: str
 ) -> None:
+    """Log eager diagnostics once; compiled regions do not lock or log."""
     if torch.compiler.is_compiling():
         return
     key = (path, reason)
@@ -51,7 +52,9 @@ def _log_once(
 
 
 def missed(state: ReportingTarget, /, path: str, rows: Optional[int], reason: str) -> None:
-    """``path`` covers this step but cannot run: raise under require, else log once; the caller falls back."""
+    """Raise under require, including during tracing; otherwise report only on eager steps."""
+    if not state._require[0] and torch.compiler.is_compiling():
+        return
     at = "" if rows is None else f" at {rows} rows"
     if state._require[0]:
         raise state.FastPathUnavailable(
@@ -71,8 +74,10 @@ def capture_missed(state: ReportingTarget, /, path: str, rows: Optional[int], wh
 
 
 def taken(state: ReportingTarget, /, path: str, rows: Optional[int], what: str = "") -> None:
-    """``path`` ran on this rank at ``rows``: one rank-tagged info line per (path, rows, what), the engagement line
-    every GEN rank prints for each fast path it takes (``what``: an optional detail, e.g. the projection)."""
+    """Report eager engagement once per (path, rows, what) on each rank.
+
+    Compiled regions do not report. ``what`` is an optional detail such as the projection.
+    """
     if torch.compiler.is_compiling():
         return
     at = "" if rows is None else f" at {rows} rows"
