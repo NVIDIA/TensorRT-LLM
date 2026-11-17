@@ -332,17 +332,18 @@ class Gemma4ToolParser(BaseToolParser):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing: detect and parse all tool calls in text."""
         if BOT_TOKEN not in text:
-            return StreamingParseResult(normal_text=text, calls=[])
+            return StreamingParseResult(normal_text=text.replace(EOT_TOKEN, ""), calls=[])
 
         tool_indices = self._get_tool_indices(tools)
 
-        # Normal text is the text outside the call blocks, as the streaming
-        # path reports it. A block that is skipped contributes no text.
+        # Normal text is the text outside the call blocks without stray end
+        # tokens, as the streaming path reports it. A block that is skipped
+        # contributes no text.
         normal_parts = []
         cursor = 0
         calls = []
         for start, end, call in _iter_tool_call_blocks(text):
-            normal_parts.append(text[cursor:start])
+            normal_parts.append(text[cursor:start].replace(EOT_TOKEN, ""))
             cursor = end
             if call is None:
                 continue
@@ -366,12 +367,12 @@ class Gemma4ToolParser(BaseToolParser):
             )
 
         # After the last block: text up to a call that never ends, otherwise
-        # all of it without stray end tokens.
+        # all of it.
         tail = text[cursor:]
         unterminated = tail.find(BOT_TOKEN)
-        normal_parts.append(
-            tail.replace(EOT_TOKEN, "") if unterminated == -1 else tail[:unterminated]
-        )
+        if unterminated != -1:
+            tail = tail[:unterminated]
+        normal_parts.append(tail.replace(EOT_TOKEN, ""))
         normal_text = "".join(normal_parts).strip()
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -406,11 +407,14 @@ class Gemma4ToolParser(BaseToolParser):
             if not self._is_inside_tool_call:
                 bot_pos = current_text.find(BOT_TOKEN)
                 if bot_pos == -1:
-                    # Check for partial start token at the end
-                    partial_len = self._ends_with_partial_token(current_text, BOT_TOKEN)
+                    # Keep a partial start or end token at the end, so a stray
+                    # end token split across increments is still stripped
+                    partial_len = max(
+                        self._ends_with_partial_token(current_text, BOT_TOKEN),
+                        self._ends_with_partial_token(current_text, EOT_TOKEN),
+                    )
                     if partial_len:
-                        # Keep the partial match, emit everything before it
-                        normal = current_text[:-partial_len]
+                        normal = current_text[:-partial_len].replace(EOT_TOKEN, "")
                         self._buffer = current_text[-partial_len:]
                         return (
                             StreamingParseResult(normal_text=normal)
@@ -424,7 +428,7 @@ class Gemma4ToolParser(BaseToolParser):
                     return StreamingParseResult(normal_text=cleaned)
 
                 # Found start of tool call
-                normal_text = current_text[:bot_pos]
+                normal_text = current_text[:bot_pos].replace(EOT_TOKEN, "")
                 self._buffer = current_text[bot_pos:]
                 self._is_inside_tool_call = True
 
@@ -511,6 +515,22 @@ class Gemma4ToolParser(BaseToolParser):
             self._is_inside_tool_call = False
             self._buffer = ""
             return StreamingParseResult()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Report the calls left in the buffer and release held-back text.
+
+        Complete calls are reported first. Text held back as the possible
+        start of a token is then content. A call that has not reached its end
+        token reports nothing.
+        """
+        result = super().finish(tools)
+        if self._is_inside_tool_call or not self._buffer:
+            return result
+        held, self._buffer = self._buffer, ""
+        return StreamingParseResult(
+            normal_text=result.normal_text + held.replace(EOT_TOKEN, ""),
+            calls=result.calls,
+        )
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

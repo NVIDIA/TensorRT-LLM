@@ -5834,6 +5834,57 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
             (call.name, json.loads(call.parameters)) for call in result.calls
         ]
 
+    @pytest.mark.parametrize("chunk_size", [1, 1000],
+                             ids=["char_by_char", "one_increment"])
+    @pytest.mark.parametrize("text,expected_normal,expected_names", [
+        ("Is 3 < 4? Yes, 3 <", "Is 3 < 4? Yes, 3 <", []),
+        ("see " + BOT_TOKEN[:6], "see " + BOT_TOKEN[:6], []),
+        (_g4_tc("search_web", f'query:{_g4_s("a")}') + " <|", "<|",
+         ["search_web"]),
+        (f"Hi{EOT_TOKEN} there", "Hi there", []),
+        (f"Sure.{EOT_TOKEN} " + _g4_tc("search_web", f'query:{_g4_s("a")}') +
+         f" ok{EOT_TOKEN}", "Sure.  ok", ["search_web"]),
+    ],
+                             ids=[
+                                 "ends_with_less_than",
+                                 "ends_with_partial_start_token",
+                                 "call_then_partial_start_token",
+                                 "stray_end_token",
+                                 "stray_end_tokens_around_call"
+                             ])
+    def test_held_back_text_and_stray_end_tokens(self, sample_tools, parser,
+                                                 text, expected_normal,
+                                                 expected_names, chunk_size):
+        """Both paths keep text that only looks like a token and drop stray end tokens.
+
+        This holds however the stream splits the text.
+        """
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == expected_normal
+        assert [call.name for call in result.calls] == expected_names
+
+        streaming = Gemma4ToolParser()
+        normal, calls = "", []
+        for i in range(0, len(text), chunk_size):
+            increment = streaming.parse_streaming_increment(
+                text[i:i + chunk_size], sample_tools)
+            normal += increment.normal_text
+            calls += increment.calls
+        increment = streaming.finish(sample_tools)
+        normal += increment.normal_text
+        calls += increment.calls
+        assert normal.strip() == expected_normal
+        assert [call.name for call in calls] == expected_names
+
+    def test_finish_keeps_an_unfinished_call_silent(self, sample_tools, parser):
+        """A call cut off before its end token reports no call and no content."""
+        text = "Sure. " + BOT_TOKEN + CALL_PREFIX + "search_web{query:"
+        assert parser.parse_streaming_increment(
+            text, sample_tools).normal_text == "Sure. "
+        result = parser.finish(sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
         info = info_fn("get_weather")
