@@ -875,6 +875,39 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             or bool(request.py_min_length)
         )
 
+    def _raw_logprobs_from_logits(self, request: LlmRequest) -> bool:
+        """Whether the request's raw logprobs are read from the logits, not the beam history."""
+        return self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)] and not (
+            self._use_beam_search and request.py_beam_width != 1
+        )
+
+    def _save_raw_logprob_logits(
+        self,
+        logits_cuda: torch.Tensor,
+        requests: list[LlmRequest],
+        req_offsets: torch.Tensor,
+        req_num_generated_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Copy the rows that raw logprobs read and the logit rewrites would change.
+
+        Returns the int64 row indices and the copied rows, or None when no row needs saving.
+        """
+        req_indices = [
+            req_idx
+            for req_idx, request in enumerate(requests)
+            if self._raw_logprobs_from_logits(request) and self._request_rewrites_logits(request)
+        ]
+        if not req_indices:
+            return None
+        rows_cuda = _PackedStepIndexer(
+            num_steps=req_num_generated_tokens,
+            req_offsets=req_offsets,
+            index_dtype=torch.int64,
+        )[torch.tensor(req_indices, dtype=torch.int64)].to(
+            device=logits_cuda.device, non_blocking=True
+        )
+        return rows_cuda, logits_cuda.index_select(0, rows_cuda)
+
     @staticmethod
     def _request_needs_finish_reason_kernel(request: LlmRequest) -> bool:
         """Whether stopping needs the finish-reason kernel rather than host checks.
@@ -2164,10 +2197,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ):
                 if need_raw_logprobs[slot]:
                     reqs_indices_needing_raw_logprobs.append(req_idx)
+                if self._raw_logprobs_from_logits(request):
+                    reqs_indices_needing_raw_logits.append(req_idx)
                 if self._use_beam_search and request.py_beam_width != 1:
                     continue
-                if need_raw_logprobs[slot]:
-                    reqs_indices_needing_raw_logits.append(req_idx)
                 if need_processed_logprobs[slot]:
                     num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
@@ -2853,6 +2886,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots_cuda = seq_slots_host.to(device="cuda", dtype=torch.int64, non_blocking=True)
         seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
+        saved_raw_logprob_logits = (
+            self._save_raw_logprob_logits(
+                logits_cuda,
+                sampling_requests,
+                sampling_requests_metadata.req_offsets,
+                sampling_requests_metadata.req_num_generated_tokens,
+            )
+            if return_log_probs
+            else None
+        )
+
         # Handle embedding bias
         apply_embedding_bias(
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
@@ -2972,6 +3016,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             token_dtype=new_tokens_cuda.dtype,
             return_log_probs=return_log_probs,
         )
+
+        # Sampling and processed logprobs are done with the rewritten rows; raw logprobs read
+        # the logits as the sampler received them.
+        if saved_raw_logprob_logits is not None:
+            raw_rows_cuda, raw_rows_logits_cuda = saved_raw_logprob_logits
+            logits_cuda.index_copy_(0, raw_rows_cuda, raw_rows_logits_cuda)
 
         # Fill results into output buffers
         new_tokens_host = self._unbatch_sampling_results(

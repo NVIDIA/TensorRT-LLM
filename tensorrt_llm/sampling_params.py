@@ -107,6 +107,10 @@ class LogprobMode(StrEnum):
     RAW = "raw"
     """
     Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+
+    With the PyTorch backend, these are the logits the sampler receives, before embedding bias, repetition,
+    presence and frequency penalties, bad words, min_length and no_repeat_ngram_size bans, temperature, top-k
+    and top-p. Guided decoding and logits processors run before the sampler and are included.
     """
     PROCESSED = "processed"
     """

@@ -468,9 +468,22 @@ def test_logprobs_simple_format_validation():
 
 @pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
 @pytest.mark.parametrize("prompt_logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
+@pytest.mark.parametrize(
+    "penalty",
+    [
+        {},
+        {"repetition_penalty": 1.3},
+        {"presence_penalty": 1.0},
+        {"frequency_penalty": 1.0},
+    ],
+    ids=["no_penalty", "repetition", "presence", "frequency"],
+)
 @pytest.mark.threadleak(enabled=False)
 def test_logprobs_against_logits(
-    logprobs_k: int | None, prompt_logprobs_k: int | None, simple_llm: LLM
+    logprobs_k: int | None,
+    prompt_logprobs_k: int | None,
+    penalty: dict[str, float],
+    simple_llm: LLM,
 ):
     """
     Test combination of logprobs and prompt_logprobs against manually calculated log probabilities from logits
@@ -482,6 +495,7 @@ def test_logprobs_against_logits(
         prompt_logprobs=prompt_logprobs_k,
         return_generation_logits=True,
         return_context_logits=True,
+        **penalty,
     )
 
     def check_logprobs(
@@ -921,7 +935,9 @@ class TestLogsprobsInBatchedSampling:
     VOCAB_SIZE = 123
 
     @staticmethod
-    def _build_test_cases(max_draft_len: int) -> list[tuple[list[SamplingParams], str]]:
+    def _build_test_cases(
+        max_draft_len: int, vocab_size: int
+    ) -> list[tuple[list[SamplingParams], str]]:
         """Return test cases for testing logprobs handling in batched sampling.
 
         Each test case consists of a list of sampling parameters and a human-readable
@@ -1111,6 +1127,26 @@ class TestLogsprobsInBatchedSampling:
             assert raw_configs
             test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
 
+        # Raw logprobs of rows the sampler rewrites before sampling (here: embedding bias),
+        # alone and mixed with requests it leaves alone.
+        embedding_bias = torch.linspace(-5.0, 5.0, vocab_size)
+        biased_configs = [
+            SamplingParams(
+                temperature=0.7, top_k=2, logprobs=params.logprobs, embedding_bias=embedding_bias
+            )
+            for label, params in BASE_CASES.items()
+            if label.startswith("single-raw")
+        ]
+        assert biased_configs
+        test_cases.append((biased_configs, "single_raw_biased"))
+        test_cases += _shuffle_mixed_batches(
+            (
+                biased_configs,
+                [params for label, params in BASE_CASES.items() if label.startswith("single")],
+            ),
+            ("raw_biased", "single"),
+        )
+
         return test_cases
 
     @pytest.fixture(scope="function")
@@ -1213,6 +1249,7 @@ class TestLogsprobsInBatchedSampling:
                     logprobs_mode=sampling_params.logprobs_mode,
                     num_logprobs=sampling_params.logprobs or 0,
                     return_log_probs=sampling_params.logprobs is not None,
+                    embedding_bias=sampling_params.embedding_bias,
                 )
                 for sampling_params, seq_slot, draft_len in zip(
                     sampling_params_list, seq_slots, draft_lens, strict=True
@@ -1462,7 +1499,7 @@ class TestLogsprobsInBatchedSampling:
                 [VOCAB_SIZE],
             )
             for (sampling_params_list, params_label) in _build_test_cases(
-                max_draft_len=max_draft_len
+                max_draft_len=max_draft_len, vocab_size=vocab_size
             )
         ],
     )
@@ -1506,6 +1543,8 @@ class TestLogsprobsInBatchedSampling:
         monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
+        # The logits as the sampler receives them; sample_async may rewrite its input in place.
+        reference_outputs = {"logits": model_outputs["logits"].clone()}
         sample_state = sampler.sample_async(
             mock_requests,
             model_outputs,
@@ -1516,7 +1555,7 @@ class TestLogsprobsInBatchedSampling:
 
         self._validate_logprobs(
             mock_requests=mock_requests,
-            model_outputs=model_outputs,
+            model_outputs=reference_outputs,
             sampler=sampler,
         )
 
@@ -1540,7 +1579,7 @@ class TestLogsprobsInBatchedSampling:
             sampler.update_requests(active_state)
             assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
             self._validate_logprobs(
-                mock_requests=active_requests, model_outputs=model_outputs, sampler=sampler
+                mock_requests=active_requests, model_outputs=reference_outputs, sampler=sampler
             )
 
 
