@@ -2592,7 +2592,10 @@ class MLA(nn.Module):
         allocated weights: a module whose `kv_b_proj.weight` is still a meta
         tensor is left untouched, since a staged receiver runs this after its
         weights are materialized. It is idempotent and leaves
-        `_weights_transformed` alone.
+        `_weights_transformed` alone. The view is built from the storage that
+        `kv_b_proj.weight` holds when this runs, so a caller that later replaces
+        `kv_b_proj.weight` must call this again, as it must rebind the
+        `_bind_v_b_proj_weight` view the loader makes.
 
         Only an unquantized `kv_b_proj` without a locality-domain partition plan
         and without CP head slicing is eligible; every other layout is left

@@ -155,8 +155,10 @@ and MoE in every later layer (`first_k_dense_replace: 1` and
 back); DeepSeek-V3-Lite BF16 is the qualified canary and the only checkpoint
 that the donor/receiver rows cover. The Hugging Face `kv_b_proj` weight is re-laid out
 at load into all K-nope rows followed by all V rows per tensor-parallel head
-split, and the absorption weight `v_b_proj` is a view of those V rows; a
-staged receiver rebinds that view in `setup_aliases()` instead of loading it.
+split, and the absorption weight `v_b_proj` is a view of those V rows. A
+staged receiver rebinds that view before its weights arrive, in the
+receiver-only `setup_post_transform_receiver_aliases()` hook, instead of
+loading it; GMS read-only peers and ordinary loads never run that hook.
 The full DeepSeek-V3, R1, and V3.1 checkpoints share the identity but use YaRN
 RoPE scaling, FP8 weights, three dense layers, and TP=8, so the RoPE,
 quantization, layer-layout, and TP constraints exclude them. Checkpoints with another model type or root do not
@@ -243,7 +245,10 @@ Support for another model family requires a focused qualification change:
 1. Audit every post-load hook in the family and its nested modules. Move
    structural wiring to `setup_aliases()`, one-time tensor-layout changes to
    `transform_weights()`, and process-local derived state to
-   `cache_derived_state()`.
+   `cache_derived_state()`. An alias that only the family's weight loader
+   creates goes to `setup_post_transform_receiver_aliases()`, which MX runs
+   on a qualified receiver before its weights arrive, because a staged
+   receiver never runs the loader.
 2. Verify that every one-time transform is guarded by `_weights_transformed`
    and that the staged receiver can skip `transform_weights()` without
    changing aliases, derived state, tensor layout, or outputs. Declare the guard

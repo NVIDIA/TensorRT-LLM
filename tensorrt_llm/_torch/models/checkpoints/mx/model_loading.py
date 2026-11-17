@@ -438,8 +438,9 @@ def get_mx_load_weights_kwargs(
         "allow_post_transform_weights": qualification.qualified,
     }
     if qualification.qualified:
-        # The receiver sets up aliases before post-transform bytes arrive.
-        mx_kwargs["prepare_post_transform_receiver"] = model_hooks.setup_aliases
+        # The receiver sets up aliases, including the ones its weight loader
+        # would create, before post-transform bytes arrive.
+        mx_kwargs["prepare_post_transform_receiver"] = model_hooks.prepare_post_transform_receiver
     return mx_kwargs
 
 

@@ -14,6 +14,9 @@
 # limitations under the License.
 """MX post-transform qualification tests for the DeepSeek-V3 MLA + CUTLASS MoE root."""
 
+from collections.abc import Callable
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 from torch import nn
@@ -633,9 +636,10 @@ def test_deepseek_v3_receiver_restores_v_b_proj_alias_before_transfer(
 ) -> None:
     """A receiver that never loads still binds `v_b_proj` to the V rows of `kv_b_proj`.
 
-    The loader binds that view; a staged receiver gets it from
-    `setup_aliases()` instead, so storage offsets and alias groups match the
-    donor's before the transfer and in the MX parameter catalog.
+    The loader binds that view; a staged receiver gets it from MX receiver
+    preparation (`model_hooks.prepare_post_transform_receiver`) instead, so
+    storage offsets and alias groups match the donor's before the transfer and
+    in the MX parameter catalog.
     """
     producer = _tiny_model(monkeypatch, q_lora_rank=q_lora_rank)
     receiver = _tiny_model(monkeypatch, q_lora_rank=q_lora_rank)
@@ -652,13 +656,13 @@ def test_deepseek_v3_receiver_restores_v_b_proj_alias_before_transfer(
     )
     donor_catalog = mx_canonical_parameter_catalog(producer)
 
-    model_hooks_mod.setup_aliases(receiver)
+    model_hooks_mod.prepare_post_transform_receiver(receiver)
     bound = [layer.self_attn.v_b_proj for layer in receiver.model.layers]
-    model_hooks_mod.setup_aliases(receiver)
+    model_hooks_mod.prepare_post_transform_receiver(receiver)
 
     for layer, parameter in zip(receiver.model.layers, bound):
         attention = layer.self_attn
-        assert attention.v_b_proj is parameter, "setup_aliases() must be idempotent"
+        assert attention.v_b_proj is parameter, "receiver preparation must be idempotent"
         assert not attention._weights_transformed
         # The same storage as `kv_b_proj.weight`, past the K-nope rows.
         assert (
@@ -684,10 +688,17 @@ def test_deepseek_v3_receiver_restores_v_b_proj_alias_before_transfer(
 
 
 @_requires_cutlass_bf16_moe
-def test_deepseek_v3_setup_aliases_leaves_a_loaded_producer_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "alias_walk",
+    [
+        pytest.param(model_hooks_mod.setup_aliases, id="setup-aliases"),
+        pytest.param(model_hooks_mod.prepare_post_transform_receiver, id="receiver-preparation"),
+    ],
+)
+def test_deepseek_v3_alias_walks_leave_a_loaded_producer_unchanged(
+    monkeypatch: pytest.MonkeyPatch, alias_walk: Callable[[nn.Module], None]
 ) -> None:
-    """After the loader bound `v_b_proj`, `setup_aliases()` rebinds nothing."""
+    """After the loader bound `v_b_proj`, neither alias walk rebinds it."""
     producer = _tiny_model(monkeypatch)
     _hf_checkpoint_loader(_hf_state_dict(None))(producer)
     model_hooks_mod.walk_full_post_load(producer)
@@ -700,7 +711,7 @@ def test_deepseek_v3_setup_aliases_leaves_a_loaded_producer_unchanged(
         for layer in producer.model.layers
     ]
 
-    model_hooks_mod.setup_aliases(producer)
+    alias_walk(producer)
 
     after = [
         (
@@ -713,22 +724,26 @@ def test_deepseek_v3_setup_aliases_leaves_a_loaded_producer_unchanged(
     assert all(a[0] is b[0] and a[1:] == b[1:] for a, b in zip(before, after))
 
 
-@_requires_cutlass_bf16_moe
-@pytest.mark.parametrize(
-    "model_class",
-    [
-        pytest.param(modeling_deepseekv3_mod.GlmMoeDsaForCausalLM, id="glm-5"),
-        pytest.param(modeling_mistral_large3_mod.MistralLarge3ForCausalLM, id="mistral-large-3"),
-        pytest.param(_UnqualifiedDeepseekV3ForCausalLM, id="other-subclass"),
-    ],
+# The DeepSeek-V3 root and its subclasses, which share its MLA modules.
+_DEEPSEEK_V3_FAMILY_ROOTS = (
+    pytest.param(modeling_deepseekv3_mod.DeepseekV3ForCausalLM, id="deepseek-v3"),
+    pytest.param(modeling_deepseekv3_mod.GlmMoeDsaForCausalLM, id="glm-5"),
+    pytest.param(modeling_mistral_large3_mod.MistralLarge3ForCausalLM, id="mistral-large-3"),
+    pytest.param(_UnqualifiedDeepseekV3ForCausalLM, id="other-subclass"),
 )
-def test_deepseek_v3_subclasses_keep_their_v_b_proj_binding(
+
+
+@_requires_cutlass_bf16_moe
+@pytest.mark.parametrize("model_class", _DEEPSEEK_V3_FAMILY_ROOTS)
+def test_setup_aliases_leaves_deepseek_v3_v_b_proj_unbound(
     monkeypatch: pytest.MonkeyPatch, model_class: type[nn.Module]
 ) -> None:
-    """`setup_aliases()` restores the `v_b_proj` view only on the exact DeepSeek-V3 root.
+    """`setup_aliases()`, the only alias walk outside MX receivers, never rebinds `v_b_proj`.
 
-    A subclass can lay out `kv_b_proj` with its own loader, so even a
-    separately allocated `v_b_proj` stays the tensor the subclass built.
+    GMS read-only peers, for example, run it before they materialize weights.
+    The models here hold real tensors, as when `MetaInitMode` construction
+    falls back, so the receiver hook would rebind `v_b_proj` if this walk
+    called it.
     """
     model = _tiny_model(monkeypatch, model_class=model_class, filled=False)
     before = [layer.self_attn.v_b_proj for layer in model.model.layers]
@@ -742,6 +757,35 @@ def test_deepseek_v3_subclasses_keep_their_v_b_proj_binding(
             attention.v_b_proj.untyped_storage().data_ptr()
             != attention.kv_b_proj.weight.untyped_storage().data_ptr()
         )
+
+
+@_requires_cutlass_bf16_moe
+@pytest.mark.parametrize("model_class", _DEEPSEEK_V3_FAMILY_ROOTS)
+def test_mx_prepares_only_a_qualified_deepseek_v3_receiver(
+    monkeypatch: pytest.MonkeyPatch, model_class: type[nn.Module]
+) -> None:
+    """MX asks for receiver preparation, and so the `v_b_proj` restore, only for a qualified root.
+
+    The GLM-5, Mistral Large 3, and other subclasses inherit the receiver hook
+    but never qualify, so no load runs it on them.
+    """
+    model = _tiny_model(monkeypatch, model_class=model_class, filled=False)
+    decision = _qualify(model)
+
+    kwargs = mx_loading_mod.get_mx_load_weights_kwargs(
+        model_config=model.model_config,
+        llm_args=MagicMock(name="llm_args"),
+        qualification=decision,
+    )
+
+    qualified = model_class is modeling_deepseekv3_mod.DeepseekV3ForCausalLM
+    assert decision.qualified is qualified
+    if qualified:
+        assert kwargs["prepare_post_transform_receiver"] is (
+            model_hooks_mod.prepare_post_transform_receiver
+        )
+    else:
+        assert "prepare_post_transform_receiver" not in kwargs
 
 
 @_requires_cutlass_bf16_moe
@@ -804,7 +848,7 @@ def test_staged_deepseek_v3_finalization_preserves_mx_tensor_catalog(
     """Routed-expert and MLA tensors stay registered, with unchanged storage, through finalization."""
     model = _tiny_model(monkeypatch)
 
-    model_hooks_mod.setup_aliases(model)
+    model_hooks_mod.prepare_post_transform_receiver(model)
     registered_catalog = mx_canonical_parameter_catalog(model)
 
     model_hooks_mod.setup_aliases(model)

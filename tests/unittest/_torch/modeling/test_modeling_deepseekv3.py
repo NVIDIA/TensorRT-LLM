@@ -594,7 +594,7 @@ def _tiny_dense_deepseek_v3(tp_size: int = 1, rank: int = 0):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the MLA module needs CUDA")
 def test_mla_v_b_proj_alias_is_restored_structurally_and_idempotently():
-    """`setup_aliases()` binds `v_b_proj` to the V rows of `kv_b_proj.weight` without copying."""
+    """The receiver hook binds `v_b_proj` to the V rows of `kv_b_proj.weight` without copying."""
     model = _tiny_dense_deepseek_v3()
     attention = model.model.layers[0].self_attn
     assert attention.kv_b_proj.weight.untyped_storage().data_ptr() != (
@@ -602,9 +602,9 @@ def test_mla_v_b_proj_alias_is_restored_structurally_and_idempotently():
     )
     attention._weights_transformed = False
 
-    model.setup_aliases()
+    model.setup_post_transform_receiver_aliases()
     bound = attention.v_b_proj
-    model.setup_aliases()
+    model.setup_post_transform_receiver_aliases()
 
     assert attention.v_b_proj is bound
     assert not attention._weights_transformed
@@ -689,6 +689,6 @@ def test_mla_v_b_proj_alias_skips_ineligible_layouts(monkeypatch, break_eligibil
     break_eligibility(attention, monkeypatch)
     original = attention.v_b_proj
 
-    model.setup_aliases()
+    model.setup_post_transform_receiver_aliases()
 
     assert attention.v_b_proj is original

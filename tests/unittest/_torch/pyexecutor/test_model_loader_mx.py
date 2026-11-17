@@ -1877,7 +1877,9 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
         kwargs["post_transform_protocol_version"]
         == mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
-    assert callable(kwargs["prepare_post_transform_receiver"])
+    assert (
+        kwargs["prepare_post_transform_receiver"] is model_hooks_mod.prepare_post_transform_receiver
+    )
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
@@ -4994,6 +4996,9 @@ class _HookRecorder(nn.Module):
     def setup_aliases(self) -> None:
         self.events.append((self.name, "setup_aliases"))
 
+    def setup_post_transform_receiver_aliases(self) -> None:
+        self.events.append((self.name, "setup_post_transform_receiver_aliases"))
+
     def cache_derived_state(self) -> None:
         self.events.append((self.name, "cache_derived_state"))
 
@@ -5020,6 +5025,28 @@ def test_staged_hook_setup_aliases_walks_skip_removed_modules():
         ("model", "setup_aliases"),
         ("child", "setup_aliases"),
         ("transformed_child", "setup_aliases"),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_receiver_preparation_adds_receiver_aliases_after_setup_aliases():
+    """MX receiver preparation runs the shared alias walk, then the receiver-only hook.
+
+    `test_staged_hook_setup_aliases_walks_skip_removed_modules` shows that the
+    shared walk alone never calls the receiver hook.
+    """
+    events = []
+    model = _HookModel(events)
+
+    model_hooks_mod.prepare_post_transform_receiver(model)
+
+    assert events == [
+        ("model", "setup_aliases"),
+        ("child", "setup_aliases"),
+        ("transformed_child", "setup_aliases"),
+        ("model", "setup_post_transform_receiver_aliases"),
+        ("child", "setup_post_transform_receiver_aliases"),
+        ("transformed_child", "setup_post_transform_receiver_aliases"),
     ]
 
 
