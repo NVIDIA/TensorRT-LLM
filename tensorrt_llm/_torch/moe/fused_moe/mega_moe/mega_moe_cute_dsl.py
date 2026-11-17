@@ -590,12 +590,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
-        # TEP (attention TP + MoE EP) needs no gate here: the fused kernel
+        # Eager TEP (attention TP + MoE EP) is supported: the fused kernel
         # returns a globally combined routed output, and FusedCommMoEScheduler
         # hands it to callers that reduce externally as a rank partial. It is
         # correct but not cheap: every TP rank dispatches the same replicated
         # tokens, so expert compute runs parallel_size times (the reason
         # MegaMoEDeepGemm rejects TEP). validate_configurable_moe warns once.
+        if d.use_cuda_graph and d.parallel_size > 1 and not d.use_dp:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                "MegaMoECuteDsl TEP (attention TP + MoE EP) does not support CUDA graphs; "
+                "disable CUDA graphs (cuda_graph_config=None) or use another MoE backend.",
+            )
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:

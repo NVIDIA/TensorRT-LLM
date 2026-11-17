@@ -3822,13 +3822,18 @@ def _make_megamoe_cutedsl_minimax_problem(
 
 
 def _make_megamoe_cutedsl_test_deployment(
-    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
+    *,
+    ep_size: int = 1,
+    parallel_size: int = 1,
+    use_dp: bool = False,
+    use_cuda_graph: bool = False,
 ) -> MoEDeployment:
     return MoEDeployment(
         ep_size=ep_size,
         tp_size=1,
         parallel_size=parallel_size,
         use_dp=use_dp,
+        use_cuda_graph=use_cuda_graph,
         num_slots=8,
         env=MoEEnvironment(
             sm=100,
@@ -3911,6 +3916,30 @@ def test_megamoe_cutedsl_accepts_tep_for_every_model(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "parallel_size,use_dp,eligible",
+    [(8, False, False), (1, False, True), (8, True, True)],
+    ids=["tep", "single_rank", "adp"],
+)
+def test_megamoe_cutedsl_cuda_graph_eligibility(
+    parallel_size: int, use_dp: bool, eligible: bool
+) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_tep_problem(ActivationType.SiTu, {"alpha", "beta"}),
+        _make_megamoe_cutedsl_test_deployment(
+            ep_size=parallel_size,
+            parallel_size=parallel_size,
+            use_dp=use_dp,
+            use_cuda_graph=True,
+        ),
+    )
+    assert verdict.eligible is eligible, verdict.detail
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+        assert "cuda_graph_config=None" in verdict.detail
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
 def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
     activation: ActivationType, constants: set[str]
@@ -3927,21 +3956,46 @@ def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
 
 
 @pytest.mark.cpu_only
-def test_strict_megamoe_cutedsl_request_reports_rejection_detail() -> None:
+@pytest.mark.parametrize("cuda_graph", [False, True], ids=["moe_tp", "tep_cuda_graph"])
+def test_strict_megamoe_cutedsl_request_reports_rejection_detail(cuda_graph: bool) -> None:
     """A strict MEGAMOE_CUTEDSL request names why the backend was rejected."""
     model_config = ModelConfig()
     model_config.moe_backend = "MEGAMOE_CUTEDSL"
-    deployment = dataclasses.replace(
-        _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+    deployment = (
+        _make_megamoe_cutedsl_test_deployment(ep_size=8, parallel_size=8, use_cuda_graph=True)
+        if cuda_graph
+        else dataclasses.replace(
+            _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+        )
     )
 
-    with pytest.raises(ValueError, match="EP-only"):
+    with pytest.raises(ValueError, match="CUDA graphs" if cuda_graph else "EP-only"):
         resolve_moe_impl(
             model_config,
             problem=_make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
             deployment=deployment,
             allow_degradation=False,
         )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_tep_cuda_graph_request_falls_back_to_cutlass() -> None:
+    model_config = ModelConfig(moe_backend="MEGAMOE_CUTEDSL", use_cuda_graph=True)
+    report = resolve_moe_impl(
+        model_config,
+        problem=_make_megamoe_cutedsl_tep_problem(ActivationType.SiTu, {"alpha", "beta"}),
+        deployment=_make_megamoe_cutedsl_test_deployment(
+            ep_size=8, parallel_size=8, use_cuda_graph=True
+        ),
+    )
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
+    assert report.degraded
+    rejection = report.degraded_from
+    assert rejection is not None
+    assert rejection.reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+    metadata = report.to_dict()["deployment"]
+    assert isinstance(metadata, dict)
+    assert metadata["use_cuda_graph"] is True
 
 
 def _fused_comm_scheduler(
@@ -6806,20 +6860,29 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             ref_fused_moe.check_accuracy(output, ref_output)
 
 
-def test_build_moe_deployment_carries_finalize_and_locality_domain():
-    """The two fields SM107 eligibility reads must survive ``ModelConfig``."""
-    from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
-
-    default = build_moe_deployment(ModelConfig(), num_experts=8)
+@pytest.mark.cpu_only
+def test_build_moe_deployment_carries_finalize_and_locality_domain() -> None:
+    """Eligibility settings must survive ``ModelConfig`` without hardware probes."""
+    environment = MoEEnvironment(sm=100)
+    default = build_moe_deployment(ModelConfig(), num_experts=8, environment=environment)
     assert default.fused_finalize_enabled is True
     assert default.locality_domain_requested is False
+    assert default.use_cuda_graph is False
 
-    disabled = build_moe_deployment(ModelConfig(moe_disable_finalize_fusion=True), num_experts=8)
+    graphs = build_moe_deployment(
+        ModelConfig(use_cuda_graph=True), num_experts=8, environment=environment
+    )
+    assert graphs.use_cuda_graph is True
+
+    disabled = build_moe_deployment(
+        ModelConfig(moe_disable_finalize_fusion=True), num_experts=8, environment=environment
+    )
     assert disabled.fused_finalize_enabled is False
 
     requested = build_moe_deployment(
         ModelConfig(locality_domain_policy=LocalityDomainPolicy(enabled=True)),
         num_experts=8,
+        environment=environment,
     )
     assert requested.locality_domain_requested is True
 

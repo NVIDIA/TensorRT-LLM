@@ -325,6 +325,8 @@ class MoEDeployment:
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
     force_dynamic_quantization: bool = False
+    # Whether engine forwards may be captured and replayed with CUDA graphs.
+    use_cuda_graph: bool = False
 
     @property
     def smart_router(self) -> bool:
@@ -655,6 +657,7 @@ class MoEResolutionReport:
                 "eplb_mode": self.deployment.eplb_mode,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
                 "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
+                "use_cuda_graph": self.deployment.use_cuda_graph,
                 "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,
                 "sm": self.deployment.env.sm,
                 "env_flags": dict(self.deployment.env.env_flags),

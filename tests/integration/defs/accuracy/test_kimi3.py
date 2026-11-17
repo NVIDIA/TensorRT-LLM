@@ -482,7 +482,8 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             # capture needs a whole-sequence prefill.
             disable_overlap_scheduler=True,
             enable_chunked_prefill=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            # The TEP backend eligibility guard requires eager execution.
+            cuda_graph_config=None,
             # K3's NVFP4 routed experts on the fused-comm MegaMoE CuteDSL
             # kernels; TestKimiK3 covers them on TRTLLM-Gen.
             moe_config=MoeConfig(
