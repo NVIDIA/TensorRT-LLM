@@ -25,6 +25,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -829,29 +831,55 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 # green. What this does cover is the RoPE, KV-write, sparse-MLA and compressor
 # paths at widths other than one, which was previously nothing at all.
 @pytest.mark.parametrize(
-    "context_lengths,generation_seq_len_q,sinks,exports_softmax_stats",
+    "context_lengths,generation_seq_len_q",
     [
-        ([4399], 1, "small", False),
-        ([14, 508, 3947], 1, "small", False),
-        ([2, 1406, 3327], 1, "small", False),
-        ([14, 508, 3947], 2, "small", False),
-        ([14, 508, 3947], 6, "small", False),
-        ([14, 508, 3947], [1, 2, 4], "small", False),
-        ([14, 508, 3947], [2, 2, 2], "small", False),
-        # The split-KV reduction of the generation kernel adds the sink term and exports the softmax
-        # stats. Large sinks hold up to most of the softmax mass; the small ones above stay below the
-        # tolerance even when dropped.
-        ([14, 508, 3947], 2, "large", False),
-        ([14, 508, 3947], 2, "large", True),
-        ([14, 508, 3947], 2, "none", False),
-        ([14, 508, 3947], 2, "none", True),
+        ([4399], 1),
+        ([14, 508, 3947], 1),
+        ([2, 1406, 3327], 1),
+        ([14, 508, 3947], 2),
+        ([14, 508, 3947], 6),
+        ([14, 508, 3947], [1, 2, 4]),
+        ([14, 508, 3947], [2, 2, 2]),
     ],
 )
-def test_deepseek_v4_sparse_mla(
+def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int | List[int]):
+    _run_deepseek_v4_sparse_mla(context_lengths, generation_seq_len_q)
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+# Large sinks hold up to most of the softmax mass; the small ones of the cases above stay below
+# the tolerance even when dropped.
+@pytest.mark.parametrize(
+    "sinks,exports_softmax_stats",
+    [("large", False), ("large", True), ("none", False), ("none", True)],
+)
+def test_deepseek_v4_sparse_mla_split_kv_reduction(
+    monkeypatch, sinks: str, exports_softmax_stats: bool
+):
+    """The TRTLLM-Gen split-KV reduction adds the sink term and exports the softmax stats.
+
+    PrimTS serves SM100 generation by default; it is turned off to keep these cases on TRTLLM-Gen.
+    """
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts_sparse_mla")
+    generation_fmhas: list[type] = []
+    for fmha_cls in (PrimsTSSparseMlaFmha, FallbackFmha):
+
+        def spy_forward(self, q, k, v, metadata, forward_args, _forward=fmha_cls.forward):
+            if forward_args.attention_input_type == AttentionInputType.generation_only:
+                generation_fmhas.append(type(self))
+            return _forward(self, q, k, v, metadata, forward_args)
+
+        monkeypatch.setattr(fmha_cls, "forward", spy_forward)
+    _run_deepseek_v4_sparse_mla([14, 508, 3947], 2, sinks, exports_softmax_stats)
+    assert generation_fmhas and set(generation_fmhas) == {FallbackFmha}, generation_fmhas
+
+
+def _run_deepseek_v4_sparse_mla(
     context_lengths: List[int],
     generation_seq_len_q: int | List[int],
-    sinks: str,
-    exports_softmax_stats: bool,
+    sinks: str = "small",
+    exports_softmax_stats: bool = False,
 ):
     num_generation_steps = 2
     is_ragged = isinstance(generation_seq_len_q, list)
@@ -1833,6 +1861,4 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(
-        context_lengths=[4399], generation_seq_len_q=1, sinks="small", exports_softmax_stats=False
-    )
+    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=1)
