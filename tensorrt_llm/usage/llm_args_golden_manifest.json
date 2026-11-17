@@ -118,6 +118,11 @@
       "path": "attn_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "autotuner_nvmmh_config.max_tactics"
+    },
+    {
       "allowed_values": [
         "pytorch"
       ],
@@ -284,6 +289,16 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "cuda_graph_config.num_tokens"
+    },
+    {
+      "allowed_values": [
+        "greedy",
+        "advanced",
+        "temperature_only"
+      ],
+      "capture_policy": "list[literal]|none",
+      "kind": "categorical",
+      "path": "cuda_graph_config.sampling_variants"
     },
     {
       "capture_policy": "list[int]|none",

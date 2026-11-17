@@ -16,27 +16,27 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers the trtllm ops
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_index_score as index_score_kernel,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_index_score_t2sc as index_score_t2sc_kernel,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_index_score import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_index_score import (  # noqa: E501
     m3_index_score,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv import (  # noqa: E501
     O_PROJ,
     SHARED_DOWN,
     SHARED_GATE_UP,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_index_score import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_index_score import (  # noqa: E501
     IndexScoreRunner as TargetIndexScoreRunner,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
     op as mx_gemv,
 )
 
@@ -231,7 +231,8 @@ def _projection(nk, push):
 def test_gemvs_after_prebuild_never_compile(monkeypatch, nk, push) -> None:
     use_pdl = True
     module = _projection(nk, push)
-    variants = modeling._gemv_variants(*nk, push, 4)
+    call_n, call_k = nk
+    variants = modeling._gemv_variants(call_n, call_k, push, 4)
     pushes = [v for v in variants if v[2] is not None]
     if push is None:
         assert not pushes

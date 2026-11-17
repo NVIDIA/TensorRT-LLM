@@ -28,7 +28,7 @@ from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim, _kept_entries
 
 pytestmark = pytest.mark.cpu_only
 
-_PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PY = "tensorrt_llm/_torch/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)"
 _COMM = "unittest/_torch/modeling_v2/comm"

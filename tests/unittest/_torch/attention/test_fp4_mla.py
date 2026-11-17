@@ -14,6 +14,7 @@ import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backe
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
+import tensorrt_llm._torch.attention.backends.fp4_mla.decode_4x as fp4_mla_decode_4x
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
 import tensorrt_llm._torch.attention.backends.trtllm as trtllm_backend
@@ -89,6 +90,23 @@ def _is_cutedsl_unavailable() -> bool:
         or torch.cuda.get_device_capability() != (10, 7)
         or not _cutedsl_backend_available()
     )
+
+
+def _cutedsl_4x_skip_reason() -> str | None:
+    """Why the tests that must take the 4x kernel cannot run on this machine; None when they can."""
+    if _is_cutedsl_unavailable():
+        return "requires Rubin SM107 and the CTM/CuTeDSL runtime"
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    # the 4x kernel needs the oversized shared-memory mode; a device without it decodes on 2x by design
+    return host_4x.device_unsupported_reason(torch.device("cuda", torch.cuda.current_device()))
+
+
+_CUTEDSL_4X_SKIP_REASON = _cutedsl_4x_skip_reason()
+_requires_cutedsl_4x = pytest.mark.skipif(
+    _CUTEDSL_4X_SKIP_REASON is not None,
+    reason=_CUTEDSL_4X_SKIP_REASON or "the 4x kernel can run here",
+)
 
 
 def test_fp4_mla_request_validation_uses_sparse_runtime_params() -> None:
@@ -1863,6 +1881,85 @@ def test_fp4_mla_pool_views_built_in_inference_mode_can_be_scrubbed(monkeypatch)
         manager.shutdown()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch) -> None:
+    """A KV-regime-keyed CUDA graph bounds the decode path choice of its own metadata only.
+
+    The graph metadata owns an FP4 state of its own, so eager steps keep deciding on the
+    page-table capacity.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=1024,
+        max_seq_len=512,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+    )
+    try:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=1024,
+            kv_cache_manager=manager,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+        graph_metadata = metadata.create_cuda_graph_metadata(2, False, 3)
+        eager_state = metadata.fp4_mla_state
+        graph_state = graph_metadata.fp4_mla_state
+        assert eager_state is not None and graph_state is not None
+        assert graph_state is not eager_state
+
+        graph_metadata.set_decode_kv_regime(8192)
+        assert graph_metadata.decode_kv_regime == 8192
+        assert graph_state.kv_regime_max_kv == 8192
+        assert metadata.decode_kv_regime is None
+        assert eager_state.kv_regime_max_kv is None
+
+        graph_metadata.set_decode_kv_regime(None)
+        assert graph_metadata.decode_kv_regime is None
+    finally:
+        manager.shutdown()
+
+
+def test_fp4_mla_decode_packed_split_stays_on_the_graph_metadata(monkeypatch) -> None:
+    """A split-keyed CUDA graph fixes the packed split decision of its own metadata only.
+
+    Eager steps keep deciding per call on their host KV lengths.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=1024,
+        max_seq_len=512,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+    )
+    try:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=1024,
+            kv_cache_manager=manager,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+        graph_metadata = metadata.create_cuda_graph_metadata(2, False, 3)
+        eager_state = metadata.fp4_mla_state
+        graph_state = graph_metadata.fp4_mla_state
+        assert eager_state is not None and graph_state is not None
+        assert graph_state is not eager_state
+
+        graph_metadata.set_decode_packed_split(False)
+        assert graph_metadata.decode_packed_split is False
+        assert graph_state.packed_split is False
+        assert metadata.decode_packed_split is None
+        assert eager_state.packed_split is None
+
+        graph_metadata.set_decode_packed_split(None)
+        assert graph_metadata.decode_packed_split is None
+    finally:
+        manager.shutdown()
+
+
 def _create_fp4_mla_v2_manager(
     *,
     max_tokens: int,
@@ -2189,7 +2286,8 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
-        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        # Packed decode pads the rows of each request to a whole scale row group.
+        torch.testing.assert_close(state.prequantized_q[: expected_q_fp4.shape[0]], expected_q_fp4)
         q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
         valid_q_sf_offsets = torch.tensor(
             [
@@ -2769,9 +2867,30 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
+    enable_4x: bool = False,
+    env: dict[str, str] | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_CUTEDSL_4X_ENV, str(int(enable_4x)))
+    if enable_4x:
+        # the test caches are small batches: lift the production floor on pair tasks (dispatch is tested on CPU)
+        from tensorrt_llm._torch.attention.backends.fp4_mla import (
+            fp4_mla_cutedsl_4x_host as host_4x,
+        )
+
+        monkeypatch.setenv(host_4x.MIN_PAIRS_ENV, "0")
+        from tensorrt_llm._torch.attention.backends.fp4_mla import (
+            fp4_mla_dispatch,
+            fp4_mla_twostream,
+        )
+
+        monkeypatch.setenv(fp4_mla_dispatch.MIN_KV_4X_ENV, "0")
+        # the plain-4x tests exercise the split mode on short caches: keep the two-stream split off unless a test
+        # enables it through ``env`` (the two-stream tests do)
+        monkeypatch.setenv(fp4_mla_twostream.TWOSTREAM_ENV, "0")
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv(
         FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
         str(int(fused_v_transpose)),
@@ -2994,6 +3113,509 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     )
 
 
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "query_len_per_seq,seq_lens",
+    [
+        (2, [131, 512, 2100]),
+        (4, [131, 512]),
+        (4, [131, 9000, 131, 24000]),
+        (6, [131, 2100]),
+        (8, [131, 512]),
+    ],
+    ids=["h128-q2", "h128-q4", "h128-q4-skew", "h128-q6", "h128-q8"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
+    monkeypatch,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+) -> None:
+    """4x one-wave kernel (TRTLLM_FP4_MLA_CUTEDSL_4X=1) on the shapes inside its envelope."""
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+    )
+    assert calls == ["4x"], calls
+
+
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "query_len_per_seq,seq_lens,forced_r2",
+    [
+        (
+            4,
+            [131, 512, 2100, 300, 1024, 777, 4096, 64],
+            2,
+        ),  # 8 requests: 6 on the 4x arm (12 pairs), 2 on the 2x arm
+        (
+            2,
+            [131, 512, 2100, 300, 1024, 777, 4096, 64, 9, 3000],
+            3,
+        ),  # q2: 128-row m-tiles, 3 requests on the 2x arm
+    ],
+    ids=["q4-r2", "q2-r3"],
+)
+def test_fp4_mla_attention_decode_cutedsl_twostream_matches_reference(
+    monkeypatch,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+    forced_r2: int,
+) -> None:
+    """Two-stream decode (TRTLLM_FP4_MLA_TWOSTREAM_R2 forces the split): the 4x arm takes the first requests, the
+    2x packed arm the last ones, on two streams; the merged output matches the reference."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_twostream as ts
+
+    calls: list[tuple[str, int]] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append(("4x", kwargs["num_requests"]))
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append(("2x", kwargs["num_requests"]))
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=seq_lens,
+        seed=43,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+        env={ts.TWOSTREAM_R2_ENV: str(forced_r2)},
+    )
+    assert calls, "no decode call recorded"
+    assert all(call in (("4x", len(seq_lens) - forced_r2), ("2x", forced_r2)) for call in calls), (
+        calls
+    )
+    assert ("4x", len(seq_lens) - forced_r2) in calls and ("2x", forced_r2) in calls, calls
+
+
+@_requires_cutedsl_4x
+def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> None:
+    """Automatic dispatcher at B128/q4 (5.57 4x waves): 13 requests move to the 2x arm; output matches the reference."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[tuple[str, int]] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append(("4x", kwargs["num_requests"]))
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append(("2x", kwargs["num_requests"]))
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[257 + 7 * i for i in range(128)],
+        seed=44,
+        query_len_per_seq=4,
+        packed_queries=True,
+        enable_4x=True,
+        # the test page table is short: lift the split-mode KV floor so the multi-wave call enters the 4x envelope
+        env={
+            host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0",
+            "TRTLLM_FP4_MLA_TWOSTREAM": "1",
+            "TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE": "1.0",  # the split that was measured with the internal 2x kernel
+        },
+    )
+    assert ("4x", 115) in calls and ("2x", 13) in calls, calls
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "forced_path,expect",
+    [pytest.param("4x", ("4x", 128), marks=_requires_cutedsl_4x), ("2x", ("2x", 128))],
+    ids=["force-4x", "force-2x"],
+)
+def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(
+    monkeypatch, forced_path: str, expect
+) -> None:
+    """TRTLLM_FP4_MLA_DECODE_PATH forces the plain paths even where the dispatcher would split."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+
+    calls: list[tuple[str, int]] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append(("4x", kwargs["num_requests"]))
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append(("2x", kwargs["num_requests"]))
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[257 + 7 * i for i in range(128)],
+        seed=44,
+        query_len_per_seq=4,
+        packed_queries=True,
+        enable_4x=True,
+        env={
+            fp4_mla_dispatch.DECODE_PATH_ENV: forced_path,
+            host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0",
+        },
+    )
+    assert calls and all(call == expect for call in calls), calls
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,enable_helix,enable_4x,seq_lens",
+    [
+        (128, 1, False, True, [131, 512]),  # odd q: 4x needs token pairs
+        (128, 4, False, False, [131, 512]),  # knob off
+        (96, 8, True, True, [131, 2100]),  # Helix bounds / stats
+        (128, 4, False, True, [131] * 24),  # 48 pairs > one wave of 46 with the split mode off
+        (
+            96,
+            4,
+            False,
+            True,
+            [131, 512],
+        ),  # 96 x 4 rows is not a multiple of 256 (no rows-mode pair)
+    ],
+    ids=["q1", "knob-off", "helix", "two-waves-split-off", "h96-q4"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    enable_helix: bool,
+    enable_4x: bool,
+    seq_lens: list[int],
+) -> None:
+    """Outside the 4x envelope (or with the knob off) the packed 2x path runs, untouched."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[str] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+        packed_queries=True,
+        split_kv=1,
+        enable_4x=enable_4x,
+        env={host_4x.SPLIT_ENV: "0"},
+    )
+    assert calls == ["2x"], calls
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_unavailable_device_runs_packed(monkeypatch) -> None:
+    """A device that cannot host the 4x kernel keeps a call inside the 4x envelope on the packed 2x path."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    reason = "the 4x kernel declares more shared memory per block than the device allows"
+    calls: list[str] = []
+    asked: list[torch.device] = []
+    recorded: list[str | None] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    def unsupported(device):
+        asked.append(device)
+        return reason
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(host_4x, "device_unsupported_reason", unsupported)
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_fp4_mla_4x_record", lambda why, *a, **k: recorded.append(why)
+    )
+    # the "h128-q4" case of test_fp4_mla_attention_decode_cutedsl_4x_matches_reference: 4x takes it otherwise
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[131, 512],
+        seed=41,
+        query_len_per_seq=4,
+        packed_queries=True,
+        enable_4x=True,
+    )
+    assert calls == ["2x"], calls
+    # the backend asked about the device of the call, and the host's reason is the dispatcher's
+    assert asked and all(device.type == "cuda" for device in asked), asked
+    assert recorded == [reason], recorded
+
+
+@_requires_cutedsl_4x
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,seq_lens,one_wave_min_kv",
+    [
+        (128, 4, [131] * 24, None),  # 48 pairs: 23 whole + 1 split request (two waves)
+        (128, 2, [131, 512, 2100, 77] * 13, None),  # 52 pairs, skewed: the longest requests are cut
+        (
+            96,
+            8,
+            [131, 2100, 513],
+            "0",
+        ),  # rows mode (H96 x q8 = 3 pairs per request) + one-wave split
+        (128, 8, [2100] * 11, "0"),  # 44 pairs under one wave, split forced by the one-wave knob
+    ],
+    ids=["48-pairs", "52-pairs-skew", "h96-q8-onewave-split", "q8-onewave-split"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_split_matches_reference(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+    one_wave_min_kv: str | None,
+) -> None:
+    """4x split mode (device plan + FP32 partials + packed reducer) on batches above one wave, skewed KV
+    lengths and the rows-mode head count; the multi-wave KV floor is lifted so the test caches qualify."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+    split_launches: list[int] = []
+    buffers = fp4_mla_decode_4x._fp4_mla_4x_split_buffers
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    def spy_buffers(*args, **kwargs):
+        split = buffers(*args, **kwargs)
+        split_launches.append(int(split["task_capacity"]))
+        return split
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(fp4_mla_decode_4x, "_fp4_mla_4x_split_buffers", spy_buffers)
+    env = {host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"}
+    if one_wave_min_kv is not None:
+        env[host_4x.SPLIT_MIN_KV_ONEWAVE_ENV] = one_wave_min_kv
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=43,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+        env=env,
+    )
+    assert calls == ["4x"], calls
+    assert split_launches, "the split mode was not taken"
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+def test_fp4_mla_cutedsl_4x_plan_kernel_matches_host_mirror() -> None:
+    """The device plan of the 4x split mode equals its host mirror (same policy, integer arithmetic, tie rules)."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_plan as plan_4x
+
+    device = torch.device("cuda")
+    cases = [
+        ([30080] * 32, 2, 512),  # B32/Q4: 23 whole + 9 x 2-way
+        ([135168] * 32, 2, 512),  # B32/Q4 long: 23 whole + 9 x 5-way
+        ([30080] * 52, 1, 256),  # B52/Q2: 46 whole + 6 x 6-way
+        ([30080] * 23, 2, 512),  # exactly one wave: nothing split
+        ([135168] * 11, 3, 768),  # H96 x q8, under-filled wave at long KV: uniform 4-way
+        ([131, 2100, 7], 3, 768),
+        ([1, 127, 128, 129, 255, 256, 257, 30079, 30080], 2, 512),
+        ([256 * (i + 1) for i in range(46)], 1, 256),
+        ([30080] * 128, 2, 512),  # B128/Q4: 115 whole + 13 x 3-way
+    ]
+    for kv_lens, pairs_per_request, rows in cases:
+        num_requests = len(kv_lens)
+        capacity = plan_4x.plan_4x_task_capacity(num_requests, pairs_per_request)
+        plan = torch.full(
+            (plan_4x.plan_4x_length(num_requests, capacity),), -1, dtype=torch.int32, device=device
+        )
+        plan_4x.launch_4x_plan(
+            torch.tensor(kv_lens, dtype=torch.int32, device=device),
+            plan,
+            num_requests=num_requests,
+            task_capacity=capacity,
+            pairs_per_request=pairs_per_request,
+            rows_per_request=rows,
+        )
+        torch.cuda.synchronize()
+        expected = plan_4x.plan_4x_tasks(
+            kv_lens,
+            task_capacity=capacity,
+            pairs_per_request=pairs_per_request,
+            rows_per_request=rows,
+        )
+        assert plan.tolist() == expected, (kv_lens[:4], pairs_per_request)
+        used = expected[1]
+        assert num_requests <= used <= capacity
+        # every request's tasks tile its KV exactly once
+        tables = 3 + num_requests
+        for request in range(num_requests):
+            tiles = max((kv_lens[request] + 255) // 256, 1)
+            chunks = sorted(
+                (expected[tables + 3 * capacity + i], expected[tables + 4 * capacity + i])
+                for i in range(used)
+                if expected[tables + i] == request
+            )
+            position = 0
+            for begin, count in chunks:
+                assert begin == position and count >= 1
+                position += count
+            assert position == tiles
+
+
+def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
+    """CPU-only: the static dispatch predicate behind TRTLLM_FP4_MLA_CUTEDSL_4X."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    ok = dict(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080, sm_count=212)
+    assert host_4x.envelope_reason_static(**ok) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 14}) is None
+    )  # 2 x 14 x 4 m-tiles > 106 clusters: the 2x plan keeps requests whole (4x -4 %)
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 13}) is not None
+    )  # the 2x two-piece plan fits one wave (4x +29 %)
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 7, "query_len": 8}) is None
+    )  # 2 x 7 x 8 = 112 > 106
+    assert host_4x.envelope_reason_static(**{**ok, "query_len": 1}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "query_len": 3}) is not None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_heads": 96}) is not None
+    )  # 96 x 4 % 256 != 0
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_heads": 96, "query_len": 8}) is None
+    )  # rows mode
+    # one pair = 256 packed rows of one request: q2 -> 46 requests, q8 -> 11 requests fill the wave; above
+    # that the split mode takes over (plan-driven multi-wave), down to its KV floor
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 46, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 47, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 24}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 128}) is None  # 256 pairs
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 257}) is not None
+    )  # > SPLIT_MAX_PAIRS
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 24, "max_kv_len": 4096}) is not None
+    )
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "max_kv_len": 4096}) is None
+    )  # one wave: no floor
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 11, "query_len": 8}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 12, "query_len": 8}) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 6, "query_len": 8}) is not None
+    )  # 2 x 6 x 8 = 96 <= 106
+    # q2: the 2x path is latency-bound and its two-piece plan gains little -> 4x from 20 pairs on
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 20, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 26, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 19, "query_len": 2}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 9, "query_len": 6}) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 8, "query_len": 6}) is not None
+    )  # 2 x 8 x 6 = 96 <= 106
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 9, "num_heads": 96, "query_len": 8})
+        is None
+    )  # rows mode: 2 x 9 x 6 m-tiles > 106
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 8, "num_heads": 96, "query_len": 8})
+        is not None
+    )
+    assert host_4x.envelope_reason_static(**{**ok, "max_kv_len": 163841}) is not None
+    # the static FULL-only / split-mode choice
+    assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080)
+    assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=24, max_kv_len=30080)
+    assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=15, max_kv_len=30080)
+    assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=15, max_kv_len=135168)
+    assert not host_4x.use_split_mode(
+        num_heads=128, query_len=4, num_requests=23, max_kv_len=135168
+    )
+    assert host_4x.envelope_reason_static(**{**ok, "sm_count": 148}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "helix": True}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "softmax_stats": True}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "v_packed": False}) is not None
+
+
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CuTeDSL runtime",
@@ -3062,9 +3684,22 @@ def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
+@pytest.mark.parametrize(
+    "whole_block_claims", [True, False], ids=["whole-block-claims", "other-claims"]
+)
 def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
     monkeypatch,
+    whole_block_claims: bool,
 ) -> None:
+    """With block reuse the context step repacks the packed V of every page it reads.
+
+    A generation step then writes packed V directly when the manager's reuse
+    claims whole blocks only (the dense manager's policy); for any other
+    manager it repacks the pages it touched.
+    """
+    monkeypatch.setattr(
+        Fp4MlaKVCacheManagerV2, "fp4_mla_reuse_claims_whole_blocks", whole_block_claims
+    )
     original_repack = fp4_mla_backend._repack_cutedsl_v_packed_cache
     repack_calls = []
 
@@ -3092,10 +3727,10 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         enable_block_reuse=True,
     )
 
-    assert len(repack_calls) == 2
+    # the context step repacks every page of the prompt, reused ones included
+    assert len(repack_calls) == (1 if whole_block_claims else 2)
     expected_indptr = torch.tensor([0, 4, 8], dtype=torch.int32)
     torch.testing.assert_close(repack_calls[0]["page_indptr"], expected_indptr)
-    torch.testing.assert_close(repack_calls[1]["page_indptr"], expected_indptr)
     torch.testing.assert_close(
         repack_calls[0]["kv_lens"],
         torch.tensor([130, 511], dtype=torch.int32),
@@ -3104,6 +3739,11 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         repack_calls[0]["generation_lens"],
         torch.tensor([130, 511], dtype=torch.int32),
     )
+    assert repack_calls[0]["max_touched_pages"] == 4
+    if whole_block_claims:
+        return
+    # the generation step repacks the trailing page it appended to
+    torch.testing.assert_close(repack_calls[1]["page_indptr"], expected_indptr)
     torch.testing.assert_close(
         repack_calls[1]["kv_lens"],
         torch.tensor([131, 512], dtype=torch.int32),
@@ -3112,7 +3752,6 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         repack_calls[1]["generation_lens"],
         torch.ones(2, dtype=torch.int32),
     )
-    assert repack_calls[0]["max_touched_pages"] == 4
     assert repack_calls[1]["max_touched_pages"] == 1
 
 
@@ -3484,3 +4123,476 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     assert torch.equal(actual, expected)
     assert torch.all(actual[_V_REPACK_HEAD_DIM : 2 * _V_REPACK_HEAD_DIM] == sentinel)
     assert torch.all(actual[3 * _V_REPACK_HEAD_DIM : 4 * _V_REPACK_HEAD_DIM] == sentinel)
+
+
+# Cached-context prefill: block reuse and chunked prefill.
+
+_CACHED_CONTEXT_NUM_HEADS = 16
+_CACHED_CONTEXT_KV_LORA_RANK = 512
+_CACHED_CONTEXT_QK_NOPE_HEAD_DIM = 128
+_CACHED_CONTEXT_QK_ROPE_HEAD_DIM = 64
+_CACHED_CONTEXT_V_HEAD_DIM = 128
+
+
+class _MlaContextStub:
+    """The MLA module state that the FP4 MLA cached-context path reads."""
+
+    forward_context_with_chunked_prefill_fp4 = MLA.forward_context_with_chunked_prefill_fp4
+
+    def __init__(self, mha, kv_b_weight: torch.Tensor) -> None:
+        self.mha = mha
+        self.num_heads_tp = _CACHED_CONTEXT_NUM_HEADS
+        self.num_context_heads = _CACHED_CONTEXT_NUM_HEADS
+        self.kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+        self.qk_nope_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+        self.qk_rope_head_dim = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.v_head_dim = _CACHED_CONTEXT_V_HEAD_DIM
+        self.out_scale = None
+        self.kv_b_weight = kv_b_weight
+
+    def _project_context_kv(self, compressed_kv: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(compressed_kv, self.kv_b_weight)
+
+
+def _fp4_mla_rope_table(max_positions: int) -> torch.Tensor:
+    """RoPE table in the FP4 MLA kernel layout with a distinct angle per position."""
+    pairs = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM // 2
+    positions = torch.arange(max_positions, dtype=torch.float64)[:, None]
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(pairs, dtype=torch.float64) / pairs))
+    angles = positions * inv_freq[None, :]
+    table = torch.zeros(max_positions, _CACHED_CONTEXT_QK_ROPE_HEAD_DIM, 2, dtype=torch.float64)
+    table[:, :pairs, 0] = torch.cos(angles)
+    table[:, :pairs, 1] = torch.sin(angles)
+    return table.to(device="cuda", dtype=torch.float32).contiguous()
+
+
+def _apply_fp4_mla_rope_reference(
+    values: torch.Tensor, positions: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Rotate interleaved RoPE pairs of ``values[..., rope_dim]`` at ``positions``."""
+    pairs = values.shape[-1] // 2
+    rows = table[positions.long()][:, :pairs]
+    while rows.ndim < values.ndim + 1:
+        rows = rows.unsqueeze(1)
+    cos = rows[..., 0]
+    sin = rows[..., 1]
+    even = values[..., 0::2].float()
+    odd = values[..., 1::2].float()
+    return torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(-2)
+
+
+def _make_fp4_mla_context_attention(max_positions: int):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        MLAParams,
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm.functional import PositionEmbeddingType
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    attention = TrtllmAttention(
+        layer_idx=0,
+        num_heads=_CACHED_CONTEXT_NUM_HEADS,
+        head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+        num_kv_heads=_CACHED_CONTEXT_NUM_HEADS,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        q_scaling=1.0,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams(
+                dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+                max_positions=max_positions,
+                duplicate_data=True,
+            ),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=_CACHED_CONTEXT_KV_LORA_RANK,
+            qk_rope_head_dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+            qk_nope_head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM,
+            v_head_dim=_CACHED_CONTEXT_V_HEAD_DIM,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+    assert attention.uses_fp4_mla_attention
+    # A distinct angle per position makes a wrong token offset visible.
+    attention.rotary_cos_sin = _fp4_mla_rope_table(max_positions)
+    return attention
+
+
+def _make_fp4_mla_context_metadata(
+    kv_cache_manager: Fp4MlaKVCacheManagerV2,
+    *,
+    request_ids: list[int],
+    cached_lens: list[int],
+    new_lens: list[int],
+    max_num_tokens: int,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+):
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=len(request_ids),
+        max_num_tokens=max_num_tokens,
+        kv_cache_manager=kv_cache_manager,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        enable_context_mla_with_cached_kv=True,
+        runtime_features=AttentionRuntimeFeatures(
+            chunked_prefill=chunked_prefill,
+            cache_reuse=enable_block_reuse,
+            chunk_size=max_num_tokens,
+            # One buffer per partition keeps the cached prefix split across loops.
+            chunked_prefill_buffer_batch_size=1,
+        ),
+        seq_lens=torch.tensor(new_lens, dtype=torch.int),
+        num_contexts=len(request_ids),
+        request_ids=request_ids,
+        prompt_lens=[cached + new for cached, new in zip(cached_lens, new_lens)],
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+    )
+    metadata.prepare()
+    return metadata
+
+
+def _fp4_mla_cached_context_reference(
+    metadata,
+    *,
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    cached_lens: list[int],
+    new_lens: list[int],
+) -> torch.Tensor:
+    """Attend rotated context queries over the dequantized FP4 prefix and the BF16 tokens."""
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    qk_nope = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+    qk_head_dim = qk_nope + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = _CACHED_CONTEXT_KV_LORA_RANK + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    weight = kv_b_weight.float()
+    outputs = []
+    token_start = 0
+    for seq_idx, (cached_len, new_len) in enumerate(zip(cached_lens, new_lens)):
+        rows = slice(token_start, token_start + new_len)
+        token_start += new_len
+        latent_rows = [torch.cat((compressed_kv[rows].float(), k_pe[rows].float()), dim=-1)]
+        if cached_len > 0:
+            prefix = _materialize_reference_cache_tokens(
+                metadata,
+                layer_idx=0,
+                batch_indices=torch.full((cached_len,), seq_idx, dtype=torch.int32),
+                positions=torch.arange(cached_len, dtype=torch.int32),
+                head_dim=head_dim,
+                include_k_residual=True,
+            )
+            latent_rows.insert(0, prefix.float())
+        latent = torch.cat(latent_rows, dim=0)
+        # kv_b_proj rows hold every head's K-nope block, then every head's V block.
+        kv = latent[:, :_CACHED_CONTEXT_KV_LORA_RANK] @ weight.t()
+        k = torch.cat(
+            (
+                kv[:, : num_heads * qk_nope].view(-1, num_heads, qk_nope),
+                latent[:, None, _CACHED_CONTEXT_KV_LORA_RANK:].expand(-1, num_heads, -1),
+            ),
+            dim=-1,
+        )
+        v = kv[:, num_heads * qk_nope :].view(-1, num_heads, _CACHED_CONTEXT_V_HEAD_DIM)
+        query = q[rows].float().view(new_len, num_heads, qk_head_dim)
+        scores = torch.einsum("qhd,khd->hqk", query, k) / qk_head_dim**0.5
+        key_positions = torch.arange(cached_len + new_len, device=q.device)
+        query_positions = cached_len + torch.arange(new_len, device=q.device)
+        mask = key_positions[None, :] > query_positions[:, None]
+        scores = scores.masked_fill(mask[None], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", probs, v).reshape(new_len, -1))
+    return torch.cat(outputs, dim=0)
+
+
+def _assert_rows_close(actual: torch.Tensor, expected: torch.Tensor, *, what: str) -> None:
+    actual = actual.float().reshape(actual.shape[0], -1)
+    expected = expected.float().reshape(expected.shape[0], -1)
+    expected_norms = torch.linalg.vector_norm(expected, dim=1)
+    relative_l2 = torch.linalg.vector_norm(actual - expected, dim=1) / expected_norms
+    cosine = torch.sum(actual * expected, dim=1) / (
+        torch.linalg.vector_norm(actual, dim=1) * expected_norms
+    )
+    assert bool(torch.all(expected_norms > 1e-3).item())
+    max_relative_l2 = float(relative_l2.max().item())
+    min_cosine = float(cosine.min().item())
+    assert max_relative_l2 < 0.1, f"{what}: relative L2 error {max_relative_l2} is too large"
+    assert min_cosine > 0.995, f"{what}: cosine similarity {min_cosine} is too small"
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    ("enable_block_reuse", "chunked_prefill"),
+    [(True, False), (False, True), (True, True)],
+    ids=["reuse", "chunked-prefill", "reuse-chunked-prefill"],
+)
+def test_fp4_mla_cached_context_matches_reference(
+    monkeypatch,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+) -> None:
+    """A context step over a cached FP4 prefix matches a dequantized reference.
+
+    The prefix is written by an earlier context step. The cached step attends
+    it in several partitions, with or without chunked prefill, appends its own
+    tokens at their absolute positions, and leaves the decode sidecars that
+    its K payload implies.
+    """
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    _reset_triton_allocator()
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    torch.manual_seed(2026)
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+    qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = kv_lora_rank + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    # Request 0 has a prefix read back in two partitions and new tokens that
+    # end mid-tile, request 1 has no cached prefix, and request 2's new tokens
+    # end on a block boundary.
+    cached_lens = [384, 0, 256]
+    new_lens = [100, 50, 128]
+    total_lens = [cached + new for cached, new in zip(cached_lens, new_lens)]
+    request_ids = list(range(len(cached_lens)))
+    max_num_tokens = 320
+    max_seq_len = 4 * page_size
+    num_pages = sum((total + page_size) // page_size + 1 for total in total_lens)
+    kv_cache_manager = _create_fp4_mla_v2_manager(
+        max_tokens=num_pages * page_size,
+        max_seq_len=max_seq_len,
+        max_batch_size=len(cached_lens),
+        enable_block_reuse=enable_block_reuse,
+    )
+    try:
+        kv_cache_manager.add_dummy_requests(request_ids, total_lens)
+        for pool in kv_cache_manager._iter_fp4_mla_physical_pool_views():
+            pool.view(torch.uint8).zero_()
+        attention = _make_fp4_mla_context_attention(max_seq_len)
+        kv_b_weight = (
+            torch.randn(
+                num_heads * (_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_V_HEAD_DIM),
+                kv_lora_rank,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * kv_lora_rank**-0.5
+        )
+        mla = _MlaContextStub(attention, kv_b_weight)
+
+        # An earlier context step writes the prefixes.
+        prefix_ids = [idx for idx, cached in enumerate(cached_lens) if cached > 0]
+        prefix_lens = [cached_lens[idx] for idx in prefix_ids]
+        prefix_metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=prefix_ids,
+            cached_lens=[0] * len(prefix_ids),
+            new_lens=prefix_lens,
+            max_num_tokens=sum(prefix_lens),
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        prefix_latent = (
+            torch.randn(sum(prefix_lens), head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        prefix_q = torch.randn(
+            sum(prefix_lens), num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        attention.append_fp4_mla_context_cache(prefix_q, prefix_latent, prefix_metadata)
+        torch.cuda.synchronize()
+
+        metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=request_ids,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+            max_num_tokens=max_num_tokens,
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        assert attention.has_cached_kv_for_mla_context(metadata)
+        # Both features split the 640 cached tokens into partitions of at
+        # most max_num_tokens, the FP8 context scratch of one buffer.
+        assert metadata.chunked_loop_num == 2
+
+        num_tokens = sum(new_lens)
+        latent = (
+            torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        compressed_kv = latent[:, :kv_lora_rank].clone()
+        q = torch.randn(num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda")
+        original_q = q.clone()
+        original_k_pe = latent[:, kv_lora_rank:].clone()
+        output = torch.empty(
+            num_tokens, num_heads * _CACHED_CONTEXT_V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        mla.forward_context_with_chunked_prefill_fp4(q, compressed_kv, latent, metadata, output)
+        torch.cuda.synchronize()
+
+        # Q and the current K rotate at their absolute positions.
+        positions = torch.cat(
+            [
+                torch.arange(cached, cached + new, dtype=torch.int32, device="cuda")
+                for cached, new in zip(cached_lens, new_lens)
+            ]
+        )
+        table = attention.rotary_cos_sin
+        q_view = q.view(num_tokens, num_heads, qk_head_dim)
+        expected_q_pe = _apply_fp4_mla_rope_reference(
+            original_q.view(num_tokens, num_heads, qk_head_dim)[
+                ..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:
+            ],
+            positions,
+            table,
+        )
+        torch.testing.assert_close(
+            q_view[..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:].float(),
+            expected_q_pe,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        expected_k_pe = _apply_fp4_mla_rope_reference(original_k_pe, positions, table)
+        torch.testing.assert_close(
+            latent[:, kv_lora_rank:].float(), expected_k_pe, atol=2e-2, rtol=2e-2
+        )
+
+        # The current tokens are appended after their cached prefix.
+        batch_indices = torch.cat(
+            [
+                torch.full((new,), seq_idx, dtype=torch.int32, device="cuda")
+                for seq_idx, new in enumerate(new_lens)
+            ]
+        )
+        appended = _materialize_reference_cache_tokens(
+            metadata,
+            layer_idx=0,
+            batch_indices=batch_indices,
+            positions=positions,
+            head_dim=head_dim,
+            include_k_residual=True,
+        )
+        torch.testing.assert_close(appended, latent.float(), rtol=0.25, atol=0.2)
+
+        reference = _fp4_mla_cached_context_reference(
+            metadata,
+            q=q,
+            compressed_kv=compressed_kv,
+            k_pe=latent[:, kv_lora_rank:],
+            kv_b_weight=kv_b_weight,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+        )
+        _assert_rows_close(output, reference, what="FP4 MLA cached-context output")
+
+        # Every page, the prefix pages written by the earlier step included,
+        # carries the V scales and packed V that its K payload implies.
+        v_scale = kv_cache_manager.get_mla_v_scale_pool_base()
+        v_packed = kv_cache_manager.get_mla_v_packed_pool_base()
+        assert v_packed is not None
+        expected_v_scale = v_scale.clone()
+        expected_v_packed = v_packed.clone()
+        v_scale.zero_()
+        v_packed.zero_()
+        kv_cache_manager.rebuild_disagg_imported_cache(
+            [
+                SimpleNamespace(py_request_id=request_id, prompt_len=total)
+                for request_id, total in zip(request_ids, total_lens)
+            ]
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(v_scale, expected_v_scale)
+        assert torch.equal(v_packed, expected_v_packed)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch) -> None:
+    """Reuse claims only whole blocks, even for one-model draft lookahead."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=16 * page_size,
+        max_seq_len=4 * page_size,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+        enable_block_reuse=True,
+    )
+
+    def make_request(request_id: int, tokens: list[int]) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=tokens,
+            sampling_config=SamplingParams()._get_sampling_config(),
+            is_streaming=False,
+        )
+        request.paged_kv_block_ids = []
+        return request
+
+    def run_context(request: LlmRequest) -> int:
+        assert manager.prepare_context(request)
+        reused = request.context_current_position
+        assert manager.resize_context(request, request.prompt_len - reused)
+        request.context_current_position = request.prompt_len
+        manager.try_commit_blocks(request)
+        return reused
+
+    try:
+        # The HP ring is request-private, so it never cuts a prefix match short.
+        hp_layers = [
+            layer
+            for layer in manager.kv_cache_manager_py_config.layers
+            if layer.layer_id in manager._hp_manager_layer_ids
+        ]
+        assert hp_layers
+        assert all(layer.reuse_policy == ReusePolicy.PRIVATE for layer in hp_layers)
+        assert manager.reuse_match_backoff == 0
+
+        prompt = list(range(1000, 1000 + 3 * page_size + 40))
+        first = make_request(1, prompt)
+        assert run_context(first) == 0
+        first_pages = manager.get_batch_cache_indices([1], layer_idx=0)[0]
+        manager.free_resources(first)
+
+        # The shared prefix ends inside the fourth block. Only whole blocks
+        # are claimed, so the context restarts on a fresh FP4 tile.
+        second = make_request(2, prompt[: 3 * page_size + 20] + [7] * 30)
+        assert run_context(second) == 3 * page_size
+        second_pages = manager.get_batch_cache_indices([2], layer_idx=0)[0]
+        assert second_pages[:3] == first_pages[:3]
+        manager.free_resources(second)
+
+        # The final prompt token is always recomputed, so an exact block
+        # multiple reuses one block less.
+        third = make_request(3, prompt[: 2 * page_size])
+        assert run_context(third) == page_size
+        manager.free_resources(third)
+    finally:
+        manager.shutdown()

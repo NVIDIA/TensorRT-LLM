@@ -9,7 +9,7 @@ import torch
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp  # noqa: E402 — needs the path declared above
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.moe.m3_router_tc import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_router_tc import (  # noqa: E501
     m3_router_tc as tc,
 )
 
