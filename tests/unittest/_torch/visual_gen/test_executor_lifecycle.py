@@ -1073,6 +1073,7 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -1109,6 +1110,7 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -1131,6 +1133,7 @@ def test_shutdown_waits_for_external_worker_teardown(finishes: bool) -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -1411,9 +1414,10 @@ def test_shutdown_is_idempotent() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
-    client.background_thread.is_alive.return_value = False
+    client.background_thread.is_alive.side_effect = lambda: not client.background_thread.join.called
     worker = MagicMock()
     worker.pid = 123
     worker.is_alive.return_value = False
@@ -1451,9 +1455,10 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = TrackedEvent()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
-    client.background_thread.is_alive.return_value = False
+    client.background_thread.is_alive.side_effect = lambda: not client.background_thread.join.called
 
     def block_active_cleanup(*args, **kwargs) -> None:
         del args, kwargs
