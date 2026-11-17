@@ -2459,8 +2459,6 @@ def test_prims_ts_decode_task_manager_builds_schedule_without_gpu(seq_len_kv: in
         make_decode_config,
     )
     from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
-        _compute_decode_gen_loop_domain,
-        _compute_total_kv_tiles,
         build_decode_task_manager,
     )
 
@@ -2479,9 +2477,4 @@ def test_prims_ts_decode_task_manager_builds_schedule_without_gpu(seq_len_kv: in
     tile = int(cfg.tile_size_kv)
     assert tile > 0
     expected_kv_tiles = -(-seq_len_kv // tile)
-    assert _compute_total_kv_tiles(seq_len_kv, tile) == expected_kv_tiles
-    num_insts = int(cfg.num_insts_kv)
-    remaining = max(expected_kv_tiles - num_insts, 0)
-    assert _compute_decode_gen_loop_domain(expected_kv_tiles, num_insts) == -(
-        -remaining // num_insts
-    )
+    assert cfg.total_kv_tiles == expected_kv_tiles

@@ -3828,7 +3828,7 @@ def test_selfsampling_topk_regclus_mixed_dtype(
 
 @pytest.mark.parametrize(
     "batch_size,n_valid,split",
-    [(304, 16387, False), (1, 131075, True)],
+    [(304, 16387, False), (1, 131087, True)],
     ids=["single_cta", "split"],
 )
 @pytest.mark.parametrize("distribution", ["equal", "boundary_ties"])
@@ -3888,6 +3888,7 @@ def test_selfsampling_varlen_main_deterministic_ties(batch_size, n_valid, split,
 
 def test_selfsampling_topk_main_sampling_exactness():
     batch_size, top_k, n_valid = 128, 512, 16391
+    assert ss_host.route(batch_size, n_valid, 16448, top_k)["kernel"] == "main"
     logits, pre_idx, indices, ref_vals = _make_case(
         batch_size, n_valid, top_k, seed=n_valid * 31 + top_k + batch_size
     )

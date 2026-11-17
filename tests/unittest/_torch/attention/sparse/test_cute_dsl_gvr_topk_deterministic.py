@@ -141,6 +141,7 @@ def test_default_path_is_the_original_kernel():
 def test_main_varlen_mtp_mixed_lengths(deterministic):
     """Main-family MTP rows mask poisoned tails and pad short rows with -1."""
     num_rows, width, top_k = 128, 65536, 2048
+    assert ss.route(num_rows, width, width, top_k, det=deterministic)["kernel"] == "main"
     next_n, compress_ratio = 2, 4
     row = _row(width, top_k, "unique")
     lengths = torch.tensor(

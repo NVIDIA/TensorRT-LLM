@@ -1506,6 +1506,31 @@ def test_round2_replay_clamps_oversized_acceptance(num_spec, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("kernel", ["v2", "two_cta"])
+@pytest.mark.parametrize("num_spec", [2, 7])
+def test_packed_replay_clamps_oversized_acceptance(num_spec, kernel, monkeypatch):
+    """Packed fused-norm verify kernels clamp accepted counts to the available drafts."""
+    oversized = torch.tensor([0, num_spec, num_spec + 1, 2**31 - 1], dtype=torch.int32)
+    clamped = oversized.clamp(max=num_spec)
+    actual_data = _packed_fused_norm_inputs(B=4, H=6, num_spec=num_spec, state_dtype=torch.float32)
+    expected_data = dict(actual_data)
+    slots = actual_data["ssm_state_indices"].long()
+    actual_accepted = torch.empty_like(actual_data["num_accepted_tokens"])
+    expected_accepted = torch.empty_like(actual_data["num_accepted_tokens"])
+    actual_accepted[slots] = oversized.cuda()
+    expected_accepted[slots] = clamped.cuda()
+    actual_data["num_accepted_tokens"] = actual_accepted
+    expected_data["num_accepted_tokens"] = expected_accepted
+
+    def run(data):
+        return cute_run(data, packed_token_layout=True, fuse_output_norm=True)
+
+    expected = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(expected_data))
+    actual = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(actual_data))
+    for name in _VERIFY_RESULTS:
+        assert torch.equal(actual[name], expected[name]), name
+
+
 if __name__ == "__main__":
     import sys
 
