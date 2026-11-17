@@ -15,7 +15,9 @@
 """KV cache pool rebalance on disaggregated context servers.
 
 CPU tests drive PyExecutor's rebalance gate, transfer drain, veto, early skip
-and back-off with stubs, and check the cross-node veto's inputs. The GPU test runs kv_pool_rebalance_worker.py as two
+and back-off with stubs, check the cross-node veto's inputs, and check the
+incremental KV pool registration's bookkeeping across resizes with a recording
+fake agent. The GPU test runs kv_pool_rebalance_worker.py as two
 single-rank ``mpirun`` processes (ctx and gen) on one GPU: ctx resizes its pools
 between transfers, then sends from slots past the old registered extent, and gen
 verifies the data bit-exact. Its ``skiptail`` variant leaves the grown tail
@@ -34,10 +36,14 @@ import types
 
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 import tensorrt_llm._torch.pyexecutor.py_executor as pe
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar, _endpoint_host
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 PE = pe.PyExecutor
 
@@ -60,6 +66,7 @@ class _Xcvr:
     def __init__(self, shared=False, sessions=0, reason=None, peer_wait=0.0, peer_wait_step=0.0):
         self.shared, self.sessions, self.reason = shared, sessions, reason
         self.peer_wait, self.peer_wait_step = peer_wait, peer_wait_step
+        self.allow_cross_node_args = []
 
     def kv_pool_rebalance_unsupported_reason(self):
         return self.reason
@@ -72,6 +79,7 @@ class _Xcvr:
         return False
 
     def kv_pool_rebalance_veto_reason(self, allow_cross_node=False):
+        self.allow_cross_node_args.append(allow_cross_node)
         return "a peer holds this rank's pool layout" if self.shared else None
 
     def has_inflight_transfers(self):
@@ -92,6 +100,7 @@ def _executor(xcvr, peers_states=()):
     s._disagg_rebalance_retry_at = 0.0
     s._kv_pool_rebalance_allow_cross_node = False
     s.reaps = 0
+    s.reap_args = []
     s.flushes = 0
     s.async_transfer_manager = types.SimpleNamespace(has_any_inflight_requests=lambda: False)
     s.dist = types.SimpleNamespace(
@@ -100,6 +109,7 @@ def _executor(xcvr, peers_states=()):
 
     def reap(n):
         s.reaps += 1
+        s.reap_args.append(n)
         if xcvr is not None and xcvr.sessions:
             xcvr.sessions -= 1
 
@@ -135,6 +145,25 @@ def test_drain_without_transceiver_or_sends():
 def test_drain_reaps_inflight_sends():
     s = _executor(_Xcvr(sessions=3))
     assert _drain(s) and s.reaps == 3 and s.flushes == 3
+    # Non-blocking polls: a blocking one (n > 0) can wait out a sender-future
+    # timeout per pending send, far past the drain budget.
+    assert s.reap_args == [0, 0, 0]
+
+
+def test_drain_sleeps_within_its_budget(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(pe.time, "sleep", sleeps.append)
+    s = _executor(_Xcvr(sessions=3))
+    assert _drain(s) and len(sleeps) == 3
+    assert all(0 < t <= pe.KV_POOL_REBALANCE_DISAGG_POLL_S for t in sleeps)
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_drain_passes_cross_node_flag(allow):
+    s = _executor(_Xcvr(sessions=2))
+    s._kv_pool_rebalance_allow_cross_node = allow
+    assert _drain(s)
+    assert s.kv_cache_transceiver.allow_cross_node_args == [allow] * 3
 
 
 def test_drain_waits_for_unpublished_gen_receives():
@@ -168,8 +197,8 @@ def test_peer_deadline_skips_without_disabling():
 
 def test_early_skip_on_send_waiting_for_peer():
     s = _executor(_Xcvr(sessions=5, peer_wait=0.3))
-    t0 = time.monotonic()
-    assert not _drain(s) and s.reaps == 0 and time.monotonic() - t0 < 0.05
+    # No reap: the drain stopped on its first pass instead of waiting.
+    assert not _drain(s) and s.reaps == 0
     assert not s._disagg_rebalance_disabled and s._disagg_rebalance_skips == 1
     # Another rank's waiting send skips an idle rank too.
     s = _executor(_Xcvr(), [(None, True, False, True)])
@@ -247,8 +276,9 @@ def test_rebalance_gate(xcvr, disabled, expected):
     assert PE._can_pause_for_rebalance(g) is expected
 
 
-def test_oldest_send_waiting_for_peer():
-    now = time.monotonic()
+def test_oldest_send_waiting_for_peer(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(transceiver_mod.time, "monotonic", lambda: now)
 
     def sess(status, age):
         return types.SimpleNamespace(status=status, created_monotonic=now - age)
@@ -261,7 +291,7 @@ def test_oldest_send_waiting_for_peer():
         3: sess(SessionStatus.INIT, 0.7),
         4: sess(SessionStatus.INIT, 0.2),
     }
-    assert 0.7 <= KvCacheTransceiverV2.oldest_send_waiting_for_peer_s(x) < 0.75
+    assert KvCacheTransceiverV2.oldest_send_waiting_for_peer_s(x) == pytest.approx(0.7)
 
 
 @pytest.mark.parametrize(
@@ -311,6 +341,359 @@ def test_transceiver_veto_reason(registered, cross_node, allow, expected):
     )
     reason = x.kv_pool_rebalance_veto_reason(allow_cross_node=allow)
     assert (reason is None) if expected is None else (expected in reason)
+
+
+# ---------------------------------------------------------------------------
+# CPU: the executor's resize brackets adjust() with begin/end on the transceiver
+# ---------------------------------------------------------------------------
+
+
+class _ResizeXcvr:
+    def __init__(self):
+        self.calls = []
+
+    def begin_kv_pool_resize(self):
+        self.calls.append("begin")
+
+    def end_kv_pool_resize(self):
+        self.calls.append("end")
+
+
+def _resize_executor(adjust):
+    req = types.SimpleNamespace(py_request_id=7)
+    mgr = types.SimpleNamespace(
+        impl=types.SimpleNamespace(
+            adjust=adjust,
+            init_config=types.SimpleNamespace(
+                pool_rebalance=types.SimpleNamespace(in_place_relocation=False)
+            ),
+        ),
+        is_request_active=lambda rid: True,
+        suspended=[],
+        resumed=[],
+    )
+    mgr.suspend_request = mgr.suspended.append
+    mgr.resume_request = mgr.resumed.append
+    s = types.SimpleNamespace(
+        kv_cache_manager=mgr,
+        active_requests=[req],
+        kv_cache_transceiver=_ResizeXcvr(),
+        _suspend_padding_dummies_for_rebalance=lambda mgr: [],
+        _resume_padding_dummies_after_rebalance=lambda mgr, dummies: None,
+        _read_kv_cache_capacity=lambda: 0,
+        _defer_generation_only_release=False,
+    )
+    return s, req
+
+
+def _raise(exc):
+    def adjust():
+        raise exc
+
+    return adjust
+
+
+def test_resize_ends_after_out_of_pages():
+    """adjust() failing after begin must still re-register (end) and resume."""
+    s, req = _resize_executor(_raise(OutOfPagesError("no pages")))
+    PE._rebalance_kv_pools_now(s)
+    assert s.kv_cache_transceiver.calls == ["begin", "end"]
+    assert s.kv_cache_manager.resumed == [req]
+
+
+def test_resize_ends_before_other_errors_propagate():
+    s, _ = _resize_executor(_raise(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        PE._rebalance_kv_pools_now(s)
+    assert s.kv_cache_transceiver.calls == ["begin", "end"]
+
+
+# ---------------------------------------------------------------------------
+# CPU: incremental KV pool registration across resizes (recording fake agent)
+# ---------------------------------------------------------------------------
+
+_SEG = 1024  # small registration unit for the test
+# Pool group -> (base, slot stride) of each pool; strides that do not divide
+# _SEG make pool ends fall mid-segment.
+_POOLS = {0: [(0x100000, 96), (0x200000, 160)], 1: [(0x300000, 256)]}
+
+
+class _RecordingAgent:
+    def __init__(self):
+        self.live = {}  # id(descs) -> (memory type, [(addr, length), ...])
+        self.registrations = []  # (addr, length), in order
+
+    def register_memory(self, descs):
+        assert id(descs) not in self.live, "registered twice"
+        ranges = [(addr, length) for addr, length, _, _ in descs.descs]
+        for _, live in self.live.values():
+            for a, n in live:
+                for addr, length in ranges:
+                    assert addr + length <= a or a + n <= addr, "overlapping registration"
+        self.live[id(descs)] = (descs.type, ranges)
+        self.registrations.extend(ranges)
+
+    def deregister_memory(self, descs):
+        del self.live[id(descs)]
+
+    def get_local_agent_desc(self):
+        return b"agent"
+
+
+class _Manager:
+    """Pool groups' slot counts, the plan for the next adjust(), and adjust()."""
+
+    def __init__(self, num_slots, with_plan=True, host_pool_groups=()):
+        self.num_slots = list(num_slots)
+        # Pool groups whose pools live in host memory (registered as DRAM).
+        self.host_pool_groups = set(host_pool_groups)
+        self.impl = types.SimpleNamespace(pool_group_descs=[], planned_slot_counts=None)
+        if not with_plan:
+            del self.impl.planned_slot_counts
+        self._sync()
+
+    def _sync(self):
+        self.impl.pool_group_descs = [types.SimpleNamespace(num_slots=n) for n in self.num_slots]
+
+    def page_table(self):
+        return types.SimpleNamespace(
+            layer_groups=[types.SimpleNamespace(kind=CacheKind.PAGED)],
+            has_host_pools=bool(self.host_pool_groups),
+            pool_groups=[
+                types.SimpleNamespace(
+                    pools=[
+                        types.SimpleNamespace(
+                            base_address=base,
+                            slot_stride_bytes=stride,
+                            num_slots=n,
+                            memory_type="DRAM" if pg in self.host_pool_groups else "VRAM",
+                        )
+                        for base, stride in _POOLS[pg]
+                    ]
+                )
+                for pg, n in enumerate(self.num_slots)
+            ],
+        )
+
+    def lengths(self, num_slots=None):
+        num_slots = self.num_slots if num_slots is None else num_slots
+        return {
+            base: num_slots[pg] * stride for pg, pools in _POOLS.items() for base, stride in pools
+        }
+
+
+def _worker(monkeypatch, mgr):
+    monkeypatch.setattr(transfer, "_KV_REG_SEGMENT_BYTES", _SEG)
+    monkeypatch.setattr(transfer, "build_page_table_from_manager", lambda m: m.page_table())
+    monkeypatch.setattr(transfer, "KVRegionExtractorV1", lambda page_table: page_table)
+    monkeypatch.setenv("TLLM_KV_INCREMENTAL_REGISTRATION", "1")
+    w = object.__new__(transfer.TransferWorker)
+    w._agent = _RecordingAgent()
+    w._config = types.SimpleNamespace(kv_cache_manager=mgr)
+    w._rank_info = types.SimpleNamespace(
+        page_table=mgr.page_table(), device_id=0, transfer_engine_info=b""
+    )
+    w._peer_registrar = types.SimpleNamespace(replace_self_extractor=lambda extractor: None)
+    w._registered_mem = []
+    w._kv_registered_mem = []
+    w._kv_segments = None
+    w._register_kv_cache()
+    return w
+
+
+def _check_segments(w, lengths):
+    """Each pool's segments tile [0, length) from aligned starts, all registered."""
+    live = set()
+    for base, length in lengths.items():
+        segs = w._kv_segments[base]
+        assert [start for start, _, _ in segs] == list(range(0, length, _SEG))
+        assert all(end == min(start + _SEG, length) for start, end, _ in segs)
+        assert (segs[-1][1] if segs else 0) == length
+        live |= {id(descs) for _, _, descs in segs}
+    assert set(w._agent.live) == live
+    assert {id(d) for d in w._registered_mem} == live
+
+
+def _resize(w, mgr, new_slots, adjust_ok=True):
+    """Begin -> adjust (or a failed one) -> end, checking what begin dropped and end kept."""
+    planned = getattr(mgr.impl, "planned_slot_counts", "absent")
+    if planned != "absent":
+        mgr.impl.planned_slot_counts = list(new_slots)
+    w.begin_kv_pool_resize()
+    planned_len = mgr.lengths(new_slots) if planned != "absent" else dict.fromkeys(_POOLS, 0)
+    kept = {}
+    for base, segs in w._kv_segments.items():
+        # Nothing registered may reach past the planned length once adjust() runs.
+        assert all(end <= planned_len.get(base, 0) for _, end, _ in segs)
+        kept[base] = list(segs)
+    if adjust_ok:
+        mgr.num_slots = list(new_slots)
+        mgr._sync()
+    w.end_kv_pool_resize()
+    _check_segments(w, mgr.lengths())
+    for base, segs in kept.items():
+        now = w._kv_segments[base]
+        for i, seg in enumerate(segs):
+            # A kept segment keeps its registration; only one that ended
+            # mid-unit (the pool's old end) may be redone, from the same start.
+            if seg[1] % _SEG == 0 or seg[1] == mgr.lengths()[base]:
+                assert now[i] is seg
+            else:
+                assert i == len(segs) - 1 and now[i][0] == seg[0]
+    assert w._rank_info.transfer_engine_info == b"agent"
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        [((40, 30), True), ((90, 30), True), ((90, 70), True)],  # grow
+        [((90, 70), True), ((40, 30), True), ((5, 1), True)],  # shrink
+        [((41, 30), True), ((47, 33), True), ((200, 33), True)],  # grow from mid-unit
+        [((200, 80), True), ((47, 33), True), ((48, 32), True)],  # shrink to mid-unit
+        [((90, 70), True), ((40, 30), False), ((40, 30), True)],  # adjust() fails after begin
+        [((60, 40), True), ((0, 40), True), ((60, 40), True)],  # a pool group to zero and back
+    ],
+    ids=["grow", "shrink", "grow_mid_unit", "shrink_mid_unit", "adjust_fails", "to_zero"],
+)
+def test_incremental_registration_tracks_resizes(monkeypatch, steps):
+    mgr = _Manager((64, 48))
+    w = _worker(monkeypatch, mgr)
+    _check_segments(w, mgr.lengths())
+    for new_slots, adjust_ok in steps:
+        _resize(w, mgr, new_slots, adjust_ok)
+
+
+def test_incremental_registration_without_plan_reregisters_all(monkeypatch):
+    mgr = _Manager((64, 48), with_plan=False)
+    w = _worker(monkeypatch, mgr)
+    first = len(w._agent.registrations)
+    _resize(w, mgr, (90, 30))
+    # No plan: begin drops every segment, end registers each pool from 0.
+    assert len(w._agent.registrations) - first == sum(
+        -(-length // _SEG) for length in mgr.lengths().values()
+    )
+
+
+def test_incremental_registration_kept_segments_not_reregistered(monkeypatch):
+    # Every pool ends mid-unit: 65 * 96, 65 * 160 and 47 * 256 bytes.
+    mgr = _Manager((65, 47))
+    w = _worker(monkeypatch, mgr)
+    old_lengths = mgr.lengths()
+    first = len(w._agent.registrations)
+    _resize(w, mgr, (128, 96))
+    new = w._agent.registrations[first:]
+    assert new
+    # Growing re-registers only each pool's old mid-unit tail and what lies past it.
+    for base, old_len in old_lengths.items():
+        assert old_len % _SEG
+        tail_start = old_len - old_len % _SEG
+        assert all(addr >= base + tail_start for addr, _ in new if base <= addr < base + 0x100000)
+
+
+def _pool_memory_descs(page_table, device_id, memory_type=None):
+    """Whole-pool descriptors of one memory type (get_unique_pool_memory_descs)."""
+    return [
+        (
+            pool.base_address,
+            pool.num_slots * pool.slot_stride_bytes,
+            device_id,
+            f"{pool.base_address:x}",
+        )
+        for pg in page_table.pool_groups
+        for pool in pg.pools
+        if memory_type in (None, pool.memory_type)
+    ]
+
+
+def test_host_pools_fall_back_to_whole_pool_registration(monkeypatch):
+    """With a pool in host memory, every pool is registered whole, one entry per memory type."""
+    monkeypatch.setattr(transfer, "get_unique_pool_memory_descs", _pool_memory_descs)
+    mgr = _Manager((64, 48), host_pool_groups={1})
+    w = _worker(monkeypatch, mgr)
+
+    def check():
+        assert w._kv_segments is None
+        live = sorted(w._agent.live.values())
+        assert [t for t, _ in live] == ["DRAM", "VRAM"]
+        lengths = mgr.lengths()
+        for _, ranges in live:
+            assert all(length == lengths[addr] for addr, length in ranges)
+        assert {id(d) for d in w._kv_registered_mem} == set(w._agent.live)
+
+    check()
+    for new_slots, adjust_ok in [((90, 30), True), ((40, 70), False), ((40, 70), True)]:
+        mgr.impl.planned_slot_counts = list(new_slots)
+        w.begin_kv_pool_resize()
+        assert not w._agent.live and not w._kv_registered_mem and not w._registered_mem
+        if adjust_ok:
+            mgr.num_slots = list(new_slots)
+            mgr._sync()
+        w.end_kv_pool_resize()
+        check()
+
+
+_ARENA_BASE = 0x10000000
+_ARENA_BYTES = 0x200000
+
+
+class _ArenaManager(_Manager):
+    """CoReba layout: two elastic groups in the GPU arena, and a fixed group beside it.
+
+    The fixed group (as with sparse attention KV cache offload) has a device pool of its own and a
+    host-backed pool; the elastic groups' pools report the arena base.
+    """
+
+    _LAYOUT = {
+        0: [(_ARENA_BASE, 96, "VRAM")],
+        1: [(_ARENA_BASE, 256, "VRAM")],
+        2: [(0x40000000, 64, "VRAM"), (0x50000000, 512, "DRAM")],
+    }
+
+    def __init__(self, num_slots):
+        super().__init__(num_slots)
+        self.impl.get_gpu_arena_extent = lambda: (_ARENA_BASE, _ARENA_BYTES, False)
+
+    def page_table(self):
+        return types.SimpleNamespace(
+            layer_groups=[types.SimpleNamespace(kind=CacheKind.PAGED)],
+            has_host_pools=True,
+            pool_groups=[
+                types.SimpleNamespace(
+                    pools=[
+                        types.SimpleNamespace(
+                            base_address=base, slot_stride_bytes=stride, num_slots=n, memory_type=mt
+                        )
+                        for base, stride, mt in self._LAYOUT[pg]
+                    ]
+                )
+                for pg, n in enumerate(self.num_slots)
+            ],
+        )
+
+
+def test_arena_registers_once_beside_fixed_groups(monkeypatch):
+    """The arena is one region; a fixed group's pools are registered on their own, by memory type.
+
+    Neither changes with a rebalance: the arena never remaps and fixed groups never resize, so the
+    layout is fixed and nothing is registered again.
+    """
+    monkeypatch.setattr(transfer, "get_unique_pool_memory_descs", _pool_memory_descs)
+    mgr = _ArenaManager((40, 30, 16))
+    w = _worker(monkeypatch, mgr)
+    assert w.kv_pool_layout_fixed and w._kv_segments is None
+    live = sorted(w._agent.live.values())
+    assert live == [
+        ("DRAM", [(0x50000000, 16 * 512)]),
+        ("VRAM", [(_ARENA_BASE, _ARENA_BYTES), (0x40000000, 16 * 64)]),
+    ]
+    registrations = len(w._agent.registrations)
+    mgr.impl.planned_slot_counts = [60, 10, 16]
+    w.begin_kv_pool_resize()
+    mgr.num_slots = [60, 10, 16]
+    mgr._sync()
+    w.end_kv_pool_resize()
+    assert sorted(w._agent.live.values()) == live
+    assert len(w._agent.registrations) == registrations
 
 
 # ---------------------------------------------------------------------------
@@ -375,10 +758,13 @@ def test_rebalance_integrity(mode, tmp_path):
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+        # One deadline for both waits, inside the pytest timeout, so the log
+        # tails below are always printed.
+        deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
         try:
-            procs["ctx"].wait(timeout=_PROCESS_TIMEOUT_SECONDS)
+            procs["ctx"].wait(timeout=max(0.0, deadline - time.monotonic()))
             if mode == "refresh":
-                procs["gen"].wait(timeout=_PROCESS_TIMEOUT_SECONDS)
+                procs["gen"].wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
     finally:
