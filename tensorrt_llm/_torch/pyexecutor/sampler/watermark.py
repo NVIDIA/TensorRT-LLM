@@ -37,9 +37,10 @@ the committed prefix and the output matches what non-speculative decoding would 
 
 With ``algorithm="gumbel_dual_key"`` and ``alpha > 0`` an ordinary decoding position is drawn under
 the second key with probability ``alpha`` (and under the first key otherwise). The choice is the
-Philox stream of a per-slot routing seed at the position's index in the request's output, so it
-does not depend on the batch, the speculation depth or the TP rank, and a request with a seed
-reproduces it.
+Philox stream of a per-slot routing seed at the position's index in the request's output (counted
+from where the slot's state starts, so not from 0 for a request that arrives with tokens already
+generated). It does not depend on the batch, the speculation depth or the TP rank, and a request
+with a seed reproduces it.
 
 :meth:`WatermarkHandler.plan` and :meth:`WatermarkHandler.commit` use static shapes and no
 host synchronization, so they can be captured in a CUDA graph.

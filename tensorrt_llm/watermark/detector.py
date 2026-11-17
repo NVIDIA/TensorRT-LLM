@@ -97,8 +97,9 @@ def _dual_key_p_value(total_a: float, total_b: float, n: int) -> tuple[float, fl
     """Combine the two tests of dual-key text; returns ``(p_value, score)``.
 
     Text from ``gumbel_dual_key`` mixes tokens drawn under the first key with tokens drawn under
-    the second, in a proportion the detector cannot know: plain and exact-match decoding use only
-    the first key, rejection sampling uses both. So two tests are run. The first key alone has the
+    the second, in a proportion the detector cannot know: ordinary and exact-match decoding use the
+    second key for a fraction ``alpha`` of the tokens, rejection sampling uses it after each
+    rejection. So two tests are run. The first key alone has the
     most power when the text carries few second-key tokens, and the two keys' scores summed have
     the most power for a mix. Each is exact under "not watermarked", so the smaller p-value, doubled,
     is a valid p-value.

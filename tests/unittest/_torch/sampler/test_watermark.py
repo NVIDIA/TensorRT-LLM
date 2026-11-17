@@ -194,6 +194,12 @@ class TestConfig:
         with pytest.raises(ValueError):
             WatermarkConfig(**kwargs)
 
+    @pytest.mark.parametrize("algorithm", ["gumbel", "gumbel_dual_key"])
+    def test_survives_a_dump_round_trip(self, algorithm):
+        # Model defaults are applied by re-validating a full model_dump().
+        config = WatermarkConfig(key=1, algorithm=algorithm)
+        assert WatermarkConfig(**config.model_dump()) == config
+
     def test_rejects_unknown_field(self):
         with pytest.raises(ValueError):
             WatermarkConfig(key=1, algorithm="synthid")
@@ -487,6 +493,13 @@ class TestHandler:
         for alpha in (0.1, 0.5):
             uniform = route_uniform(seeded[0], np.arange(20000))
             assert abs((uniform < alpha).mean() - alpha) < 0.015
+        # The handler draws position j under the second key exactly where the stream says so.
+        handler = route([_request(1, 0, [1, 2, 3], seed=7)], 0.1)
+        drafts = torch.zeros(1, 299, dtype=torch.int64, device="cuda")
+        rows = handler.plan(_device([0]), _device([True], torch.bool), drafts)
+        expected = route_uniform(seeded[0], np.arange(300)) < 0.1
+        picked = (rows.draw_seeds == rows.seeds_secondary).cpu().numpy()[0]
+        assert expected.any() and (picked == expected).all()
         # Rejection sampling (alpha 0), alpha 0 and the single-key algorithm use the first key only.
         handlers = [route([], 0.0)]
         for kwargs in ({}, dict(algorithm="gumbel_dual_key", alpha=0.0)):
