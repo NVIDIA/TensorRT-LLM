@@ -13,6 +13,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     )
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_shared_gate_up_swiglu import (  # noqa: E402, E501
+    MTP_ROWS,
     PREFILL_MAX_ROWS,
     PREFILL_MIN_ROWS,
     PrefillGateUpRunner,
@@ -119,6 +120,73 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         assert op(x, prepared, out, runner) is out, "the op writes `out` and returns it"
     _compare(out, op.reference(x, prepared, out, runner))
+
+
+#: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): the target builds the fused cell
+#: at these on an MTP3 / MTP5 engine (`_SHARED_FUSED_UP_SEQS`); 16, a decode cell, is the control.
+MTP_DECODE_ROWS = (6, 12, 18, 16)
+
+
+@pytest.mark.parametrize("rows", MTP_ROWS + MTP_DECODE_ROWS)
+def test_mtp_rows_replay_bitwise_in_a_cuda_graph(rows) -> None:
+    """The MTP3 / MTP5 runners (128 / 192, and the fused cells at the small-batch decode
+    counts 6 / 12 / 18) run inside the decode CUDA graph: a replay writes the eager launch's
+    bytes, and a replay after new operands are copied into the captured buffers writes the
+    eager launch's product on them, within the band of the reference."""
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    prepared = prepare_weight(_checkpoint_weight(g))
+    runner = build(rows, prepared)
+    x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    out = torch.empty(rows, OUT, dtype=torch.bfloat16, device="cuda")
+    op(x, prepared, out, runner)
+    eager = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(x, prepared, out, runner)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager), "the replay differs from the eager launch"
+    x.copy_(torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16))
+    prepared.copy_(prepare_weight(_checkpoint_weight(g)))
+    again = torch.empty_like(out)
+    op(x, prepared, again, runner)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, again), "the replay on new operands differs from the eager launch"
+    assert not torch.equal(again, eager), "the new operands did not change the product"
+    _compare(out, op.reference(x, prepared, out, runner))
+
+
+#: MTP3 / MTP5 decode row counts without a cell: each bucket's edges, the 24-request batches
+#: (96, 144) and partial batches at widths 4 / 6.
+WIDE_ROWS = (65, 66, 68, 84, 96, 100, 126, 127, 129, 144, 150, 190, 191)
+
+
+def test_mtp_cells_at_other_wide_row_counts_are_the_cells_bitwise() -> None:
+    """The MTP cells are the split-K kernel on a symbolic row count: the target runs a
+    wide decode row count without a cell on the next cell up at its exact rows. Each row is
+    bitwise what the cell writes for it at its own row count with the input padded by
+    other (random) rows, nothing is written past the last row, and it is within the band."""
+    g = torch.Generator(device="cuda").manual_seed(11)
+    prepared = prepare_weight(_checkpoint_weight(g))
+    cells = {m: build(m, prepared) for m in MTP_ROWS}
+    for rows in WIDE_ROWS:
+        cell = min(m for m in cells if m > rows)
+        x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+        parent = torch.full((rows + 8, OUT), -7.0, dtype=torch.bfloat16, device="cuda")
+        out = parent[:rows]
+        with validating(op):
+            assert op(x, prepared, out, cells[cell]) is out
+        padded = torch.randn(cell, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+        padded[:rows] = x
+        full = torch.empty(cell, OUT, dtype=torch.bfloat16, device="cuda")
+        op(padded, prepared, full, cells[cell])
+        torch.cuda.synchronize()
+        assert torch.equal(out, full[:rows]), f"{rows} rows on the {cell}-row cell: not the cell's"
+        assert bool((parent[rows:] == -7.0).all()), f"{rows} rows: wrote past the last row"
+        _compare(out, op.reference(x, prepared, out, cells[cell]))
 
 
 def test_prepare_weight_pairs_each_gate_row_with_its_up_row() -> None:

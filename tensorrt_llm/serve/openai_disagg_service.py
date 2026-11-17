@@ -21,13 +21,18 @@ from typing import Callable, Optional
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
-from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (
+    ConditionalDisaggConfig,
+    DisaggServerConfig,
+    ServerRole,
+    check_output_length_prediction_schedule,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
 )
-from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -45,6 +50,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
+from tensorrt_llm.serve.output_length_predictor import RECORD_FLUSH_S, OutputLengthPriority
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -158,6 +164,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         client_factory: Callable[[Router, ServerRole], OpenAIClient],
         req_timeout_secs: int = 180,
     ):
+        # schedule_style may have been overridden (CLI -s, TLLM_DISAGG_SCHEDULE_STYLE) after parsing.
+        check_output_length_prediction_schedule(config)
         self._config = config
         # The service drives the coordinator's ctx/gen routers uniformly, so serving
         # is identical whether the router is the real one (single-process) or a
@@ -172,6 +180,22 @@ class OpenAIDisaggregatedService(OpenAIService):
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
         self._subagent_affinity_scope = config.subagent_affinity_scope
+        # Generation priority from the predicted output length (output_length_prediction).
+        self._output_length_priority: Optional[OutputLengthPriority] = None
+        if config.output_length_prediction is not None:
+            # A fleet worker whose generation placement goes through the coordinator gets the
+            # prediction from /select, and reports replies in batches.
+            remote = isinstance(coordinator, CoordinatorClient)
+            self._output_length_priority = OutputLengthPriority(
+                coordinator,
+                config.output_length_prediction.predictor,
+                via_select=remote and coordinator.enable_output_length_prediction_in_select(),
+                record_flush_s=RECORD_FLUSH_S if remote else 0.0,
+            )
+            # Requests without a priority field (/v1/responses) are not predicted: a pooled
+            # generation router seats them at the prior's priority.
+            self._gen_router.set_unpredicted_priority(self._output_length_priority.prior_priority)
+            logger.info(self._output_length_priority.startup_line())
 
         self._ctx_client = None
         self._gen_client = None
@@ -310,6 +334,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = need_ctx and not benchmark_gen_only
         ctx_response = None
         gen_req = request
+        length_ticket = None
         if need_ctx:
             try:
                 # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
@@ -333,6 +358,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+                if self._output_length_priority is not None:
+                    # Before the generation placement, which orders by the priority it sets
+                    # (or, in a fleet, predicts it in the same /select).
+                    length_ticket = await self._output_length_priority.assign(
+                        gen_req, placed_later=not gen_server
+                    )
             except Exception:
                 if gen_server:
                     await self._gen_router.finish_request(
@@ -345,19 +376,40 @@ class OpenAIDisaggregatedService(OpenAIService):
             # benchmark-only path above is the only trusted source here.
             if not benchmark_gen_only:
                 gen_req = request.model_copy(update={"disaggregated_params": None})
+            if self._output_length_priority is not None:
+                # No context phase, so no prompt length to predict from; a priority the
+                # client sent must not go ahead of the predicted ones.
+                self._output_length_priority.assign_prior(gen_req)
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
-            if not gen_server:
-                gen_server, _ = await self._gen_router.get_next_server(
-                    gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+            try:
+                if not gen_server:
+                    if ctx_response is not None:
+                        # A pooled generation router ages the request from its arrival and
+                        # bounds its wait by the context servers' KV transfer timeout, which
+                        # runs from here. Stamped again below to include this wait.
+                        self._stamp_orig_elapsed(gen_req, arrival_time)
+                    gen_server, gen_route_info = await self._gen_router.get_next_server(
+                        gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                    )
+                    gen_reservation_id = disagg_request_id
+                    if length_ticket is not None:
+                        self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
+                self._stamp_orig_elapsed(gen_req, arrival_time)
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
                 )
-                gen_reservation_id = disagg_request_id
-            self._stamp_orig_elapsed(gen_req, arrival_time)
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
-            )
+            except BaseException:
+                if length_ticket is not None:
+                    # No reply will come: the coordinator drops the request's prediction row.
+                    self._output_length_priority.abandon(length_ticket)
+                raise
+            if length_ticket is not None:
+                gen_response = self._output_length_priority.track(gen_response, length_ticket)
             return gen_response
         else:
+            if length_ticket is not None:
+                self._output_length_priority.track(ctx_response, length_ticket)
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
             if hooks:
@@ -636,9 +688,17 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
-            )
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            except (Exception, asyncio.CancelledError):
+                # No context task owns the context reservation yet (e.g. a pooled
+                # generation router found no seat): release it here.
+                await self._ctx_router.finish_request(
+                    request, success=False, req_id=disagg_request_id
+                )
+                raise
 
             queue: asyncio.Queue = asyncio.Queue()
             gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()

@@ -40,7 +40,6 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-kv", "fp8-kv"])
-@pytest.mark.parametrize("replay", [False, True], ids=["no-replay", "replay"])
 @pytest.mark.parametrize(
     "snapshot_options,retains_page",
     [
@@ -65,8 +64,18 @@ pytestmark = pytest.mark.cpu_only
     ],
 )
 @pytest.mark.parametrize(
-    "layout,expected_sparse_layers",
-    [("tp", 1), ("adp", 1), ("mtp", 2), ("pp-linear", 0), ("pp-mtp", 2), ("draft-only", 1)],
+    "layout,expected_sparse_layers,replay",
+    [
+        ("tp", 1, False),
+        ("adp", 1, False),
+        ("pp-linear", 0, False),
+        ("mtp", 2, False),
+        ("mtp", 2, True),
+        ("pp-mtp", 2, False),
+        ("pp-mtp", 2, True),
+        ("draft-only", 1, False),
+        ("draft-only", 1, True),
+    ],
 )
 def test_indexer_static_cache_cost(
     monkeypatch, fp8, replay, snapshot_options, retains_page, layout, expected_sparse_layers
@@ -176,6 +185,8 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
         enable_block_reuse=bool(snapshot_interval),
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=snapshot_interval),
     )
+    # What __init__ declares before costing: the recurrent-state region of the KDA layer.
+    manager._declare_regions()
 
     buffers = manager._extra_buffers_per_layer(tokens_per_block=32)
     assert set(buffers) == {1}

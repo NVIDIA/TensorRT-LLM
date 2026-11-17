@@ -553,6 +553,15 @@ def kernel(
                         (k_coord, coord_n),
                         full_bar.subview(stage),
                     )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so
+        # the MMA warp's last `stages` commit-arrives are awaited here. Nothing orders them
+        # against the `acc_mbar` commit the CTA does wait for, and an arrive still in
+        # flight at exit lands in the shared memory of the next CTA on this SM.
+        for j in cutlass.range_constexpr(max(0, local_k_steps - stages), local_k_steps):
+            while not prims.mbarrier_try_wait_parity(
+                empty_bar.subview(j % stages), (j // stages) % 2, time_limit=10_000_000
+            ):
+                pass
 
     # ---- MMA warp ----------------------------------------------------------
     if warp_idx == MMA_WARP:

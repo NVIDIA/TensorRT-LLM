@@ -306,6 +306,10 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
+// True outside the official post-merge pipeline, where post-merge perf-sanity stages run only when
+// --stage-list or --extra-stage names them.
+@Field
+def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
 @Field
@@ -398,6 +402,7 @@ def testFilter = [
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
     (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
+    (SKIP_POST_MERGE_PERF_SANITY): !(env.JOB_NAME ==~ /.*PostMerge.*/),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
@@ -485,6 +490,10 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// BUILD_NUMBER of the official post-merge pipeline, passed to every L0_Test job so they all
+// apply consistent stage scheduling; null otherwise.
+@Field
+def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
 // The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
 // Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
 @Field
@@ -511,6 +520,7 @@ def globalVars = [
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
     (JOB_TYPE): env.JOB_BASE_NAME,
+    (POST_MERGE_BUILD_NUMBER): (env.JOB_NAME ==~ /.*PostMerge.*/) ? env.BUILD_NUMBER : null,
     (TRTLLM_RELEASE_REPO): null,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
@@ -518,9 +528,16 @@ globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
 // Scope variant publication to post-merge and nightly releases so pre-merge
 // consumption remains governed by its own rollout switch and explicit opt-in.
+// A bot-triggered NGC-Container-Scanning or Build-Docker-Images run leaves the
+// canonical tarball un-BOLTed so the image build is its only BOLT pass; BOLTing
+// it here too would leave the image-side pass with a wheel that has no .rela.text.
+def imageBuildRequested = [TEST_STAGE_LIST, EXTRA_STAGE_LIST].any {
+    (testFilter[it]?.contains("NGC-Container-Scanning") ||
+     testFilter[it]?.contains("Build-Docker-Images")) ?: false
+}
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
-    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
-        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    !imageBuildRequested && (ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true"),
     globalVars[TARGET_BRANCH],
     globalVars[BOLT_PUBLISH_VARIANT])
 if (runMode == "nightly_release") {
@@ -2030,11 +2047,20 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/distributed/",
+        // GQA KV-replica decode and the MNNVL / TP2 all-reduce + norm kernels: their tests run only in
+        // l0_gb300's 4-GPU pre-merge block.
+        "tensorrt_llm/_torch/attention/backends/fmha/gqa_",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
+        "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
+        // KVCM2 remote tier: its fabric-transport tests run only on GB300 (l0_gb300).
+        "tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
@@ -2082,8 +2108,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/serving_extensions.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/defs/model_express/",
-        "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
-        "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300_efa_multi_nodes.yml",
@@ -2092,25 +2116,18 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/scripts/perf-sanity/disaggregated/b300_qwen3_0.6b_efa_functional.yaml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
-        "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
+        "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/kv_cache_manager_v2_tests/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -2159,28 +2176,33 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
         return ""
     }
+    // Any prefix or suffix can match a file (OR); all changed files must match the group.
     def groupFileMap = [
         "Docs": [
-            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
-            "docs/",
+            prefixes: ["docs/"],
+            suffixes: [".md"],
         ],
         "PyTorch": [
-            "tensorrt_llm/_torch/",
-            "tensorrt_llm/scaffolding/",
-            "tests/unittest/_torch/",
-            "tests/unittest/scaffolding/",
-            "tests/unittest/llmapi/test_llm_pytorch.py",
-            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-            "tests/integration/defs/disaggregated/",
-            "examples/disaggregated",
-            "examples/pytorch/",
-            "examples/scaffolding/",
-            "docs/",
+            prefixes: [
+                "tensorrt_llm/_torch/",
+                "tensorrt_llm/scaffolding/",
+                "tests/unittest/_torch/",
+                "tests/unittest/scaffolding/",
+                "tests/unittest/llmapi/test_llm_pytorch.py",
+                "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+                "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+                "tests/integration/defs/disaggregated/",
+                "examples/disaggregated",
+                "examples/pytorch/",
+                "examples/scaffolding/",
+                "docs/",
+            ],
         ],
         "Triton": [
-            "tests/integration/defs/triton_server/",
-            "triton_backend/",
+            prefixes: [
+                "tests/integration/defs/triton_server/",
+                "triton_backend/",
+            ],
         ],
     ]
 
@@ -2190,13 +2212,10 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     }
 
     for (group in groupFileMap.keySet()) {
-        def groupPrefixes = groupFileMap[group]
+        def groupRules = groupFileMap[group]
         def matchesGroup = { file ->
-            // Any *.md file, anywhere in the repo, counts as Docs-only.
-            if (group == "Docs" && file.endsWith(".md")) {
-                return true
-            }
-            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            return groupRules.prefixes?.any { prefix -> file.startsWith(prefix) } ||
+                groupRules.suffixes?.any { suffix -> file.endsWith(suffix) }
         }
         def allFilesInGroup = changedFileList.every(matchesGroup)
 
@@ -2689,14 +2708,23 @@ def getCommonParameters()
     ]
 }
 
+// Nightly release passes its Slack thread down so PLC notifications reply in it.
+// Read via env: callers build a local `params` list that shadows the build params.
+def getPLCSlackParameters()
+{
+    return [
+        string(name: 'slack_thread_id', value: env.slack_thread_id ?: ''),
+    ]
+}
+
 def getPLCRepoUrlKey()
 {
     def repoUrlKey = "tensorrt_llm_github_sync"
+    def normalizedRepo = LLM_REPO.replaceFirst(/\.git$/, "")
     withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-        if (LLM_REPO == DEFAULT_LLM_REPO) {
+        if (normalizedRepo == DEFAULT_LLM_REPO.replaceFirst(/\.git$/, "")) {
             repoUrlKey = "tensorrt_llm_internal"
-        } else if (LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM.git" ||
-                   LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM") {
+        } else if (normalizedRepo == "https://github.com/NVIDIA/TensorRT-LLM") {
             repoUrlKey = "tensorrt_llm_github"
         }
     }
@@ -2795,6 +2823,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
     def buildAllDockerImages = false
+    def dockerImagesOnly = false
     def runContainerScanning = false
     stages = [
         "Release-Check": {
@@ -2876,7 +2905,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'runContainerOssScanning', value: 'false'),
                                 string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
-                            ]
+                            ] + getPLCSlackParameters()
                             def handle = build(
                                 job: "/LLM/helpers/PLCScanningSetup",
                                 parameters: params,
@@ -2938,7 +2967,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (runContainerScanning && runMode != "nightly_release") {
                     echo "Skipping x86_64 tests (PLC container scanning)"
                     return
                 }
@@ -3125,8 +3154,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (runContainerScanning && runMode != "nightly_release") {
                     echo "Skipping SBSA tests (PLC container scanning)"
+                    return
+                }
+                if (dockerImagesOnly) {
+                    echo "Skipping SBSA tests (Build-Docker-Images only: build stage only supplies the wheel tarball)"
                     return
                 }
                 if (testFilter[INFRA_DRY_RUN]) {
@@ -3431,7 +3464,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(name: 'runContainerOssScanning', value: 'true'),
                             string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
-                        ]
+                        ] + getPLCSlackParameters()
                         def logger = new Logger(pipeline)
                         def handle = build(
                             job: "/LLM/helpers/PLCScanningSetup",
@@ -3484,11 +3517,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
             testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
             echo "Will run Build-Docker-Images job"
+            // Keep SBSA-Linux for its build only: the SBSA release image downloads
+            // the tarball it publishes to BOLT-optimize the wheel. Its tests are skipped.
             stages.remove("x86_64-Linux")
-            stages.remove("SBSA-Linux")
-            echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+            dockerImagesOnly = true
+            echo "Build-Docker-Images job is set explicitly. x86_64-Linux is disabled; SBSA-Linux runs its build only."
         }
-        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scanning")) {
             runContainerScanning = true
             testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
             echo "Will run job to build ngc containers and running in-pipeline scanning for them"
