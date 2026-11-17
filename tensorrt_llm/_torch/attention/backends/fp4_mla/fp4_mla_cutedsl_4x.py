@@ -39,9 +39,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
 from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
     _compile_cutedsl as _compile_cutedsl,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
-    _current_cu_stream as _current_cu_stream,
-)
 from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     CUDA_GRID_Z_MAX,
     FP4_MLA_P_GLOBAL_SCALE,

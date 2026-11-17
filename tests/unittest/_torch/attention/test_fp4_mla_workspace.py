@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_plan as plan4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import layout, packed_plan
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+    _FP4_MLA_SPLIT_KV_ENV,
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
     FP4_MLA_PACKED_Q_ENV,
@@ -188,7 +189,7 @@ def test_max_sequences_prefers_sequences_then_requests():
 @pytest.mark.parametrize("m_tiles", [1, 2, 4])
 @pytest.mark.parametrize("max_requests", [1, 7, 23, 64, 128, 256])
 def test_packed_split_task_bound_covers_every_batch(monkeypatch, m_tiles, max_requests):
-    monkeypatch.delenv(packed_plan._FP4_MLA_SPLIT_KV_ENV, raising=False)
+    monkeypatch.delenv(_FP4_MLA_SPLIT_KV_ENV, raising=False)
     monkeypatch.setattr(packed_plan, "_get_sm_count", lambda device: 212)
     bound = packed_plan.packed_split_task_bound(max_requests, m_tiles, CPU)
     worst = max(
@@ -210,7 +211,7 @@ def test_packed_split_task_bound_covers_every_batch(monkeypatch, m_tiles, max_re
 
 def test_packed_split_task_bound_honours_the_override(monkeypatch):
     monkeypatch.setattr(packed_plan, "_get_sm_count", lambda device: 212)
-    monkeypatch.setenv(packed_plan._FP4_MLA_SPLIT_KV_ENV, "5")
+    monkeypatch.setenv(_FP4_MLA_SPLIT_KV_ENV, "5")
     assert packed_plan.packed_split_task_bound(100, 4, CPU) == 500
 
 
@@ -315,7 +316,7 @@ def test_packed_split_scratch_bound_covers_every_query_width(monkeypatch, max_re
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
     monkeypatch.delenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, raising=False)
     monkeypatch.setenv(FP4_MLA_PACKED_Q_ENV, "1")
-    monkeypatch.delenv(packed_plan._FP4_MLA_SPLIT_KV_ENV, raising=False)
+    monkeypatch.delenv(_FP4_MLA_SPLIT_KV_ENV, raising=False)
     assert all(packed_plan._fp4_mla_packed_rows_per_seq(128, q) > 0 for q in (1, 2, 3, 4))
     monkeypatch.setattr(packed_plan, "_get_sm_count", lambda device: 212)
     meta = SimpleNamespace(max_num_sequences=max_requests, max_total_draft_tokens=3)

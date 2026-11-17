@@ -196,7 +196,6 @@ class Fp4MlaCacheLayout:
         default: Callable[..., Optional[torch.Tensor]],
         layer_idx: int,
         kv_layout: str = "NHD",
-        **kwargs: Any,
     ) -> Optional[torch.Tensor]:
         """Return the layer's primary paged-cache view.
 
@@ -210,7 +209,7 @@ class Fp4MlaCacheLayout:
         if callable(is_linear_layer) and is_linear_layer(local_layer):
             return None
         if local_layer not in self._fp8_mla_local_layer_indices():
-            return default(layer_idx, kv_layout, **kwargs)
+            return default(layer_idx, kv_layout)
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
 

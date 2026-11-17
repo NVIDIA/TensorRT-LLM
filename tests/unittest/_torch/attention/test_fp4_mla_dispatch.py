@@ -370,7 +370,7 @@ def test_kv_regimes_for_batch(monkeypatch):
     assert _regimes(128, 4, 30080) == (8191, 30080)
 
 
-def test_kv_regime_for_step():
+def test_select_kv_regime_ceiling():
     # a step is keyed by the smallest of its shape's regimes that covers its longest KV
     ceilings = _regimes(128, 4, 30080)
     assert select_kv_regime_ceiling(1, ceilings) == 8191

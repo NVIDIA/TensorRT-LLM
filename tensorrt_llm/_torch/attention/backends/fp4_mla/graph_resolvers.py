@@ -4,7 +4,7 @@
 
 The decoder graph runner asks ``resolve_fp4_mla_graph_variants`` once, at
 capture, when the KV cache exists. It gets a graph variant
-(``cuda_graph_runner.GraphVariant``) for each thing the FP4 MLA decode decides
+(``interface.GraphVariant``) for each thing the FP4 MLA decode decides
 per step and a graph has to freeze: the KV regime the dispatcher chooses its
 kernel on, and whether the packed decode launches its KV split budget. A
 decode that needs neither gets none, which is every decode without an FP4 MLA
@@ -19,8 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import GraphVariant
-
+from ..interface import GraphVariant
 from . import config as _config
 from . import fp4_mla_dispatch, packed_plan
 from .state import KV_REGIME_VARIANT, PACKED_SPLIT_VARIANT

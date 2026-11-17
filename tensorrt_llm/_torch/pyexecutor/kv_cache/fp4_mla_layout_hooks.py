@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, List, Optional
 
 import torch
 
@@ -25,6 +25,17 @@ class Fp4MlaLayoutHooks:
     """
 
     fp4_mla_layout: Optional[Fp4MlaCacheLayout] = None
+    # The hooks the layout takes over. A manager class that overrides one of
+    # them after this class would shadow the layout.
+    LAYOUT_HOOKS: ClassVar[tuple[str, ...]] = (
+        "_get_buffer_roles_for_layer",
+        "get_buffers",
+        "get_layer_bytes_per_token",
+        "_extra_buffers_per_layer",
+        "_prepare_page_table_tensor",
+        "_get_runtime_cache_size_layer_components",
+        "_get_generation_request_capacity",
+    )
 
     @property
     def fp4_mla_context_only_cache(self) -> bool:

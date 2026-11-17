@@ -18,6 +18,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.backends.interface import GraphVariant
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
@@ -156,36 +157,6 @@ class KeyType(NamedTuple):
     # Values of the graph variants the decode graphs are keyed by, one per
     # registered GraphVariant in registration order; empty keeps one family.
     variants: Tuple[int, ...] = ()
-
-
-class GraphVariant(NamedTuple):
-    """One more dimension the decode graphs are keyed by, declared by the attention backend.
-
-    A decode step has one integer value of the variant, and graphs captured
-    for different values are different graphs. The runner does not know what
-    a value means: it captures the values a graph shape can take, keys every
-    step by its value, and tells the attention metadata of a graph which
-    value the graph serves (``AttentionMetadata.set_decode_graph_variant``).
-
-    Ranks that must replay the same graph take the largest value among their
-    own, so a graph of a larger value has to be valid for a step of a smaller
-    one.
-    """
-    name: str
-    # Values the graphs of a shape (batch size, draft length) are captured
-    # for, ascending. A shape with one value is keyed by it without measuring
-    # the step.
-    values: Callable[[int, int], Tuple[int, ...]]
-    # A step's value, from its shape and the KV length each of its rows reads.
-    of_step: Callable[[int, int, List[int]], int]
-    # The value a step replays when no graph of its own value was captured,
-    # from that value and the ones captured for the step's shape.
-    replayable: Callable[[int, Sequence[int]], int]
-    # (warm-up length, value) of the capture passes of a shape, from the
-    # warm-up lengths of the capture and the shape's values. None captures
-    # every value at every length. Only the first variant may set it.
-    capture_passes: Optional[Callable[[Sequence[int], Tuple[int, ...]],
-                                      List[Tuple[int, int]]]] = None
 
 
 def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:

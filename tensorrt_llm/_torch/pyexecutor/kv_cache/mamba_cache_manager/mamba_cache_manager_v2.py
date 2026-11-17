@@ -202,6 +202,24 @@ REPLAY_STATE_REGION = "replay_state"
 _REPLAY_STATE_LIFE_CYCLE = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
 
 
+def _reject_fp4_mla_layout_hook_overrides(manager_type: type) -> None:
+    """Refuse the FP4 MLA cache layout to a hybrid manager class that overrides one of its hooks.
+
+    Such an override runs before the layout's and would replace it, leaving the
+    manager with a layout only some of whose pools exist.
+    """
+    overridden = [
+        name
+        for name in Fp4MlaLayoutHooks.LAYOUT_HOOKS
+        if getattr(manager_type, name) is not getattr(MambaHybridCacheManagerV2, name)
+    ]
+    if overridden:
+        raise NotImplementedError(
+            f"{manager_type.__name__} overrides {', '.join(overridden)}, which the FP4 MLA cache "
+            "layout takes over: this manager cannot store an NVFP4 MLA latent cache."
+        )
+
+
 def _uses_fp4_mla_cache_layout(
     dtype: DataType, kv_cache_type: CacheTypeCpp, pretrained_config: object
 ) -> bool:
@@ -517,6 +535,7 @@ class MambaHybridCacheManagerV2(Fp4MlaLayoutHooks, KVCacheManagerV2, MambaHybrid
         self.fp4_mla_layout = None
         pretrained_config = kwargs.get("pretrained_config")
         if _uses_fp4_mla_cache_layout(dtype, kv_cache_type, pretrained_config):
+            _reject_fp4_mla_layout_hook_overrides(type(self))
             # NVFP4 MLA latent cache (Kimi K3): compose the FP4 MLA V2 layout
             # (K, K scales, V scales, BF16 HP ring) with the recurrent-state
             # lifecycle. The policy attaches the layout as fp4_mla_layout, to
