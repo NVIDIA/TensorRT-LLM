@@ -3,12 +3,15 @@
 """CPU admission and routing contracts for the eager TP4 target; no model allocation."""
 
 import builtins
+import json
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2 import _router_index
 from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.beam import routing
@@ -153,6 +156,34 @@ def test_route_selects_nvfp4_from_model_quant_config(
     model_config.quant_config.quant_algo = fallback
     assert routing.route(model_config, llm_args, (10, 3)) is Target
     assert reads == [None]
+
+
+@pytest.mark.parametrize("file_format", ["legacy", "flat"])
+@pytest.mark.parametrize("quant_algo", ["NVFP4", "FP8"])
+def test_route_uses_file_only_modelopt_quantization(
+    route_setup: tuple[NS, NS, list], tmp_path: Path, file_format: str, quant_algo: str
+) -> None:
+    model_config, llm_args, reads = route_setup
+    del model_config.pretrained_config.quantization_config
+    recipe = {"quant_algo": quant_algo, "group_size": 16}
+    raw = (
+        {"quantization": recipe}
+        if file_format == "legacy"
+        else {"quant_method": "modelopt", **recipe}
+    )
+    quant_file = tmp_path / "hf_quant_config.json"
+    quant_file.write_text(json.dumps(raw))
+    model_config.quant_config, _ = ModelConfig.load_modelopt_quant_config(
+        quant_file, tmp_path, None
+    )
+    assert not hasattr(model_config.pretrained_config, "quantization_config")
+    if quant_algo == "NVFP4":
+        assert routing.route(model_config, llm_args, (10, 3)) is Target
+        assert reads == [None]
+    else:
+        with pytest.raises(NoTarget, match="quantization FP8"):
+            routing.route(model_config, llm_args, (10, 3))
+        assert reads == []
 
 
 @pytest.mark.parametrize("pretrained_quant", ["NVFP4", "FP8"])
