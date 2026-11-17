@@ -163,6 +163,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark/test_k3_unified_draft_binding.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark/test_k3_target_head_rows.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/cache/test_k3_sm107_cache_manager.py
   # Kimi K3 family glue and kernels: V1 import scan, the FC12 counter layout and die-claim
   # gating, source parity with V1 / the reference, and the KDA mid-chunk snapshot plan
