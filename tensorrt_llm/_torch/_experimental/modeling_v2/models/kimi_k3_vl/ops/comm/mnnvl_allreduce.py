@@ -111,3 +111,8 @@ class K3MnnvlAllReduce(nn.Module):
         """No fused GEMM + all-reduce + norm kernel: the caller runs them apart. The runtime
         ``AllReduce.gemm_allreduce_norm`` asks the module in its ``mnnvl_allreduce`` slot."""
         return None
+
+    def gemm_twoshot_allreduce_norm(self, input, weight, weight_scale, input_scale, params) -> None:
+        """No fused GEMM + two-shot all-reduce + norm kernel: the caller runs them apart. The runtime
+        ``AllReduce.gemm_twoshot_allreduce_norm`` asks the module in its ``mnnvl_allreduce`` slot."""
+        return None

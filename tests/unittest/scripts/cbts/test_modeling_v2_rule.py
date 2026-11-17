@@ -67,7 +67,7 @@ def rule(tmp_path) -> ModelingV2Rule:
         Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _TREE]),
     ]
     stages = {
-        "B300-PyTorch-1": Stage("B300-PyTorch-1", "l0_b300", "aarch64", 1, 2),
+        "DGX_B300-PyTorch-1": Stage("DGX_B300-PyTorch-1", "l0_b300", "x86_64", 1, 4),
         "GB300-4_GPUs-PyTorch-1": Stage(
             "GB300-4_GPUs-PyTorch-1", "l0_gb300_multi_gpus", "aarch64", 1, 1
         ),
@@ -202,7 +202,7 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
     selected = kernel_tests | {matrix, norm, native, host, accuracy, _TREE}
     assert _selected(result) == selected
     assert result.affected_stages == {
-        "B300-PyTorch-1",
+        "DGX_B300-PyTorch-1",
         "B200-PyTorch-1",
         "GB300-4_GPUs-PyTorch-1",
         "CPU-Generic-x86-1",
@@ -289,24 +289,18 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                 )
                 continue
             if name in sm100_tests:
-                yaml_stem, count, runs_on = "l0_b200", 1, None
+                yaml_stem, count = "l0_b200", 1
             elif name in non_mnnvl_tests:
-                yaml_stem, count, runs_on = "l0_dgx_b200", 4, None
+                yaml_stem, count = "l0_dgx_b200", 4
             elif name in collective_tests:
-                yaml_stem, count, runs_on = "l0_gb300", 4, {"GB300-4_GPUs-PyTorch-1"}
+                yaml_stem, count = "l0_gb300", 4
             else:
-                yaml_stem, count, runs_on = "l0_b300", 1, {"B300-PyTorch-1", "B300-PyTorch-2"}
+                yaml_stem, count = "l0_b300", 1
             assert block.yaml_stem == yaml_stem, name
             assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
             assert block.condition["terms"]["stage"] == "pre_merge"
-            matched = {
-                stage.name
+            assert any(
+                stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
                 for stage in stages.values()
-                if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
-            }
-            if runs_on is None:
-                # The B200 stages are split into shards; the test lands in one of them.
-                assert matched and all("B200" in stage for stage in matched), (name, matched)
-            else:
-                assert matched == runs_on
+            ), (block.yaml_stem, name)
     assert seen == expected

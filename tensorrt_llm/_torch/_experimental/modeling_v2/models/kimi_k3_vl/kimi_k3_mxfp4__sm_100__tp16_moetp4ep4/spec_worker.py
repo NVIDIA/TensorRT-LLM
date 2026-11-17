@@ -542,10 +542,18 @@ class KimiK3DSparkWorker(DSparkWorker):
 
         # Lazy init buffers and attach worker reference for prepare()
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        previous_ctx_len = self._ctx_len
         self._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         spec_metadata._dflash_worker = self
+        if (
+            self._ctx_unified_cache
+            and self._ctx_len is not previous_ctx_len
+            and spec_metadata.request_ids
+        ):
+            # New buffers clear request slots; seed them before generation.
+            spec_metadata.prepare()
         # A decode step of the supported mode runs the acceptance and the drafter's inputs as one kernel
         # (trtllm::k3_spec_accept), which also decodes the block table below.
         if shard is None:
@@ -1033,6 +1041,10 @@ class KimiK3DSparkWorker(DSparkWorker):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
+                if self._ctx_unified_cache:
+                    self._check_block_within_allocation(
+                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
@@ -1258,18 +1270,21 @@ class KimiK3DSparkWorker(DSparkWorker):
         num_contexts=0,
         draft_step=None,
         mapping_lm_head_tp=None,
+        out=None,
     ):
         """Greedy block drafts straight from ``k3_markov``.
 
         When ``logits`` are the corrected logits the kernel just returned, its per-position global
         argmax (first maximum, lowest vocabulary index among equal values) is the token the
-        TP-gathered greedy sampler would pick. Anything else goes to the base sampler.
+        TP-gathered greedy sampler would pick. Anything else, and any call with ``out``, goes to
+        the base sampler.
         """
         chain = getattr(self, "_k3_markov", None)
         if (
             chain is not None
             and chain[0] is logits
             and mapping_lm_head_tp is None
+            and out is None
             and not spec_metadata.wants_advanced_draft_sampling
         ):
             self._k3_markov_next = (chain[1], chain[2], chain[3], chain[4])
@@ -1282,6 +1297,7 @@ class KimiK3DSparkWorker(DSparkWorker):
             num_contexts=num_contexts,
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
+            out=out,
         )
 
     def _prepare_next_new_tokens(

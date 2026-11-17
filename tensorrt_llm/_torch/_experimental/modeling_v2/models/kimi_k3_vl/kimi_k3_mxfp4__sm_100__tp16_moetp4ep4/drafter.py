@@ -75,6 +75,9 @@ _DRAFTER_EPS = 1e-5
 
 _DRAFTER_ROPE_BASE = 10000.0
 
+#: The page sizes the TRTLLM block decode's trtllm-gen kernels take.
+MANAGED_CTX_PAGE_SIZES = (16, 32, 64)
+
 #: Every name the speculative runtime reads off a DFlash / DSpark drafter it is handed (``speculative/dflash.py``,
 #: ``speculative/dspark.py``, ``pyexecutor/_util.py``, ``pyexecutor/model_loader.py``) or that this target's worker
 #: reads (``spec_worker.py``). The worker reads them duck-typed; the shell test checks the drafter has each.
@@ -93,7 +96,7 @@ WORKER_FIELDS = (
     "logit_multiplier",
     "logit_softcap",
     "apply_draft_logit_transform",
-    "_dspark_shift_label",
+    "shift_label",
     "has_markov_head",
     "markov_w1",
     "markov_w2",
@@ -109,6 +112,8 @@ WORKER_FIELDS = (
     "dflash_attention_backend",
     "_uses_worker_attention_backend",
     "_paged_ctx_cache",
+    "reads_managed_ctx_pages",
+    "reads_helix_sharded_ctx_pages",
     "_kv_factor",
     "_runtime_position_ceiling",
     "validate_block_attention_windows",
@@ -551,7 +556,7 @@ class K3DSparkDrafter(nn.Module):
         # The DSpark heads: shift_label slots on by default, the vanilla Markov head, the confidence head (loaded,
         # unused: confidence-scheduled verification is not implemented).
         shift_label = head_config(cfg, "shift_label")
-        self._dspark_shift_label = True if shift_label is None else bool(shift_label)
+        self.shift_label = True if shift_label is None else bool(shift_label)
         self._dspark_markov_rank = int(head_config(cfg, "markov_rank") or 0)
         self._dspark_use_confidence_head = bool(head_config(cfg, "use_confidence_head") or False)
         self.markov_w1 = None
@@ -658,6 +663,19 @@ class K3DSparkDrafter(nn.Module):
         self.model.embed_tokens = target_model.model.embed_tokens
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
+
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Whether the block decode reads the context KV from a KV cache manager's pages of ``tokens_per_block``
+        tokens: on TRTLLM, at the page sizes its trtllm-gen kernels take. Elsewhere the drafter keeps its own pool.
+        The engine asks it when it decides whether the drafter's layers share the target's KV cache manager."""
+        return (
+            self.dflash_attention_backend == "TRTLLM" and tokens_per_block in MANAGED_CTX_PAGE_SIZES
+        )
+
+    @property
+    def reads_helix_sharded_ctx_pages(self) -> bool:
+        """Whether the block decode reads a context whose pages are sharded over helix CP: never."""
+        return False
 
     def validate_block_attention_windows(self) -> list:
         """On TRTLLM every draft layer (non-causal, unwindowed) runs the decode kernel with the block's rows folded into

@@ -385,7 +385,7 @@ class K3MLADSparkDrafter(nn.Module):
         self.logit_multiplier, self.logit_softcap = _drafter_config.logit_transform(dflash_config)
 
         shift_label = head_config(cfg, "shift_label")
-        self._dspark_shift_label = True if shift_label is None else bool(shift_label)
+        self.shift_label = True if shift_label is None else bool(shift_label)
         self._dspark_markov_rank = int(head_config(cfg, "markov_rank") or 0)
         reason = _drafter_config.mla_markov_head_declines(
             cfg
@@ -468,6 +468,11 @@ class K3MLADSparkDrafter(nn.Module):
     def validate_block_attention_windows(self) -> list:
         """Not read for this drafter (it brings its own block decode)."""
         return []
+
+    # Whether the block decode reads the context KV from a KV cache manager's pages, as the GQA drafter answers:
+    # on TRTLLM at the page sizes its kernels take; never over helix CP.
+    reads_managed_ctx_pages = K3DSparkDrafter.reads_managed_ctx_pages
+    reads_helix_sharded_ctx_pages = K3DSparkDrafter.reads_helix_sharded_ctx_pages
 
     def _get_cos_sin_cache(self) -> torch.Tensor:
         raise RuntimeError(

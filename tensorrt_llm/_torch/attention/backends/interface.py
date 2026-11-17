@@ -360,6 +360,10 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
@@ -1077,6 +1081,14 @@ class AttentionForwardArgs:
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
     quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)
@@ -1124,6 +1136,11 @@ class AttentionForwardArgs:
     # the output sets output_gate_applied, and the caller applies the gate otherwise.
     output_gate: Optional[torch.Tensor] = None
     output_gate_applied: bool = False
+    # o_proj's static FP8 input scale offered together with output_gate: an FMHA library that applies the gate may
+    # also write the gated output as E4M3 at this scale, byte for byte as o_proj's own static quant would, into
+    # output_fp8 [num_tokens, num_heads * head_dim]; the caller then passes output_fp8 to o_proj (output unwritten).
+    gated_out_scale: Optional[torch.Tensor] = None
+    output_fp8: Optional[torch.Tensor] = None
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.

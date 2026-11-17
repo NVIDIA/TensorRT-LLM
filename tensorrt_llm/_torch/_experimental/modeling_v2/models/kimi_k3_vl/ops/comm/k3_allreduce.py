@@ -13,11 +13,11 @@ runtime module's ``forward``, which picks the path:
    ``TLLM_DISABLE_ALLREDUCE_AUTOTUNE=1``), with every fusion passed through. The MNNVL strategy takes this step
    with AUTO.
 
-The runtime module is built without a dtype. It then builds no MNNVL all-reduce and no MNNVL workspace of its own:
-it builds them only for a dtype (``AllReduce.__init__``). This module sets the runtime module's public
-``mnnvl_allreduce`` slot to a ``K3MnnvlAllReduce`` where the runtime would run MNNVL
-(``mnnvl_workspace.mnnvl_supported``: the TP group spans nodes of one NVLink domain, or the MNNVL strategy is named
-on an MNNVL-capable host). Its one-shot ceiling is the runtime's until the decode path raises it
+The runtime module is built as any model builds it (``AllReduce.__init__`` with the dtype): where it runs MNNVL
+(the TP group spans nodes of one NVLink domain, or the MNNVL strategy is named on an MNNVL-capable host) it builds
+its own MNNVL all-reduce on the mapping's shared Lamport workspace. This module then sets the public
+``mnnvl_allreduce`` slot: to a ``K3MnnvlAllReduce`` on the same workspace where ``mnnvl_workspace.mnnvl_supported``
+holds, else to None. The family's one-shot ceiling is the runtime's until the decode path raises it
 (``decode_comm.use_decode_one_shot``).
 
 Step 4 can return NCCL window buffers (NCCL_SYMMETRIC). The engine opens an NCCL window tensor scope around every
@@ -60,9 +60,9 @@ class K3AllReduce(AllReduce):
             raise ValueError(f"K3AllReduce runs the AUTO and MNNVL strategies, not {strategy.name}")
         if mapping.tp_size > 1 and mapping.enable_attention_dp:
             raise ValueError("K3AllReduce reduces over the TP group; attention DP has none")
-        # No dtype: the runtime module reads it only for its own MNNVL and symmetric-memory all-reduces, and this
-        # module routes neither.
-        super().__init__(mapping=mapping, strategy=strategy, dtype=None)
+        super().__init__(mapping=mapping, strategy=strategy, dtype=dtype)
+        # The slot holds the family's MNNVL all-reduce or nothing, never the runtime's.
+        self.mnnvl_allreduce = None
         self.dtype = dtype
         if mapping.tp_size == 1:
             return

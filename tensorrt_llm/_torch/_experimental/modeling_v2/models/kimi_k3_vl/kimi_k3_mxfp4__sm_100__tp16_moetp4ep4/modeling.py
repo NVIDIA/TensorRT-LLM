@@ -94,6 +94,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ANY_MOE_IMPL,
     NoTarget,
     step_contract_enabled,
 )
@@ -990,6 +991,13 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(
     mamba_metadata_cls = KimiK3MambaMetadata
     # The one-engine speculative fast paths (vocabulary-sharded sampling, hoisted positions): not taken.
     spec_decode_fast_paths = False
+
+    # The routed experts are the TRTLLM-Gen W4A8_MXFP4_MXFP8 implementation: the generic path runs its op (the
+    # catalog's block-scale MoE runner) and the decode path runs k3_moe over the same buffers (decode_moe.py).
+    # The drafters this target builds (drafter.py, drafter_mla.py) have dense MLPs only, so no draft tactic selects
+    # anything in them.
+    moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8"})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

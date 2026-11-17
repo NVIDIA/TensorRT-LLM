@@ -65,6 +65,9 @@ TestQwen3_5_35B_A3B::test_bf16_mtp:
 TestQwen3_5_35B_A3B::test_bf16_mtp_flashinfer_ring_replay:
   ref_al: 3.504435
   min_al: 3.32921325
+TestQwen3_5_35B_A3B::test_bf16_mtp_adp2:
+  ref_al: 3.505987
+  min_al: 3.33068765
 TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload:
   ref_al: 1.890148
   min_al: 1.7956406
@@ -291,9 +294,8 @@ ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7:
   ref_al: 4.369
   min_al: 4.151
 ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7_mla:
-  # No STOCK reading on this layout yet. This is the modeling_v2 leg on this layout: full gsm8k
-  # 96.285. Replace it with a STOCK reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg)
-  # when one is measured.
+  # The STOCK leg (modeling_v2 "off", eager) on this layout: full gsm8k 96.664. The modeling_v2 leg
+  # read 4.315 on the same code.
   ref_al: 4.315
   min_al: 4.099
 ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::sa2:

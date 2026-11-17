@@ -124,7 +124,7 @@ def _drafter(tp_size=1, tp_rank=0, comm=None, fc=None, all_reduce=True, row_para
     drafter = target.K3DSparkDrafter.__new__(target.K3DSparkDrafter)
     nn.Module.__init__(drafter)
     drafter.model_config = SimpleNamespace(
-        mapping=SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank)
+        mapping=SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, enable_attention_dp=False)
     )
     drafter.config = SimpleNamespace(hidden_size=OUT)
     drafter.model = SimpleNamespace(

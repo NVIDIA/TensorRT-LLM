@@ -102,9 +102,8 @@ class TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(LlmapiAccuracyTestHarness):
     MODEL_PATH = _MODEL_PATH
 
     # One anchor per variant, shared by both legs of its gate. It names the target and the variant, not a test
-    # function, because that is what the number is a property of. Populate it from the STOCK leg where that leg has a
-    # reading: taking it from the target's own number would make the gate self-referential. An anchor without a
-    # STOCK reading says so in the reference file.
+    # function, because that is what the number is a property of. Populate it from the STOCK leg: taking it from
+    # the target's own number would make the gate self-referential.
     DSPARK7_KEY = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7"
     DSPARK7_MLA_KEY = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7_mla"
     SA2_KEY = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::sa2"

@@ -115,9 +115,9 @@ class GlmMoE(Deepseekv3MoE):
         if router_logits is None:
             router_logits = self.gate(hidden_states)
 
-        # The draft layer's BF16 routed experts (the FlashInfer TRT-LLM-Gen BF16 leaf) through
-        # the draft routed-MoE kernels on the leaf's own buffers, bit-identical to the native
-        # call. Its eligibility (leaf type, routing, shapes, dtypes, device, finalized output)
+        # The draft layer's BF16 routed experts (the TRT-LLM-Gen BF16 leaf) through
+        # the draft routed-MoE kernels on the leaf's own buffers (routing math as noted in
+        # draft_routed_moe.routed_moe). Its eligibility (leaf type, routing, shapes, dtypes, device, finalized output)
         # is decided before any device work; None keeps the path below (NVFP4 layers always
         # decline).
         if (
@@ -900,6 +900,9 @@ class GlmDecoderLayer(_AdoptedLayerMixin, _PostAttentionHopMixin, DeepseekV3Deco
 class GlmMtpLayer(_AdoptedLayerMixin, _PostAttentionHopMixin, DeepseekV3MTP):
     """The draft layer: the built-in MTP layer, with the target's decode composition."""
 
+    # Step 0 keeps only the live rows through its own hop (arm_live_rows below), not the
+    # built-in pick_rows argument.
+    supports_pick_rows = False
     # The draft front packs this rank's chunk of the projection input; None keeps the
     # built-in norms and concatenation.
     draft_front = None

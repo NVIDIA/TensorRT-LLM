@@ -214,7 +214,7 @@ def test_weight_load_matches_main(pair):
         "mask_token_id",
         "target_layer_ids",
         "block_size",
-        "_dspark_shift_label",
+        "shift_label",
         "softmax_scale",
         "dflash_attention_backend",
         "_num_attn_layers",

@@ -74,7 +74,7 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
         is_cuda_graph=False,
         sharded_target_logits=False,
     )
-    worker = SimpleNamespace(force_num_accepted_tokens=0.0)
+    worker = SimpleNamespace(force_num_accepted_tokens=0.0, fused_sample_accept=False)
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
     )

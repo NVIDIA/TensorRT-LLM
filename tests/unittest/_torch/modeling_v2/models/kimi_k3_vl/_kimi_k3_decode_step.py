@@ -99,6 +99,7 @@ def slot_worker(spec_worker):
     worker._ctx_block_divisor = 1
     worker._ctx_block_counts = torch.full((3,), 4, dtype=torch.int32)
     worker._ctx_block_tables = None
+    worker._ctx_unified_cache = False
     worker._ctx_page_table = None
     worker._ctx_page_size = 32
     worker._ctx_k_buf = torch.empty(4, 1, 64, 1, 4)

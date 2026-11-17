@@ -41,6 +41,9 @@ from .k3_rms_norm_gated_kernel import (
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+# Tiles per program of k3_rms_norm_gated_token_major from _MULTIROW_GROUPS_MIN_ROWS rows (prefill-sized inputs).
+_MULTIROW_GROUPS = 4
+_MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 
 
 @functools.lru_cache(maxsize=None)
@@ -123,8 +126,11 @@ def k3_rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+    # rstd is not consumed on this path; Rstd=None skips both the scratch
+    # allocation and the (measurably expensive) extra store in the kernel.
     device_index = x.device.index
+    groups = _MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS else 1
+    grid_size = triton.cdiv(M, _MULTIROW_ROWS * groups)
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
         _rms_norm_gated_fwd_multirow_kernel[(grid_size,)](
@@ -145,10 +151,13 @@ def k3_rms_norm_gated_token_major(
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            CONTIG=(x.stride(0) == N and out.stride(0) == N),
+            EVEN=(M % (_MULTIROW_ROWS * groups) == 0),
             num_warps=_MULTIROW_NUM_WARPS,
             # Dependents (out_proj) prefetch their weights; they read Y only
             # after their own griddepcontrol.wait.
             EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
+            GROUPS=groups,
             launch_pdl=launch_with_pdl,
         )
     return out
@@ -241,6 +250,8 @@ def _layer_norm_fwd(
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
                 LAUNCH_WITH_PDL=launch_with_pdl,
+                CONTIG=(x.stride(0) == group_size and out.stride(0) == group_size),
+                EVEN=(M % _MULTIROW_ROWS == 0),
                 num_warps=_MULTIROW_NUM_WARPS,
                 launch_pdl=launch_with_pdl,
             )

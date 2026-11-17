@@ -163,14 +163,17 @@ def _checkpoint_file(checkpoint_dir: str, file_name: str) -> str | None:
 
 
 def checkpoint_quant_algo(
-    checkpoint_dir: str, pretrained_config: PretrainedConfig, moe_backend: str
+    checkpoint_dir: str,
+    pretrained_config: PretrainedConfig,
+    moe_backend: str,
+    moe_tactic: str | None = None,
 ) -> QuantAlgo | None:
     """The weight quantization ``ModelConfig.from_pretrained`` resolves for the checkpoint at ``checkpoint_dir``, whose
-    config `load_pretrained_config` read as ``pretrained_config``, with the requested MoE backend ``moe_backend``:
-    the engine's readers on the same files in the same order. ``hf_quant_config.json`` (ModelOpt) first, and where it
-    sets no global algorithm the ``quantization_config`` of ``config.json``; else that ``quantization_config``; else
-    ``dtypes.json``. None for unquantized weights. The architecture-specific branches (DeepSeek-V4 / V4.1, MiniMax M3)
-    do not apply to a DSpark drafter's architecture.
+    config `load_pretrained_config` read as ``pretrained_config``, with the requested MoE selection (``moe_backend``,
+    ``moe_tactic``): the engine's readers on the same files in the same order. ``hf_quant_config.json`` (ModelOpt)
+    first, and where it sets no global algorithm the ``quantization_config`` of ``config.json``; else that
+    ``quantization_config``; else ``dtypes.json``. None for unquantized weights. The architecture-specific branches
+    (DeepSeek-V4 / V4.1, MiniMax M3) do not apply to a DSpark drafter's architecture.
 
     Raises:
         OSError, ValueError: a quantization file the engine's readers cannot read. A declaration the readers reject
@@ -180,27 +183,30 @@ def checkpoint_quant_algo(
     from tensorrt_llm._torch.model_config import ModelConfig
 
     architectures = getattr(pretrained_config, "architectures", None)
-    moe_backend = ModelConfig.resolve_moe_backend(
-        moe_backend, architectures[0] if architectures else ""
-    )
+    architecture = architectures[0] if architectures else ""
+    moe_backend = ModelConfig.resolve_moe_backend(moe_backend, architecture)
     declared = getattr(pretrained_config, "quantization_config", None)
     modelopt_file = _checkpoint_file(checkpoint_dir, "hf_quant_config.json")
     quant_algo = None
     if modelopt_file is not None:
         quant_config, _ = ModelConfig.load_modelopt_quant_config(
-            modelopt_file, checkpoint_dir, moe_backend
+            modelopt_file, checkpoint_dir, moe_backend, moe_tactic, architecture=architecture
         )
         quant_algo = quant_config.quant_algo
     if quant_algo is None and declared is not None:
         quant_config, _ = ModelConfig.load_hf_quant_config(
-            declared, moe_backend, checkpoint_dir=checkpoint_dir
+            declared,
+            moe_backend,
+            checkpoint_dir=checkpoint_dir,
+            moe_tactic=moe_tactic,
+            architecture=architecture,
         )
         quant_algo = quant_config.quant_algo
     elif modelopt_file is None and declared is None:
         dtypes_file = _checkpoint_file(checkpoint_dir, "dtypes.json")
         if dtypes_file is not None:
             quant_config, _ = ModelConfig.load_quant_config_from_dtypes_json(
-                dtypes_file, moe_backend
+                dtypes_file, moe_backend, moe_tactic
             )
             quant_algo = quant_config.quant_algo
     return quant_algo
@@ -475,25 +481,48 @@ def declines(
     )
 
 
+def drafter_moe_selection(
+    model_config: ModelConfig, spec_config: DSparkDecodingConfig
+) -> dict[str, str | None]:
+    """The ``moe_backend`` / ``moe_tactic`` kwargs that load a standalone drafter checkpoint.
+    ``speculative_config.moe_tactic`` pins, else ``speculative_config.moe_backend`` selects. With neither the drafter
+    takes the target's resolved backend, unless ``moe_config.tactic`` pins the target: that tactic names
+    implementations of the target's experts, so the drafter gets AUTO. A standalone drafter registers into no EPLB
+    balancer, so AUTO stays AUTO."""
+    from tensorrt_llm._torch.model_config import MoESelection
+
+    moe_tactic = getattr(spec_config, "moe_tactic", None)
+    moe_backend = getattr(spec_config, "moe_backend", None)
+    if moe_tactic is not None:
+        selection = MoESelection(tactic=moe_tactic)
+    elif moe_backend is not None:
+        selection = MoESelection(backend=moe_backend)
+    elif model_config.moe_tactic is not None:
+        selection = MoESelection(backend="AUTO")
+    else:
+        selection = MoESelection(backend=model_config.moe_backend)
+    return selection.loader_kwargs()
+
+
 def external_drafter_config_kwargs(
     model_config: ModelConfig, spec_config: DSparkDecodingConfig
 ) -> dict[str, Any]:
     """``ModelConfig.from_pretrained`` kwargs for a standalone drafter checkpoint: the execution-layout properties it
     inherits from the target engine (the standalone case of the built-in
     ``modeling_speculative.external_drafter_config_kwargs``: no EPLB namespace is shared)."""
-    requested_moe_backend = getattr(spec_config, "moe_backend", None)
     return dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=model_config.moe_backend
-        if requested_moe_backend is None
-        else requested_moe_backend,
+        **drafter_moe_selection(model_config, spec_config),
         mapping=model_config.mapping.mapping_for_full_rows(),
         spec_config=None,
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
         use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         max_seq_len=model_config.max_seq_len,
+        # Engine settings (``moe_config``), not checkpoint properties.
+        use_low_precision_moe_combine=model_config.use_low_precision_moe_combine,
+        megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
     )
 
 
@@ -532,7 +561,9 @@ def standalone_drafter_declines(
     path = spec_config.speculative_model
     try:
         pretrained_config = load_pretrained_config(path, **kwargs)
-        quant_algo = checkpoint_quant_algo(path, pretrained_config, kwargs["moe_backend"])
+        quant_algo = checkpoint_quant_algo(
+            path, pretrained_config, kwargs["moe_backend"], kwargs["moe_tactic"]
+        )
     except (OSError, ValueError) as error:  # a missing or malformed config; Modeling V1 reports it.
         return f"the drafter config at {path!r} cannot be loaded ({type(error).__name__}: {error})"
     return declines(

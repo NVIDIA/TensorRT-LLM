@@ -11,6 +11,7 @@ quantization files. Each case checks that a configuration the targets do not ser
 
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 import sys
@@ -33,7 +34,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
 )
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (
     DFlashDecodingConfig,
@@ -42,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MoeLoadBalancerConfig,
     NGramDecodingConfig,
     SADecodingConfig,
+    SkipSoftmaxAttentionConfig,
     TorchCompileConfig,
     TorchLlmArgs,
 )
@@ -899,6 +902,17 @@ def test_kimi_k3_torch_compile_does_not_match():
         modeling_v2_resolve(config, llm_args("require"))
 
 
+def test_kimi_k3_sparse_attention_does_not_match():
+    """The targets' MLA layers run dense attention: a deployment that asks for a sparse algorithm is declined."""
+    config = replace(
+        _k3_model_config(_k3_config(), **_TP16_MOETP4EP4),
+        sparse_attention_config=SkipSoftmaxAttentionConfig(),
+    )
+    assert modeling_v2_resolve(config, _k3_llm_args("auto")) is None
+    with pytest.raises(ValueError, match="sparse_attention_config skip_softmax"):
+        modeling_v2_resolve(config, _k3_llm_args("require"))
+
+
 def test_kimi_k3_default_kv_cache_settings_do_not_match():
     """Without the K3 settings the KV cache config defaults to 32-token blocks with reuse on: no target."""
     config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
@@ -915,6 +929,60 @@ def test_kimi_k3_default_kv_cache_settings_do_not_match():
 def test_kimi_k3_tp16_moetp4ep4_speculation_matches(spec_config):
     config = _k3_with(spec_config=spec_config)
     assert _qualified(modeling_v2_resolve(config, _k3_llm_args("require"))) == _K3_TARGET
+
+
+_K3_TARGETS = pytest.mark.parametrize(
+    "mapping_kwargs, target",
+    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
+    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
+)
+
+
+def _k3_tactic_config(mapping_kwargs, moe_tactic) -> ModelConfig:
+    """K3 as the model config reads the checkpoint, W4A16_MXFP4, with ``moe_tactic``."""
+    return replace(_k3_model_config(_k3_config(), **mapping_kwargs), moe_tactic=moe_tactic)
+
+
+@pytest.mark.parametrize(
+    "tactic", ["trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", "trtllm.trtllm_gen", "trtllm_gen"]
+)
+@_K3_TARGETS
+def test_kimi_k3_targets_take_the_tactic_of_the_experts_their_kernels_read(
+    mapping_kwargs, target, tactic
+):
+    """The targets run the TRTLLM-Gen W4A8_MXFP4_MXFP8 routed experts. The model config reads the checkpoint as
+    W4A16_MXFP4, but K3 runs experts the checkpoint does not list as W4A8_MXFP4_MXFP8, so a tactic is narrowed to
+    that format."""
+    config = _k3_tactic_config(mapping_kwargs, tactic)
+    assert _qualified(modeling_v2_resolve(config, _k3_llm_args("require"))) == target
+
+
+@_K3_TARGETS
+def test_kimi_k3_targets_decline_the_tactic_of_other_experts(mapping_kwargs, target):
+    config = _k3_tactic_config(mapping_kwargs, "cutlass")
+    assert modeling_v2_resolve(config, _k3_llm_args("auto")) is None
+    with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.split('.')[-1]}"):
+        modeling_v2_resolve(config, _k3_llm_args("require"))
+
+
+@_K3_TARGETS
+def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_experts_as(
+    mapping_kwargs, target
+):
+    """Three places spell the format K3 runs the experts a checkpoint does not list in: the loader's
+    ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, the family MoE block's own copy,
+    which it builds the experts in, and the quant of the ids each target honors."""
+    module_path, class_name = target.rsplit(".", 1)
+    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
+    family_moe = importlib.import_module(f"{_FAMILY}.moe")
+    assert family_moe._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
+    loaded = ModelConfig._declared_moe_quants(
+        QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
+        None,
+        architecture="KimiK3ForConditionalGeneration",
+    )
+    honored = getattr(module, class_name).moe_impls_honored
+    assert {MoEImplId.parse(impl_id).quant for impl_id in honored} == loaded
 
 
 def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):

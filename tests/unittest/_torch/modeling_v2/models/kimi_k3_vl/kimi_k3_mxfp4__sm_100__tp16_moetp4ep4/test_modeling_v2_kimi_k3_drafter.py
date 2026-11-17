@@ -360,7 +360,7 @@ def test_weight_load_matches_stock(drafters, name):
         _assert_bitwise(getattr(new, attr), getattr(old, attr), attr)
     _assert_bitwise(new.mask_token_embedding, old.mask_token_embedding, "mask_token_embedding")
     assert new.hidden_norm.eps == old.hidden_norm.eps
-    for field in ("mask_token_id", "target_layer_ids", "block_size", "_dspark_shift_label"):
+    for field in ("mask_token_id", "target_layer_ids", "block_size", "shift_label"):
         assert getattr(new, field) == getattr(old, field), field
     assert new.has_markov_head and old.has_markov_head
     assert (new.logit_multiplier, new.logit_softcap) == (old.logit_multiplier, old.logit_softcap)

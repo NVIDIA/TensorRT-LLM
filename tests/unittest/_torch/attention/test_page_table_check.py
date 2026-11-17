@@ -23,6 +23,8 @@ import pytest
 
 from tensorrt_llm._torch.attention.backends.utils import PLACEHOLDER_PAGE_INDEX, check_page_table
 
+pytestmark = pytest.mark.cpu_only
+
 PAGE_SIZE = 4
 
 

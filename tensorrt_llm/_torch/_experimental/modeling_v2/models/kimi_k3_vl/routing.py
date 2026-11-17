@@ -186,6 +186,12 @@ def _unmet_settings(
 
     if getattr(llm_args, "torch_compile_config", None) is not None:
         unmet.append("torch_compile_config set: torch.compile does not trace the targets")
+    sparse_attention = model_config.sparse_attention_config
+    if sparse_attention is not None:
+        unmet.append(
+            f"sparse_attention_config {getattr(sparse_attention, 'algorithm', sparse_attention)}: the targets' MLA "
+            "layers run dense attention"
+        )
 
     kv_cache_config = llm_args.kv_cache_config
     if kv_cache_config.tokens_per_block != _engine_settings.TOKENS_PER_BLOCK:
