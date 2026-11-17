@@ -59,6 +59,21 @@ python examples/visual_gen/models/minimax_h3.py \
   --visual_gen_args minimax-h3-sm107.yaml --prompt "<prompt>"
 ```
 
+To serve the scenario, use the configuration files in `examples/visual_gen/configs/` and the request files in `examples/visual_gen/requests/`:
+
+```bash
+trtllm-serve <approved-prequantized-NVFP4-checkpoint> \
+  --visual_gen_args examples/visual_gen/configs/minimax-h3-nvfp4-sm107-4gpu.yaml --port 8000
+
+curl -s http://localhost:8000/v1/videos/sync -H "Content-Type: application/json" \
+  -d @examples/visual_gen/requests/minimax-h3-768x1344x124.json -o out.mp4
+
+python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
+  --workload examples/visual_gen/requests/minimax-h3-768x1344x124-workload.yaml --port 8000
+```
+
+`minimax-h3-nvfp4-sm107-1gpu.yaml` is the one-GPU variant; both warm up 768 × 1344 pixels at 124 frames.
+
 The example uses 544 × 960 pixels, 124 frames and seed 42; these are example defaults, not a performance protocol.
 For four GPUs, set `parallel_config: {ulysses_size: 4}` and use the same command on one node with four visible GPUs.
 

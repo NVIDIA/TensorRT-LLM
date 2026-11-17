@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Workload for tensorrt_llm.serve.scripts.benchmark_visual_gen: one MiniMax-H3
+# request at 768 x 1344, 124 frames. The prompt is the "prompt" field of the
+# request JSON beside this file.
+backend: openai-videos
+common_params:
+  width: 1344
+  height: 768
+  num_frames: 124
+  frame_rate: 24
+  num_inference_steps: 28
+  seed: 42
+requests:
+  - prompt_file: minimax-h3-768x1344x124.json
