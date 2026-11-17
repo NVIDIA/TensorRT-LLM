@@ -1651,6 +1651,33 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert events == ["post_load_weights", "load_weights"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preloaded", [True, False], ids=["p2p", "disk"])
+def test_page_cache_release_gets_the_checkpoint_only_when_read_from_disk(
+    monkeypatch: pytest.MonkeyPatch, preloaded: bool
+) -> None:
+    loader = _make_loader(monkeypatch, events=[])
+    monkeypatch.setattr(
+        mx_loading_mod,
+        "MX_POST_TRANSFORM_PROFILE_REGISTRY",
+        _tiny_profile_registry(),
+    )
+    released_dirs = []
+    monkeypatch.setattr(
+        model_loader_mod,
+        "_release_checkpoint_page_cache",
+        lambda dirs: released_dirs.append(list(dirs)) or 2.5,
+    )
+    checkpoint_loader = _mock_mx_checkpoint_loader()
+    checkpoint_loader.is_weights_preloaded.return_value = preloaded
+    checkpoint_loader.load_weights.return_value = {} if preloaded else {"weight": MagicMock()}
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert released_dirs == [[] if preloaded else ["/ckpt"]]
+    assert loader.metrics["checkpoint_page_cache_release_seconds"] == 2.5
+
+
 def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
     loader = _make_loader(monkeypatch, events=[])
     checkpoint_loader = _mock_mx_checkpoint_loader()
