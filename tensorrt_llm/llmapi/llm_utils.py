@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
+from pydantic import BaseModel
 
 from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
@@ -537,6 +538,7 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
+    fields_set_before = _snapshot_fields_set(llm_args)
 
     # A user's ``moe_config.tactic`` already names the implementation, so a
     # model's preferred ``moe_config.backend`` yields to it instead of being
@@ -576,7 +578,9 @@ def apply_model_defaults_to_llm_args(
                 if isinstance(user_override, dict):
                     nested_applied = _compute_applied(default_value,
                                                       user_override)
-                    if nested_applied:
+                    # A default for a key the user left unset constructs that
+                    # config even when it sets nothing inside it.
+                    if nested_applied or key not in overrides:
                         applied[key] = nested_applied
                 elif key not in overrides:
                     applied[key] = default_value
@@ -585,7 +589,64 @@ def apply_model_defaults_to_llm_args(
                     applied[key] = default_value
         return applied
 
-    return _compute_applied(model_defaults_dict, user_overrides)
+    applied = _compute_applied(model_defaults_dict, user_overrides)
+    # Rebuilding from a full dump marks every field, nested ones included, as
+    # set. Keep only the fields the user set and the ones the model defaults
+    # applied, at every level, so checks of whether a deployment set a field
+    # (``model_fields_set``) still hold.
+    _restore_fields_set(llm_args, fields_set_before, applied)
+    return applied
+
+
+def _snapshot_fields_set(value: Any) -> Any:
+    """Record which fields are set on each config in ``value``.
+
+    Descends into config fields and into dicts and lists that hold configs.
+    A config maps to ``(fields_set, {field: snapshot})``; a dict or list maps
+    to the same container of snapshots; anything else maps to None.
+    """
+    if isinstance(value, BaseModel):
+        return (frozenset(value.model_fields_set), {
+            name: _snapshot_fields_set(getattr(value, name, None))
+            for name in type(value).model_fields
+        })
+    if isinstance(value, dict):
+        return {key: _snapshot_fields_set(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_fields_set(item) for item in value]
+    return None
+
+
+def _restore_fields_set(value: Any, snapshot: Any, applied: Any) -> None:
+    """Mark the snapshot's fields and the applied names as set.
+
+    Applies to each config in ``value``. ``snapshot`` comes from
+    ``_snapshot_fields_set`` and is None where no config existed before the
+    defaults were applied; ``applied`` is the defaults applied at this level.
+    """
+    if isinstance(applied, BaseModel):
+        applied = applied.model_dump(exclude_unset=True)
+    if isinstance(value, BaseModel):
+        applied = applied if isinstance(applied, dict) else {}
+        fields_set, nested = (snapshot if isinstance(snapshot, tuple) else
+                              (frozenset(), {}))
+        object.__setattr__(value, "__pydantic_fields_set__",
+                           set(fields_set) | applied.keys())
+        for name in type(value).model_fields:
+            _restore_fields_set(getattr(value, name, None), nested.get(name),
+                                applied.get(name))
+    elif isinstance(value, dict):
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        applied = applied if isinstance(applied, dict) else {}
+        for key, item in value.items():
+            _restore_fields_set(item, snapshot.get(key), applied.get(key))
+    elif isinstance(value, (list, tuple)):
+        snapshot = snapshot if isinstance(snapshot, list) else []
+        applied = applied if isinstance(applied, (list, tuple)) else []
+        for index, item in enumerate(value):
+            _restore_fields_set(
+                item, snapshot[index] if index < len(snapshot) else None,
+                applied[index] if index < len(applied) else None)
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',

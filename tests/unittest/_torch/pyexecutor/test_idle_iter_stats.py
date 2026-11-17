@@ -6,6 +6,7 @@ import datetime
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -358,10 +359,11 @@ def test_zero_duration_rows_leave_the_encoder_calls_for_a_measured_record(execut
     _queue_backlog(executor, 2)
     executor._maybe_emit_quiescent_stats(engine_idle=False)
     assert len(executor.stats) == 2
-    assert all(row[8] is None and row[9] is True for row in executor.stats)
+    assert all(row.mm_encoder_stats is None and row.is_queue_snapshot for row in executor.stats)
     take.assert_not_called()
 
-    assert _append_measured(executor)[8] == {"gpuTimesMS": [2.5]}
+    measured = _append_measured(executor)
+    assert measured.mm_encoder_stats == {"gpuTimesMS": [2.5]} and not measured.is_queue_snapshot
     take.assert_called_once_with()
 
 
@@ -588,40 +590,71 @@ def _attention_dp_rank(rank, clock):
         "_publish_idle_heartbeat",
         "_append_queue_snapshot",
         "_export_adp_fanout",
+        "_publish_adp_iter_stats",
         "_idle_heartbeat_tick",
         "_plan_idle_heartbeat_wait",
     )
     return stub
 
 
+class _RankExchange:
+    """The DP ranks' allgather of iteration-stats payloads.
+
+    A rank's call returns every rank's state once all ranks have called, so
+    ranks that disagree on the number of exchanges time out instead of passing.
+    """
+
+    def __init__(self, num_ranks):
+        self.count = 0
+        self._payloads = [None] * num_ranks
+        self._states = None
+        self._barrier = threading.Barrier(num_ranks, action=self._gather, timeout=5)
+
+    def _gather(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+        self._states = []
+        for rank, payload in enumerate(self._payloads):
+            state = RankState(rank=rank)
+            state.copy_iter_stats_from(payload)
+            self._states.append(state)
+        self.count += 1
+
+    def gather(self, rank, payload):
+        self._payloads[rank] = payload
+        self._barrier.wait()
+        return self._states
+
+
 def _attention_dp_idle_pass(ranks, clock):
     """Routing exchange, fanout and rank 0's wait plan, as _fetch_new_requests does.
 
-    Returns rank 0's idle_tick once it parks. Otherwise rank 0's wait ends
-    empty and every rank runs the rest of an idle loop pass.
+    Returns rank 0's idle_tick once it parks, and the number of exchanges the
+    pass took. Otherwise rank 0's wait ends empty and every rank runs the rest
+    of an idle loop pass.
     """
-    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+    exchange = _RankExchange(len(ranks))
 
-    states = []
-    for stub in ranks:
-        state = RankState(rank=stub.dist.rank)
-        state.copy_iter_stats_from(stub._adp_iter_stats.next_payload())
-        states.append(state)
-    for stub in ranks:
-        stub._export_adp_fanout(
-            stub._adp_iter_stats.finalize(
-                states, is_rank0=stub.dist.rank == 0, scheduler_mode=stub._stats_scheduler_mode()
-            )
+    def exchange_and_publish(stub):
+        rank = stub.dist.rank
+        stub.adp_router = SimpleNamespace(
+            gather_iter_stats=lambda payload: exchange.gather(rank, payload)
         )
+        states = exchange.gather(rank, stub._adp_iter_stats.next_payload())
+        stub._publish_adp_iter_stats(states, idle_wait_follows=True)
+
+    with ThreadPoolExecutor(len(ranks)) as pool:
+        for done in [pool.submit(exchange_and_publish, stub) for stub in ranks]:
+            done.result()
     timeout, idle_tick = ranks[0]._plan_idle_heartbeat_wait(None)
     if idle_tick is not None:
-        return idle_tick
+        return idle_tick, exchange.count
     clock.value += timeout.total_seconds()
     for stub in ranks:
         stub._maybe_emit_quiescent_stats(engine_idle=True)
         stub._maybe_emit_quiescent_stats(engine_idle=False)  # The loop tail.
         stub.iter_counter += 1
-    return None
+    return None, exchange.count
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -642,13 +675,19 @@ def test_attention_dp_engine_parks_soon_after_going_idle(clock, overlap):
             stub.iter_counter = 12
     rank0, started = ranks[0], clock.value
 
-    idle_tick = None
-    for passes in range(1, 6):
-        idle_tick = _attention_dp_idle_pass(ranks, clock)
+    idle_tick, exchanges = None, []
+    for _ in range(5):
+        idle_tick, count = _attention_dp_idle_pass(ranks, clock)
+        exchanges.append(count)
         if idle_tick is not None:
             break
     assert idle_tick is not None, "rank 0 never parked"
-    assert passes == (3 if overlap else 2)
+    # Before an idle wait the ranks exchange until rank 0 has nothing pending:
+    # the first pass fans out what the busy passes left, the second the idle
+    # heartbeat every rank queued after it. Each ends with the exchange that
+    # shows rank 0 has nothing left, which must not make rank 0 forget that
+    # the heartbeat was fanned out.
+    assert exchanges == ([3, 2] if overlap else [2, 2])
     assert clock.value == started  # No pass waited for a heartbeat period.
     # The measured record, then one fresh heartbeat row per rank.
     rows = [json.loads(row) for row in rank0.stats]
@@ -685,6 +724,7 @@ def _fetch_stub(**overrides):
         iter_counter=7,
         dist=SimpleNamespace(rank=0, pp_size=1),
         disagg=SimpleNamespace(has_retiring_gen_receives=False),
+        canceled_req_ids=set(),
         _has_pending_connector_transfers=lambda: False,
         _idle_kv_transfer_poll_timeout=lambda: None,
         _stats_has_pending_work=False,
@@ -807,19 +847,22 @@ def test_idle_fetch_parks_with_local_heartbeats(clock, attention_dp):
 
 
 @pytest.mark.parametrize(
-    "previous,pp_pending,native_transfer,control",
+    "previous,pp_pending,native_transfer,control,close_outs",
     [
-        (False, False, False, False),
-        (True, False, False, False),
-        (False, True, False, False),
-        (False, False, True, False),
-        (False, False, False, True),
+        (False, False, False, False, False),
+        (True, False, False, False, False),
+        (False, True, False, False, False),
+        (False, False, True, False, False),
+        (False, False, False, True, False),
+        (False, False, False, False, True),
     ],
-    ids=["drained", "model-batch", "pipeline", "native-kv-send", "control"],
+    ids=["drained", "model-batch", "pipeline", "native-kv-send", "control", "close-outs"],
 )
 def test_pending_work_includes_model_batches_and_native_transfers(
-    previous, pp_pending, native_transfer, control
+    previous, pp_pending, native_transfer, control, close_outs
 ):
+    """Also completions of requests finished at their first token that no record reports yet:
+    an idle heartbeat must not come before them."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     stub = SimpleNamespace(
@@ -827,10 +870,11 @@ def test_pending_work_includes_model_batches_and_native_transfers(
         dist=SimpleNamespace(pp_size=1 if previous else 2),
         _pp_ring_is_drained=lambda: not pp_pending,
         control_requests=[object()] if control else [],
+        _has_close_outs_pending_iter_stats=close_outs,
         async_transfer_manager=SimpleNamespace(has_any_inflight_requests=lambda: native_transfer),
     )
     assert PyExecutor._has_pending_iteration_stats_work(stub) == (
-        previous or pp_pending or native_transfer or control
+        previous or pp_pending or native_transfer or control or close_outs
     )
 
 
@@ -842,6 +886,7 @@ def test_drained_pipeline_ignores_retained_previous_batch():
         dist=SimpleNamespace(pp_size=2),
         _pp_ring_is_drained=lambda: True,
         control_requests=[],
+        _has_close_outs_pending_iter_stats=False,
         async_transfer_manager=None,
     )
     assert not PyExecutor._has_pending_iteration_stats_work(stub)

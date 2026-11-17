@@ -16,10 +16,10 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel is built for sm_103", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E402, E501
     build,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E402, E501
     cute_dsl_indexer_q_side_fused as op,
 )
 
@@ -49,7 +49,11 @@ def _rope_table(positions: int) -> torch.Tensor:
     return torch.cat([ang.cos(), ang.sin()], dim=1).float().cuda().contiguous()
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor, torch.Tensor
+]:
     """`(q, position_ids, cos_sin, wq, weight_scale, q_fp8_out, weights_out)` for one cell.
 
     Both outputs start poisoned, so a row the kernel skipped cannot pass. With `wq_pitch`
