@@ -40,9 +40,9 @@ SM_SCALE = 1.0 / math.sqrt(512.0)
 
 
 def _op():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode import op
+    from tensorrt_llm._torch.attention.kernels.blackwell.dsv4_sparse_decode import megakernel_op
 
-    return op
+    return megakernel_op
 
 
 def _mk():
@@ -334,6 +334,70 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
     pytest.param(
         [262127 - 4099 * r for r in range(8)], "realistic", {"ties": {3: 31}}, id="b8-mixed-ties"
     ),
+    # batch sizes between the powers of two, and the ring of 9 to 48 rows
+    pytest.param([131071, 98309, 50021], "gather_exact", {}, id="b3-mixed"),
+    pytest.param([262127] * 5, "realistic", {}, id="b5-max"),
+    pytest.param(
+        [65536, 32771, 700, 262127, 8192, 5000],
+        "gather_exact",
+        {"ties": {2: 13}},
+        id="b6-short-ties",
+    ),
+    pytest.param(
+        [262127 - 5003 * r for r in range(7)], "gather_exact", {"flat": (4,)}, id="b7-flat"
+    ),
+    pytest.param([262127 - 7001 * r for r in range(9)], "realistic", {}, id="b9-mixed"),
+    pytest.param([131071] * 12, "gather_exact", {"ties": {5: 17}}, id="b12-ties"),
+    pytest.param(
+        [262127 - 3001 * r for r in range(13)], "gather_exact", {"flat": (9,)}, id="b13-flat"
+    ),
+    pytest.param([262127] * 16, "realistic", {}, id="b16-max"),
+    pytest.param(
+        [262127 - 4093 * r for r in range(16)],
+        "gather_exact",
+        {"ties": {11: 29, 3: 6000}},
+        id="b16-mixed-ties",
+    ),
+    pytest.param([262127 - 6007 * r for r in range(17)], "realistic", {}, id="b17-mixed"),
+    pytest.param(
+        [131071 - 3001 * r for r in range(20)], "gather_exact", {"ties": {7: 21}}, id="b20-ties"
+    ),
+    pytest.param([262127] * 24, "gather_exact", {"flat": (13, 20)}, id="b24-flat"),
+    pytest.param(
+        [262127 - 2999 * r for r in range(27)],
+        "realistic",
+        {"ties": {26: 9, 0: 6000}},
+        id="b27-mixed-ties",
+    ),
+    pytest.param([262127] * 32, "realistic", {}, id="b32-max"),
+    pytest.param(
+        [262127 - 3989 * r if r % 3 else 700 + 17 * r for r in range(32)],
+        "gather_exact",
+        {"ties": {5: 3, 31: 77}, "flat": (18,)},
+        id="b32-mixed-short-ties",
+    ),
+    # 33 to 48 rows: the block-table slices of rows 32 and up reuse the entries of rows 0 and up
+    pytest.param([262127 - 4999 * r for r in range(33)], "realistic", {}, id="b33-mixed"),
+    pytest.param(
+        [131071 - 2003 * r for r in range(37)],
+        "gather_exact",
+        {"ties": {20: 21, 36: 6000}},
+        id="b37-ties",
+    ),
+    pytest.param([262127] * 41, "gather_exact", {"flat": (13, 33, 40)}, id="b41-flat"),
+    pytest.param(
+        [262127 - 3517 * r if r % 4 else 900 + 31 * r for r in range(45)],
+        "realistic",
+        {"ties": {0: 5, 32: 11, 44: 77}},
+        id="b45-mixed-ties",
+    ),
+    pytest.param([262127] * 48, "realistic", {}, id="b48-max"),
+    pytest.param(
+        [262127 - 3989 * r if r % 3 else 700 + 17 * r for r in range(48)],
+        "gather_exact",
+        {"ties": {5: 3, 31: 77, 47: 6000}, "flat": (18, 40)},
+        id="b48-mixed-short-ties",
+    ),
 ]
 
 
@@ -398,9 +462,9 @@ def test_dsv4_sparse_decode_rejects_unsupported_shapes():
     op = _op()
     dev = torch.device("cuda")
     i32 = torch.int32
-    bt = torch.zeros((3, 8), dtype=i32, device=dev)
+    bt = torch.zeros((49, 8), dtype=i32, device=dev)
     with pytest.raises(ValueError, match="batch size"):
-        op.prepare(torch.full((3,), 4096, dtype=i32), torch.full((3,), 16384, dtype=i32), bt)
+        op.prepare(torch.full((49,), 4096, dtype=i32), torch.full((49,), 16384, dtype=i32), bt)
     with pytest.raises(ValueError, match="compressed lengths"):
         op.prepare(torch.tensor([300], dtype=i32), torch.tensor([1200], dtype=i32), bt[:1])
     with pytest.raises(ValueError, match="compressed lengths"):

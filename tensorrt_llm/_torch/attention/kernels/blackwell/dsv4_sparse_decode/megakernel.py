@@ -170,7 +170,9 @@ T_OFF_MISC = T_OFF_BAR + 512
 T_OFF_FA = T_OFF_MISC + 256
 T_OFF_CROW = T_OFF_FA + 1024 + 64 + 256 + 512
 # entry words of up to MAXP passes (8 x int32 each) outside misc
-MAXP = 8
+MAXP = 16
+# passes of the 33..48-row configuration: their entry words reach past T_BYTES, inside the grown arena
+MAXP48 = 24
 T_OFF_PW = T_OFF_CROW + 288 * 4
 T_BYTES = T_OFF_PW + MAXP * 8 * 4
 # bucket s_map and the pre-select index buffer inside the list area, beyond the partner's merge push
@@ -645,6 +647,8 @@ class Dsv4SparseDecodeKernel:
         b1l_e: bool = True,
         b1l_pub: bool = False,
         b1l_upub: int = 2,
+        ring: bool = False,
+        ring_w12: bool = False,
     ):
         assert coop, (
             "the protocol spins across CTAs: all 148 CTAs must be co-resident (cooperative launch)"
@@ -670,7 +674,9 @@ class Dsv4SparseDecodeKernel:
         ), "rs24_lsu: multiple of 4 in [4, 32], needs rs24"
         assert not (self.rs24_asym and self.rs24_f32), "rs24_asym pushes bf16"
         self.nrows = int(nrows)
-        assert 1 <= self.nrows <= 8 and (self.nrows == 1 or self.rs24), "multi-row needs rs24"
+        assert 1 <= self.nrows <= (48 if ring else 8) and (self.nrows == 1 or self.rs24), (
+            "multi-row needs rs24 (nrows > 8 needs ring)"
+        )
         assert not self.rs24 or (
             gjoin and (num_sms - NTEAM * (int(nteams) if nteams else self.nrows)) % 2 == 0
         ), "rs24 pairs team CTAs 2k, 2k+1 of the gjoin layout"
@@ -680,7 +686,7 @@ class Dsv4SparseDecodeKernel:
         assert 1 <= self.nteams <= self.nrows
         self.ns = num_sms - NTEAM * self.nteams
         self.npmax = (self.nrows + self.nteams - 1) // self.nteams
-        assert self.npmax <= MAXP  # pass entry words in T_OFF_PW
+        assert self.npmax <= (MAXP if self.nrows <= 32 else MAXP48)  # pass entry words in T_OFF_PW
         assert self.ns * CAPR >= NB_INITIAL * BUCKET_CAP
         assert self.ns * MAXS * SPLIT_TOK >= N_MAX and self.ns <= 160
         self.policy = policy
@@ -767,6 +773,133 @@ class Dsv4SparseDecodeKernel:
         self.qdb = bool(qdb) and self.nrows > 1
         # next row's descriptor / ctx loaded one row ahead in the stream roles (knob dpf)
         self.dpf = bool(dpf) and self.nrows > 1
+        # ring's common-path K_DONE check on the T poller (warp 12), not the publishers (knob ring_w12)
+        self.ring_w12 = bool(ring_w12)
+        # words of the saved row state (tot, ntok, t_lo, seq, done) per row: 8 (32 B); 5 from 33 rows on
+        self.rst_w = 8
+        # 9..48 rows (2 teams x up to 24 passes): 8-slot logits ring with a K_DONE guard (knob ring)
+        self.ring = bool(ring) and self.nrows > 8
+        self.arena_bytes = ARENA
+        if self.ring:
+            assert (
+                self.nteams == 2
+                and self.npmax <= (MAXP if self.nrows <= 32 else MAXP48)
+                and not self.qdb
+                and self.tsz01
+                and self.tsz2
+                and self.tsz
+                and self.tszall
+            ), (
+                "ring: 2 shared teams, stream T servers for every row (tsz01 / tsz2 / tsz / tszall), no "
+                "qdb"
+            )
+            if self.nrows <= 16:
+                # 16-entry service state, slot-free mbarriers and the T-server scratch in the single-row LOG / BTC
+                # region
+                self.s_tsrv_fa = S_OFF_LOG  # fa .. fa + 1856 B, misc at fa + 2048 .. fa + 2304
+                self.s_svb = S_OFF_LOG + 2304  # 16 x MAXS x 8 int32 (C-pool block-table slices)
+                self.s_rowst = (
+                    self.s_svb + 16 * MAXS * 8 * 4
+                )  # 16 x 8 int32 [tot, ntok, t_lo, seq, done], gens at +512
+                self.s_rgen_off = 512
+                self.s_svg = self.s_rowst + 640  # 16 x 3 entry words, 16 gens at +384
+                self.s_svgs_off = 16 * 3 * 8
+                self.s_svt = self.s_svg + 512  # 16 x [T, bin scale]
+                self.s_svm = self.s_svt + 128  # 16 mbarriers: row handed to the publishers / drain
+                self.s_svtb = self.s_svm + 128  # 16 mbarriers: row T armed
+                self.s_slf = self.s_svtb + 128  # 8 mbarriers: logits slot free again
+                self.nslot = 16
+                assert (
+                    self.s_slf + 8 * 8 <= S_OFF_BAR
+                    and self.s_svm % 8 == 0
+                    and self.s_rowst % 8 == 0
+                    and self.s_svg % 8 == 0
+                )
+                assert S_SVC_END <= ARENA
+            elif self.nrows <= 32:
+                # 17..32 rows (2 teams x 16 passes): 32-entry service state past the stream layout, the C-pool
+                # block-table slices in the single-row LOG region; the arena grows to hold it
+                ext = S_SVC_END
+                self.s_tsrv_fa = ext  # fa .. fa + 1856 B, misc at fa + 2048 .. fa + 2304
+                self.s_rowst = (
+                    ext + 2304
+                )  # 32 x 8 int32 [tot, ntok, t_lo, seq, done], gens at +1024
+                self.s_rgen_off = 1024
+                self.s_svg = self.s_rowst + 1280  # 32 x 3 entry words, 32 gens at +768
+                self.s_svgs_off = 32 * 3 * 8
+                self.s_svt = self.s_svg + 1024  # 32 x [T, bin scale]
+                self.s_svm = self.s_svt + 256  # 32 mbarriers: row handed to the publishers / drain
+                self.s_svtb = self.s_svm + 256  # 32 mbarriers: row T armed
+                self.s_slf = self.s_svtb + 256  # 8 mbarriers: logits slot free again
+                self.s_svb = S_OFF_LOG  # 32 x MAXS x 8 int32 (C-pool block-table slices)
+                self.nslot = 32
+                self.arena_bytes = (self.s_slf + 64 + 4 * 32 + 1023) // 1024 * 1024
+                assert self.s_svb + 32 * MAXS * 8 * 4 <= S_OFF_BAR
+                assert (
+                    self.arena_bytes <= 232448 - 1024
+                    and self.s_svm % 8 == 0
+                    and self.s_rowst % 8 == 0
+                )
+            else:
+                # 33..48 rows (2 teams x up to 24 passes): nrows-entry state past the stream layout with one
+                # generation word per row (math warps), 5 state words per row and a 32-entry ring of block-table
+                # slices in the single-row LOG region; slice entry r & 31 is rewritten for row r >= 32 after the
+                # publishers of row r - 32 are done with it (mbarrier SFB[r - 32])
+                n_ = self.nrows
+                ext = S_SVC_END
+                # fa .. fa + 1856 B, misc at fa + 2048 .. fa + 2304
+                self.s_tsrv_fa = ext
+                # n x 5 int32 [tot, ntok, t_lo, seq, done], then n generations
+                self.s_rowst = ext + 2304
+                self.rst_w = 5
+                self.s_rgen_off = (n_ * 5 * 4 + 7) // 8 * 8
+                # n generations (math warps), then n (poller)
+                self.s_svg = self.s_rowst + self.s_rgen_off + n_ * 8
+                self.s_svgs_off = n_ * 8
+                # n x [T, bin scale]
+                self.s_svt = self.s_svg + n_ * 16
+                # n mbarriers: row handed to the publishers / drain, then n: row T armed
+                self.s_svm = self.s_svt + n_ * 8
+                self.s_svtb = self.s_svm + n_ * 8
+                # n - 32 mbarriers: slice entry free again, then 8: logits slot free again
+                self.s_sfb = self.s_svtb + n_ * 8
+                self.s_slf = self.s_sfb + 16 * 8
+                # 32 x MAXS x 8 int32 (C-pool block-table slices, ring)
+                self.s_svb = S_OFF_LOG
+                self.nslot = n_
+                self.arena_bytes = (self.s_slf + 64 + 4 * n_ + 1023) // 1024 * 1024
+                assert self.s_svb + 32 * MAXS * 8 * 4 <= S_OFF_BAR and n_ - 32 <= 16
+                assert (
+                    self.arena_bytes <= 232448 - 1024
+                    and self.s_svm % 8 == 0
+                    and self.s_svtb % 8 == 0
+                    and self.s_sfb % 8 == 0
+                    and self.s_rowst % 8 == 0
+                    and self.s_svg % 8 == 0
+                    and self.s_rgen_off % 8 == 0
+                )
+                assert T_OFF_PW + self.npmax * 32 <= self.arena_bytes
+        else:
+            self.s_tsrv_fa = (
+                (S_TSRV_FA if self.nrows <= 4 else S_TSRV_FA8) if self.tsz01 else S_OFF_KV0
+            )
+            self.s_svb = S_OFF_SVB
+            self.s_rowst = S_OFF_ROWST
+            self.s_rgen_off = 256
+            self.s_svg = S_OFF_SVG
+            self.s_svgs_off = 8 * 3 * 8
+            self.s_svt = S_OFF_SVT
+            self.s_svm = S_OFF_SVM
+            self.s_svtb = S_OFF_SVTB
+            self.s_slf = 0
+            self.nslot = 8
+        self.ring_w12 = self.ring_w12 and self.ring
+        # ring_w12: warp 12's per-row verdicts (8 int32: 1 = K_DONE seen and slot freed, 2 = publishers serve the row)
+        self.s_vrd = self.s_slf + 64
+        assert not self.ring_w12 or self.s_vrd + 32 <= (
+            S_OFF_BAR if self.nrows <= 16 else self.arena_bytes
+        )
+        assert self.nrows <= 32 or self.s_vrd + 4 * self.nslot <= self.arena_bytes
         # stream CTAs: row descriptor load first, TMA descriptor prefetch at entry (knob early)
         self.early = bool(early)
         # _team_cta: row and window lengths loaded before the barrier setup (knob tearly)
@@ -1077,7 +1210,7 @@ class Dsv4SparseDecodeKernel:
         bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         smem = cutlass.utils.SmemAllocator()
-        arena = smem.allocate(ARENA, byte_alignment=1024)
+        arena = smem.allocate(self.arena_bytes, byte_alignment=1024)
         ws = mWs.iterator.toint()
         if cutlass.const_expr(self.stamps):
             if tidx == 0:
@@ -1211,6 +1344,54 @@ class Dsv4SparseDecodeKernel:
                     mCPool,
                     tr_,
                 )
+
+    def _svbi(self, r):
+        # entry of row r in the block-table slice ring (32 entries, reused by row r + 32)
+        if self.nrows > 32:
+            return r & Int32(31)
+        return r
+
+    def _entry_words(self, svg, r):
+        # the three entry words of row r as _gen_from takes them; from 33 rows on the stored word is the
+        # generation itself (_gen_from(gen, 0, 0) == gen)
+        if self.nrows > 32:
+            return Uint64(svg[r]), Uint64(0), Uint64(0)
+        return (
+            Uint64(svg[r * Int32(3)]),
+            Uint64(svg[r * Int32(3) + Int32(1)]),
+            Uint64(svg[r * Int32(3) + Int32(2)]),
+        )
+
+    def _lslot(self, r):
+        # logits slot of row r (ring: r & 7)
+        if self.ring:
+            return r & Int32(7)
+        return r
+
+    def _mstr(self, mStamps, r):
+        # per-row stream stamps: slot base + 16 r of block 0 (PR); ring: row r's own block 8 + r
+        if self.ring:
+            return cute.make_tensor(
+                mStamps.iterator + (Int32(8) + r) * Int32(self.num_sms * NSTAMP), mStamps.layout
+            )
+        return cute.make_tensor(mStamps.iterator + r * Int32(16), mStamps.layout)
+
+    def _mstt(self, mStamps, r):
+        # stream T-server stamps: blocks 1 / 2 / 3 (PR); ring: block 24 + r
+        if self.ring:
+            return cute.make_tensor(
+                mStamps.iterator + (Int32(24) + r) * Int32(self.num_sms * NSTAMP), mStamps.layout
+            )
+        return cute.make_tensor(
+            mStamps.iterator
+            + cutlass.select_(
+                r == Int32(self.nrows - 1),
+                Int32(3),
+                cutlass.select_(r == Int32(1), Int32(1), Int32(2)),
+            )
+            * Int32(self.num_sms * NSTAMP),
+            mStamps.layout,
+        )
 
     def row_sizes(self):
         # per-row element counts of the flat buffers (ws64, hist, board, region, ctl, desc)
@@ -1347,10 +1528,22 @@ class Dsv4SparseDecodeKernel:
                 prims.mbarrier_init(q_free, 3)
                 if cutlass.const_expr(self.qdb):
                     prims.mbarrier_init(q_free + 1, 3)
-                for rb_ in cutlass.range_constexpr(8):
-                    prims.mbarrier_init(cute.recast_ptr(arena + S_OFF_SVM, dtype=Int64) + rb_, 1)
+                for rb_ in cutlass.range_constexpr(self.nslot):
+                    prims.mbarrier_init(cute.recast_ptr(arena + self.s_svm, dtype=Int64) + rb_, 1)
                     # row T armed by the T poller
-                    prims.mbarrier_init(cute.recast_ptr(arena + S_OFF_SVTB, dtype=Int64) + rb_, 1)
+                    prims.mbarrier_init(cute.recast_ptr(arena + self.s_svtb, dtype=Int64) + rb_, 1)
+                if cutlass.const_expr(self.ring):
+                    for rb_ in cutlass.range_constexpr(8):
+                        # logits slot rb_ free again (its row reached K_DONE): one publisher arrival
+                        prims.mbarrier_init(
+                            cute.recast_ptr(arena + self.s_slf, dtype=Int64) + rb_, 1
+                        )
+                if cutlass.const_expr(self.nrows > 32):
+                    for rb_ in cutlass.range_constexpr(self.nrows - 32):
+                        # block-table slice entry rb_ free again (the publishers are done with row rb_): one arrival
+                        prims.mbarrier_init(
+                            cute.recast_ptr(arena + self.s_sfb, dtype=Int64) + rb_, 1
+                        )
             prims.fence_mbarrier_init()
         sLog = cute.make_tensor(
             cute.recast_ptr(arena + S_OFF_LOG, dtype=Float32), cute.make_layout(MAXS * SPLIT_TOK)
@@ -1995,7 +2188,7 @@ class Dsv4SparseDecodeKernel:
                 else:
                     dnx_ = Int32(0)
                 for r_ in cutlass.range(self.nrows, unroll=1):
-                    mStR_ = cute.make_tensor(mStamps.iterator + r_ * Int32(16), mStamps.layout)
+                    mStR_ = self._mstr(mStamps, r_)
                     if cutlass.const_expr(self.dpf):
                         desc_lane = dnx_
                         dnx_ = mDesc[
@@ -2185,7 +2378,7 @@ class Dsv4SparseDecodeKernel:
                 else:
                     dnx_ = Int32(0)
                 for r_ in cutlass.range(self.nrows, unroll=1):
-                    mStR_ = cute.make_tensor(mStamps.iterator + r_ * Int32(16), mStamps.layout)
+                    mStR_ = self._mstr(mStamps, r_)
                     if cutlass.const_expr(self.dpf):
                         desc_lane = dnx_
                         dnx_ = mDesc[
@@ -2282,25 +2475,31 @@ class Dsv4SparseDecodeKernel:
                 cC = cute.make_identity_tensor(epi_sub_mn)
                 rs_ = self.row_sizes()
                 svg_ = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_SVG, dtype=Int64), cute.make_layout(24)
+                    cute.recast_ptr(arena + self.s_svg, dtype=Int64),
+                    cute.make_layout((3 if self.nrows <= 32 else 1) * self.nslot),
                 )
-                svm_ = cute.recast_ptr(arena + S_OFF_SVM, dtype=Int64)
+                svm_ = cute.recast_ptr(arena + self.s_svm, dtype=Int64)
                 rgen_ = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_ROWST + 256, dtype=Int64), cute.make_layout(8)
+                    cute.recast_ptr(arena + self.s_rowst + self.s_rgen_off, dtype=Int64),
+                    cute.make_layout(self.nslot),
                 )
                 if tidx == 0:
                     # every row's entry words at kernel start (the team writes a row's ws only after that row
                     # streamed)
                     for rr_ in cutlass.range_constexpr(self.nrows):
                         ge1_, ge2_, ge3_ = self._entry_loads(ws + Int64(rr_ * rs_["ws"] * 8))
-                        svg_[rr_ * 3] = Int64(ge1_)
-                        svg_[rr_ * 3 + 1] = Int64(ge2_)
-                        svg_[rr_ * 3 + 2] = Int64(ge3_)
+                        if cutlass.const_expr(self.nrows > 32):
+                            svg_[rr_] = Int64(self._gen_from(ge1_, ge2_, ge3_))
+                        else:
+                            svg_[rr_ * 3] = Int64(ge1_)
+                            svg_[rr_ * 3 + 1] = Int64(ge2_)
+                            svg_[rr_ * 3 + 2] = Int64(ge3_)
                 # the math warps scan + publish the last row after their stream; warm that code now (memory idle,
                 # first tile ~2 us away): same call site shape, scratch addresses in the debug buffer, T = -inf
-                tbbm_ = cute.recast_ptr(arena + S_OFF_SVTB, dtype=Int64)
+                tbbm_ = cute.recast_ptr(arena + self.s_svtb, dtype=Int64)
                 s_tvm_ = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_SVT, dtype=Int32), cute.make_layout(16)
+                    cute.recast_ptr(arena + self.s_svt, dtype=Int32),
+                    cute.make_layout(2 * self.nslot),
                 )
                 sListM_ = cute.make_tensor(
                     cute.recast_ptr(
@@ -2325,10 +2524,10 @@ class Dsv4SparseDecodeKernel:
                     dnx_ = Int32(0)
                     cnx_ = Int32(0)
                 for r_ in cutlass.range(self.nrows, unroll=1):
-                    mStR_ = cute.make_tensor(mStamps.iterator + r_ * Int32(16), mStamps.layout)
+                    mStR_ = self._mstr(mStamps, r_)
                     sLogR_ = cute.make_tensor(
                         cute.recast_ptr(arena + S_OFF_LOGR, dtype=Float32)
-                        + r_ * Int32(MAXS * SPLIT_TOK),
+                        + self._lslot(r_) * Int32(MAXS * SPLIT_TOK),
                         cute.make_layout(MAXS * SPLIT_TOK),
                     )
                     if cutlass.const_expr(self.dpf):
@@ -2383,11 +2582,25 @@ class Dsv4SparseDecodeKernel:
                         prims.mbarrier_arrive((q_free + q_stage_local) if self.qdb else q_free)
                     if tidx == 0:
                         self._stamp(mStR_, cta, 7)
-                    gen = self._gen_from(
-                        Uint64(svg_[r_ * Int32(3)]),
-                        Uint64(svg_[r_ * Int32(3) + Int32(1)]),
-                        Uint64(svg_[r_ * Int32(3) + Int32(2)]),
-                    )
+                    if cutlass.const_expr(self.ring):
+                        if r_ >= Int32(8):
+                            # logits slot r & 7 is written only after its previous row r - 8 reached K_DONE
+                            # (publisher arrival on SLF[r & 7]; the k-th reuse of a slot waits phase (k - 1) & 1)
+                            while not prims.mbarrier_try_wait_parity(
+                                cute.recast_ptr(arena + self.s_slf, dtype=Int64) + (r_ & Int32(7)),
+                                ((r_ >> Int32(3)) - Int32(1)) & Int32(1),
+                            ):
+                                pass
+                            if tidx == 0:
+                                self._stamp(mStR_, cta, 14)
+                    if cutlass.const_expr(self.nrows > 32):
+                        gen = Uint64(svg_[r_])
+                    else:
+                        gen = self._gen_from(
+                            Uint64(svg_[r_ * Int32(3)]),
+                            Uint64(svg_[r_ * Int32(3) + Int32(1)]),
+                            Uint64(svg_[r_ * Int32(3) + Int32(2)]),
+                        )
                     if tidx == 0:
                         rgen_[r_] = Int64(gen)
                     if tidx == 0:
@@ -2563,16 +2776,8 @@ class Dsv4SparseDecodeKernel:
                                     srv_ = Int32(1)
                         if srv_ != Int32(0):
                             if tidx < Int32(128):
-                                mStT_ = cute.make_tensor(
-                                    mStamps.iterator
-                                    + cutlass.select_(
-                                        r_ == Int32(self.nrows - 1),
-                                        Int32(3),
-                                        cutlass.select_(r_ == Int32(1), Int32(1), Int32(2)),
-                                    )
-                                    * Int32(self.num_sms * NSTAMP),
-                                    mStamps.layout,
-                                )
+                                mStT_ = self._mstt(mStamps, r_)
+                                sg1_, sg2_, sg3_ = self._entry_words(svg_, r_)
                                 self._block_a_lead(
                                     arena,
                                     cta,
@@ -2581,18 +2786,14 @@ class Dsv4SparseDecodeKernel:
                                     n,
                                     _flat(mBoard, r_, rs_["board"]),
                                     mStT_,
-                                    Uint64(svg_[r_ * Int32(3)]),
-                                    Uint64(svg_[r_ * Int32(3) + Int32(1)]),
-                                    Uint64(svg_[r_ * Int32(3) + Int32(2)]),
+                                    sg1_,
+                                    sg2_,
+                                    sg3_,
                                     _flat(mCtl, r_, rs_["ctl"]),
                                     Int32(0),
                                     _flat(mHist, r_, rs_["hist"]),
-                                    fa=(S_TSRV_FA if self.nrows <= 4 else S_TSRV_FA8)
-                                    if self.tsz01
-                                    else S_OFF_KV0,
-                                    mi=((S_TSRV_FA if self.nrows <= 4 else S_TSRV_FA8) + 2048)
-                                    if self.tsz01
-                                    else S_OFF_KV0 + 2048,
+                                    fa=self.s_tsrv_fa,
+                                    mi=self.s_tsrv_fa + 2048,
                                 )
                     if r_ == Int32(self.nrows - 1):
                         # the last row: wait its T (armed by the T poller), scan + publish with all 256 math threads
@@ -2604,7 +2805,8 @@ class Dsv4SparseDecodeKernel:
                             ntokl_ = Int32(0)
                         rgl_ = mRegion.iterator.toint() + Int64(r_) * Int64(rs_["region"] * 8)
                         sBtcL_ = cute.make_tensor(
-                            cute.recast_ptr(arena + S_OFF_SVB, dtype=Int32) + r_ * Int32(MAXS * 8),
+                            cute.recast_ptr(arena + self.s_svb, dtype=Int32)
+                            + self._svbi(r_) * Int32(MAXS * 8),
                             cute.make_layout(MAXS * 8),
                         )
                         totl_ = self._svc_scanpub(
@@ -2633,8 +2835,9 @@ class Dsv4SparseDecodeKernel:
                         )
                         if tidx == 0:
                             rstl_ = cute.make_tensor(
-                                cute.recast_ptr(arena + S_OFF_ROWST, dtype=Int32) + r_ * Int32(8),
-                                cute.make_layout(8),
+                                cute.recast_ptr(arena + self.s_rowst, dtype=Int32)
+                                + r_ * Int32(self.rst_w),
+                                cute.make_layout(self.rst_w),
                             )
                             rstl_[0] = totl_
                             rstl_[1] = ntokl_
@@ -2658,16 +2861,19 @@ class Dsv4SparseDecodeKernel:
                     cute.recast_ptr(arena + S_OFF_SVW + 32, dtype=Int32), cute.make_layout(8)
                 )
                 s_tvr = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_SVT, dtype=Int32), cute.make_layout(16)
+                    cute.recast_ptr(arena + self.s_svt, dtype=Int32),
+                    cute.make_layout(2 * self.nslot),
                 )
-                svm_ = cute.recast_ptr(arena + S_OFF_SVM, dtype=Int64)
-                tbb_ = cute.recast_ptr(arena + S_OFF_SVTB, dtype=Int64)
+                svm_ = cute.recast_ptr(arena + self.s_svm, dtype=Int64)
+                tbb_ = cute.recast_ptr(arena + self.s_svtb, dtype=Int64)
                 rgen_ = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_ROWST + 256, dtype=Int64), cute.make_layout(8)
+                    cute.recast_ptr(arena + self.s_rowst + self.s_rgen_off, dtype=Int64),
+                    cute.make_layout(self.nslot),
                 )
                 cbase = mCPool.iterator.toint()
                 svgs_ = cute.make_tensor(
-                    cute.recast_ptr(arena + S_OFF_SVG + 8 * 3 * 8, dtype=Int64), cute.make_layout(8)
+                    cute.recast_ptr(arena + self.s_svg + self.s_svgs_off, dtype=Int64),
+                    cute.make_layout(self.nslot),
                 )
                 if warp_idx == 12:
                     # T poller: every row's C-pool block-table slice and T in row order; each T arms the row's
@@ -2677,15 +2883,56 @@ class Dsv4SparseDecodeKernel:
                             ge1_, ge2_, ge3_ = self._entry_loads(ws + Int64(rr_ * rs_["ws"] * 8))
                             svgs_[rr_] = Int64(self._gen_from(ge1_, ge2_, ge3_))
                     for r_ in cutlass.range(self.nrows, unroll=1):
-                        mStR_ = cute.make_tensor(mStamps.iterator + r_ * Int32(16), mStamps.layout)
+                        mStR_ = self._mstr(mStamps, r_)
                         desc_lane = mDesc[(r_ * Int32(self.num_sms) + cta) * Int32(32) + lane]
                         s0 = cute.arch.shuffle_sync(desc_lane, 0)
                         ns = cute.arch.shuffle_sync(desc_lane, 1)
                         ws_r_ = ws + Int64(r_) * Int64(rs_["ws"] * 8)
                         sBtcR_ = cute.make_tensor(
-                            cute.recast_ptr(arena + S_OFF_SVB, dtype=Int32) + r_ * Int32(MAXS * 8),
+                            cute.recast_ptr(arena + self.s_svb, dtype=Int32)
+                            + self._svbi(r_) * Int32(MAXS * 8),
                             cute.make_layout(MAXS * 8),
                         )
+                        if cutlass.const_expr(self.ring_w12):
+                            # (ring_w12): row r - 5's directive word, once: K_DONE -> its logits slot is free for
+                            # row r + 3 now; otherwise the publishers serve it after publishing row r
+                            ck_ = r_ - Int32(5)
+                            if ck_ >= Int32(0) and ck_ + Int32(8) < Int32(self.nrows):
+                                if lane == Int32(0):
+                                    mStC_ = self._mstr(mStamps, ck_)
+                                    self._stamp(mStC_, cta, 8)
+                                    vr_ = cute.make_tensor(
+                                        cute.recast_ptr(arena + self.s_vrd, dtype=Int32),
+                                        cute.make_layout(self.nslot),
+                                    )
+                                    hk_ = L.ld_relaxed_u64(
+                                        self._w(ws + Int64(ck_) * Int64(rs_["ws"] * 8), W_DIR)
+                                    )
+                                    if hk_ >> Uint64(24) == self._tag40(
+                                        Uint64(svgs_[ck_])
+                                    ) and Int32(Uint32(hk_ & Uint64(15))) == Int32(K_DONE):
+                                        # acquire: the team's K_DONE follows its reads of every CTA's packets of the
+                                        # row,
+                                        # which follow this CTA's scan of the slot
+                                        L.fence_acq_rel_gpu()
+                                        vr_[ck_] = Int32(1)
+                                        prims.mbarrier_arrive(
+                                            cute.recast_ptr(arena + self.s_slf, dtype=Int64)
+                                            + (ck_ & Int32(7))
+                                        )
+                                        self._stamp(mStC_, cta, 9)
+                                    else:
+                                        vr_[ck_] = Int32(2)
+                                cute.arch.sync_warp()
+                        if cutlass.const_expr(self.nrows > 32):
+                            if r_ >= Int32(32):
+                                # slice entry r & 31 is free once the publishers are done with row r - 32
+                                while not prims.mbarrier_try_wait_parity(
+                                    cute.recast_ptr(arena + self.s_sfb, dtype=Int64)
+                                    + (r_ - Int32(32)),
+                                    Int32(0),
+                                ):
+                                    pass
                         btc_r_ = _row2(mBtC, r_)
                         btc_cols = cute.size(mBtC, mode=[1])
                         for e in cutlass.range_constexpr(2):
@@ -2712,7 +2959,40 @@ class Dsv4SparseDecodeKernel:
                     for it_ in cutlass.range(1, self.nrows, unroll=1):
                         live = cutlass.select_(it_ > Int32(0), Int32(1), Int32(0))
                         r_ = cutlass.max(it_ - Int32(1), Int32(0))
-                        mStR_ = cute.make_tensor(mStamps.iterator + r_ * Int32(16), mStamps.layout)
+                        if cutlass.const_expr(self.ring and not self.ring_w12):
+                            # before publishing row r, serve row r - 6 to its K_DONE (blocking; on the bucket
+                            # path its directive word already says K_DONE) and free its logits slot for row r + 2
+                            ck_ = r_ - Int32(6)
+                            if ck_ >= Int32(0) and ck_ + Int32(8) < Int32(self.nrows):
+                                mStC_ = self._mstr(mStamps, ck_)
+                                if pid == Int32(0):
+                                    self._stamp(mStC_, cta, 8)
+                                self._serve_row(
+                                    ck_,
+                                    cta,
+                                    pid,
+                                    ws,
+                                    arena,
+                                    s_wc4,
+                                    s_dir4,
+                                    mRegion,
+                                    mHist,
+                                    True,
+                                    nth=96,
+                                    bid=4,
+                                    hoff=S_OFF_SVH,
+                                    ebid=4,
+                                )
+                                # every publisher thread's reads of the slot complete before the arrival
+                                fence_acq_rel_cta()
+                                L.bar(4, 96)
+                                if pid == Int32(0):
+                                    prims.mbarrier_arrive(
+                                        cute.recast_ptr(arena + self.s_slf, dtype=Int64)
+                                        + (ck_ & Int32(7))
+                                    )
+                                    self._stamp(mStC_, cta, 9)
+                        mStR_ = self._mstr(mStamps, r_)
                         desc_lane = mDesc[(r_ * Int32(self.num_sms) + cta) * Int32(32) + lane]
                         s0 = cute.arch.shuffle_sync(desc_lane, 0)
                         ns = cute.arch.shuffle_sync(desc_lane, 1)
@@ -2720,7 +3000,8 @@ class Dsv4SparseDecodeKernel:
                         t_lo = s0 * Int32(SPLIT_TOK)
                         ws_r_ = ws + Int64(r_) * Int64(rs_["ws"] * 8)
                         sBtcR_ = cute.make_tensor(
-                            cute.recast_ptr(arena + S_OFF_SVB, dtype=Int32) + r_ * Int32(MAXS * 8),
+                            cute.recast_ptr(arena + self.s_svb, dtype=Int32)
+                            + self._svbi(r_) * Int32(MAXS * 8),
                             cute.make_layout(MAXS * 8),
                         )
                         if live != Int32(0):
@@ -2741,7 +3022,7 @@ class Dsv4SparseDecodeKernel:
                         gen = Uint64(rgen_[r_])
                         sLogR_ = cute.make_tensor(
                             cute.recast_ptr(arena + S_OFF_LOGR, dtype=Float32)
-                            + r_ * Int32(MAXS * SPLIT_TOK),
+                            + self._lslot(r_) * Int32(MAXS * SPLIT_TOK),
                             cute.make_layout(MAXS * SPLIT_TOK),
                         )
                         ntok_ = cutlass.min(ns * Int32(SPLIT_TOK), n - t_lo)
@@ -2785,9 +3066,9 @@ class Dsv4SparseDecodeKernel:
                         if live != Int32(0):
                             if pid == Int32(0):
                                 rst_ = cute.make_tensor(
-                                    cute.recast_ptr(arena + S_OFF_ROWST, dtype=Int32)
-                                    + r_ * Int32(8),
-                                    cute.make_layout(8),
+                                    cute.recast_ptr(arena + self.s_rowst, dtype=Int32)
+                                    + r_ * Int32(self.rst_w),
+                                    cute.make_layout(self.rst_w),
                                 )
                                 rst_[0] = tot_
                                 rst_[1] = ntok_
@@ -2795,9 +3076,62 @@ class Dsv4SparseDecodeKernel:
                                 rst_[3] = Int32(0)
                                 rst_[4] = Int32(0)
                         L.bar(4, 96)
+                        if cutlass.const_expr(self.nrows > 32):
+                            if r_ + Int32(32) < Int32(self.nrows):
+                                if pid == Int32(0):
+                                    # the scan and publish read slice entry r & 31 (r < nrows - 32): the poller
+                                    # may reuse it
+                                    prims.mbarrier_arrive(
+                                        cute.recast_ptr(arena + self.s_sfb, dtype=Int64) + r_
+                                    )
                         if live != Int32(0):
                             if pid == Int32(0):
                                 self._stamp(mStR_, cta, 12)
+                        if cutlass.const_expr(self.ring_w12):
+                            # (ring_w12): row r - 5 (verdict written by warp 12 before it armed T(r), which these
+                            # threads waited): freed by warp 12 -> done for the drain; not K_DONE yet -> serve it here
+                            # (blocking) and free its slot
+                            ck_ = r_ - Int32(5)
+                            if ck_ >= Int32(0) and ck_ + Int32(8) < Int32(self.nrows):
+                                vr_ = cute.make_tensor(
+                                    cute.recast_ptr(arena + self.s_vrd, dtype=Int32),
+                                    cute.make_layout(self.nslot),
+                                )
+                                if vr_[ck_] == Int32(1):
+                                    if pid == Int32(0):
+                                        rsc_ = cute.make_tensor(
+                                            cute.recast_ptr(arena + self.s_rowst, dtype=Int32)
+                                            + ck_ * Int32(self.rst_w),
+                                            cute.make_layout(self.rst_w),
+                                        )
+                                        rsc_[4] = Int32(1)
+                                else:
+                                    mStC_ = self._mstr(mStamps, ck_)
+                                    self._serve_row(
+                                        ck_,
+                                        cta,
+                                        pid,
+                                        ws,
+                                        arena,
+                                        s_wc4,
+                                        s_dir4,
+                                        mRegion,
+                                        mHist,
+                                        True,
+                                        nth=96,
+                                        bid=4,
+                                        hoff=S_OFF_SVH,
+                                        ebid=4,
+                                    )
+                                    # every publisher thread's reads of the slot complete before the arrival
+                                    fence_acq_rel_cta()
+                                    L.bar(4, 96)
+                                    if pid == Int32(0):
+                                        prims.mbarrier_arrive(
+                                            cute.recast_ptr(arena + self.s_slf, dtype=Int64)
+                                            + (ck_ & Int32(7))
+                                        )
+                                        self._stamp(mStC_, cta, 9)
                 # final drain (all four warps, named barrier 2) once the math warps saved the last row's state
                 while not prims.mbarrier_try_wait_parity(svm_ + Int32(self.nrows - 1), Int32(0)):
                     pass
@@ -3700,14 +4034,17 @@ class Dsv4SparseDecodeKernel:
         # serve row q from its saved state (all math threads; tidx 0 writes the state back)
         rs_ = self.row_sizes()
         rst = cute.make_tensor(
-            cute.recast_ptr(arena + S_OFF_ROWST, dtype=Int32) + q * Int32(8), cute.make_layout(8)
+            cute.recast_ptr(arena + self.s_rowst, dtype=Int32) + q * Int32(self.rst_w),
+            cute.make_layout(self.rst_w),
         )
         rgen = cute.make_tensor(
-            cute.recast_ptr(arena + S_OFF_ROWST + 256, dtype=Int64), cute.make_layout(8)
+            cute.recast_ptr(arena + self.s_rowst + self.s_rgen_off, dtype=Int64),
+            cute.make_layout(self.nslot),
         )
         if rst[4] == Int32(0):
             sLogQ = cute.make_tensor(
-                cute.recast_ptr(arena + S_OFF_LOGR, dtype=Float32) + q * Int32(MAXS * SPLIT_TOK),
+                cute.recast_ptr(arena + S_OFF_LOGR, dtype=Float32)
+                + self._lslot(q) * Int32(MAXS * SPLIT_TOK),
                 cute.make_layout(MAXS * SPLIT_TOK),
             )
             seq2, fin2 = self._stream_serve(
@@ -3869,8 +4206,14 @@ class Dsv4SparseDecodeKernel:
         hoff: cutlass.Constexpr[int] = S_OFF_KV0,
     ):
         sh = _sm_tensor(arena, hoff, Int32, NB_DRS)
-        for z_ in cutlass.range_constexpr(NB_DRS // nth):
-            sh[tidx + Int32(z_ * nth)] = Int32(0)
+        if cutlass.const_expr(NB_DRS % nth == 0):
+            for z_ in cutlass.range_constexpr(NB_DRS // nth):
+                sh[tidx + Int32(z_ * nth)] = Int32(0)
+        else:
+            # nth = 96 (publisher warps): the last round clears the remaining bins only
+            for z_ in cutlass.range_constexpr((NB_DRS + nth - 1) // nth):
+                if tidx + Int32(z_ * nth) < Int32(NB_DRS):
+                    sh[tidx + Int32(z_ * nth)] = Int32(0)
         L.bar(bid, nth)
         shp = Uint64(Int32(K50_BITS) - plen)
         shd = Uint64(Int32(K50_BITS - DRS_DIG) - plen)
@@ -3898,11 +4241,20 @@ class Dsv4SparseDecodeKernel:
             jj = jj + Int32(1)
         L.bar(bid, nth)
         gh = mHist.iterator.toint() + Int64(seq) * Int64(NB_DRS * 4)
-        for z_ in cutlass.range_constexpr(NB_DRS // nth):
-            b_ = tidx + Int32(z_ * nth)
-            v_ = sh[b_]
-            if v_ != Int32(0):
-                red_add_u32(gh + Int64(b_) * Int64(4), v_)
+        if cutlass.const_expr(NB_DRS % nth == 0):
+            for z_ in cutlass.range_constexpr(NB_DRS // nth):
+                b_ = tidx + Int32(z_ * nth)
+                v_ = sh[b_]
+                if v_ != Int32(0):
+                    red_add_u32(gh + Int64(b_) * Int64(4), v_)
+        else:
+            # nth = 96: bounds-checked rounds
+            for z_ in cutlass.range_constexpr((NB_DRS + nth - 1) // nth):
+                b_ = tidx + Int32(z_ * nth)
+                if b_ < Int32(NB_DRS):
+                    v_ = sh[b_]
+                    if v_ != Int32(0):
+                        red_add_u32(gh + Int64(b_) * Int64(4), v_)
         L.bar(bid, nth)
         if tidx == 0:
             L.fence_acq_rel_gpu()

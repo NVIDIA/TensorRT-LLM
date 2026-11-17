@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSeek-V4-Flash decode sparse attention for 1, 2, 4 or 8 rows on B200 (SM100, 148 SMs).
+"""Fused DeepSeek-V4-Flash decode sparse attention for 1 to 48 rows on B200 (SM100, 148 SMs): the megakernel.
 
 One cooperative launch streams each row's FP8 indexer K cache once, computes the indexer logits, selects the exact
 top-512 compressed positions (sampled threshold with a count certificate and exact fallbacks), maps them to
@@ -63,7 +63,7 @@ __all__ = [
     "run",
 ]
 
-SUPPORTED_BATCH_SIZES = (1, 2, 4, 8)
+SUPPORTED_BATCH_SIZES = tuple(range(1, 49))
 NUM_SMS = 148
 NUM_HEADS = 64
 INDEX_DIM = 128
@@ -97,8 +97,8 @@ _BASE = dict(
     acqpoll=True,
     late_done=4,
 )
-# Each batch size extends the previous set. At 4 and 8 rows two teams of 8 CTAs serve the rows in turn while 132 CTAs
-# stream the indexer K cache.
+# Each batch size extends the previous set. From 3 rows on, two teams of 8 CTAs serve the rows in turn while 132 CTAs
+# stream the indexer K cache; 9 to 48 rows add the ring of logits slots (ring).
 _BS1 = dict(swag=True, nohoist=True, rs24=True, rs24_t4split=True, rs24_lsu=12)
 _BS2 = dict(_BS1, math_regs=216, kv_stages=3, wdelay=0, early=True, tearly=True)
 _BS4 = dict(
@@ -119,7 +119,15 @@ _BS4 = dict(
     bpf=True,
 )
 _BS8 = dict(_BS4, tszall=True, dpf=True, b1l=True, b1l_pub=True, b1l_upub=2)
-_CONFIGS: dict[int, dict] = {1: _BS1, 2: _BS2, 4: _BS4, 8: _BS8}
+_BS16 = dict(_BS8, ring=True, ring_w12=True)
+_CONFIGS: dict[int, dict] = {
+    1: _BS1,
+    2: _BS2,
+    3: _BS4,
+    4: _BS4,
+    **{b: _BS8 for b in range(5, 9)},
+    **{b: _BS16 for b in range(9, 49)},
+}
 
 _lock = threading.Lock()
 _engines: dict[tuple[int, int], dict] = {}
@@ -294,7 +302,15 @@ def prepare(
             region=torch.zeros(batch_size * rsz["region"], dtype=torch.int64, device=device),
             dbg=torch.empty(MAX_CTX_LEN + 512, dtype=torch.float32, device=device),
             stamps=torch.zeros(
-                NUM_SMS * mk.NSTAMP * (4 if batch_size > 1 else 1), dtype=torch.int64, device=device
+                NUM_SMS
+                * mk.NSTAMP
+                * (
+                    56
+                    if batch_size > 16
+                    else (40 if batch_size > 8 else (4 if batch_size > 1 else 1))
+                ),
+                dtype=torch.int64,
+                device=device,
             ),
             ctl=torch.zeros(batch_size * rsz["ctl"], dtype=torch.int32, device=device),
         )
