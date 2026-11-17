@@ -64,11 +64,27 @@ def _qualified(target) -> str:
 
 _SM100 = (10, 0)
 
+# Every environment variable route reads: the built-in switches the targets do not read, and the targets' own.
+_ROUTE_ENVIRONMENT = (
+    *(name for name, _, _ in routing._ENV_SWITCHES),
+    environment.AUX_ATTN_RES_STREAM,
+    environment.FUSED_ATTN_RES,
+    environment.ATTN_RES_TOPOLOGY,
+    environment.FUSED_ATTN_RES_MAX_TOKENS,
+    environment.DISABLE_MIN_LATENCY_LATENT_PROJ,
+    environment.DISABLE_FUSED_ROUTE_QUANT,
+    environment.ROUTER_BF16,
+    environment.MLA_MAX_POSITIONS,
+)
+
 
 @pytest.fixture(autouse=True)
 def _on_gb200(monkeypatch):
     """Route as if this were a GB200 (sm 10.0, the targets' SM), wherever the test actually runs, on trays of one
-    NVLink domain. A case that routes on another SM pins it itself."""
+    NVLink domain, with none of the environment variables route reads set. A case that routes on another SM or
+    with a variable sets it itself."""
+    for name in _ROUTE_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
     monkeypatch.setattr(MNNVLAllReduce, "is_mnnvl", staticmethod(lambda *a, **k: True))

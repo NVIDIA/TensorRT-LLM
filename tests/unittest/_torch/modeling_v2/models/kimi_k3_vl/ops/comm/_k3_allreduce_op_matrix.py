@@ -124,13 +124,18 @@ def check_mnnvl_structure():
     assert not any(isinstance(m, MNNVLAllReduce) for m in MNNVL_NEW.modules()), (
         "K3AllReduce holds a runtime MNNVL all-reduce"
     )
+    # Use the workspace first, so a constructor that re-armed it would change its flag words.
+    fresh = _shared_workspace_state()
+    _check_plain(MNNVL_STOCK, MNNVL_NEW, (1,), 90, "MNNVL, before the second module")
     before = _shared_workspace_state()
+    assert before != fresh, "the collectives did not advance the shared workspace's flag words"
     again = K3AllReduce(R.mapping, AllReduceStrategy.MNNVL, torch.bfloat16)
     assert isinstance(again.mnnvl_allreduce, K3MnnvlAllReduce)
     after = _shared_workspace_state()
     assert before == after, (
         f"building K3AllReduce changed the shared workspace: {before} -> {after}"
     )
+    _check_plain(MNNVL_STOCK, again, (1,), 95, "MNNVL, the second module")
     R.barrier()
 
 

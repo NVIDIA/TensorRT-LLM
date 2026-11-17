@@ -564,15 +564,16 @@ class K3MLADSparkDrafter(nn.Module):
         del weight_mapper, kwargs
         device = self.model.norm.weight.device
         weights = self._take_head_weights(weights, device)
+        # Strip the prefix first, so a prefixed TorchSpec name is renamed too.
+        weights = {
+            (k[len("model.") :] if k.startswith("model.") else k): v for k, v in weights.items()
+        }
         renames = {
             "context_proj.weight": "fc.weight",
             "context_norm.weight": "hidden_norm.weight",
             "final_norm.weight": "norm.weight",
         }
         weights = {renames.get(k, k): v for k, v in weights.items()}
-        weights = {
-            (k[len("model.") :] if k.startswith("model.") else k): v for k, v in weights.items()
-        }
         missing = [k for k in ("fc.weight", "hidden_norm.weight") if k not in weights]
         if missing:
             raise ValueError(

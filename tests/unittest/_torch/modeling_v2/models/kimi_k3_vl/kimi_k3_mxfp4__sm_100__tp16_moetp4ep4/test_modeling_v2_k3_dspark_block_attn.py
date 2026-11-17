@@ -427,6 +427,9 @@ def test_unavailability_reason_matches_the_dflash_runtime(monkeypatch) -> None:
         dflash_trtllm_gen_unavailability_reason,
     )
 
-    assert _attn.unavailability_reason() == dflash_trtllm_gen_unavailability_reason()
+    reason = _attn.unavailability_reason()
+    assert reason == dflash_trtllm_gen_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"the SM is checked after the dependencies, and this build lacks one: {reason}")
     monkeypatch.setattr(_attn, "get_sm_version", lambda: 90)
     assert _attn.unavailability_reason() == "requires SM100 or SM103, got SM90"

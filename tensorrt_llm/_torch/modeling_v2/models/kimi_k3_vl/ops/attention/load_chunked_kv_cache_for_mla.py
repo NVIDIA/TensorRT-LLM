@@ -89,7 +89,8 @@ class LoadChunkedKvCacheForMla(OpWrapper):
         lora_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """The chunk from each request's stored rows ``rows[b]`` (``[len, lora_size + rope_size]``, in position
-        order, as the test reads them back from the pool). The pool addressing arguments are the test's business."""
+        order, as the test reads them back from the pool). The pool addressing arguments are the test's business: a
+        pool read does not mirror ``__call__``, the same exception as the catalog's ``load_paged_kv_cache_for_mla``."""
         cu = cu_ctx_chunked_kv_lens.tolist()
         start = chunked_ld_global_offset.tolist()
         parts = [rows[b][start[b] : start[b] + cu[b + 1] - cu[b]] for b in range(len(rows))]

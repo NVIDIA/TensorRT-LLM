@@ -75,18 +75,21 @@ def test_shared_workspace_presence(monkeypatch):
     assert not mcast.has_shared_lamport_workspace("b")
 
 
+@pytest.mark.parametrize("builtin_result", [False, True])
 @pytest.mark.parametrize("requested", [False, True])
-def test_mnnvl_supported_is_the_builtin_decision(monkeypatch, requested):
-    seen = []
+def test_mnnvl_supported_is_the_builtin_decision(monkeypatch, builtin_result, requested):
+    calls = []
     monkeypatch.setattr(
         ops.MNNVLAllReduce,
         "is_mnnvl",
         staticmethod(
-            lambda m, d, explicitly_requested=False: seen.append(explicitly_requested) or True
+            lambda m, d, explicitly_requested=False: (
+                calls.append((m, d, explicitly_requested)) or builtin_result
+            )
         ),
     )
-    assert mcast.mnnvl_supported("mapping", torch.bfloat16, requested) is True
-    assert seen == [requested]
+    assert mcast.mnnvl_supported("mapping", torch.bfloat16, requested) is builtin_result
+    assert calls == [("mapping", torch.bfloat16, requested)]
 
 
 def test_one_shot_threshold_is_the_builtin_one():

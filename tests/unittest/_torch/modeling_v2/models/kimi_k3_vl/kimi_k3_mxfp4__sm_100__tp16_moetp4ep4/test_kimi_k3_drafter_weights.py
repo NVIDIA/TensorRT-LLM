@@ -280,6 +280,9 @@ def test_mla_drafter_load_cuts_each_tensor_like_the_builtin_loader(tp):
             attn, mlp = layer.self_attn, layer.mlp
             gate_up = torch.cat([shard(p + f"mlp.{n}_proj.weight", col) for n in ("gate", "up")])
             assert torch.equal(attn.q_a_proj.weight, weights[p + "self_attn.q_a_proj.weight"])
+            assert torch.equal(
+                attn.q_a_layernorm.weight, weights[p + "self_attn.q_a_layernorm.weight"]
+            )
             assert torch.equal(attn.q_b_proj.weight, shard(p + "self_attn.q_b_proj.weight", col))
             assert torch.equal(
                 attn.kv_a_proj_with_mqa.weight, weights[p + "self_attn.kv_a_proj_with_mqa.weight"]
@@ -291,6 +294,7 @@ def test_mla_drafter_load_cuts_each_tensor_like_the_builtin_loader(tp):
             assert torch.equal(attn.o_proj.weight, shard(p + "self_attn.o_proj.weight", row))
             assert torch.equal(mlp.gate_up_proj.weight, gate_up)
             assert torch.equal(mlp.down_proj.weight, shard(p + "mlp.down_proj.weight", row))
+            assert torch.equal(layer.input_layernorm.weight, weights[p + "input_layernorm.weight"])
             assert torch.equal(
                 layer.post_attention_layernorm.weight,
                 weights[p + "post_attention_layernorm.weight"],
@@ -306,6 +310,19 @@ def test_mla_drafter_load_cuts_each_tensor_like_the_builtin_loader(tp):
             assert isinstance(drafter.fc, target_drafter.K3FcSlice)
             assert (drafter.fc.start, drafter.fc.end) == (start, end)
             assert torch.equal(drafter.fc.weight, fc[:, start:end])
+
+
+def test_mla_drafter_loads_the_torchspec_names_under_the_model_prefix():
+    """``model.context_proj`` / ``model.context_norm`` / ``model.final_norm`` load as ``fc`` / ``hidden_norm`` /
+    ``norm``, like the names without the prefix."""
+    weights = _mla_weights()
+    for name in ("context_proj.weight", "context_norm.weight", "final_norm.weight"):
+        weights["model." + name] = weights.pop(name)
+    drafter = _mla_drafter()
+    drafter.load_weights(dict(weights))
+    assert torch.equal(drafter.fc.weight, weights["model.context_proj.weight"])
+    assert torch.equal(drafter.hidden_norm.weight, weights["model.context_norm.weight"])
+    assert torch.equal(drafter.model.norm.weight, weights["model.final_norm.weight"])
 
 
 @pytest.mark.parametrize("tp", [2, 4])
