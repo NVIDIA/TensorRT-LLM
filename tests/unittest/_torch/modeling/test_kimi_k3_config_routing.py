@@ -297,5 +297,11 @@ def test_kimi_k3_forward_with_attached_embeddings():
         manager.shutdown()
 
 
+def test_kimi_k3_declares_ragged_verification_on_the_wrapper_only():
+    """A target that subclasses the text backbone does not inherit the declaration."""
+    assert KimiK3ForConditionalGeneration.supports_ragged_verification(None)
+    assert not KimiLinearForCausalLM.supports_ragged_verification(None)
+
+
 if __name__ == "__main__":
     unittest.main()

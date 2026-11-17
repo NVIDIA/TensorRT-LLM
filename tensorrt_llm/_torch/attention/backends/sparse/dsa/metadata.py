@@ -84,6 +84,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # The ragged rows are sized with the expanded indexer buffers, built from
     # the device-window KV bound and refreshed between the indexer updates.
     uses_base_ragged_row_hooks: ClassVar[bool] = False
+    # Ragged verification on a DSA target relies on the DSv4 KV compressor, whose
+    # metadata helpers the engine compiles at warmup and requires.
+    needs_ragged_compressor_warmup: ClassVar[bool] = True
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -163,6 +166,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # cross-step state).
     needs_gvr_prior: bool = field(default=False, init=False)
     gvr_prior_indices: Optional[torch.Tensor] = field(default=None, init=False)
+    # Query tokens per generation request for a uniform runtime tier. Zero
+    # falls back to the static draft-token ceiling.
+    runtime_tokens_per_gen_step: int = 0
 
     @property
     def has_mixed_precision_high_rows(self) -> bool:
@@ -460,6 +466,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def _max_verify_window(self) -> int:
+        """The anchor and every draft of the current draft length, which a runtime
+        tier may keep below the sizing cap."""
         return 1 + self.max_draft_tokens
 
     def prepare_for_draft_forward(self) -> dict | None:
@@ -1255,10 +1263,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     @property
     def _draft_sizing_cap(self) -> int:
         """Process-wide draft ceiling used only for persistent buffer sizing."""
-        cap = getattr(self, "_draft_alloc_cap", None)
-        if cap is None:
-            return self.max_draft_tokens
-        return max(int(cap), self.max_draft_tokens)
+        return max(self._draft_alloc_cap, self.max_draft_tokens)
 
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
@@ -1383,10 +1388,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             rows_per_sequence = max(rows_per_sequence, spec_tree_manager._internal_buf_dim)
         resize_radix_workspace = rows_per_sequence != self._radix_rows_per_sequence
         self._radix_rows_per_sequence = rows_per_sequence
-        self._draft_alloc_cap = max(
-            int(max_total_draft_tokens),
-            int(getattr(self, "_draft_alloc_cap", 0) or 0),
-        )
+        self._draft_alloc_cap = max(int(max_total_draft_tokens), self._draft_alloc_cap)
         capture_graph = self.is_cuda_graph
         max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
         if (

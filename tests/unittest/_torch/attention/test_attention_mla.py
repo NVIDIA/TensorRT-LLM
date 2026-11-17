@@ -1666,12 +1666,55 @@ def test_uniform_step_keeps_the_request_major_presentation(monkeypatch):
     assert metadata.token_major_gen_view() is None
     assert metadata.ragged_row_kv_lens(4) is None
 
-    # Windows installed on metadata built without the rows are rejected.
+
+@pytest.mark.cpu_only
+def test_ragged_rows_reject_kv_caches_with_page_tables_of_their_own(
+        monkeypatch):
+    """The rows expand the block offsets only."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
+    metadata.fp4_mla_state = None
+    metadata._validate_ragged_verification_kv_cache()
+
+    manager = metadata.kv_cache_manager
+    manager.mixed_precision_high_layers = {0: 1}
+    manager.mixed_precision_low_dtype = "nvfp4"
+    manager.mixed_precision_high_dtype = "fp8"
+    with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
+        metadata._validate_ragged_verification_kv_cache()
+
+    manager.mixed_precision_high_layers = None
+    metadata.fp4_mla_state = object()
+    with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
+        metadata._validate_ragged_verification_kv_cache()
+
+    # Metadata without the rows is not concerned.
     metadata.enable_ragged_verification = False
-    metadata.ragged_verify_lens = [2, 2]
+    metadata._validate_ragged_verification_kv_cache()
+
+
+@pytest.mark.cpu_only
+def test_verify_windows_need_the_rows_allocated(monkeypatch):
+    """Windows installed on metadata built without the rows are rejected."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, [2, 2])
+    metadata.enable_ragged_verification = False
     with pytest.raises(RuntimeError,
                        match="without enabling ragged-verification buffers"):
         metadata._validate_ragged_verification()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_ragged_rows_map_to_and_from_a_uniform_layout(monkeypatch,
+                                                      num_contexts):
+    """Past its window a request repeats its last row; its own rows map back."""
+    metadata, _, _ = _prepare_ragged_rows(monkeypatch, num_contexts)
+    metadata._seq_lens_cuda = metadata._seq_lens.clone()
+    metadata._num_generations = 2
+
+    # Requests verifying 2 and 4 tokens, in a layout of 4 rows per request.
+    source_rows, kept_rows = metadata.ragged_uniform_rows(4)
+    assert source_rows.tolist() == [0, 1, 1, 1, 2, 3, 4, 5]
+    assert kept_rows.tolist() == [0, 1, 4, 5, 6, 7]
 
 
 @pytest.mark.cpu_only
@@ -1745,9 +1788,13 @@ def test_device_window_mode_bounds_the_host_kv_extents(monkeypatch):
     assert kv_lens.tolist() == [3, 102, 204]
     assert metadata.kv_lens.tolist() == [3, 106, 206]
 
+
+@pytest.mark.cpu_only
+def test_device_selected_windows_need_a_ragged_step(monkeypatch):
+    """A uniform step has no rows for the device to re-rank."""
+    metadata = _ragged_metadata(monkeypatch, [2, 4], 0, None)
     with pytest.raises(RuntimeError,
                        match="requires enabled ragged verification"):
-        metadata.ragged_verify_lens = None
         metadata.apply_device_ragged_layout(torch.tensor([2]),
                                             torch.tensor([0, 0]),
                                             torch.tensor([-1, 0]))

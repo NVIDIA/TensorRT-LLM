@@ -612,7 +612,8 @@ class KimiKDALinearAttention(nn.Module):
             else:
                 # Speculative verification: each generation request carries
                 # 1 + draft_len tokens (drafts are padded to the static max,
-                # so T is uniform). Per-step states go to the manager's
+                # so T is uniform; a ragged step is padded to that layout
+                # below). Per-step states go to the manager's
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
@@ -1326,7 +1327,7 @@ class KimiKDALinearAttention(nn.Module):
         many drafts, the sequential path's intermediate buffers one state per row."""
         if self._has_kda_replay_caches(layer_cache):
             return 1 + layer_cache.kda_k_cache.shape[1]
-        intermediate_ssm = getattr(layer_cache, "intermediate_ssm", None)
+        intermediate_ssm = layer_cache.intermediate_ssm
         if intermediate_ssm is None:
             raise RuntimeError(
                 "ragged speculative verification requires the KDA replay caches or the "

@@ -239,7 +239,8 @@ def _get_num_cuda_graph_padding_dummy_slots(
     reachable at every batch size, including the zero-length acceptance-rate
     fallback. ``compute_dynamic_draft_len_mapping`` is created
     later and covers only configured CUDA-graph batch sizes, so it cannot size
-    this persistent ID set.
+    this persistent ID set. DSpark confidence scheduling doubles the count: a
+    ragged graph is padded with a second dummy per draft length.
     """
     if spec_config is None:
         return 1
@@ -277,8 +278,7 @@ def _get_num_cuda_graph_padding_dummy_slots(
         getattr(spec_config, "acceptance_rate_threshold", 0) or 0
     ) > 0:
         runtime_draft_lengths.add(0)
-    # DSpark confidence scheduling pads a ragged graph with a second dummy per
-    # draft length, whose verify window is one token longer.
+    # The second dummy of a ragged graph verifies a window one token longer.
     variants = 2 if getattr(spec_config, "enable_confidence_scheduling", False) else 1
     return variants * len(runtime_draft_lengths)
 

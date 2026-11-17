@@ -6848,12 +6848,11 @@ class TestDSparkConfidenceScheduling:
         values.update(overrides)
         return SimpleNamespace(**values)
 
-    def test_confidence_environment_rejects_standalone_dspark(self):
+    def test_confidence_environment_accepts_standalone_dspark(self):
+        # Whether the target is validated for it is the engine's check.
         environment = self._environment(speculative_config=SimpleNamespace(
             draft_is_embedded_in_target=False))
-        with pytest.raises(ValueError,
-                           match="only the embedded DeepSeek-V4 draft"):
-            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+        TorchLlmArgs._validate_dspark_confidence_environment(environment)
 
     @pytest.mark.parametrize(
         ("overrides", "message"),

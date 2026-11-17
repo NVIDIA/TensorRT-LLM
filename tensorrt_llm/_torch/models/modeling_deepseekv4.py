@@ -3530,6 +3530,11 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     logits_processor_cls = DeepseekV4LogitsProcessor
     weight_loader_cls = DeepseekV4WeightLoader
 
+    @classmethod
+    def supports_ragged_verification(cls, model_config: ModelConfig[PretrainedConfig]) -> bool:
+        """Validated with the DSpark draft embedded in the target checkpoint."""
+        return bool(getattr(model_config.spec_config, "draft_is_embedded_in_target", False))
+
     @property
     def runtime_hooks(self) -> RuntimeHooks:
         """Staged decode inputs and priority decode graphs; speculative decoding also runs

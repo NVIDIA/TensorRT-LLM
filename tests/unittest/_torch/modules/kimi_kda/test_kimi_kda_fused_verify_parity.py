@@ -701,11 +701,6 @@ def _verify_step_metadata(layer_cache, conv_pool, ssm_pool, slots, verify_lens, 
     return metadata
 
 
-def _rel_l2(actual, expected):
-    actual, expected = actual.float(), expected.float()
-    return ((actual - expected).norm() / (expected.norm() + 1e-12)).item()
-
-
 @torch.no_grad()
 @pytest.mark.parametrize("fused", [True, False], ids=["fused", "sequential"])
 def test_ragged_verify_matches_uniform(fused):
@@ -759,7 +754,7 @@ def test_ragged_verify_matches_uniform(fused):
     names = ("round 1 kept rows", "committed state", "round 2", "state after round 2")
     for name, actual, expected in zip(names, run(True), run(False)):
         assert actual.shape == expected.shape, name
-        assert _rel_l2(actual, expected) < 1e-2, name
+        assert _rep(name, actual, expected), name
 
 
 @torch.no_grad()

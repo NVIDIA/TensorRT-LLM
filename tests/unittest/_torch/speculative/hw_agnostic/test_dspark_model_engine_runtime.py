@@ -517,7 +517,9 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     model, kwargs = _metadata_inputs(MetadataProbe)
     decoder = object.__new__(DecoderMetadata)
     decoder.attn_metadata = None
-    decoder.model = SimpleNamespace(model_config=model)
+    decoder.model = SimpleNamespace(
+        model_config=model, supports_ragged_verification=lambda _model_config: True
+    )
     decoder._config = SimpleNamespace(
         **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=enabled)
     )
@@ -535,6 +537,24 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     assert seen == [enabled]
     assert decoder.setup_attention(kv) is result
     assert seen == [enabled]
+
+
+@pytest.mark.parametrize("declared", [None, False])
+def test_decoder_rejects_ragged_verification_the_model_does_not_declare(declared):
+    """A target is validated by its own declaration, never by its metadata class alone."""
+    model, kwargs = _metadata_inputs(DSAtrtllmAttentionMetadata)
+    decoder = object.__new__(DecoderMetadata)
+    decoder.attn_metadata = None
+    decoder.model = SimpleNamespace(model_config=model)
+    if declared is not None:
+        decoder.model.supports_ragged_verification = lambda _model_config: declared
+    decoder._config = SimpleNamespace(
+        **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=True)
+    )
+
+    with pytest.raises(ValueError, match="not validated for SimpleNamespace"):
+        decoder.setup_attention(object())
+    assert decoder.attn_metadata is None
 
 
 @pytest.mark.parametrize("graph_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])

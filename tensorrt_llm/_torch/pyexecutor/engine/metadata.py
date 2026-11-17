@@ -98,8 +98,9 @@ def build_attention_metadata(
         )
         from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-        # Validated row layouts: the dense TRTLLM metadata itself and the DSA metadata.
-        # Other subclasses lay out their own rows and stay rejected.
+        # Metadata that implements the ragged rows: the dense TRTLLM metadata itself and
+        # the DSA metadata. Other subclasses lay out their own rows. Whether the target is
+        # validated is the model's own declaration, which the caller checks.
         metadata_type = attention_backend.Metadata
         if metadata_type is not TrtllmAttentionMetadata and not issubclass(
             metadata_type, DSAtrtllmAttentionMetadata

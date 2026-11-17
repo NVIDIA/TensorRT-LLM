@@ -196,8 +196,8 @@ class HelixMlaChunkPlan:
 class TokenMajorGenView:
     """One attention row per generation query token.
 
-    Only the MLA RoPE and sparse-MLA generation ops consume this view. The
-    request-major metadata remains unchanged for every other consumer.
+    Only the generation attention ops consume this view. The request-major
+    metadata remains unchanged for every other consumer.
     """
 
     num_rows: int
@@ -417,9 +417,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Allocate the row-major and token-major buffers used only by ragged
     # verification. This is fixed before CUDA-graph metadata is created.
     enable_ragged_verification: bool = False
-    # Query tokens per generation request for a uniform runtime tier. Zero
-    # falls back to the static draft-token ceiling.
-    runtime_tokens_per_gen_step: int = 0
     # In device-window mode the host windows determine only the captured
     # shape; `apply_device_ragged_layout` installs the true windows before
     # replay.
@@ -447,9 +444,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 "ragged verification metadata was installed without enabling "
                 "ragged-verification buffers")
 
+    def _validate_ragged_verification_kv_cache(self) -> None:
+        """Reject KV caches whose page tables the token-major rows do not expand."""
+        if not (self.enable_ragged_verification
+                and self.uses_base_ragged_row_hooks):
+            return
+        # Both read page tables of their own instead of the block offsets.
+        if (self.fp4_mla_state is not None
+                or self._has_mixed_precision_staging()):
+            raise ValueError(
+                "Ragged verification is not validated with an NVFP4 or "
+                "mixed-precision KV cache on the dense TRTLLM attention "
+                "metadata")
+
     @property
     def _draft_sizing_cap(self) -> int:
-        """Process-wide draft ceiling used only for persistent buffer sizing."""
+        """Draft tokens per sequence the persistent row buffers hold."""
         return self._draft_alloc_cap
 
     @property
@@ -771,6 +781,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         None)):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
+        self._validate_ragged_verification_kv_cache()
+
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
             self.helix_position_offsets = self.get_empty(
@@ -892,6 +904,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
         self._cute_dsl_mla_split_plan_key = None
+        # The ragged row maps are derived from q_lens as well.
         self._ragged_uniform_rows_width = 0
 
     def restore_from_spec_dec(self) -> None:
@@ -1255,8 +1268,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     capture_graph=capture_graph,
                 ))
 
-        # MLA RoPE and sparse-MLA generation consume one row per query token;
-        # every other consumer keeps using request-major metadata.
+        # The generation attention ops consume one row per query token; every
+        # other consumer keeps using request-major metadata.
         attn_rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
         self.attn_row_kv_lens_cuda = self.get_empty(
             buffers,
@@ -1501,7 +1514,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             attn_row_start:attn_row_end] = kv_correction
         self.refresh_token_major_block_table()
 
-    def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
+    def token_major_gen_view(self) -> Optional[TokenMajorGenView]:
         """The token-major generation presentation, or None.
 
         None unless this step verifies a ragged batch.
@@ -1570,7 +1583,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @contextlib.contextmanager
     def presented_token_major(
-            self, view: Optional["TokenMajorGenView"]) -> Iterator[None]:
+            self, view: Optional[TokenMajorGenView]) -> Iterator[None]:
         """Temporarily present the generation half as one row per query token.
 
         The MLA rope and sparse-MLA generation ops learn their sequence count

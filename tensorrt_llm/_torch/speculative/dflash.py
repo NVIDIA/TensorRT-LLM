@@ -2298,6 +2298,8 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_base_host = list(self._ctx_base_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
+        if is_warmup:
+            self._save_warmup_state()
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -2514,6 +2516,7 @@ class DFlashWorker(SpecWorkerBase):
         if is_warmup:
             self._restore_ctx_len_device()
             self._restore_ctx_len_host()
+            self._restore_warmup_state()
         self._ctx_len_restore_pending = False
 
         return {
@@ -2526,6 +2529,16 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _save_warmup_state(self) -> None:
+        """Hook run before a warmup forward drafts.
+
+        The context lengths are saved by the caller; a subclass saves any other
+        state the forward writes. A no-op here.
+        """
+
+    def _restore_warmup_state(self) -> None:
+        """Hook run after a warmup forward: undo what :meth:`_save_warmup_state` saved."""
 
     def _on_block_drafted(
         self,

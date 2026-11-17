@@ -2016,3 +2016,14 @@ def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> Non
     )
     reference = _reference(q, cos_sin, positions.long(), num_heads)
     _assert_matches(quant_q, q_pe, reference, num_heads)
+
+
+def test_deepseek_v4_declares_ragged_verification_for_the_embedded_draft():
+    def model_config(spec_config):
+        return SimpleNamespace(spec_config=spec_config)
+
+    embedded = SimpleNamespace(draft_is_embedded_in_target=True)
+    standalone = SimpleNamespace(draft_is_embedded_in_target=False)
+    assert DeepseekV4ForCausalLM.supports_ragged_verification(model_config(embedded))
+    assert not DeepseekV4ForCausalLM.supports_ragged_verification(model_config(standalone))
+    assert not DeepseekV4ForCausalLM.supports_ragged_verification(model_config(None))

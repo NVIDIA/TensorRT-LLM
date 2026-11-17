@@ -1703,7 +1703,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
 
     @property
     def spec_worker(self):
-        return getattr(self.llm, "spec_worker", None)
+        return self.llm.spec_worker
 
     @property
     def model(self):

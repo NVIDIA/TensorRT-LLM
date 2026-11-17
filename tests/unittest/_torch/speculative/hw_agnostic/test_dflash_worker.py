@@ -166,3 +166,24 @@ def test_generation_step_keeps_the_dummy_slot_context_empty():
         real_len = 5 + 2 * (step + 1)
         assert worker._ctx_len.tolist() == [real_len, 0, 0]
         assert inputs["num_ctx_per_req"].tolist() == [real_len, 0]
+
+
+def test_ragged_step_gathers_each_requests_target_rows_by_window():
+    """A ragged step packs fewer target rows per request; past its window a request repeats
+    its last row, so the K + 1 rows per request stay request-major."""
+    max_draft_len = 3
+    config = DFlashDecodingConfig(
+        max_draft_len=max_draft_len, attention_backend="TRTLLM", mask_token_id=0
+    )
+    worker = DFlashWorker(config, Mapping())
+    # One context token, then generation requests verifying 2 and 4 tokens.
+    captured = torch.arange(7, dtype=torch.float32).unsqueeze(1)
+    spec_metadata = SimpleNamespace(
+        is_ragged_verify=True,
+        qo_indptr=torch.tensor([0, 2, 6]),
+        verify_lens=torch.tensor([2, 4]),
+    )
+
+    rows = worker._gen_target_rows(captured, spec_metadata, gen_start=1, num_gens=2)
+
+    assert rows.squeeze(1).tolist() == [1, 2, 2, 2, 3, 4, 5, 6]

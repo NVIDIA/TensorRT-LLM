@@ -2043,6 +2043,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         them where they are validated."""
         return False
 
+    @classmethod
+    def supports_ragged_verification(cls, model_config: ModelConfig) -> bool:
+        """Whether this target verifies a different number of draft tokens for
+        each request of a step, which DSpark confidence scheduling relies on.
+        A model enables it for the configurations where it is validated."""
+        return False
+
     def __init__(self,
                  model: TModel,
                  model_config: ModelConfig[TConfig],

@@ -457,15 +457,18 @@ class DSparkConfidenceMixin:
 
     The executor and the verify planner reach a worker through this surface
     only, so every deployment form schedules verification the same way. The
-    worker supplies the slot bookkeeping: ``_req_to_slot`` (request id ->
-    confidence row) and :meth:`_batch_slot_buffer` (batch position -> row).
+    worker supplies ``spec_config`` and the slot bookkeeping: ``_req_to_slot``
+    (request id -> confidence row) and :meth:`_batch_slot_buffer` (batch
+    position -> row).
     """
 
-    def _init_confidence_state(self, spec_config: "DSparkDecodingConfig") -> None:
+    def _init_confidence_state(self) -> None:
         # ``return_confidence`` is read once here (never per step) so the
         # captured draft graph cannot diverge. ``_confidence_logits`` is the
         # slot-indexed handoff to the verification scheduler.
-        self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
+        self.return_confidence = bool(
+            getattr(self.spec_config, "enable_confidence_scheduling", False)
+        )
         self._confidence_logits: Optional[torch.Tensor] = None  # [rows + 1, block]
         # Draft-pass stamps for the buffer above.
         self._confidence_stamp: Optional[torch.Tensor] = None
@@ -749,7 +752,7 @@ class DSv4DSparkWorker(DSparkConfidenceMixin, SpecWorkerBase):
         self._prep_fork: Optional[tuple] = None
 
         # Confidence rows and the verify planner are allocated in ``_lazy_init``.
-        self._init_confidence_state(spec_config)
+        self._init_confidence_state()
 
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
@@ -1805,7 +1808,8 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
     ):
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
         # Confidence rows and the verify planner follow the context buffers.
-        self._init_confidence_state(spec_config)
+        self._init_confidence_state()
+        self._warmup_confidence: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     def _batch_slot_buffer(self) -> Optional[torch.Tensor]:
         buffer = self._batch_to_slot_buffer
@@ -1859,6 +1863,14 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
             draft_model.draft_confidence_logits(block_hidden, first_prev_tokens, draft_tokens),
         )
 
+    def _save_warmup_state(self) -> None:
+        # A warmup forward's scores must not reach the verification planner.
+        self._warmup_confidence = self._snapshot_confidence()
+
+    def _restore_warmup_state(self) -> None:
+        self._restore_confidence(self._warmup_confidence)
+        self._warmup_confidence = None
+
     def _forward_impl(
         self,
         input_ids,
@@ -1870,9 +1882,6 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
         draft_model,
         resource_manager=None,
     ):
-        # A warmup forward's scores must not reach the verification planner.
-        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        saved_confidence = self._snapshot_confidence() if is_warmup else None
         outputs = super()._forward_impl(
             input_ids,
             position_ids,
@@ -1883,7 +1892,6 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
             draft_model,
             resource_manager,
         )
-        self._restore_confidence(saved_confidence)
         if self.return_confidence:
             _publish_policy_window_output(
                 outputs,

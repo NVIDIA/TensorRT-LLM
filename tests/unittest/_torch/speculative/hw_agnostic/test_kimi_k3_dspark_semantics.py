@@ -15,8 +15,8 @@ resolves to the exact pre-dspark behavior (slots 1..K, no window, no
 Markov bias). CPU-only where possible; the tiny end-to-end block-decode
 parity test needs CUDA + flash_attn and is skip-guarded.
 
-Confidence-scheduled verification is MR B: here we only check that
-confidence_proj weights load without being used.
+Confidence-scheduled verification is covered elsewhere: here we only check
+that the confidence head is built from the confidence_proj weights.
 """
 
 import math

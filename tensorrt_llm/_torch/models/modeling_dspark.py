@@ -4183,18 +4183,21 @@ class _DSparkHeadMixin:
 
     def _build_confidence_head(
         self, weight: torch.Tensor, bias: Optional[torch.Tensor]
-    ) -> DSparkConfidenceHead:
-        """The confidence head for a checkpoint's ``confidence_proj`` tensors."""
+    ) -> Optional[DSparkConfidenceHead]:
+        """The confidence head for a checkpoint's ``confidence_proj`` tensors, or None for a
+        projection width it does not know."""
         hidden_size = self.config.hidden_size
         with_markov = self.has_markov_head and (
             weight.shape[-1] == hidden_size + self._dspark_markov_rank
         )
         if not with_markov and weight.shape[-1] != hidden_size:
-            raise ValueError(
+            logger.warning(
                 f"DSpark confidence_proj.weight has shape {tuple(weight.shape)}; expected "
                 f"[1, hidden_size] = [1, {hidden_size}], or [1, hidden_size + markov_rank] = "
-                f"[1, {hidden_size + self._dspark_markov_rank}] with a Markov head."
+                f"[1, {hidden_size + self._dspark_markov_rank}] with a Markov head. "
+                "The confidence head is not built."
             )
+            return None
         head = DSparkConfidenceHead(
             hidden_size=hidden_size,
             markov_rank=self._dspark_markov_rank,
@@ -4277,11 +4280,6 @@ class _DSparkHeadMixin:
             self.confidence_head = self._build_confidence_head(
                 dspark_weights["confidence_proj.weight"],
                 dspark_weights.get("confidence_proj.bias"),
-            )
-        elif self._dspark_use_confidence_head:
-            raise ValueError(
-                "DSpark drafter declares use_confidence_head but the checkpoint is "
-                "missing confidence_proj.weight."
             )
         return weights, dspark_weights
 
