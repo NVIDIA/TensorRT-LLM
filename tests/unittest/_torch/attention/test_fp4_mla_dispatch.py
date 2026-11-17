@@ -397,3 +397,215 @@ def test_kv_regime_for_step():
             == dp.PATH_4X
         )
         assert _choose(16, 4, 30080, live=kv).path == dp.PATH_4X
+
+
+# Which launcher a CuTe DSL decode call reaches. The launchers, the V operands and the device checks are
+# replaced, so these run on the host: they pin the routing, not the kernels.
+
+
+def _decode_call(**overrides):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode
+
+    num_queries = overrides.get("num_queries", 4)
+    num_heads = overrides.get("num_heads", 128)
+    fields = dict(
+        metadata=SimpleNamespace(
+            page_size=128,
+            fp4_mla_state=SimpleNamespace(paged_kv_indptr_decode=torch.zeros(9, dtype=torch.int32)),
+        ),
+        layer_idx=0,
+        local_layer=0,
+        output=torch.zeros(num_queries, num_heads, 4),
+        sm_scale=0.5,
+        kv_lora_rank=4,
+        head_dim=68,
+        backend="cutedsl",
+        device=torch.device("cpu"),
+        num_queries=num_queries,
+        num_gen_seqs=4,
+        query_len_per_seq=1,
+        num_heads=num_heads,
+        packed_rows_per_seq=128,
+        q_fp4=torch.zeros(1, dtype=torch.uint8),
+        q_sf=torch.zeros(1, dtype=torch.uint8),
+        q_batch_capacity=8,
+        kv_global_scale=torch.ones(1),
+        q_global_scale=torch.ones(1),
+        kv_cache=torch.zeros(1),
+        sf_cache=torch.zeros(1),
+        v_sf_pool=torch.zeros(1),
+        v_sf=torch.zeros(1),
+        kv_lens=torch.zeros(4, dtype=torch.int32),
+        src_page_ids=torch.zeros(4, dtype=torch.int32),
+        max_pages=16,
+        plan_geometry=None,
+        helix_kv_bounds=None,
+        softmax_stats_tensor=None,
+    )
+    fields.update(overrides)
+    return decode._DecodeCall(**fields)
+
+
+@pytest.fixture
+def decode_routes(monkeypatch):
+    """Record the launcher a decode call reaches, as (name, keyword arguments)."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import (
+        decode,
+        decode_4x,
+        decode_twostream,
+        fp4_mla_foldq,
+        fp4_mla_splitkv,
+    )
+
+    routes: list[tuple[str, dict]] = []
+
+    def record(name):
+        return lambda *args, **kwargs: routes.append((name, kwargs))
+
+    kernel = SimpleNamespace(
+        SUPPORTS_FOLDED_QUERIES=True,
+        run_trtllm_fp4_mla_decode_page_native_from_raw=record("page_native"),
+    )
+    monkeypatch.setattr(decode, "_check_cutedsl_decode_supported", lambda call: None)
+    monkeypatch.setattr(decode, "_fp4_mla_cutedsl_kernel_module", lambda: kernel)
+    monkeypatch.setattr(decode, "_fp4_mla_cutedsl_fused_v_transpose_enabled", lambda: False)
+    monkeypatch.setattr(
+        decode,
+        "_cutedsl_v_operands",
+        lambda call, module: decode._VOperands(torch.zeros(1), torch.zeros(1), 3),
+    )
+    monkeypatch.setattr(
+        decode,
+        "_unpacked_kernel_q",
+        lambda call, module: decode._UnpackedQ(call.q_fp4, call.q_sf, call.q_batch_capacity),
+    )
+    monkeypatch.setattr(
+        decode,
+        "_ensure_workspace_tensor",
+        lambda metadata, name, shape, *, dtype, device, **kwargs: torch.zeros(shape, dtype=dtype),
+    )
+    monkeypatch.setattr(decode, "_max_sequences", lambda metadata: 4)
+    monkeypatch.setattr(decode, "_run_cutedsl_packed_decode", record("packed_2x"))
+    monkeypatch.setattr(decode_4x, "_run_cutedsl_4x_decode", record("4x"))
+    monkeypatch.setattr(decode_4x, "_fp4_mla_cutedsl_4x_enabled", lambda: False)
+    monkeypatch.setattr(decode_4x, "_fp4_mla_4x_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(decode_twostream, "run_cutedsl_twostream_decode", record("twostream"))
+    monkeypatch.setattr(fp4_mla_splitkv, "run_fp4_mla_splitkv", record("splitkv"))
+    monkeypatch.setattr(fp4_mla_splitkv, "select_split_count", lambda max_kv_len: 1)
+    monkeypatch.setattr(fp4_mla_foldq, "run_fp4_mla_foldq", record("foldq"))
+    monkeypatch.delenv("TRTLLM_FP4_MLA_FOLD_Q", raising=False)
+    return routes
+
+
+def test_packed_decode_runs_on_the_2x_kernel_by_default(decode_routes):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode
+
+    decode._run_cutedsl_attention_decode(_decode_call())
+    [(name, kwargs)] = decode_routes
+    assert name == "packed_2x"
+    assert kwargs["rows_per_seq"] == 128 and kwargs["num_requests"] == 4
+    assert kwargs["v_page_offset"] == 3 and kwargs["sm_scale"] == 0.5
+    assert kwargs["page_indptr"].numel() == 5  # one page-table row offset per request, plus the end
+
+
+@pytest.mark.parametrize(
+    "path,r2,expected",
+    [(dp.PATH_2X, 0, "packed_2x"), (dp.PATH_4X, 0, "4x"), (dp.PATH_TWO_STREAM, 2, "twostream")],
+)
+def test_packed_decode_follows_the_dispatcher_when_4x_is_enabled(
+    monkeypatch, decode_routes, path, r2, expected
+):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode, decode_4x
+
+    asked = {}
+
+    def choose(**kwargs):
+        asked.update(kwargs)
+        return dp.DecodeStrategy(path, r2, "test", 2048, "capacity", None)
+
+    monkeypatch.setattr(decode_4x, "_fp4_mla_cutedsl_4x_enabled", lambda: True)
+    monkeypatch.setattr(dp, "choose_decode_strategy", choose)
+    monkeypatch.setattr(decode, "_get_sm_count", lambda device: SM)
+    monkeypatch.setattr(host_4x, "device_unsupported_reason", lambda device: None)
+
+    decode._run_cutedsl_attention_decode(_decode_call())
+    [(name, kwargs)] = decode_routes
+    assert name == expected
+    # the dispatcher decides on the page-table capacity of the step and on what the call carries
+    assert asked["kv_capacity"] == 16 * 128 and asked["rows_per_seq"] == 128
+    assert asked["v_packed"] is True and asked["helix"] is False and asked["softmax_stats"] is False
+    if expected == "twostream":
+        assert kwargs["num_requests_2x"] == 2
+    if expected != "packed_2x":
+        assert kwargs["max_kv_len"] == 16 * 128
+
+
+def test_unpacked_decode_runs_one_task_per_query_token(decode_routes):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode
+
+    decode._run_cutedsl_attention_decode(_decode_call(packed_rows_per_seq=0))
+    [(name, kwargs)] = decode_routes
+    assert name == "page_native"
+    assert kwargs["num_heads"] == 128 and kwargs["q_batch_capacity"] == 8
+    assert kwargs["softmax_row_max"] is None and kwargs["helix_kv_bounds"] is None
+
+
+def test_unpacked_decode_splits_a_long_kv(monkeypatch, decode_routes):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode, fp4_mla_splitkv
+
+    monkeypatch.setattr(fp4_mla_splitkv, "select_split_count", lambda max_kv_len: 3)
+    decode._run_cutedsl_attention_decode(_decode_call(packed_rows_per_seq=0))
+    [(name, kwargs)] = decode_routes
+    assert name == "splitkv" and kwargs["splits"] == 3 and kwargs["max_kv_len"] == 16 * 128
+
+    # Helix softmax statistics come from the unsplit kernel only
+    decode_routes.clear()
+    stats = torch.zeros(4, 128, 2)
+    decode._run_cutedsl_attention_decode(
+        _decode_call(packed_rows_per_seq=0, softmax_stats_tensor=stats)
+    )
+    [(name, kwargs)] = decode_routes
+    assert name == "page_native" and kwargs["softmax_row_max"].shape == (4, 128)
+
+
+def test_unpacked_decode_pads_fewer_heads_through_a_workspace(decode_routes):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode
+
+    call = _decode_call(packed_rows_per_seq=0, num_heads=16)
+    decode._run_cutedsl_attention_decode(call)
+    [(name, kwargs)] = decode_routes
+    assert name == "page_native"
+    # the kernel writes 128 head rows per query token; the call's heads are copied back
+    assert kwargs["output"].shape == (4, 128, 4) and kwargs["output"] is not call.output
+
+
+def test_folded_queries_take_the_six_query_single_request_shape_with_a_long_kv(
+    monkeypatch, decode_routes
+):
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode, fp4_mla_splitkv
+
+    shape = dict(
+        packed_rows_per_seq=0, num_heads=6, query_len_per_seq=6, num_gen_seqs=1, num_queries=6
+    )
+    # a KV too short to split stays on the unfolded path
+    decode._run_cutedsl_attention_decode(_decode_call(**shape))
+    assert [name for name, _ in decode_routes] == ["page_native"]
+
+    decode_routes.clear()
+    monkeypatch.setattr(fp4_mla_splitkv, "select_split_count", lambda max_kv_len: 2)
+    decode._run_cutedsl_attention_decode(_decode_call(**shape))
+    [(name, kwargs)] = decode_routes
+    assert name == "foldq" and kwargs["splits"] == 2 and kwargs["query_len_per_seq"] == 6
+
+    # TRTLLM_FP4_MLA_FOLD_Q=0 keeps the shape on the split path
+    decode_routes.clear()
+    monkeypatch.setenv("TRTLLM_FP4_MLA_FOLD_Q", "0")
+    decode._run_cutedsl_attention_decode(_decode_call(**shape))
+    assert [name for name, _ in decode_routes] == ["splitkv"]
+
+
+def test_triton_backend_rejects_an_unknown_backend_name():
+    from tensorrt_llm._torch.attention.backends.fp4_mla import decode
+
+    with pytest.raises(ValueError, match="Unsupported FP4 MLA attention backend 'other'"):
+        decode._run_triton_backend_decode(_decode_call(backend="other"))

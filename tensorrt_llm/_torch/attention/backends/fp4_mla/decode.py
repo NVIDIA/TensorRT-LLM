@@ -3,6 +3,7 @@
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
 import functools
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -843,7 +844,79 @@ def _run_cutedsl_packed_decode(
     )
 
 
-def run_fp4_mla_attention_decode(
+# Rows of one CuTe DSL kernel task: the unpacked Q layout pads every query token to this many head rows.
+_CUTEDSL_PHYSICAL_HEADS = 128
+
+
+@dataclass(slots=True)
+class _DecodeCall:
+    """One FP4 MLA decode call: its shapes and the operands every decode path reads."""
+
+    metadata: Any
+    layer_idx: int
+    local_layer: int
+    output: torch.Tensor
+    sm_scale: float
+    kv_lora_rank: int
+    head_dim: int
+    backend: str
+    device: torch.device
+    num_queries: int
+    num_gen_seqs: int
+    query_len_per_seq: int
+    num_heads: int
+    # Rows one request owns in the packed Q layout; 0 for the unpacked layout,
+    # one group of head rows per query token.
+    packed_rows_per_seq: int
+    q_fp4: torch.Tensor
+    q_sf: torch.Tensor
+    q_batch_capacity: int
+    kv_global_scale: torch.Tensor
+    q_global_scale: torch.Tensor
+    kv_cache: torch.Tensor
+    sf_cache: torch.Tensor
+    v_sf_pool: torch.Tensor
+    v_sf: torch.Tensor
+    kv_lens: torch.Tensor
+    src_page_ids: torch.Tensor
+    max_pages: int
+    plan_geometry: _PackedPlanGeometry | None
+    helix_kv_bounds: torch.Tensor | None
+    softmax_stats_tensor: torch.Tensor | None
+
+    @property
+    def max_kv_len(self) -> int:
+        """KV tokens the generation page table of this step can address."""
+        return self.max_pages * self.metadata.page_size
+
+    @property
+    def page_indptr(self) -> torch.Tensor:
+        """Page-table row offsets of the generation requests."""
+        return self.metadata.fp4_mla_state.paged_kv_indptr_decode[: self.num_gen_seqs + 1]
+
+
+@dataclass(slots=True)
+class _VOperands:
+    """V as a CuTe DSL kernel reads it: pool-wide tensors and this layer's page offset in them.
+
+    ``v_packed`` is None for the fused-V kernel, which reads V from the KV cache.
+    """
+
+    v_packed: torch.Tensor | None
+    v_sf: torch.Tensor
+    page_offset: int
+
+
+@dataclass(slots=True)
+class _UnpackedQ:
+    """Q of the unpacked layout as the kernel reads it, padded to the kernel's head rows."""
+
+    q_fp4: torch.Tensor
+    q_sf: torch.Tensor
+    q_batch_capacity: int
+
+
+def _prepare_decode_call(
     metadata: Any,
     layer_idx: int,
     local_layer: int,
@@ -856,18 +929,9 @@ def run_fp4_mla_attention_decode(
     prequantized_q: torch.Tensor,
     prequantized_q_sf: torch.Tensor,
     q_batch_capacity: int,
-    softmax_stats_tensor: torch.Tensor | None = None,
-) -> None:
-    """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
-
-    Q is supplied in its assembled ``[latent, RoPE]`` layout and quantized to
-    FP4 directly. QK reads ``[KV-nope, K-RoPE, K-RoPE-residual]`` contiguously
-    from the primary cache with swizzled block scales. Softmax probabilities
-    are quantized to FP4 per page, and PV repacks V nibbles from the shared KV
-    cache while reading the auxiliary V-view scale pool. No BF16 dequantized
-    KV workspace is materialized on this path. Callers must supply the packed Q
-    and scales produced by the fused generation cache update.
-    """
+    softmax_stats_tensor: torch.Tensor | None,
+) -> _DecodeCall:
+    """Validate a decode call and resolve the operands shared by every decode path."""
     head_dim = kv_lora_rank + qk_rope_head_dim
     if qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM:
         raise ValueError(
@@ -946,9 +1010,8 @@ def run_fp4_mla_attention_decode(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
 
-    global_scale = _get_fp4_mla_global_scale(metadata, q.device)
-    q_residual_dim = FP4_MLA_Q_RESIDUAL_DIM
-    _validate_fp4_mla_attention_q_shape(head_dim, q_residual_dim)
+    kv_global_scale = _get_fp4_mla_global_scale(metadata, q.device)
+    _validate_fp4_mla_attention_q_shape(head_dim, FP4_MLA_Q_RESIDUAL_DIM)
 
     if prequantized_q is None or prequantized_q_sf is None or q_batch_capacity is None:
         raise RuntimeError(
@@ -1044,446 +1107,574 @@ def run_fp4_mla_attention_decode(
     max_pages = _max_generation_pages(metadata)
     if max_pages == 0:
         raise RuntimeError("FP4 MLA attention decode requires generation cache pages.")
-    if backend == _FP4_MLA_CUTEDSL_BACKEND:
-        if get_sm_version() != 107:
-            raise RuntimeError(
-                "FP4 MLA cutedsl attention backend requires Rubin SM107; "
-                f"current architecture is SM{get_sm_version()}."
-            )
-        if not _cutedsl_backend_available():
-            raise RuntimeError(
-                "FP4 MLA cutedsl attention backend requires a CuTe DSL build "
-                "that provides the tcgen05 descriptor K-segment offset, and "
-                "cuda-python."
-            )
-        if not 0 < num_heads <= 128 or kv_lora_rank != 512:
-            raise ValueError(
-                "FP4 MLA cutedsl attention requires 1-128 local heads and "
-                f"kv_lora_rank=512, got num_heads={num_heads}, "
-                f"kv_lora_rank={kv_lora_rank}."
-            )
 
-        cutedsl_kernel = _fp4_mla_cutedsl_kernel_module()
-        QK_LOGICAL_DIM = cutedsl_kernel.QK_LOGICAL_DIM
-        QK_SF_GROUPS = cutedsl_kernel.QK_SF_GROUPS
-        SMEM_P4_V_N_PER_CTA = cutedsl_kernel.SMEM_P4_V_N_PER_CTA
-        run_trtllm_fp4_mla_decode_page_native_from_raw = (
-            cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw
+    return _DecodeCall(
+        metadata=metadata,
+        layer_idx=layer_idx,
+        local_layer=local_layer,
+        output=output,
+        sm_scale=float(sm_scale),
+        kv_lora_rank=kv_lora_rank,
+        head_dim=head_dim,
+        backend=backend,
+        device=q.device,
+        num_queries=num_queries,
+        num_gen_seqs=num_gen_seqs,
+        query_len_per_seq=query_len_per_seq,
+        num_heads=num_heads,
+        packed_rows_per_seq=packed_rows_per_seq,
+        q_fp4=q_fp4,
+        q_sf=q_sf,
+        q_batch_capacity=q_batch_capacity,
+        kv_global_scale=kv_global_scale,
+        q_global_scale=q_global_scale,
+        kv_cache=kv_cache,
+        sf_cache=sf_cache,
+        v_sf_pool=v_sf_pool,
+        v_sf=v_sf,
+        kv_lens=kv_lens,
+        src_page_ids=src_page_ids,
+        max_pages=max_pages,
+        plan_geometry=plan_geometry,
+        helix_kv_bounds=helix_kv_bounds,
+        softmax_stats_tensor=softmax_stats_tensor,
+    )
+
+
+def _check_cutedsl_decode_supported(call: _DecodeCall) -> None:
+    if get_sm_version() != 107:
+        raise RuntimeError(
+            "FP4 MLA cutedsl attention backend requires Rubin SM107; "
+            f"current architecture is SM{get_sm_version()}."
+        )
+    if not _cutedsl_backend_available():
+        raise RuntimeError(
+            "FP4 MLA cutedsl attention backend requires a CuTe DSL build "
+            "that provides the tcgen05 descriptor K-segment offset, and "
+            "cuda-python."
+        )
+    if not 0 < call.num_heads <= _CUTEDSL_PHYSICAL_HEADS or call.kv_lora_rank != 512:
+        raise ValueError(
+            "FP4 MLA cutedsl attention requires 1-128 local heads and "
+            f"kv_lora_rank=512, got num_heads={call.num_heads}, "
+            f"kv_lora_rank={call.kv_lora_rank}."
         )
 
-        # Keep general cases on the original path. This specialization uses
-        # the prepacked-V mufu16 core and linear six-query MTP only.
-        fold_queries = (
-            not packed_rows_per_seq
-            and num_heads == 6
-            and query_len_per_seq == 6
-            and num_gen_seqs == 1
-            and helix_kv_bounds is None
-            and softmax_stats_tensor is None
-            and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
-            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
-            and getattr(metadata, "_fp4_mla_fold_q", True)
-            and _fp4_mla_fold_q_enabled()
+
+def _uses_folded_queries(call: _DecodeCall, cutedsl_kernel: Any) -> bool:
+    """Whether the call takes the folded-query specialization of the unpacked layout.
+
+    General cases stay on the unfolded paths: the specialization uses the
+    prepacked-V mufu16 core and linear six-query MTP only, and it only pays
+    where the KV is long enough to be split.
+    """
+    fold_queries = (
+        not call.packed_rows_per_seq
+        and call.num_heads == 6
+        and call.query_len_per_seq == 6
+        and call.num_gen_seqs == 1
+        and call.helix_kv_bounds is None
+        and call.softmax_stats_tensor is None
+        and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
+        and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+        and getattr(call.metadata, "_fp4_mla_fold_q", True)
+        and _fp4_mla_fold_q_enabled()
+    )
+    if fold_queries:
+        from .fp4_mla_splitkv import select_split_count
+
+        fold_queries = select_split_count(call.max_kv_len) > 1
+    return fold_queries
+
+
+def _unpacked_kernel_q(call: _DecodeCall, cutedsl_kernel: Any) -> _UnpackedQ:
+    """Q of an unpacked call with every query token padded to the kernel's 128 head rows."""
+    if call.num_heads >= _CUTEDSL_PHYSICAL_HEADS:
+        return _UnpackedQ(call.q_fp4, call.q_sf, call.q_batch_capacity)
+    qk_logical_dim = cutedsl_kernel.QK_LOGICAL_DIM
+    kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
+        call.metadata,
+        call.num_queries,
+        _CUTEDSL_PHYSICAL_HEADS,
+        call.device,
+    )
+    active_q_rows = call.num_queries * _CUTEDSL_PHYSICAL_HEADS
+    active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(
+        active_q_rows,
+        qk_logical_dim,
+    )
+    kernel_q = kernel_q_storage[:active_q_rows]
+    kernel_q_sf = kernel_q_sf_storage[:active_q_sf_bytes]
+    _cutedsl_pad_q_and_sf_kernel[(call.num_queries, _ceil_div(qk_logical_dim // 2, 64))](
+        kernel_q,
+        call.q_fp4,
+        kernel_q_sf,
+        call.q_sf,
+        call.num_heads,
+        output_heads=_CUTEDSL_PHYSICAL_HEADS,
+        packed_dim=qk_logical_dim // 2,
+        block_bytes=64,
+        sf_cols=cutedsl_kernel.QK_SF_GROUPS,
+        sf_cols_per_byte_block=8,
+    )
+    return _UnpackedQ(kernel_q, kernel_q_sf, q_batch_capacity)
+
+
+def _cutedsl_v_operands(call: _DecodeCall, cutedsl_kernel: Any) -> _VOperands:
+    """Resolve the V tensors of a CuTe DSL decode and check that the layer's views lie in them."""
+    metadata = call.metadata
+    local_layer = call.local_layer
+    kv_cache = call.kv_cache
+    v_sf = call.v_sf
+    v_sf_pool = call.v_sf_pool
+    if _fp4_mla_cutedsl_fused_v_transpose_enabled():
+        # The fusion kernel reads V from the canonical KV cache and uses the
+        # current layer V scales directly. Its launchers take the same
+        # arguments as the mufu16 ones, with no packed V.
+        return _VOperands(v_packed=None, v_sf=v_sf, page_offset=0)
+
+    v_packed = _get_cutedsl_persistent_v_packed_cache(
+        metadata,
+        local_layer,
+        kv_cache,
+        v_head_dim=call.kv_lora_rank,
+        page_size=metadata.page_size,
+        block_v=cutedsl_kernel.SMEM_P4_V_N_PER_CTA,
+    )
+    core_v_packed = _get_fp4_mla_v_packed_pool_base(metadata)
+    if core_v_packed is None:
+        raise RuntimeError("Persistent FP4 MLA V packing requires a stable full-pool base.")
+    get_v_page_offset = getattr(metadata.kv_cache_manager, "get_mla_v_packed_page_offset", None)
+    v_page_offset = (
+        int(get_v_page_offset(local_layer))
+        if callable(get_v_page_offset)
+        else local_layer * kv_cache.shape[0]
+    )
+    page_bytes = call.kv_lora_rank * (metadata.page_size // 2)
+    expected_layer_ptr = core_v_packed.data_ptr() + v_page_offset * page_bytes
+    if expected_layer_ptr != v_packed.data_ptr():
+        raise RuntimeError(
+            "Persistent FP4 MLA V-packed layer view does not match its "
+            "full-pool base and page offset."
         )
-        if fold_queries:
-            from .fp4_mla_splitkv import select_split_count
 
-            fold_queries = select_split_count(max_pages * metadata.page_size) > 1
-        physical_heads = 128
-        kernel_q = q_fp4
-        kernel_q_sf = q_sf
-        if not packed_rows_per_seq and num_heads < physical_heads and not fold_queries:
-            kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
-                metadata,
-                num_queries,
-                physical_heads,
-                q.device,
-            )
-            active_q_rows = num_queries * physical_heads
-            active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(
-                active_q_rows,
-                QK_LOGICAL_DIM,
-            )
-            kernel_q = kernel_q_storage[:active_q_rows]
-            kernel_q_sf = kernel_q_sf_storage[:active_q_sf_bytes]
-            _cutedsl_pad_q_and_sf_kernel[(num_queries, _ceil_div(QK_LOGICAL_DIM // 2, 64))](
-                kernel_q,
-                q_fp4,
-                kernel_q_sf,
-                q_sf,
-                num_heads,
-                output_heads=physical_heads,
-                packed_dim=QK_LOGICAL_DIM // 2,
-                block_bytes=64,
-                sf_cols=QK_SF_GROUPS,
-                sf_cols_per_byte_block=8,
-            )
+    v_sf_pool_base = _get_fp4_mla_v_scale_pool_base(metadata)
+    if v_sf_pool_base is None:
+        v_sf_pool_base = v_sf_pool.flatten(0, 1).view(torch.uint8)
+        if v_sf_pool_base.data_ptr() != v_sf_pool.data_ptr():
+            raise RuntimeError("Persistent FP4 MLA V-scale pool must flatten without a copy.")
+    if (
+        not isinstance(v_sf_pool_base, torch.Tensor)
+        or v_sf_pool_base.dtype != torch.uint8
+        or v_sf_pool_base.device != v_sf.device
+        or v_sf_pool_base.ndim != 2
+        or v_sf_pool_base.shape[1] != v_sf_pool.shape[-1]
+        or not v_sf_pool_base.is_contiguous()
+    ):
+        raise RuntimeError(
+            "Persistent FP4 MLA V-scale pool base must be a contiguous "
+            "two-dimensional uint8 tensor with the configured page stride."
+        )
+    core_v_sf = v_sf_pool_base.view(torch.float8_e4m3fn)
+    get_v_sf_page_offset = getattr(metadata.kv_cache_manager, "get_mla_v_scale_page_offset", None)
+    v_sf_page_offset = (
+        int(get_v_sf_page_offset(local_layer))
+        if callable(get_v_sf_page_offset)
+        else local_layer * kv_cache.shape[0]
+    )
+    if v_sf_page_offset != v_page_offset:
+        raise RuntimeError(
+            "Persistent FP4 MLA V-packed and V-scale pools require matching encoded layer offsets."
+        )
+    expected_v_sf_ptr = (
+        core_v_sf.data_ptr() + v_sf_page_offset * v_sf_pool.stride(1) * v_sf_pool.element_size()
+    )
+    if expected_v_sf_ptr != v_sf.data_ptr():
+        raise RuntimeError(
+            "Persistent FP4 MLA V-scale layer view does not match its "
+            "full-pool base and page offset."
+        )
+    return _VOperands(v_packed=core_v_packed, v_sf=core_v_sf, page_offset=v_page_offset)
 
-        fused_v_transpose = _fp4_mla_cutedsl_fused_v_transpose_enabled()
-        if fused_v_transpose:
-            # The fusion kernel reads V from the canonical KV cache and uses
-            # the current layer V scales directly. Keep a None placeholder so
-            # the mufu16 and fused-V launchers share one Python call site.
-            core_v_packed = None
-            core_v_sf = v_sf
-            v_page_offset = 0
-        else:
-            v_packed = _get_cutedsl_persistent_v_packed_cache(
-                metadata,
-                local_layer,
-                kv_cache,
-                v_head_dim=kv_lora_rank,
-                page_size=metadata.page_size,
-                block_v=SMEM_P4_V_N_PER_CTA,
-            )
-            core_v_packed = _get_fp4_mla_v_packed_pool_base(metadata)
-            if core_v_packed is None:
-                raise RuntimeError("Persistent FP4 MLA V packing requires a stable full-pool base.")
-            get_v_page_offset = getattr(
-                metadata.kv_cache_manager, "get_mla_v_packed_page_offset", None
-            )
-            v_page_offset = (
-                int(get_v_page_offset(local_layer))
-                if callable(get_v_page_offset)
-                else local_layer * kv_cache.shape[0]
-            )
-            page_bytes = kv_lora_rank * (metadata.page_size // 2)
-            expected_layer_ptr = core_v_packed.data_ptr() + v_page_offset * page_bytes
-            if expected_layer_ptr != v_packed.data_ptr():
-                raise RuntimeError(
-                    "Persistent FP4 MLA V-packed layer view does not match its "
-                    "full-pool base and page offset."
-                )
 
-            v_sf_pool_base = _get_fp4_mla_v_scale_pool_base(metadata)
-            if v_sf_pool_base is None:
-                v_sf_pool_base = v_sf_pool.flatten(0, 1).view(torch.uint8)
-                if v_sf_pool_base.data_ptr() != v_sf_pool.data_ptr():
-                    raise RuntimeError(
-                        "Persistent FP4 MLA V-scale pool must flatten without a copy."
-                    )
-            if (
-                not isinstance(v_sf_pool_base, torch.Tensor)
-                or v_sf_pool_base.dtype != torch.uint8
-                or v_sf_pool_base.device != v_sf.device
-                or v_sf_pool_base.ndim != 2
-                or v_sf_pool_base.shape[1] != v_sf_pool.shape[-1]
-                or not v_sf_pool_base.is_contiguous()
-            ):
-                raise RuntimeError(
-                    "Persistent FP4 MLA V-scale pool base must be a contiguous "
-                    "two-dimensional uint8 tensor with the configured page stride."
-                )
-            core_v_sf = v_sf_pool_base.view(torch.float8_e4m3fn)
-            get_v_sf_page_offset = getattr(
-                metadata.kv_cache_manager, "get_mla_v_scale_page_offset", None
-            )
-            v_sf_page_offset = (
-                int(get_v_sf_page_offset(local_layer))
-                if callable(get_v_sf_page_offset)
-                else local_layer * kv_cache.shape[0]
-            )
-            if v_sf_page_offset != v_page_offset:
-                raise RuntimeError(
-                    "Persistent FP4 MLA V-packed and V-scale pools require "
-                    "matching encoded layer offsets."
-                )
-            expected_v_sf_ptr = (
-                core_v_sf.data_ptr()
-                + v_sf_page_offset * v_sf_pool.stride(1) * v_sf_pool.element_size()
-            )
-            if expected_v_sf_ptr != v_sf.data_ptr():
-                raise RuntimeError(
-                    "Persistent FP4 MLA V-scale layer view does not match its "
-                    "full-pool base and page offset."
-                )
+def _launch_packed_2x_decode(call: _DecodeCall, v: _VOperands, cutedsl_kernel: Any) -> None:
+    _run_cutedsl_packed_decode(
+        cutedsl_kernel,
+        call.metadata,
+        q_fp4=call.q_fp4,
+        q_sf=call.q_sf,
+        kv_cache=call.kv_cache,
+        sf_cache=call.sf_cache,
+        v_packed=v.v_packed,
+        v_sf=v.v_sf,
+        kv_global_scale=call.kv_global_scale,
+        q_global_scale=call.q_global_scale,
+        src_page_ids=call.src_page_ids,
+        page_indptr=call.page_indptr,
+        kv_lens=call.kv_lens,
+        output=call.output,
+        num_heads=call.num_heads,
+        query_len=call.query_len_per_seq,
+        num_requests=call.num_gen_seqs,
+        rows_per_seq=call.packed_rows_per_seq,
+        sm_scale=call.sm_scale,
+        v_page_offset=v.page_offset,
+        helix_kv_bounds=call.helix_kv_bounds,
+        softmax_stats_tensor=call.softmax_stats_tensor,
+        plan_geometry=call.plan_geometry,
+    )
 
-        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
-            # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
-            # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
-            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
-            # KV regime ceiling of a regime-keyed CUDA graph (Fp4MlaState.kv_regime_max_kv), an upper bound of the
-            # step's longest live KV; eager steps decide on the capacity.
-            from . import fp4_mla_cutedsl_4x_host as _host_4x
 
-            max_kv_len_4x = max_pages * metadata.page_size
-            strategy = _dispatch.choose_decode_strategy(
-                num_requests=num_gen_seqs,
-                query_len=query_len_per_seq,
-                num_heads=num_heads,
-                rows_per_seq=packed_rows_per_seq,
-                kv_capacity=max_kv_len_4x,
-                sm_count=_get_sm_count(q.device),
-                envelope_reason=_host_4x.envelope_reason_static,
-                live_max_kv=getattr(metadata.fp4_mla_state, "kv_regime_max_kv", None),
-                helix=helix_kv_bounds is not None,
-                softmax_stats=softmax_stats_tensor is not None,
-                v_packed=core_v_packed is not None,
-                four_x_unavailable=_host_4x.device_unsupported_reason(q.device),
-            )
-            _decode_4x._fp4_mla_4x_record(
-                None if strategy.path != _dispatch.PATH_2X else strategy.reason,
-                num_gen_seqs,
-                query_len_per_seq,
-                max_kv_len_4x,
-                tag=strategy.record_tag,
-            )
-            if strategy.path == _dispatch.PATH_TWO_STREAM:
-                _decode_twostream.run_cutedsl_twostream_decode(
-                    cutedsl_kernel,
-                    metadata,
-                    q_fp4,
-                    q_sf,
-                    kv_cache,
-                    sf_cache,
-                    core_v_packed,
-                    core_v_sf,
-                    global_scale,
-                    q_global_scale,
-                    src_page_ids,
-                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                    kv_lens,
-                    output,
-                    num_heads=num_heads,
-                    query_len=query_len_per_seq,
-                    num_requests=num_gen_seqs,
-                    num_requests_2x=strategy.num_requests_2x,
-                    rows_per_seq=packed_rows_per_seq,
-                    max_kv_len=max_kv_len_4x,
-                    sm_scale=float(sm_scale),
-                    v_page_offset=v_page_offset,
-                    run_4x=_decode_4x._run_cutedsl_4x_decode,
-                    run_2x=_run_cutedsl_packed_decode,
-                )
-                return
-            if strategy.path == _dispatch.PATH_4X:
-                _decode_4x._run_cutedsl_4x_decode(
-                    q_fp4,
-                    q_sf,
-                    kv_cache,
-                    sf_cache,
-                    core_v_packed,
-                    core_v_sf,
-                    global_scale,
-                    q_global_scale,
-                    src_page_ids,
-                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                    kv_lens,
-                    output,
-                    num_heads=num_heads,
-                    query_len=query_len_per_seq,
-                    num_requests=num_gen_seqs,
-                    max_kv_len=max_kv_len_4x,
-                    sm_scale=float(sm_scale),
-                    v_page_offset=v_page_offset,
-                    metadata=metadata,
-                )
-                return
-        if packed_rows_per_seq:
-            _run_cutedsl_packed_decode(
-                cutedsl_kernel,
-                metadata,
-                q_fp4,
-                q_sf,
-                kv_cache,
-                sf_cache,
-                core_v_packed,
-                core_v_sf,
-                global_scale,
-                q_global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                kv_lens,
-                output,
-                num_heads=num_heads,
-                query_len=query_len_per_seq,
-                num_requests=num_gen_seqs,
-                rows_per_seq=packed_rows_per_seq,
-                sm_scale=float(sm_scale),
-                v_page_offset=v_page_offset,
-                helix_kv_bounds=helix_kv_bounds,
-                softmax_stats_tensor=softmax_stats_tensor,
-                plan_geometry=plan_geometry,
+def _launch_4x_decode(call: _DecodeCall, v: _VOperands) -> None:
+    _decode_4x._run_cutedsl_4x_decode(
+        q_fp4=call.q_fp4,
+        q_sf=call.q_sf,
+        kv_cache=call.kv_cache,
+        sf_cache=call.sf_cache,
+        v_packed=v.v_packed,
+        v_sf=v.v_sf,
+        kv_global_scale=call.kv_global_scale,
+        q_global_scale=call.q_global_scale,
+        src_page_ids=call.src_page_ids,
+        page_indptr=call.page_indptr,
+        kv_lens=call.kv_lens,
+        output=call.output,
+        num_heads=call.num_heads,
+        query_len=call.query_len_per_seq,
+        num_requests=call.num_gen_seqs,
+        max_kv_len=call.max_kv_len,
+        sm_scale=call.sm_scale,
+        v_page_offset=v.page_offset,
+        metadata=call.metadata,
+    )
+
+
+def _launch_twostream_decode(
+    call: _DecodeCall, v: _VOperands, cutedsl_kernel: Any, *, num_requests_2x: int
+) -> None:
+    _decode_twostream.run_cutedsl_twostream_decode(
+        cutedsl_kernel,
+        call.metadata,
+        q_fp4=call.q_fp4,
+        q_sf=call.q_sf,
+        kv_cache=call.kv_cache,
+        sf_cache=call.sf_cache,
+        v_packed=v.v_packed,
+        v_sf=v.v_sf,
+        kv_global_scale=call.kv_global_scale,
+        q_global_scale=call.q_global_scale,
+        src_page_ids=call.src_page_ids,
+        page_indptr=call.page_indptr,
+        kv_lens=call.kv_lens,
+        output=call.output,
+        num_heads=call.num_heads,
+        query_len=call.query_len_per_seq,
+        num_requests=call.num_gen_seqs,
+        num_requests_2x=num_requests_2x,
+        rows_per_seq=call.packed_rows_per_seq,
+        max_kv_len=call.max_kv_len,
+        sm_scale=call.sm_scale,
+        v_page_offset=v.page_offset,
+        run_4x=_decode_4x._run_cutedsl_4x_decode,
+        run_2x=_run_cutedsl_packed_decode,
+    )
+
+
+def _run_packed_decode(call: _DecodeCall, v: _VOperands, cutedsl_kernel: Any) -> None:
+    """Decode a call in the packed Q layout on the 2x kernel, the 4x kernel or both."""
+    if _decode_4x._fp4_mla_cutedsl_4x_enabled():
+        # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
+        # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
+        # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
+        # KV regime ceiling of a regime-keyed CUDA graph (Fp4MlaState.kv_regime_max_kv), an upper bound of the
+        # step's longest live KV; eager steps decide on the capacity.
+        from . import fp4_mla_cutedsl_4x_host as _host_4x
+
+        strategy = _dispatch.choose_decode_strategy(
+            num_requests=call.num_gen_seqs,
+            query_len=call.query_len_per_seq,
+            num_heads=call.num_heads,
+            rows_per_seq=call.packed_rows_per_seq,
+            kv_capacity=call.max_kv_len,
+            sm_count=_get_sm_count(call.device),
+            envelope_reason=_host_4x.envelope_reason_static,
+            live_max_kv=getattr(call.metadata.fp4_mla_state, "kv_regime_max_kv", None),
+            helix=call.helix_kv_bounds is not None,
+            softmax_stats=call.softmax_stats_tensor is not None,
+            v_packed=v.v_packed is not None,
+            four_x_unavailable=_host_4x.device_unsupported_reason(call.device),
+        )
+        _decode_4x._fp4_mla_4x_record(
+            None if strategy.path != _dispatch.PATH_2X else strategy.reason,
+            call.num_gen_seqs,
+            call.query_len_per_seq,
+            call.max_kv_len,
+            tag=strategy.record_tag,
+        )
+        if strategy.path == _dispatch.PATH_TWO_STREAM:
+            _launch_twostream_decode(
+                call, v, cutedsl_kernel, num_requests_2x=strategy.num_requests_2x
             )
             return
-
-        from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
-
-        if fold_queries:
-            from .fp4_mla_foldq import run_fp4_mla_foldq
-
-            run_fp4_mla_foldq(
-                cutedsl_kernel,
-                metadata,
-                q_fp4,
-                q_sf,
-                kv_cache,
-                sf_cache,
-                core_v_packed,
-                core_v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                kv_lens,
-                output,
-                splits=select_split_count(max_pages * metadata.page_size),
-                max_kv_len=max_pages * metadata.page_size,
-                sm_scale=float(sm_scale),
-                q_global_scale=q_global_scale,
-                query_len_per_seq=query_len_per_seq,
-                v_page_offset=v_page_offset,
-            )
+        if strategy.path == _dispatch.PATH_4X:
+            _launch_4x_decode(call, v)
             return
+    _launch_packed_2x_decode(call, v, cutedsl_kernel)
 
-        # Helix also needs per-query bounds and softmax stats from the native path.
-        splits = (
-            select_split_count(max_pages * metadata.page_size)
-            if helix_kv_bounds is None and softmax_stats_tensor is None
-            else 1
-        )
-        direct_split_output = splits > 1 and getattr(
-            metadata, "_fp4_mla_splitkv_direct_output", True
-        )
-        kernel_output = output
-        kernel_softmax_stats = None
-        if softmax_stats_tensor is not None:
-            kernel_softmax_stats = _ensure_workspace_tensor(
-                metadata,
-                "_fp4_mla_cutedsl_softmax_stats_buf",
-                (2, num_queries, physical_heads),
-                dtype=torch.float32,
-                device=output.device,
-                capacity_numel=2 * _max_sequences(metadata) * query_len_per_seq * physical_heads,
-            )
-        if num_heads < physical_heads and not direct_split_output:
-            kernel_output = _ensure_workspace_tensor(
-                metadata,
-                "_fp4_mla_cutedsl_output_buf",
-                (q_batch_capacity, physical_heads, kv_lora_rank),
-                dtype=output.dtype,
-                device=output.device,
-            )[:num_queries]
 
-        if splits > 1:
-            run_fp4_mla_splitkv(
-                _fp4_mla_cutedsl_kernel_module(),
-                metadata,
-                kernel_q,
-                kernel_q_sf,
-                kv_cache,
-                sf_cache,
-                core_v_packed,
-                core_v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                kv_lens,
-                kernel_output,
-                splits=splits,
-                max_kv_len=max_pages * metadata.page_size,
-                sm_scale=float(sm_scale),
-                q_global_scale=q_global_scale,
-                query_len_per_seq=query_len_per_seq,
-                v_page_offset=v_page_offset,
-                q_batch_capacity=q_batch_capacity,
-            )
-        else:
-            run_trtllm_fp4_mla_decode_page_native_from_raw(
-                kernel_q,
-                kernel_q_sf,
-                kv_cache,
-                sf_cache,
-                core_v_packed,
-                core_v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-                kv_lens,
-                kernel_output,
-                max_kv_len=max_pages * metadata.page_size,
-                sm_scale=float(sm_scale),
-                num_heads=physical_heads,
-                q_global_scale=q_global_scale,
-                page_size=metadata.page_size,
-                query_len_per_seq=query_len_per_seq,
-                v_page_offset=v_page_offset,
-                q_batch_capacity=q_batch_capacity,
-                partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
-                softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
-                softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
-                helix_kv_bounds=helix_kv_bounds,
-            )
-        if kernel_output is not output:
-            output.copy_(kernel_output[:, :num_heads])
-        if kernel_softmax_stats is not None:
-            softmax_stats_tensor[..., 0].copy_(kernel_softmax_stats[0, :, :num_heads])
-            softmax_stats_tensor[..., 1].copy_(kernel_softmax_stats[1, :, :num_heads])
+def _launch_folded_query_decode(call: _DecodeCall, v: _VOperands, cutedsl_kernel: Any) -> None:
+    from .fp4_mla_foldq import run_fp4_mla_foldq
+    from .fp4_mla_splitkv import select_split_count
+
+    run_fp4_mla_foldq(
+        cutedsl_kernel,
+        call.metadata,
+        q=call.q_fp4,
+        q_sf=call.q_sf,
+        kv_cache=call.kv_cache,
+        sf_cache=call.sf_cache,
+        v_packed=v.v_packed,
+        v_sf=v.v_sf,
+        kv_scale=call.kv_global_scale,
+        src_pages=call.src_page_ids,
+        src_indptr=call.page_indptr,
+        lengths=call.kv_lens,
+        output=call.output,
+        splits=select_split_count(call.max_kv_len),
+        max_kv_len=call.max_kv_len,
+        sm_scale=call.sm_scale,
+        q_global_scale=call.q_global_scale,
+        query_len_per_seq=call.query_len_per_seq,
+        v_page_offset=v.page_offset,
+    )
+
+
+def _run_unpacked_decode(
+    call: _DecodeCall, v: _VOperands, q: _UnpackedQ, cutedsl_kernel: Any
+) -> None:
+    """Decode a call in the unpacked Q layout: one kernel task per query token, or split along KV."""
+    from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
+
+    metadata = call.metadata
+    output = call.output
+    softmax_stats_tensor = call.softmax_stats_tensor
+    # Helix also needs per-query bounds and softmax stats from the native path.
+    splits = (
+        select_split_count(call.max_kv_len)
+        if call.helix_kv_bounds is None and softmax_stats_tensor is None
+        else 1
+    )
+    direct_split_output = splits > 1 and getattr(metadata, "_fp4_mla_splitkv_direct_output", True)
+    kernel_output = output
+    kernel_softmax_stats = None
+    if softmax_stats_tensor is not None:
+        kernel_softmax_stats = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_cutedsl_softmax_stats_buf",
+            (2, call.num_queries, _CUTEDSL_PHYSICAL_HEADS),
+            dtype=torch.float32,
+            device=output.device,
+            capacity_numel=2
+            * _max_sequences(metadata)
+            * call.query_len_per_seq
+            * _CUTEDSL_PHYSICAL_HEADS,
+        )
+    if call.num_heads < _CUTEDSL_PHYSICAL_HEADS and not direct_split_output:
+        kernel_output = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_cutedsl_output_buf",
+            (q.q_batch_capacity, _CUTEDSL_PHYSICAL_HEADS, call.kv_lora_rank),
+            dtype=output.dtype,
+            device=output.device,
+        )[: call.num_queries]
+
+    if splits > 1:
+        run_fp4_mla_splitkv(
+            cutedsl_kernel,
+            metadata,
+            q_fp4=q.q_fp4,
+            q_sf=q.q_sf,
+            kv_cache=call.kv_cache,
+            sf_cache=call.sf_cache,
+            v_packed=v.v_packed,
+            v_sf=v.v_sf,
+            kv_global_scale=call.kv_global_scale,
+            src_page_ids=call.src_page_ids,
+            src_indptr=call.page_indptr,
+            kv_lens=call.kv_lens,
+            output=kernel_output,
+            splits=splits,
+            max_kv_len=call.max_kv_len,
+            sm_scale=call.sm_scale,
+            q_global_scale=call.q_global_scale,
+            query_len_per_seq=call.query_len_per_seq,
+            v_page_offset=v.page_offset,
+            q_batch_capacity=q.q_batch_capacity,
+        )
+    else:
+        cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw(
+            q_fp4=q.q_fp4,
+            q_sf=q.q_sf,
+            kv_cache=call.kv_cache,
+            sf_cache=call.sf_cache,
+            v_packed=v.v_packed,
+            v_sf=v.v_sf,
+            global_scale=call.kv_global_scale,
+            src_page_ids=call.src_page_ids,
+            paged_kv_indptr_decode=call.page_indptr,
+            kv_lens=call.kv_lens,
+            output=kernel_output,
+            max_kv_len=call.max_kv_len,
+            sm_scale=call.sm_scale,
+            num_heads=_CUTEDSL_PHYSICAL_HEADS,
+            q_global_scale=call.q_global_scale,
+            page_size=metadata.page_size,
+            query_len_per_seq=call.query_len_per_seq,
+            v_page_offset=v.page_offset,
+            q_batch_capacity=q.q_batch_capacity,
+            partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+            helix_kv_bounds=call.helix_kv_bounds,
+        )
+    if kernel_output is not output:
+        output.copy_(kernel_output[:, : call.num_heads])
+    if kernel_softmax_stats is not None:
+        softmax_stats_tensor[..., 0].copy_(kernel_softmax_stats[0, :, : call.num_heads])
+        softmax_stats_tensor[..., 1].copy_(kernel_softmax_stats[1, :, : call.num_heads])
+
+
+def _run_cutedsl_attention_decode(call: _DecodeCall) -> None:
+    """Decode on the CuTe DSL kernels.
+
+    A call in the packed Q layout runs on the 2x kernel, the 4x kernel or both
+    (two-stream). A call in the unpacked layout runs one kernel task per query
+    token, split along KV when it is long, or the folded-query specialization.
+    """
+    _check_cutedsl_decode_supported(call)
+    cutedsl_kernel = _fp4_mla_cutedsl_kernel_module()
+    if call.packed_rows_per_seq:
+        _run_packed_decode(call, _cutedsl_v_operands(call, cutedsl_kernel), cutedsl_kernel)
         return
+    if _uses_folded_queries(call, cutedsl_kernel):
+        _launch_folded_query_decode(call, _cutedsl_v_operands(call, cutedsl_kernel), cutedsl_kernel)
+        return
+    q = _unpacked_kernel_q(call, cutedsl_kernel)
+    _run_unpacked_decode(call, _cutedsl_v_operands(call, cutedsl_kernel), q, cutedsl_kernel)
 
-    total_p_rows = num_queries * max_pages * num_heads
+
+def _run_triton_backend_decode(call: _DecodeCall) -> None:
+    """Decode on the Triton kernels.
+
+    Self-contained public-Triton path: TMA-loaded QK + fused page-stats pack,
+    reduce-stats, prob-scale, and PV with an optional prepacked V cache.
+    """
+    if call.backend != "triton":
+        raise ValueError(
+            f"Unsupported FP4 MLA attention backend '{call.backend}'. "
+            f"Set {FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton' or "
+            f"'{_FP4_MLA_CUTEDSL_BACKEND}'."
+        )
+    metadata = call.metadata
+    total_p_rows = call.num_queries * call.max_pages * call.num_heads
     p_fp4 = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_buf",
         (max(total_p_rows, 1), metadata.page_size // 2),
         dtype=torch.uint8,
-        device=q.device,
+        device=call.device,
     )[:total_p_rows]
     p_sf = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_sf_buf",
         (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
         dtype=torch.float8_e4m3fn,
-        device=q.device,
+        device=call.device,
     )
-    stats_shape = (num_queries, num_heads)
+    stats_shape = (call.num_queries, call.num_heads)
     max_scores = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_max_buf",
         stats_shape,
         dtype=torch.float32,
-        device=q.device,
+        device=call.device,
     )
     denom = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_denom_buf",
         stats_shape,
         dtype=torch.float32,
-        device=q.device,
+        device=call.device,
     )
-
-    if backend != "triton":
-        raise ValueError(
-            f"Unsupported FP4 MLA attention backend '{backend}'. "
-            f"Set {FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton' or "
-            f"'{_FP4_MLA_CUTEDSL_BACKEND}'."
-        )
-
-    # Self-contained public-Triton path: TMA-loaded QK + fused page-stats pack,
-    # reduce-stats, prob-scale, and PV with an optional prepacked V cache.
     _run_triton_attention_decode(
         metadata=metadata,
-        layer_idx=layer_idx,
-        local_layer=local_layer,
-        q_fp4=q_fp4,
-        q_sf=q_sf.contiguous().view(-1),
-        kv_cache=kv_cache,
-        sf_cache=sf_cache,
-        v_sf=v_sf,
-        global_scale=global_scale,
-        src_page_ids=src_page_ids,
-        kv_lens=kv_lens,
+        layer_idx=call.layer_idx,
+        local_layer=call.local_layer,
+        q_fp4=call.q_fp4,
+        q_sf=call.q_sf.contiguous().view(-1),
+        kv_cache=call.kv_cache,
+        sf_cache=call.sf_cache,
+        v_sf=call.v_sf,
+        global_scale=call.kv_global_scale,
+        src_page_ids=call.src_page_ids,
+        kv_lens=call.kv_lens,
         p_fp4=p_fp4,
         p_sf=p_sf,
         max_scores=max_scores,
         denom=denom,
-        output=output,
-        num_queries=num_queries,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        kv_lora_rank=kv_lora_rank,
-        q_residual_dim=q_residual_dim,
-        query_len_per_seq=query_len_per_seq,
-        max_pages=max_pages,
-        sm_scale=float(sm_scale),
-        q_global_scale=q_global_scale,
+        output=call.output,
+        num_queries=call.num_queries,
+        num_heads=call.num_heads,
+        head_dim=call.head_dim,
+        kv_lora_rank=call.kv_lora_rank,
+        q_residual_dim=FP4_MLA_Q_RESIDUAL_DIM,
+        query_len_per_seq=call.query_len_per_seq,
+        max_pages=call.max_pages,
+        sm_scale=call.sm_scale,
+        q_global_scale=call.q_global_scale,
     )
+
+
+def run_fp4_mla_attention_decode(
+    metadata: Any,
+    layer_idx: int,
+    local_layer: int,
+    q: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    sm_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    prequantized_q: torch.Tensor,
+    prequantized_q_sf: torch.Tensor,
+    q_batch_capacity: int,
+    softmax_stats_tensor: torch.Tensor | None = None,
+) -> None:
+    """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
+
+    Q is supplied in its assembled ``[latent, RoPE]`` layout and quantized to
+    FP4 directly. QK reads ``[KV-nope, K-RoPE, K-RoPE-residual]`` contiguously
+    from the primary cache with swizzled block scales. Softmax probabilities
+    are quantized to FP4 per page, and PV repacks V nibbles from the shared KV
+    cache while reading the auxiliary V-view scale pool. No BF16 dequantized
+    KV workspace is materialized on this path. Callers must supply the packed Q
+    and scales produced by the fused generation cache update.
+    """
+    call = _prepare_decode_call(
+        metadata,
+        layer_idx,
+        local_layer,
+        q,
+        output,
+        sm_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        prequantized_q=prequantized_q,
+        prequantized_q_sf=prequantized_q_sf,
+        q_batch_capacity=q_batch_capacity,
+        softmax_stats_tensor=softmax_stats_tensor,
+    )
+    if call.backend == _FP4_MLA_CUTEDSL_BACKEND:
+        _run_cutedsl_attention_decode(call)
+    else:
+        _run_triton_backend_decode(call)
