@@ -27,7 +27,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
+    SamplingSchedule,
     load_scheduler,
+    resolve_sampling_schedule,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
@@ -69,6 +71,10 @@ def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
     scheduler_dir.mkdir(parents=True, exist_ok=True)
     with open(scheduler_dir / "scheduler_config.json", "w") as f:
         json.dump(config, f)
+
+
+# The schedule every request on a distilled checkpoint resolves to.
+_FIXED = SamplingSchedule(grid="fixed", flow_shift=1.0)
 
 
 def _distilled_policy() -> Cosmos3SamplingPolicy:
@@ -305,12 +311,22 @@ class TestValidateRequest:
         _base_policy().validate_request(None, None)
 
 
+def _resolved(policy, flow_shift):
+    return resolve_sampling_schedule(
+        policy,
+        sigma_grid=None,
+        flow_shift=flow_shift,
+        mode_flow_shift=1.0,
+        mode_use_karras_sigmas=None,
+    )
+
+
 class TestFlowShift:
     def test_unipc_rebuilds_on_change(self):
         policy = _base_policy()
         scheduler = _base_scheduler()
 
-        rebuilt = policy.set_flow_shift(scheduler, 3.0)
+        rebuilt = policy.set_flow_shift(scheduler, _resolved(policy, 3.0))
         assert rebuilt is not scheduler
         assert isinstance(rebuilt, UniPCMultistepScheduler)
         assert float(rebuilt.config.flow_shift) == 3.0
@@ -319,31 +335,38 @@ class TestFlowShift:
         """No separate shift-tracking state: a second call with the same target
         on the rebuilt instance is a no-op; restoring rebuilds again."""
         policy = _base_policy()
-        rebuilt = policy.set_flow_shift(_base_scheduler(), 3.0)
-        assert policy.set_flow_shift(rebuilt, 3.0) is rebuilt
+        rebuilt = policy.set_flow_shift(_base_scheduler(), _resolved(policy, 3.0))
+        assert policy.set_flow_shift(rebuilt, _resolved(policy, 3.0)) is rebuilt
 
-        restored = policy.set_flow_shift(rebuilt, 1.0)
+        restored = policy.set_flow_shift(rebuilt, _resolved(policy, 1.0))
         assert restored is not rebuilt
         assert float(restored.config.flow_shift) == 1.0
 
     def test_distilled_is_structural_noop(self):
         policy = _distilled_policy()
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        assert policy.set_flow_shift(scheduler, 3.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, None)) is scheduler
 
 
 class TestSetTimesteps:
     def test_distilled_programs_fixed_sigmas(self):
         policy = _distilled_policy()
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        policy.set_timesteps(scheduler, num_inference_steps=4, device="cpu")
+        policy.set_timesteps(scheduler, num_inference_steps=4, device="cpu", schedule=_FIXED)
         expected = [s * 1000.0 for s in DISTILLED_SIGMAS]
         assert torch.allclose(scheduler.timesteps.float(), torch.tensor(expected), atol=1e-3)
 
     def test_base_programs_step_count(self):
         policy = _base_policy()
         scheduler = _base_scheduler()
-        policy.set_timesteps(scheduler, num_inference_steps=7, device="cpu")
+        schedule = resolve_sampling_schedule(
+            policy,
+            sigma_grid=None,
+            flow_shift=None,
+            mode_flow_shift=1.0,
+            mode_use_karras_sigmas=None,
+        )
+        policy.set_timesteps(scheduler, num_inference_steps=7, device="cpu", schedule=schedule)
         assert len(scheduler.timesteps) == 7
 
 
@@ -353,7 +376,7 @@ class TestStochasticStepDeterminism:
     def _run_steps(self, seed):
         policy = _distilled_policy()
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        policy.set_timesteps(scheduler, num_inference_steps=4, device="cpu")
+        policy.set_timesteps(scheduler, num_inference_steps=4, device="cpu", schedule=_FIXED)
         generator = torch.Generator().manual_seed(seed)
         kwargs = policy.scheduler_step_kwargs(generator)
 
