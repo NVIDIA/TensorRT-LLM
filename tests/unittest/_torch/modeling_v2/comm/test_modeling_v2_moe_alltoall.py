@@ -14,7 +14,8 @@ another NaN, an e2m1 -0 into +0).
 The combine check runs a stand-in expert: a rank's finalized row is the token's base vector
 times the token's routing weights on the slots this rank holds, so a token's combined row is
 its base vector times all its weights. Rows that hold no token for the rank are filled with a
-large value the combine must never read.
+large value the combine must never read. The finalized rows reach the combine in a tensor of
+their own or in the rows it reads in the workspace (`moe_alltoall_combine_rows`).
 """
 
 import pickle
@@ -122,6 +123,7 @@ def _worker(case: dict) -> dict:
     from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
     from tensorrt_llm._torch.modeling_v2.catalog.comm.moe_alltoall import (
         moe_alltoall_combine,
+        moe_alltoall_combine_rows,
         moe_alltoall_dispatch,
         moe_alltoall_gathered_statistic,
         moe_alltoall_workspace,
@@ -204,7 +206,10 @@ def _worker(case: dict) -> dict:
                 f"from rank {src} received tokens {sorted(received[src])}, expected {expected[src]}"
             )
 
-    combined = moe_alltoall_combine(a2a, partial.to(dev)).cpu().float()
+    rows = partial.to(dev)
+    if case.get("in_workspace"):
+        rows = moe_alltoall_combine_rows(a2a, max(counts), HIDDEN).copy_(rows)
+    combined = moe_alltoall_combine(a2a, rows).cpu().float()
     want = mine["base"].float() * mine["weights"].float().sum(-1, keepdim=True)
     if mine["pad"]:
         want[-mine["pad"] :] = 0
@@ -244,12 +249,15 @@ def _run(pool: MPIPoolExecutor, case: dict) -> list[dict]:
 
 
 @pytest.mark.no_xdist
+@pytest.mark.parametrize("rows_in", ["own_tensor", "workspace"])
 @pytest.mark.parametrize("cell", MoeAlltoallDispatch.CELLS, ids=lambda c: c.why[:40])
-def test_certified_cells(pool, cell) -> None:
+def test_certified_cells(pool, cell, rows_in) -> None:
     """Every rank receives exactly the tokens with a slot in its window, payload, scales,
     slots and weights intact; every token comes back with all its weights summed, and a row
-    sent to no rank comes back as zeros."""
-    for r in _run(pool, dict(spec=dict(cell.spec), seed=11, eplb=False)):
+    sent to no rank comes back as zeros, whether the combine reads the finalized rows from a
+    tensor of their own or from its workspace."""
+    case = dict(spec=dict(cell.spec), seed=11, eplb=False, in_workspace=rows_in == "workspace")
+    for r in _run(pool, case):
         assert not r["errors"], f"rank {r['rank']}: " + "; ".join(r["errors"][:5])
         # bf16 rows, summed over at most top_k ranks: a few ulps of the largest value.
         assert r["combine_err"] <= 2**-6 * max(r["combine_scale"], 1.0), (r["rank"], r)

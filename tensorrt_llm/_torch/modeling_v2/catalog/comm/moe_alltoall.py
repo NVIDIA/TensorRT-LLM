@@ -11,7 +11,9 @@ A routed MoE layer under wide expert parallelism runs one round trip per round o
    round; a received row's slot ids stay global, and a row that holds no token for this rank
    carries `INVALID_SLOT` in every slot.
 2. The rank's expert kernel runs over the received rows, its own slot window only, and
-   finalizes each row: the row's weighted sum over the slots this rank holds.
+   finalizes each row: the row's weighted sum over the slots this rank holds. A kernel that
+   finalizes into `moe_alltoall_combine_rows`, the rows the combine reads in the workspace,
+   saves the combine a copy of every row.
 3. `moe_alltoall_combine`: every rank sends each finalized row back to the rank it came from,
    which sums the rows of its tokens, `[local_tokens, hidden]`.
 
@@ -279,7 +281,8 @@ class MoeAlltoallCombine(OpWrapper):
         Args:
             workspace: The communicator of that dispatch.
             final_hidden_states: The finalized rows, `[ep_size * max_tokens, hidden]` BF16,
-                in the order the dispatch received them.
+                in the order the dispatch received them. Rows in `moe_alltoall_combine_rows`
+                are read where they are; others are first copied there.
         """
         return workspace.combine(final_hidden_states)
 
@@ -303,6 +306,18 @@ class MoeAlltoallCombine(OpWrapper):
             for i, token in enumerate(sources[rank]):
                 out[token] += partials[i].float()
         return out
+
+
+def moe_alltoall_combine_rows(workspace, max_tokens: int, hidden_size: int) -> torch.Tensor:
+    """The rows the next combine on `workspace` reads, `[ep_size * max_tokens, hidden_size]`
+    BF16 in the communicator's workspace, `max_tokens` the largest count any rank sent in the
+    round the last dispatch on `workspace` opened. An expert kernel that writes its finalized
+    rows here, in the order the dispatch received them, saves `moe_alltoall_combine` a copy of
+    every row. The rows hold nothing until the kernel writes them, and only until the combine
+    reads them."""
+    return workspace.get_combine_payload_tensor_in_workspace(
+        max_tokens, hidden_size, torch.bfloat16
+    )
 
 
 def moe_alltoall_gathered_statistic(workspace) -> Optional[torch.Tensor]:

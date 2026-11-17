@@ -90,6 +90,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.mnnvl_allreduce import (
 from tensorrt_llm._torch.modeling_v2.catalog.comm.moe_alltoall import (
     alltoall_rounds,
     moe_alltoall_combine,
+    moe_alltoall_combine_rows,
     moe_alltoall_dispatch,
     moe_alltoall_gathered_statistic,
     moe_alltoall_workspace,
@@ -821,11 +822,12 @@ def _trunk_runner(
     xsf: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_w: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """This rank's slots of a trunk layer over NVFP4 rows `xq` with their linear scales
     `xsf`: each row finalized to its weighted sum over the slots this rank holds, `[rows,
-    hidden]` bf16. `topk_ids` are global slot ids; the ones outside this rank's window, and
-    `INVALID_SLOT`, add nothing."""
+    hidden]` bf16, written into `out` when given. `topk_ids` are global slot ids; the ones
+    outside this rank's window, and `INVALID_SLOT`, add nothing."""
     cfg = core.model_config.pretrained_config
     d = core.dims
     return fp4_block_scale_moe_runner(
@@ -858,19 +860,19 @@ def _trunk_runner(
         act_type=_ACT_TYPE_SWIGLU,
         topk_weights=topk_w,
         topk_ids=topk_ids,
+        output=out,
     )[0]
 
 
-def _received_in_runner_calls(run: Callable[..., torch.Tensor], *received: torch.Tensor):
+def _received_in_runner_calls(
+    run: Callable[..., torch.Tensor], out: torch.Tensor, *received: torch.Tensor
+) -> torch.Tensor:
     """`run` over the rows an alltoall dispatch received, at most `_MOE_MAX_T` rows a call,
-    re-joined in order for the combine. Every received row is independent."""
-    rows = received[0].shape[0]
-    if rows <= _MOE_MAX_T:
-        return run(*received)
-    return torch.cat(
-        [run(*(t[s : s + _MOE_MAX_T] for t in received)) for s in range(0, rows, _MOE_MAX_T)],
-        0,
-    )
+    each call writing its rows of `out`, the combine's rows in the communicator's workspace
+    (`moe_alltoall_combine_rows`). Every received row is independent."""
+    for s in range(0, received[0].shape[0], _MOE_MAX_T):
+        run(*(t[s : s + _MOE_MAX_T] for t in received), out=out[s : s + _MOE_MAX_T])
+    return out
 
 
 def _experts_alltoall(
@@ -885,7 +887,8 @@ def _experts_alltoall(
     Each rank routes its own tokens -- under EPLB to slots, counting their experts -- and
     quantizes them to NVFP4; `moe_alltoall_dispatch` sends them to the ranks whose slot
     windows hold their slots, each rank runs its slots over what it received
-    (`_trunk_runner`), and `moe_alltoall_combine` sums the results back onto the tokens.
+    (`_trunk_runner`), writing the rows the combine reads in the communicator's workspace, and
+    `moe_alltoall_combine` sums the results back onto the tokens.
     `counts` is every rank's token count: the rounds (`alltoall_rounds`) send at most the
     communicator's capacity a rank, and every rank runs every round, its own tokens or none.
     Under online EPLB the last round's dispatch carries this rank's histogram, and the layer
@@ -920,7 +923,10 @@ def _experts_alltoall(
         if statistic is not None:
             L.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
         run = functools.partial(_trunk_runner, core, L)
-        outs.append(moe_alltoall_combine(a2a, _received_in_runner_calls(run, rq, rsf, rids, rw)))
+        rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
+        outs.append(
+            moe_alltoall_combine(a2a, _received_in_runner_calls(run, rows, rq, rsf, rids, rw))
+        )
     if L.eplb is not None:
         L.eplb.close()
     return outs[0] if len(outs) == 1 else torch.cat(outs, 0)
@@ -1055,6 +1061,7 @@ def _mtp_runner(
     topk_w: torch.Tensor,
     alltoall: bool = False,
     tuner_num_tokens: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """This rank's slots of the MTP layer over bf16 rows `x`, each row finalized to its
     weighted sum over the slots this rank holds. `topk_ids` are global slot ids, `topk_w`
@@ -1062,10 +1069,10 @@ def _mtp_runner(
     back only the rows that hold a token for this rank, so the kernel leaves the others
     unwritten rather than zeroing them; `tuner_num_tokens` is then the round's tokens over
     every rank, which the kernel's tactic is cached by, as it is for the rows before the
-    dispatch."""
+    dispatch. With `out` the rows are written into it, which is returned."""
     d = core.dims
     top_k = core.model_config.pretrained_config.num_experts_per_tok
-    return fused_moe(
+    result = fused_moe(
         input=x,
         token_selected_experts=topk_ids,
         token_final_scales=topk_w,
@@ -1083,7 +1090,9 @@ def _mtp_runner(
         tuner_num_tokens=tuner_num_tokens if alltoall else None,
         tuner_top_k=top_k if alltoall else None,
         activation_type=_FUSED_MOE_ACT_SWIGLU,
-    )[0]
+        out_tensor=out,
+    )
+    return out if out is not None else result[0]
 
 
 def _mtp_experts_alltoall(
@@ -1125,7 +1134,8 @@ def _mtp_experts_alltoall(
         if statistic is not None:
             M.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
         run = functools.partial(_mtp_runner, core, M, alltoall=True, tuner_num_tokens=sum(sizes))
-        outs.append(moe_alltoall_combine(a2a, _received_in_runner_calls(run, rx, rids, rw)))
+        rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
+        outs.append(moe_alltoall_combine(a2a, _received_in_runner_calls(run, rows, rx, rids, rw)))
     return outs[0] if len(outs) == 1 else torch.cat(outs, 0)
 
 

@@ -206,12 +206,14 @@ def _run(pool: MPIPoolExecutor, **case) -> list[dict]:
     return results
 
 
-#: Every rank's token count: decode, uneven with a rank of no tokens, and a prefill-like count
-#: that takes several rounds of `cap` rows.
+#: Every rank's token count: decode, uneven with a rank of no tokens, a prefill-like count
+#: that takes several rounds of `cap` rows, and a round whose received rows (4 x 2600) take
+#: more than one expert-kernel call.
 COUNTS = {
     "decode": ((1, 1, 1, 1), 64),
     "uneven": ((37, 0, 64, 5), 64),
     "rounds": ((300, 17, 0, 129), 64),
+    "large": ((2500, 2600, 2400, 2500), 4096),
 }
 
 
