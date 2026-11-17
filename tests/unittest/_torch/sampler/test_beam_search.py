@@ -2163,7 +2163,7 @@ def test_beam_search_handoff_tolerates_cancellation_during_history_copy(
 @pytest.mark.parametrize(
     "missing_history, error_message",
     [(False, "beam snapshot allocation failed"),
-     (True, "Missing finalized beam history")],
+     (True, "Final beam builder returned no history")],
     ids=["exception", "missing_history"],
 )
 def test_beam_search_handoff_relays_builder_errors(
@@ -2197,7 +2197,10 @@ def test_beam_search_handoff_relays_builder_errors(
                                host=pickle.loads(pickle.dumps(state.host)))
     for sampler, sample_state in ((sampling_rank, state), (receiving_rank,
                                                            relayed)):
-        with pytest.raises(RuntimeError, match=error_message):
+        with pytest.raises(
+                RuntimeError,
+                match="Building final beams on the last pipeline-parallel rank "
+                f"failed: .*{error_message}"):
             sampler.update_requests(sample_state)
 
 
@@ -2214,7 +2217,8 @@ def test_beam_search_handoff_requires_final_history(
     histories = relayed.host.beam_handoff.beam_histories
     assert histories is not None
     del histories[received_requests[0].py_request_id]
-    with pytest.raises(RuntimeError, match="Missing finalized beam history"):
+    with pytest.raises(RuntimeError,
+                       match="Missing relayed final beam history"):
         receiving_rank.update_requests(relayed)
 
 

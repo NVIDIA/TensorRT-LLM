@@ -1397,7 +1397,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return (unfinished.cumsum(dim=1) == 0).sum(dim=1).tolist()
 
     @staticmethod
-    def _beam_request_finishing(
+    def _finalizes_beam_history(
         request: LlmRequest, finished_beam_prefix_lengths: list[int]
     ) -> bool:
         """Whether the step finalizes ``request``, a beam-search request.
@@ -1725,7 +1725,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             finishing = [
                 (req_idx, req)
                 for req_idx, req in enumerate(state.requests)
-                if self._beam_request_finishing(req, finished_beam_prefix_lengths)
+                if self._finalizes_beam_history(req, finished_beam_prefix_lengths)
             ]
             batched_histories = None
             if state.beam_histories_deferred and len(finishing) > 1:
@@ -1745,7 +1745,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if req.state == LlmRequestState.GENERATION_COMPLETE:
                         continue
                     raise RuntimeError(
-                        f"Missing finalized beam history for request {req.py_request_id}"
+                        f"Final beam builder returned no history for request {req.py_request_id}"
                     )
                 beam_histories[req.py_request_id] = beam_history
         except Exception as exception:
@@ -1843,7 +1843,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         assert state.host is not None
         if state.host.beam_handoff is not None and state.host.beam_handoff.error is not None:
-            raise RuntimeError(f"PP beam-search relay failed: {state.host.beam_handoff.error}")
+            raise RuntimeError(
+                "Building final beams on the last pipeline-parallel rank failed: "
+                f"{state.host.beam_handoff.error}"
+            )
         # Reuse sample_async's qualification instead of rechecking every
         # request after the asynchronous sample completes.
         if state.host.single_step_greedy:
@@ -1900,7 +1903,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 beam_history = beam_histories.get(req.py_request_id)
                 if beam_history is None:
                     raise RuntimeError(
-                        f"Missing finalized beam history for request {req.py_request_id}"
+                        f"Missing relayed final beam history for request {req.py_request_id}"
                     )
                 return beam_history
             if (
@@ -1974,7 +1977,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # finished, checking it here first keeps the builder off
                 # for every step that does not end the request.
                 if (
-                    self._beam_request_finishing(req, finished_beam_prefix_lengths)
+                    self._finalizes_beam_history(req, finished_beam_prefix_lengths)
                     and (beam_history := _maybe_build_beam_history(req_idx, req)) is not None
                 ):
                     finalize_beam(req, beam_history)
