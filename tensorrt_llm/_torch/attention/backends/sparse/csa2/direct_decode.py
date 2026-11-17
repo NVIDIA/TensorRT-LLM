@@ -155,9 +155,9 @@ def smem_layout_v2(keys: int) -> dict:
     fac = red + 2 * 8 * 8 * 4
     recv = pad_up(fac + 8 * 9 * 4, 128)
     block = 4 * 32 * 16 + 8 * 8
-    # Two mbarriers: the partial outputs', then the (max, sum) pairs'.
+    # Three mbarriers: the partial outputs', the (max, sum) pairs', then the imported main rows'.
     mbar = recv + 8 * block
-    total_bytes = mbar + 16
+    total_bytes = mbar + 24
     extras = keys * 12 + 16 * 20 + 6 * 128 + 64 * 4
     return {
         "sp": 0,
@@ -185,6 +185,15 @@ def _v2_engaged(q_heads: int, swa_width: int, main_width: int, device_index: int
     cluster = plan_split(swa_width, main_width)
     keys = sum(cta_keys(swa_width, main_width, cluster))
     return cluster == 8 and keys % 16 == 0 and 16 <= keys <= 128
+
+
+def main_rows_bytes(q_heads: int, swa_width: int, main_width: int, device: torch.device) -> int:
+    """Bytes per query row of the BF16 main-row image ``direct_sparse_decode`` stores
+    (``rows_out``) or loads (``rows_in``) for this geometry; 0 when the launch has none."""
+    if not main_width or not _v2_engaged(q_heads, swa_width, main_width, device.index):
+        return 0
+    cluster = plan_split(swa_width, main_width)
+    return cluster * cta_keys(swa_width, main_width, cluster)[0] * _KEY_ROW
 
 
 # 58% (132 KB) shared-memory carveout: the keys-as-M CTA starts beside the projection GEMMs' CTAs.
@@ -953,6 +962,43 @@ def _kernel_type():
         asm(None, [], "barrier.cluster.wait.aligned;", "~{memory}", loc=loc, ip=ip)
 
     @dsl_user_op
+    def bulk_load_global(dst: Int32, src: Int64, size: int, mbar: Int32, *, loc=None, ip=None):
+        """Copy ``size`` bytes of global memory into this CTA's shared memory; the copy completes
+        its bytes on the barrier at ``mbar``."""
+        asm(
+            None,
+            [
+                Int32(dst).ir_value(loc=loc, ip=ip),
+                Int64(src).ir_value(loc=loc, ip=ip),
+                Int32(mbar).ir_value(loc=loc, ip=ip),
+            ],
+            "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+            f"[$0], [$1], {size}, [$2];",
+            "r,l,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def bulk_store_global(dst: Int64, src: Int32, size: int, *, loc=None, ip=None) -> None:
+        """Copy ``size`` bytes of this CTA's shared memory to global memory (``bulk_wait_read``
+        before the CTA exits)."""
+        asm(
+            None,
+            [Int64(dst).ir_value(loc=loc, ip=ip), Int32(src).ir_value(loc=loc, ip=ip)],
+            f"cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], {size};\n\t"
+            "cp.async.bulk.commit_group;",
+            "l,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def bulk_wait_read(*, loc=None, ip=None) -> None:
+        """This thread's bulk copies have read their shared-memory sources."""
+        asm(None, [], "cp.async.bulk.wait_group.read 0;", "~{memory}", loc=loc, ip=ip)
+
+    @dsl_user_op
     def st_global_b16(addr: Int64, w: Int32, *, loc=None, ip=None) -> None:
         asm(
             None,
@@ -1046,6 +1092,8 @@ def _kernel_type():
             main_prewait: bool = False,
             o_rope: bool = False,
             late_coefs: bool = False,
+            rows_out: bool = False,
+            rows_in: bool = False,
         ):
             self.q_heads = q_heads or heads
             self.heads = heads
@@ -1076,6 +1124,10 @@ def _kernel_type():
             # The sinks and RoPE coefficients reach shared memory after the key resolve is issued.
             self.late_coefs = late_coefs
             self.export_slots = export_slots and mapped and main_width > 0
+            # Keys-as-M: ``rows_out`` stores the decoded main rows as laid out in shared memory;
+            # ``rows_in`` (main rows final at launch) copies that image in instead of decoding them.
+            self.rows_out = rows_out and v2 and not self.main_ready
+            self.rows_in = rows_in and v2 and self.main_ready
             if v2:
                 self.layout = smem_layout_v2(self.keys)
             else:
@@ -1119,6 +1171,7 @@ def _kernel_type():
             q_positions: cute.Pointer,
             q_cos_sin: cute.Pointer,
             slots_out: cute.Pointer,
+            main_rows: cute.Pointer,
             stream,
         ):
             self.kernel(
@@ -1147,6 +1200,7 @@ def _kernel_type():
                 q_positions,
                 q_cos_sin,
                 slots_out,
+                main_rows,
             ).launch(
                 grid=[self.cluster, rows, 1],
                 block=[_THREADS, 1, 1],
@@ -1615,6 +1669,7 @@ def _kernel_type():
             q_positions: cute.Pointer,
             q_cos_sin: cute.Pointer,
             slots_out: cute.Pointer,
+            main_rows: cute.Pointer,
         ):
             tidx, _, _ = cute.arch.thread_idx()
             rank, row, _ = cute.arch.block_idx()
@@ -1668,6 +1723,14 @@ def _kernel_type():
                     mbar_init_expect(mbar_addr, 8 * (block - 64))
                     mbar_init_expect(mbar_addr + 8, 8 * 64)
                 cluster_arrive_relaxed()
+            image: cutlass.Constexpr = main_keys * _KEY_ROW
+            image_src = Int64(main_rows.toint()) + Int64(row * cluster + rank) * Int64(image)
+            if const_expr(self.rows_in):
+                # The main rows' image streams in while the slots resolve.
+                if tidx == 0:
+                    mbar_init_expect(mbar_addr + 16, image)
+                    fence_proxy_async_shared()
+                    bulk_load_global(k_addr, image_src, image, mbar_addr + 16)
             if const_expr(self.use_pdl and not self.main_prewait):
                 griddepcontrol_launch_dependents()
 
@@ -1766,11 +1829,12 @@ def _kernel_type():
                         Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
                     )
             # main_prewait: the main rows are loaded before the dependent wait and decoded after it.
-            m_rows: cutlass.Constexpr = ceil_div(main_keys, 8) if self.main_prewait else 1
+            main_loads: cutlass.Constexpr = self.main_prewait and not self.rows_in
+            m_rows: cutlass.Constexpr = ceil_div(main_keys, 8) if main_loads else 1
             m_data = cute.make_rmem_tensor(cute.make_layout((m_rows, 4), stride=(4, 1)), Int32)
             m_scale = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
             m_kinds = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
-            if const_expr(self.main_prewait):
+            if const_expr(main_loads):
                 cute.arch.sync_threads()
                 self._load_rows(
                     warp,
@@ -1873,7 +1937,22 @@ def _kernel_type():
                         Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
                     )
             cute.arch.sync_threads()
-            if const_expr(self.main_prewait):
+            if const_expr(self.rows_in):
+                self._decode_rows(
+                    warp,
+                    lane,
+                    k_addr,
+                    swa,
+                    main,
+                    swa_stride,
+                    main_stride,
+                    sSlot,
+                    sKind,
+                    main_keys,
+                    swa_keys,
+                    5,
+                )
+            elif const_expr(self.main_prewait):
                 # This layer's SWA rows go out first; the main rows decode while they are in flight.
                 s_rows: cutlass.Constexpr = ceil_div(swa_keys, 8)
                 s_data = cute.make_rmem_tensor(cute.make_layout((s_rows, 4), stride=(4, 1)), Int32)
@@ -1931,8 +2010,16 @@ def _kernel_type():
                 )
             if const_expr(self.late_coefs and not self.pre_main):
                 self._store_coefs(tidx, sSink, sRope, sink_v, rope_v)
+            if const_expr(self.rows_out):
+                # The main rows leave through the async proxy (one bulk copy, behind this sync).
+                fence_proxy_async_shared()
             cp_async_wait_all()
+            if const_expr(self.rows_in):
+                mbar_wait0(mbar_addr + 16)
             cute.arch.sync_threads()
+            if const_expr(self.rows_out):
+                if tidx == 0:
+                    bulk_store_global(image_src, k_addr, image)
             if const_expr(self.q_rope and not self.pre_main):
                 self._rope_query(tidx, q_addr, sRope)
                 cute.arch.sync_threads()
@@ -1952,6 +2039,9 @@ def _kernel_type():
                     out,
                     scale_log2,
                 )
+                if const_expr(self.rows_out):
+                    if tidx == 0:
+                        bulk_wait_read()
             else:
                 if const_expr((not self.pre_main) and main_keys > 0):
                     self._part(
@@ -2509,6 +2599,8 @@ def direct_sparse_decode(
     slots_out: torch.Tensor | None = None,
     plain_edge: bool = False,
     bulk_exchange: bool = True,
+    rows_out: torch.Tensor | None = None,
+    rows_in: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse attention of ``q [T, H, 512]`` (BF16) over its selected packed cache rows.
 
@@ -2532,6 +2624,10 @@ def direct_sparse_decode(
     main selection resolves to (-1 when invalid), so a later launch over the same selections, owner
     and visible lengths can take them as ``main_indices`` unmapped. ``bulk_exchange``: the partial
     outputs go to their owners as bulk copies when shared memory allows (same values).
+
+    ``rows_out`` (uint8 ``[T, main_rows_bytes(...)]``, main rows not ``main_ready``): the launch
+    also stores its decoded main rows; ``rows_in`` (with ``main_ready``): a later launch over the
+    same main slots of the same pool takes them from there instead of decoding them (same values).
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -2631,6 +2727,20 @@ def direct_sparse_decode(
         or not slots_out.is_contiguous()
     ):
         raise ValueError("CSA2 direct decode slot export needs mapped main rows and int64 [T, Wm]")
+    image = main_rows_bytes(q_heads, swa_width, main_width, q.device)
+    for rows_io, ready in ((rows_out, False), (rows_in, True)):
+        if rows_io is not None and (
+            not image
+            or bool(main_ready) != ready
+            or rows_io.dtype != torch.uint8
+            or rows_io.shape != (rows, image)
+            or not rows_io.is_contiguous()
+            or rows_io.data_ptr() % 16
+        ):
+            raise ValueError(
+                "CSA2 direct decode main-row images need a keys-as-M launch and uint8 "
+                "[T, main_rows_bytes] (rows_out without main_ready, rows_in with it)"
+            )
     use_pdl = get_env_enable_pdl()
     fmul2 = _datacenter_blackwell(q.device.index)
     v2 = _v2_engaged(q_heads, swa_width, main_width, q.device.index)
@@ -2658,6 +2768,8 @@ def direct_sparse_decode(
         main_prewait,
         bool(output_rope),
         _datacenter_blackwell(q.device.index),
+        rows_out is not None,
+        rows_in is not None,
     )
     key = (q.device.index, *config)
     swa_index_type = cutlass.Int64 if swa_index64 else cutlass.Int32
@@ -2695,6 +2807,7 @@ def direct_sparse_decode(
         _pointer(q_positions, cutlass.Int32, 4),
         _pointer(q_table, cutlass.Float32, 4),
         _pointer(slots_out, cutlass.Int64, 8),
+        _pointer(rows_out if rows_out is not None else rows_in, cutlass.Uint8, 16),
         cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream),
     )
     compiled = _COMPILED.get(key)
@@ -2714,4 +2827,5 @@ __all__ = [
     "MAX_ROWS",
     "direct_decode_device_supported",
     "direct_sparse_decode",
+    "main_rows_bytes",
 ]
