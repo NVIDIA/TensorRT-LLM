@@ -7,6 +7,8 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Callable, Optional, Protocol
 
+import torch
+
 
 class _Logger(Protocol):
     info: Callable[[str], None]
@@ -38,6 +40,8 @@ def require_mode(state: ReportingTarget, /) -> bool:
 def _log_once(
     state: ReportingTarget, /, level: Callable[[str], None], path: str, reason: str, message: str
 ) -> None:
+    if torch.compiler.is_compiling():
+        return
     key = (path, reason)
     with state._lock:
         if key in state._logged:
@@ -69,6 +73,8 @@ def capture_missed(state: ReportingTarget, /, path: str, rows: Optional[int], wh
 def taken(state: ReportingTarget, /, path: str, rows: Optional[int], what: str = "") -> None:
     """``path`` ran on this rank at ``rows``: one rank-tagged info line per (path, rows, what), the engagement line
     every GEN rank prints for each fast path it takes (``what``: an optional detail, e.g. the projection)."""
+    if torch.compiler.is_compiling():
+        return
     at = "" if rows is None else f" at {rows} rows"
     detail = f" ({what})" if what else ""
     state._log_once(
