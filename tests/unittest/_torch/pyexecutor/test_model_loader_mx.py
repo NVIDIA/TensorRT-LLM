@@ -1427,7 +1427,8 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
     """Map each `l0_model_express.yml` GPU count to its donor/receiver case IDs.
 
     Blocks that share a GPU count, such as the pre-merge canary and the
-    post-merge TP=1 rows, are combined.
+    post-merge TP=1 rows, are combined. Only the H100 blocks count: the Blackwell
+    block repeats rows that an H100 block already lists.
     """
     test_db = yaml.safe_load(
         _repository_text("tests/integration/test_lists/test-db/l0_model_express.yml")
@@ -1435,6 +1436,8 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
     prefix = "model_express/test_model_express.py::test_mx_donor_receiver["
     case_ids: dict[int, list[str]] = {}
     for block in test_db["l0_model_express"]:
+        if block["condition"]["wildcards"]["gpu"] != ["*h100*"]:
+            continue
         gpu_count = block["condition"]["ranges"]["system_gpu_count"]
         assert gpu_count["gte"] == gpu_count["lte"]
         case_ids.setdefault(gpu_count["gte"], []).extend(

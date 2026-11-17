@@ -386,7 +386,7 @@ Qwen3 profile rows `qwen3-tied-bf16-tp1` / `qwen3-tied-bf16-tp2` load the tied
 Qwen3-4B checkpoint, with an optional model path override in
 `TRTLLM_MX_QWEN3_TIED_MODEL`.
 
-The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
+The dedicated CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. Coverage is tiered so that pull requests pay for one lightweight
 end-to-end canary while every qualified family still runs on each main commit:
 
@@ -395,6 +395,7 @@ end-to-end canary while every qualified family still runs on each main commit:
 | `DGX_H100-2_GPUs-PyTorch-ModelExpress-1` | Pre-merge and post-merge | `llama-bf16-tp1` and `test_mx_source_identity_gate.py` |
 | `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 rows and the accuracy canaries below |
 | `DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | Every TP=2 row |
+| `DGX_B200-2_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | `llama-bf16-tp1` and `qwen3-bf16-tp1` on Blackwell |
 
 The two-GPU stages are classified as multi-GPU, so running either of them on a
 pull request requires the `ci: full pre-merge approved` label; the pre-merge
@@ -414,7 +415,17 @@ multi-GPU runs:
 /bot run --stage-list "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1"
 ```
 
-All three stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model,
+The Blackwell stage runs under Slurm, where there are no Kubernetes sidecars:
+the job starts Redis and the ModelExpress server as extra steps from the same
+images, on ports chosen per job (see
+`jenkins/scripts/slurm_model_express_services.sh`), and keeps their logs in the
+`model_express_services/` folder of the stage results. Trigger it with:
+
+```text
+/bot run --stage-list "DGX_B200-2_GPUs-PyTorch-ModelExpress-OnDemand-1"
+```
+
+All stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model,
 client, or NIXL prerequisites fail instead of skipping. Do not grow pre-merge
 coverage with each new family: its TP=1 row belongs in the `post_merge` block of
 `tests/integration/test_lists/test-db/l0_model_express.yml` and its TP=2 row

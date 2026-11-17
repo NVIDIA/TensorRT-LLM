@@ -61,6 +61,21 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             SLURM_RUN,
         )
 
+    def test_model_express_sbatch_stage_starts_the_services_before_the_tests(self) -> None:
+        sbatch = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "runLLMTestlistOnSlurm")
+        services = (
+            REPO_ROOT / "jenkins" / "scripts" / "slurm_model_express_services.sh"
+        ).read_text()
+
+        self.assertIn('stageName.contains("-ModelExpress-")', sbatch)
+        self.assertLess(
+            sbatch.index("mx_services_start"), sbatch.index("srun --kill-on-bad-exit=1")
+        )
+        self.assertIn("-name 'model_express*'", sbatch)
+        self.assertIn("srun --overlap", services)
+        for name in ("MODEL_EXPRESS_URL", "TRTLLM_MX_E2E_REQUIRED", "MX_METADATA_PORT"):
+            self.assertIn(f"export {name}=", services)
+
     def test_parent_dry_run_is_opt_in_non_fail_fast_and_collects_results(self) -> None:
         helper = _function_body(L0_PARENT, "launchInfraDryRunTestJob", "launchStages")
 

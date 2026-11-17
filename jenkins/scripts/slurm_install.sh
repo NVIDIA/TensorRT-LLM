@@ -160,6 +160,10 @@ slurm_install_setup() {
             fi
             retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
+        if [[ -n "${MODEL_EXPRESS_VERSION:-}" && "$stageName" == *-ModelExpress-* ]]; then
+            # The wheel goes in with --no-deps, so its `mx` extra never applies.
+            retry_command --timeout 2700 pip3 install --retries 10 "modelexpress==${MODEL_EXPRESS_VERSION}"
+        fi
         llmSrcNode=$resourcePathNode/TensorRT-LLM/src
         if [[ -n "${cppTestArchive:-}" ]]; then
             tar -zxf "$cppTestArchive" -C "$llmSrcNode"

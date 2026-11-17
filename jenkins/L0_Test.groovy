@@ -2498,6 +2498,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
     def singleNvlinkDomainMode = stageName.contains("SingleNvlinkDomain")
+    // ModelExpress stages run Redis and the ModelExpress server as job steps beside the tests.
+    def modelExpress = stageName.contains("-ModelExpress-")
+    if (modelExpress && (nodeCount > 1 || disaggMultiNodeMode || aggMultiNodeMode)) {
+        error "ModelExpress stages support single-node Slurm jobs only: ${stageName}"
+    }
     def infraDryRun = isInfraDryRun()
     if (infraDryRun) {
         testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -2543,6 +2548,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
             def scriptProfilerEnvLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_profiler_env.sh"
             def scriptProfilerEnvPathNode = "${jobWorkspace}/${jobUID}-slurm_profiler_env.sh"
+            def scriptMxServicesLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_model_express_services.sh"
+            def scriptMxServicesPathNode = "${jobWorkspace}/${jobUID}-slurm_model_express_services.sh"
+            // Registry credentials for the ModelExpress service images, kept apart from
+            // enrootConfigDirNode, which the srun prologue deletes for a fat sqsh.
+            def mxEnrootConfigDirNode = "${jobWorkspace}/mx-enroot-config"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -2600,6 +2610,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptProfilerEnvPathNode,
                     true
                 )
+                if (modelExpress) {
+                    Utils.exec(pipeline, script: "echo \"Script for the ModelExpress services: \" && cat ${scriptMxServicesLocalPath}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptMxServicesLocalPath,
+                        scriptMxServicesPathNode,
+                        true
+                    )
+                }
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2766,6 +2786,37 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             remote,
                             credsLocal,
                             "${enrootConfigDirNode}/.credentials"
+                        )
+                    }
+                }
+
+                if (modelExpress && cluster.containerRuntime.toString() == "ENROOT") {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASSWORD'
+                    )]) {
+                        def mxCredsLocal = Utils.createTempLocation(pipeline, "./mx_enroot_credentials-${stageName}")
+                        def mxRegistryHosts = [MODEL_EXPRESS_SERVER_IMAGE, MODEL_EXPRESS_REDIS_IMAGE]
+                            .collect { it.toString().tokenize("/")[0] }.unique().join(" ")
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${mxCredsLocal}",
+                            "MX_REGISTRY_HOSTS=${mxRegistryHosts}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                for host in $MX_REGISTRY_HOSTS; do
+                                    printf 'machine %s login %s password %s\\n' "$host" "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD"
+                                done > "$ENROOT_CREDS_PATH"
+                            '''.replaceAll("\\n\\s*", "\n"))
+                        }
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${mxEnrootConfigDirNode}\""), numRetries: 3)
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            mxCredsLocal,
+                            "${mxEnrootConfigDirNode}/.credentials"
                         )
                     }
                 }
@@ -3066,6 +3117,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     ${infraDryRun ? "export infraDryRun=true" : ""}
+                    ${modelExpress ? "export MODEL_EXPRESS_VERSION=${MODEL_EXPRESS_VERSION}" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
@@ -3127,8 +3179,28 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         srunArgs.add("--mpi=pmix")
                     }
 
+                    // Redis and the ModelExpress server start as srun steps beside the test step.
+                    def mxServicesLaunch = ""
+                    if (modelExpress) {
+                        // The test step shares the job's resources with the two service steps,
+                        // which are still running when it starts.
+                        srunArgs.add("--overlap")
+                        def mxEnroot = cluster.containerRuntime.toString() == "ENROOT"
+                        // enroot addresses an image as host#path.
+                        def mxImage = { String image -> mxEnroot ? image.replaceFirst("/", "#") : image }
+                        mxServicesLaunch = """
+                            export MX_REDIS_IMAGE="${mxImage(MODEL_EXPRESS_REDIS_IMAGE.toString())}"
+                            export MX_SERVER_IMAGE="${mxImage(MODEL_EXPRESS_SERVER_IMAGE.toString())}"
+                            export MX_SERVICES_ENROOT=${mxEnroot ? 1 : 0}
+                            export MX_CONTAINER_DIR="${cluster.scratchPath}/users/svc_tensorrt/containers"
+                            export MX_ENROOT_CONFIG_PATH="${mxEnrootConfigDirNode}"
+                            source ${scriptMxServicesPathNode}
+                            mx_services_start
+                        """
+                    }
                     def scriptContent = """
                         ${scriptLaunchPrefix}
+                        ${mxServicesLaunch}
                         srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunPathNode}
                     """.replaceAll("(?m)^\\s*", "")
                     pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
@@ -3153,6 +3225,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptBashUtilsPathNode,
                     scriptFetchHelperPathNode,
                     scriptProfilerEnvPathNode,
+                    scriptMxServicesPathNode,
                     artifactoryNetrcPathNode,
                     fatArtifactoryNetrcPathNode,
                     scriptLaunchPathNode,
@@ -3170,7 +3243,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
                 if (cluster.containerRuntime.toString() == "ENROOT") {
                     filesToKeepWhenRetry += [
-                        enrootConfigDirNode
+                        enrootConfigDirNode,
+                        mxEnrootConfigDirNode
                     ]
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
@@ -3548,7 +3622,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
-                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
+                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' -o -name 'model_express*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                 def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
                 try {
@@ -7541,7 +7615,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // In this Kubernetes map only, an optional 6th element `true` attaches the Redis +
         // ModelExpress server sidecars and the CI ModelExpress env to the pod
         // (`createKubernetesPodConfig(..., values[5])`). The Slurm maps read slot 6 as the
-        // node count and slot 7 as `runWithSbatch` instead.
+        // node count and slot 7 as `runWithSbatch` instead. The Blackwell ModelExpress stage is in
+        // the Slurm map below, where the services run as job steps.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
         // Post-merge only: the `stage: post_merge` rows of l0_model_express, i.e. the TP=1 smoke
@@ -7627,6 +7702,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
         "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
+        // ModelExpress on Blackwell: Redis and the ModelExpress server run as extra steps of the
+        // Slurm job (see jenkins/scripts/slurm_model_express_services.sh); no Kubernetes sidecars.
+        "DGX_B200-2_GPUs-PyTorch-ModelExpress-OnDemand-1": ["auto:dgx-b200-flex", "l0_model_express", 1, 1, 2, 1, true],
         "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
