@@ -19,11 +19,13 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Callable, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
+                    TypeVar, Union)
 
 import msgspec
 import torch
@@ -67,6 +69,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
+                                             _start_input_processing,
+                                             _time_input_processing)
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -121,6 +126,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
+                                             _input_processing_context,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -592,6 +598,9 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
+_InputProcessingResult = TypeVar("_InputProcessingResult")
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -965,10 +974,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock,
+                input_processing_observer=(
+                    self.metrics_collector.log_input_processing
+                    if self.metrics_collector else None))
         self.app.add_middleware(ServerArrivalTimeMiddleware,
                                 adjusted_clock=self._adjusted_steady_clock)
 
@@ -1422,6 +1435,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        if self.generator.args.return_perf_metrics:
+            self.mount_metrics()
 
     async def _require_rl_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
@@ -2214,6 +2229,25 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
+    async def _run_input_processor(
+        self,
+        process: Callable[[], _InputProcessingResult],
+    ) -> _InputProcessingResult:
+        """Run preprocessing with separate thread queue and execution times."""
+        loop = asyncio.get_running_loop()
+        queued = _start_input_processing()
+        if queued is None:
+            return await loop.run_in_executor(self._input_proc_executor,
+                                              process)
+
+        def run() -> _InputProcessingResult:
+            _record_input_processing("processor_queue", queued)
+            with _time_input_processing("processor"):
+                return process()
+
+        return await loop.run_in_executor(self._input_proc_executor,
+                                          copy_context().run, run)
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -2256,6 +2290,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
@@ -2640,9 +2675,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         _preprocess_in_conversation,
                         scheduling_params.subagent_affinity_id
                         or get_request_conversation_id(request), preprocess)
-                loop = asyncio.get_event_loop()
-                generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor, preprocess)
+                generate_inputs = await self._run_input_processor(preprocess)
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -2660,6 +2693,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if raw_request is not None:
                 # The executor client id, which the perf metrics, the
@@ -2703,6 +2739,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -2884,7 +2922,16 @@ class OpenAIServer(_VideoRoutesMixin):
 
         raw_request = self._synthetic_request(
             chat_request.model_dump(exclude_none=True))
-        response = await self.openai_chat(chat_request, raw_request)
+        if self._collect_perf_metrics:
+            observer = (self.metrics_collector.log_input_processing
+                        if self.metrics_collector else None)
+            with _input_processing_context(raw_request.scope["state"],
+                                           observer):
+                response = await self.openai_chat(chat_request, raw_request)
+            for record in raw_request.state.perf_metrics_records:
+                self._perf_metrics_writer.submit(record)
+        else:
+            response = await self.openai_chat(chat_request, raw_request)
         if response is None:
             return "errored", {
                 "type": "api_error",
@@ -3050,6 +3097,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 ),
             )
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3110,9 +3158,13 @@ class OpenAIServer(_VideoRoutesMixin):
                                              mm_item_order)
 
             promise = self.generator.generate_async(inputs=prompt, )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
+            await self._extract_metrics(promise, raw_request)
             return JSONResponse(content=response.model_dump())
 
         except CppExecutorError:
@@ -3123,6 +3175,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3232,6 +3286,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield output
             yield "data: [DONE]\n\n"
 
+        input_started = _start_input_processing()
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
@@ -3292,9 +3347,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    loop = asyncio.get_event_loop()
-                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
-                        self._input_proc_executor,
+                    prompt_token_ids, extra_processed_inputs = await self._run_input_processor(
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
@@ -3325,6 +3378,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_params_collection.append(
                     None if self.postproc_worker_enabled else postproc_params)
 
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if request.stream:
                 generators = [
                     completion_generator(promise, params) for promise, params in
@@ -3351,6 +3407,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3387,6 +3445,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3487,6 +3546,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
@@ -3510,6 +3572,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Error details: %s", traceback.format_exc())
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
+        finally:
+            _record_input_processing("total", input_started)
 
     def _responses_prompt_tokens_excluded_from_usage(
             self, request: ResponsesRequest) -> int:
@@ -3592,6 +3656,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     yield pp_res
             await self._extract_metrics(res, raw_request)
 
+        input_started = _start_input_processing()
         try:
             if request.background:
                 logger.warning(
@@ -3733,6 +3798,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             # The reply carries the executor client id (see
             # name_responses_reply). The input messages were stored under the
             # request's id before it was named.
@@ -3783,6 +3851,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+        finally:
+            _record_input_processing("total", input_started)
 
         return JSONResponse(content={"detail": "None"})
 

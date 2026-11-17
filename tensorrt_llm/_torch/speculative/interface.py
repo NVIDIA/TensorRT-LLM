@@ -917,9 +917,10 @@ class SpecMetadata:
     # step counter -- keeps a seeded request reproducible regardless of which
     # batch it lands in.
     #
-    # The fused kernel and the acceptance kernels honor these per row. The
-    # flashinfer ops behind the non-fused advanced sampling modes read only
-    # element 0.
+    # The fused kernel, the acceptance kernels and the flashinfer ops behind
+    # the non-fused advanced sampling modes all honor these per row. The
+    # flashinfer ops also use the row index as the Philox subsequence, so under
+    # those modes a seeded request's tokens still depend on its batch position.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
     # Count of RNG windows already handed out. Seeded requests are counted per
