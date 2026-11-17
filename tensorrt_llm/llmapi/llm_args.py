@@ -9358,9 +9358,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
                 rs_parallel_active = self.context_parallel_size > 1
-                # DSpark applies the grammar mask to both the target logits and
-                # the draft logits it samples from (so q and p are both
-                # grammar-masked), hence guided decoding is allowed with it.
+                # DSpark verifies against the grammar-masked target, and
+                # rejection sampling stays correct for any draft distribution q,
+                # so guided decoding is allowed with it. The draft block is
+                # sampled unmasked by default; the per-position masked draft loop
+                # (which makes q grammar-masked too) is an internal opt-in.
                 rs_guided_active = (self.guided_decoding_backend is not None
                                     and not spec_mode.is_dspark())
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
