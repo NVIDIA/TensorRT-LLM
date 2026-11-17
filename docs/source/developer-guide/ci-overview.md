@@ -41,9 +41,9 @@ The **Release Checks** GitHub Actions workflow checks C++ license headers after
 the pre-commit checks, within the **Pre-commit Check** job. It scans `cpp/include`
 and `cpp/tensorrt_llm`, including the Python helpers in those directories. It
 checks full Apache license headers and uses the filters and exceptions in
-`jenkins/license_cpp.json`. Jenkins Release-Check runs the same
-`scripts/check_cpp_licenses.py` entry point, so both checks share the implementation
-and policy. Run it locally without installing dependencies:
+`jenkins/license_cpp.json`. Jenkins Release-Check retains its Go license checker;
+the GHA checker shares its policy configuration. Run the GHA checker locally
+without installing dependencies:
 
 ```bash
 python3 scripts/check_cpp_licenses.py
