@@ -3,7 +3,7 @@
 """The DSpark draft block's fused glue on SM107: its attention over the paged context window
 plus the query block, the latent and query rope tails, and the recurrent Markov head's
 per-step input, gate and biased-logit argmax. Each entry's `reference` is the torch chain the
-target ran before it, which the target still runs under its fallback switches."""
+target ran before it."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ _ARGMAX_BLOCK = 4096
 
 
 def _rotate(x: torch.Tensor, table: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """The draft's interleaved rope, as `DraftModel._rotate` computes it."""
+    """The draft's interleaved rope over a `[cos | sin]` table row per position."""
     cos, sin = table[positions.long()].chunk(2, dim=-1)
     if x.ndim == positions.ndim + 2:
         cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
@@ -154,17 +154,22 @@ class TritonLatentTail(OpWrapper):
     so it can differ from flashinfer's by one bf16 ulp."""
 
     ARCHS = frozenset({Arch.SM_107})
+    #: The target calls it one layer at a time: a draft layer's tail with the query rope into a
+    #: `[batch, block, 576]` buffer, or one of the 3 layers of the context features into its
+    #: slice of the `[rows, 3, 1, 576]` buffer, over a decode step's accepted tokens or a
+    #: prefill step.
     CELLS = tuple(
         Cell(
-            why=f"{what}: {rows} rows x {layers} layer(s){' with the query tail' if q else ''}",
-            spec=dict(rows=rows, layers=layers, heads=heads, with_q=q),
+            why=f"{what}: {rows} rows",
+            spec=dict(rows=rows, heads=heads, with_q=heads is not None),
         )
-        for what, rows, layers, heads, q in (
-            ("tp4 draft layer, 1 sequence", 3, 1, 16, True),
-            ("tp4 draft layer, 16 sequences", 48, 1, 16, True),
-            ("tp8 draft layer, 4 sequences", 12, 1, 8, True),
-            ("context features, 1 sequence", 4, 3, 16, False),
-            ("context features, 16 sequences", 64, 3, 16, False),
+        for what, rows, heads in (
+            ("tp4 draft layer, 1 sequence", 3, 16),
+            ("tp4 draft layer, 16 sequences", 48, 16),
+            ("tp8 draft layer, 4 sequences", 12, 8),
+            ("context features layer, 1 sequence", 4, None),
+            ("context features layer, 16 sequences", 64, None),
+            ("context features layer, a 16384-token prefill step", 16384, None),
         )
     )
 
