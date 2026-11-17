@@ -6701,10 +6701,17 @@ class KVCacheManagerV2(BaseResourceManager):
         request_id = req.py_request_id
         retained = self._retained_generation_allocations.pop(request_id, None)
         if retained is not None:
-            # The connector already knows these pages. Reuse the skipped
-            # step's allocation without growing it or reporting another delta.
-            self._allocated_draft_lens[request_id] = retained
-            self._inflight_draft_lens.setdefault(request_id, []).append(retained)
+            # The connector already knows these pages. Reuse the skipped step's
+            # allocation, and grow it only when this retry drafts more tokens.
+            draft_slots = max(retained, self._generation_draft_slots(req))
+            extra_slots = draft_slots - retained
+            if extra_slots > 0:
+                if not kv_cache.resize(kv_cache.capacity + extra_slots):
+                    self._retained_generation_allocations[request_id] = retained
+                    return False
+                self._fill_fresh_kv_pages(request_id)
+            self._allocated_draft_lens[request_id] = draft_slots
+            self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
             return True
         draft_slots = self._generation_draft_slots(req)
         self._allocated_draft_lens.pop(request_id, None)
@@ -7692,6 +7699,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _prepare_disagg_gen_init_cache(self, req: LlmRequest) -> bool:
         """Allocate a disagg generation init request's cache; see ``prepare_disagg_gen_init``."""
+        self.validate_completion_capacity(req)
         reused = self.prepare_context_cache(req)
         if reused is None:
             return False

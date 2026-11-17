@@ -4515,7 +4515,8 @@ def test_skipped_context_chunk_keeps_pages_a_moving_connector_was_told_about(
     context_request.is_dummy = False
     context_request.context_chunk_size = 4
     scheduled_batch = ScheduledRequests()
-    scheduled_batch.context_requests.append(context_request)
+    scheduled_batch.append_context_request(context_request)
+    assert scheduled_batch.context_requests == [context_request]
 
     PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
