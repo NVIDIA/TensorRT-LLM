@@ -15,7 +15,7 @@ workflow, this means a `kernel` task (onboard, verify); a tuner loads
 it only when changing an entry or its test. A primer may preload it. Model
 assembly, survey and serving-only work do not require it.
 
-Read `tensorrt_llm/_torch/_experimental/modeling_v2/README.md`,
+Read `tensorrt_llm/_torch/modeling_v2/README.md`,
 `cpp/tensorrt_llm/modeling_v2/README.md`, `catalog/_op.py` in the ModelingV2
 package, and one same-category entry with its test. The two README guides
 are the source of truth; this skill scopes one flow task and its certification,

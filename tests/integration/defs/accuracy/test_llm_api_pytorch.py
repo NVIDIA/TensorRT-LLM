@@ -318,9 +318,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     acceptance_length,
                 )
 
-    @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla(self, monkeypatch):
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True],
+                             ids=["unchunked", "chunked"])
+    def test_nvfp4_mla(self, monkeypatch: pytest.MonkeyPatch,
+                       enable_chunked_prefill: bool) -> None:
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _fp4_mla_attention_backend, fp4_mla_generation_backend_supported)
+        if not fp4_mla_generation_backend_supported(
+                get_sm_version(), _fp4_mla_attention_backend()):
+            pytest.skip("requires a supported FP4 MLA generation backend")
         from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
             Fp4MlaFmha
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
@@ -339,7 +346,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=enable_chunked_prefill,
+                cuda_graph_config=CudaGraphConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:
@@ -364,6 +372,50 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 assert any(
                     isinstance(fmha, Fp4MlaFmha)
                     for fmha in layer._fmha_manager._cache.values())
+
+    @skip_no_rubin
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_block_reuse,enable_chunked_prefill,mtp_nextn",
+                          [(True, False, 0), (False, True, 0), (True, True, 0),
+                           (True, True, 3)])
+    def test_nvfp4_mla_cached_context(self, monkeypatch,
+                                      enable_block_reuse: bool,
+                                      enable_chunked_prefill: bool,
+                                      mtp_nextn: int):
+        """FP4 MLA context attention over a prefix already in the FP4 cache.
+
+        GSM8K prompts share their few-shot examples, so with block reuse most
+        requests reuse that prefix; a 512-token budget splits every prompt
+        into several chunked-prefill chunks.
+
+        Decode runs with the 4x path dispatcher on, so the decoder CUDA graphs
+        are keyed by KV regime. The 16 heads of DeepSeek-V3-Lite fill no
+        256-row 4x item, so every graph shape keeps one regime and the
+        dispatcher keeps the 2x kernel.
+        """
+        # env_overrides also sets it in this process; monkeypatch removes it
+        # from this process once the test ends.
+        env = {"TRTLLM_FP4_MLA_CUTEDSL_4X": "1"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=True,
+                                        enable_block_reuse=enable_block_reuse)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                attn_backend="TRTLLM",
+                env_overrides=env,
+                kv_cache_config=kv_cache_config,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_tokens=512 if enable_chunked_prefill else 8192,
+                speculative_config=mtp_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])

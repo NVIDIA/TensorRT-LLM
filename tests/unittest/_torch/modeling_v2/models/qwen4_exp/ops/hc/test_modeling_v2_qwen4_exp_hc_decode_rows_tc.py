@@ -15,7 +15,7 @@ import importlib
 import pytest
 import torch
 
-P = "tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc."
+P = "tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc."
 rows_mod = importlib.import_module(P + "qwen4_exp_hc_decode_rows_tc")
 first_op = rows_mod.qwen4_exp_hc_decode_rows_first
 mix_op = rows_mod.qwen4_exp_hc_decode_rows_mix

@@ -247,11 +247,21 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         draft_layer_ids=draft_layer_ids,
     )
     manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
+    # The drafter declares an FP8 pool (draft_kv_dtype); the target keeps HALF.
+    manager.get_layer_dtype = lambda layer_id: bindings.DataType.FP8
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.num_draft_layers == expected
-    assert RankInfo.from_bytes(info.to_bytes()).num_draft_layers == expected
+    assert info.draft_kv_dtype == ("FP8" if expected else None)
+    payload = msgpack.unpackb(info.to_bytes(), strict_map_key=False)
+    # Without shared draft layers the wire shape is unchanged.
+    assert ("draft_kv_dtype" in payload) == bool(expected)
+    restored = RankInfo.from_bytes(info.to_bytes())
+    assert (restored.num_draft_layers, restored.draft_kv_dtype) == (
+        expected,
+        info.draft_kv_dtype,
+    )
 
 
 def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:

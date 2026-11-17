@@ -34,7 +34,7 @@ from cbts.coverage.collection.compact_db import canonicalize_path
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
 
 # Trailing `-<split_id>` of a pytest-split shard name.
-_SPLIT_SUFFIX_RE = re.compile(r"-\d+$")
+_SPLIT_SUFFIX_RE = re.compile(r"-\d+(_of_\d+)?(-cbts)?$")
 
 # Completeness-heuristic constants consumed by `untrusted_tests()`.
 _WORKER_SENTINEL = "tensorrt_llm/_torch/pyexecutor/py_executor.py"

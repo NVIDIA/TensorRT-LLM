@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
+import tensorrt_llm._torch.modeling_v2 as _modeling_v2
 
 pytestmark = pytest.mark.cpu_only
 

@@ -9,10 +9,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (  # noqa: E501
     silu_and_mul_rows as op,
 )
 

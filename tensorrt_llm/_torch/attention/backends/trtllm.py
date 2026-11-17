@@ -61,9 +61,9 @@ from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
@@ -779,6 +779,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        # The FP4 MLA packed decode launches its split budget only when True.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.packed_split = packed_split
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        state = self.fp4_mla_state
+        return None if state is None else state.packed_split
+
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
         # buffers below must be rebuilt before the next MLA layer reads them.
@@ -1221,17 +1243,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # every block-table access, so the staged/H2D width can be capped
             # at the batch's maximum instead of max_seq_len's worth of
             # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
+            # its kernels dereference block columns a host-derived cap would
             # leave unstaged (uninitialized in this buffer).
-            spec_active = (self.draft_kv_cache_manager is not None
-                           or self.is_spec_decoding_enabled
-                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
-                           (self.runtime_features is not None and
-                            self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
+            if (not self._generation_block_offsets_need_capacity()
+                    and self.kv_cache_manager.tokens_per_block):
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
@@ -1503,6 +1519,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
+    def _generation_block_offsets_need_capacity(self) -> bool:
+        """Whether generation block-offset rows need their configured capacity."""
+        return (self.draft_kv_cache_manager is not None
+                or self.is_spec_decoding_enabled
+                or bool(self.kv_cache_params.num_extra_kv_tokens)
+                or (self.runtime_features is not None
+                    and self.runtime_features.has_speculative_draft_tokens))
+
     @property
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
@@ -1736,6 +1760,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1745,15 +1784,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1861,10 +1904,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1916,7 +1957,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,
@@ -2495,8 +2537,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
                       and is_sm_100f())
-        short_seq_mha_enabled = int(
-            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+        short_seq_mha_enabled = _get_short_seq_mha_threshold() > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
         return int(
             thop.get_context_mla_workspace_bytes_per_token(
@@ -2509,6 +2552,47 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 separate_q_and_kv_input=True,
                 sparse_mla=stages_no_buffer,
             ))
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: "Mapping",
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Dense FP8 context MLA's complete chunked-prefill K/V staging capacity."""
+        if (not is_mla(model_config.pretrained_config)
+                or not runtime_features.chunked_prefill):
+            return 0
+        if not cls.runtime_workspace_is_chunked_prefill_bounded(model_config):
+            return 0
+        # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
+        # and the cached-partition capacity prepared by this backend's metadata.
+        return runtime_features.chunked_prefill_buffer_batch_size * max_num_tokens
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Credit only the dense staging used by the profiling attention route."""
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        if (sparse_algorithm == "dsa"
+                and model_config.quant_config.quant_mode.has_fp8_kv_cache()
+                and is_sm_100f(get_sm_version())):
+            from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+            threshold = _get_short_seq_mha_threshold()
+            if 0 < threshold < profiled_prompt_len:
+                return 0
+        return min(max_num_tokens, max_batch_size * profiled_prompt_len)
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",
