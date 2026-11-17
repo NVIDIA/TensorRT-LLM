@@ -8,6 +8,7 @@ import inspect
 import pytest
 
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
+import tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common as cutedsl_common
 import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16 as mufu16
 import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16_fused_v_transpose as mufu16_fused_v_transpose  # noqa: E501
 
@@ -24,7 +25,7 @@ def fresh_availability():
     fp4_mla_config._cutedsl_backend_available.cache_clear()
 
 
-@pytest.mark.parametrize("kernel_module", [mufu16, mufu16_fused_v_transpose])
+@pytest.mark.parametrize("kernel_module", [cutedsl_common, mufu16, mufu16_fused_v_transpose])
 def test_kernels_do_not_use_non_public_schedule_hints(kernel_module):
     tree = ast.parse(inspect.getsource(kernel_module))
     hint_uses = [

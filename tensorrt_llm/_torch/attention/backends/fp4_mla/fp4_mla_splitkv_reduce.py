@@ -12,7 +12,7 @@ import torch
 from cutlass.cute.runtime import make_ptr
 
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
-from .fp4_mla_cutedsl_mufu16 import (
+from .cutedsl_common import (
     _cutlass_output_dtype,
     _validate_output_dtype,
     _validate_tensor_pointer_alignment,

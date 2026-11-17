@@ -154,9 +154,7 @@ def use_split_mode(*, num_heads: int, query_len: int, num_requests: int, max_kv_
 INT32_MAX = 2147483647
 LOG2_E = 1.4426950408889634  # X79:395
 COMPILE_OPTIONS = "--opt-level 2 --ptxas-options '--uumn'"  # X79:10093
-# The kernel module reads sys.argv at import (X79:318-356 via :380 SF_VEC_SIZE and :406 lazy-anchor threshold):
-# a driver whose argv happens to carry these flags would silently reconfigure the kernel (hazard H-E2).
-KERNEL_ARGV_FLAGS = ("--sf-vec-size", "--lazy-anchor-threshold-log2")
+KERNEL_ARGV_FLAGS: tuple[str, ...] = ()
 
 _HERE = Path(__file__).resolve().parent
 KERNEL_FILE = _HERE / "fp4_mla_cutedsl_4x.py"
@@ -188,15 +186,8 @@ class EnvelopeError(ValueError):
 
 
 def check_kernel_argv(argv: list[str] | None = None) -> None:
-    """Reject argv that the kernel module would consume at import time (X79:318-356, 380, 406)."""
-    args = sys.argv[1:] if argv is None else list(argv)
-    for arg in args:
-        for flag in KERNEL_ARGV_FLAGS:
-            if arg == flag or arg.startswith(flag + "="):
-                raise EnvelopeError(
-                    f"sys.argv carries {flag!r}, which the kernel module reads at import time "
-                    f"(X79:318-356); the 4x host refuses to run with kernel-tuning flags in argv (H-E2)"
-                )
+    """Compatibility no-op: the CuTe DSL kernel modules no longer inspect sys.argv on import."""
+    del argv
 
 
 _KERNEL_LOCK = threading.Lock()

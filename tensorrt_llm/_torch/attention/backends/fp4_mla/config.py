@@ -81,6 +81,7 @@ FP4_MLA_PREPACK_V_ENV = "TRTLLM_FP4_MLA_PREPACK_V"
 FP4_MLA_TRITON_PREPACK_V_ENV = "TRTLLM_FP4_MLA_TRITON_PREPACK_V"
 FP4_MLA_PAGE_STATS_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS"
 FP4_MLA_PV_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PV_NUM_WARPS"
+FP4_MLA_LAZY_ANCHOR_LOG2_ENV = "TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2"
 
 
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
@@ -229,6 +230,15 @@ def _env_float(name: str, default: float) -> float:
     if value is None or value.strip() == "":
         return default
     return float(value)
+
+
+def resolve_fp4_mla_lazy_anchor_rebase_log2(default: float) -> float:
+    threshold = _env_float(FP4_MLA_LAZY_ANCHOR_LOG2_ENV, default)
+    if not 0.0 <= threshold <= 8.0:
+        raise ValueError(
+            f"{FP4_MLA_LAZY_ANCHOR_LOG2_ENV} must be in [0, 8], got {threshold}"
+        )
+    return threshold
 
 
 def _fp4_mla_attention_backend() -> str:

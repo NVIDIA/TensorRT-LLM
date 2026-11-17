@@ -2,13 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import os
-import sys
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -17,19 +14,68 @@ import cutlass as ctm
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import torch
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
+from .config import resolve_fp4_mla_lazy_anchor_rebase_log2
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
+from .cutedsl_common import (
+    CUDA_GRID_Z_MAX,
+    FP4_MLA_E4M3_MAX_FINITE,
+    FP4_MLA_P_GLOBAL_SCALE,
+    INT32_MAX,
+    LOG2_6,
+    LOG2_E,
+    PREPARED_BUFFER_ALIGNMENT_BYTES,
+    KvCache3DLayout,
+    _add_f16x2,
+    _as_shared_cta,
+    _ceil_div,
+    _compact_sfb_copy_cols_per_scale_chunk,
+    _compact_sfb_mma_cols_per_scale_chunk,
+    _cutlass_output_dtype,
+    _derive_qk_scale_burst_kblocks,
+    _fence_async_shared_cta,
+    _float_to_ordered_u32_for_atomic_max,
+    _horizontal_pack_two_f16x2_sums,
+    _mapa_shared_cluster,
+    _mask_invalid_score,
+    _mbarrier_arrive_release_cta_shared_cluster,
+    _mma_block_scale_kind,
+    _mma_scale_format,
+    _mma_scale_vec_size_enum,
+    _mma_sf_ids_per_scale_atom,
+    _ordered_u32_to_float_after_atomic_max,
+    _p4_n256_prequant_rowsum_from_f16x2_psf,
+    _p4_n256_rowsum_from_packed_psf_word,
+    _pack_e2m1x8,
+    _pack_e2m1x8_from_f16x2,
+    _pack_e4m3x4_natural,
+    _pack_e4m3x4_natural_from_f16x2,
+    _pack_f32_pair_to_f16x2,
+    _pack_p4_16_scores_with_sum as _pack_p4_16_scores_from_group,
+    _publish_p4_n256_atomic_rowmax,
+    _qk_compact_sfb_cols_per_scale_chunk,
+    _qk_sfb_cols_per_kblock,
+    _qk_sfb_smem_nchunks_per_cta,
+    _scale_pack_e4m3x4_natural_from_f16x2,
+    _scale_words_for_k,
+    _sfa_tmem_cols_for_scale_chunks,
+    _smem_atomic_max_ordered_u32,
+    _softmax_exp2_pair,
+    _softmax_exp2_pair_packed_f16x2,
+    _sum_p4_n256_psf_row_parts,
+    _tcgen05_ld_red_32x32b_x16_max_f32,
+    _unpack_f16x2_to_f32_pair,
+    _validate_output_dtype,
+    _validate_tensor_pointer_alignment,
+    nvvm_add_packed_f32x2,
+    nvvm_fma_packed_f32x2,
+    nvvm_mul_packed_f32x2,
+)
 
-nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-PREPARED_BUFFER_ALIGNMENT_BYTES = 32
-CUDA_GRID_Z_MAX = 65535
 SUPPORTS_FOLDED_QUERIES = True
 # Packed decode rows: one batch entry per request holding [query token, head]
 # rows, KV split across grid.z tasks, per-row causal bounds (Helix per-token
@@ -39,179 +85,6 @@ SUPPORTS_PACKED_QUERIES = True
 PACKED_MAX_M = 1024
 # Balanced packed split: no task owns fewer KV tiles than this unless a request is shorter.
 PACKED_MIN_TILES_PER_TASK = 2
-INT32_MAX = (1 << 31) - 1
-
-
-@ctm.dsl_user_op
-def _as_shared_cta(address, *, loc=None, ip=None):
-    address_ir = address.ir_value() if hasattr(address, "ir_value") else address
-    address_space = llvm.PointerType(address_ir.type).address_space
-    if address_space == ctm.AddressSpace.dsmem:
-        return prims.cvta_to(address, prims.CvtaSpace.SHARED, loc=loc, ip=ip)
-    return address
-
-
-@ctm.dsl_user_op
-def _mapa_shared_cluster(address, rank, *, loc=None, ip=None):
-    return prims.mapa(_as_shared_cta(address, loc=loc, ip=ip), rank, loc=loc, ip=ip)
-
-
-@ctm.dsl_user_op
-def _mbarrier_arrive_release_cta_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None:
-    prims.mbarrier_arrive(
-        mbar,
-        count=count,
-        scope=prims.MemScope.CTA,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _scale_words_for_k(k_dim: int, sf_vec_size: int) -> int:
-    return (k_dim + sf_vec_size * 4 - 1) // (sf_vec_size * 4)
-
-
-def _sfa_tmem_cols_for_scale_chunks(scale_chunks: int, use_128dp_unique: bool) -> int:
-    if use_128dp_unique:
-        return (scale_chunks + 3) // 4 * 4
-    return scale_chunks * 4
-
-
-def _derive_qk_scale_burst_kblocks(
-    *,
-    qk_mma_kblocks: int,
-    qk_scale_burst_target_kblocks: int,
-    scale_a_col_offset: int,
-    num_tmem_alloc_cols: int,
-    qk_mma_m_dim: int,
-    mma_scale_chunks_per_kblock: int,
-    use_sfa_128dp_unique: bool,
-    qk_score_slot_n: int,
-    qk_compact_sfb_cols_per_scale_chunk: int = 0,
-) -> int:
-    target = max(1, qk_scale_burst_target_kblocks)
-    if qk_compact_sfb_cols_per_scale_chunk > 0:
-        sfb_cols_per_kblock = mma_scale_chunks_per_kblock * qk_compact_sfb_cols_per_scale_chunk
-    else:
-        sfb_cols_per_kblock = _qk_sfb_cols_per_kblock(
-            qk_mma_m_dim, qk_score_slot_n, mma_scale_chunks_per_kblock
-        )
-    best = 0
-    for burst_kblocks in range(1, target + 1):
-        if qk_mma_kblocks % burst_kblocks != 0:
-            continue
-        sfa_cols = _sfa_tmem_cols_for_scale_chunks(
-            burst_kblocks * mma_scale_chunks_per_kblock, use_sfa_128dp_unique
-        )
-        sfb_cols = burst_kblocks * sfb_cols_per_kblock
-        scale_b_col_offset = (scale_a_col_offset + sfa_cols + 15) // 16 * 16
-        qk_scale_feed_col_end = max(scale_a_col_offset + sfa_cols, scale_b_col_offset + sfb_cols)
-        if qk_scale_feed_col_end <= num_tmem_alloc_cols:
-            best = burst_kblocks
-    if best == 0:
-        raise ValueError(
-            "QK scale feed cannot fit even one K64 block in the TMEM tail; "
-            f"scale_a_col_offset={scale_a_col_offset}, "
-            f"num_tmem_alloc_cols={num_tmem_alloc_cols}"
-        )
-    return best
-
-
-def _compact_sfb_mma_cols_per_scale_chunk(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-        return 2 * ((n_dim + 127) // 128)
-    return 2 * ((n_dim + 63) // 64)
-
-
-def _compact_sfb_copy_cols_per_scale_chunk(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-        return 4 * ((n_dim + 127) // 128)
-    return _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_compact_sfb_cols_per_scale_chunk(m_dim: int, n_dim: int, warpx2_mode: int) -> int:
-    if warpx2_mode != 0 and m_dim == 128:
-        return _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-    return _compact_sfb_copy_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_sfb_cols_per_kblock(m_dim: int, n_dim: int, mma_scale_chunks_per_kblock: int) -> int:
-    return mma_scale_chunks_per_kblock * _compact_sfb_copy_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_sfb_smem_nchunks_per_cta(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-    return (n_dim + 127) // 128
-
-
-def _mma_sf_ids_per_scale_atom(k_dim: int, sf_vec_size: int) -> int:
-    return max(1, sf_vec_size * 4 // k_dim)
-
-
-def _mma_scale_vec_size_enum(sf_vec_size: int):
-    if sf_vec_size == 16:
-        return prims.Tcgen05MMAScaleVecSize.BLOCK16
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _mma_scale_format(sf_vec_size: int) -> int:
-    if sf_vec_size == 16:
-        return 0
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _mma_block_scale_kind(sf_vec_size: int):
-    if sf_vec_size == 16:
-        return prims.MMABlockScaleKind.MXF4NVF4
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _initial_sf_vec_size_from_argv(options: Sequence[int], default: int) -> int:
-    args = sys.argv[1:]
-    for idx, arg in enumerate(args):
-        value_text: str | None = None
-        if arg == "--sf-vec-size":
-            if idx + 1 >= len(args):
-                raise ValueError("--sf-vec-size requires an integer value")
-            value_text = args[idx + 1]
-        elif arg.startswith("--sf-vec-size="):
-            value_text = arg.split("=", 1)[1]
-        if value_text is None:
-            continue
-        try:
-            value = int(value_text)
-        except ValueError as exc:
-            raise ValueError(f"--sf-vec-size must be an integer, got {value_text!r}") from exc
-        if value not in options:
-            raise ValueError(f"--sf-vec-size must be one of {options}, got {value}")
-        return value
-    return default
-
-
-def _initial_float_from_argv(option: str, default: float) -> float:
-    args = sys.argv[1:]
-    for idx, arg in enumerate(args):
-        value_text: str | None = None
-        if arg == option:
-            if idx + 1 >= len(args):
-                raise ValueError(f"{option} requires a floating-point value")
-            value_text = args[idx + 1]
-        elif arg.startswith(f"{option}="):
-            value_text = arg.split("=", 1)[1]
-        if value_text is None:
-            continue
-        try:
-            return float(value_text)
-        except ValueError as exc:
-            raise ValueError(f"{option} must be a float, got {value_text!r}") from exc
-    return default
-
 
 M_TILE = 256
 KV_TILE = 256
@@ -234,7 +107,7 @@ QK_PREFIX_DIM = TRTLLM_V_HEAD_DIM
 TRTLLM_QSF_EVEN_PRMT_SELECTOR = 25632
 TRTLLM_QSF_ODD_PRMT_SELECTOR = 30001
 SF_VEC_SIZE_OPTIONS = (16,)
-SF_VEC_SIZE = _initial_sf_vec_size_from_argv(SF_VEC_SIZE_OPTIONS, 16)
+SF_VEC_SIZE = 16
 MMA_KBLOCK_DIM = 64
 MMA_KBLOCK_IDESC_K_DIM = 0
 MMA_SCALE_CHUNK_K = SF_VEC_SIZE * 4
@@ -248,12 +121,6 @@ QK_TAIL_EFFECTIVE_MMA_KBLOCKS = QK_EFFECTIVE_MMA_KBLOCKS - QK_PREFIX_DIM // MMA_
 FIRST_ORDER_TAIL_A_LOCAL_KBLOCKS = (0, 1, 0)
 FIRST_ORDER_TAIL_B_LOCAL_KBLOCKS = (0, 0, 1)
 QK_SF_GROUPS = QK_PADDED_DIM // SF_VEC_SIZE
-LOG2_6 = math.log2(6.0)
-LOG2_E = 1.4426950408889634
-# Keep the PV-only P scale above E4M3's underflow range.  The matching output
-# normalization below cancels this factor without changing the attention math.
-FP4_MLA_E4M3_MAX_FINITE = 448.0
-FP4_MLA_P_GLOBAL_SCALE = FP4_MLA_E4M3_MAX_FINITE * 6.0
 SMEM_P4_PAGE_PLAN_PROFILE_KV = 160 * 1024
 SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT = 4
 SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT = SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT * TRTLLM_PAGE_SIZE
@@ -265,20 +132,7 @@ SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_PAGE_PLAN_PROFILE_KV // TRTLLM_PAGE_SIZE
 # softmax scale, PV rescale, producer mask bound (Int32 bits), pad.
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 4
 SMEM_P4_RUNTIME_MASK_BOUND_WORD = 2
-# Lazy-anchor rebase threshold (log2): a tile rescales the running O accumulator ("correction") only when the row
-# maximum grew by more than this since the current anchor. Every rebase drains the PV pipeline of all warps (and of
-# the whole 4-CTA cluster in the 4x kernel). Measured 2026-11-01 (hecate0340, DS-R1 shapes, logits scaled x1..x32): with
-# the default 1.0 realistic logits (x4) cost the 4x kernel 18-19 % and the 2x kernel 2-6 %; 4.0 removes the stalls up to
-# x8 logits and 6.0 up to ~x16 with FP32 cosine unchanged (the P scale saturates only above ~6.5 log2 at kv_gs 89.6; 8.0
-# breaks accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it and the --lazy-anchor-threshold-log2
-# argv flag of the bench tools overrides both.
-SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv(
-    "--lazy-anchor-threshold-log2", float(os.environ.get("TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2", "4.0"))
-)
-if not 0.0 <= SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 <= 8.0:
-    raise ValueError(
-        f"--lazy-anchor-threshold-log2 must be in [0, 8], got {SMEM_P4_LAZY_ANCHOR_REBASE_LOG2}"
-    )
+SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = resolve_fp4_mla_lazy_anchor_rebase_log2(4.0)
 SMEM_P4_PIPELINE_DIRECT_TARGET_PAGE_SIZE = 128
 RUBIN_TMEM_CAPACITY_KB = 288
 TMEM_BYTES_PER_COL = 512
@@ -483,15 +337,6 @@ SMEM_P4_PV_SFB_EXTRA_COL_STRIDE = -1
 SMEM_P4_PV_SFB_S2T_STRIDE_BYTES = 128
 SMEM_P4_PV_SFB_CP_GROUP_ONE = False
 SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-
-
-@dataclass(frozen=True)
-class KvCache3DLayout:
-    num_pages: int
-    packed_dim: int
-    stride_page: int
-    stride_token: int
-    stride_packed_dim: int
 
 
 SMEM_P4_PRODUCER_WARPS_PER_SCORE_SLOT = SMEM_P4_TMEM_WARP_M * SMEM_P4_TMEM_WARP_N
@@ -904,10 +749,6 @@ O_STORE_BAR_THREADS = 32 * SMEM_P4_STORE_WARPS
 SMEM_P4_QSF_OWNER_BAR_THREADS = 32 * (SMEM_P4_COMPUTE_WARPS + 1)
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 def _select_runtime_kv_profile(max_kv_len: int) -> int:
     if type(max_kv_len) is not int:
         raise TypeError(f"max_kv_len must be an int, got {type(max_kv_len).__name__}")
@@ -926,48 +767,6 @@ def _select_runtime_kv_profile(max_kv_len: int) -> int:
     profile_payload = max_kv_len - SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
     profile_kv = (1 << (profile_payload - 1).bit_length()) + (SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT)
     return min(profile_kv, SMEM_P4_RUNTIME_MAX_KV)
-
-
-def _validate_output_dtype(output_dtype: torch.dtype) -> None:
-    if output_dtype not in {torch.float16, torch.bfloat16}:
-        raise TypeError(f"output dtype must be torch.float16 or torch.bfloat16, got {output_dtype}")
-
-
-def _validate_tensor_pointer_alignment(
-    name: str,
-    tensor: torch.Tensor,
-    alignment_bytes: int = PREPARED_BUFFER_ALIGNMENT_BYTES,
-) -> None:
-    pointer = tensor.data_ptr()
-    if pointer % alignment_bytes != 0:
-        raise ValueError(
-            f"{name} data pointer must be {alignment_bytes}B aligned, got address remainder {pointer % alignment_bytes}"
-        )
-
-
-@cute.jit
-def _pack_e2m1x8(
-    p0: ctm.Float32,
-    p1: ctm.Float32,
-    p2: ctm.Float32,
-    p3: ctm.Float32,
-    p4: ctm.Float32,
-    p5: ctm.Float32,
-    p6: ctm.Float32,
-    p7: ctm.Float32,
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b8 b0, b1, b2, b3;\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b0, {$r1}, {$r0};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b1, {$r3}, {$r2};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b2, {$r5}, {$r4};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b3, {$r7}, {$r6};\n"
-        "\tmov.b32 {$w0}, {b0, b1, b2, b3};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[p0, p1, p2, p3, p4, p5, p6, p7],
-    )
 
 
 @cute.jit
@@ -2233,11 +2032,6 @@ def _load_v_tile_stage(
 
 
 @cute.jit
-def _fence_async_shared_cta() -> None:
-    prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-
-
-@cute.jit
 def _sleep_until_producer_slot_free(producer) -> ctm.Boolean:
     """Poll a load pipeline slot with a sleep between acquire attempts."""
     acquired = producer.try_acquire()
@@ -2300,82 +2094,6 @@ def _permute_raw_trtllm_q_tail_in_smem(sQ, local_warp_idx: ctm.Int32, lane_idx: 
 
 
 @cute.jit
-def _mask_invalid_score(
-    score: ctm.Float32, global_k_idx: ctm.Int32, valid_k: ctm.Int32
-) -> ctm.Float32:
-    masked = score
-    if global_k_idx >= valid_k:
-        masked = ctm.Float32(-ctm.Float32.inf)
-    return masked
-
-
-@cute.jit
-def _pack_e4m3x4_natural(
-    sf0: ctm.Float32, sf1: ctm.Float32, sf2: ctm.Float32, sf3: ctm.Float32
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
-        "\tcvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[sf0, sf1, sf2, sf3],
-    )
-
-
-@cute.jit
-def _pack_e4m3x4_natural_from_f16x2(pair01: ctm.Int32, pair23: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 lo, {$r0};\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 hi, {$r1};\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair01, pair23],
-    )
-
-
-@cute.jit
-def _scale_pack_e4m3x4_natural_from_f16x2(
-    pair01: ctm.Int32, pair23: ctm.Int32, scale: ctm.Float32
-) -> ctm.Int32:
-    """Scale two FP16x2 pairs and pack the PV-only E4M3 scale word."""
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .f16 scale_h;\n"
-        "\t.reg .b32 scale_h2, scaled01, scaled23;\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.f16.f32 scale_h, {$r2};\n"
-        "\tmov.b32 scale_h2, {scale_h, scale_h};\n"
-        "\tmul.f16x2 scaled01, {$r0}, scale_h2;\n"
-        "\tmul.f16x2 scaled23, {$r1}, scale_h2;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 lo, scaled01;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 hi, scaled23;\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair01, pair23, scale],
-    )
-
-
-@cute.jit
-def _softmax_exp2_pair(
-    score0: ctm.Float32,
-    score1: ctm.Float32,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-) -> tuple:
-    shifted = nvvm_fma_packed_f32x2(
-        (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
-    )
-    return (cute.exp2(shifted[0], fastmath=True), cute.exp2(shifted[1], fastmath=True))
-
-
-@cute.jit
 def _bitcast_i32_to_f32(value: ctm.Int32) -> ctm.Float32:
     return ctm.Vector.from_elements((value,), dtype=ctm.Int32).bitcast(ctm.Float32)[0]
 
@@ -2395,177 +2113,6 @@ def _warp_uniform_f32(value: ctm.Float32) -> ctm.Float32:
     bits = ctm.Vector.from_elements((value,), dtype=ctm.Float32).bitcast(ctm.Int32)[0]
     uniform_bits = cute.arch.make_warp_uniform(bits)
     return ctm.Vector.from_elements((uniform_bits,), dtype=ctm.Int32).bitcast(ctm.Float32)[0]
-
-
-@cute.jit
-def _pack_f32_pair_to_f16x2(value0: ctm.Float32, value1: ctm.Float32) -> ctm.Int32:
-    return (
-        ctm.Vector.from_elements((value0, value1), dtype=ctm.Float32)
-        .to(ctm.Float16)
-        .bitcast(ctm.Int32)[0]
-    )
-
-
-@cute.jit
-def _softmax_exp2_pair_packed_f16x2(
-    score0: ctm.Float32,
-    score1: ctm.Float32,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-) -> ctm.Int32:
-    shifted = nvvm_fma_packed_f32x2(
-        (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
-    )
-    shifted_h2 = _pack_f32_pair_to_f16x2(shifted[0], shifted[1])
-    return cute_inline_ptx(
-        "ex2.approx.f16x2 {$w0}, {$r0};",
-        write_only_types=[ctm.Int32],
-        read_only_args=[shifted_h2],
-    )
-
-
-@cute.jit
-def _add_f16x2(a: ctm.Int32, b: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "add.rn.f16x2 {$w0}, {$r0}, {$r1};",
-        write_only_types=[ctm.Int32],
-        read_only_args=[a, b],
-    )
-
-
-@cute.jit
-def _unpack_f16x2_to_f32_pair(packed: ctm.Int32) -> tuple:
-    """Widen one packed probability pair for the denominator only."""
-    values_f16 = ctm.Vector.from_elements((packed,), dtype=ctm.Int32).bitcast(ctm.Float16)
-    values_f32 = values_f16.to(ctm.Float32)
-    return (values_f32[0], values_f32[1])
-
-
-@cute.jit
-def _p4_n256_prequant_rowsum_from_f16x2_psf(
-    sf_h2_01: ctm.Int32,
-    sf_h2_23: ctm.Int32,
-    group_p_sums,
-) -> ctm.Float32:
-    """Weight FP32 P sums before the FP16 PSF values narrow to E4M3."""
-    sf_exact_0, sf_exact_1 = _unpack_f16x2_to_f32_pair(sf_h2_01)
-    sf_exact_2, sf_exact_3 = _unpack_f16x2_to_f32_pair(sf_h2_23)
-    row_sum_parts01 = nvvm_mul_packed_f32x2(
-        (sf_exact_0, sf_exact_1), (group_p_sums[0], group_p_sums[1])
-    )
-    row_sum_parts23 = nvvm_mul_packed_f32x2(
-        (sf_exact_2, sf_exact_3), (group_p_sums[2], group_p_sums[3])
-    )
-    return _sum_p4_n256_psf_row_parts(
-        row_sum_parts01[0],
-        row_sum_parts01[1],
-        row_sum_parts23[0],
-        row_sum_parts23[1],
-    )
-
-
-@cute.jit
-def _pack_e2m1x8_from_f16x2(
-    pair0: ctm.Int32, pair1: ctm.Int32, pair2: ctm.Int32, pair3: ctm.Int32
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b8 b0, b1, b2, b3;\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b0, {$r0};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b1, {$r1};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b2, {$r2};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b3, {$r3};\n"
-        "\tmov.b32 {$w0}, {b0, b1, b2, b3};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair0, pair1, pair2, pair3],
-    )
-
-
-@cute.jit
-def _horizontal_pack_two_f16x2_sums(group_sum0: ctm.Int32, group_sum1: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .f16 g0lo, g0hi, g1lo, g1hi, sum0, sum1;\n"
-        "\tmov.b32 {g0lo, g0hi}, {$r0};\n"
-        "\tmov.b32 {g1lo, g1hi}, {$r1};\n"
-        "\tadd.rn.f16 sum0, g0lo, g0hi;\n"
-        "\tadd.rn.f16 sum1, g1lo, g1hi;\n"
-        "\tmov.b32 {$w0}, {sum0, sum1};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[group_sum0, group_sum1],
-    )
-
-
-@cute.jit
-def _pack_p4_16_scores_from_group(
-    group_scores,
-    group_base: ctm.Int32,
-    valid_k: ctm.Int32,
-    group_valid: ctm.Boolean,
-    mask_valid_k: ctm.Constexpr,
-    use_mixed_imlp: ctm.Constexpr,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-    elem_base: ctm.Constexpr,
-) -> tuple:
-    words = ctm.Array(ctm.Int32, 2, space=ctm.AddressSpace.rmem)
-    p_sum_pair = (ctm.Float32(0.0), ctm.Float32(0.0))
-    for word_part in ctm.range_constexpr(2):
-        packed_p0 = ctm.Float32(0.0)
-        packed_p1 = ctm.Float32(0.0)
-        packed_p2 = ctm.Float32(0.0)
-        packed_p3 = ctm.Float32(0.0)
-        packed_p4 = ctm.Float32(0.0)
-        packed_p5 = ctm.Float32(0.0)
-        packed_p6 = ctm.Float32(0.0)
-        packed_p7 = ctm.Float32(0.0)
-        for pair_idx in ctm.range_constexpr(4):
-            elem0: ctm.Constexpr = elem_base + word_part * 8 + pair_idx * 2
-            elem1: ctm.Constexpr = elem0 + 1
-            p0 = ctm.Float32(0.0)
-            p1 = ctm.Float32(0.0)
-            should_compute = ctm.Boolean(True)
-            if cutlass.const_expr(mask_valid_k):
-                should_compute = group_valid
-            if should_compute:
-                score0 = group_scores[elem0]
-                score1 = group_scores[elem1]
-                if cutlass.const_expr(mask_valid_k):
-                    global_k_idx0 = group_base + ctm.Int32(elem0)
-                    global_k_idx1 = group_base + ctm.Int32(elem1)
-                    score0 = _mask_invalid_score(score0, global_k_idx0, valid_k)
-                    score1 = _mask_invalid_score(score1, global_k_idx1, valid_k)
-                p0, p1 = _softmax_exp2_pair(score0, score1, softmax_scale_log2, p_bias)
-            if cutlass.const_expr(word_part == 0 and pair_idx == 0):
-                p_sum_pair = (p0, p1)
-            else:
-                p_sum_pair = nvvm_add_packed_f32x2(p_sum_pair, (p0, p1))
-            if cutlass.const_expr(pair_idx == 0):
-                packed_p0 = p0
-                packed_p1 = p1
-            elif cutlass.const_expr(pair_idx == 1):
-                packed_p2 = p0
-                packed_p3 = p1
-            elif cutlass.const_expr(pair_idx == 2):
-                packed_p4 = p0
-                packed_p5 = p1
-            else:
-                packed_p6 = p0
-                packed_p7 = p1
-        words[word_part] = _pack_e2m1x8(
-            packed_p0,
-            packed_p1,
-            packed_p2,
-            packed_p3,
-            packed_p4,
-            packed_p5,
-            packed_p6,
-            packed_p7,
-        )
-    p_sum = p_sum_pair[0] + p_sum_pair[1]
-    return (words[0], words[1], p_sum)
 
 
 @cute.jit
@@ -3558,64 +3105,6 @@ def _smem_p4_p4_materialize_group_col(
 
 
 @cute.jit
-def _float_to_ordered_u32_for_atomic_max(value: ctm.Float32) -> ctm.Uint32:
-    bits = prims.mov_b32(value, target_type=ctm.Int32)
-    sign_mask = bits >> ctm.Int32(31) | ctm.Int32(2147483648)
-    encoded = bits ^ sign_mask
-    return prims.mov_b32(encoded, target_type=ctm.Uint32)
-
-
-@cute.jit
-def _ordered_u32_to_float_after_atomic_max(value: ctm.Uint32) -> ctm.Float32:
-    encoded = prims.mov_b32(value, target_type=ctm.Int32)
-    sign_mask = ~(encoded >> ctm.Int32(31)) | ctm.Int32(2147483648)
-    bits = encoded ^ sign_mask
-    return prims.mov_b32(bits, target_type=ctm.Float32)
-
-
-@cute.jit
-def _smem_atomic_max_ordered_u32(pointer, value: ctm.Uint32) -> None:
-    prims.atomicrmw(
-        prims.AtomicOp.MAX,
-        pointer,
-        value,
-        syncscope=prims.MemScope.CTA,
-        space=prims.SharedSpace.shared_cta,
-    )
-
-
-@cute.jit
-def _tcgen05_ld_red_32x32b_x16_max_f32(tmem) -> tuple:
-    tmem_addr = tmem.toint(ctm.Int32)
-    return cute_inline_ptx(
-        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
-        "{{$w0}, {$w1}, {$w2}, {$w3}, {$w4}, {$w5}, {$w6}, {$w7}, "
-        "{$w8}, {$w9}, {$w10}, {$w11}, {$w12}, {$w13}, {$w14}, {$w15}}, "
-        "{$w16}, [{$r0}];",
-        write_only_types=[ctm.Int32] * 17,
-        read_only_args=[tmem_addr],
-    )
-
-
-@cute.jit
-def _publish_p4_n256_atomic_rowmax(
-    sAtomicRunningRowMax,
-    tile_row_max: ctm.Float32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-) -> None:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    _smem_atomic_max_ordered_u32(
-        sAtomicRunningRowMax.data_ptr() + local_row,
-        _float_to_ordered_u32_for_atomic_max(tile_row_max),
-    )
-
-
-@cute.jit
 def _prepare_p4_n256_score_half_tmem_addresses(
     warp_idx: ctm.Int32,
     base_col_id: ctm.Int32,
@@ -4125,41 +3614,6 @@ def _issue_p4_n256_psf_bank_to_tmem_from_desc(desc_psf_s2t, p_sfa_tmem) -> None:
             group=prims.CTAGroup.CTA_2,
             multicast=psf_s2t_multicast,
         )
-
-
-@cute.jit
-def _sum_p4_n256_psf_row_parts(
-    row_sum_part0: ctm.Float32,
-    row_sum_part1: ctm.Float32,
-    row_sum_part2: ctm.Float32,
-    row_sum_part3: ctm.Float32,
-) -> ctm.Float32:
-    row_sum = row_sum_part0 + row_sum_part1
-    row_sum = row_sum + row_sum_part2
-    return row_sum + row_sum_part3
-
-
-@cute.jit
-def _p4_n256_rowsum_from_packed_psf_word(sf_word: ctm.Int32, packed_group_sums) -> ctm.Float32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 sf01, sf23;\n"
-        "\t.reg .b32 sf_h2_01, sf_h2_23, weighted_h2;\n"
-        "\t.reg .f16 weighted_lo, weighted_hi;\n"
-        "\t.reg .f32 weighted_lo_f32, weighted_hi_f32;\n"
-        "\tmov.b32 {sf01, sf23}, {$r0};\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_01, sf01;\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_23, sf23;\n"
-        "\tmul.f16x2 weighted_h2, {$r1}, sf_h2_01;\n"
-        "\tfma.rn.f16x2 weighted_h2, {$r2}, sf_h2_23, weighted_h2;\n"
-        "\tmov.b32 {weighted_lo, weighted_hi}, weighted_h2;\n"
-        "\tcvt.f32.f16 weighted_lo_f32, weighted_lo;\n"
-        "\tcvt.f32.f16 weighted_hi_f32, weighted_hi;\n"
-        "\tadd.f32 {$w0}, weighted_lo_f32, weighted_hi_f32;\n"
-        "\t}\n",
-        write_only_types=[ctm.Float32],
-        read_only_args=[sf_word, packed_group_sums[0], packed_group_sums[1]],
-    )
 
 
 @cute.jit
@@ -7046,13 +6500,6 @@ def kernel(
             folded_query_heads,
             packed_query_heads,
         )
-
-
-def _cutlass_output_dtype(output_dtype: torch.dtype):
-    _validate_output_dtype(output_dtype)
-    if output_dtype == torch.bfloat16:
-        return cutlass.BFloat16
-    return cutlass.Float16
 
 
 def _make_fused_ptrs(

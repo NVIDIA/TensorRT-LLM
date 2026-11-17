@@ -23,14 +23,16 @@ from cutlass.cute.runtime import make_ptr
 
 from .config import _fp4_mla_packed_wave_plan_enabled
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
-from .fp4_mla_cutedsl_mufu16 import (
-    KV_TILE,
+from .cutedsl_common import (
     LOG2_E,
-    PACKED_MIN_TILES_PER_TASK,
     _cutlass_output_dtype,
-    _packed_query_bound,
     _validate_output_dtype,
     _validate_tensor_pointer_alignment,
+)
+from .fp4_mla_cutedsl_mufu16 import (
+    KV_TILE,
+    PACKED_MIN_TILES_PER_TASK,
+    _packed_query_bound,
 )
 
 _PACKED_REDUCE_COMPILE_CACHE: dict[tuple[int, bool, torch.dtype], Callable] = {}
