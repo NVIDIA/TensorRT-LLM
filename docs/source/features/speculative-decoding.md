@@ -180,7 +180,9 @@ With `attention_backend="TRTLLM"`, TRTLLM target attention, and the default
 manager. Target and draft layers share one page table, so one KV budget covers
 both and each request's draft pages are allocated, padded and freed with its
 target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
-cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
+cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache, unless
+the drafter declares another pool dtype (`draft_kv_dtype`, for example FP8 E4M3
+latents for an MLA drafter).
 
 In disaggregated serving, direct worker launches require
 `TRTLLM_DISAGG_SHARED_DRAFT_KV=1` (or `auto`, which shares wherever the layout
