@@ -34,9 +34,23 @@ Use post-merge or QA for coverage suited to those schedules. Keep one-time
 investigation checks out of recurring CI unless they protect a lasting
 regression. Prune redundant cases while preserving meaningful failure modes.
 
-For Python unit-test case design, parameter matrices and native helpers, follow
+For Python unit-test case design and parameter matrices, follow
 the [unit-test guidance](unittest/AGENTS.md). For C++ targets, build artifacts and
 execution, follow the [C++ test guidance](../cpp/tests/AGENTS.md).
+
+## Build test helpers before the test stage
+
+For CI tests that need native helpers or executables, build them in the
+build stage and consume matching artifacts in the test stage. Do not introduce
+ad hoc compiler, CMake, or extension builds during test discovery, setup, or
+execution merely to prepare a helper. Reuse the existing build targets and
+artifact flow. For C++ executables and their packaging, follow the
+[C++ test build guidance](../cpp/tests/AGENTS.md#build-and-execution).
+
+Keep intentional runtime compilation when it is part of the behavior under
+test (for example, a JIT kernel), and account for its cost when choosing the CI
+layer. Preserve explicit local/source-build workflows; these are not a reason
+to rebuild ordinary test helpers on every CI test node.
 
 ## Whether a new test runs in CI
 

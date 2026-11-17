@@ -52,17 +52,3 @@ Before changing registrations or process boundaries, follow the
 [test-list instructions](../integration/test_lists/AGENTS.md). An existing parent
 entry may already select a new test; confirm actual selection before adding an
 entry.
-
-## Build test helpers before the test stage
-
-For unit tests in CI that need native helpers or executables, build them in the
-build stage and consume matching artifacts in the test stage. Do not introduce
-ad hoc compiler, CMake, or extension builds in pytest collection, fixtures, or
-test bodies merely to prepare a helper. Reuse the existing build targets and
-artifact flow. For C++ executables and their packaging, follow the
-[C++ test build guidance](../../cpp/tests/AGENTS.md#build-and-execution).
-
-Keep intentional runtime compilation when it is part of the behavior under
-test (for example, a JIT kernel), and account for its cost when choosing the CI
-layer. Preserve explicit local/source-build workflows; these are not a reason
-to rebuild ordinary test helpers on every CI test node.

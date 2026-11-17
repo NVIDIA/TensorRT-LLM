@@ -21,15 +21,10 @@ Scope: this directory and its descendants. Supplements the repository-root
 `AGENTS.md`. The build and execution guidance also applies to the
 [integration fixtures](../../tests/integration/defs/cpp/) that run these tests.
 
-Follow the shared [test-value and placement rules](../../tests/AGENTS.md#test-value-and-execution-placement)
-when adding or pruning C++ tests.
+Follow the shared [test guidance](../../tests/AGENTS.md) for regression value,
+coverage, CI placement and building helpers before the test stage.
 
 ## Build and execution
-
-Build CI test executables in the build stage and consume matching artifacts in
-the test stage. Extend the existing targets and bundle flow when adding tests;
-avoid introducing ad hoc compilation on each test node. Preserve the explicit
-source-build workflows described below.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
