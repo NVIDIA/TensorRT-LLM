@@ -20,13 +20,14 @@ import mmap
 import threading
 import weakref
 from types import SimpleNamespace
-from typing import List, Set
+from typing import Callable, ContextManager, List, Set
 
 import numpy as np
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     Lease,
     LeaseView,
@@ -377,13 +378,22 @@ def test_staging_refuses_a_manager_that_commits_no_blocks(kit, real_manager, cas
 
 @pytest.mark.parametrize("capacity_only", [False, True])
 def test_staging_refuses_a_manager_with_a_kv_cache_connector(
-    kit, real_manager, capacity_only, attach=attach
-):
+    kit: SimpleNamespace,
+    real_manager: Callable[..., ContextManager[KVCacheManagerV2]],
+    capacity_only: bool,
+    attach: Callable[..., Lender] = attach,
+) -> None:
     """A KV cache connector serves a request's prefix at its first context chunk, measured from the
     committed tokens, so it cannot lower a history a windowed fetch moved, and its loads run off the
     manager's stream. Staging refuses either transfer or capacity-only connectors at the attach,
     which then changed nothing. A stand-in exposing the connector mode suffices here."""
-    connector = SimpleNamespace(capacity_only=capacity_only)
+    connector = SimpleNamespace(
+        capacity_only=capacity_only,
+        requires_block_aligned_reuse=False,
+        drops_reuse_match_backoff=False,
+        requires_completion_reservation=False,
+        reports_failed_loads=False,
+    )
     with real_manager(windows=[WINDOW, 256], kv_connector_manager=connector) as mgr:
         assert mgr.kv_connector_manager is connector
         before = len(kit.retained())

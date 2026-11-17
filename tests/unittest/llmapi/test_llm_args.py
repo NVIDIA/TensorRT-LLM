@@ -1928,7 +1928,7 @@ class TestKvCacheManagerV2AutoResolution:
 @pytest.mark.parametrize(
     "offload_field",
     ["cold_tier_offload_min_priority", "secondary_offload_min_priority"])
-def test_KvCacheConfig_declaration(offload_field):
+def test_KvCacheConfig_declaration(offload_field: str) -> None:
     assert KvCacheConfig().mamba_state_cache_interval is None
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
@@ -2036,6 +2036,37 @@ def test_KvCacheConfig_defer_generation_only_release():
                        match="defer_generation_only_release requires"):
         KvCacheConfig(defer_generation_only_release=True,
                       use_kv_cache_manager_v2=False)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_disagg_completion_reservation() -> None:
+    assert KvCacheConfig().enable_disagg_completion_reservation is False
+    field = KvCacheConfig.model_fields["enable_disagg_completion_reservation"]
+    assert field.json_schema_extra["status"] == "prototype"
+
+    config = KvCacheConfig(host_cache_size=0,
+                           enable_disagg_completion_reservation=True)
+    assert config.enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate(
+        config.model_dump()).enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate_json(
+        config.model_dump_json()).enable_disagg_completion_reservation is True
+    # The C++ config has no such field, and the conversion leaves it out.
+    pybind_config = config._to_pybind()
+    assert pybind_config.host_cache_size == 0
+    assert not hasattr(pybind_config, "enable_disagg_completion_reservation")
+
+    # The deployment path: a YAML extra-options file merged into the LLM args.
+    merged = update_llm_args_with_extra_dict(
+        {"model": "dummy"},
+        yaml.safe_load("kv_cache_config:\n"
+                       "  host_cache_size: 0\n"
+                       "  enable_disagg_completion_reservation: true\n"))
+    assert merged[
+        "kv_cache_config"].enable_disagg_completion_reservation is True
+    with pytest.raises(ValidationError,
+                       match="enable_disagg_completion_reservation"):
+        KvCacheConfig(enable_disagg_completion_reservation="sometimes")
 
 
 @pytest.mark.cpu_only
@@ -7259,3 +7290,87 @@ class TestDwdpLaunch:
         assert message.startswith("Dense DWDP (dwdp_config.enable_dense) ")
         assert message.endswith("Change the launch configuration or set "
                                 "dwdp_config.enable_dense=False.")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("overrides", [
+    {
+        "use_kv_cache_manager_v2": False
+    },
+    {
+        "host_cache_size": 1
+    },
+    {
+        "disk_cache_size": 1,
+        "disk_cache_path": "/tmp"
+    },
+])
+def test_completion_reservation_rejects_incompatible_config(
+        overrides: dict[str, bool | int | str]) -> None:
+    with pytest.raises(ValueError,
+                       match="enable_disagg_completion_reservation"):
+        KvCacheConfig(enable_disagg_completion_reservation=True, **overrides)
+
+
+@pytest.mark.cpu_only
+def test_auto_v1_warns_when_completion_reservation_cannot_take_effect() -> None:
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2="auto",
+            enable_disagg_completion_reservation=True,
+            host_cache_size=0,
+        ),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="CPP"),
+    )
+    with patch("tensorrt_llm.llmapi.llm_utils.logger.warning") as warning:
+        _resolve_kv_cache_manager_v2_auto(
+            args, TestKvCacheManagerV2AutoResolution._PreferV2)
+    assert args.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert any(
+        "enable_disagg_completion_reservation will not take effect" in str(item)
+        for item in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+class TestKvCacheConnectorAdmissionQuery:
+    """kv_connector_config.admission_query: admission-time connector queries."""
+
+    @staticmethod
+    def _config(**kwargs):
+        from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+        return KvCacheConnectorConfig(connector="mooncake-store", **kwargs)
+
+    def test_off_by_default(self) -> None:
+        assert self._config().admission_query is None
+
+    def test_empty_mapping_enables_page_booking_only(self) -> None:
+        admission = self._config(admission_query={}).admission_query
+        assert admission.max_uncharged_parks == 0
+        assert admission.max_offer_deferrals == 16
+
+    def test_round_trip(self) -> None:
+        from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+        config = self._config(admission_query={
+            "max_uncharged_parks": 4,
+            "max_offer_deferrals": 0
+        })
+        dumped = config.model_dump()
+        assert dumped["admission_query"] == {
+            "max_uncharged_parks": 4,
+            "max_offer_deferrals": 0
+        }
+        restored = KvCacheConnectorConfig.model_validate_json(
+            config.model_dump_json())
+        assert restored.admission_query == config.admission_query
+
+    @pytest.mark.parametrize("field",
+                             ["max_uncharged_parks", "max_offer_deferrals"])
+    def test_negative_values_are_rejected(self, field: str) -> None:
+        with pytest.raises(ValidationError, match=field):
+            self._config(admission_query={field: -1})
+
+    def test_unknown_key_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="max_parks"):
+            self._config(admission_query={"max_parks": 1})

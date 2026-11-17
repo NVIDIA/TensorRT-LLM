@@ -5418,6 +5418,12 @@ def create_py_executor_resources(
         enable_prefix_aware_scheduling = (
             scheduler_config.enable_prefix_aware_scheduling
             if scheduler_config is not None else True)
+        # Admission-time connector queries. The executor checks the connector,
+        # the overlap scheduler and attention DP once the connector is bound;
+        # the fallbacks match the config defaults and are inert while it is off.
+        kv_connector_config = getattr(llm_args, "kv_connector_config", None)
+        admission = (kv_connector_config.admission_query
+                     if kv_connector_config is not None else None)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -5447,6 +5453,11 @@ def create_py_executor_resources(
                 if scheduler_config is not None else None),
             exact_context_demotion=runtime_hooks_of(
                 model_engine.model).exact_context_demotion,
+            connector_admission_query=admission is not None,
+            max_uncharged_connector_parks=(admission.max_uncharged_parks
+                                           if admission is not None else 0),
+            max_connector_offer_deferrals=(admission.max_offer_deferrals
+                                           if admission is not None else 16),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

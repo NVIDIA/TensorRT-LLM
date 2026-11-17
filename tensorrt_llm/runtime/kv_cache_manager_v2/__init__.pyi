@@ -601,6 +601,9 @@ class KVCacheManagerConfig:
     # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
     # per-layer-group slot-count proportions at cold page sizes.
     cold_typical_step: BatchDesc | None = None
+    # Candidate alignment after backoff, before each coverage validation;
+    # a positive divisor of tokens_per_block. 1 keeps token-granular reuse.
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
