@@ -92,9 +92,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
-    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -3045,8 +3047,8 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         mgr.shutdown()
 
 
-def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
-    return KVCacheLayerSpec(
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheStorageLayerSpec:
+    return KVCacheStorageLayerSpec(
         global_layer_id=global_layer_id,
         owner=KVCacheLayerOwner.DRAFT,
         dtype=DataType.FP8,

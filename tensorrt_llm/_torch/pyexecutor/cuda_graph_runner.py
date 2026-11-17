@@ -364,6 +364,7 @@ class CUDAGraphRunner:
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        self.forward_scratch_buffers = Buffers()
         if self.enabled:
             self._create_shared_static_tensors()
         self.cuda_graph_meta_buffers = (Buffers()
@@ -1033,8 +1034,11 @@ class CUDAGraphRunner:
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, key.draft_len,
-            self.cuda_graph_meta_buffers)
+            num_sequences_in_batch,
+            False,
+            key.draft_len,
+            self.cuda_graph_meta_buffers,
+            forward_scratch_buffers=self.forward_scratch_buffers)
         for variant, value in zip(self.graph_variants, key.variants):
             # The decode captured in this graph behaves as the key's value of
             # the variant says, instead of deciding on each call.
@@ -1953,6 +1957,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.forward_scratch_buffers.buffers.clear()
         self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
