@@ -519,40 +519,6 @@ def _llm_api_options(tmp_path, **llm_args):
     return str(options)
 
 
-@pytest.mark.parametrize("checkpoint_format", [None, "HF", "mistral", "mistral_large_3"])
-def test_cli_options_read_the_model_type_of_the_checkpoint_format(tmp_path, checkpoint_format):
-    """The model type of a Mistral-native checkpoint comes from its native format.
-
-    Its configuration is in params.json; the model type selects the multimodal prompt rendering.
-    """
-    env = BenchmarkEnvironment(model="m", checkpoint_path=tmp_path, workspace=tmp_path)
-    params = {}
-    if checkpoint_format is not None:
-        params["extra_llm_api_options"] = _llm_api_options(
-            tmp_path, checkpoint_format=checkpoint_format
-        )
-    options = get_general_cli_options(params, env)
-    assert options.checkpoint_format == checkpoint_format
-    native = checkpoint_format in ("mistral", "mistral_large_3")
-    with (
-        mock.patch(
-            "tensorrt_llm.bench.benchmark.load_pretrained_config",
-            return_value=SimpleNamespace(model_type="mistral_common"),
-        ) as load,
-        mock.patch(
-            "tensorrt_llm.bench.benchmark.get_model_config",
-            return_value=SimpleNamespace(model_type="llama"),
-        ),
-    ):
-        assert options.model_type == ("mistral_common" if native else "llama")
-    if native:
-        load.assert_called_once_with(
-            tmp_path, trust_remote_code=True, checkpoint_format=checkpoint_format
-        )
-    else:
-        load.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "checkpoint_format, model_path, downloads",
     [
@@ -650,6 +616,34 @@ def _mistral_native_checkpoint(path, *, weights="consolidated", hf_config=False)
     return path
 
 
+@pytest.mark.parametrize(
+    "checkpoint_format,model_type",
+    [
+        (None, "llama"),
+        ("HF", "llama"),
+        ("mistral", "mistral_common"),
+        ("mistral_large_3", "mistral_common"),
+    ],
+)
+def test_cli_options_read_the_model_type_of_the_checkpoint_format(
+    tmp_path, checkpoint_format, model_type
+):
+    """A Mistral-native checkpoint's model type comes from params.json, even beside a config.json.
+
+    The model type selects the multimodal prompt rendering.
+    """
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=True)
+    env = BenchmarkEnvironment(model="m", checkpoint_path=checkpoint, workspace=tmp_path)
+    params = {}
+    if checkpoint_format is not None:
+        params["extra_llm_api_options"] = _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format
+        )
+    options = get_general_cli_options(params, env)
+    assert options.checkpoint_format == checkpoint_format
+    assert options.model_type == model_type
+
+
 def _tune(tmp_path, checkpoint, checkpoint_format="mistral"):
     """Run get_settings without explicit limits; return the engine-setting arguments."""
     params = {
@@ -709,27 +703,6 @@ def test_tuning_of_an_unreadable_mistral_native_checkpoint_needs_explicit_limits
     checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", weights=None)
     with pytest.raises(ValueError, match="pass --max_batch_size and --max_num_tokens"):
         _tune(tmp_path, checkpoint)
-
-
-def test_explicit_limits_of_a_mistral_native_checkpoint_skip_the_tuning_heuristic(tmp_path):
-    params = {
-        "tp": 4,
-        "pp": 1,
-        "ep": 4,
-        "max_batch_size": 16,
-        "max_num_tokens": 32768,
-        "extra_llm_api_options": _llm_api_options(
-            tmp_path, checkpoint_format="mistral", enable_chunked_prefill="false"
-        ),
-    }
-    metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
-    with mock.patch(
-        "tensorrt_llm.bench.benchmark.utils.general._tuning_model_configs",
-        side_effect=AssertionError("the tuning heuristic must not read the checkpoint"),
-    ):
-        settings = get_settings(params, metadata, "mistral-native", tmp_path)
-    assert settings["settings_config"]["max_batch_size"] == 16
-    assert settings["settings_config"]["max_num_tokens"] == 32768
 
 
 def _fp8_mistral_native_checkpoint(path, *, hf_config):

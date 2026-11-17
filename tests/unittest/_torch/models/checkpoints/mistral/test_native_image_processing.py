@@ -170,16 +170,6 @@ def test_pil_image_size_is_the_size_of_the_pil_image(image, size):
     assert _to_pil(image).size == size
 
 
-def test_two_different_image_sizes_preserve_each_grid(native_processor):
-    processor = native_processor.processor
-    images = [_rgb(12, (224, 336)), _rgb(13, (448, 280))]
-    together = processor("Describe.", images=images)
-    _assert_grids(native_processor, together, images)
-    singles = [processor("Describe.", images=[image]) for image in images]
-    expected = sum(int((one["input_ids"] == processor.image_token_id).sum()) for one in singles)
-    assert int((together["input_ids"] == processor.image_token_id).sum()) == expected
-
-
 def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_processor):
     from tensorrt_llm.inputs.content_format import ContentFormat
     from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY

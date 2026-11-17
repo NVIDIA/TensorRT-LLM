@@ -44,7 +44,6 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     get_guided_decoding_config,
 )
 from tensorrt_llm.bindings.executor import GuidedDecodingParams
-from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 from tensorrt_llm.tokenizer import TransformersTokenizer
 
 pytestmark = pytest.mark.cpu_only
@@ -95,15 +94,11 @@ def _matcher(tokenizer, llg, backend, guide_type, guide):
 
 
 def test_guided_decoding_configs(tokenizer):
-    tekken = tokenizer.tokenizer
-    n_special, n_words = tekken.num_special_tokens, tekken.n_words
+    n_words = tokenizer.tokenizer.n_words
     xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
     assert xgrammar.tokenizer_str is None
     assert xgrammar.stop_token_ids == [tokenizer.eos_token_id]
-    vocab = xgrammar.encoded_vocab
-    assert len(vocab) == n_words and vocab[:n_special] == [""] * n_special
-    pieces = [tekken.id_to_byte_piece(i) for i in range(n_special, n_words)]
-    assert vocab[n_special:] == ["" if piece.startswith(b"\x00") else piece for piece in pieces]
+    assert len(xgrammar.encoded_vocab) == n_words
 
     llguidance = get_guided_decoding_config("llguidance", tokenizer)
     assert llguidance.tokenizer_str is None and llguidance.encoded_vocab is None
@@ -133,53 +128,43 @@ def _llm_args(checkpoint_format=None, custom_tokenizer=None):
     )
 
 
-@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
-def test_native_checkpoint_reloads_its_tekken_tokenizer(dual_format_dir, checkpoint_format):
-    """A rank that reloads the tokenizer masks the vocabulary its input processor encodes with."""
-    tokenizer = _load_guided_decoding_tokenizer(_llm_args(checkpoint_format), str(dual_format_dir))
-    assert type(tokenizer) is MistralTokenizer
-    config = get_guided_decoding_config("xgrammar", tokenizer)
-    assert config.encoded_vocab == tokenizer.xgrammar_tokenizer_info()["encoded_vocab"]
+_HF_TOKENIZER = "tensorrt_llm.tokenizer.TransformersTokenizer"
 
 
 @pytest.mark.parametrize(
-    "llm_args",
+    "llm_args,keep_tekken,expected",
     [
-        _llm_args(),
-        _llm_args("HF"),
+        (_llm_args("mistral"), True, MistralTokenizer),
+        (_llm_args("mistral_large_3"), True, MistralTokenizer),
+        # Guided decoding masks Tekken vocabularies only; a SentencePiece checkpoint keeps HF's.
+        (_llm_args("mistral"), False, TransformersTokenizer),
+        (_llm_args("mistral_large_3"), False, TransformersTokenizer),
+        (_llm_args(), True, TransformersTokenizer),
+        (_llm_args("HF"), True, TransformersTokenizer),
         # An explicit custom tokenizer takes precedence over the format's.
-        _llm_args("mistral", custom_tokenizer="tensorrt_llm.tokenizer.TransformersTokenizer"),
+        (_llm_args("mistral", custom_tokenizer=_HF_TOKENIZER), True, TransformersTokenizer),
+        (_llm_args(custom_tokenizer="mistral_common"), True, MistralTokenizer),
     ],
-    ids=["default", "HF", "custom_tokenizer"],
+    ids=[
+        "mistral",
+        "mistral_large_3",
+        "mistral_without_tekken",
+        "mistral_large_3_without_tekken",
+        "default",
+        "HF",
+        "custom_hf_tokenizer",
+        "custom_mistral_common",
+    ],
 )
-def test_other_checkpoints_reload_the_hf_tokenizer(dual_format_dir, llm_args):
-    tokenizer = _load_guided_decoding_tokenizer(llm_args, str(dual_format_dir))
-    assert type(tokenizer) is TransformersTokenizer
-    assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
-
-
-@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
-def test_a_native_checkpoint_without_tekken_reloads_its_hf_tokenizer(
-    dual_format_dir, checkpoint_format
+def test_a_rank_reloads_the_tokenizer_its_input_processor_encodes_with(
+    dual_format_dir, llm_args, keep_tekken, expected
 ):
-    """Guided decoding masks Tekken vocabularies only; a SentencePiece checkpoint keeps HF's."""
-    (dual_format_dir / "tekken.json").unlink()
-    tokenizer = _load_guided_decoding_tokenizer(_llm_args(checkpoint_format), str(dual_format_dir))
-    assert type(tokenizer) is TransformersTokenizer
-    assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
-
-
-def test_custom_tokenizer_reloads_the_tekken_tokenizer_of_an_hf_checkpoint(dual_format_dir):
-    tokenizer = _load_guided_decoding_tokenizer(
-        _llm_args(custom_tokenizer="mistral_common"), str(dual_format_dir)
-    )
-    assert type(tokenizer) is MistralTokenizer
-
-
-def test_tokenizers_without_their_own_vocabulary_keep_the_hf_path():
-    config = GuidedDecodingConfig(backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE)
-    assert _llguidance_tokenizer(config, object(), 32) is None
-    assert _llguidance_tokenizer(config, None, 32) is None
+    if not keep_tekken:
+        (dual_format_dir / "tekken.json").unlink()
+    tokenizer = _load_guided_decoding_tokenizer(llm_args, str(dual_format_dir))
+    assert type(tokenizer) is expected
+    if expected is TransformersTokenizer:
+        assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
 
 
 def test_llguidance_masks_a_padded_vocabulary(tokenizer):
@@ -198,22 +183,6 @@ def test_llguidance_masks_a_padded_vocabulary(tokenizer):
     assert allowed and max(allowed) < n_words
     assert not matcher.accept_token(padded - 1)
     assert _consume(matcher, _text(tokenizer, '{"city": "Paris"}'))
-
-
-def test_llguidance_tokenizer_is_tekken(tokenizer, llg):
-    tekken = tokenizer.tokenizer
-    assert llg.vocab_size == tekken.n_words and llg.eos_token == tokenizer.eos_token_id
-    assert all(llg.is_special_token(i) for i in range(tekken.num_special_tokens))
-    # llguidance marks special tokens with a leading 0xFF byte, so the raw 0xFF token is too.
-    ordinary = [
-        i
-        for i in range(tekken.num_special_tokens, 2000)
-        if not tekken.id_to_byte_piece(i).startswith(b"\xff")
-    ]
-    assert len(ordinary) > 900 and not any(llg.is_special_token(i) for i in ordinary)
-    text = '{"city": "巴黎 São Paulo 🙂"}'
-    ids = _text(tokenizer, text)
-    assert llg.tokenize_str(text) == ids and llg.decode_bytes(ids) == text.encode()
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])

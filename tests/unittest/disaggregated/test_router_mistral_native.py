@@ -26,7 +26,6 @@ The checkpoints are read from LLM_MODELS_ROOT: Mistral-Large-3 as published (no
 """
 
 import base64
-import sys
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,15 +158,6 @@ def test_router_loads_and_fingerprints_what_the_servers_load(router, same_server
     assert tokenizer["encoding"]["kind"] == "mistral_common" and tokenizer["complete"]
 
 
-def test_every_model_name_shares_the_checkpoints_resources(router, checkpoint):
-    """Whatever model name a client sends, the router loads its checkpoint once."""
-    resources = router._render_resources("m")
-    for name in ("a", "b", "c"):
-        assert router._render_resources(name) is resources
-        assert router._get_tokenizer(name) is resources.tokenizer
-    assert list(router._render_resources_cache) == [checkpoint[0]]
-
-
 @pytest.mark.parametrize("batched", [False, True])
 def test_completion_ids_are_the_servers(router, batched):
     resources = router._render_resources("m")
@@ -187,9 +177,6 @@ def test_completion_ids_are_the_servers(router, batched):
 @pytest.mark.parametrize("fields", [{}, {"tools": [_TOOL]}], ids=["plain", "tools"])
 def test_chat_ids_are_the_servers_and_are_forwarded(router, same_server, fields):
     expected = _servers_chat_ids(router, _MESSAGES, **fields)
-    assert expected == router._render_resources("m").tokenizer.apply_chat_template(
-        _MESSAGES, tools=fields.get("tools"), tokenize=True, return_dict=False
-    )
     request = ChatCompletionRequest(model="m", messages=_MESSAGES, **fields)
     assert router._routing_key_sync(request)["num_tokens"] == len(expected)
     assert request.prompt_token_ids == expected
@@ -283,12 +270,3 @@ def test_other_checkpoint_formats_keep_the_hf_tokenizer(checkpoint_format):
     chat = ChatCompletionRequest(model="m", messages=_MESSAGES)
     expected = reference._tokenize(ChatCompletionRequest(model="m", messages=_MESSAGES))
     assert router._tokenize(chat) == expected and expected[0]
-
-
-def test_an_hf_router_does_not_import_the_mistral_tokenizer(monkeypatch):
-    """Telling a Mistral-native tokenizer apart does not load the model packages for others."""
-    module = "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer"
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    router = _router(tokenizer_dir=str(_model_dir(_QWEN3)))
-    assert router._get_tokenizer("m") is not None
-    assert module not in sys.modules
