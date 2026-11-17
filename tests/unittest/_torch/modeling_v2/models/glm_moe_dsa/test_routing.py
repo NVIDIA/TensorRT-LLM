@@ -9,8 +9,8 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
@@ -38,7 +38,7 @@ def _on_sm103(monkeypatch):
     """Route as if this were a GB300, wherever the test actually runs."""
     # Routing selects a class; these synthetic CPU configs do not construct it.
     module = ModuleType(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__low_latency.modeling"
     )
     module.ModelingV2Glm52Nvfp4Sm107LowLatency = type(
@@ -189,7 +189,7 @@ def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, 
     # Exercise the real routing predicates on CPU without requiring the target's
     # native library. Native loading and execution are covered by GPU tests.
     module_name, class_name = _GLM52_HIGH_THROUGHPUT_TARGET.rsplit(".", 1)
-    stub = ModuleType(f"tensorrt_llm._torch._experimental.modeling_v2.{module_name}")
+    stub = ModuleType(f"tensorrt_llm._torch.modeling_v2.{module_name}")
     setattr(stub, class_name, type(class_name, (), {"__module__": stub.__name__}))
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     config = _model_config(

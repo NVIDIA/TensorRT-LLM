@@ -16,7 +16,7 @@ import torch
 from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
-from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+from tensorrt_llm._torch.memory_buffer_utils import BufferBlock, Buffers, get_memory_buffers
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -43,6 +43,18 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _empty_runner() -> CUDAGraphRunner:
+    runner = object.__new__(CUDAGraphRunner)
+    runner.memory_pool = None
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner.graph_metadata = {}
+    runner._step_input_prologue_keys = {}
+    runner._hostfunc_graph_keys = set()
+    runner.forward_scratch_buffers = Buffers()
+    return runner
 
 
 def _feature_encoder_runner(
@@ -512,6 +524,26 @@ def _decoder_runner(
     return CUDAGraphRunner(config)
 
 
+def test_runner_can_clear_after_static_input_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    config = replace(_decoder_runner().config, use_cuda_graph=True)
+    partially_built: list[CUDAGraphRunner] = []
+
+    def fail_initialization(runner: CUDAGraphRunner) -> None:
+        partially_built.append(runner)
+        raise ValueError("static inputs rejected")
+
+    monkeypatch.setattr(CUDAGraphRunner, "_create_shared_static_tensors", fail_initialization)
+    with pytest.raises(ValueError, match="static inputs rejected"):
+        CUDAGraphRunner(config)
+    runner = partially_built.pop()
+    runner.clear()
+    assert not runner.forward_scratch_buffers.buffers
+
+
 def _dsa_config(skip_indexer_for_short_seqs: bool) -> DeepSeekSparseAttentionConfig:
     return DeepSeekSparseAttentionConfig(
         index_topk=512, skip_indexer_for_short_seqs=skip_indexer_for_short_seqs
@@ -592,7 +624,7 @@ class SparseGraphKeyTestCase(unittest.TestCase):
         sparse_config = Mock(spec=SeqLenAwareSparseAttentionConfig)
         sparse_config.needs_separate_short_long_cuda_graphs.return_value = True
         sparse_config.seq_len_threshold = 16
-        runner = object.__new__(CUDAGraphRunner)
+        runner = _empty_runner()
         runner.sparse_config = sparse_config
         runner.spec_config = None
         runner.graphs = {}
@@ -670,7 +702,7 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
         "input_ids": torch.zeros(1),
         "position_ids": torch.zeros(1, 1),
     }
-    runner = object.__new__(CUDAGraphRunner)
+    runner = _empty_runner()
     runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
     runner.shared_static_tensors = inputs
     runner.config = SimpleNamespace(use_mrope=False, stage_decode_inputs=False)
@@ -678,13 +710,14 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner._get_num_tokens_for_key = lambda key: 1
     runner._step_input_prologue_keys = {key: captured}
     runner._pre_replay_hooks = []
+    runner._hostfunc_graph_keys = set()
 
     def replay():
         queued.append("replay")
         if replay_fails:
             raise RuntimeError("replay failed")
 
-    runner.graphs = {key: SimpleNamespace(replay=replay)}
+    runner.graphs = {key: SimpleNamespace(replay=replay, reset=lambda: None)}
     runner.graph_outputs = {key: None}
     captured.on_graph_replay.side_effect = lambda: queued.append("release")
     monkeypatch.setattr(
@@ -705,13 +738,41 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
         captured.quiesce_graph_window.assert_called_once_with()
 
 
+@pytest.mark.cpu_only
+def test_forward_scratch_is_released_with_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    import weakref
+
+    runner = _empty_runner()
+    runner.memory_pool = None
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner._step_input_prologue_keys = {}
+    runner._hostfunc_graph_keys = set()
+    runner.forward_scratch_buffers = Buffers()
+    scratch = torch.empty(16)
+    reference = weakref.ref(scratch)
+    runner.forward_scratch_buffers.buffers["scratch"] = [
+        BufferBlock(buffer=scratch, is_reserved=True)
+    ]
+    runner.graph_metadata = {
+        0: {"attn_metadata": SimpleNamespace(forward_scratch={"scratch": scratch})}
+    }
+    runner.reset_padding_dummies = lambda: None
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    del scratch
+
+    runner.clear()
+    assert reference() is None
+    assert not runner.forward_scratch_buffers.buffers
+
+
 class KvRegimeGraphKeyTestCase(unittest.TestCase):
     """Decode graphs keyed by the KV regime of the step's longest live KV (FP4 MLA dispatcher)."""
 
     CEILINGS = (8192, 16384, 32768)
 
     def _runner(self, ceilings: tuple[int, ...] | None = CEILINGS) -> CUDAGraphRunner:
-        runner = object.__new__(CUDAGraphRunner)
+        runner = _empty_runner()
         runner.config = SimpleNamespace(enable_in_graph_sampling=False, enable_attention_dp=False)
         runner.enabled = True
         runner.sparse_config = None
@@ -952,7 +1013,7 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
     """Decode graphs keyed by the FP4 MLA packed split decision of the step."""
 
     def _runner(self, variants: tuple[bool, ...] | None = (False, True)) -> CUDAGraphRunner:
-        runner = object.__new__(CUDAGraphRunner)
+        runner = _empty_runner()
         runner.config = SimpleNamespace(enable_in_graph_sampling=False, enable_attention_dp=False)
         runner.enabled = True
         runner.sparse_config = None

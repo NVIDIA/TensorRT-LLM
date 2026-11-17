@@ -18,7 +18,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     ACT_SWIGLU,
     CERTIFIED_PAIRS,
     DECODE_TACTICS,
@@ -27,10 +27,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp4_
     _ckpt,
     _pinned_tactic,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
     renorm_moe_routing_op,
 )
 
@@ -47,6 +47,7 @@ G1 = 137.0  # activation global scale, as the pre-routed entry's test draws it
 
 
 def _routed(args, data, sf, logits, scalars, spec, top_k=None):
+    call_output1_scale_scalar, call_output1_scale_gate_scalar, call_output2_scale_scalar = scalars
     return op(
         logits,
         data,
@@ -55,7 +56,9 @@ def _routed(args, data, sf, logits, scalars, spec, top_k=None):
         args["gemm1_weights_scale"],
         args["gemm2_weights"],
         args["gemm2_weights_scale"],
-        *scalars,
+        call_output1_scale_scalar,
+        call_output1_scale_gate_scalar,
+        call_output2_scale_scalar,
         spec["num_experts"],
         spec["top_k"] if top_k is None else top_k,
         spec["intermediate"],

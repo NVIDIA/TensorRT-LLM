@@ -129,10 +129,8 @@ def check_workspace_is_armed_and_sized() -> None:
 def check_create_refuses_on_every_rank() -> None:
     """One rank asks for three buffers past its device's free memory: every rank raises before any allocates and frees
     the communicator it made, and the workspaces in use stay correct."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import mnnvl_workspace
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
 
@@ -165,7 +163,7 @@ def check_create_refuses_on_every_rank() -> None:
 def check_create_involves_only_the_tp_group() -> None:
     """Under TP W/2 x PP 2 only the first TP group's ranks create a workspace, while the other group's ranks make no
     MNNVL call: create() completes on the group without them, armed and sized for the group."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
     from tensorrt_llm.mapping import Mapping
@@ -345,10 +343,10 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, entry, validating, WS_A, WS_B
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allreduce_attn_res as module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
 

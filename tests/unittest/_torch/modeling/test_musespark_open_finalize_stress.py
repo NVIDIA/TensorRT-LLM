@@ -128,7 +128,10 @@ def _random_sequences(rank, mapping):
             calls, graph, outputs = graphs[schedule.randrange(len(graphs))]
             for index, (call, tokens) in enumerate(calls):
                 _refill(call, tokens, rank, 20_000 + 10 * step + index)
-            expected = [_reference(nccl, *call, tokens) for call, tokens in calls]
+            expected = [
+                _reference(nccl, call_gemm, call_indices, call_weights, call_norm, tokens)
+                for (call_gemm, call_indices, call_weights, call_norm), tokens in calls
+            ]
             graph.replay()
             for actual, want in zip(outputs, expected):
                 ok &= _within_gates(actual, want)
@@ -180,7 +183,10 @@ def _delayed_ranks(rank, mapping, pattern):
     for repeat in range(30):
         for index, (call, tokens) in enumerate(calls):
             _refill(call, tokens, rank, 50_000 + 10 * repeat + index)
-        expected = [_reference(nccl, *call, tokens) for call, tokens in calls]
+        expected = [
+            _reference(nccl, call_gemm, call_indices, call_weights, call_norm, tokens)
+            for (call_gemm, call_indices, call_weights, call_norm), tokens in calls
+        ]
         graph.replay()
         for actual, want in zip(outputs, expected):
             ok &= _within_gates(actual, want)
@@ -221,7 +227,10 @@ def _two_workspaces(rank, mapping):
     for repeat in range(10):
         for index, (call, tokens) in enumerate(calls):
             _refill(call, tokens, rank, 80_000 + 10 * repeat + index)
-        expected = [_reference(nccl, *call, tokens) for call, tokens in calls]
+        expected = [
+            _reference(nccl, call_gemm, call_indices, call_weights, call_norm, tokens)
+            for (call_gemm, call_indices, call_weights, call_norm), tokens in calls
+        ]
         graph.replay()
         for actual, want in zip(outputs, expected):
             ok &= _within_gates(actual, want)
