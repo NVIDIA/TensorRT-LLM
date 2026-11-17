@@ -11,11 +11,11 @@ site fixes the rest. These two are its build dimensions (``_CONFIG``, ``_PROXY_C
 KernelBuilder's build mode, the plan and the run are replayed for one query segment of each
 shape the dimensions sweep from that call's and no earlier run of its call signature swept,
 with the package's variant lookup recording the variant it is asked for instead of compiling
-it. Each variant found goes to a worker process of the rank (:func:`build_variant`), which
-compiles it in the directory and under the file lock the package's own lookup uses, so that a
-lookup here waits for it and loads it. The plan, split-KV reduction and sparse top-k modules,
-and the k2q CSR extension the sparse prefill loads, need nothing from a call: the first run in
-build mode submits them.
+it. The variants found build on the rank's worker processes (:func:`build_variant`), in the
+directory and under the file lock the package's own lookup uses, and the run goes on once they
+are built: its lookups load them. The plan, split-KV reduction and sparse top-k modules, and the
+k2q CSR extension the sparse prefill loads, need nothing from a call: they build with the
+variants of the first run in build mode.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ class _Package:
         self.plan_fn, self.run_fn = module.fmha_sm100_plan, module.fmha_sm100
         self.variant_fn, self.reduction_fn = api.get_fmha_variant, api.get_reduction_module
         self.looked_up: set = set()
-        self.modules_submitted = False
+        self.modules_listed = False
 
     def plan(self, qo_segment_lens, kv_segment_lens, *args, **kwargs):
         plan_info = self.plan_fn(qo_segment_lens, kv_segment_lens, *args, **kwargs)
@@ -141,16 +141,17 @@ class _Package:
                 sub_plan[_PLAN_ARGS] = (args, options, qo_segment_lens, num_kv_splits)
         return plan_info
 
-    def submit_modules(self) -> None:
-        if self.modules_submitted:
-            return
-        self.modules_submitted = True
-        builder = KernelBuilder.get()
-        for name, library, compile_fn in _MODULES:
-            builder.submit(
-                _OP, name, BuildTask(f"{_HERE}:build_module", (name, library, compile_fn)), _CONFIG
-            )
-        builder.submit(_OP, _K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG)
+    def _module_builds(self) -> List[Tuple[str, BuildTask, BuildConfig]]:
+        """The builds of the modules, the first time they are asked for."""
+        if self.modules_listed:
+            return []
+        self.modules_listed = True
+        builds = [
+            (name, BuildTask(f"{_HERE}:build_module", (name, library, compile_fn)), _CONFIG)
+            for name, library, compile_fn in _MODULES
+        ]
+        builds.append((_K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG))
+        return builds
 
     def run(self, q, k, v, plan_info, *args, **kwargs):
         builder = KernelBuilder.get()
@@ -160,7 +161,6 @@ class _Package:
             and isinstance(plan_info, tuple)
             and not torch.cuda.is_current_stream_capturing()
         ):
-            self.submit_modules()
             planned = next(
                 (p[_PLAN_ARGS] for p in plan_info[3:] if isinstance(p, dict) and _PLAN_ARGS in p),
                 None,
@@ -197,9 +197,9 @@ class _Package:
 
     def _list(
         self, q, k, v, plan_args, plan_options, num_kv_splits, run_options, shapes
-    ) -> List[Tuple[str, BuildTask]]:
+    ) -> List[tuple]:
         """Replay the plan and the run for one query segment of each shape; return the
-        variants asked for.
+        builds of the variants asked for, after those of the modules the first time.
 
         A shape the package rejects is skipped: a call of that shape would fail too.
         """
@@ -232,7 +232,7 @@ class _Package:
         # Variants in the package's bundled module need no build.
         self.manager._ensure_all_module()
         bundled = self.manager._all_module
-        return [
+        return self._module_builds() + [
             (name, BuildTask(f"{_HERE}:build_variant", (name, params)))
             for name, params in found.items()
             if bundled is None or not hasattr(bundled, f"run_{name}")
@@ -250,8 +250,6 @@ class _Package:
             name = self.variant_key(*args)[0]
         except ValueError:
             return self.variant_fn(*args)
-        # A variant a worker is still building: wait for it, then load it.
-        KernelBuilder.get().wait(_OP, name)
         missing = (
             name not in self.manager._loaded
             and not (self.jit._built_dir(name, f"{name}.so") / f"{name}.so").exists()

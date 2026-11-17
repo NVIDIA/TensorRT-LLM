@@ -22,9 +22,9 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..build_pool import process_built
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
-from ..rank_worker import process_built
 
 _NUM_SMS_DEFAULT = 148
 # SM100/SM103 opt-in shared memory per block; stands in for the device without CUDA (CPU-only test collection).

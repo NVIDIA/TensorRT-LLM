@@ -62,13 +62,13 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.fixture(autouse=True)
-def _rank_workers_off(monkeypatch):
+def _build_pool_off(monkeypatch):
     """The tests here build and time in this process, as with TLLM_KERNEL_BUILDER=0; the
-    tests that take ``tune_mode_workers`` build in worker processes."""
-    from tensorrt_llm._torch import rank_worker
+    tests that take ``tune_mode_workers`` build on worker processes."""
+    from tensorrt_llm._torch import build_pool
 
-    monkeypatch.setattr(rank_worker.RankWorker, "_instance",
-                        rank_worker.RankWorker(enabled=False))
+    monkeypatch.setattr(build_pool.BuildPool, "_instance",
+                        build_pool.BuildPool(enabled=False))
 
 
 def test_multi_dynamic_dims():
@@ -3173,10 +3173,10 @@ def test_the_warmup_pool_runs_the_profiles_this_process_claims(
 
 @pytest.fixture
 def tune_mode_workers(monkeypatch):
-    """A RankWorker whose worker processes import autotuner_worker_targets."""
-    from tensorrt_llm._torch import rank_worker
+    """A BuildPool whose worker processes import autotuner_worker_targets."""
+    from tensorrt_llm._torch import build_pool
 
-    original = rank_worker._worker_env
+    original = build_pool._worker_env
     here = os.path.dirname(os.path.abspath(__file__))
 
     def worker_env():
@@ -3186,11 +3186,11 @@ def tune_mode_workers(monkeypatch):
                                             if p)
         return env
 
-    monkeypatch.setattr(rank_worker, "_worker_env", worker_env)
+    monkeypatch.setattr(build_pool, "_worker_env", worker_env)
     # Every build goes to the workers, however short (the tests of that rule set it).
     monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
-    rank = rank_worker.RankWorker(workers=2, enabled=True)
-    monkeypatch.setattr(rank_worker.RankWorker, "_instance", rank)
+    rank = build_pool.BuildPool(workers=2, enabled=True)
+    monkeypatch.setattr(build_pool.BuildPool, "_instance", rank)
     yield rank
     rank.stop()
 

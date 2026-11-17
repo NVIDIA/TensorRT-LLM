@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Builds for test_rank_worker.py and test_kernel_builder.py, whose worker processes import this
+"""Builds for test_build_pool.py and test_kernel_builder.py, whose worker processes import this
 module.
 
 Its "kernels" record the process that compiled them, and pickle. Imported in a worker process
@@ -14,15 +14,14 @@ import time
 from typing import NamedTuple, Tuple
 
 from tensorrt_llm import _jit_share
-from tensorrt_llm._torch.rank_worker import process_built
+from tensorrt_llm._torch.build_pool import process_built
 
-IN_WORKER_ENV = "RANK_WORKER_TEST_IN_WORKER"
+IN_WORKER_ENV = "BUILD_POOL_TEST_IN_WORKER"
 # Variables of a launcher that the tests set in the test process.
 LAUNCHER_VARS = ("SLURM_JOB_ID", "OMPI_COMM_WORLD_SIZE", "PMIX_RANK")
-NAME = "rank_worker_test"
+NAME = "build_pool_test"
 # The kernels' names would hold the GPU's compute capability.
-IDENTITY = "rank-worker-test"
-WHERE = f"{__name__}:compile_kernel"
+IDENTITY = "build-pool-test"
 
 
 class Kernel(NamedTuple):
@@ -107,9 +106,9 @@ def _load_only_here() -> LoadsOnlyHere:
 
 
 if os.environ.get(IN_WORKER_ENV) == "1":
-    from tensorrt_llm._torch import rank_worker as _rank_worker
+    from tensorrt_llm._torch import build_pool as _build_pool
 
-    _rank_worker._cuda_context_broken = lambda: _context_lost
+    _build_pool._cuda_context_broken = lambda: _context_lost
     _jit_share._export_kernel = export_kernel
     _jit_share._load_kernel = load_kernel
     _jit_share._cute_identity = lambda: IDENTITY

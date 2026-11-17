@@ -150,7 +150,7 @@ def test_a_process_a_launch_process_starts_keeps_the_launch_directory(local_disk
     _launch()
     assert _jit_share.install()
     share_dir = os.environ[_jit_share.SHARE_DIR_ENV]
-    # A RankWorker worker process: no launcher variables, the launch's directory inherited.
+    # A BuildPool worker process: no launcher variables, the launch's directory inherited.
     for name in _LAUNCH_VARS:
         os.environ.pop(name, None)
     monkeypatch.setattr(_jit_share, "_installed", False)

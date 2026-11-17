@@ -99,8 +99,8 @@ _PROCESS_ENV = "TLLM_JIT_SHARE_PROCESS"
 # Linux reads at most this much of a script's "#!" line on older kernels.
 _SHEBANG_LIMIT = 127
 
-# Set in a RankWorker worker process (tensorrt_llm._torch.rank_worker): its rank's store.
-_RANK_STORE_ENV = "TLLM_RANK_WORKER_STORE"
+# Set in a BuildPool worker process (tensorrt_llm._torch.build_pool): its rank's store.
+_POOL_STORE_ENV = "TLLM_BUILD_POOL_STORE"
 # "1" when TLLM_JIT_SHARE_DIR is the launch's directory that install() chose, not one the user set;
 # "0", set by the user, leaves the launch without a default directory.
 _DEFAULT_ENV = "TLLM_JIT_SHARE_DEFAULT"
@@ -108,7 +108,7 @@ _DEFAULT_ENV = "TLLM_JIT_SHARE_DEFAULT"
 _DWDP_RANK_ENV = "TRTLLM_DWDP_RANK"
 _DWDP_ADDR_ENV = "TRTLLM_DWDP_MASTER_ADDR"
 _DWDP_PORT_ENV = "TRTLLM_DWDP_MASTER_PORT"
-# "0" (tensorrt_llm._torch.rank_worker.ENABLE_ENV) leaves a launch without a default directory.
+# "0" (tensorrt_llm._torch.build_pool.ENABLE_ENV) leaves a launch without a default directory.
 _KERNEL_BUILDER_ENV = "TLLM_KERNEL_BUILDER"
 # Where the launches' default directories are made: this node's local disk.
 _DEFAULT_ROOT = "/tmp"
@@ -118,9 +118,9 @@ _PRUNE_AFTER_S = 6 * 3600
 _installed = False
 _slot: int | None = None
 _kernel_sharing_depth = 0
-# The store of this rank's RankWorker build pass (set_rank_store), where shared kernel caches
+# The store of this rank's BuildPool build pass (set_pool_store), where shared kernel caches
 # keep CuTe DSL kernels while the pass runs.
-_rank_store: str | None = None
+_pool_store: str | None = None
 _cute_salt: str | None = None
 # .claim: (claim, failed) of the kernel this thread claimed and has not stored.
 _unstored = threading.local()
@@ -289,18 +289,18 @@ class sharing_kernels:
         return False
 
 
-def set_rank_store(path: str | None) -> None:
+def set_pool_store(path: str | None) -> None:
     """Have shared kernel caches keep CuTe DSL kernels in ``path``, the store of this rank's
-    RankWorker build pass, where its worker processes build them; None when the pass ends."""
-    global _rank_store
-    _rank_store = path
+    BuildPool build pass, where its worker processes build them; None when the pass ends."""
+    global _pool_store
+    _pool_store = path
 
 
 def _cute_store() -> str | None:
-    """Where shared kernel caches keep CuTe DSL kernels: inside a RankWorker build pass, the
+    """Where shared kernel caches keep CuTe DSL kernels: inside a BuildPool build pass, the
     rank's store (in a worker process, the store of the rank it builds for); else
     ``<TLLM_JIT_SHARE_DIR>/cute``, if set."""
-    store = _rank_store or os.environ.get(_RANK_STORE_ENV)
+    store = _pool_store or os.environ.get(_POOL_STORE_ENV)
     if store:
         return store
     share_dir = os.environ.get(SHARE_DIR_ENV)

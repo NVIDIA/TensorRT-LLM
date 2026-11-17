@@ -323,8 +323,8 @@ class DecoderWarmup:
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises. The memory-profiling warmup is
-        # KernelBuilder's build mode: ops list their kernels as calls reach new shapes, worker
-        # processes build them, and the pass waits for the builds at its end.
+        # KernelBuilder's build mode: as calls reach new shapes, ops build their kernels on
+        # worker processes before they go on, and the workers stop when the pass ends.
         with (
             self._warmup_timer,
             KernelBuilder.get().warmup_pass(self._warmup_timer.purpose),

@@ -13,8 +13,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_kernel_builds
+from tensorrt_llm._torch.build_pool import BuildPool
 from tensorrt_llm._torch.kernel_builder import KernelBuilder
-from tensorrt_llm._torch.rank_worker import RankWorker
 
 _OP = msa_kernel_builds._OP
 # The stand-in's variants: a 64-row query tile up to 64 rows, a 128-row one above.
@@ -23,9 +23,9 @@ _SHORT, _LONG = "v64_0", "v128_0"
 
 @pytest.fixture
 def package(monkeypatch, tmp_path):
-    """The stand-in package's module, routed through this process's KernelBuilder, whose waits
-    and the package's own variant lookups are recorded in order (``events``), and the query
-    length at which a plan raises (``fail``)."""
+    """The stand-in package's module, routed through this process's KernelBuilder, with the
+    package's own variant lookups recorded in order (``events``), and the query length at which
+    a plan raises (``fail``)."""
     events = []
     fail = {"qo_len": None}
     manager = types.SimpleNamespace(
@@ -69,8 +69,7 @@ def package(monkeypatch, tmp_path):
     builder = KernelBuilder(enabled=True)
     monkeypatch.setattr(KernelBuilder, "_instance", builder)
     # The variants take long enough for a worker; none is started here.
-    monkeypatch.setattr(RankWorker, "worth_a_worker", lambda self, family, expected_s=None: True)
-    monkeypatch.setattr(builder, "wait", lambda op, key: events.append(("wait", key)) or 0.0)
+    monkeypatch.setattr(BuildPool, "worth_a_worker", lambda self, family, expected_s=None: True)
     return types.SimpleNamespace(module=module, builder=builder, events=events, fail=fail)
 
 
@@ -84,31 +83,31 @@ def _call(module, longest):
 
 @pytest.fixture
 def build_mode(package, monkeypatch):
-    """KernelBuilder in build mode, with the builds submitted recorded, not run."""
-    submitted = []
+    """KernelBuilder in build mode, with the builds asked for recorded, not run."""
+    built = []
     monkeypatch.setattr(package.builder, "active", lambda: True)
-    monkeypatch.setattr(
-        package.builder,
-        "submit",
-        lambda op, key, task, config=None: submitted.append((key, task)) or True,
-    )
-    return submitted
+    monkeypatch.setattr(package.builder, "build", lambda op, builds: built.extend(builds))
+    return built
 
 
-def _variants(submitted):
-    return {key for key, task in submitted if task.function.endswith(":build_variant")}
+def _variants(built):
+    return {key for key, task, _ in built if task.function.endswith(":build_variant")}
 
 
-def test_a_run_in_build_mode_submits_the_variants_of_the_query_lengths_it_sweeps(
+def test_a_run_in_build_mode_builds_the_variants_of_the_query_lengths_it_sweeps(
     package, build_mode
 ):
     _call(package.module, 100)
     # Query lengths 1 to 100 reach both tiles.
     assert _variants(build_mode) == {_SHORT, _LONG}
-    modules = {key for key, task in build_mode if task.function.endswith(":build_module")}
+    modules = {key for key, task, _ in build_mode if task.function.endswith(":build_module")}
     assert modules == {"plan", "reduction", "sparse_topk"}
-    # The replays looked nothing up; the call's own lookup waited for its build first.
-    assert package.events == [("wait", _LONG), ("lookup", (128, False))]
+    # The ranks split the variants and modules; each builds the k2q CSR extension.
+    configs = {key: config for key, _, config in build_mode}
+    assert configs[_SHORT] is configs["plan"] is msa_kernel_builds._CONFIG
+    assert configs[msa_kernel_builds._K2Q_CSR_MODULE] is msa_kernel_builds._K2Q_CONFIG
+    # The replays looked nothing up; the call's own lookup is the package's.
+    assert package.events == [("lookup", (128, False))]
 
     # A call of the same signature and lengths lists nothing new.
     count = len(build_mode)
@@ -116,27 +115,21 @@ def test_a_run_in_build_mode_submits_the_variants_of_the_query_lengths_it_sweeps
     assert len(build_mode) == count
 
 
-def test_a_replay_that_raises_leaves_the_variants_to_their_first_use(package, build_mode):
+def test_a_replay_that_raises_leaves_the_kernels_to_their_first_use(package, build_mode):
     package.fail["qo_len"] = 7
     _call(package.module, 100)
-    assert _variants(build_mode) == set()
+    assert build_mode == []
     assert msa_kernel_builds._replay.found is None
-    assert package.events == [("wait", _LONG), ("lookup", (128, False))]
+    assert package.events == [("lookup", (128, False))]
 
 
-def test_in_inference_mode_a_lookup_waits_for_its_build_once(package, monkeypatch):
-    submitted = []
-    monkeypatch.setattr(
-        package.builder, "submit", lambda op, key, task, config=None: submitted.append(key) or True
-    )
+def test_in_inference_mode_a_run_builds_nothing(package, monkeypatch):
+    built = []
+    monkeypatch.setattr(package.builder, "build", lambda op, builds: built.extend(builds))
     _call(package.module, 40)
     _call(package.module, 40)
-    assert submitted == []
-    assert package.events == [
-        ("wait", _SHORT),
-        ("lookup", (64, False)),
-        ("lookup", (64, False)),
-    ]
+    assert built == []
+    assert package.events == [("lookup", (64, False)), ("lookup", (64, False))]
 
 
 def test_ranks_split_variant_builds_only_over_one_cache_directory_of_one_host(

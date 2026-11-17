@@ -97,8 +97,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ...kernel_builder import KernelBuilder
-from ...rank_worker import process_built
+from ...build_pool import build_kernels, process_built
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: K extent of one pipeline stage (one 128x128 FP8 weight block).
@@ -3599,20 +3598,9 @@ def precompile_prequantized(n: int, k: int, max_m: int) -> int:
     """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
     an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
     tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
-    return _build(
-        {(_compiled_mid_kernel, (n, k, t, TRTLLM_ENABLE_PDL, False, True)) for t in tactics}
+    return build_kernels(
+        (_compiled_mid_kernel, (n, k, t, TRTLLM_ENABLE_PDL, False, True)) for t in tactics
     )
-
-
-def _build(builds) -> int:
-    """Compile each ``(compile function, args)``. In KernelBuilder's build mode the rank's worker
-    processes build those whose compiles take long enough to repay a worker
-    (``RankWorker.worth_a_worker``), and the first launches load them. Returns their count."""
-    submit = KernelBuilder.get().active()
-    for compile_fn, args in builds:
-        if not (submit and compile_fn.submit(*args)):
-            compile_fn(*args)
-    return len(builds)
 
 
 def run_low_m_gemm_prequantized(

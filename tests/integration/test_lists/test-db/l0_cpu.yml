@@ -210,7 +210,7 @@ l0_cpu:
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_jit_share_default_dir.py
   - unittest/_torch/test_kernel_builder.py
-  - unittest/_torch/test_rank_worker.py
+  - unittest/_torch/test_build_pool.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py

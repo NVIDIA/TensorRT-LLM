@@ -47,9 +47,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ....kernel_builder import KernelBuilder
+from ....build_pool import build_kernels, process_built
 from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
-from ....rank_worker import process_built
 from . import raw_ptx as ptx
 
 #: Experts selected per token.
@@ -1050,17 +1049,15 @@ def precompile(num_experts: int, use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
     """
     if not _is_supported_device(torch.cuda.current_device()):
         return 0
-    compiled = 0
+    builds = []
     for warps_per_token, num_warps in ((2, 8), (1, 8), (1, 16)):
         local_caps = {num_experts}
         if num_experts > _SMALL_LOCAL_CAP:
             local_caps.add(_SMALL_LOCAL_CAP)
         for local_cap in sorted(local_caps):
             args = (num_experts, num_warps, warps_per_token, local_cap, use_pdl)
-            if not (KernelBuilder.get().active() and _compiled_kernel.submit(*args)):
-                _compiled_kernel(*args)
-            compiled += 1
-    return compiled
+            builds.append((_compiled_kernel, args))
+    return build_kernels(builds)
 
 
 def can_run(
