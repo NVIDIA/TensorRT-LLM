@@ -13,7 +13,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
     CKPT_CONTEXT_LEN,
     CKPT_EOS_TOKEN_ID,
     CKPT_HEAD_OFFSETS,
@@ -21,7 +21,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embeddin
     CKPT_MULTIPLIERS,
     CKPT_VOCAB_SIZE,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (  # noqa: E501
     ngram_hash as op,
 )
 
@@ -45,7 +45,7 @@ NGRAM_HEADS = len(CKPT_HEAD_VOCAB_SIZES)
 PADDED_TABLE_ROWS = 320001536  # sum(head_vocab_sizes) rounded up to a multiple of 128
 
 
-def _constants():
+def _constants() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.tensor(CKPT_MULTIPLIERS, dtype=torch.long, device=DEV),
         torch.tensor(CKPT_HEAD_VOCAB_SIZES, dtype=torch.long, device=DEV),
@@ -143,4 +143,7 @@ def test_cuda_graph_capture_and_replay(windows) -> None:
     ids.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(captured, op.reference(fresh, *constants, EOS, 1))
+    assert torch.equal(
+        captured,
+        op.reference(fresh, *constants, EOS, 1),
+    )

@@ -14,8 +14,12 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from .indexer import DeepseekV4Indexer
-from .offload import SparseOffloadState
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
@@ -317,23 +321,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # One mixed-precision high page table per compression ratio; -1 = not in the high pool.
-        manager = self.kv_cache_manager
-        if manager.mixed_precision_high_layers:
-            self._mixed_precision_high_table_layers = {}
-            for local, high_layer in manager.mixed_precision_high_layers.items():
-                ratio = manager._compress_ratios[manager.pp_layers[local]]
-                self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
-            self.mixed_precision_high_block_table = {
-                compress_ratio: self.get_empty(
-                    self.cuda_graph_buffers,
-                    compress_block_table_shape,
-                    cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
-                for compress_ratio in self._mixed_precision_high_table_layers
-            }
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -396,61 +383,26 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if not self.sparse_metadata_params.enable_kv_cache_offload:
             return
         manager = self.kv_cache_manager
-        # Per-batch beam/draft values start at defaults. Also check the manager's
-        # configured limits before allocating any offload buffers.
-        if (
-            self.beam_width != 1
-            or manager.max_beam_width != 1
-            or self.max_draft_tokens
-            or manager.max_draft_len
-            or manager.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
-        ):
-            raise NotImplementedError(
-                "Sparse offload requires single-beam, non-speculative execution"
-            )
-        # Compression policies are bound after manager construction, before
-        # metadata initialization. Validate them once here, not on each batch.
-        manager._validate_sparse_history_policy()
-        # Descriptor setup also validates the fixed KV dtype and pool layout.
-        layers = manager.get_sparse_offload_descriptors()
+        # Descriptors include every sparse role in native fetch order.
+        layers = get_sparse_offload_metadata_layers(self)
         if not layers:
             # This PP stage has no ratio-4 main KV to stage.
             return
-        if self.sparse_mla_topk <= 0:
-            raise ValueError("Sparse offload metadata requires positive top-k")
-        batch = self.max_num_sequences
-        max_blocks = self.kv_cache_manager.max_blocks_per_seq
-
-        def allocate(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
-            tensor = self.get_empty(
+        # Native fetch always processes every Batch row, including for smaller
+        # graph profiles. Its selection width is fixed by BufferConfig.
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: self.get_empty(
                 self.cuda_graph_buffers,
                 shape,
-                dtype=torch.int32,
+                dtype=dtype,
                 cache_name=f"dsv4_sparse_offload_{name}",
                 capture_graph=self.is_cuda_graph,
-            )
-            tensor.fill_(value)
-            return tensor
-
-        history_blocks = allocate("history_blocks", (batch,), 0)
-        self.sparse_offload_state = SparseOffloadState(
-            layers=layers,
-            base_page_tables={
-                group: allocate(f"base_page_table_{group}", (batch, max_blocks), -1)
-                for group in sorted({descriptor.group_id for descriptor in layers.values()})
-            },
-            history_blocks=history_blocks,
-            history_blocks_host=torch.zeros(
-                batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
             ),
-            active_request_count=allocate("active_request_count", (1,), 0),
-            selected_history_pages=allocate(
-                "selected_history_pages", (batch, min(self.sparse_mla_topk, max_blocks)), -1
-            ),
-            fetched_page_table=allocate("fetched_page_table", (batch, max_blocks), -1),
-            compress_read_table=allocate("compress_read_table", (batch, max_blocks), -1),
-            read_table_valid=allocate("read_table_valid", (1,), 1),
+            layers,
+            max_batch_size=manager.max_batch_size,
+            topk=self.sparse_mla_topk,
+            # The hook the device reservation counts the scratch by.
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )
 
     def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:
@@ -527,13 +479,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
                 and self.sparse_metadata_params.enable_kv_cache_offload
             ):
-                if self.sparse_offload_state is None:
-                    compress_block_table.fill_(-1)
-                else:
+                # Host page indices cannot provide GPU write destinations.
+                # Sparse writes require a separate per-layer arena mapping.
+                compress_block_table.fill_(-1)
+                if self.sparse_offload_state is not None:
                     self.kv_cache_manager.prepare_sparse_offload(
                         self.sparse_offload_state,
                         self.request_ids,
-                        compress_block_table,
                         beam_width=self.beam_width,
                     )
                 continue
@@ -544,13 +496,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 beam_width=self.beam_width,
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
-            )
-        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
-            # Any mixed-precision high layer of this ratio shares the pool.
-            self._fill_mixed_precision_high_block_table(
-                self.kv_cache_manager,
-                self._mixed_precision_high_table_layers[compress_ratio],
-                high_table,
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
@@ -666,7 +611,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         swa_buffer_ptrs = {layer_idx: manager.swa_pool_ptr for layer_idx in manager.pp_layers}
         compressed_buffer_ptrs = {
-            layer_idx: manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+            layer_idx: (
+                manager._sparse_arena_base(
+                    manager._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS],
+                    DeepseekV4AttentionType.COMPRESS.role,
+                )
+                if manager._enable_kv_cache_offload and compress_ratios_by_layer[layer_idx] == 4
+                else manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+            )
             for layer_idx in manager.pp_layers
             if is_compress_layer(compress_ratios_by_layer[layer_idx])
         }
@@ -730,6 +682,35 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         "swa_buffer_ptrs",
     )
 
+    def _create_mixed_precision_high_block_tables(self, buffers, capture_graph: bool) -> None:
+        """One mixed-precision high page table per compression ratio; -1 = not in the high pool."""
+        manager = self.kv_cache_manager
+        if not manager.mixed_precision_high_layers:
+            return
+        self._mixed_precision_high_table_layers = {}
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            ratio = manager._compress_ratios[manager.pp_layers[local]]
+            self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
+        self.mixed_precision_high_block_table = {
+            compress_ratio: self.get_empty(
+                buffers,
+                (self.max_num_sequences, manager.max_blocks_per_seq),
+                cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._mixed_precision_high_table_layers
+        }
+
+    def _fill_mixed_precision_high_block_tables(self) -> None:
+        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
+            # Any mixed-precision high layer of this ratio shares the pool.
+            self._fill_mixed_precision_high_block_table(
+                self.kv_cache_manager,
+                self._mixed_precision_high_table_layers[compress_ratio],
+                high_table,
+            )
+
     def prepare_for_draft_forward(self) -> dict | None:
         """Repoint sparse fields to the draft buffers for a draft forward."""
         # Draft layers have no mixed-precision high layer while the draft manager is in use.
@@ -746,54 +727,23 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         return None
 
     def validate_sparse_offload_batch(self) -> None:
-        """Reject unsupported layouts on the host before any model writes.
+        """Reject batches offload cannot run, on the host before any model writes.
 
-        Only a fresh, unchunked context batch or one query per decode request
-        is supported. This runs during prepare(), outside capture/replay;
-        the per-layer path consumes the resulting phase and device metadata.
-        Fixed configuration is validated during offload metadata initialization.
+        An offloading worker only decodes, one query token per request, as DSA's
+        does, so the check is DSA's. It runs during prepare(), outside capture and
+        replay; fixed configuration is validated when the offload metadata is
+        initialized.
         """
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
-            return
-        state = self.sparse_offload_state
-        if state is not None:
-            state.prepared = False
-            state.is_prefill = False
-        if self.num_contexts and self.num_generations:
-            raise NotImplementedError(
-                "Sparse offload does not support mixed context/decode batches"
-            )
-        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
-            raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        if not torch.equal(self.seq_lens, self.seq_lens_kv):
-            raise NotImplementedError("Sparse offload requires matching query and new-KV lengths")
-        if not self.num_contexts:
-            if not torch.all(self.seq_lens == 1):
-                raise NotImplementedError("Sparse offload decode requires one query per request")
-            return
-        cached = self.kv_cache_params.num_cached_tokens_per_seq
-        if (
-            self.prompt_lens is None
-            or len(self.prompt_lens) < self.num_contexts
-            or len(cached) < self.num_contexts
-            or any(cached[: self.num_contexts])
-            or self.seq_lens.tolist() != self.prompt_lens[: self.num_contexts]
-            or any(
-                self.kv_cache_manager.kv_cache_map[request_id].history_length != 0
-                for request_id in self.request_ids
-            )
-        ):
-            raise NotImplementedError(
-                "Sparse offload prefill must be fresh, uncached, and unchunked"
-            )
-        if state is not None:
-            state.is_prefill = True
+        if self.sparse_offload_state is not None:
+            self._validate_dsa_sparse_offload_batch()
 
     def prepare(self) -> None:
         self._validate_ragged_verification()
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
         self.validate_sparse_offload_batch()
+        if self.sparse_offload_state is not None:
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
 
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,

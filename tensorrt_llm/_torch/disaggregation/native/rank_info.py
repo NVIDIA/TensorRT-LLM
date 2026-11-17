@@ -82,6 +82,8 @@ class RankInfo:
     # Layers a unified KV cache manager owns for the drafter (layer specs with
     # a DRAFT owner). They ride the target's pages, so both peers must agree.
     num_draft_layers: int = 0
+    # KV dtype of those draft layers (a DataType name); None without them.
+    draft_kv_dtype: Optional[str] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -94,6 +96,9 @@ class RankInfo:
         if not self.context_first_ownership:
             # Preserve the legacy wire shape for endpoints outside this profile.
             data.pop("context_first_ownership")
+        if self.draft_kv_dtype is None:
+            # Preserve the wire shape for peers without shared draft layers.
+            data.pop("draft_kv_dtype")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -123,6 +128,15 @@ class RankInfo:
             if bytes_for_eight_elements % 8 == 0
             else bytes_for_eight_elements / 8
         )
+        # Explicit draft layers (layer specs) ride the target's pages and
+        # requests; folded MTP/Eagle layers travel as ordinary layers.
+        get_draft_view = getattr(kvm, "get_draft_kv_cache_view", None)
+        shares_draft_layers = get_draft_view is not None and get_draft_view() is kvm
+        draft_layer_ids = kvm.draft_layer_ids if shares_draft_layers else ()
+        draft_kv_dtype = None
+        if draft_layer_ids:
+            dtype = kvm.get_layer_dtype(draft_layer_ids[0])
+            draft_kv_dtype = getattr(dtype, "name", str(dtype))
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -150,9 +164,8 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
-            num_draft_layers=(
-                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
-            ),
+            num_draft_layers=len(draft_layer_ids),
+            draft_kv_dtype=draft_kv_dtype,
         )
 
     @classmethod

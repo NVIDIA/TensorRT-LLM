@@ -10,14 +10,14 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("cute_dsl_moe_zero runs sm_103 CuTe DSL kernels", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_zero import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_zero import (  # noqa: E402, E501
     DECODE_MAX_ROWS,
     HIDDEN,
     CompiledZero,
     build_decode,
     build_prefill,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_zero import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_zero import (  # noqa: E402, E501
     cute_dsl_moe_zero as op,
 )
 
@@ -31,8 +31,10 @@ _TAIL_ROWS = 8
 _HANDLES: dict[object, CompiledZero] = {}
 
 
-def _compiled(rows: int) -> CompiledZero:
-    key = "prefill" if rows > DECODE_MAX_ROWS else rows
+def _compiled(rows: int, decode: bool = False) -> CompiledZero:
+    """The exact-row clear up to 64 rows or when `decode` (a wide decode width), else the
+    prefill one."""
+    key = "prefill" if rows > DECODE_MAX_ROWS and not decode else rows
     if key not in _HANDLES:
         device = torch.cuda.current_device()
         _HANDLES[key] = build_prefill(device) if key == "prefill" else build_decode(rows, device)
@@ -53,7 +55,7 @@ def test_certified_cells(cell) -> None:
     that ran one vector too far would change the tail.
     """
     rows = cell.spec["rows"]
-    compiled = _compiled(rows)
+    compiled = _compiled(rows, cell.spec.get("decode", False))
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     buf = torch.randn(rows + _TAIL_ROWS, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     out = buf[:rows]

@@ -896,6 +896,7 @@ def test_pool_scores_offsets_beyond_int32() -> None:
             ROWS=rows_per_program,
             PRECISION="tf32",
             HAS_REQ=True,
+            # pyrefly: ignore [unexpected-keyword]
             num_warps=4,
         )
         expected = torch.full((32, 64), FP32_MIN, device="cuda")

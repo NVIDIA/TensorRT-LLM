@@ -238,7 +238,14 @@ class PagedLatentPrepare(NamedTuple):
     rebase_pages: torch.Tensor  # [G] int64, row entries the block decode skips
 
 
-@triton.jit
+# The generation count, the first generation row and the slot view sliced at
+# that row follow the batch composition. Specializing them (a count of 1 or a
+# multiple of 16, a 16-byte-aligned pointer) would compile kernel variants
+# mid-serving.
+@triton.jit(
+    do_not_specialize=["num_gens", "first_row"],
+    do_not_specialize_on_alignment=["slots_ptr"],
+)
 def _paged_latent_prepare_kernel(
     num_accepted_ptr,
     accepted_ptr,

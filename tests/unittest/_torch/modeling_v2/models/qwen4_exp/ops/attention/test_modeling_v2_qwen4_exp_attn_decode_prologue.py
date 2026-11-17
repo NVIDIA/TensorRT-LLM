@@ -17,7 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_attn_decode_prologue import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_attn_decode_prologue import (  # noqa: E501
     qwen4_exp_attn_decode_prologue as op,
 )
 

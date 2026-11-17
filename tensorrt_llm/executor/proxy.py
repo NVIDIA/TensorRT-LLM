@@ -31,10 +31,16 @@ import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._startup_errors import (StartupErrorInfo,
+                                          is_worker_startup_error,
+                                          log_startup_error,
+                                          wrap_worker_startup_error)
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient,
                                   validate_session_world_size)
@@ -44,6 +50,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .prompt_tail import PromptTailPolicy
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .result import GenerationResult, IterationResult
@@ -232,6 +239,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     # Total wait for the worker futures in an orderly shutdown. Generous
     # enough for the teardown of a large engine.
     _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
+    # Set from gen_prompt_tail_tokens; None sends full prompts.
+    _prompt_tail: Optional[PromptTailPolicy] = None
 
     def __init__(
         self,
@@ -300,6 +309,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
+        prompt_tail = (_llm_args.gen_prompt_tail_tokens if isinstance(
+            _llm_args, TorchLlmArgs) else None)
+        if prompt_tail:
+            self._prompt_tail = PromptTailPolicy(prompt_tail)
+            logger.info(f"prompt tail trimming on, tail={prompt_tail}")
 
         # Multi-frontend serving: this launcher proxy owns the shared ipc
         # dir + HMAC key for the per-frontend endpoints (_setup_queues);
@@ -702,6 +716,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.rpc_addr,
             "rpc_hmac_key":
             self.hmac_key.hex(),
+            "prompt_tail_tokens":
+            self._prompt_tail.tail if self._prompt_tail is not None else 0,
         }
 
     @property
@@ -971,6 +987,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         abort itself raises, so the engine-dead bookkeeping (and the original
         initialization error) cannot be lost to a teardown failure.
         """
+        # The abort can end this process (MPI_Abort) before the error reaches
+        # the LLM boundary, so the classified hint is logged first.
+        error.__cause__ = cause
+        log_startup_error(error, "LLM initialization failed")
         root_cause = cause if cause is not None else error
         try:
             self._abort_owned_session(root_cause)
@@ -993,9 +1013,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         dead_worker = self._worker_process_monitor.find_dead_worker()
         if dead_worker is not None:
-            return RuntimeError("MPI worker rank "
-                                f"{dead_worker.rank} (pid {dead_worker.pid}) "
-                                "exited unexpectedly")
+            return RuntimeInitError(
+                f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
+                "exited unexpectedly",
+                reason="worker_died")
         for fut in self.mpi_futures:
             if fut.done():
                 # exception() raises CancelledError on a cancelled future,
@@ -1003,7 +1024,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                 # teardown; a cancelled worker future still means this rank
                 # can never come up, so report it as a death instead.
                 exc = fut.exception() if not fut.cancelled() else None
-                return exc or RuntimeError("MPI worker exited unexpectedly")
+                return exc or RuntimeInitError("MPI worker exited unexpectedly",
+                                               reason="worker_died")
         check = getattr(self.mpi_session, "check_worker_error", None)
         if check is None:
             return None
@@ -1071,9 +1093,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
                 logger.error(
                     f"Executor worker initialization error: {error_trace}")
+                # The worker classified the error before pickling dropped its
+                # cause chain; carry that onto the error raised here.
+                info = status[2] if len(status) > 2 and isinstance(
+                    status[2], StartupErrorInfo) else None
                 self._fail_initialization(
-                    RuntimeError("Executor worker returned error"),
-                    ready_signal)
+                    wrap_worker_startup_error("Executor worker returned error",
+                                              info), ready_signal)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -1115,13 +1141,17 @@ class GenerationExecutorProxy(GenerationExecutor):
 
             death = self._detect_worker_death_during_init()
             if death is not None:
+                # A non-leader rank that fails here has no status queue, so its
+                # peers stay blocked in the init collective still holding their
+                # share of the weights. Raising alone leaks them until job end
+                # and makes the next blocking shutdown() hang instead of
+                # reporting this failure.
+                if is_worker_startup_error(death):
+                    # The rank raised its classified error, which already names
+                    # the rank, stage and root cause.
+                    self._fail_initialization(death)
                 message = f"Executor worker died during initialization: {death}"
                 logger.error(message)
-                # A non-leader rank that fails here returns without notifying
-                # anyone, so its peers stay blocked in the init collective
-                # still holding their share of the weights. Raising alone
-                # leaks them until job end and makes the next blocking
-                # shutdown() hang instead of reporting this failure.
                 self._fail_initialization(RuntimeError(message), death)
             self._handle_background_error()
 
@@ -1372,6 +1402,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._engine_dead or self._fatal_error is not None:
             self._results.pop(request.id, None)
             raise EngineDeadError(self._fatal_error)
+
+        # Requests that read their full prompt keep it (see prompt_tail.py).
+        if self._prompt_tail is not None:
+            tail = self._prompt_tail(request)
+            if tail:
+                request._prompt_tail_tokens = tail
 
         with nvtx_range_debug("request_queue.put"):
             self._send_request(request)
@@ -1680,6 +1716,12 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
         self._frontend_id = frontend_id
         self._num_frontends = num_lanes
+        # The launcher's validated prompt-tail setting.
+        prompt_tail = attach_info.get("prompt_tail_tokens", 0)
+        if prompt_tail:
+            self._prompt_tail = PromptTailPolicy(prompt_tail)
+            logger.info(f"prompt tail trimming on, tail={prompt_tail} "
+                        f"(frontend {frontend_id})")
         self._results: Dict[int, GenerationResult] = {}
         self.garbage_collection_gen0_threshold = None
         self.workers_started = False

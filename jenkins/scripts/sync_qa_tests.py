@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 TEST_DB_REL = Path("tests/integration/test_lists/test-db")
-CORE_REL = Path("tests/integration/test_lists/qa/llm_function_core.txt")
+CORE_REL = Path("tests/integration/test_lists/qa/functional/llm_function_core.txt")
 BACKENDS = frozenset({"pytorch"})
 
 
