@@ -33,6 +33,7 @@ from profiler_test_utils import (
 from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+    MoEFusedRouteQuant,
     MoEInputRequirement,
     MoERunContext,
     MoEStaticCapability,
@@ -116,22 +117,21 @@ class _Routing(DefaultMoeRoutingMethod):
 
 class _Backend:
     capabilities = MoEStaticCapability()
+    fused_route_quant_enabled = True
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.bfloat16)
 
     def __init__(self, ledger: list[str]) -> None:
         self.ledger = ledger
         self.contexts: list[MoERunContext] = []
-        self.fused_result: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
-            None
-        )
+        self.fused_result: MoEFusedRouteQuant | None = None
         self.error: RuntimeError | None = None
 
     def _supports_load_balancer(self) -> bool:
         return True
 
     def try_fused_route_quant(
-        self, x: torch.Tensor, logits: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        self, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> MoEFusedRouteQuant | None:
         self.ledger.append("try_fused")
         return self.fused_result
 
@@ -166,6 +166,7 @@ class _Moe:
     parallel_size = 1
     reduce_results = False
     enable_alltoall = False
+    enable_dummy_allreduce = False
     aux_stream = None
     repeat_idx = 0
     repeat_count = 1
@@ -189,6 +190,22 @@ class _Moe:
 
     def _using_load_balancer(self) -> bool:
         return self.layer_load_balancer
+
+    def _using_dynamic_load_balancer(self) -> bool:
+        """Model the dynamic EPLB path exercised by the ordering assertions."""
+        return self.layer_load_balancer
+
+    def _warmup_placement_route_counters(self, row_offset: int | None) -> None:
+        """These doubles do not enable warmup expert placement."""
+        return None
+
+    def _load_balancer_count_warmup(
+        self,
+        token_selected_experts: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        row_offset: int | None,
+    ) -> None:
+        return None
 
     def _load_balancer_start_wait_gpu_stage(self, first: bool) -> None:
         self.ledger.append(f"start_wait:{first}")
@@ -382,7 +399,7 @@ class TestMoeProfilerCPU:
         weights = torch.tensor([[0.125, 0.75]])
         quantized = torch.full((1, 4), 5.0)
         sf = torch.tensor([[2.0]])
-        moe.backend.fused_result = ids, weights, quantized, sf
+        moe.backend.fused_result = MoEFusedRouteQuant(ids, weights, quantized, sf)
         records = trace_routing(lambda: _external(moe, torch.zeros((1, 4)), torch.zeros((1, 4))))
         assert records[0]["moe.num_tokens"] == 1
         torch.testing.assert_close(moe.backend.contexts[0].token_selected_experts, ids)
