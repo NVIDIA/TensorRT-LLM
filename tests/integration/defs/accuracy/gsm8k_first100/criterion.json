@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "protocol_id": "gsm8k-first100-public-v1",
-  "manifest_sha256": "d36d25d42c8c9d02f9e927e82efa705523f30106fb90523067c2cc22c9b946ad",
+  "protocol_id": "beam-gsm8k-first100-public-v1",
+  "manifest_sha256": "3d4d297f47dc9538a45042135a59215c956fd85d390d13cd382b95694b1b899e",
   "min_correct": 95
 }
