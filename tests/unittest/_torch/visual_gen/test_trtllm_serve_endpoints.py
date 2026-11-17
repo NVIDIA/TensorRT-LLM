@@ -41,7 +41,7 @@ from PIL import Image
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.serve.openai_protocol import VideoJob
-from tensorrt_llm.serve.openai_server import _normalize_image_output
+from tensorrt_llm.serve.openai_server import OpenAIServer, _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
@@ -480,15 +480,10 @@ def _create_server(
     return client
 
 
-def _create_async_client(generator: MockVisualGen, model_name: str = "test-model"):
-    """Build the VISUAL_GEN server and return an ``httpx.AsyncClient`` over its
-    ASGI app.
-
-    The sync ``TestClient`` drives each request through a portal and does not run
-    the event loop between requests, so a detached ``/v1/videos`` background task
-    (and its offloaded encode) never progresses. Exercising the app on the
-    caller's live loop lets the background task run to completion.
-    """
+def _create_async_server(
+    generator: MockVisualGen, model_name: str = "test-model"
+) -> tuple[OpenAIServer, httpx.AsyncClient]:
+    """Build the supported server and client so tests can enter its lifespan."""
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -503,9 +498,17 @@ def _create_async_client(generator: MockVisualGen, model_name: str = "test-model
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
         )
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
     )
+    return server, client
+
+
+def _create_async_client(
+    generator: MockVisualGen, model_name: str = "test-model"
+) -> httpx.AsyncClient:
+    """Run requests on the caller's live loop so background tasks can progress."""
+    return _create_async_server(generator, model_name)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -1868,6 +1871,143 @@ class TestImageEdit:
             await asyncio.gather(request_task, return_exceptions=True)
             await client.aclose()
             loop.set_exception_handler(previous_handler)
+
+    @pytest.mark.threadleak(enabled=False)  # finite off-loop submit and fake executor
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["cancelled-aresult", "normal", "no-edits", "finite-submit"])
+    async def test_image_edit_lifespan_settles_owned_tasks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        case: Literal["cancelled-aresult", "normal", "no-edits", "finite-submit"],
+    ) -> None:
+        """Lifespan settles the edit owner before closing its result loop."""
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionResponse
+        from tensorrt_llm._torch.visual_gen.output import PipelineOutput
+        from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+        class _ResultExecutor:
+            def __init__(self) -> None:
+                self._event_loop = asyncio.new_event_loop()
+                self._stop = threading.Event()
+                self._ready = threading.Event()
+                self.waiting = threading.Event()
+                self.result_ready = asyncio.Event()
+                self.waiters: list[weakref.ReferenceType[asyncio.Task]] = []
+                self.response: DiffusionResponse | None = None
+                self.pending_at_close = -1
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+                assert self._ready.wait(5)
+
+            async def _serve(self) -> None:
+                self._ready.set()
+                while not self._stop.is_set():
+                    # Match the executor's poll cadence, not a cancellation ack.
+                    await asyncio.sleep(0.001)
+
+            def _run(self) -> None:
+                asyncio.set_event_loop(self._event_loop)
+                try:
+                    self._event_loop.run_until_complete(self._serve())
+                finally:
+                    self.pending_at_close = sum(
+                        ref() is not None and not ref().done() for ref in self.waiters
+                    )
+                    self._event_loop.close()
+
+            async def await_responses(
+                self, request_id: int, timeout: float | None = None
+            ) -> DiffusionResponse:
+                task = asyncio.current_task()
+                assert task is not None
+                self.waiters.append(weakref.ref(task))
+                self.waiting.set()
+                await self.result_ready.wait()
+                assert self.response is not None
+                return self.response
+
+            def shutdown(self) -> None:
+                self._stop.set()
+                self.thread.join(5)
+                assert not self.thread.is_alive()
+
+        gen = self._generator()
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        executor = _ResultExecutor()
+        submit_entered = threading.Event()
+        submit_finished = threading.Event()
+        original = gen.generate_async
+
+        def _submit(
+            inputs: str | None = None, params: VisualGenParams | None = None
+        ) -> VisualGenResult:
+            submit_entered.set()
+            try:
+                if case == "finite-submit":
+                    threading.Event().wait(0.25)  # finite callable; cancellation cannot stop it
+                inner = original(inputs=inputs, params=params)
+                executor.response = DiffusionResponse(
+                    request_id=inner.request_id,
+                    output=PipelineOutput(image=inner.result().image),
+                )
+                return VisualGenResult(inner.request_id, executor)
+            finally:
+                submit_finished.set()
+
+        monkeypatch.setattr(gen, "generate_async", _submit)
+        server, client = _create_async_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        edits_at_generator_shutdown: list[int] = []
+
+        def _shutdown() -> None:
+            edits_at_generator_shutdown.append(len(server._image_edit_tasks))
+            executor.shutdown()
+
+        monkeypatch.setattr(gen, "shutdown", _shutdown)
+        request_task: asyncio.Task[httpx.Response] | None = None
+        lifespan = server.app.router.lifespan_context(server.app)
+        entered = False
+        exited = False
+        try:
+            await lifespan.__aenter__()
+            entered = True
+            if case != "no-edits":
+                request_task = asyncio.create_task(
+                    client.post(
+                        "/v1/images/edits",
+                        json={
+                            "prompt": "split layers",
+                            "image": _b64_white_png_1x1(),
+                            "response_format": "b64_json",
+                        },
+                    )
+                )
+                assert await asyncio.to_thread(submit_entered.wait, 5)
+                if case != "finite-submit":
+                    assert await asyncio.to_thread(executor.waiting.wait, 5)
+                if case == "normal":
+                    executor._event_loop.call_soon_threadsafe(executor.result_ready.set)
+                    assert (await asyncio.wait_for(request_task, 5)).status_code == 200
+                else:
+                    request_task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(request_task, 5)
+            await asyncio.wait_for(lifespan.__aexit__(None, None, None), 5)
+            exited = True
+            assert edits_at_generator_shutdown == [0]
+            assert not server._image_edit_tasks
+            assert executor.pending_at_close == 0
+            if case != "no-edits":
+                assert await asyncio.to_thread(submit_finished.wait, 5)
+        finally:
+            if entered and not exited:
+                await asyncio.wait_for(lifespan.__aexit__(None, None, None), 5)
+            if request_task is not None:
+                if not request_task.done():
+                    request_task.cancel()
+                await asyncio.gather(request_task, return_exceptions=True)
+            executor.shutdown()
+            await client.aclose()
 
 
 # =========================================================================

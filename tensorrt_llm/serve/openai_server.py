@@ -849,6 +849,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            if self._is_visual_gen:
+                await self._shutdown_image_edit_tasks()
             self.generator.shutdown()
             # A stats read still in flight fails fast now that the executor is
             # down; the /metrics handler already treats that as no stats.
@@ -926,6 +928,21 @@ class OpenAIServer(_VideoRoutesMixin):
         error = task.exception()
         if error is not None:
             logger.error(f"Background image edit generation failed: {error!r}")
+
+    async def _shutdown_image_edit_tasks(self) -> None:
+        """Cancel and boundedly observe edit-owned waits before shutdown."""
+        tasks = tuple(self._image_edit_tasks)
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        # Cancelling a submission's await cannot stop its worker thread. Bound
+        # this task-only wait; owned late tasks keep their completion callbacks.
+        _, pending = await asyncio.wait(tasks, timeout=1.0)
+        if pending:
+            logger.warning(
+                f"{len(pending)} image edit generation task(s) still pending at shutdown"
+            )
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
