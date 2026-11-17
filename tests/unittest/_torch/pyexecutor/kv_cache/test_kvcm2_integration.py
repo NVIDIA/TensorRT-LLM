@@ -4846,6 +4846,33 @@ def test_per_conversation_policy_drop_extended_turns_drops_every_extended_turn(
         _free_if_active(manager, main)
 
 
+@pytest.mark.parametrize("drop_extended_turns", [False, True])
+def test_per_conversation_policy_extension_keeps_shared_window_page(
+    manager: KVCacheManagerV2,
+) -> None:
+    """Dropping the extended turn keeps the window page it shares with the new turn.
+
+    The one-token extension keeps the new turn's SWA window on the page the old
+    turn ended in. The new turn is planned before the old one is dropped, so
+    that page stays reusable at the new endpoint.
+    """
+    turn = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    extension = _ContextRequest(2, list(range(9)), 9, "conv-1")
+    extension_probe = _ContextRequest(3, list(range(9)), 9, "conv-2")
+
+    try:
+        for request in (turn, extension):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(extension_probe)
+        assert extension_probe.prepopulated_prompt_len == extension_probe.prompt_len - 1
+    finally:
+        _free_if_active(manager, extension_probe)
+        _free_if_active(manager, extension)
+        _free_if_active(manager, turn)
+
+
 def test_prefix_digests_match_across_token_types() -> None:
     """Integer prefixes digest the same whether or not later tokens are multimodal."""
     text = [5, 6, 7, 8]

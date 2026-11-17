@@ -479,6 +479,30 @@
     },
     "BlockReuseConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "drop_extended_turns": {
+                "const": true
+              }
+            },
+            "required": [
+              "drop_extended_turns"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy": {
+                "const": "per_conversation"
+              }
+            },
+            "required": [
+              "policy"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for KV cache block reuse policies.",
       "properties": {
         "drop_extended_turns": {

@@ -937,6 +937,24 @@ _GIB = 1 << 30
             {"defer_generation_only_release": True, "use_kv_cache_manager_v2": False},
             False,
         ),
+        # BlockReuseConfig
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_conversation", "drop_extended_turns": True}},
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": False}},
+            True,
+        ),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": False}}, True),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": True}}, False),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": True}},
+            False,
+        ),
         # AttentionDpConfig
         (
             "attention_dp_config",
