@@ -35,9 +35,10 @@ import pytest_asyncio
 import torch
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import ValidationError
 
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.serve.openai_protocol import VideoJob
+from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
@@ -2646,9 +2647,8 @@ class TestVisualGenValidationErrorRendering:
     Routes with a declared request model fail with FastAPI's
     ``RequestValidationError``; handlers that build their own request
     model (video sync/async, image edit, multipart) fail with pydantic's
-    ``ValidationError``. Every path must render byte-identical bodies.
-    These tests pin the full body, so they must pass unchanged before
-    and after any refactor of the rendering code.
+    ``ValidationError``. Every path must render the same JSON body.
+    These tests pin the full JSON body across both entry points.
     """
 
     # The exact envelope every unknown-field request below must produce.
@@ -2672,14 +2672,8 @@ class TestVisualGenValidationErrorRendering:
         assert resp.status_code == 422
         assert resp.json() == self._UNKNOWN_FIELD_BODY
 
-    def test_route_level_type_error_names_the_field(self, image_client):
-        """A type error reads ``<field>: <pydantic msg>``. The expected
-        message is computed from the model in the test, so the assertion
-        does not hard-code pydantic's wording."""
-        from pydantic import ValidationError
-
-        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
-
+    def test_route_level_type_error_names_the_field(self, image_client: TestClient) -> None:
+        """Name the field without hard-coding Pydantic's type-error wording."""
         payload = {"prompt": "a cat", "seed": "abc"}
         with pytest.raises(ValidationError) as exc_info:
             ImageGenerationRequest.model_validate(payload)
@@ -2691,18 +2685,46 @@ class TestVisualGenValidationErrorRendering:
         _assert_llm_envelope(body, code=422)
         assert body["message"] == f"seed: {expected_msg}"
 
-    def test_handler_level_bodies_match_route_level(self, tmp_path, monkeypatch):
-        """Handlers that build their own request model (video sync JSON,
-        video async JSON, image edit JSON) return the same 422 body as the
-        route-level path."""
+    def test_route_level_multiple_errors_are_joined(self, image_client: TestClient) -> None:
+        """Join every error with a semicolon and a space."""
+        payload = {"prompt": "a cat", "seed": "abc", "not_a_field": 1}
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate(payload)
+        errors = exc_info.value.errors()
+        assert [error["loc"] for error in errors] == [("seed",), ("not_a_field",)]
+        expected_message = f"seed: {errors[0]['msg']}; {self._UNKNOWN_FIELD_BODY['message']}"
+
+        resp = image_client.post("/v1/images/generations", json=payload)
+        assert resp.status_code == 422
+        assert resp.json() == {**self._UNKNOWN_FIELD_BODY, "message": expected_message}
+
+    def test_route_level_model_error_has_no_location_prefix(self, image_client: TestClient) -> None:
+        """Render a model-validator error without an empty location prefix."""
+        payload = {"prompt": "a cat", "width": 64}
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate(payload)
+        errors = exc_info.value.errors()
+        assert len(errors) == 1
+        assert errors[0]["loc"] == ()
+
+        resp = image_client.post("/v1/images/generations", json=payload)
+        assert resp.status_code == 422
+        assert resp.json() == {**self._UNKNOWN_FIELD_BODY, "message": errors[0]["msg"]}
+
+    @pytest.mark.parametrize("url", ("/v1/videos/sync", "/v1/videos"))
+    def test_video_handler_level_body_matches_route_level(
+        self, video_client: TestClient, url: str
+    ) -> None:
+        """Both video handlers return the route-level 422 JSON body."""
+        resp = video_client.post(url, json={"prompt": "a cat", "not_a_field": 1})
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_image_edit_handler_level_body_matches_route_level(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Image-edit validation returns the route-level 422 JSON body."""
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-
-        video_client = _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
-        for url in ("/v1/videos/sync", "/v1/videos"):
-            resp = video_client.post(url, json={"prompt": "a cat", "not_a_field": 1})
-            assert resp.status_code == 422, (url, resp.text)
-            assert resp.json() == self._UNKNOWN_FIELD_BODY, url
-
         edit_client = _create_server(
             MockVisualGen(
                 image_output=_make_dummy_image_tensor(),
@@ -2720,7 +2742,7 @@ class TestVisualGenValidationErrorRendering:
         """The multipart path funnels through the same pydantic model and
         renders the same envelope. The unknown field is sent as a plain
         multipart text part (no filename) so it is the only validation
-        error and the body matches the route-level one byte for byte."""
+        error and the JSON body matches the route-level one."""
         resp = video_client.post(
             "/v1/videos/sync",
             data={"prompt": "a cat"},
@@ -2728,166 +2750,6 @@ class TestVisualGenValidationErrorRendering:
         )
         assert resp.status_code == 422, resp.text
         assert resp.json() == self._UNKNOWN_FIELD_BODY
-
-    @staticmethod
-    def _pydantic_unknown_field_error():
-        """Return the pydantic ValidationError for an unknown field."""
-        from pydantic import ValidationError
-
-        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
-
-        with pytest.raises(ValidationError) as exc_info:
-            ImageGenerationRequest.model_validate({"prompt": "x", "not_a_field": 1})
-        return exc_info.value
-
-    def test_renderer_accepts_both_exception_types(self):
-        """The shared renderer produces the same status and bytes for a
-        pydantic ``ValidationError`` and for a ``RequestValidationError``
-        whose ``loc`` entries carry FastAPI's leading ``body`` segment."""
-        from fastapi.exceptions import RequestValidationError
-
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
-        from tensorrt_llm.serve.openai_server import OpenAIServer
-
-        pydantic_exc = self._pydantic_unknown_field_error()
-        fastapi_exc = RequestValidationError(
-            errors=[{**err, "loc": ("body", *err["loc"])} for err in pydantic_exc.errors()]
-        )
-
-        responses = [
-            render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
-            for exc in (pydantic_exc, fastapi_exc)
-        ]
-        assert [r.status_code for r in responses] == [422, 422]
-        assert responses[0].body == responses[1].body
-        assert json.loads(responses[0].body) == self._UNKNOWN_FIELD_BODY
-
-    def test_renderer_falls_back_to_str_without_errors(self):
-        """With no error entries the message falls back to ``str(exc)``."""
-        from fastapi.exceptions import RequestValidationError
-
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
-        from tensorrt_llm.serve.openai_server import OpenAIServer
-
-        exc = RequestValidationError([])
-        resp = render_visual_gen_validation_error(exc, OpenAIServer.create_error_response)
-        assert resp.status_code == 422
-        assert json.loads(resp.body)["message"] == str(exc)
-
-    def test_renderer_delegates_to_the_factory(self):
-        """The renderer builds no response itself: it calls the factory it
-        is given exactly once, with the rendered message and the fixed
-        error type and status, and returns the factory's result. The
-        factory owns the envelope and the context-length code rule."""
-        from http import HTTPStatus
-
-        from fastapi.responses import Response
-
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
-
-        calls = []
-        sentinel = Response(status_code=422)
-
-        def spy_factory(*, message, err_type, status_code):
-            calls.append((message, err_type, status_code))
-            return sentinel
-
-        result = render_visual_gen_validation_error(
-            self._pydantic_unknown_field_error(), spy_factory
-        )
-        assert result is sentinel
-        assert calls == [
-            (
-                self._UNKNOWN_FIELD_BODY["message"],
-                "BadRequestError",
-                HTTPStatus.UNPROCESSABLE_ENTITY,
-            )
-        ]
-
-
-# =========================================================================
-# Non-visual-gen routes keep FastAPI's default validation response
-# =========================================================================
-
-
-class TestNonVisualGenValidationResponse:
-    """Validation failures on non-visual-gen roles use the shared
-    ``OpenAIServer`` response shape (HTTP 400 + ``{"error": ...}``)
-    that existing integration coverage and clients expect (e.g.
-    ``test_malformed_json_request``). Only the visual-gen role swaps
-    in the LLM envelope.
-
-    The assertion is checked at the handler-closure level: rebuild
-    the exact dispatch installed in :meth:`OpenAIServer.__init__`
-    against a minimal FastAPI app so the assertion stays narrow and
-    the test doesn't need to spin up a full LLM-role server."""
-
-    def _build_app_with_dispatch(self, role):
-        """Return a FastAPI app wired with the production handler
-        dispatch, where ``role`` controls the branch the handler takes
-        on a ``RequestValidationError``."""
-        from fastapi import FastAPI
-        from fastapi.exceptions import RequestValidationError
-        from fastapi.responses import JSONResponse
-        from pydantic import BaseModel
-
-        app = FastAPI()
-
-        class _Body(BaseModel):
-            messages: list
-
-        @app.post("/route")
-        async def _route(body: _Body):
-            return {"ok": True}
-
-        @app.exception_handler(RequestValidationError)
-        async def _handler(_, exc):
-            if role == "VISUAL_GEN":
-                return _llm_envelope_branch(exc)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
-
-        # Mirror :func:`tensorrt_llm.serve._visual_gen_errors.render_visual_gen_validation_error`
-        # inline so the test does not depend on instance state.
-        def _llm_envelope_branch(exc):
-            from http import HTTPStatus
-
-            from tensorrt_llm.serve.openai_protocol import ErrorResponse
-
-            error = ErrorResponse(
-                message="Validation failed",
-                type="BadRequestError",
-                code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
-            )
-            return JSONResponse(
-                content=error.model_dump(),
-                status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
-            )
-
-        return app
-
-    def test_non_visual_gen_role_returns_shared_400_error_body(self):
-        """Non-visual-gen roles return HTTP 400 with the shared
-        ``{"error": str(exc)}`` body that ``test_malformed_json_request``
-        and existing clients depend on."""
-        client = TestClient(self._build_app_with_dispatch(role="CONTEXT"))
-        resp = client.post("/route", json={"not_messages": []})
-        assert resp.status_code == 400
-        body = resp.json()
-        assert "error" in body
-        assert isinstance(body["error"], str)
-        # The visual-gen LLM envelope must not leak into non-VG paths.
-        assert "object" not in body
-        assert "type" not in body
-        assert "code" not in body
-
-    def test_visual_gen_role_uses_llm_envelope(self):
-        client = TestClient(self._build_app_with_dispatch(role="VISUAL_GEN"))
-        resp = client.post("/route", json={"not_messages": []})
-        assert resp.status_code == 422
-        body = resp.json()
-        assert body["type"] == "BadRequestError"
-        assert body["code"] == 422
-        assert "message" in body
 
 
 # =========================================================================

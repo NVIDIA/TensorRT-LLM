@@ -16,24 +16,38 @@
 and handler-level (``ValidationError``) entry points. Private module."""
 
 from http import HTTPStatus
-from typing import Callable, Union
+from typing import Protocol
 
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response
 from pydantic import ValidationError
 
 
-def render_visual_gen_validation_error(
-    exc: Union[RequestValidationError, ValidationError],
-    create_error_response: Callable[..., Response],
-) -> Response:
-    """Render a VisualGen request validation failure as the 422 error envelope.
+class _ErrorResponseFactory(Protocol):
+    """Keyword contract for the shared error-response factory."""
 
-    Both entry points produce the same body: FastAPI's RequestValidationError
-    when a route's declared request model rejects the JSON body, and pydantic's
-    ValidationError when a handler builds its own request model (multipart,
-    image edit, video). ``create_error_response`` is the server's error-response
-    factory, so the body and the context-length code rule stay in one place.
+    def __call__(self, *, message: str, err_type: str, status_code: HTTPStatus) -> Response: ...
+
+
+def render_visual_gen_validation_error(
+    exc: RequestValidationError | ValidationError,
+    create_error_response: _ErrorResponseFactory,
+) -> Response:
+    """Render a VisualGen request validation failure with HTTP status 422.
+
+    Locations are dot-separated, omitting ``body`` segments. Unknown fields
+    receive an ``extra_params`` hint; other errors use ``<loc>: <msg>`` or a
+    bare message when the location is empty. Messages are joined with ``"; "``;
+    an empty error list falls back to ``str(exc)``.
+
+    Args:
+        exc: Route-level or handler-level request validation failure.
+        create_error_response: Called once by keyword with the message,
+            ``BadRequestError`` type and HTTP status 422. The factory owns the
+            response envelope and any message-derived error code.
+
+    Returns:
+        The response returned by the shared error-response factory.
     """
     parts: list[str] = []
     for err in exc.errors():
