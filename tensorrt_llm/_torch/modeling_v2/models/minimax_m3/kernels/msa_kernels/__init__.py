@@ -10,7 +10,8 @@
   paged sparse prefill), vendor lock entry ``msa-m31-prefill-bf16x``.
 
 All are MIT, Copyright (c) 2026 MiniMax (see each tree's LICENSE and NOTICE), and all compile at run time (JIT).
-``3rdparty/vendor-sources.md`` describes the entries and their persistent patches.
+``3rdparty/vendor_sources.lock.yaml`` pins each entry, and ``3rdparty/vendor_patches/<entry>.patch`` holds its
+persistent patch.
 """
 
 
