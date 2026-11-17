@@ -803,7 +803,7 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
 
 
 def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
-    """Guided mixed (context + gen) batch: ``forward`` must walk the K draft
+    """Guided mixed (context + gen) batch with the draft loop enabled: ``forward`` must walk the K draft
     positions left-to-right, advancing the grammar matcher
     (``add_draft_batch``) and masking each position's logits in place
     (``execute_draft_batch``) BEFORE that position is sampled.
@@ -883,6 +883,9 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
 
     guided = FakeGuidedDecoder()
     worker.guided_decoder = guided
+    # The per-position loop is opt-in (off by default); this test pins its behavior.
+    monkeypatch.setattr(worker, "_guided_draft_loop", True)
+    meta.use_rejection_sampling = True
 
     sampled_per_step = []
 

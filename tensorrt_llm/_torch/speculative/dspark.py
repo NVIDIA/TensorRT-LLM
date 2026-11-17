@@ -492,6 +492,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     # derived weights cache_derived_state builds (set_draft_model).
     _forks_backfill = True
     _draft_model_ref: Optional[weakref.ref] = None
+    # Whether guided decoding drafts the block position by position under the grammar mask.
+    # Off: the block is sampled unmasked and verification against the masked target keeps
+    # the output valid, without a host round-trip per draft position.
+    _guided_draft_loop = False
 
     def __init__(
         self,
@@ -1582,6 +1586,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
         )
 
+        guided_draft_loop_ran = False
         if num_gens > 0:
             reuse_draft_tokens = self._can_reuse_draft_tokens(draft_model, spec_metadata)
             draft_output = self._draft_gen_block_batched(
@@ -1603,7 +1608,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 gen_vocab = None
             elif draft_output is not None:
                 gen_logits = draft_output
-                if self.guided_decoder is not None:
+                if (
+                    self.guided_decoder is not None
+                    and self._guided_draft_loop
+                    and spec_metadata.use_rejection_sampling
+                ):
                     gen_draft_tokens = self._sample_draft_tokens_guided(
                         gen_logits,
                         spec_metadata,
@@ -1613,6 +1622,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                         batch_size,
                         K,
                     )
+                    guided_draft_loop_ran = True
                 else:
                     # SpecWorkerBase samples the draft tokens.
                     gen_draft_tokens = self.sample_draft_tokens(
@@ -1646,6 +1656,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         else:
             next_draft_tokens = gen_draft_tokens
+
+        if not guided_draft_loop_ran:
+            self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
