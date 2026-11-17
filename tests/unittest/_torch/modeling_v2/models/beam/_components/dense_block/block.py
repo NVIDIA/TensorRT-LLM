@@ -39,18 +39,13 @@ from typing import TYPE_CHECKING, Mapping
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
-    swiglu_fp32,
-)
-from tensorrt_llm._torch.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
-    beam_rmsnorm_fp32,
-)
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import swiglu_fp32
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,

@@ -19,11 +19,9 @@ from typing import NoReturn
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import MODELING_V2_VALIDATE_ENV
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (  # noqa: E501
-    component_bf16 as bf16,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2._router_index import MODELING_V2_VALIDATE_ENV
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
     component as nvfp4,
 )
 
@@ -207,7 +205,7 @@ def test_attention_rechecks_the_step_per_layer_only_when_needed(
 def test_full_model_validates_once_and_marks_every_block_call_checked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
         model as full,
     )
 

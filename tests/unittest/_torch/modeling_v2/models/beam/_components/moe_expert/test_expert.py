@@ -36,8 +36,8 @@ from _beam_component_support import TorchCallTrace, bitwise_equal  # noqa: E402
 from _validating import validating  # noqa: E402
 
 from _components.moe_expert.expert import WEIGHT_SHAPES, BeamMoeExpertBf16Sm103Tp1  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm, cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import CublasMm, cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
     SwigluFp32,
     swiglu_fp32,
 )

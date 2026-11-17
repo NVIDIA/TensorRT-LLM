@@ -12,7 +12,7 @@ dispatches no token and combines no expert output; the routed scaling factor bel
 that combine and is not applied here. It does not call the built-in Beam modeling.
 
 The routing uses FP32 at every step, through the Beam family operator
-``tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router``::
+``tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router``::
 
     logits  = hidden.float() @ weight^T                        [T, 256]
     scores  = sigmoid(logits)                                  unbiased: the weights use these

@@ -59,30 +59,20 @@ from _validating import validating  # noqa: E402
 
 from _components.dense_block import block as block_module  # noqa: E501
 from _components.dense_block.block import BeamDenseBlockBf16Sm103Tp1  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
-    swiglu_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import swiglu_fp32
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_neox_rope import beam_neox_rope
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_output_gate import (
     beam_output_gate,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
-    beam_rmsnorm_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.mapping import Mapping

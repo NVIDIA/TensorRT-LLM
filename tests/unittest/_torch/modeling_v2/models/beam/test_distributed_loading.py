@@ -30,15 +30,13 @@ def test_distributed_loading(tmp_path, monkeypatch, packed):
 
     from safetensors.torch import save_file
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import layout_bf16 as layout
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import loader_bf16 as loader
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import layout_bf16 as layout
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import loader_bf16 as loader
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         component as nvfp4,
     )
-    from tensorrt_llm._torch.distributed.communicator import Distributed
     from tensorrt_llm.mapping import Mapping
 
     rank = mpi_rank()
@@ -114,9 +112,7 @@ def test_catalog_collectives() -> None:
     if mpi_disabled() or mpi_world_size() != 4 or torch.cuda.device_count() < 4:
         pytest.skip("requires MPI with four ranks and four visible GPUs on one node")
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
     from tensorrt_llm.mapping import Mapping
 
     rank = mpi_rank()

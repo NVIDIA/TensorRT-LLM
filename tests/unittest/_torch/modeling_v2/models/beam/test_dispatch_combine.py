@@ -28,11 +28,11 @@ import inspect
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import dispatch_combine  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam import dispatch_combine  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.dispatch_combine import (  # noqa: E501
     dispatch_and_combine,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
     beam_dispatch_combine,
 )
 

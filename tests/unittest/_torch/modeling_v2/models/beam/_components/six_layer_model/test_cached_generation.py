@@ -62,13 +62,11 @@ from _beam_component_support import bitwise_equal  # noqa: E402
 from _components.six_layer_model import generation  # noqa: E501
 from _components.six_layer_model import model as model_module  # noqa: E501
 from _components.six_layer_model.generation import BeamSmallModelGenerator, Lifecycle  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
+from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests

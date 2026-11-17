@@ -59,15 +59,15 @@ from _validating import validating  # noqa: E402
 from _components.moe.moe import BeamMoeBf16Sm103Tp1
 from _components.moe_expert.expert import BeamMoeExpertBf16Sm103Tp1  # noqa: E501
 from _components.moe_router.router import BeamMoeRouterBf16Sm103Tp1  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import dispatch_combine  # noqa: E501
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.beam import dispatch_combine  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
     swiglu_fp32,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
     beam_dispatch_combine,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router,
 )
 

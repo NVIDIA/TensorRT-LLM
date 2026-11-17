@@ -30,10 +30,10 @@ import struct
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import (  # noqa: E501
     layout_bf16 as bf16_layout,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
     layout,
     loader,
 )
@@ -520,7 +520,7 @@ def _assert_gemm(out: torch.Tensor, a_codes, a_sf, w_packed, w_sf, alpha) -> Non
 @needs_sm103
 @pytest.mark.parametrize("shared_fc1", [True, False])
 def test_expert_provider_matches_independent_reference(shared_fc1, monkeypatch) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
         expert as provider,
     )
 

@@ -44,20 +44,14 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.distributed import AllReduce, allgather
 from tensorrt_llm._torch.modeling_v2._router_index import (
     MODELING_V2_VALIDATE_ENV,
     step_contract_enabled,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
-from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import (
-    allreduce,
-    allreduce_group_args,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
     beam_logit_softcap,
 )
@@ -70,7 +64,6 @@ from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residua
     beam_depth_residual,
     depth_scales,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 

@@ -19,7 +19,7 @@ is re-selected, no bias is added and no weight is re-normalized here. No residua
 normalization or collective is applied.
 
 The combination follows the Beam family operator
-``tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine``::
+``tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine``::
 
     for each selected expert e, ascending:
         out   = expert_provider(e, hidden[tokens routed to e])     [n, 5120] bf16

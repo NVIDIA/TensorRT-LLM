@@ -528,7 +528,7 @@ def test_bringup_helpers_and_tensor_captures_are_not_runtime_apis():
 def test_dispatch_routing_preconditions(ids, error):
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
         beam_dispatch_combine as op,
     )
 
@@ -567,7 +567,7 @@ def test_standalone_block_cache_retention(
 ):
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+    from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 
     # Metadata geometry is checked separately; use a non-identity logical-to-local mapping.
     monkeypatch.setattr(_attention, "check_metadata", lambda *args, **kwargs: 0)

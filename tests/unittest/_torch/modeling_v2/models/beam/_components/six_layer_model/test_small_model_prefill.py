@@ -49,38 +49,30 @@ from _components.six_layer_model.model import (  # noqa: E501
     BeamSixLayerBf16Sm103Tp1,
     prefill_context,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
     beam_logit_softcap,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
     swiglu_fp32,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_neox_rope import beam_neox_rope
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
     beam_nope_query_scale,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_output_gate import (
     beam_output_gate,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
     beam_dispatch_combine,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
-    beam_rmsnorm_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
