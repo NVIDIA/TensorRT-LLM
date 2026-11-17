@@ -25,7 +25,7 @@ mode switch, but it is not the registered default yet.
 
 | Mode | CI status | Threads | Coverage |
 |------|-----------|---------|----------|
-| `log_only` | Registered in `qa/llm_function_stress.txt` | log-only probe + log scanner | startup/data-path crash guard: UAF, broken promise, segfault-class logs |
+| `log_only` | Registered in `qa/functional/llm_function_stress.txt` | log-only probe + log scanner | startup/data-path crash guard: UAF, broken promise, segfault-class logs |
 | `full_cancel_poison` | Opt-in only | load, canary, injector, log scanner, metrics | cancellation load, failure injection, poison canaries, KV-growth guard |
 
 Thread bodies:
@@ -106,7 +106,7 @@ features are ready:
 ### Scheduled QA stress run
 
 The Python/V2 DeepSeek marathon is registered in
-`tests/integration/test_lists/qa/llm_function_stress.txt`, which makes
+`tests/integration/test_lists/qa/functional/llm_function_stress.txt`, which makes
 it eligible for the QA/Jenkins job that consumes that stress list. This
 PR does not create or modify the scheduler for that job; the exact
 cadence and wall-clock start time are owned by QA CI configuration
@@ -124,7 +124,7 @@ The integration test-list parser interprets `TIMEOUT (45)` in
 minutes. CI should run the list from `tests/integration/defs` with:
 
 ```bash
-pytest --test-list=../test_lists/qa/llm_function_stress.txt \
+pytest --test-list=../test_lists/qa/functional/llm_function_stress.txt \
   --output-dir=<ci-output-dir> \
   -s -v
 ```
@@ -202,7 +202,7 @@ cd /path/to/TensorRT-LLM/tests/integration/defs
 export LLM_MODELS_ROOT=/path/to/model/root
 
 pytest stress_test/disagg_cancel/test_disagg_cancel_stress.py \
-  --test-list=../test_lists/qa/llm_function_stress.txt \
+  --test-list=../test_lists/qa/functional/llm_function_stress.txt \
   --output-dir=/tmp/trtllm-disagg-cancel-stress \
   -s -v
 ```
@@ -211,7 +211,7 @@ To collect without running:
 
 ```bash
 pytest stress_test/disagg_cancel/test_disagg_cancel_stress.py \
-  --test-list=../test_lists/qa/llm_function_stress.txt \
+  --test-list=../test_lists/qa/functional/llm_function_stress.txt \
   --output-dir=/tmp/trtllm-disagg-cancel-stress \
   -s --co -q
 ```
@@ -220,7 +220,7 @@ pytest stress_test/disagg_cancel/test_disagg_cancel_stress.py \
 
 On a GitHub pull request, ask the CI bot which stress stages are
 available, then trigger the QA stress stage that consumes
-`tests/integration/test_lists/qa/llm_function_stress.txt`:
+`tests/integration/test_lists/qa/functional/llm_function_stress.txt`:
 
 ```text
 /bot help
