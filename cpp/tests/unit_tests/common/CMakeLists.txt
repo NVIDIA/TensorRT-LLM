@@ -151,6 +151,6 @@ if(BUILD_PYT)
   target_compile_definitions(
     profilerTest
     PRIVATE
-      TRTLLM_PROFILER_SELECTOR_CASES="${PROJECT_SOURCE_DIR}/../tests/unittest/profiler_selector_cases.json"
+      TRTLLM_PROFILER_SELECTOR_CASES="${TOP_LEVEL_DIR}/tests/unittest/profiler_selector_cases.json"
   )
 endif()
