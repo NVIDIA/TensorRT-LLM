@@ -104,6 +104,10 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._transceiver.kv_transfer_timeout_ms
 
     @property
+    def reads_unique_tokens(self) -> bool:
+        return self._transceiver.reads_unique_tokens
+
+    @property
     def pipeline_transfer_enabled(self) -> bool:
         return self._transceiver.pipeline_transfer_enabled
 
@@ -493,6 +497,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
 
     def get_status_dump(self) -> str:
         return self._transceiver.get_status_dump()
+
+    def prepare_shutdown(self) -> None:
+        return self._transceiver.prepare_shutdown()
 
     def shutdown(self) -> None:
         """Shut down the resource owner before cancelling its remaining

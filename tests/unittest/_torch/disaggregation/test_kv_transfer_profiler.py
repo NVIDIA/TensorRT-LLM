@@ -806,6 +806,43 @@ def test_shutdown_failure_preserves_observations_and_original_error_for_retry(
     assert backend.call_log.count("shutdown") == 3
 
 
+@pytest.mark.parametrize("preparation_fails", [False, True])
+def test_shutdown_preparation_preserves_observations_and_cache_release_order(
+    monkeypatch: pytest.MonkeyPatch, events: list, preparation_fails: bool
+) -> None:
+    """Keep pending observations until shutdown after preparation and cache release."""
+    backend = _ScriptedTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    wrapper.respond_and_send_async(_request())
+    records = dict(wrapper._records)
+    observed = set(backend.observed)
+    error = RuntimeError("preparation retains cache ownership") if preparation_fails else None
+
+    def prepare() -> None:
+        backend.call_log.append("prepare_shutdown")
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(backend, "prepare_shutdown", prepare)
+    if preparation_fails:
+        with pytest.raises(RuntimeError) as caught:
+            wrapper.prepare_shutdown()
+        assert caught.value is error
+        assert wrapper._records == records and backend.observed == observed and len(events) == 1
+        assert backend.call_log == ["send", "prepare_shutdown"]
+        error = None
+
+    assert wrapper.prepare_shutdown() is None
+    assert wrapper._records == records and backend.observed == observed and len(events) == 1
+    expected = ["send"] + ["prepare_shutdown"] * (2 if preparation_fails else 1)
+    assert backend.call_log == expected
+    backend.call_log.append("cache_release")
+    wrapper.shutdown()
+    assert backend.call_log == expected + ["cache_release", "shutdown"]
+    assert not wrapper._records and not backend.observed
+    assert len(events) == 2 and events[-1][0] == "trtllm::kv_transfer_cancelled"
+
+
 def test_duplicates_still_delegate_without_duplicate_submit(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
@@ -888,11 +925,18 @@ def test_poll_arguments_and_empty_record_calls_preserve_rank_symmetry(
     assert backend.polls == [("context", bound, mark)]
 
 
-def test_all_resource_capabilities_are_delegated(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("reads_unique_tokens", [False, True])
+def test_all_resource_capabilities_are_delegated(
+    monkeypatch: pytest.MonkeyPatch, reads_unique_tokens: bool
+) -> None:
     """Verify the wrapper preserves every resource-owner capability result."""
     backend = _ScriptedTransceiver()
     backend.owned = True
+    reads_tokens = PropertyMock(return_value=reads_unique_tokens)
+    monkeypatch.setattr(type(backend), "reads_unique_tokens", reads_tokens)
     wrapper = _wrap(backend, monkeypatch)
+    assert wrapper.reads_unique_tokens is reads_unique_tokens
+    reads_tokens.assert_called_once_with()
     assert isinstance(wrapper, KvCacheTransceiver)
     assert wrapper.kv_transfer_timeout_ms == 123
     backend.kv_transfer_timeout_ms = None
