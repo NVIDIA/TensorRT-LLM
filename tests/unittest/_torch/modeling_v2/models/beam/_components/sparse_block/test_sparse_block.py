@@ -954,11 +954,22 @@ def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
     assert type(blk).__module__.endswith("sparse_block.block")
     top = [c for c in calls if c["depth"] == 0]
     assert tuple(c["op"] for c in top) == EXPECTED_CALLS, [c["op"] for c in top]
-    # Every other call ran inside BeamDispatchCombine: right after it, one level down.
+    # The router owns one nested projection; the dispatcher owns the expert calls.
     position = names.index("BeamDispatchCombine")
-    inner = len(calls) - len(top)
+    router_position = names.index("BeamGroupedTopkRouter")
+    assert position == router_position + 2
+    assert (calls[router_position + 1]["op"], calls[router_position + 1]["depth"]) == (
+        "CublasMm",
+        1,
+    )
+    inner = len(calls) - len(top) - 1
     depths = [c["depth"] for c in calls]
-    assert depths == [0] * (position + 1) + [1] * inner + [0] * (len(calls) - position - 1 - inner)
+    assert depths == (
+        [0] * (router_position + 1)
+        + [1, 0]
+        + [1] * inner
+        + [0] * (len(calls) - position - 1 - inner)
+    )
     router = calls[names.index("BeamGroupedTopkRouter")]
     ids = router["output"]["ids"]
     selected = sorted(set(ids.reshape(-1).tolist()))
