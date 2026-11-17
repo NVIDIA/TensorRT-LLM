@@ -185,11 +185,13 @@ public:
     //                       manager-level statistics are disabled.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
+    // inputKnownNoDigest: inputTokens hold no digest token (e.g. the zero-copy int32 path), so the reuse
+    // match may skip hashing; the sequence's text_only flag is unchanged.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt);
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        bool inputKnownNoDigest = false);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();
