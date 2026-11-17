@@ -25,6 +25,8 @@
    "accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_gsm8k": 931.6819444444445,
    "accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_eagle3_gsm8k_and_acceptance": 791.973,
    "accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_gsm8k": 659.1681428571428,
+   "accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_disaggregated_dep2": 360.976,
+   "accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[dep4]": 666.068,
    "accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2": 314.12083333333334,
    "accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context": 585.9465129533679,
    "accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv]": 600.46915,

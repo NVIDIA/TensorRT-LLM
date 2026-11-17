@@ -56,6 +56,7 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -221,9 +222,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
-    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
-                                              init=False,
-                                              repr=False)
+    fmha_plan_caches: Dict[str, Any] = field(default_factory=dict,
+                                             init=False,
+                                             repr=False)
+    # Whether TLLM_FMHA_LIBS enables beam_shared_prefix, read once per metadata so that
+    # prepare() does no per-step work for it when the library is off.
+    beam_shared_prefix_enabled: bool = field(default=False,
+                                             init=False,
+                                             repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -465,6 +471,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
+            "beam_shared_prefix")
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1293,6 +1301,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
+        # Per-step host planning of the opt-in wide-beam generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        # Also runs for single-beam steps, where it only drops the previous step's plan.
+        if self.beam_shared_prefix_enabled:
+            from .fmha.beam_shared_prefix import plan_step
+            plan_step(self)
+
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
@@ -1610,7 +1626,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         (the sparse-attention subclasses keep per-step state in their own
         ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
         domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
-        KV staging, and a KV cache manager with a known block size.
+        KV staging or cold-page window (prepare() redirects its block offsets),
+        and a KV cache manager with a known block size.
         """
         return (type(self) is TrtllmAttentionMetadata
                 and self.fp4_mla_state is None
@@ -1621,6 +1638,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_flash_mla
                 and not self.enable_context_mla_with_cached_kv
                 and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
                 and self.kv_cache_params is not None
                 and self.kv_cache_params.use_cache)
 
