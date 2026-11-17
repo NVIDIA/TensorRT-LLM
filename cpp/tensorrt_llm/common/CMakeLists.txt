@@ -93,13 +93,8 @@ if(ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
 add_library(
-  common_src OBJECT
-  cudaArchitectures.cpp
-  cudaFp8Utils.cu
-  ncclUtils.cpp
-  opUtils.cpp
-  safetensors.cpp
-  sageQuant.cu)
+  common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu ncclUtils.cpp
+                    opUtils.cpp safetensors.cpp sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
