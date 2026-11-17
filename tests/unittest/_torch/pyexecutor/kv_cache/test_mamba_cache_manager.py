@@ -2773,6 +2773,7 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     assert mgr._fp4_mla_compact_layer_idx(3) == 1
     assert callable(mgr.get_fp4_mla_cache_buffers)
     assert callable(mgr.get_fp4_mla_page_table_spec)
+    assert mgr.uses_fp4_mla_cache_layout is True
     assert mgr.fp4_mla_hp_pool_size == mgr._fp4_mla_hp_pool_size
     assert mgr.get_buffers(0) is None
     assert mgr.get_buffers(2) is None
@@ -2849,6 +2850,24 @@ def test_v2_hybrid_fp4_disagg_role_mapping_covers_mla_and_ssm_roles(
     # INDEXED stays the whole-manager fallback only, as the page-table
     # builder requires.
     assert [role for role, kind in kinds.items() if kind == MapperKind.INDEXED] == [Role.ALL]
+
+
+def test_v2_hybrid_without_fp4_mla_leaves_the_layout_hooks_off() -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla.config import has_fp4_mla_cache_layout
+
+    # Every hybrid manager inherits the FP4 MLA layout; only configure_manager turns it on.
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+
+    assert mgr.uses_fp4_mla_cache_layout is False
+    assert not has_fp4_mla_cache_layout(mgr)
+    with pytest.raises(RuntimeError, match="does not use the FP4 MLA layout"):
+        mgr.get_fp4_mla_page_table_spec()
+    # A disaggregated import has no derived FP4 MLA state to rebuild.
+    assert mgr.rebuild_disagg_imported_cache([]) is None
+
+    # A manager double without the flag counts by exposing the page-table spec.
+    assert has_fp4_mla_cache_layout(SimpleNamespace(get_fp4_mla_page_table_spec=lambda: None))
+    assert not has_fp4_mla_cache_layout(SimpleNamespace())
 
 
 def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:

@@ -64,16 +64,48 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
     a compact ``16 + max_rewind`` BF16 ring. The HP role therefore follows V2
     allocation, rewind, prefix, and disaggregated-transfer lifecycles without
     storing BF16 values for the full sequence.
+
+    ``Fp4MlaKVCacheManagerV2`` applies this policy directly for pure MLA
+    models. Its block reuse claims only whole ``tokens_per_block`` prefixes,
+    so a reused request starts its context on a fresh 16-token quantization
+    tile and never reads the HP ring of the shared prefix. Its HP lifecycle is
+    therefore request-private: it does not constrain prefix matching, and the
+    radix tree retains only the full-history FP4 pages.
+
+    Hybrid linear-attention managers inherit the layout itself
+    (``Fp4MlaV2CacheLayoutMixin``) and call ``configure_manager``,
+    ``_build_cache_config`` and ``finalize_manager`` of this policy on their
+    own instance, next to their SSM lifecycle. Such a manager keeps its own
+    disaggregation declarations and merges the policy's attention roles into
+    them (``DISAGG_ROLE_MAPPER_KINDS``, ``DISAGG_IGNORED_ROLES``,
+    ``_fp4_mla_disagg_global_layer_id``, ``_fp4_mla_disagg_role_layouts``), so
+    the recurrent-state roles keep their own transfer mappings.
     """
 
     uses_fp4_mla_cache_layout: bool = True
+    # Transfer layout of the MLA roles. FP4 and FP8-fallback latent pages are
+    # written token-major by the FP4 MLA kernels, and every TP rank holds the
+    # same single-head latent state, including its HP ring.
     DISAGG_ROLE_MAPPER_KINDS: dict[DataRole, MapperKind] = {
         Role.KEY: MapperKind.NHD,
         Role.KEY_BLOCK_SCALE: MapperKind.NHD,
         Role.MLA_HP_TAIL: MapperKind.REPLICATED,
     }
+    # V scales and packed V derive from K and K scales; the generation worker
+    # rebuilds them locally in rebuild_disagg_imported_cache.
     DISAGG_IGNORED_ROLES: frozenset[DataRole] = frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+    # A one-model draft layer at position i reads prompt token i + 1, and the
+    # generic reuse-match backoff recomputes that many tokens past a matched
+    # block boundary. The resulting context start is not tile aligned, which
+    # FP4 MLA cannot append to, so FP4 MLA claims whole blocks instead. The
+    # draft KV of the last reused position may then come from a different
+    # continuation, which affects draft acceptance only.
     _supports_reuse_match_backoff = False
+    # With whole-block claims (_context_reuse_tokens) the page a generation
+    # step appends to is never a reused one: the request allocated it, and its
+    # earlier rows carry the packed-V sidecar of the request's own steps. A
+    # generation step may therefore write packed V directly with block reuse
+    # on (cache_update). Hybrid managers do not inherit this policy attribute.
     fp4_mla_reuse_claims_whole_blocks = True
 
     def __init__(self, *args, **kwargs) -> None:
@@ -126,6 +158,9 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
         if kv_cache_config.dtype == "auto":
             config_updates["dtype"] = "nvfp4"
         if kv_cache_config.enable_partial_reuse:
+            # FP4 MLA can resume only on a complete 16-token quantization
+            # tile. V2 partial reuse may return any token boundary, so keep
+            # full-block reuse while disabling only partial-block matches.
             config_updates["enable_partial_reuse"] = False
         if config_updates:
             kv_cache_config = kv_cache_config.model_copy(update=config_updates)
@@ -187,18 +222,17 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
         manager._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
         manager._fp4_mla_view_cache = {}
         manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
-        Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
-        return kv_cache_config
-
-    @staticmethod
-    def install_manager_capabilities(manager) -> None:
-        """Activate ``Fp4MlaV2CacheLayoutMixin`` capabilities on ``manager``."""
+        # Turns on the layout hooks the manager inherits from Fp4MlaV2CacheLayoutMixin.
         manager.uses_fp4_mla_cache_layout = True
+        return kv_cache_config
 
     @staticmethod
     def finalize_manager(manager) -> None:
         """Validate allocated pools and initialize derived FP4 state."""
         Fp4MlaV2CacheLayoutMixin._validate_fp4_mla_layer_groups(manager)
+        # Partial pages leave unused V-scale tiles untouched while the
+        # fixed-width PV path can load the complete scale page. Match V1's
+        # deterministic initialization before any warmup or graph capture.
         v_scale_pool = Fp4MlaV2CacheLayoutMixin.get_mla_v_scale_pool_base(manager)
         if v_scale_pool is not None:
             with torch.cuda.stream(manager._stream):
@@ -206,6 +240,9 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
             manager._stream.synchronize()
 
     def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
+        # The pure MLA manager resumes a reused prefix only on a block
+        # boundary, where no HP ring content is needed. A hybrid manager
+        # composing this policy keeps the HP ring with its recurrent snapshots.
         hp_reuse_policy = (
             ReusePolicy.PRIVATE
             if isinstance(self, Fp4MlaV2CacheLayoutPolicy)
@@ -238,11 +275,30 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
         return result
 
     def _get_typical_seq_len(self, kv_cache_config: "KvCacheConfig") -> int:
+        """Size the pools from a whole typical batch, also without ``avg_seq_len``.
+
+        The quota is split between lifecycles whose slots differ in size by
+        orders of magnitude: the full-history pool of the MLA layers and the
+        per-request HP rings. Without a typical length the core derives the
+        split from a single 2048-token request and rounds each pool of it up
+        to the allocation granularity first, which hands the HP rings a share
+        of the quota they never use. A batch of such requests, one per
+        resident sequence plus a context chunk, keeps the 2048-token default
+        and makes the rounding negligible.
+        """
         if kv_cache_config.avg_seq_len is not None:
             return kv_cache_config.avg_seq_len
         return min(self.max_seq_len, _FP4_MLA_DEFAULT_TYPICAL_SEQ_LEN)
 
     def _context_reuse_tokens(self, req: "LlmRequest", reuse_limit: Optional[int] = None):
+        """Restrict prefix matching to whole blocks of the recomputed prompt.
+
+        The radix tree can also hold a request's trailing partial block, and an
+        exact match of that block would end the reused prefix inside a 16-token
+        quantization tile. Capping the lookup at the last block boundary before
+        the final prompt token keeps every claimed prefix block aligned, so the
+        first context token always starts a fresh FP4 tile.
+        """
         num_tokens = len(self._reuse_token_source(req))
         aligned_limit = max(num_tokens - 1, 0) // self.tokens_per_block * self.tokens_per_block
         if reuse_limit is not None:
@@ -316,6 +372,9 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaV2CacheLayoutMixin):
             * torch.empty((), dtype=torch.float8_e4m3fn).element_size()
             * num_fp8_layers
         )
+        # Every resident sequence keeps one native HP ring page per local
+        # layer across pipeline stages; GEN slot preemption pauses residents
+        # in place, so the paused cap stays resident too.
         resident_capacity = max_batch_size * mapping.pp_size + int(
             kwargs.get("gen_preemption_headroom", 0)
         )

@@ -1,6 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared KV-cache V2 layout mixin for NVFP4 MLA latent and HP-ring storage."""
+"""KV cache V2 layout of the NVFP4 MLA latent cache and its BF16 tail ring.
+
+``Fp4MlaV2CacheLayoutMixin`` holds the pool, page-table and view code of the
+FP4 MLA storage layout. It is a base class of the hybrid V2 manager, which
+selects the layout at construction, so it lives next to the managers and
+imports the FP4 MLA attention backend only inside the methods that need it.
+The policy that validates the configuration and activates the layout is
+``attention.backends.fp4_mla.cache_manager.Fp4MlaV2CacheLayoutPolicy``.
+"""
 
 from __future__ import annotations
 
@@ -32,11 +40,18 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
+# Values that share one NVFP4 block scale.
 _FP4_BLOCK_SIZE = 16
 
 
 def _persistent_cache_view_mode() -> torch.inference_mode:
-    """Context for building cached views of persistent KV-cache storage."""
+    """Context for building cached views of persistent KV-cache storage.
+
+    The views are cached and also written outside inference mode, for
+    example by the post-warmup KV-cache scrub, but are often first built
+    inside a warmup forward. Building them with inference mode disabled keeps
+    them normal tensors.
+    """
     return torch.inference_mode(False)
 
 
@@ -52,16 +67,25 @@ class Fp4MlaPageTableSpec:
 
 
 class Fp4MlaV2CacheLayoutMixin:
-    """Shared FP4 MLA pool, page-table, sidecar, and workspace capabilities.
+    """FP4 MLA pools, page tables, cache views and derived-state buffers of a V2 manager.
 
-    Pure MLA managers inherit this mixin with ``uses_fp4_mla_cache_layout = True``
-    through ``Fp4MlaV2CacheLayoutPolicy``; hybrid recurrent/MLA managers inherit
-    it statically with ``uses_fp4_mla_cache_layout = False`` and activate it in
-    ``Fp4MlaV2CacheLayoutPolicy.configure_manager`` when configured for NVFP4 MLA.
+    The pure MLA manager always uses the layout (``Fp4MlaV2CacheLayoutPolicy``
+    sets ``uses_fp4_mla_cache_layout`` on the class). A hybrid recurrent/MLA
+    manager inherits the mixin with the layout off, and
+    ``Fp4MlaV2CacheLayoutPolicy.configure_manager`` turns it on for the
+    instances built for an NVFP4 MLA cache.
+
+    The methods are of two kinds. Those that override a ``KVCacheManagerV2``
+    hook start by deferring to the next class while the layout is off, so a
+    manager without the layout behaves as if the mixin were absent. The rest
+    are FP4 MLA accessors, which only FP4 MLA code calls.
     """
 
     uses_fp4_mla_cache_layout: bool = False
+    # Set by configure_manager: a disaggregated context worker keeps neither
+    # V scales nor packed V (see is_fp4_mla_context_only_cache).
     fp4_mla_context_only_cache: bool = False
+    # Manager layers of a standalone drafter appended to the lifecycle manager.
     _draft_manager_layer_ids: tuple[LayerId, ...] = ()
     _fp8_context_scratch: Optional[Any] = None
     _fp4_mla_q_buffers: Optional[dict[str, torch.Tensor]] = None
@@ -101,6 +125,7 @@ class Fp4MlaV2CacheLayoutMixin:
         ]
 
     def _fp4_mla_local_layer_indices(self) -> list[int]:
+        # Draft layers appended by a standalone drafter keep their own storage.
         excluded = set(self._fp8_mla_local_layer_indices()) | set(self._appended_draft_layer_specs)
         is_linear_layer = getattr(self, "_is_local_mamba_layer", None)
         return [
@@ -135,7 +160,13 @@ class Fp4MlaV2CacheLayoutMixin:
     def get_buffers(
         self, layer_idx: int, kv_layout: str = "NHD", **kwargs: Any
     ) -> Optional[torch.Tensor]:
-        """Return the layer's primary paged-cache view."""
+        """Return the layer's primary paged-cache view.
+
+        FP8 fallback layers use a buffer role and physical page geometry that
+        differ from the manager-wide NVFP4 layout. Construct their view from
+        the role descriptor directly so FMHA dispatch observes the same FP8
+        dtype and logical shape as an all-FP8 cache manager.
+        """
         if not self.uses_fp4_mla_cache_layout:
             return super().get_buffers(layer_idx, kv_layout, **kwargs)
         local_layer = self.layer_offsets[layer_idx]
@@ -170,8 +201,11 @@ class Fp4MlaV2CacheLayoutMixin:
         )
 
     def get_kv_cache_dtype(self, layer_idx: Optional[int] = None) -> DataType:
-        if not self.uses_fp4_mla_cache_layout:
-            return super().get_kv_cache_dtype(layer_idx)
+        """Storage dtype of a layer's primary cache role; the manager's dtype without ``layer_idx``.
+
+        A drafter layer keeps its own dtype and an FP8 fallback layer stores
+        FP8, whatever the manager-wide dtype is.
+        """
         if layer_idx is None:
             return self.dtype
         local_layer = self.layer_offsets[layer_idx]
@@ -180,21 +214,6 @@ class Fp4MlaV2CacheLayoutMixin:
         if local_layer in self._fp8_mla_local_layer_indices():
             return DataType.FP8
         return self.dtype
-
-    def get_kv_cache_num_blocks(self, layer_idx: int) -> int:
-        if not self.uses_fp4_mla_cache_layout:
-            return super().get_kv_cache_num_blocks(layer_idx)
-        local_layer = self.layer_offsets[layer_idx]
-        if (
-            local_layer in self._appended_draft_layer_specs
-            or local_layer in self._fp8_mla_local_layer_indices()
-        ):
-            manager_layer = LayerId(local_layer)
-        else:
-            manager_layer = self._cache_manager_layer_ids[
-                self._fp4_mla_compact_layer_idx(local_layer)
-            ]
-        return self._role_encoded_page_capacity(manager_layer, Role.KEY)
 
     def _storage_head_dim(self, local_layer_idx: int) -> int:
         return self.head_dim_per_layer[local_layer_idx] + self.fp4_mla_k_residual_dim
@@ -278,6 +297,12 @@ class Fp4MlaV2CacheLayoutMixin:
     def _apply_fp4_mla_cache_config(
         self, config: KVCacheManagerConfig, *, hp_reuse_policy: ReusePolicy
     ) -> KVCacheManagerConfig:
+        """Lay out the FP4 MLA layers of ``config`` and record their manager layer IDs.
+
+        FP8 fallback and drafter layers get a lifecycle of their own, and every
+        FP4 MLA layer gets a virtual layer for its HP ring, reused under
+        ``hp_reuse_policy``.
+        """
         cache_layers = list(config.layers)
         fp8_local_layers = self._fp8_mla_local_layer_indices()
         fp4_local_layers = self._fp4_mla_local_layer_indices()
@@ -297,9 +322,13 @@ class Fp4MlaV2CacheLayoutMixin:
                             size=self._fp8_mla_bytes_per_token(local_layer) * self.tokens_per_block,
                         )
                     ],
+                    # A distinct, non-evicting lifecycle gives FP8 pages their
+                    # own attention-op pool without changing the model window.
                     sliding_window_size=fp8_lifecycle_window,
                     num_sink_tokens=None,
                 )
+        # Draft layers take one more distinct non-evicting lifecycle: the FP4
+        # and FP8 tables address pages with their own pools' index scales.
         self._draft_manager_layer_ids = tuple(
             LayerId(local_layer) for local_layer in sorted(self._appended_draft_layer_specs)
         )
@@ -363,6 +392,7 @@ class Fp4MlaV2CacheLayoutMixin:
         if self._draft_manager_layer_ids:
             draft_pool_id = int(self.impl.get_layer_group_id(self._draft_manager_layer_ids[0]))
 
+        # The hybrid manager can split a recurrent layer across groups by buffer reuse policy.
         num_pools = len(self.impl.buffer_grouping)
         pool_pointers = [[[0, 0], [0, 0]] for _ in range(num_pools)]
         pool_pointers[cache_pool_id] = [
@@ -376,6 +406,7 @@ class Fp4MlaV2CacheLayoutMixin:
             [int(self.impl.get_mem_pool_base_address(hp_layer, Role.MLA_HP_TAIL)), 0],
             [0, 0],
         ]
+        # Single-buffer pools: the FP8 fallback latents and the drafter's.
         single_buffer_pools = [
             (pool_id, layer_ids)
             for pool_id, layer_ids in (
@@ -429,6 +460,9 @@ class Fp4MlaV2CacheLayoutMixin:
             num_pools, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self._index_scale_ints = self.index_scales.tolist()
+        # FP4 MLA builds one page table per lifecycle pool (each pool holds a
+        # single layer kind) and rejects enable_swa_scratch_reuse, so the base
+        # per-layer page-table copy never applies.
         self._use_per_layer_page_tables = False
         self.num_attention_op_pools = num_pools
         self.host_kv_cache_block_offsets = torch.zeros(
@@ -529,12 +563,14 @@ class Fp4MlaV2CacheLayoutMixin:
         hp_layer = self._hp_manager_layer_ids[compact_layer]
         return Fp4MlaPageTableSpec(
             cache_pool_id=int(self.impl.get_layer_group_id(cache_layer)),
+            # copy_batch_block_offsets already applies the V2 converter scale.
             cache_page_index_scale=1,
             hp_pool_id=int(self.impl.get_layer_group_id(hp_layer)),
             hp_page_index_scale=1,
         )
 
     def _role_encoded_page_capacity(self, layer_id: LayerId, role: DataRole) -> int:
+        """Return the tensor extent needed by shared-base encoded page IDs."""
         converter = self.impl.get_page_index_converter(layer_id, role)
         if converter.expansion != 1:
             raise NotImplementedError("FP4 MLA V2 roles require unexpanded page indices.")
@@ -591,6 +627,7 @@ class Fp4MlaV2CacheLayoutMixin:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if kv_layout != "NHD":
             raise ValueError("FP4 MLA V2 cache buffers support only NHD layout.")
+        # Every attention layer looks these views up once per forward step.
         cache_key = ("cache_buffers", layer_idx)
         cached = self._fp4_mla_view_cache.get(cache_key)
         if cached is not None:
@@ -616,6 +653,12 @@ class Fp4MlaV2CacheLayoutMixin:
         return kv_cache, sf_cache
 
     def get_fp4_mla_cache_pool_bases(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return K and K-scale views spanning the pages of every FP4 MLA layer.
+
+        All FP4 layers share one coalesced page geometry, so page ``p`` of the
+        ``get_fp4_mla_cache_buffers`` views of compact layer ``c`` is page
+        ``p + get_mla_v_scale_page_offset(c)`` of these views.
+        """
         cache_key = ("cache_pool_bases",)
         cached = self._fp4_mla_view_cache.get(cache_key)
         if cached is not None:
@@ -649,6 +692,7 @@ class Fp4MlaV2CacheLayoutMixin:
         return kv_cache, sf_cache
 
     def _iter_fp4_mla_physical_pool_views(self) -> Iterable[torch.Tensor]:
+        """Yield page-major views spanning each physical MLA pool once."""
         local_layer = self._fp4_mla_compact_to_local[0]
         cache_layer = self._cache_manager_layer_ids[0]
         storage_head_dim = self._storage_head_dim(local_layer)
@@ -679,6 +723,7 @@ class Fp4MlaV2CacheLayoutMixin:
                 ),
             )
         if self._draft_manager_layer_ids:
+            # Every appended draft layer lives in this one single-buffer pool.
             draft_layer = self._draft_manager_layer_ids[0]
             draft_spec = self._appended_draft_layer_specs[int(draft_layer)]
             yield self._role_pool_base_view(
@@ -763,6 +808,7 @@ class Fp4MlaV2CacheLayoutMixin:
         dtype: torch.dtype,
         page_shape: tuple[int, ...],
     ) -> torch.Tensor:
+        """Return a contiguous view spanning a role's complete coalesced pool."""
         cache_key = ("pool_base", int(layer_id), role, dtype, page_shape)
         cached = self._fp4_mla_view_cache.get(cache_key)
         if cached is not None:
@@ -866,6 +912,12 @@ class Fp4MlaV2CacheLayoutMixin:
         ).permute(1, 0, 2, 3)
 
     def _fp4_mla_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Declare the HP role as a ring of BF16 latent tokens.
+
+        A token at global position ``p`` sits in ring slot ``p % ring_size``,
+        and the ring size depends on the worker's speculative rewind, so a
+        context and a generation worker usually size it differently.
+        """
         head_dims = {
             int(self.head_dim_per_layer[local_layer])
             for local_layer in self._fp4_mla_compact_to_local
@@ -878,6 +930,7 @@ class Fp4MlaV2CacheLayoutMixin:
         return {Role.MLA_HP_TAIL: RoleLayout(ring_slot_bytes=slot_bytes)}
 
     def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
+        """Rebuild the derived V sidecars of requests whose prompt KV was imported."""
         if not self.uses_fp4_mla_cache_layout:
             return
         from tensorrt_llm._torch.attention.backends.fp4_mla.v_cache import (
@@ -892,6 +945,13 @@ class Fp4MlaV2CacheLayoutMixin:
         )
 
     def _fp4_mla_disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+        """Collision-free transfer ID of an MLA cache or HP-ring layer.
+
+        A model layer's latent cache (FP4 or FP8 fallback) maps to ``2 * L``
+        and its HP-ring virtual layer to ``2 * L + 1``, where ``L`` is the
+        global model layer; an appended draft layer ``D`` maps to ``2 * D``.
+        Returns ``None`` for any other internal layer.
+        """
         internal_layer = int(internal_layer)
         if internal_layer in self._appended_draft_layer_specs:
             return 2 * int(self.pp_layers[internal_layer])
@@ -935,6 +995,10 @@ class Fp4MlaV2CacheLayoutMixin:
     def _get_generation_request_capacity(self) -> int:
         if not self.uses_fp4_mla_cache_layout:
             return super()._get_generation_request_capacity()
+        # Pipeline stages retain different in-flight microbatches, and every
+        # resident sequence needs one native HP ring page per local layer.
+        # GEN slot preemption pauses residents in place, so the paused cap
+        # stays resident too.
         return self.max_batch_size * self.mapping.pp_size + self.gen_preemption_headroom
 
 
