@@ -444,6 +444,80 @@ def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("token_counts", [(2, 1), (5, 1), (5, 0), (0, 0)])
+def test_fused_comm_dummy_allreduce_brackets_every_chunk(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, token_counts: tuple[int, int]
+) -> None:
+    """Ranks with empty/tail chunks must issue the same debug collectives as their peers."""
+    scheduler_module = importlib.import_module(FusedCommMoEScheduler.__module__)
+    monkeypatch.setattr(scheduler_module, "_record_routes", lambda moe, routes, slots: routes)
+    monkeypatch.setattr(scheduler_module, "get_active_route_capture", lambda: None)
+    num_chunks = max(1, (max(token_counts) + 1) // 2)
+
+    for rank, num_tokens in enumerate(token_counts):
+        events = []
+        chunk_sizes = []
+
+        def run_moe(ctx: MoERunContext) -> torch.Tensor:
+            events.append("run_moe")
+            chunk_sizes.append(ctx.x.shape[0])
+            return ctx.x + 1
+
+        moe = SimpleNamespace(
+            mapping=SimpleNamespace(moe_ep_rank=rank, moe_ep_size=2),
+            parallel_size=2,
+            use_dp=True,
+            moe_max_num_tokens=2,
+            split_chunk=_split_chunk,
+            repeat_idx=0,
+            repeat_count=1,
+            apply_router_weight_on_input=False,
+            enable_dummy_allreduce=enabled,
+            dummy_allreduce=lambda: events.append("allreduce"),
+            layer_load_balancer=None,
+            num_slots=4,
+            routing_method=SimpleNamespace(
+                experts_per_token=1,
+                apply=lambda logits, ids: (
+                    torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                    torch.ones((logits.shape[0], 1), dtype=torch.float32),
+                ),
+            ),
+            _using_dynamic_load_balancer=lambda: False,
+            _load_balancer_uses_replica_plan=lambda: False,
+            _warmup_placement_route_counters=lambda offset: None,
+            _maybe_get_perfect_router_expert_ids=lambda routes: routes,
+            _load_balancer_start_wait_gpu_stage=Mock(),
+            _load_balancer_start_set_cpu_stage=Mock(),
+            _load_balancer_done_set_cpu_stage=Mock(),
+            backend=SimpleNamespace(
+                input_requirement=MoEInputRequirement(),
+                fused_route_quant_enabled=False,
+                quantize_input=lambda x: (x, None),
+                run_moe=run_moe,
+            ),
+        )
+        scheduler = FusedCommMoEScheduler(moe)
+        # Attention-DP padding must not turn an idle rank into a nonempty chunk.
+        x = torch.arange(max(token_counts) * 8, dtype=torch.float32).reshape(-1, 8)
+        output = scheduler.forward(
+            x,
+            torch.zeros((x.shape[0], 4)),
+            do_finalize=True,
+            output_dtype=x.dtype,
+            all_rank_num_tokens=list(token_counts),
+            use_dp_padding=True,
+            input_ids=None,
+        )
+
+        expected_chunk_events = ["allreduce", "run_moe", "allreduce"] if enabled else ["run_moe"]
+        assert events == expected_chunk_events * num_chunks
+        assert chunk_sizes == _split_chunk(num_tokens, num_chunks)
+        torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
     import tensorrt_llm
     import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module

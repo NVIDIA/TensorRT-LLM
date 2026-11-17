@@ -1655,8 +1655,8 @@ class FusedCommMoEScheduler(MoEScheduler):
     ) -> List[torch.Tensor]:
         """Drive the per-chunk kernel launches, padding zero-token chunks.
 
-        Stage hooks + AllReduce only fire at the (first|last) chunk of the
-        (first|last) repeat, matching the external-comm path. The
+        EPLB stage hooks and statistics AllReduce only fire at the (first|last)
+        chunk of the (first|last) repeat, matching the external-comm path. The
         ``idx_chunk >= len(x_chunks)`` branch only triggers when
         ``real_local == 0`` (this rank has no tokens but peers do): class
         invariant 7 says launch every chunk on every EP rank so the in-kernel
@@ -1907,6 +1907,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         # num_slots in quantization.py).
         # Fused-comm backends own the EP exchange, so there is no comm plan:
         # nothing outside the fused kernel decided anything about this forward.
+        # Synchronize even zero-token chunks: every EP rank launches the fused exchange.
+        if moe.enable_dummy_allreduce:
+            moe.dummy_allreduce()
         out = moe.backend.run_moe(
             MoERunContext(
                 token_selected_experts=token_selected_slots,
@@ -1917,6 +1920,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 replica_plan=replica_plan,
             )
         )
+        if moe.enable_dummy_allreduce:
+            moe.dummy_allreduce()
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----
         # The external-comm path overlaps CPU stage with ``comm.combine``;
