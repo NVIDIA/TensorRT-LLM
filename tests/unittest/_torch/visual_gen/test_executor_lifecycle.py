@@ -1024,6 +1024,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -1040,6 +1041,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     allow_start_to_finish.set()
     shutdown_thread.join(timeout=10.0)
     assert not shutdown_thread.is_alive()
+    assert client._shutdown_error is None
     spawner._thread.join(timeout=10.0)
     assert not spawner._thread.is_alive()
 
