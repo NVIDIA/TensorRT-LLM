@@ -124,7 +124,7 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
 
 
 def _capture_reference(updated, weight, eps, out) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
         m3_spec_tail,
     )
 
@@ -134,7 +134,7 @@ def _capture_reference(updated, weight, eps, out) -> None:
 def _one_case(
     kind: str, m: int, maxt: int, opts: int, scale: float, quant: bool, seed: int
 ) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
         sf_written,
     )
 
@@ -219,8 +219,8 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 4, f"the tp4 boundary runs at 4 ranks, got {WORLD}"
     try:
-        import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_mc_allreduce as _ar  # noqa: E501
-        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.comm import (  # noqa: E501
+        import tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_mc_allreduce as _ar  # noqa: E501
+        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.comm import (  # noqa: E501
             m3_mc_allreduce_norm as _plain,
         )
 

@@ -21,15 +21,15 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
         LATENT_OFFSET,
         mla_kv_half_append,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
         GLM_SOFTMAX_SCALE,
         HEAD_DIM_QK,
         KV_LORA_RANK,
@@ -38,13 +38,13 @@ try:
         NUM_HEADS,
         V_HEAD_DIM,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
         sparse_mla_flash_decode as op,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.sparse_mla_flash_decode import (  # noqa: E501
         sparse_mla_flash_decode_latent as latent_op,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm._low_m_splitk import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm._low_m_splitk import (  # noqa: E501
         bmm_prewait_tactic,
         run_splitk_bmm,
     )

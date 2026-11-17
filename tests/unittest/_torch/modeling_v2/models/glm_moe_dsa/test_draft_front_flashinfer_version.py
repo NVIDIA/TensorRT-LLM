@@ -19,7 +19,7 @@ def test_pinned_flashinfer_is_verified_for_draft_front() -> None:
     pinned_version = match.group(1)
     norm_path = (
         repo_root
-        / "tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa"
+        / "tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa"
         / "glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py"
     )
     spec = importlib.util.spec_from_file_location("draft_front_native_norm", norm_path)

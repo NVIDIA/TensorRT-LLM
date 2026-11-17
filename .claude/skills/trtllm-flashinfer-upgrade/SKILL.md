@@ -154,7 +154,7 @@ After the user selects a target version, update these files:
 | `requirements.txt` | `flashinfer-python==OLD` → `flashinfer-python==NEW` | Yes |
 | `security_scanning/pyproject.toml` | `"flashinfer-python (==OLD)"` → `"flashinfer-python (==NEW)"` | Yes |
 | `ATTRIBUTIONS-Python.md` | `## flashinfer-python (OLD)` → `## flashinfer-python (NEW)` | Yes |
-| `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Extend the exact-match `VERIFIED_FLASHINFER_VERSIONS` list only after the Step 5 compatibility check | Yes |
+| `tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Extend the exact-match `VERIFIED_FLASHINFER_VERSIONS` list only after the Step 5 compatibility check | Yes |
 | `security_scanning/poetry.lock` | Update `version = "OLD"` → `version = "NEW"` under `[[package]] name = "flashinfer-python"`, and update the `files` list with new hashes | Only if user opted in at Step 3 question 3 |
 
 #### Updating `security_scanning/poetry.lock` hashes
@@ -212,7 +212,7 @@ grep -rn 'flashinfer.*__version__\|flashinfer.*version' \
 
 Known locations with version checks:
 - `tensorrt_llm/_torch/speculative/interface.py` — `flashinfer.__version__ >= "0.6.4"`
-- `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` — `VERIFIED_FLASHINFER_VERSIONS` is an exact-match list, not a minimum version.
+- `tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` — `VERIFIED_FLASHINFER_VERSIONS` is an exact-match list, not a minimum version.
 
 For the minimum-version gate, no changes are needed if the new version is still >=
 the gated version. Otherwise, flag it to the user.
@@ -321,7 +321,7 @@ All files that contain flashinfer-python version pins:
 | `security_scanning/pyproject.toml` | `"flashinfer-python (==X.Y.Z)"` |
 | `security_scanning/poetry.lock` | `name = "flashinfer-python"` block with version + hashes |
 | `ATTRIBUTIONS-Python.md` | `## flashinfer-python (X.Y.Z)` |
-| `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Exact-match `VERIFIED_FLASHINFER_VERSIONS`; extend only after the Step 5 compatibility check |
+| `tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Exact-match `VERIFIED_FLASHINFER_VERSIONS`; extend only after the Step 5 compatibility check |
 
 ## Notes
 

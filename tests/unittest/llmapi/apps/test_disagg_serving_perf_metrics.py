@@ -222,7 +222,9 @@ def test_return_perf_metrics_and_jsonl_dump(
     payload = {
         "model": model_name,
         "prompt": "Reply with one token.",
-        "max_tokens": 1,
+        # The first token comes from the context server. The generation server
+        # runs a step, and reports step metrics, only from the second token on.
+        "max_tokens": 2,
         "temperature": 0.0,
     }
     response = requests.post(

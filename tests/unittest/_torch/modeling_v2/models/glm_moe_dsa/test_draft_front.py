@@ -15,7 +15,7 @@ def test_pack_draft_front_matches_flashinfer_rmsnorm() -> None:
     from flashinfer.norm import rmsnorm
 
     draft_front = import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_103__tp8.kernels.draft_front"
     )
     native_norm = import_module(f"{draft_front.__name__}.native_norm")
